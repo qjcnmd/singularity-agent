@@ -21,14 +21,12 @@ use singularity_tools::{
 use super::observation::OccurrenceTimer;
 use super::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentLoopInput,
-    AgentObservation, AgentRepairPlan, AgentVerification, FinalReviewObservation,
-    FinalReviewStatus, FinalReviewVerdict, OccurrenceIdentity, OccurrenceLifecycle,
-    PolicyDecisionCause, PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation,
-    PromptAssemblyStatus, ProviderAttemptObservation, ProviderAttemptStatus,
-    ProviderAttemptUsageObservation, RepairPlanningObservation, RepairPlanningStatus,
+    AgentObservation, AgentVerification, FinalReviewObservation, FinalReviewStatus,
+    FinalReviewVerdict, OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause,
+    PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation, PromptAssemblyStatus,
+    ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
     SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
-    VerificationObservation, VerificationPlanObservation, VerificationPlanStatus,
-    VerificationStatus,
+    VerificationObservation, VerificationStatus,
 };
 
 pub(super) struct ToolOccurrenceContext {
@@ -152,78 +150,6 @@ pub(super) fn emit_final_review_finished_with_verdict(
             verdict,
         })),
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_verification_plan_occurrence(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    input: &AgentLoopInput,
-    model_turn_ordinal: u32,
-    occurrence_ordinal: u32,
-    revision: Option<singularity_tools::WorkspaceRevision>,
-    risk_count: u32,
-    requirement_count: u32,
-    satisfied_requirement_count: u32,
-    status: VerificationPlanStatus,
-) -> Result<(), AgentLoopEventSinkError> {
-    let timer = OccurrenceTimer::start();
-    let identity = occurrence_identity(
-        input,
-        "verification_plan",
-        model_turn_ordinal,
-        occurrence_ordinal,
-        None,
-    );
-    for lifecycle in [timer.started(), timer.finished(status)] {
-        emit_event(
-            on_event,
-            AgentLoopEvent::Observation(AgentObservation::VerificationPlan(
-                VerificationPlanObservation {
-                    identity: identity.clone(),
-                    lifecycle,
-                    revision,
-                    risk_count,
-                    requirement_count,
-                    satisfied_requirement_count,
-                },
-            )),
-        )?;
-    }
-    Ok(())
-}
-
-pub(super) fn emit_repair_planning_occurrence(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    input: &AgentLoopInput,
-    model_turn_ordinal: u32,
-    occurrence_ordinal: u32,
-    plan: &AgentRepairPlan,
-    status: RepairPlanningStatus,
-) -> Result<(), AgentLoopEventSinkError> {
-    let timer = OccurrenceTimer::start();
-    let identity = occurrence_identity(
-        input,
-        "repair_planning",
-        model_turn_ordinal,
-        occurrence_ordinal,
-        None,
-    );
-    for lifecycle in [timer.started(), timer.finished(status)] {
-        emit_event(
-            on_event,
-            AgentLoopEvent::Observation(AgentObservation::RepairPlanning(
-                RepairPlanningObservation {
-                    identity: identity.clone(),
-                    lifecycle,
-                    reason: plan.reason,
-                    attempt: plan.attempt,
-                    max_attempts: plan.max_attempts,
-                    required_revision: plan.required_revision,
-                },
-            )),
-        )?;
-    }
-    Ok(())
 }
 
 enum ProviderAttemptIdentityScope {

@@ -19,8 +19,8 @@ use super::completion::{
 };
 use super::context::AgentContextTrace;
 use super::{
-    APPROVAL_CHECKPOINT_VERSION, AgentLoopInput, AgentPlan, AgentRecoveryMetrics,
-    approval_request_id, is_sha256_fingerprint,
+    APPROVAL_CHECKPOINT_VERSION, AgentLoopInput, AgentRecoveryMetrics, approval_request_id,
+    is_sha256_fingerprint,
 };
 
 /// approval 暂停运行期间保留的规范化可执行 tool call 数据。
@@ -64,6 +64,9 @@ impl PendingToolCall {
         }
         if self.tool_name.as_str().trim().is_empty() {
             return Err("approval checkpoint pending tool name is missing".to_string());
+        }
+        if matches!(self.tool_name.as_str(), "update_plan" | "edit") {
+            return Err("approval checkpoint contains a retired tool call".to_string());
         }
         serde_json::from_str::<Value>(&self.raw_arguments).map_err(|error| {
             format!("approval checkpoint pending tool arguments are invalid: {error}")
@@ -172,28 +175,17 @@ pub(super) struct CheckpointState {
     pub(super) model_turns: u32,
     #[serde(default)]
     pub(super) resume_attempt: u32,
-    /// Monotonic count of persisted user-input deliveries applied after turn/start.
-    #[serde(default)]
-    pub(super) input_revision: u32,
-    #[serde(default)]
-    pub(super) replanned_input_revision: u32,
     pub(super) completion: CompletionTracker,
-    #[serde(default)]
-    pub(super) verification_plan: Option<super::VerificationPlanState>,
     #[serde(default)]
     pub(super) verification_change: Option<super::VerificationChangeSummary>,
     #[serde(default)]
-    pub(super) verification_failure_history: Vec<String>,
-    #[serde(default)]
-    pub(super) repair_plan: Option<super::RepairPlanState>,
+    pub(super) repair_state: Option<super::RepairState>,
     pub(super) repair_attempts: u32,
     #[serde(default)]
     pub(super) repair_cycles: Vec<super::RepairCycleRecord>,
     #[serde(default)]
     pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
-    pub(super) plan: Option<AgentPlan>,
-    pub(super) plan_update_count: u32,
     pub(super) recovery_metrics: AgentRecoveryMetrics,
     pub(super) model_usage: ModelUsage,
     pub(super) provider_attempts: ProviderAttemptMetadata,
@@ -360,11 +352,6 @@ impl TurnCheckpoint {
         self
     }
 
-    /// Return how many interactive input batches are already represented by this checkpoint.
-    pub fn input_revision(&self) -> u32 {
-        self.state.input_revision
-    }
-
     /// Return canonical validated calls that may run only when no execution became `Unknown`.
     pub fn pending_tool_calls(&self) -> &[PendingToolCall] {
         &self.pending_tool_calls
@@ -420,23 +407,9 @@ impl CheckpointState {
         if self.messages.is_empty() {
             return Err("approval checkpoint messages are missing".to_string());
         }
-        if self.replanned_input_revision > self.input_revision {
-            return Err("approval checkpoint input revision is invalid".to_string());
-        }
         let used_approval_grants = self.used_approval_grants.iter().collect::<BTreeSet<_>>();
         if used_approval_grants.len() != self.used_approval_grants.len() {
             return Err("approval checkpoint contains duplicate grants".to_string());
-        }
-        if let Some(plan) = &self.plan {
-            plan.validate()
-                .map_err(|error| format!("approval checkpoint plan is invalid: {error}"))?;
-            if self.plan_update_count == 0 {
-                return Err("approval checkpoint plan update count is invalid".to_string());
-            }
-        } else if self.plan_update_count != 0
-            && self.input_revision == self.replanned_input_revision
-        {
-            return Err("approval checkpoint plan update count is invalid".to_string());
         }
         let seen_tool_call_fingerprints = self
             .seen_tool_call_fingerprints
@@ -473,17 +446,10 @@ impl CheckpointState {
         if !self.completion.is_consistent() {
             return Err("approval checkpoint workspace revision state is invalid".to_string());
         }
-        if self
-            .verification_failure_history
-            .iter()
-            .any(|failure| failure.trim().is_empty() || failure.chars().count() > 128)
-        {
-            return Err("approval checkpoint verification failure history is invalid".to_string());
-        }
         if let Some(change) = &self.verification_change
             && (!super::is_sha256_fingerprint(&change.diff_digest)
                 || change.changed_paths.is_empty()
-                || change.changed_paths.len() > super::MAX_VERIFICATION_REQUIREMENTS
+                || change.changed_paths.len() > super::MAX_WORKSPACE_CHANGE_PATHS
                 || Some(change.revision) != self.completion.workspace_revision
                 || change
                     .changed_paths
@@ -537,47 +503,24 @@ impl CheckpointState {
                 );
             }
         }
-        if let Some(plan) = &self.verification_plan {
-            plan.plan.validate().map_err(|error| {
-                format!("approval checkpoint verification plan is invalid: {error}")
-            })?;
-            if let Some(revision) = plan.revision
-                && Some(revision) != self.completion.workspace_revision
-            {
-                return Err(
-                    "approval checkpoint verification plan revision binding is invalid".to_string(),
-                );
+        if let Some(repair) = &self.repair_state {
+            if repair.attempt == 0 || repair.attempt > repair.max_attempts.saturating_add(1) {
+                return Err("approval checkpoint repair state budget is invalid".to_string());
             }
-            if self.completion.workspace_mutated() && plan.revision.is_none() {
-                return Err(
-                    "approval checkpoint verification plan revision binding is missing".to_string(),
-                );
-            }
-        }
-        if let Some(repair) = &self.repair_plan {
-            if repair.plan.attempt == 0
-                || repair.plan.attempt > repair.plan.max_attempts.saturating_add(1)
-            {
-                return Err("approval checkpoint repair plan budget is invalid".to_string());
-            }
-            if repair.plan.max_attempts == 0
-                || repair.plan.max_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS
-            {
-                return Err("approval checkpoint repair plan bound is invalid".to_string());
+            if repair.max_attempts == 0 || repair.max_attempts > super::MAX_REPAIR_ATTEMPTS {
+                return Err("approval checkpoint repair state bound is invalid".to_string());
             }
             if !repair.signature.is_empty() && !is_sha256_fingerprint(&repair.signature) {
-                return Err("approval checkpoint repair plan signature is invalid".to_string());
+                return Err("approval checkpoint repair state signature is invalid".to_string());
             }
             if repair
-                .plan
                 .required_revision
                 .is_some_and(|revision| Some(revision) != self.completion.workspace_revision)
-                || repair.plan.required_check_count != self.completion.required_command_count()
             {
-                return Err("approval checkpoint repair plan binding is invalid".to_string());
+                return Err("approval checkpoint repair state binding is invalid".to_string());
             }
         }
-        if self.repair_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS {
+        if self.repair_attempts > super::MAX_REPAIR_ATTEMPTS {
             return Err("approval checkpoint repair attempt ledger is invalid".to_string());
         }
         if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
@@ -610,23 +553,19 @@ impl CheckpointState {
             }
         }
         if self
-            .repair_plan
+            .repair_state
             .as_ref()
-            .is_some_and(|repair| repair.plan.attempt != self.repair_attempts.saturating_add(1))
+            .is_some_and(|repair| repair.attempt != self.repair_attempts.saturating_add(1))
         {
             return Err("approval checkpoint repair attempt ledger is not monotonic".to_string());
         }
-        if self.input_revision == self.replanned_input_revision
-            && self.repair_plan.is_none()
-            && self.completion.has_unresolved_failures()
-        {
+        if self.repair_state.is_none() && self.completion.has_unresolved_failures() {
             return Err(
                 "approval checkpoint repair state is missing for unresolved failure".to_string(),
             );
         }
         if self.final_review_verdict == Some(super::FinalReviewVerdict::Accept)
-            && (!self.completion.allows_final()
-                || self.plan.as_ref().is_some_and(|plan| !plan.is_completed()))
+            && !self.completion.allows_final()
         {
             return Err(
                 "approval checkpoint accepted review lacks completion evidence".to_string(),

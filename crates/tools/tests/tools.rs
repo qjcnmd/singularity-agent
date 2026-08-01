@@ -7,15 +7,14 @@ use singularity_sandbox::{
     SandboxNetworkMode,
 };
 use singularity_tools::{
-    AgentControlToolExecutor, CommandScopeDigest, CommandToolInput, EditToolInput, GrepToolInput,
-    ListToolInput, ReadToolInput, SandboxExecutionBoundary, SandboxExecutionStatus,
-    ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry,
-    ToolExecutionMode, ToolExecutor, ToolExposure, ToolFailureKind, ToolInputValidationError,
-    ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspaceChangeSummary, WorkspaceMutation,
-    WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError,
-    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count, command_scope_digest,
-    command_script_scope_digest, command_script_scope_digest_with_policy, workspace_tool_entries,
-    workspace_tool_specs,
+    CommandScopeDigest, CommandToolInput, GrepToolInput, ListToolInput, ReadToolInput,
+    SandboxExecutionBoundary, SandboxExecutionStatus, ToolAuthorization, ToolBroker,
+    ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode,
+    ToolExecutor, ToolFailureKind, ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult,
+    ToolSpec, WorkspaceChangeSummary, WorkspaceMutation, WorkspacePatch, WorkspacePatchChange,
+    WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
+    approximate_token_count, command_scope_digest, command_script_scope_digest,
+    command_script_scope_digest_with_policy, workspace_tool_entries, workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,12 +29,12 @@ fn test_tool_spec(
     input_schema: serde_json::Value,
 ) -> ToolEntry {
     let spec = raw_test_tool_spec(name, description, input_schema);
-    ToolEntry::model(
+    ToolEntry::new(
         spec,
         1,
-        ToolCapability::PlanManagement,
-        ToolAuthorization::AgentControl,
-        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
+        ToolCapability::WorkspaceRead,
+        ToolAuthorization::WorkspaceRead,
+        ToolExecutor::Workspace(WorkspaceToolExecutor::Read),
     )
     .expect("valid test tool entry")
 }
@@ -49,13 +48,13 @@ fn raw_test_tool_spec(
         name,
         description,
         input_schema,
-        ToolExecutionMode::Exclusive,
+        ToolExecutionMode::ParallelRead,
         validate_object_input,
     )
 }
 
 fn test_command_entry(spec: ToolSpec) -> ToolEntry {
-    ToolEntry::model(
+    ToolEntry::new(
         spec,
         1,
         ToolCapability::CommandExecution,
@@ -78,21 +77,21 @@ fn contract_mismatch_cases() -> Vec<(&'static str, ToolEntry)> {
         "Update the plan",
         serde_json::json!({"type": "object"}),
     );
-    wrong_capability.capability = ToolCapability::WorkspaceRead;
+    wrong_capability.capability = ToolCapability::WorkspaceSearch;
 
     let mut wrong_authorization = test_tool_spec(
         "update_plan",
         "Update the plan",
         serde_json::json!({"type": "object"}),
     );
-    wrong_authorization.authorization = ToolAuthorization::WorkspaceRead;
+    wrong_authorization.authorization = ToolAuthorization::Command;
 
     let mut wrong_execution_mode = test_tool_spec(
         "update_plan",
         "Update the plan",
         serde_json::json!({"type": "object"}),
     );
-    wrong_execution_mode.spec.execution_mode = ToolExecutionMode::ParallelRead;
+    wrong_execution_mode.spec.execution_mode = ToolExecutionMode::Exclusive;
 
     let mut wrong_spec_name = test_tool_spec(
         "update_plan",
@@ -292,28 +291,21 @@ fn registry_rejects_executor_contract_mismatches_before_broker_execution() {
 }
 
 #[test]
-fn broker_binds_valid_workspace_and_agent_control_entries() {
+fn broker_binds_all_public_workspace_tools_and_retires_unknown_control_calls() {
     let workspace = test_workspace("registry-valid-bindings");
     let workspace_tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
     let mut broker = ToolBroker::default();
-    broker
-        .register(
-            workspace_tool_entries()
-                .into_iter()
-                .find(|entry| {
-                    entry.executor == ToolExecutor::Workspace(WorkspaceToolExecutor::Read)
-                })
-                .expect("read entry"),
-        )
-        .expect("register read entry");
-    broker
-        .register(test_tool_spec(
-            "update_plan",
-            "Update the plan",
-            serde_json::json!({"type": "object"}),
-        ))
-        .expect("register agent control entry");
-
+    for entry in workspace_tool_entries() {
+        broker.register(entry).expect("register workspace entry");
+    }
+    assert_eq!(
+        broker
+            .tool_schema_payloads()
+            .iter()
+            .map(|payload| payload["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["command", "grep", "list", "patch", "read"]
+    );
     let read = broker
         .bind_authorization(
             "read",
@@ -323,101 +315,17 @@ fn broker_binds_valid_workspace_and_agent_control_entries() {
             SandboxNetworkMode::Denied,
         )
         .expect("bind workspace read entry");
-    assert_eq!(
-        read.executor,
-        ToolExecutor::Workspace(WorkspaceToolExecutor::Read)
-    );
     assert_eq!(read.execution_mode, ToolExecutionMode::ParallelRead);
 
-    let update_plan = broker
-        .bind_authorization(
-            "update_plan",
-            serde_json::json!({"steps": []}),
-            Some(&workspace_tools),
-            SandboxFilesystemMode::ReadOnly,
-            SandboxNetworkMode::Denied,
-        )
-        .expect("bind agent control entry");
-    assert_eq!(
-        update_plan.executor,
-        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
-    );
-    assert_eq!(update_plan.execution_mode, ToolExecutionMode::Exclusive);
-    remove_workspace(&workspace);
-}
-
-#[test]
-fn internal_entries_stay_out_of_model_projection_but_bind_and_execute_explicitly() {
-    let internal_entry = ToolEntry::internal(
-        raw_test_tool_spec(
-            "internal_update_plan",
-            "Internal plan update",
-            serde_json::json!({"type": "object"}),
-        ),
-        1,
-        ToolCapability::PlanManagement,
-        ToolAuthorization::AgentControl,
-        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
-    )
-    .expect("internal entry is valid");
-
-    let mut broker = ToolBroker::default();
-    broker
-        .register(internal_entry)
-        .expect("internal entry is a valid registered tool");
-
-    assert_eq!(
-        broker
-            .entry("internal_update_plan")
-            .expect("entry")
-            .exposure,
-        ToolExposure::Internal
-    );
-    assert!(
-        broker
-            .tool_schema_payloads()
-            .iter()
-            .all(|payload| payload["name"] != "internal_update_plan")
-    );
-    assert!(
-        broker
-            .entries_for_capability(ToolCapability::PlanManagement, 1)
-            .is_empty()
-    );
-    assert_eq!(
-        broker
-            .prepare_model_input("internal_update_plan", &serde_json::json!({}))
-            .expect_err("internal entry is not model-visible")
-            .code,
-        "tool_not_visible"
-    );
-
-    let bound = broker
-        .bind_authorization(
-            "internal_update_plan",
-            serde_json::json!({}),
-            None,
-            SandboxFilesystemMode::ReadOnly,
-            SandboxNetworkMode::Denied,
-        )
-        .expect("explicit internal binding is allowed");
-    assert_eq!(
-        bound.executor,
-        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
-    );
-
-    let envelope = ToolCallRequest::new("call_internal", "internal_update_plan", "{}");
+    let retired = ToolCallRequest::new("retired", "update_plan", "{}");
     let mut executor_called = false;
-    let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |executor, _| {
+    let result = broker.execute(&retired, ToolBrokerDecision::Allow, |_, _| {
         executor_called = true;
-        assert_eq!(
-            executor,
-            ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
-        );
-        ToolOutput::success(serde_json::json!({"ok": true}))
+        ToolOutput::success(serde_json::json!({"unexpected": true}))
     });
-    assert!(executor_called);
-    assert!(result.ok);
+    assert!(!executor_called);
+    assert_eq!(result.error_code.as_deref(), Some("unknown_tool"));
+    remove_workspace(&workspace);
 }
 
 #[test]
@@ -1221,40 +1129,13 @@ fn workspace_grep_supports_case_control_and_deterministic_order() {
 }
 
 #[test]
-fn exact_tool_inputs_drive_both_projected_schema_and_local_admission() {
-    let allowed = serde_json::json!({"path": "README.md"});
-    let mut spec = raw_test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
-
-    spec.restrict_to_exact_inputs(vec![allowed.clone(), allowed.clone()])
-        .expect("restrict exact inputs");
-
-    assert_eq!(
-        spec.input_schema["properties"]["path"]["const"],
-        "README.md"
-    );
-    assert_eq!(spec.exact_model_inputs(), vec![allowed.clone()]);
-    assert_eq!(
-        spec.prepare_model_input(&allowed)
-            .expect("allowed model input"),
-        allowed
-    );
-    assert_eq!(
-        spec.prepare_model_input(&serde_json::json!({"path": "other.md"}))
-            .expect_err("unadvertised input must be rejected")
-            .code,
-        "input_not_allowed"
-    );
-}
-
-#[test]
 fn command_contract_rejects_policy_fields() {
     let model_input = serde_json::json!({
         "command": "cargo test",
         "cwd": ".",
         "timeout_seconds": 60,
     });
-    let execution_input = model_input.clone();
-    let mut command = workspace_tool_specs()
+    let command = workspace_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "command")
         .expect("command spec");
@@ -1271,18 +1152,13 @@ fn command_contract_rejects_policy_fields() {
             .code,
         "invalid_command_arguments"
     );
-    command
-        .restrict_to_input_bindings(vec![(model_input.clone(), execution_input.clone())])
-        .expect("restrict command binding");
-
-    assert_eq!(command.exact_model_inputs(), vec![model_input.clone()]);
     assert_eq!(
         command
             .prepare_model_input(&model_input)
-            .expect("bound model input"),
-        execution_input
+            .expect("validated model input"),
+        model_input
     );
-    assert!(command.validate_execution_input(&execution_input).is_ok());
+    assert!(command.validate_execution_input(&model_input).is_ok());
     assert_eq!(
         command
             .validate_execution_input(&serde_json::json!({
@@ -1324,24 +1200,6 @@ fn command_contract_rejects_policy_fields() {
     assert!(!executed);
     assert_eq!(result.failure_kind, Some(ToolFailureKind::Input));
     assert_eq!(result.error_code.as_deref(), Some("invalid_tool_arguments"));
-}
-
-#[test]
-fn exact_input_bindings_reject_ambiguous_mappings() {
-    let model_input = serde_json::json!({"path": "README.md"});
-    let mut spec = raw_test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
-
-    let error = spec
-        .restrict_to_input_bindings(vec![
-            (
-                model_input.clone(),
-                serde_json::json!({"path": "README.md"}),
-            ),
-            (model_input, serde_json::json!({"path": "other.md"})),
-        ])
-        .expect_err("one model input cannot select multiple execution inputs");
-
-    assert!(error.contains("maps to multiple execution inputs"));
 }
 
 #[test]
@@ -1507,13 +1365,6 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
             "unknown": true
         }))
         .is_err(),
-        serde_json::from_value::<EditToolInput>(serde_json::json!({
-            "path": "file.txt",
-            "expected": "old",
-            "replacement": "new",
-            "unknown": true
-        }))
-        .is_err(),
         serde_json::from_value::<WorkspacePatch>(serde_json::json!({
             "changes": [],
             "unknown": true
@@ -1653,18 +1504,6 @@ fn workspace_tools_reject_symlink_escape() {
         }),
         Err(WorkspaceToolError::OutsideWorkspace(_) | WorkspaceToolError::ProtectedPath(_))
     ));
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: "linked-secret.txt".to_string(),
-                expected: "outside".to_string(),
-                replacement: "inside".to_string(),
-            },
-            &ToolBrokerDecision::Allow
-        ),
-        Err(WorkspaceToolError::OutsideWorkspace(_) | WorkspaceToolError::ProtectedPath(_))
-    ));
-
     remove_workspace(&workspace);
     let _ = std::fs::remove_file(&outside);
 }
@@ -1897,15 +1736,17 @@ fn workspace_capability_survives_workspace_path_replacement() {
         .expect("read bound value");
     assert_eq!(read.content["preview"], "bound\n");
     tools
-        .edit(
-            EditToolInput {
-                path: "value.txt".to_string(),
-                expected: "bound".to_string(),
-                replacement: "updated".to_string(),
+        .patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: "value.txt".to_string(),
+                    expected: Some("bound".to_string()),
+                    replacement: "updated".to_string(),
+                }],
             },
             &ToolBrokerDecision::Allow,
         )
-        .expect("edit bound value");
+        .expect("patch bound value");
     assert_eq!(
         std::fs::read_to_string(moved_workspace.join("value.txt")).expect("read moved value"),
         "updated\n"
@@ -1949,17 +1790,6 @@ fn workspace_tools_reject_hard_linked_files_before_read_or_mutation() {
             line_start: None,
             line_end: None,
         }),
-        Err(WorkspaceToolError::HardLinkRejected(_))
-    ));
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: "target.txt".to_string(),
-                expected: "protected".to_string(),
-                replacement: "changed".to_string(),
-            },
-            &ToolBrokerDecision::Allow
-        ),
         Err(WorkspaceToolError::HardLinkRejected(_))
     ));
     assert_eq!(
@@ -2111,181 +1941,6 @@ fn workspace_grep_skips_symlinked_directories() {
 }
 
 #[test]
-fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
-    let workspace = test_workspace("edit-patch");
-    let app = workspace.join("app.txt");
-    let other = workspace.join("other.txt");
-    std::fs::write(&app, "status = old\n").expect("write app");
-    std::fs::write(&other, "other\n").expect("write other");
-    std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
-    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
-
-    let denied = tools.edit(
-        EditToolInput {
-            path: "app.txt".to_string(),
-            expected: "old".to_string(),
-            replacement: "new".to_string(),
-        },
-        &ToolBrokerDecision::deny("policy denied"),
-    );
-    assert!(matches!(denied, Err(WorkspaceToolError::InvalidInput(_))));
-    assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = old\n");
-
-    let edited = tools
-        .edit(
-            EditToolInput {
-                path: "app.txt".to_string(),
-                expected: "old".to_string(),
-                replacement: "new".to_string(),
-            },
-            &ToolBrokerDecision::Allow,
-        )
-        .expect("edit");
-    assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = new\n");
-    assert_eq!(
-        edited.content["changed_files"],
-        serde_json::json!(["app.txt"])
-    );
-    assert!(edited.content.get("diff_ref").is_none());
-
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: "app.txt".to_string(),
-                expected: "new".to_string(),
-                replacement: "new".to_string(),
-            },
-            &ToolBrokerDecision::Allow,
-        ),
-        Err(WorkspaceToolError::InvalidInput(message))
-            if message == "workspace mutation made no change: app.txt"
-    ));
-    assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = new\n");
-
-    let failed_patch = tools.patch(
-        WorkspacePatch {
-            changes: vec![
-                WorkspacePatchChange {
-                    path: "app.txt".to_string(),
-                    expected: Some("new".to_string()),
-                    replacement: "changed".to_string(),
-                },
-                WorkspacePatchChange {
-                    path: "other.txt".to_string(),
-                    expected: Some("missing".to_string()),
-                    replacement: "unreachable".to_string(),
-                },
-            ],
-        },
-        &ToolBrokerDecision::Allow,
-    );
-    assert!(matches!(
-        failed_patch,
-        Err(WorkspaceToolError::ExpectedContentMissing(_))
-    ));
-    assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = new\n");
-    assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
-
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: ".env".to_string(),
-                expected: "TOKEN".to_string(),
-                replacement: "SAFE".to_string(),
-            },
-            &ToolBrokerDecision::deny("policy denied")
-        ),
-        Err(WorkspaceToolError::InvalidInput(_))
-    ));
-
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: ".env".to_string(),
-                expected: "TOKEN".to_string(),
-                replacement: "SAFE".to_string(),
-            },
-            &ToolBrokerDecision::Allow,
-        ),
-        Err(WorkspaceToolError::ProtectedPath(_))
-    ));
-    assert_eq!(
-        std::fs::read_to_string(workspace.join(".env")).unwrap(),
-        "TOKEN=secret"
-    );
-    for protected_path in [
-        ".git/config",
-        ".agents/runtime.json",
-        ".singularity/state.json",
-        ".aws/credentials",
-        ".azure/token",
-        ".env.local",
-        ".env.production",
-        ".gnupg/private",
-        ".ssh/config",
-        "credential",
-        "credentials.json",
-        "private-key.pem",
-        "server.pem",
-        "deploy.key",
-        "id_ecdsa",
-        "secret.txt",
-    ] {
-        if let Some(parent) = workspace.join(protected_path).parent() {
-            std::fs::create_dir_all(parent).expect("create protected parent");
-        }
-        std::fs::write(workspace.join(protected_path), "old").expect("write protected file");
-        assert!(
-            matches!(
-                tools.edit(
-                    EditToolInput {
-                        path: protected_path.to_string(),
-                        expected: "old".to_string(),
-                        replacement: "new".to_string(),
-                    },
-                    &ToolBrokerDecision::Allow,
-                ),
-                Err(WorkspaceToolError::ProtectedPath(_))
-            ),
-            "{protected_path} should require approval"
-        );
-        assert_eq!(
-            std::fs::read_to_string(workspace.join(protected_path)).unwrap(),
-            "old"
-        );
-    }
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: ".env".to_string(),
-                expected: "TOKEN".to_string(),
-                replacement: "SAFE".to_string(),
-            },
-            &ToolBrokerDecision::approved("  "),
-        ),
-        Err(WorkspaceToolError::ProtectedPath(_))
-    ));
-
-    assert!(matches!(
-        tools.edit(
-            EditToolInput {
-                path: ".env".to_string(),
-                expected: "TOKEN".to_string(),
-                replacement: "SAFE".to_string(),
-            },
-            &ToolBrokerDecision::approved("approval_1"),
-        ),
-        Err(WorkspaceToolError::ProtectedPath(_))
-    ));
-    assert_eq!(
-        std::fs::read_to_string(workspace.join(".env")).unwrap(),
-        "TOKEN=secret"
-    );
-
-    remove_workspace(&workspace);
-}
-
-#[test]
 fn workspace_mutation_summary_hashes_published_before_and_after_bytes() {
     let workspace = test_workspace("mutation-summary");
     let path = workspace.join("contract.txt");
@@ -2293,29 +1948,33 @@ fn workspace_mutation_summary_hashes_published_before_and_after_bytes() {
     let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let first = tools
-        .edit(
-            EditToolInput {
-                path: "contract.txt".to_string(),
-                expected: "before".to_string(),
-                replacement: "after-one".to_string(),
+        .patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: "contract.txt".to_string(),
+                    expected: Some("before".to_string()),
+                    replacement: "after-one".to_string(),
+                }],
             },
             &ToolBrokerDecision::Allow,
         )
-        .expect("first edit");
+        .expect("first patch");
     let first_summary: WorkspaceChangeSummary =
         serde_json::from_value(first.metadata["workspace_change_summary"].clone())
             .expect("first workspace change summary");
 
     let second = tools
-        .edit(
-            EditToolInput {
-                path: "contract.txt".to_string(),
-                expected: "after-one".to_string(),
-                replacement: "after-two".to_string(),
+        .patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: "contract.txt".to_string(),
+                    expected: Some("after-one".to_string()),
+                    replacement: "after-two".to_string(),
+                }],
             },
             &ToolBrokerDecision::Allow,
         )
-        .expect("second edit");
+        .expect("second patch");
     let second_summary: WorkspaceChangeSummary =
         serde_json::from_value(second.metadata["workspace_change_summary"].clone())
             .expect("second workspace change summary");

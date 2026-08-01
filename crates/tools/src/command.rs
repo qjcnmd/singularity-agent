@@ -2,25 +2,6 @@
 
 use super::*;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CommandModelInput {
-    command: String,
-    cwd: Option<String>,
-    timeout_seconds: Option<u64>,
-}
-
-impl CommandModelInput {
-    pub(crate) fn validate(&self) -> Result<(), WorkspaceToolError> {
-        CommandToolInput {
-            command: self.command.clone(),
-            cwd: self.cwd.clone(),
-            timeout_seconds: self.timeout_seconds,
-        }
-        .validate()
-    }
-}
-
 /// 面向模型的命令输入；执行策略由受信任的 sandbox 路径固定提供。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

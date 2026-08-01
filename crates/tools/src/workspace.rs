@@ -153,21 +153,6 @@ impl GrepToolInput {
     }
 }
 
-/// 工作区 tool 接受的单文件替换请求。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct EditToolInput {
-    pub path: String,
-    pub expected: String,
-    pub replacement: String,
-}
-
-impl EditToolInput {
-    pub(crate) fn validate(&self) -> Result<(), WorkspaceToolError> {
-        validate_nonempty_path("path", &self.path)
-    }
-}
-
 /// 多文件变更；所有目标会在开始写入前完成校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -533,18 +518,6 @@ impl WorkspaceTools {
                     vec![PermissionResource::WorkspacePath(path)],
                 )
             }
-            WorkspaceToolExecutor::Edit => {
-                ensure_authorization(entry, ToolAuthorization::WorkspaceWrite)?;
-                let mut input: EditToolInput = preflight_input(&input)?;
-                input.validate()?;
-                let path = self.bound_workspace_path(&input.path, false)?;
-                input.path = path.as_str().to_string();
-                (
-                    PermissionOperation::Write,
-                    serde_json::to_value(input).map_err(serialization_error)?,
-                    vec![PermissionResource::WorkspacePath(path)],
-                )
-            }
             WorkspaceToolExecutor::Patch => {
                 ensure_authorization(entry, ToolAuthorization::WorkspaceWrite)?;
                 let mut input: WorkspacePatch = preflight_input(&input)?;
@@ -642,12 +615,6 @@ impl WorkspaceTools {
                 let input: GrepToolInput = preflight_input(input)?;
                 input.validate()?;
                 let target = self.resolve_optional_workspace_path(input.path.as_deref(), true)?;
-                self.validate_existing_path(&target, false)?;
-            }
-            EDIT_TOOL => {
-                let input: EditToolInput = preflight_input(input)?;
-                input.validate()?;
-                let target = self.resolve_workspace_path(&input.path, false)?;
                 self.validate_existing_path(&target, false)?;
             }
             PATCH_TOOL => {

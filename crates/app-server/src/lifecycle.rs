@@ -493,7 +493,6 @@ impl AppServer {
         thread_id: &str,
         turn_id: &str,
         event: TurnCheckpointEvent,
-        caller_requirements: &[singularity_agent::AgentVerificationRequirement],
     ) -> AppServerResult<TurnBoundaryAction> {
         let checkpoint_version = event.checkpoint.checkpoint_version();
         let checkpoint = event
@@ -606,7 +605,7 @@ impl AppServer {
             } else {
                 let updated = event
                     .checkpoint
-                    .with_user_inputs(&messages, cancel_pending_tools, caller_requirements)
+                    .with_user_inputs(&messages, cancel_pending_tools)
                     .map_err(|_| AppServerError::TurnExecution {
                         stage: TurnFailureStage::ApprovalCheckpoint,
                         cause: TurnFailureCause::Serialization,
@@ -1410,9 +1409,6 @@ impl AppServer {
                 return Ok(Some((turn.clone(), run_status, Vec::new())));
             }
         };
-        let verification_requirements = loop_input
-            .verification_requirements()
-            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1445,12 +1441,7 @@ impl AppServer {
                 if callback_error.borrow().is_some() {
                     return Err(AgentLoopEventSinkError);
                 }
-                match self.persist_turn_checkpoint_event(
-                    &thread.thread_id,
-                    &turn.turn_id,
-                    event,
-                    &verification_requirements,
-                ) {
+                match self.persist_turn_checkpoint_event(&thread.thread_id, &turn.turn_id, event) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
                         *boundary_action.borrow_mut() = Some(action);
@@ -1631,9 +1622,6 @@ impl AppServer {
             &workspace_root,
             invocation.history,
         )?;
-        let verification_requirements = loop_input
-            .verification_requirements()
-            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1673,7 +1661,6 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
-                    &verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1792,9 +1779,6 @@ impl AppServer {
             invocation.history,
         )?
         .with_resume_attempt(checkpoint.resume_attempt());
-        let verification_requirements = loop_input
-            .verification_requirements()
-            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1834,7 +1818,6 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
-                    &verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1914,7 +1897,6 @@ impl AppServer {
                 phase: TurnCheckpointPhase::ModelResponseCommitted,
                 checkpoint,
             },
-            &[],
         )? {
             TurnBoundaryAction::Restart(checkpoint) => checkpoint,
             TurnBoundaryAction::Paused => return Ok(AgentRunStatus::paused()),
@@ -2050,11 +2032,6 @@ impl AppServer {
         authority: TurnOutcomeAuthority,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
-        let plan = run_status
-            .plan
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?;
         let event = agent_loop_trace(turn, run_status);
         self.store.commit_turn_outcome_with_authority(
             &turn.turn_id,
@@ -2063,7 +2040,6 @@ impl AppServer {
                 agent_loop_status: run_status.status.as_str(),
                 assistant_item_id: assistant_delta.as_ref().and(assistant_item_id),
                 assistant_delta: assistant_delta.as_deref(),
-                plan: plan.as_ref(),
                 trace: &event,
             },
             authority,
@@ -2083,7 +2059,6 @@ impl AppServer {
         let mut effective_status = run_status.clone();
         let commit = |status: &AgentRunStatus| {
             let assistant_delta = agent_completed_delta(status);
-            let plan = status.plan.as_ref().map(serde_json::to_value).transpose()?;
             let event = agent_loop_trace(turn, status);
             let effective_next_approvals = if status.status == AgentStatus::Blocked {
                 encode_pending_approvals(next_approvals)?
@@ -2104,7 +2079,6 @@ impl AppServer {
                         agent_loop_status: status.status.as_str(),
                         assistant_item_id: assistant_delta.as_ref().and(assistant_item_id),
                         assistant_delta: assistant_delta.as_deref(),
-                        plan: plan.as_ref(),
                         trace: &event,
                     },
                     &effective_next_approvals,

@@ -197,11 +197,11 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "turn_id": &request.turn_id,
         "tool_call_id": tool_call_id,
         "tool_name": &request.action,
-        "raw_arguments": "{}",
+        "raw_arguments": r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,
         "resources": &request.resources,
-        "checkpoint_version": 3,
+        "checkpoint_version": 4,
         "project_instructions_digest": null,
-        "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
+        "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]},"raw_arguments":r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,"parse_status":"valid","validation_errors":[]}]}],
         "tool_result_occurrences": [],
         "used_approval_grants": [],
         "approval_count": 1,
@@ -217,8 +217,6 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         },
         "repair_attempts": 0,
         "last_completion_error": null,
-        "plan": null,
-        "plan_update_count": 0,
         "recovery_metrics": AgentRecoveryMetrics::default(),
         "model_usage": ModelUsage::default(),
         "provider_attempts": ProviderAttemptMetadata::default(),
@@ -1175,7 +1173,7 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        tool_id("edit"),
+        tool_id("patch"),
     )
     .with_tool_call_id("call_1")
     .with_resources([workspace_resource("README.md")]);
@@ -1260,7 +1258,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
         "approval_archived",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        tool_id("edit"),
+        tool_id("patch"),
     )
     .with_tool_call_id("call_1")
     .with_resources([workspace_resource("README.md")]);
@@ -1342,7 +1340,7 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
         "approval_resume_error",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        tool_id("edit"),
+        tool_id("patch"),
     )
     .with_tool_call_id("call_1")
     .with_resources([workspace_resource("README.md")]);
@@ -1455,7 +1453,7 @@ fn unavailable_workspace_only_blocks_allow_decisions() {
             format!("approval_workspace_missing_{outcome_label}"),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            tool_id("edit"),
+            tool_id("patch"),
         )
         .with_tool_call_id("call_1")
         .with_resources([workspace_resource("README.md")]);
@@ -2189,15 +2187,17 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        tool_id("edit"),
+        tool_id("patch"),
     )
     .with_tool_call_id("call_1")
     .with_resources([workspace_resource("README.md")]);
     let mut checkpoint = approval_checkpoint(&request, "call_1");
     let arguments = serde_json::json!({
-        "path": "README.md",
-        "expected": "before",
-        "replacement": "after"
+        "changes": [{
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }]
     });
     checkpoint["raw_arguments"] = serde_json::json!(arguments.to_string());
     checkpoint["messages"][0]["tool_calls"][0]["arguments"] = arguments.clone();
@@ -2500,7 +2500,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
             "jsonrpc": "2.0", "method": "event/subscribe", "id": 99,
             "params": {"eventTypes": [
                 "thread/started", "turn/started", "turn/completed",
-                "turn/plan/updated", "item/started", "item/completed",
+                "item/started", "item/completed",
                 "item/agentMessage/delta", "approval/requested"
             ]}
         }),
@@ -2512,7 +2512,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
 fn subscribe_events(server: &mut AppServer) {
     let response = server
         .handle_json(
-            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":99,"params":{"eventTypes":["thread/started","turn/started","turn/completed","turn/plan/updated","item/started","item/completed","item/agentMessage/delta","approval/requested"]}}"#,
+            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":99,"params":{"eventTypes":["thread/started","turn/started","turn/completed","item/started","item/completed","item/agentMessage/delta","approval/requested"]}}"#,
         )
         .expect("event subscription");
     assert!(
@@ -2938,66 +2938,37 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
 
-    // 固定模型返回序列：
-    // 1. 请求 edit tool（触发 approval）
-    // 2. 基于已批准的真实 mutation 声明 revision-bound verification plan
-    // 3. 执行计划绑定的 command verification
-    // 4. 返回 final answer
-    let mut edit_response = ModelTurnResponse::completed("req_1", "resp_1", "");
-    edit_response
+    // 固定模型返回序列：patch 触发 approval，随后 command 产生 Unchanged 证据，最后返回答案。
+    let mut patch_response = ModelTurnResponse::completed("req_1", "resp_1", "");
+    patch_response
         .tool_calls
         .push(singularity_model::ModelToolCall {
-            tool_call_id: "call_edit_1".to_string(),
-            tool_name: "edit".to_string(),
+            tool_call_id: "call_patch_1".to_string(),
+            tool_name: "patch".to_string(),
             raw_arguments: serde_json::json!({
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
+                "changes": [{
+                    "path": "README.md",
+                    "expected": "before",
+                    "replacement": "after"
+                }]
             })
             .to_string(),
             arguments: serde_json::json!({
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
+                "changes": [{
+                    "path": "README.md",
+                    "expected": "before",
+                    "replacement": "after"
+                }]
             }),
             parse_status: singularity_model::ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
         });
 
-    let plan_arguments = serde_json::json!({
-        "steps": [{"step": "verify README.md", "status": "completed"}],
-        "verification": [{
-            "risk": "general_mutation",
-            "evidence": "README.md changed by the approved edit",
-            "affected_path": "README.md",
-            "affected_symbol": "README.md::document",
-            "current_gap": "the edited document has not been verified",
-            "action": {
-                "command": "type README.md",
-                "cwd": ".",
-                "timeout_seconds": 30,
-                "sandbox_mode": "workspace_write",
-                "network_access": "denied"
-            }
-        }]
-    });
-    let mut plan_response = ModelTurnResponse::completed("req_2", "resp_2", "");
-    plan_response
-        .tool_calls
-        .push(singularity_model::ModelToolCall {
-            tool_call_id: "call_plan_1".to_string(),
-            tool_name: "update_plan".to_string(),
-            raw_arguments: plan_arguments.to_string(),
-            arguments: plan_arguments,
-            parse_status: singularity_model::ModelToolParseStatus::Valid,
-            validation_errors: Vec::new(),
-        });
-
-    let mut verify_response = ModelTurnResponse::completed("req_3", "resp_3", "");
+    let mut verify_response = ModelTurnResponse::completed("req_2", "resp_2", "");
     verify_response
         .tool_calls
         .push(singularity_model::ModelToolCall {
-            tool_call_id: "call_cmd_1".to_string(),
+            tool_call_id: "call_verify_1".to_string(),
             tool_name: "command".to_string(),
             raw_arguments: serde_json::json!({
                 "command": "type README.md",
@@ -3015,16 +2986,11 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
         });
 
     let final_response =
-        ModelTurnResponse::completed("req_4", "resp_4", "Task completed: README.md updated.");
+        ModelTurnResponse::completed("req_3", "resp_3", "Task completed: README.md updated.");
 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = SequenceProvider {
-        responses: vec![
-            edit_response,
-            plan_response,
-            verify_response,
-            final_response,
-        ],
+        responses: vec![patch_response, verify_response, final_response],
         seen_requests: Arc::clone(&seen_requests),
         negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
@@ -3067,8 +3033,8 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     assert_eq!(approval_request.thread_id, thread_id);
     assert_eq!(
         approval_request.action.as_str(),
-        "edit",
-        "approval must be for the edit tool"
+        "patch",
+        "approval must be for the patch tool"
     );
 
     // 从 pending approval 获取 turn_id 并验证 turn 状态
@@ -3082,7 +3048,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let decision = ApprovalDecision::new(
         approval_request.request_id.clone(),
         ApprovalOutcome::Allow,
-        "operator approved edit",
+        "operator approved patch",
     );
     let _decision_response = server
         .handle_json(
@@ -3126,7 +3092,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             .as_array()
             .expect("tool result occurrences")
             .iter()
-            .any(|occurrence| occurrence["result"]["tool_call_id"] == "call_edit_1"),
+            .any(|occurrence| occurrence["result"]["tool_call_id"] == "call_patch_1"),
         "approval resume checkpoint must retain the approved tool result"
     );
 
@@ -3134,7 +3100,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     assert_eq!(
         std::fs::read_to_string(&file_path).expect("read readme"),
         "after",
-        "workspace file must be modified by the approved edit"
+        "workspace file must be modified by the approved patch"
     );
 
     // 验证 approval 已消费
@@ -3153,37 +3119,26 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let requests = seen_requests.lock().expect("requests");
     assert_eq!(
         requests.len(),
-        4,
-        "edit, planning, verification, and finalization requests"
+        3,
+        "patch, verification, and finalization requests"
     );
     let approved_edit_result = requests[1]
         .messages
         .iter()
         .find(|message| {
             message.role == singularity_model::ModelRole::Tool
-                && message.tool_call_id.as_deref() == Some("call_edit_1")
+                && message.tool_call_id.as_deref() == Some("call_patch_1")
         })
-        .expect("approved edit result must precede the resumed model request");
+        .expect("approved patch result must precede the resumed model request");
     let approved_edit_payload: serde_json::Value =
         serde_json::from_str(&approved_edit_result.content).expect("edit result payload");
     assert_eq!(approved_edit_payload["ok"], true);
-    let plan_result = requests[2]
+    let command_result = requests[2]
         .messages
         .iter()
         .find(|message| {
             message.role == singularity_model::ModelRole::Tool
-                && message.tool_call_id.as_deref() == Some("call_plan_1")
-        })
-        .expect("verification plan result must precede the verification request");
-    let plan_payload: serde_json::Value =
-        serde_json::from_str(&plan_result.content).expect("plan result payload");
-    assert_eq!(plan_payload["ok"], true);
-    let command_result = requests[3]
-        .messages
-        .iter()
-        .find(|message| {
-            message.role == singularity_model::ModelRole::Tool
-                && message.tool_call_id.as_deref() == Some("call_cmd_1")
+                && message.tool_call_id.as_deref() == Some("call_verify_1")
         })
         .expect("verification command result must precede finalization");
     let command_payload: serde_json::Value =
@@ -3196,7 +3151,11 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
         })
         .collect::<Vec<_>>();
-    assert_eq!(provider_events.len(), 8, "four attempts need Start and End");
+    assert_eq!(
+        provider_events.len(),
+        6,
+        "three attempts need Start and End"
+    );
     let mut provider_pairs = std::collections::BTreeMap::new();
     for event in provider_events {
         let span_id = event.span_id.as_deref().expect("provider span id");
@@ -3207,7 +3166,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             None => panic!("provider span phase"),
         }
     }
-    assert_eq!(provider_pairs.len(), 4);
+    assert_eq!(provider_pairs.len(), 3);
     for (_span_id, (start, end)) in provider_pairs {
         let start = start.expect("provider Start");
         let end = end.expect("provider End");
@@ -3254,158 +3213,6 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
         2,
         "initial and resumed capability-cache observations must both persist"
     );
-
-    // A deny that races with accepted steer records the decision but continues the same turn.
-    let steered_dir = tempfile::tempdir().expect("steered temp dir");
-    let steered_workspace = steered_dir.path().join("workspace");
-    std::fs::create_dir_all(steered_workspace.join(".git")).expect("steered workspace");
-    let steered_file = steered_workspace.join("README.md");
-    std::fs::write(&steered_file, "before").expect("steered readme");
-    let steered_db = steered_dir.path().join("sessions.sqlite3");
-    let steered_store = SessionStore::open(&steered_db).expect("steered store");
-    let mut steered_edit = ModelTurnResponse::completed("steer_req_1", "steer_resp_1", "");
-    steered_edit
-        .tool_calls
-        .push(singularity_model::ModelToolCall {
-            tool_call_id: "steered_edit_call".to_string(),
-            tool_name: "edit".to_string(),
-            raw_arguments: serde_json::json!({
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "must-not-run"
-            })
-            .to_string(),
-            arguments: serde_json::json!({
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "must-not-run"
-            }),
-            parse_status: singularity_model::ModelToolParseStatus::Valid,
-            validation_errors: Vec::new(),
-        });
-    let steered_plan_arguments = serde_json::json!({
-        "steps": [{"step": "follow the updated user direction", "status": "completed"}]
-    });
-    let mut steered_plan = ModelTurnResponse::completed("steer_req_2", "steer_resp_2", "");
-    steered_plan
-        .tool_calls
-        .push(singularity_model::ModelToolCall {
-            tool_call_id: "steered_plan_call".to_string(),
-            tool_name: "update_plan".to_string(),
-            raw_arguments: steered_plan_arguments.to_string(),
-            arguments: steered_plan_arguments,
-            parse_status: singularity_model::ModelToolParseStatus::Valid,
-            validation_errors: Vec::new(),
-        });
-    let steered_requests = Arc::new(Mutex::new(Vec::new()));
-    let steered_provider = SequenceProvider {
-        responses: vec![
-            steered_edit,
-            steered_plan,
-            ModelTurnResponse::completed(
-                "steer_req_3",
-                "steer_resp_3",
-                "updated direction accepted",
-            ),
-        ],
-        seen_requests: Arc::clone(&steered_requests),
-        negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    };
-    let mut steered_server = app_server(steered_store)
-        .with_test_provider(Arc::new(steered_provider))
-        .with_sandbox_backend(CompletedSandboxBackend);
-    steered_server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":101,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .expect("initialize steered server");
-    steered_server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialize steered notification");
-    let steered_thread = steered_server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"thread/start","id":102,"params":{{"cwd":{},"sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#,
-            serde_json::to_string(&steered_workspace.to_string_lossy()).expect("steered cwd")
-        ))
-        .expect("steered thread");
-    let steered_thread_id = result_message(&steered_thread)["thread"]["thread_id"]
-        .as_str()
-        .expect("steered thread id")
-        .to_string();
-    steered_server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":103,"params":{{"threadId":"{steered_thread_id}","input":[{{"type":"text","text":"Edit README.md"}}]}}}}"#
-        ))
-        .expect("steered blocked turn");
-    let steered_store = SessionStore::open(&steered_db).expect("reopen steered store");
-    let steered_approval = steered_store
-        .list_pending_approvals()
-        .expect("steered approval")
-        .pop()
-        .expect("pending steered approval");
-    steered_server
-        .handle_json(
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "turn/input",
-                "id": 104,
-                "params": {
-                    "turnId": steered_approval.turn_id.clone(),
-                    "inputId": "approval-steer",
-                    "delivery": "steer",
-                    "input": [{"type": "text", "text": "Do not edit; explain instead"}]
-                }
-            })
-            .to_string(),
-        )
-        .expect("persist approval steer");
-    steered_server
-        .handle_json(
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "approval/decision",
-                "id": 105,
-                "params": ApprovalDecision::new(
-                    steered_approval.request_id,
-                    ApprovalOutcome::Deny,
-                    "operator denied the original call",
-                )
-            })
-            .to_string(),
-        )
-        .expect("approval steer continuation");
-    assert_eq!(
-        std::fs::read_to_string(&steered_file).expect("steered readme"),
-        "before",
-        "the superseded approved call must not execute"
-    );
-    assert_eq!(
-        SessionStore::open(&steered_db)
-            .expect("final steered store")
-            .get_turn(&steered_approval.turn_id)
-            .expect("steered turn")
-            .status,
-        singularity_protocol::TurnStatus::Completed
-    );
-    let steered_requests = steered_requests.lock().expect("steered requests");
-    assert_eq!(steered_requests.len(), 3);
-    assert!(
-        steered_requests[1]
-            .messages
-            .iter()
-            .any(|message| message.role == singularity_model::ModelRole::User
-                && message.content == "Do not edit; explain instead")
-    );
-    let cancelled = steered_requests[1]
-        .messages
-        .iter()
-        .find(|message| {
-            message.role == singularity_model::ModelRole::Tool
-                && message.tool_call_id.as_deref() == Some("steered_edit_call")
-        })
-        .expect("typed cancelled tool result");
-    let cancelled: serde_json::Value =
-        serde_json::from_str(&cancelled.content).expect("cancelled result payload");
-    assert_eq!(cancelled["error_code"], "approval_denied");
-    assert_eq!(cancelled["failure_kind"], "cancelled");
 }
 
 fn result_message(messages: &[serde_json::Value]) -> &serde_json::Value {

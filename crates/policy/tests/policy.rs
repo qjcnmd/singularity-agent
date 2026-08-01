@@ -4,7 +4,7 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
     NetworkAccess, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
     PermissionProfile, PermissionProfileName, PermissionRequest, PermissionResource,
-    PermissionRule, PolicyEngine, SettingsScope, ToolId, WorkspaceRelativePath,
+    PermissionRule, PolicyEngine, SettingsScope, ToolId, WorkspaceRelativePath, workspace_policy,
 };
 
 fn tool(value: &str) -> ToolId {
@@ -88,6 +88,86 @@ fn permission_profile_and_approval_objects_keep_wire_names() {
     assert_eq!(profile.profile, PermissionProfileName::WorkspaceWrite);
     assert_eq!(decision.outcome, ApprovalOutcome::Deny);
     assert_eq!(decision.reason, "protected path");
+}
+
+#[test]
+fn standard_workspace_policy_keeps_never_fail_closed_boundaries() {
+    let workspace_write_never =
+        workspace_policy(PermissionProfileName::WorkspaceWrite, ApprovalPolicy::Never);
+    let write = workspace_write_never.evaluate(&request(
+        "patch",
+        PermissionOperation::Write,
+        workspace_path("src/lib.rs"),
+    ));
+    assert_eq!(write.outcome, PermissionDecisionOutcome::Allow);
+    assert_eq!(
+        write.rule_id.as_deref(),
+        Some("allow_workspace_writes_without_approval")
+    );
+
+    let workspace_write_on_request = workspace_policy(
+        PermissionProfileName::WorkspaceWrite,
+        ApprovalPolicy::OnRequest,
+    );
+    assert_eq!(
+        workspace_write_on_request
+            .evaluate(&request(
+                "patch",
+                PermissionOperation::Write,
+                workspace_path("src/lib.rs"),
+            ))
+            .outcome,
+        PermissionDecisionOutcome::Ask
+    );
+
+    let read_only_never = workspace_policy(PermissionProfileName::ReadOnly, ApprovalPolicy::Never);
+    let read_only_write = read_only_never.evaluate(&request(
+        "patch",
+        PermissionOperation::Write,
+        workspace_path("src/lib.rs"),
+    ));
+    assert_eq!(read_only_write.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(
+        read_only_write.cause,
+        PermissionDecisionCause::FilesystemProfile
+    );
+
+    let protected_write = workspace_write_never.evaluate(
+        &request("patch", PermissionOperation::Write, workspace_path(".env"))
+            .with_sensitive_resource(),
+    );
+    assert_eq!(protected_write.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(
+        protected_write.cause,
+        PermissionDecisionCause::ProtectedResource
+    );
+
+    let network = workspace_write_never.evaluate(&request(
+        "command",
+        PermissionOperation::Network,
+        command_scope('a'),
+    ));
+    assert_eq!(network.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(network.cause, PermissionDecisionCause::NetworkProfile);
+
+    let explicit_ask = workspace_write_never
+        .clone()
+        .with_rule(
+            PermissionRule::new(
+                "ask_explicitly",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Execute)
+            .for_resource(command_scope('a')),
+        )
+        .evaluate(&request(
+            "command",
+            PermissionOperation::Execute,
+            command_scope('a'),
+        ));
+    assert_eq!(explicit_ask.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(explicit_ask.cause, PermissionDecisionCause::ApprovalPolicy);
 }
 
 #[test]

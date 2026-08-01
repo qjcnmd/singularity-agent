@@ -12,9 +12,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ORIGINAL_TASK: &str = "Record a durable plan and then finish this same turn";
-const PLAN_CALL_ID: &str = "durable_plan_call";
-const PLAN_STEP: &str = "finish after process restart";
+const ORIGINAL_TASK: &str = "Inspect the workspace and then finish this same turn";
+const LIST_CALL_ID: &str = "durable_list_call";
 const COMMAND_CALL_ID: &str = "inflight_command_call";
 
 #[test]
@@ -50,7 +49,7 @@ fn turn_resume_after_process_kill_replays_durable_history_and_completes_same_tur
     provider
         .checkpoint_request_seen
         .recv_timeout(Duration::from_secs(10))
-        .expect("request after completed update_plan result");
+        .expect("request after completed list result");
     kill_and_reap(&mut first_child);
     provider
         .first_process_killed
@@ -339,25 +338,22 @@ fn assert_resumed_request(request: &Value) {
 
     let tool_call = input
         .iter()
-        .find(|item| item["type"] == "function_call" && item["call_id"] == PLAN_CALL_ID)
-        .expect("durable update_plan ToolCall");
-    assert_eq!(tool_call["name"], "update_plan");
+        .find(|item| item["type"] == "function_call" && item["call_id"] == LIST_CALL_ID)
+        .expect("durable list ToolCall");
+    assert_eq!(tool_call["name"], "list");
     let arguments: Value =
         serde_json::from_str(tool_call["arguments"].as_str().expect("tool arguments"))
             .expect("tool arguments json");
-    assert_eq!(arguments["steps"][0]["step"], PLAN_STEP);
-    assert!(
-        arguments.get("verification").is_none(),
-        "read-only plan must not invent a mutation verification plan"
-    );
+    assert_eq!(arguments, json!({"path": "."}));
 
     let tool_result = input
         .iter()
-        .find(|item| item["type"] == "function_call_output" && item["call_id"] == PLAN_CALL_ID)
-        .expect("durable update_plan ToolResult");
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == LIST_CALL_ID)
+        .expect("durable list ToolResult");
     let output = tool_result["output"].as_str().expect("tool result output");
     let output: Value = serde_json::from_str(output).expect("tool result json");
-    assert_eq!(output["content"]["plan"]["steps"][0]["step"], PLAN_STEP);
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["tool_name"], "list");
 }
 
 struct ResumeProvider {
@@ -387,7 +383,7 @@ impl ResumeProvider {
                 assert_eq!(request["stream"], true, "production request must stream");
                 production_request_index += 1;
                 match production_request_index {
-                    1 => write_stream_response(&mut stream, plan_response()),
+                    1 => write_stream_response(&mut stream, list_response()),
                     2 => {
                         checkpoint_tx
                             .send(())
@@ -536,19 +532,16 @@ impl CommandProvider {
     }
 }
 
-fn plan_response() -> Value {
+fn list_response() -> Value {
     json!({
-        "id": "response_plan",
+        "id": "response_list",
         "object": "response",
         "status": "completed",
         "output": [{
             "type": "function_call",
-            "call_id": PLAN_CALL_ID,
-            "name": "update_plan",
-            "arguments": json!({
-                "steps": [{"step": PLAN_STEP, "status": "completed"}]
-            })
-            .to_string()
+            "call_id": LIST_CALL_ID,
+            "name": "list",
+            "arguments": json!({"path": "."}).to_string()
         }],
         "usage": usage()
     })

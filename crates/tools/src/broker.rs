@@ -102,16 +102,6 @@ impl ToolBroker {
         self.registry.entry(name)
     }
 
-    /// 返回满足版本化能力要求的注册条目。
-    pub fn entries_for_capability(
-        &self,
-        capability: ToolCapability,
-        minimum_version: u32,
-    ) -> Vec<&ToolEntry> {
-        self.registry
-            .entries_for_capability(capability, minimum_version)
-    }
-
     /// 返回 broker 暴露给模型的 schema。
     pub fn tool_schema_payloads(&self) -> Vec<Value> {
         self.registry.schema_payloads()
@@ -141,25 +131,11 @@ impl ToolBroker {
         entry
             .validate_consistency()
             .map_err(WorkspaceToolError::InvalidInput)?;
-        match entry.executor {
-            ToolExecutor::Workspace(executor) => {
-                let workspace_tools = workspace_tools.ok_or_else(|| {
-                    WorkspaceToolError::InvalidInput(
-                        "workspace tool backend is unavailable".to_string(),
-                    )
-                })?;
-                workspace_tools.bind_tool_call(entry, executor, input, filesystem, network)
-            }
-            ToolExecutor::AgentControl(_) => Ok(BoundToolCall {
-                tool_id: entry.id.clone(),
-                execution_mode: entry.spec.execution_mode,
-                executor: entry.executor,
-                operation: PermissionOperation::Read,
-                arguments: input,
-                resources: vec![PermissionResource::Tool(entry.id.clone())],
-                sensitive_resources: BTreeSet::new(),
-            }),
-        }
+        let ToolExecutor::Workspace(executor) = entry.executor;
+        let workspace_tools = workspace_tools.ok_or_else(|| {
+            WorkspaceToolError::InvalidInput("workspace tool backend is unavailable".to_string())
+        })?;
+        workspace_tools.bind_tool_call(entry, executor, input, filesystem, network)
     }
 
     /// 在执行前校验 tool 输入。

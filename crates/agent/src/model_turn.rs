@@ -34,38 +34,6 @@ impl ModelToolView {
             max_tool_calls: 0,
         }
     }
-
-    /// Constrain the model-facing command schema to the exact input already owned by repair state.
-    pub(super) fn restrict_command_input(&mut self, input: &Value) -> Result<(), String> {
-        let command = input
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "repair command input is missing command".to_string())?;
-        let cwd = input
-            .get("cwd")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "repair command input is missing cwd".to_string())?;
-        let timeout_seconds = input
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "repair command input is missing timeout_seconds".to_string())?;
-        let tool = self
-            .tools
-            .iter_mut()
-            .find(|tool| tool.name == singularity_tools::COMMAND_TOOL)
-            .ok_or_else(|| "repair command tool is not visible".to_string())?;
-        tool.parameters_schema = json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "const": command},
-                "cwd": {"type": "string", "const": cwd},
-                "timeout_seconds": {"type": "integer", "const": timeout_seconds}
-            },
-            "required": ["command", "cwd", "timeout_seconds"],
-            "additionalProperties": false
-        });
-        Ok(())
-    }
 }
 
 pub(super) fn model_turn_request(
@@ -208,7 +176,7 @@ pub(super) fn developer_instructions(input: &AgentLoopInput, max_tool_calls: u32
         "Issue at most one tool call per assistant response and wait for its result.".to_string()
     } else {
         format!(
-            "Issue up to {max_tool_calls} tool calls in one response only when every call is an independent read-only operation. Issue mutations, commands, plan updates, approval-sensitive calls, and calls that depend on earlier results one at a time and wait for each result."
+            "Issue up to {max_tool_calls} tool calls in one response only when every call is an independent read-only operation. Issue mutations, commands, approval-sensitive calls, and calls that depend on earlier results one at a time and wait for each result."
         )
     };
     let instructions = format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}");

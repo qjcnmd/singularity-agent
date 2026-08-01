@@ -12,7 +12,7 @@ use singularity_policy::NetworkAccess;
 
 use crate::{
     Argv, EvaluationError, GitCommit, RelativePath, RemoteRepository, Result,
-    TASK_SET_SCHEMA_VERSION, TaskId, ToolCapabilityName, require_schema_version, validation_error,
+    TASK_SET_SCHEMA_VERSION, TaskId, require_schema_version, validation_error,
 };
 
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
@@ -21,8 +21,8 @@ const MAX_TRIAL_COUNT: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation task set 的 schema 版本。
 pub enum TaskSetSchemaVersion {
-    #[serde(rename = "evaluation.task_set/v5")]
-    V5,
+    #[serde(rename = "evaluation.task_set/v6")]
+    V6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -110,9 +110,6 @@ impl EvaluationTask {
             task_id: self.task_id.clone(),
             description: self.description.clone(),
             instructions: self.agent.instructions.clone(),
-            allowed_paths: self.agent.allowed_paths.clone(),
-            required_tool_capabilities: self.agent.required_tool_capabilities.clone(),
-            smoke_commands: self.agent.smoke_commands.clone(),
         }
     }
 
@@ -213,13 +210,9 @@ pub enum WorkspaceSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// Agent 阶段的指令、路径、工具和 smoke 命令。
+/// Agent 阶段的自然语言指令。
 pub struct AgentTaskSpec {
     pub instructions: String,
-    pub allowed_paths: Vec<RelativePath>,
-    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub smoke_commands: Vec<CommandSpec>,
 }
 
 impl AgentTaskSpec {
@@ -227,44 +220,6 @@ impl AgentTaskSpec {
         if self.instructions.trim().is_empty() {
             return Err(validation_error(format!(
                 "evaluation task {task_id} requires agent.instructions"
-            )));
-        }
-        validate_nonempty_unique(task_id, "agent.allowed_paths", &self.allowed_paths)?;
-        validate_nonempty_unique(
-            task_id,
-            "agent.required_tool_capabilities",
-            &self.required_tool_capabilities,
-        )?;
-        for requirement in &self.required_tool_capabilities {
-            requirement.validate(task_id)?;
-        }
-        let unique_capabilities = self
-            .required_tool_capabilities
-            .iter()
-            .map(|requirement| requirement.capability.clone())
-            .collect::<BTreeSet<_>>();
-        if unique_capabilities.len() != self.required_tool_capabilities.len() {
-            return Err(validation_error(format!(
-                "evaluation task {task_id} agent.required_tool_capabilities contains duplicate capability names"
-            )));
-        }
-        validate_commands(task_id, "agent.smoke_commands", &self.smoke_commands, false)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// Evaluation 从运行时工具注册表解析的版本化能力要求。
-pub struct ToolCapabilityRequirement {
-    pub capability: ToolCapabilityName,
-    pub minimum_version: u32,
-}
-
-impl ToolCapabilityRequirement {
-    fn validate(&self, task_id: &TaskId) -> Result<()> {
-        if self.minimum_version == 0 {
-            return Err(validation_error(format!(
-                "evaluation task {task_id} tool capability minimum_version must be positive"
             )));
         }
         Ok(())
@@ -552,9 +507,6 @@ pub struct AgentTaskProjection {
     pub task_id: TaskId,
     pub description: String,
     pub instructions: String,
-    pub allowed_paths: Vec<RelativePath>,
-    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
-    pub smoke_commands: Vec<CommandSpec>,
 }
 
 fn validate_commands(

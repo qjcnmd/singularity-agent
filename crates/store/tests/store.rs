@@ -107,7 +107,6 @@ fn typed_turn_end_recovers_persisted_start_after_sqlite_reopen() {
                 agent_loop_status: "failed",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &terminal,
             },
         )
@@ -607,7 +606,6 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
                 assistant_delta: Some("done"),
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     "trace_terminal_after_accepted_input",
                     &thread.thread_id,
@@ -715,7 +713,6 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
                 agent_loop_status: "failed",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &terminal,
             },
         ),
@@ -2734,7 +2731,6 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
                 assistant_delta: Some("too late"),
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     "trace_too_late",
                     &thread.thread_id,
@@ -2755,7 +2751,6 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "cancelled",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     "trace_cancelled",
                     &thread.thread_id,
@@ -2848,7 +2843,6 @@ fn infrastructure_failure_after_approval_claim_terminalizes_and_cleans_checkpoin
                 agent_loop_status: "failed",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     "trace_infra_after_claim_failed",
                     thread.thread_id.clone(),
@@ -2942,7 +2936,6 @@ fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
             agent_loop_status: "failed",
             assistant_item_id: None,
             assistant_delta: None,
-            plan: None,
             trace: &TraceEvent {
                 payload: serde_json::json!({"error": "forced approval terminal failure"}),
                 ..TraceEvent::for_turn(
@@ -2980,7 +2973,6 @@ fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
                 agent_loop_status: "failed",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     "trace_approval_terminal_cleanup",
                     thread.thread_id.clone(),
@@ -3037,7 +3029,6 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
                 agent_loop_status,
                 assistant_item_id: is_completed.then_some(&assistant_item_id),
                 assistant_delta: is_completed.then_some("late result"),
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     format!(
                         "trace_infrastructure_authority_result_{}",
@@ -3979,7 +3970,6 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
                 agent_loop_status: "interrupted",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &trace,
             },
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
@@ -4005,7 +3995,6 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
                 agent_loop_status: "blocked",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &trace,
             },
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
@@ -4358,9 +4347,6 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
         "agent_loop",
         "terminal result",
     );
-    let plan = serde_json::json!({
-        "steps": [{"step": "verify", "status": "completed"}]
-    });
     let assistant_item_id = SessionStore::allocate_assistant_item_id();
 
     let committed = store
@@ -4371,24 +4357,12 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&assistant_item_id),
                 assistant_delta: Some("assistant"),
-                plan: Some(&plan),
                 trace: &trace,
             },
         )
         .expect("commit terminal outcome");
 
     assert_eq!(committed.turn.status, TurnStatus::Completed);
-    assert_eq!(
-        committed.plan_item.as_ref().map(|item| &item.kind),
-        Some(&singularity_protocol::ItemKind::Plan)
-    );
-    assert_eq!(
-        committed
-            .plan_item
-            .as_ref()
-            .map(|item| item.payload.clone()),
-        Some(plan)
-    );
     assert_eq!(
         committed
             .assistant_item
@@ -4437,7 +4411,6 @@ fn terminal_assistant_item_id_and_delta_must_be_paired() {
                     agent_loop_status: "completed",
                     assistant_item_id: assistant_item_id.as_ref(),
                     assistant_delta,
-                    plan: None,
                     trace: &TraceEvent::for_turn(
                         format!("trace_pairing_{}", turn.turn_id),
                         &thread.thread_id,
@@ -4481,7 +4454,6 @@ fn preallocated_assistant_item_id_cannot_be_reused() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&item_id),
                 assistant_delta: Some("assistant"),
-                plan: None,
                 trace: &TraceEvent::for_turn(
                     trace_id,
                     thread_id,
@@ -4556,7 +4528,6 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
             agent_loop_status: "completed",
             assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
             assistant_delta: Some("assistant"),
-            plan: None,
             trace: &trace,
         },
     );
@@ -4612,7 +4583,6 @@ fn turn_trace_binding_error_remains_typed_at_store_boundary() {
                 agent_loop_status: "interrupted",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &trace,
             },
         )
@@ -4657,7 +4627,6 @@ fn missing_turn_trace_task_id_remains_typed_at_store_boundary() {
                 agent_loop_status: "interrupted",
                 assistant_item_id: None,
                 assistant_delta: None,
-                plan: None,
                 trace: &trace,
             },
         ),

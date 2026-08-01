@@ -250,13 +250,11 @@ impl AppServer {
                     let checkpoint = (if decision.outcome == ApprovalOutcome::Deny {
                         pending
                             .checkpoint()
-                            .into_turn_checkpoint_after_denial(&messages, &[])
+                            .into_turn_checkpoint_after_denial(&messages)
                     } else {
-                        pending.checkpoint().into_turn_checkpoint(
-                            &messages,
-                            !messages.is_empty(),
-                            &[],
-                        )
+                        pending
+                            .checkpoint()
+                            .into_turn_checkpoint(&messages, !messages.is_empty())
                     })
                     .and_then(|checkpoint| {
                         checkpoint

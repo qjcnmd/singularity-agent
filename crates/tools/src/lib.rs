@@ -62,22 +62,22 @@ pub use command::{
     command_script_scope_digest_with_policy,
 };
 pub use registry::{
-    AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL, EDIT_TOOL, GREP_TOOL, LIST_TOOL,
-    PATCH_TOOL, READ_TOOL, ToolAuthorization, ToolCapability, ToolEntry, ToolExecutionMode,
-    ToolExecutor, ToolExposure, ToolInputValidationError, ToolInputValidator, ToolRegistry,
-    ToolSpec, WorkspaceToolExecutor, workspace_tool_entries, workspace_tool_specs,
+    BoundToolCall, COMMAND_TOOL, GREP_TOOL, LIST_TOOL, PATCH_TOOL, READ_TOOL, ToolAuthorization,
+    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolInputValidationError,
+    ToolInputValidator, ToolRegistry, ToolSpec, WorkspaceToolExecutor, workspace_tool_entries,
+    workspace_tool_specs,
 };
 pub use workspace::{
-    CommandToolExecution, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput,
-    SandboxExecutionBoundary, SandboxExecutionCallback, SandboxExecutionObservation,
-    SandboxExecutionSinkError, SandboxExecutionStatus, WorkspaceObservation, WorkspacePatch,
-    WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceTools,
+    CommandToolExecution, GrepToolInput, ListToolInput, ReadToolInput, SandboxExecutionBoundary,
+    SandboxExecutionCallback, SandboxExecutionObservation, SandboxExecutionSinkError,
+    SandboxExecutionStatus, WorkspaceObservation, WorkspacePatch, WorkspacePatchChange,
+    WorkspaceRevision, WorkspaceToolError, WorkspaceTools,
 };
 
 pub(crate) use broker::contains_artifact_reference;
 pub(crate) use command::{
-    CommandModelInput, bounded_text, command_tool_output, io_error, is_binary, next_command_id,
-    normalize_path, redact_public_text, validate_tool_name,
+    bounded_text, command_tool_output, io_error, is_binary, next_command_id, normalize_path,
+    redact_public_text, validate_tool_name,
 };
 #[cfg(unix)]
 pub(crate) use registry::ERROR_TOO_MANY_SYMLINKS;

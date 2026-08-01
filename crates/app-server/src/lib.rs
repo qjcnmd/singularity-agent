@@ -27,7 +27,7 @@ use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
     PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
-    agent_control_tool_entries, project_audit_event,
+    project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -35,9 +35,8 @@ use singularity_core::{
 };
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
-    PermissionOperation, PermissionProfile, PermissionProfileName, PermissionResource,
-    PermissionRule, PolicyEngine, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
+    PermissionResource, workspace_policy,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
@@ -57,8 +56,6 @@ use singularity_store::{
     CreateStartedTurnParams, SessionStore, StoreError, ToolExecution, ToolExecutionState,
     TurnOutcomeAuthority,
 };
-#[cfg(test)]
-use singularity_tools::EDIT_TOOL as TOOL_EDIT;
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, ToolBroker, ToolRegistry, WorkspaceTools, workspace_tool_entries,
 };
@@ -798,15 +795,6 @@ fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery, Option<EventR
                 singularity_protocol::EmptyParams {},
             )),
         ),
-        "turn/plan/updated" => (
-            EventClass::State,
-            EventDelivery::Reliable,
-            event.params["turnId"]
-                .as_str()
-                .map(|turn_id| EventRecoveryQuery::TurnStatus {
-                    turn_id: turn_id.to_string(),
-                }),
-        ),
         _ => (EventClass::State, EventDelivery::Reliable, None),
     }
 }
@@ -1009,10 +997,7 @@ fn encode_pending_approvals(
 
 fn workspace_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
-    for entry in workspace_tool_entries()
-        .into_iter()
-        .chain(agent_control_tool_entries())
-    {
+    for entry in workspace_tool_entries() {
         registry.register(entry).expect("valid builtin tool");
     }
     registry
@@ -1163,43 +1148,11 @@ fn agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
         capability.status.as_str()
     )
 }
-fn workspace_policy(
-    sandbox_mode: PermissionProfileName,
-    approval_policy: ApprovalPolicy,
-) -> PolicyEngine {
-    let mut profile = match sandbox_mode {
-        PermissionProfileName::ReadOnly => PermissionProfile::read_only(),
-        PermissionProfileName::WorkspaceWrite => PermissionProfile::workspace_write(),
-    };
-    profile.approval_policy = approval_policy;
-    PolicyEngine::new(profile)
-        .with_rule(workspace_read_tool_rule())
-        .with_rule(sandbox_command_rule())
-}
-
 fn sandbox_mode_audit_label(mode: PermissionProfileName) -> &'static str {
     match mode {
         PermissionProfileName::ReadOnly => "read_only",
         PermissionProfileName::WorkspaceWrite => "workspace_write",
     }
-}
-
-fn workspace_read_tool_rule() -> PermissionRule {
-    PermissionRule::new(
-        "allow_workspace_read_tools",
-        SettingsScope::Project,
-        PermissionDecisionOutcome::Allow,
-    )
-    .for_operation(PermissionOperation::Read)
-}
-
-fn sandbox_command_rule() -> PermissionRule {
-    PermissionRule::new(
-        "allow_sandbox_commands",
-        SettingsScope::Project,
-        PermissionDecisionOutcome::Allow,
-    )
-    .for_operation(PermissionOperation::Execute)
 }
 
 fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
@@ -1363,8 +1316,6 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
         })),
         "tool_calls": status.tool_calls,
         "approval_count": status.approval_count,
-        "plan": &status.plan,
-        "plan_update_count": status.plan_update_count,
         "recovery_metrics": &status.recovery_metrics,
         "model_usage": &status.model_usage,
         "provider_attempts": &status.provider_attempts,

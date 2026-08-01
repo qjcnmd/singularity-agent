@@ -144,15 +144,7 @@ impl AppServer {
         committed: &CommittedTurnOutcome,
         assistant_events: Option<&AssistantItemEventState>,
     ) -> AppServerResult<Vec<Value>> {
-        let mut messages = self.agent_terminal_item_events(committed.plan_item.as_ref(), None)?;
-        if let Some(plan_item) = committed.plan_item.as_ref()
-            && let Some(event) = self.event_notification(AppEvent::turn_plan_updated(
-                &committed.turn.turn_id,
-                plan_item.payload.clone(),
-            ))?
-        {
-            messages.push(event);
-        }
+        let mut messages = Vec::new();
         messages.extend(
             self.agent_terminal_item_events(committed.assistant_item.as_ref(), assistant_events)?,
         );
@@ -189,7 +181,6 @@ impl AppServer {
             events.push(AppEvent::item_started(agent_item.item_id.clone()));
         }
         match &agent_item.kind {
-            singularity_protocol::ItemKind::Plan => {}
             singularity_protocol::ItemKind::AgentMessage => {
                 let agent_delta = agent_item
                     .payload

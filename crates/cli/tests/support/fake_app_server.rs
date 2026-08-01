@@ -172,10 +172,6 @@ fn decorate_event(
             .and_then(|turn| turn.get("turn_id"))
             .and_then(Value::as_str)
             .map(|turn_id| json!({"method":"turn/status","params":{"turnId":turn_id}})),
-        "turn/plan/updated" => params
-            .get("turnId")
-            .and_then(Value::as_str)
-            .map(|turn_id| json!({"method":"turn/status","params":{"turnId":turn_id}})),
         "approval/requested" => Some(json!({"method":"approval/list","params":{}})),
         _ => None,
     };

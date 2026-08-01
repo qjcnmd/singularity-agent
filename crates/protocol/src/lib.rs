@@ -2414,14 +2414,6 @@ impl AppEvent {
         }
     }
 
-    /// 构造 plan 更新事件。
-    pub fn turn_plan_updated(turn_id: impl Into<String>, plan: Value) -> Self {
-        Self {
-            method: "turn/plan/updated".to_string(),
-            params: serde_json::json!({"turnId": turn_id.into(), "plan": plan}),
-        }
-    }
-
     /// 构造 diff 更新事件。
     pub fn turn_diff_updated(turn_id: impl Into<String>, diff: Value) -> Self {
         Self {

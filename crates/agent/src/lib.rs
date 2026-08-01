@@ -5,7 +5,7 @@
 //! 并在完成或恢复不变量不满足时拒绝继续执行。
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use schemars::JsonSchema;
@@ -29,14 +29,13 @@ use singularity_policy::{
     ToolId,
 };
 use singularity_tools::{
-    AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput,
-    EDIT_TOOL as TOOL_EDIT, EditToolInput, GrepToolInput, ListToolInput, PATCH_TOOL as TOOL_PATCH,
-    ReadToolInput, SandboxExecutionSinkError as ToolSandboxExecutionSinkError,
-    SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker, ToolBrokerDecision,
-    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolFailureKind,
-    ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch, WorkspaceRevision,
-    WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools, approximate_token_count,
-    command_script_scope_digest_with_policy,
+    BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput, GrepToolInput, ListToolInput,
+    PATCH_TOOL as TOOL_PATCH, ReadToolInput,
+    SandboxExecutionSinkError as ToolSandboxExecutionSinkError, SandboxFilesystemMode,
+    SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolExecutionMode, ToolExecutor,
+    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspaceMutation,
+    WorkspacePatch, WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
+    approximate_token_count, command_script_scope_digest_with_policy,
 };
 use thiserror::Error;
 
@@ -45,7 +44,6 @@ mod completion;
 mod context;
 mod model_turn;
 mod observation;
-mod planning;
 mod tool_occurrence;
 
 pub use checkpoint::{
@@ -62,7 +60,6 @@ impl TurnCheckpoint {
         mut self,
         inputs: &[String],
         cancel_pending_tool_calls: bool,
-        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<Self, String> {
         if inputs.is_empty() || inputs.iter().any(|input| input.trim().is_empty()) {
             return Err("turn checkpoint user input is empty".to_string());
@@ -74,7 +71,7 @@ impl TurnCheckpoint {
                 false,
             )?;
         }
-        self.append_user_inputs(inputs, caller_requirements)
+        self.append_user_inputs(inputs)
     }
 
     fn with_pending_tool_failure(
@@ -116,33 +113,14 @@ impl TurnCheckpoint {
         Ok(self)
     }
 
-    fn append_user_inputs(
-        mut self,
-        inputs: &[String],
-        caller_requirements: &[AgentVerificationRequirement],
-    ) -> Result<Self, String> {
+    fn append_user_inputs(mut self, inputs: &[String]) -> Result<Self, String> {
+        self.state.completion.invalidate_after_user_input();
         self.state.messages.extend(
             inputs
                 .iter()
                 .map(|input| ModelMessage::text(ModelRole::User, input.clone())),
         );
-        self.state.input_revision = self
-            .state
-            .input_revision
-            .checked_add(1)
-            .ok_or_else(|| "turn checkpoint input revision is exhausted".to_string())?;
-        self.state
-            .completion
-            .mark_workspace_revision_invalid("user_input_revision");
-        // A steer starts a new input epoch: old model evidence and its revision-bound plan are
-        // discarded, while the caller-declared floor is reinstalled from the new AgentLoop input.
-        self.state
-            .completion
-            .replace_requirements(caller_requirements)?;
-        self.state.verification_plan = None;
-        self.state.plan = None;
-        self.state.verification_failure_history.clear();
-        self.state.repair_plan = None;
+        self.state.repair_state = None;
         self.state.final_review_verdict = None;
         self.state.last_completion_error = None;
         self.state.last_repair_failure = None;
@@ -159,7 +137,6 @@ impl ApprovalCheckpoint {
         &self,
         inputs: &[String],
         cancel_pending_tool_call: bool,
-        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<TurnCheckpoint, String> {
         if cancel_pending_tool_call == inputs.is_empty() {
             return Err("approval checkpoint input handoff is inconsistent".to_string());
@@ -171,7 +148,7 @@ impl ApprovalCheckpoint {
             pending_tool_calls: vec![self.pending_tool_call.clone()],
         };
         if cancel_pending_tool_call {
-            checkpoint.with_user_inputs(inputs, true, caller_requirements)
+            checkpoint.with_user_inputs(inputs, true)
         } else {
             checkpoint.encode().map(|_| checkpoint)
         }
@@ -181,7 +158,6 @@ impl ApprovalCheckpoint {
     pub fn into_turn_checkpoint_after_denial(
         &self,
         inputs: &[String],
-        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<TurnCheckpoint, String> {
         if inputs.iter().any(|input| input.trim().is_empty()) {
             return Err("approval checkpoint input handoff is inconsistent".to_string());
@@ -200,7 +176,7 @@ impl ApprovalCheckpoint {
         if inputs.is_empty() {
             checkpoint.encode().map(|_| checkpoint)
         } else {
-            checkpoint.append_user_inputs(inputs, caller_requirements)
+            checkpoint.append_user_inputs(inputs)
         }
     }
 }
@@ -224,9 +200,8 @@ pub use observation::{
     FinalReviewObservation, FinalReviewStatus, OccurrenceIdentity, OccurrenceLifecycle,
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
     PromptAssemblyObservation, PromptAssemblyStatus, ProviderAttemptObservation,
-    ProviderAttemptStatus, ProviderAttemptUsageObservation, RepairPlanningObservation,
-    RepairPlanningStatus, SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation,
-    ToolCallStatus, VerificationObservation, VerificationPlanObservation, VerificationPlanStatus,
+    ProviderAttemptStatus, ProviderAttemptUsageObservation, SandboxExecutionOccurrence,
+    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
     VerificationStatus,
 };
 use tool_occurrence::*;
@@ -238,10 +213,10 @@ use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
-const APPROVAL_CHECKPOINT_VERSION: u32 = 3;
-/// Version for ordinary turn checkpoints. Approval wire compatibility remains at v3.
-const TURN_CHECKPOINT_VERSION: u32 = 2;
-const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
+const APPROVAL_CHECKPOINT_VERSION: u32 = 4;
+/// Version for ordinary turn checkpoints after retiring update-plan/edit pending calls.
+const TURN_CHECKPOINT_VERSION: u32 = 3;
+const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise private checklist; update it when evidence or failure changes the approach, and complete the requested work before the final answer. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
 const MODEL_MESSAGE_FRAMING_TOKENS: u32 = 4;
@@ -265,34 +240,17 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
 ];
 const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
-/// AgentLoop 内部使用的计划更新 tool 名称。
-pub const UPDATE_PLAN_TOOL: &str = "update_plan";
-const MAX_PLAN_STEPS: usize = 64;
-const MAX_PLAN_STEP_CHARS: usize = 512;
-const MAX_VERIFICATION_REQUIREMENTS: usize = 64;
-const MAX_VERIFICATION_RISKS: usize = 16;
-const MAX_VERIFICATION_TEXT_CHARS: usize = 512;
-// Keep verification action bounds aligned with the registered command tool contract.
-const MAX_VERIFICATION_COMMAND_CHARS: usize = 8_000;
-const MAX_VERIFICATION_TIMEOUT_SECONDS: u64 = 3_600;
-const MAX_REPAIR_PLAN_ATTEMPTS: u32 = 3;
+const MAX_REVIEW_TEXT_CHARS: usize = 512;
+const MAX_WORKSPACE_CHANGE_PATHS: usize = 64;
+const MAX_REPAIR_ATTEMPTS: u32 = 3;
 const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
 const MAX_REPAIR_CONTEXT_PATHS: usize = 8;
 const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
 const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
-const MAX_REPAIR_CONTEXT_ACTIONS: usize = 8;
-const MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS: usize = 8_000;
-const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS: &str = "The required verification action was not submitted exactly. Do not choose a different action or vary its arguments; submit only repair_context.required_verification_action.command_tool_input exactly as provided.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. For a tool failure, failed_requirement and evidence remain the unresolved cause across diagnostic calls; use the latest previous_action and previous_result to change the failed action's inputs or method instead of repeating the same failed precondition. When repair_context.repair_strategy_change_required is true, treat it as a separate trusted strategy-change boundary: make a materially different workspace mutation that addresses failed_requirement before replanning and verification, and do not repeat the previous patch or final answer. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not claim success without new verification evidence.";
-const PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX: &str =
-    "Trusted exact verification remains pending.";
+const REPAIR_STATE_INSTRUCTIONS: &str = "Follow the bounded repair guidance. Use the latest typed tool result and trusted workspace revision evidence to choose the next valid action. When a repair strategy change is required, make a materially different workspace mutation that addresses the reported failure before retrying verification. Do not claim success without new verification evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
-const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
-const EXACT_VERIFICATION_REQUIRED: &str =
-    "completion gate rejected final answer: required verification commands are incomplete";
 const EVENT_SINK_FAILURE_ERROR: &str = "agent event sink failed";
 
 /// 一次 `AgentLoop` 运行的外部可观察生命周期状态。
@@ -352,238 +310,6 @@ pub struct AgentVerification {
     pub final_review_verdict: Option<FinalReviewVerdict>,
 }
 
-/// 进入最终答复阶段前必须满足的一项精确命令范围要求。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationRequirement {
-    pub command_scope_digest: String,
-    pub required_success_count: u32,
-}
-
-impl AgentVerificationRequirement {
-    /// 创建命令作用域验证要求。
-    pub fn new(command_scope_digest: impl Into<String>, required_success_count: u32) -> Self {
-        Self {
-            command_scope_digest: command_scope_digest.into(),
-            required_success_count,
-        }
-    }
-}
-
-/// A stable category of boundary risk that a verification plan must cover.
-///
-/// These categories describe domain behavior, not a particular fixture, provider, or task.  The
-/// planner only uses them to explain why evidence is required; command scope and revision remain
-/// the completion tracker's authoritative evidence.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentVerificationRisk {
-    GeneralMutation,
-    EmptyCollection,
-    OptionalNull,
-    ZeroValue,
-    IndexBoundary,
-    DivisionByZero,
-}
-
-/// One risk-to-evidence binding in a verification plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationCheck {
-    pub risk: AgentVerificationRisk,
-    pub requirement: AgentVerificationRequirement,
-}
-
-impl AgentVerificationCheck {
-    /// Bind a known risk to one exact command requirement.
-    pub fn new(risk: AgentVerificationRisk, requirement: AgentVerificationRequirement) -> Self {
-        Self { risk, requirement }
-    }
-}
-
-/// The model-declared command action for one revision-bound verification entry.
-///
-/// Runtime policy remains authoritative: the action is accepted only when its profile matches the
-/// current session and the same command scope is observed through the registered command tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationAction {
-    pub command: String,
-    pub cwd: String,
-    pub timeout_seconds: u64,
-    pub sandbox_mode: SandboxFilesystemMode,
-    pub network_access: SandboxNetworkMode,
-}
-
-/// One caller-owned command that the Agent must observe before finalization.
-///
-/// The executable action is the source of truth; `AgentLoop` derives the evidence scope digest
-/// instead of asking the model to reconstruct an opaque caller requirement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationCommand {
-    pub action: AgentVerificationAction,
-    pub required_success_count: u32,
-}
-
-impl AgentVerificationCommand {
-    /// Bind an exact action and the number of successful observations it requires.
-    pub fn new(action: AgentVerificationAction, required_success_count: u32) -> Self {
-        Self {
-            action,
-            required_success_count,
-        }
-    }
-
-    fn requirement(&self) -> AgentVerificationRequirement {
-        AgentVerificationRequirement::new(
-            verification_action_scope_digest(&self.action),
-            self.required_success_count,
-        )
-    }
-}
-
-/// A bounded model declaration connecting one concrete mutation to exact verification evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationEntry {
-    pub risk: AgentVerificationRisk,
-    pub evidence: String,
-    /// Exact producer-owned relative path affected by this verification entry.
-    pub affected_path: String,
-    pub affected_symbol: String,
-    pub current_gap: String,
-    pub action: AgentVerificationAction,
-}
-
-/// The single input-side verification plan consumed by `AgentLoop`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(deny_unknown_fields)]
-pub struct AgentVerificationPlan {
-    pub risks: Vec<AgentVerificationRisk>,
-    pub checks: Vec<AgentVerificationCheck>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<AgentVerificationEntry>,
-}
-
-impl AgentVerificationPlan {
-    /// Construct a general post-mutation plan from existing exact requirements.
-    pub fn from_requirements<I>(requirements: I) -> Self
-    where
-        I: IntoIterator<Item = AgentVerificationRequirement>,
-    {
-        Self {
-            risks: vec![AgentVerificationRisk::GeneralMutation],
-            checks: requirements
-                .into_iter()
-                .map(|requirement| {
-                    AgentVerificationCheck::new(AgentVerificationRisk::GeneralMutation, requirement)
-                })
-                .collect(),
-            entries: Vec::new(),
-        }
-    }
-
-    /// Validate the bounded plan and all exact command bindings.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.risks.len() > MAX_VERIFICATION_RISKS {
-            return Err(format!(
-                "verification plan must not contain more than {MAX_VERIFICATION_RISKS} risks"
-            ));
-        }
-        if self.checks.len() > MAX_VERIFICATION_REQUIREMENTS {
-            return Err(format!(
-                "verification plan must not contain more than {MAX_VERIFICATION_REQUIREMENTS} checks"
-            ));
-        }
-        if self.entries.len() > MAX_VERIFICATION_REQUIREMENTS {
-            return Err(format!(
-                "verification plan must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
-            ));
-        }
-        for check in &self.checks {
-            if !self.risks.contains(&check.risk) {
-                return Err("verification plan check risk is not declared".to_string());
-            }
-            if !is_sha256_fingerprint(&check.requirement.command_scope_digest) {
-                return Err("verification plan command digest is invalid".to_string());
-            }
-            if check.requirement.required_success_count == 0 {
-                return Err("verification plan success count must be greater than zero".to_string());
-            }
-        }
-        for risk in &self.risks {
-            // The implicit post-mutation category is allowed to rely on the generic completion
-            // gate when no exact command was supplied. Every more specific boundary risk must
-            // have at least one exact evidence binding; otherwise the plan would only label a
-            // risk without requiring observable evidence for it.
-            if *risk != AgentVerificationRisk::GeneralMutation
-                && !self.checks.iter().any(|check| check.risk == *risk)
-            {
-                return Err("verification plan risk has no exact evidence binding".to_string());
-            }
-        }
-        for entry in &self.entries {
-            if !self.risks.contains(&entry.risk) {
-                return Err("verification entry risk is not declared".to_string());
-            }
-            validate_verification_entry_shape(entry)?;
-        }
-        if !self.entries.is_empty() && self.entries.len() != self.checks.len() {
-            return Err(
-                "verification entries and exact checks must have one-to-one bindings".to_string(),
-            );
-        }
-        for (check, entry) in self.checks.iter().zip(&self.entries) {
-            let action_digest = command_script_scope_digest_with_policy(
-                &entry.action.command,
-                &entry.action.cwd,
-                entry.action.timeout_seconds,
-                entry.action.sandbox_mode.clone(),
-                entry.action.network_access.clone(),
-            );
-            if check.risk != entry.risk
-                || check.requirement.command_scope_digest != action_digest
-                || check.requirement.required_success_count != 1
-            {
-                return Err(
-                    "verification entry must exactly match its risk and command scope binding"
-                        .to_string(),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Return the exact requirements represented by this plan.
-    pub fn requirements(&self) -> Vec<AgentVerificationRequirement> {
-        // One successful command observation can prove every risk bound to the same exact
-        // action. Caller-owned requirements may still impose a larger typed floor when the plan
-        // is installed; the model cannot manufacture repeated executions through risk labels.
-        self.checks
-            .iter()
-            .fold(BTreeMap::new(), |mut requirements, check| {
-                requirements
-                    .entry(check.requirement.command_scope_digest.clone())
-                    .and_modify(|count: &mut u32| {
-                        *count = (*count).max(check.requirement.required_success_count);
-                    })
-                    .or_insert(check.requirement.required_success_count);
-                requirements
-            })
-            .into_iter()
-            .map(
-                |(command_scope_digest, required_success_count)| AgentVerificationRequirement {
-                    command_scope_digest,
-                    required_success_count,
-                },
-            )
-            .collect()
-    }
-}
-
 /// Why a bounded repair was requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -592,18 +318,6 @@ pub enum AgentRepairReason {
     ToolFailure,
     RevisionConflict,
     FinalReviewRejected,
-}
-
-/// Public, safe projection of the current bounded repair plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRepairPlan {
-    pub reason: AgentRepairReason,
-    pub attempt: u32,
-    pub max_attempts: u32,
-    /// Revision that must receive the current prospective plan's terminal verification command.
-    pub required_revision: Option<WorkspaceRevision>,
-    pub required_check_count: u32,
 }
 
 /// Typed final review result.  A final answer is accepted only after the same revision-bound
@@ -615,183 +329,6 @@ pub enum FinalReviewVerdict {
     Reject,
     Repair,
     Cancelled,
-}
-
-/// 一个用户可见执行计划步骤的生命周期状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentPlanStepStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-/// 一个计划步骤及其当前生命周期状态。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentPlanStep {
-    pub step: String,
-    pub status: AgentPlanStepStatus,
-}
-
-/// 完整计划；校验确保其有界、唯一且无歧义。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentPlan {
-    pub steps: Vec<AgentPlanStep>,
-}
-
-impl AgentPlan {
-    /// 校验计划步骤和完成状态契约。
-    pub fn validate(&self) -> Result<(), String> {
-        planning::validate(&self.steps)
-    }
-
-    /// 判断计划是否已完成。
-    pub fn is_completed(&self) -> bool {
-        self.steps
-            .iter()
-            .all(|plan_step| plan_step.status == AgentPlanStepStatus::Completed)
-    }
-}
-
-/// 返回用于更新计划的独占控制 tool 注册表条目。
-pub fn agent_control_tool_entries() -> Vec<ToolEntry> {
-    let spec = ToolSpec::new(
-        UPDATE_PLAN_TOOL,
-        "Replace the current execution plan with unique non-empty steps and at most one in_progress step",
-        json!({
-            "type": "object",
-            "properties": {
-                "steps": {
-                    "type": "array",
-                    "description": "The complete plan. Step text must be unique and at most one step may be in_progress.",
-                    "minItems": 1,
-                    "maxItems": MAX_PLAN_STEPS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {
-                                "type": "string",
-                                "description": "A unique, non-empty description of one execution step.",
-                                "minLength": 1,
-                                "maxLength": MAX_PLAN_STEP_CHARS
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "Use in_progress for at most one step.",
-                                "enum": ["pending", "in_progress", "completed"]
-                            }
-                        },
-                        "required": ["step", "status"],
-                        "additionalProperties": false
-                    }
-                },
-                "verification": {
-                    "type": "array",
-                    "description": "Required after a workspace mutation. Each entry binds a changed path to one successful exact command observation; only caller-owned typed requirements may require repeats.",
-                    "minItems": 1,
-                    "maxItems": MAX_VERIFICATION_REQUIREMENTS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "risk": {
-                                "type": "string",
-                                "enum": ["general_mutation", "empty_collection", "optional_null", "zero_value", "index_boundary", "division_by_zero"]
-                            },
-                            "evidence": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
-                            "affected_path": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
-                            "affected_symbol": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
-                            "current_gap": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
-                            "action": {
-                                "type": "object",
-                                "properties": {
-                                    "command": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_COMMAND_CHARS},
-                                    "cwd": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
-                                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_VERIFICATION_TIMEOUT_SECONDS},
-                                    "sandbox_mode": {"type": "string", "enum": ["read_only", "workspace_write"]},
-                                    "network_access": {"type": "string", "enum": ["allowed", "denied"]}
-                                },
-                                "required": ["command", "cwd", "timeout_seconds", "sandbox_mode", "network_access"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "required": ["risk", "evidence", "affected_path", "affected_symbol", "current_gap", "action"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["steps"],
-            "additionalProperties": false
-        }),
-        ToolExecutionMode::Exclusive,
-        validate_plan_tool_input_contract,
-    );
-    vec![
-        ToolEntry::model(
-            spec,
-            1,
-            ToolCapability::PlanManagement,
-            ToolAuthorization::AgentControl,
-            ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
-        )
-        .expect("built-in agent control tool entry is valid"),
-    ]
-}
-
-/// 用于替换当前执行计划的模型输入。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentPlanUpdateInput {
-    pub steps: Vec<AgentPlanStep>,
-}
-
-impl AgentPlanUpdateInput {
-    /// 将模型输入转换为已校验计划。
-    pub fn into_plan(self) -> Result<AgentPlan, String> {
-        let plan = AgentPlan { steps: self.steps };
-        plan.validate()?;
-        Ok(plan)
-    }
-}
-
-/// Extended `update_plan` request.  Verification entries stay on the same control tool as the
-/// ordinary execution plan; they are not a second planner or an independent tool surface.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentPlanUpdateRequest {
-    steps: Vec<AgentPlanStep>,
-    #[serde(default)]
-    verification: Option<Vec<AgentVerificationEntry>>,
-}
-
-struct ValidatedPlanUpdate {
-    plan: AgentPlan,
-    verification: Option<Vec<AgentVerificationEntry>>,
-}
-
-impl AgentPlanUpdateRequest {
-    fn into_update(self) -> Result<ValidatedPlanUpdate, String> {
-        let plan = AgentPlanUpdateInput { steps: self.steps }.into_plan()?;
-        if self
-            .verification
-            .as_ref()
-            .is_some_and(|entries| entries.len() > MAX_VERIFICATION_REQUIREMENTS)
-        {
-            return Err(format!(
-                "verification plan must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
-            ));
-        }
-        if let Some(entries) = &self.verification {
-            for entry in entries {
-                validate_verification_entry_shape(entry)?;
-            }
-        }
-        Ok(ValidatedPlanUpdate {
-            plan,
-            verification: self.verification,
-        })
-    }
 }
 
 /// 无效调用、修复尝试和被拒绝完成尝试的计数器。
@@ -814,8 +351,6 @@ pub struct AgentRunStatus {
     pub approval_count: u32,
     pub audit_events: Vec<Value>,
     pub verification: AgentVerification,
-    pub plan: Option<AgentPlan>,
-    pub plan_update_count: u32,
     pub recovery_metrics: AgentRecoveryMetrics,
     pub model_usage: ModelUsage,
     pub provider_attempts: ProviderAttemptMetadata,
@@ -860,8 +395,6 @@ impl AgentRunStatus {
             approval_count: 0,
             audit_events: Vec::new(),
             verification: AgentVerification::default(),
-            plan: None,
-            plan_update_count: 0,
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
@@ -943,9 +476,6 @@ pub struct AgentLoopInput {
     #[serde(skip)]
     #[schemars(skip)]
     resume_attempt: u32,
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub verification_commands: Vec<AgentVerificationCommand>,
 }
 
 impl AgentLoopInput {
@@ -967,7 +497,6 @@ impl AgentLoopInput {
             max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
             approval_grants: Vec::new(),
             resume_attempt: 0,
-            verification_commands: Vec::new(),
         }
     }
 
@@ -987,20 +516,6 @@ impl AgentLoopInput {
     pub fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
         self
-    }
-
-    /// 设置完成前必须执行并满足的精确验证命令。
-    pub fn with_verification_commands(
-        mut self,
-        commands: impl IntoIterator<Item = AgentVerificationCommand>,
-    ) -> Self {
-        self.verification_commands = commands.into_iter().collect();
-        self
-    }
-
-    /// Derive the exact completion requirements from the caller-owned command actions.
-    pub fn verification_requirements(&self) -> Result<Vec<AgentVerificationRequirement>, String> {
-        verification_requirements(self)
     }
 
     /// Binds a verified project-instruction aggregate to this turn.
@@ -1072,8 +587,6 @@ pub struct AgentLoopResult {
     /// Public projection of the ordered internal tool-result occurrences.
     pub tool_results: Vec<ToolResult>,
     pub verification: AgentVerification,
-    pub plan: Option<AgentPlan>,
-    pub plan_update_count: u32,
     pub recovery_metrics: AgentRecoveryMetrics,
     pub model_usage: ModelUsage,
     pub provider_attempts: ProviderAttemptMetadata,
@@ -1136,8 +649,6 @@ impl AgentLoopResult {
             approval_count: self.approval_count,
             audit_events: audit_events_from_tool_results(&self.tool_results),
             verification: self.verification.clone(),
-            plan: self.plan.clone(),
-            plan_update_count: self.plan_update_count,
             recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
             provider_attempts: self.provider_attempts.clone(),
@@ -1160,46 +671,26 @@ struct AgentLoopState {
     used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
     completion: CompletionTracker,
-    verification_plan: Option<VerificationPlanState>,
-    /// Monotonic occurrence ordinal for verification-plan lifecycle events in this execution
-    /// epoch. The input resume attempt supplies the durable epoch identity, so this counter is
-    /// intentionally recreated from zero when a checkpoint is resumed.
-    verification_plan_occurrence_ordinal: u32,
     verification_change: Option<VerificationChangeSummary>,
-    verification_planning_required: bool,
-    verification_failure_history: BTreeSet<String>,
-    repair_plan: Option<RepairPlanState>,
-    /// Monotonic repair-attempt ledger for the current episode. The active plan may be cleared
+    repair_state: Option<RepairState>,
+    /// Monotonic repair-attempt ledger for the current episode. The active state may be cleared
     /// after real progress, but this counter survives that transition and approval checkpoints.
     repair_attempts: u32,
     repair_cycles: Vec<RepairCycleRecord>,
     final_review_verdict: Option<FinalReviewVerdict>,
     last_completion_error: Option<String>,
-    plan: Option<AgentPlan>,
-    plan_update_count: u32,
     recovery_metrics: AgentRecoveryMetrics,
     model_usage: ModelUsage,
     provider_attempts: ProviderAttemptMetadata,
     seen_tool_call_fingerprints: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
-    input_revision: u32,
-    replanned_input_revision: u32,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
     provider_protocol_contract: Option<ProviderProtocolContract>,
     provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
-/// Internal planner state.  The plan is immutable after creation; only the observed workspace
-/// revision is bound as real tool results arrive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VerificationPlanState {
-    plan: AgentVerificationPlan,
-    revision: Option<WorkspaceRevision>,
-}
-
-/// Internal summary of the mutation boundary used to validate a model-declared verification plan.
-/// It contains only bounded relative paths and a hash of the canonical mutation call.
+/// Internal summary of the mutation boundary used by completion and repair evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VerificationChangeSummary {
     revision: WorkspaceRevision,
@@ -1207,14 +698,18 @@ struct VerificationChangeSummary {
     diff_digest: String,
 }
 
-/// Internal repair state.  The signature is a hash-only identity used to bound repeated repair;
+/// Internal repair state. The signature is a hash-only identity used to bound repeated repair;
 /// raw failure text and tool arguments never cross the checkpoint or trace projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RepairPlanState {
-    plan: AgentRepairPlan,
+#[serde(deny_unknown_fields)]
+struct RepairState {
+    reason: AgentRepairReason,
+    attempt: u32,
+    max_attempts: u32,
+    required_revision: Option<WorkspaceRevision>,
     signature: String,
     /// The tool whose legal success can close a tool-failure episode.  Other repair reasons
-    /// require mutation, replanning, or required verification progress instead.
+    /// require mutation or required verification progress instead.
     failed_tool_name: Option<String>,
 }
 
@@ -1254,36 +749,22 @@ impl AgentLoopState {
             used_approval_grants: BTreeSet::new(),
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
-            verification_plan: None,
-            verification_plan_occurrence_ordinal: 0,
             verification_change: None,
-            verification_planning_required: false,
-            verification_failure_history: BTreeSet::new(),
-            repair_plan: None,
+            repair_state: None,
             repair_attempts: 0,
             repair_cycles: Vec::new(),
             final_review_verdict: None,
             last_completion_error: None,
-            plan: None,
-            plan_update_count: 0,
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             last_repair_failure: None,
-            input_revision: 0,
-            replanned_input_revision: 0,
             model_turn_limit,
             context_trace,
             provider_protocol_contract: None,
             provider_capability_metadata: None,
         }
-    }
-
-    fn next_verification_plan_occurrence_ordinal(&mut self) -> u32 {
-        let ordinal = self.verification_plan_occurrence_ordinal;
-        self.verification_plan_occurrence_ordinal = ordinal.saturating_add(1);
-        ordinal
     }
 
     fn finish(
@@ -1309,7 +790,6 @@ impl AgentLoopState {
         let approval_count = self
             .prior_approval_count
             .saturating_add(self.pending_approvals.len() as u32);
-        let public_plan = self.plan.as_ref().map(safe_agent_plan);
         let tool_results = self
             .tool_result_occurrences
             .into_iter()
@@ -1327,8 +807,6 @@ impl AgentLoopState {
             pending_approvals: self.pending_approvals,
             tool_results,
             verification,
-            plan: public_plan,
-            plan_update_count: self.plan_update_count,
             recovery_metrics: self.recovery_metrics,
             model_usage: self.model_usage,
             provider_attempts: self.provider_attempts,
@@ -1553,23 +1031,13 @@ impl AgentLoopState {
             },
             model_turns,
             resume_attempt: input.resume_attempt,
-            input_revision: self.input_revision,
-            replanned_input_revision: self.replanned_input_revision,
             completion: self.completion.clone(),
-            verification_plan: self.verification_plan.clone(),
             verification_change: self.verification_change.clone(),
-            verification_failure_history: self
-                .verification_failure_history
-                .iter()
-                .cloned()
-                .collect(),
-            repair_plan: self.repair_plan.clone(),
+            repair_state: self.repair_state.clone(),
             repair_attempts: self.repair_attempts,
             repair_cycles: self.repair_cycles.clone(),
             final_review_verdict: self.final_review_verdict,
             last_completion_error: self.last_completion_error.clone(),
-            plan: self.plan.clone(),
-            plan_update_count: self.plan_update_count,
             recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
             provider_attempts,
@@ -1580,33 +1048,24 @@ impl AgentLoopState {
     }
 
     fn allows_final(&self) -> bool {
-        self.completion.allows_final()
-            && self.repair_plan.is_none()
-            && self.plan.as_ref().is_none_or(AgentPlan::is_completed)
+        self.completion.allows_final() && self.repair_state.is_none()
     }
 
     fn finalization_ready(&self) -> bool {
         // `allows_final` can be true before the first model turn for simple read-only work.
-        // Passed required verification supplies the additional evidence that the next request is
-        // only collecting the final answer. An explicit plan, when present, must also be complete.
-        self.completion.summary().passed
-            && self.repair_plan.is_none()
-            && self.plan.as_ref().is_none_or(AgentPlan::is_completed)
+        // Passed latest-revision command evidence supplies the additional evidence that the next
+        // request is only collecting the final answer.
+        self.completion.summary().passed && self.repair_state.is_none()
     }
 
     fn completion_rejection_reason(&self) -> String {
         let mut reasons = Vec::new();
-        if self.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
-            reasons.push(
-                "completion gate rejected final answer: plan has incomplete steps".to_string(),
-            );
-        }
         if !self.completion.allows_final() {
             reasons.push(self.completion.rejection_reason());
         }
-        if self.repair_plan.is_some() && reasons.is_empty() {
+        if self.repair_state.is_some() && reasons.is_empty() {
             reasons.push(
-                "completion gate rejected final answer: repair plan remains active".to_string(),
+                "completion gate rejected final answer: repair state remains active".to_string(),
             );
         }
         reasons.join("; ")
@@ -1614,25 +1073,13 @@ impl AgentLoopState {
 
     fn completion_feedback(&self) -> String {
         let mut feedback = Vec::new();
-        if self.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
-            feedback.push(PLAN_COMPLETION_REQUIRED.to_string());
-        }
         if !self.completion.allows_final() {
             feedback.push(self.completion.feedback());
         }
-        if self.repair_plan.is_some() {
+        if self.repair_state.is_some() {
             feedback.push(self.repair_feedback());
         }
         feedback.join(" ")
-    }
-
-    fn clear_pending_exact_verification_instruction(&mut self) {
-        self.messages.retain(|message| {
-            message.role != ModelRole::Developer
-                || !message
-                    .content
-                    .starts_with(PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX)
-        });
     }
 
     fn repair_feedback(&self) -> String {
@@ -1640,10 +1087,10 @@ impl AgentLoopState {
     }
 
     fn repair_feedback_with_failure(&self, failure: Option<&ToolResult>) -> String {
-        let Some(plan) = self.repair_plan.as_ref() else {
-            return REPAIR_PLAN_INSTRUCTIONS.to_string();
+        let Some(state) = self.repair_state.as_ref() else {
+            return REPAIR_STATE_INSTRUCTIONS.to_string();
         };
-        let reason = plan.plan.reason;
+        let reason = state.reason;
         let context = self.build_repair_context(reason, failure);
         let context = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
         let context = if context.chars().count() <= MAX_REPAIR_CONTEXT_SERIALIZED_CHARS {
@@ -1659,22 +1106,10 @@ impl AgentLoopState {
                 "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
                 "previous_action": "bounded repair action unavailable",
                 "previous_result": "bounded repair result unavailable",
-                "required_verification_action": null,
             })
             .to_string()
         };
-        format!("{REPAIR_PLAN_INSTRUCTIONS} repair_context={context}")
-    }
-
-    /// Whether the active repair must change the workspace before planning or verification.
-    fn repair_strategy_change_required(&self) -> bool {
-        let Some(plan) = self.repair_plan.as_ref() else {
-            return false;
-        };
-        self.build_repair_context(plan.plan.reason, None)
-            .get("repair_strategy_change_required")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        format!("{REPAIR_STATE_INSTRUCTIONS} repair_context={context}")
     }
 
     fn final_review_instruction(&self) -> String {
@@ -1693,121 +1128,14 @@ impl AgentLoopState {
             .as_ref()
             .map(|change| change.changed_paths.clone())
             .unwrap_or_default();
-        let plan_entries = self
-            .verification_plan
-            .as_ref()
-            .map(|plan| {
-                plan.plan
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        json!({
-                            "risk": entry.risk,
-                            "evidence": entry.evidence,
-                            "affected_path": entry.affected_path,
-                            "affected_symbol": entry.affected_symbol,
-                            "current_gap": entry.current_gap,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let verification_digests =
             serde_json::to_string(&self.completion.terminal_command_scope_digests())
                 .unwrap_or_else(|_| "[]".to_string());
         let change_paths =
             serde_json::to_string(&change_paths).unwrap_or_else(|_| "[]".to_string());
-        let plan_entries =
-            serde_json::to_string(&plan_entries).unwrap_or_else(|_| "[]".to_string());
         format!(
-            "Review the trusted current evidence before deciding. changed_paths={change_paths}; change_digest={change_digest}; verification_plan_entries={plan_entries}; passed_verification_digests={verification_digests}. Return exactly one JSON object for the terminal review, with no markdown: {{\"verdict\":\"accept|reject|repair\",\"workspace_revision\":{revision},\"change_digest\":{change_digest},\"verification_digests\":{verification_digests},\"final_answer\":\"...\",\"reason\":\"...\"}}. The revision, change_digest, and verification_digests must exactly match this trusted evidence. Use accept only when all evidence is semantically valid; use reject or repair with a bounded reason when another repair cycle is required."
+            "Review the trusted current evidence before deciding. changed_paths={change_paths}; change_digest={change_digest}; passed_verification_digests={verification_digests}. Return exactly one JSON object for the terminal review, with no markdown: {{\"verdict\":\"accept|reject|repair\",\"workspace_revision\":{revision},\"change_digest\":{change_digest},\"verification_digests\":{verification_digests},\"final_answer\":\"...\",\"reason\":\"...\"}}. The revision, change_digest, and verification_digests must exactly match this trusted evidence. Use accept only when all evidence is semantically valid; use reject or repair with a bounded reason when another repair cycle is required."
         )
-    }
-
-    fn bind_verification_plan(&mut self, only_on_change: bool) -> bool {
-        let Some(revision) = self.completion.workspace_revision else {
-            return false;
-        };
-        if self.verification_planning_required {
-            return false;
-        }
-        if self.verification_plan.is_none() {
-            return false;
-        }
-        let plan = self
-            .verification_plan
-            .as_mut()
-            .expect("verification plan created above");
-        if let Some(bound_revision) = plan.revision {
-            if bound_revision != revision {
-                // A real mutation starts a fresh plan at the new revision.  Completion evidence
-                // is already invalidated by the tracker before this binding is updated.
-                if only_on_change {
-                    plan.revision = Some(revision);
-                } else {
-                    self.completion
-                        .mark_workspace_revision_invalid("verification_plan_revision_conflict");
-                    return false;
-                }
-            }
-        } else {
-            plan.revision = Some(revision);
-        }
-        true
-    }
-
-    fn install_verification_plan(
-        &mut self,
-        plan: AgentVerificationPlan,
-        caller_requirements: &[AgentVerificationRequirement],
-    ) -> Result<(), String> {
-        plan.validate()?;
-        let Some(revision) = self.completion.workspace_revision else {
-            return Err("verification plan requires an observed workspace revision".to_string());
-        };
-        if !self.verification_planning_required {
-            return Err("verification plan is not currently required".to_string());
-        }
-        let covered_scopes = plan
-            .entries
-            .iter()
-            .map(|entry| {
-                command_script_scope_digest_with_policy(
-                    &entry.action.command,
-                    &entry.action.cwd,
-                    entry.action.timeout_seconds,
-                    entry.action.sandbox_mode.clone(),
-                    entry.action.network_access.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        if self
-            .completion
-            .required_command_scope_digests()
-            .iter()
-            .any(|digest| !covered_scopes.contains(digest))
-        {
-            return Err(
-                "verification plan must include an exact action for every caller-required command scope; include all caller-required exact checks in the same update_plan call"
-                    .to_string(),
-            );
-        }
-        let effective =
-            CompletionTracker::merged_requirements(caller_requirements, &plan.requirements())?;
-        self.completion.replace_requirements(&effective)?;
-        // Installing a valid plan resolves only the pre-execution command precondition.  Any
-        // failure from a command that actually ran remains in CompletionTracker.
-        self.completion.clear_verification_plan_required_failure();
-        self.verification_plan = Some(VerificationPlanState {
-            plan,
-            revision: Some(revision),
-        });
-        self.verification_planning_required = false;
-        Ok(())
-    }
-
-    fn repair_plan(&self) -> Option<AgentRepairPlan> {
-        self.repair_plan.as_ref().map(|state| state.plan.clone())
     }
 
     fn schedule_repair(
@@ -1815,46 +1143,35 @@ impl AgentLoopState {
         reason: AgentRepairReason,
         signature: impl Into<String>,
         failed_tool_name: Option<&str>,
-    ) -> Result<AgentRepairPlan, AgentRepairPlan> {
+    ) -> Result<RepairState, RepairState> {
         let signature = signature.into();
         // A prospective repair decision does not own the already-failing revision. Only a later
         // mutation can bind the decision to a revision and make its verification cycle consume
         // one repair attempt.
         let required_revision = None;
-        // The public summary reports one generic post-mutation check before a plan exists.
-        // Repair checkpoint state must bind the actual installed requirement set instead.
-        let required_check_count = self.completion.required_command_count();
-        if let Some(active) = self.repair_plan.as_mut() {
-            if self.repair_attempts >= MAX_REPAIR_PLAN_ATTEMPTS
-                && active.plan.required_revision.is_none()
-            {
-                let exhausted = AgentRepairPlan {
-                    reason,
-                    attempt: MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1),
-                    max_attempts: MAX_REPAIR_PLAN_ATTEMPTS,
-                    required_revision,
-                    required_check_count,
-                };
-                active.plan = exhausted.clone();
+        if let Some(active) = self.repair_state.as_mut() {
+            if self.repair_attempts >= MAX_REPAIR_ATTEMPTS && active.required_revision.is_none() {
+                active.reason = reason;
+                active.attempt = MAX_REPAIR_ATTEMPTS.saturating_add(1);
+                active.max_attempts = MAX_REPAIR_ATTEMPTS;
+                active.required_revision = required_revision;
                 active.signature = signature;
                 active.failed_tool_name = failed_tool_name.map(str::to_string);
-                return Err(exhausted);
+                return Err(active.clone());
             }
-            // A repeated failure, read, invalid replan, or approval resume does not replace the
+            // A repeated failure, read, or approval resume does not replace the
             // repair decision or create another prospective attempt. A real verification failure
             // on the bound mutation may upgrade the causal reason without consuming an attempt.
             let terminal_cycle_revision = active
-                .plan
                 .required_revision
                 .filter(|revision| Some(*revision) == self.completion.workspace_revision);
-            active.plan.required_revision = terminal_cycle_revision;
-            active.plan.required_check_count = required_check_count;
+            active.required_revision = terminal_cycle_revision;
             if reason == AgentRepairReason::VerificationFailed && terminal_cycle_revision.is_some()
             {
-                active.plan.reason = reason;
+                active.reason = reason;
                 active.signature = signature;
                 active.failed_tool_name = None;
-            } else if active.plan.reason == AgentRepairReason::ToolFailure
+            } else if active.reason == AgentRepairReason::ToolFailure
                 && reason == AgentRepairReason::ToolFailure
                 && active.failed_tool_name.as_deref() == failed_tool_name
             {
@@ -1864,24 +1181,21 @@ impl AgentLoopState {
                 active.signature = signature;
                 active.failed_tool_name = failed_tool_name.map(str::to_string);
             }
-            return Ok(active.plan.clone());
+            return Ok(active.clone());
         }
 
         let attempt = self.repair_attempts.saturating_add(1);
-        let plan = AgentRepairPlan {
+        let state = RepairState {
             reason,
             attempt,
-            max_attempts: MAX_REPAIR_PLAN_ATTEMPTS,
+            max_attempts: MAX_REPAIR_ATTEMPTS,
             required_revision,
-            required_check_count,
-        };
-        let exhausted = attempt > MAX_REPAIR_PLAN_ATTEMPTS;
-        self.repair_plan = Some(RepairPlanState {
-            plan: plan.clone(),
             signature,
             failed_tool_name: failed_tool_name.map(str::to_string),
-        });
-        if exhausted { Err(plan) } else { Ok(plan) }
+        };
+        let exhausted = attempt > MAX_REPAIR_ATTEMPTS;
+        self.repair_state = Some(state.clone());
+        if exhausted { Err(state) } else { Ok(state) }
     }
 
     fn build_repair_context(
@@ -1895,8 +1209,8 @@ impl AgentLoopState {
                 .last()
                 .map(ToolResultOccurrence::result)
         });
-        let requires_strategy_change = self.repair_plan.as_ref().is_some_and(|active| {
-            active.plan.required_revision.is_none()
+        let requires_strategy_change = self.repair_state.as_ref().is_some_and(|active| {
+            active.required_revision.is_none()
                 && matches!(
                     reason,
                     AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected
@@ -1905,7 +1219,7 @@ impl AgentLoopState {
         let active_tool_failure = (reason == AgentRepairReason::ToolFailure)
             .then(|| {
                 let failed_tool_name = self
-                    .repair_plan
+                    .repair_state
                     .as_ref()
                     .and_then(|active| active.failed_tool_name.as_deref());
                 self.tool_result_occurrences
@@ -1921,36 +1235,31 @@ impl AgentLoopState {
             .flatten();
         // A later diagnostic command is useful transcript evidence, but it must not replace the
         // failure that owns the active repair decision.
-        let evidence_result = (reason == AgentRepairReason::VerificationFailed)
-            .then(|| self.failed_planned_verification_result())
-            .flatten()
-            .or_else(|| failure.filter(|result| !result.ok))
+        let evidence_result = failure
+            .filter(|result| !result.ok)
             .or(active_tool_failure)
             .or_else(|| {
                 (!requires_strategy_change)
                     .then_some(latest_result)
                     .flatten()
             });
-        let matching_entry = evidence_result
-            .and_then(tool_result_command_scope_digest)
-            .and_then(|digest| {
-                self.verification_plan.as_ref().and_then(|plan| {
-                    plan.plan
-                        .checks
-                        .iter()
-                        .position(|check| check.requirement.command_scope_digest == digest)
-                        .and_then(|index| plan.plan.entries.get(index))
-                })
-            });
         let failed_requirement = requires_strategy_change
             .then(|| self.last_completion_error.clone())
             .flatten()
-            .or_else(|| matching_entry.map(|entry| entry.current_gap.clone()))
             .or_else(|| summary.unresolved_failures.first().cloned())
             .or_else(|| self.last_completion_error.clone())
             .unwrap_or_else(|| repair_reason_text(reason).to_string());
-        let (affected_path, affected_symbol) = matching_entry
-            .map(|entry| (entry.affected_path.clone(), entry.affected_symbol.clone()))
+        let (affected_path, affected_symbol) = self
+            .verification_change
+            .as_ref()
+            .and_then(|change| {
+                change.changed_paths.first().cloned().map(|path| {
+                    let symbol = self
+                        .previous_repair_symbol(&path)
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    (path, symbol)
+                })
+            })
             .or_else(|| {
                 self.verification_change.as_ref().and_then(|change| {
                     change.changed_paths.first().cloned().map(|path| {
@@ -1959,14 +1268,6 @@ impl AgentLoopState {
                             .unwrap_or_else(|| "unavailable".to_string());
                         (path, symbol)
                     })
-                })
-            })
-            .or_else(|| {
-                self.verification_plan.as_ref().and_then(|plan| {
-                    plan.plan
-                        .entries
-                        .first()
-                        .map(|entry| (entry.affected_path.clone(), entry.affected_symbol.clone()))
                 })
             })
             .unwrap_or_else(|| ("unavailable".to_string(), "unavailable".to_string()));
@@ -2018,47 +1319,6 @@ impl AgentLoopState {
                     .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
             })
             .unwrap_or_else(|| json!(repair_reason_text(reason)));
-        let unmet_actions = self.unmet_verification_entries(evidence_result);
-        let remaining_verification_action_count = unmet_actions.len();
-        let require_exact_action = !evidence_result
-            .is_some_and(|result| self.is_failed_planned_verification_result(result))
-            && self.required_verification_command_input().is_some();
-        let required_verification_action = require_exact_action
-            .then(|| {
-                unmet_actions.first().map(|(entry, required, remaining)| {
-                    repair_verification_action(entry, *required, *remaining)
-                })
-            })
-            .flatten()
-            .unwrap_or(Value::Null);
-        let mut projected_command_chars = unmet_actions
-            .first()
-            .map_or(0, |(entry, _, _)| entry.action.command.chars().count());
-        let mut additional_verification_actions = Vec::new();
-        if require_exact_action {
-            for (entry, required, remaining) in unmet_actions.iter().skip(1) {
-                let command_chars = entry.action.command.chars().count();
-                if additional_verification_actions.len() + 1 >= MAX_REPAIR_CONTEXT_ACTIONS
-                    || projected_command_chars.saturating_add(command_chars)
-                        > MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS
-                {
-                    break;
-                }
-                projected_command_chars = projected_command_chars.saturating_add(command_chars);
-                additional_verification_actions
-                    .push(repair_verification_action(entry, *required, *remaining));
-            }
-        }
-        let projected_action_count = usize::from(required_verification_action != Value::Null)
-            + additional_verification_actions.len();
-        let verification_actions_truncated =
-            require_exact_action && remaining_verification_action_count > projected_action_count;
-        let repair_strategy_change_required = self
-            .repair_plan
-            .as_ref()
-            .is_some_and(|active| active.plan.required_revision.is_none())
-            && (requires_strategy_change
-                || !require_exact_action && remaining_verification_action_count > 0);
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
             "evidence": evidence_result
@@ -2074,216 +1334,20 @@ impl AgentLoopState {
             "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
             "previous_action": previous_action,
             "previous_result": previous_result,
-            "required_verification_action": required_verification_action,
-            "additional_verification_actions": additional_verification_actions,
-            "remaining_verification_action_count": remaining_verification_action_count,
-            "verification_actions_truncated": verification_actions_truncated,
-            "repair_strategy_change_required": repair_strategy_change_required,
+            "repair_strategy_change_required": requires_strategy_change,
         })
     }
 
-    /// Select the trusted actions for the failed and remaining revision-bound verification checks.
-    ///
-    /// A failed command may carry a scope digest that is not present in the plan. In that case the
-    /// completion reducer's terminal evidence identifies still-unmet checks instead of treating
-    /// the untrusted command as a requested action. Each exact scope appears once with its
-    /// remaining required success count.
-    fn unmet_verification_entries(
-        &self,
-        failure: Option<&ToolResult>,
-    ) -> Vec<(&AgentVerificationEntry, u32, u32)> {
-        let Some(plan) = self.verification_plan.as_ref() else {
-            return Vec::new();
-        };
-        let observed_counts = self.completion.terminal_command_counts();
-        let mut seen = BTreeSet::new();
-        let mut entries = Vec::new();
-        let mut add_entry = |index: usize| {
-            let Some(check) = plan.plan.checks.get(index) else {
-                return;
-            };
-            let digest = &check.requirement.command_scope_digest;
-            if !seen.insert(digest.clone()) {
-                return;
-            }
-            // CompletionTracker owns the caller-plus-plan union. A model entry contributes one
-            // success; a larger caller-owned typed floor remains in force for the same scope.
-            let required = self.completion.required_command_count_for(digest);
-            let observed = observed_counts.get(digest).copied().unwrap_or(0);
-            if let Some(entry) = plan.plan.entries.get(index)
-                && observed < required
-            {
-                entries.push((entry, required, required.saturating_sub(observed)));
-            }
-        };
-        if let Some(index) = failure
-            .and_then(tool_result_command_scope_digest)
-            .and_then(|digest| {
-                plan.plan
-                    .checks
-                    .iter()
-                    .position(|check| check.requirement.command_scope_digest == digest)
-            })
-        {
-            add_entry(index);
-        }
-        for index in 0..plan.plan.checks.len() {
-            add_entry(index);
-        }
-        entries
-    }
-
-    /// Return the next installed exact command while no executed failure requires a new strategy.
-    fn required_verification_command_input(&self) -> Option<Value> {
-        if self.repair_plan.as_ref().is_some_and(|repair| {
-            matches!(
-                repair.plan.reason,
-                AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected
-            )
-        }) {
-            return None;
-        }
-        // A revision-bound action that is rejected before execution by a stable capability or
-        // policy boundary cannot become valid by submitting the same input again.  Release the
-        // exact pin for this repair episode so the model can make the required strategy change;
-        // input/validation and approval failures intentionally keep the pin.
-        if self.has_pre_execution_replan_failure() {
-            return None;
-        }
-        let entry = self.unmet_verification_entries(None).first()?.0;
-        let required_digest = command_script_scope_digest_with_policy(
-            &entry.action.command,
-            &entry.action.cwd,
-            entry.action.timeout_seconds,
-            entry.action.sandbox_mode.clone(),
-            entry.action.network_access.clone(),
-        );
-        if self
-            .failed_planned_verification_result()
-            .is_some_and(|result| {
-                tool_result_command_scope_digest(result) == Some(required_digest.as_str())
-            })
-        {
-            return None;
-        }
-        Some(repair_command_tool_input(entry))
-    }
-
-    /// Return whether the current exact action hit a stable pre-execution boundary.
-    ///
-    /// The scan stops at the latest real mutation.  This keeps a failure from an older revision
-    /// from releasing the exact action installed for a later plan, without adding a second
-    /// persisted repair-state flag.  A newer invalid input or diagnostic call does not erase the
-    /// boundary: once the installed action is known to be impossible, retrying it must not be
-    /// forced through `repair_action_mismatch` again.
-    fn has_pre_execution_replan_failure(&self) -> bool {
-        let Some(plan) = self.verification_plan.as_ref() else {
-            return false;
-        };
-        for occurrence in self.tool_result_occurrences.iter().rev() {
-            let result = occurrence.result();
-            if result.workspace_observation().is_some_and(|observation| {
-                observation.mutation() == singularity_tools::WorkspaceMutation::Changed
-            }) {
-                break;
-            }
-            if !is_pre_execution_replan_failure(result) || result.tool_name != TOOL_COMMAND {
-                continue;
-            }
-            let Some(digest) = tool_result_command_scope_digest(result) else {
-                continue;
-            };
-            if plan
-                .plan
-                .checks
-                .iter()
-                .any(|check| check.requirement.command_scope_digest == digest)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Return the latest executed failure for an exact action in the current verification plan.
-    fn failed_planned_verification_result(&self) -> Option<&ToolResult> {
-        self.tool_result_occurrences
-            .iter()
-            .rev()
-            .map(ToolResultOccurrence::result)
-            .find(|result| self.is_failed_planned_verification_result(result))
-    }
-
-    fn is_failed_planned_verification_result(&self, result: &ToolResult) -> bool {
-        let Some(plan) = self.verification_plan.as_ref() else {
-            return false;
-        };
-        let Some(revision) = plan.revision else {
-            return false;
-        };
-        result.tool_name == TOOL_COMMAND
-            && !result.ok
-            && result.workspace_observation().is_some_and(|observation| {
-                observation.mutation() == singularity_tools::WorkspaceMutation::Unchanged
-                    && observation.revision() == Some(revision)
-            })
-            && tool_result_command_scope_digest(result).is_some_and(|digest| {
-                plan.plan
-                    .checks
-                    .iter()
-                    .any(|check| check.requirement.command_scope_digest == digest)
-            })
-    }
-
-    fn previous_repair_symbol(&self, path: &str) -> Option<String> {
-        self.tool_result_occurrences
-            .iter()
-            .rev()
-            .find_map(|occurrence| {
-                let result = occurrence.result();
-                if result.tool_name != UPDATE_PLAN_TOOL || !result.ok {
-                    return None;
-                }
-                result
-                    .content
-                    .as_ref()
-                    .and_then(|content| content.get("verification"))
-                    .and_then(Value::as_array)
-                    .and_then(|entries| {
-                        entries.iter().find_map(|entry| {
-                            (entry.get("affected_path").and_then(Value::as_str) == Some(path))
-                                .then(|| {
-                                    entry
-                                        .get("affected_symbol")
-                                        .and_then(Value::as_str)
-                                        .map(bounded_repair_text)
-                                })
-                                .flatten()
-                        })
-                    })
-            })
+    fn previous_repair_symbol(&self, _path: &str) -> Option<String> {
+        None
     }
 
     fn note_repair_mutation(&mut self, revision: WorkspaceRevision) {
-        let Some(active) = self.repair_plan.as_mut() else {
+        let Some(active) = self.repair_state.as_mut() else {
             return;
         };
-        active.plan.attempt = self.repair_attempts.saturating_add(1);
-        active.plan.required_revision = Some(revision);
-        // A mutation invalidates the previous revision's verification evidence before the
-        // next plan is installed. Bind the prospective repair to the surviving caller-declared
-        // floor so the durable mutation checkpoint remains internally consistent until replanning.
-        active.plan.required_check_count = self.completion.required_command_count();
-    }
-
-    fn note_repair_verification_binding(&mut self) {
-        let Some(active) = self.repair_plan.as_mut() else {
-            return;
-        };
-        // This is called only after a plan is bound to the current workspace revision. A
-        // prospective pre-plan tool repair has no required_revision yet, but its durable state
-        // must still follow the newly installed exact requirement set.
-        active.plan.required_check_count = self.completion.required_command_count();
+        active.attempt = self.repair_attempts.saturating_add(1);
+        active.required_revision = Some(revision);
     }
 
     /// Commit exactly one repair attempt for a new mutation revision followed by its terminal
@@ -2306,31 +1370,22 @@ impl AgentLoopState {
             return None;
         }
         let revision = observation.revision()?;
-        let verification_plan = self.verification_plan.as_ref()?;
-        if verification_plan.revision != Some(revision) {
+        if self.completion.workspace_revision != Some(revision) {
             return None;
         }
         let command_scope_digest = tool_result_command_scope_digest(result)?;
-        if !verification_plan
-            .plan
-            .checks
-            .iter()
-            .any(|check| check.requirement.command_scope_digest == command_scope_digest)
-        {
-            return None;
-        }
         // A successful command only closes the cycle after every required command for this
         // revision has been observed.  A matching failure closes the failed cycle immediately.
         if result.ok && !self.completion.verification_satisfied() {
             return None;
         }
-        let active = self.repair_plan.as_mut()?;
-        if active.plan.required_revision != Some(revision) {
+        let active = self.repair_state.as_mut()?;
+        if active.required_revision != Some(revision) {
             return None;
         }
         self.repair_attempts = self.repair_attempts.saturating_add(1);
         self.recovery_metrics.repair_attempt_count = self.repair_attempts;
-        active.plan.attempt = self.repair_attempts;
+        active.attempt = self.repair_attempts;
         let committed_attempt = self.repair_attempts;
         self.repair_cycles.push(RepairCycleRecord {
             attempt: committed_attempt,
@@ -2339,18 +1394,18 @@ impl AgentLoopState {
             verification_passed: result.ok,
         });
         if result.ok {
-            self.repair_plan = None;
+            self.repair_state = None;
             self.last_repair_failure = None;
             return Some(RepairCycleCommit {
                 attempt: committed_attempt,
                 exhausted: false,
             });
         }
-        if committed_attempt >= MAX_REPAIR_PLAN_ATTEMPTS {
+        if committed_attempt >= MAX_REPAIR_ATTEMPTS {
             // Keep an internal terminal marker so the current tool batch fails immediately.  The
             // event projection below uses the committed attempt (3), never this sentinel (4).
-            active.plan.attempt = MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1);
-            active.plan.required_revision = None;
+            active.attempt = MAX_REPAIR_ATTEMPTS.saturating_add(1);
+            active.required_revision = None;
             Some(RepairCycleCommit {
                 attempt: committed_attempt,
                 exhausted: true,
@@ -2358,8 +1413,8 @@ impl AgentLoopState {
         } else {
             // The failed verification is committed, but the next prospective attempt remains
             // uncommitted until a new mutation revision is observed.
-            active.plan.required_revision = None;
-            active.plan.attempt = self.repair_attempts.saturating_add(1);
+            active.required_revision = None;
+            active.attempt = self.repair_attempts.saturating_add(1);
             Some(RepairCycleCommit {
                 attempt: committed_attempt,
                 exhausted: false,
@@ -2398,42 +1453,26 @@ impl AgentLoopState {
         &mut self,
         tool_result: &ToolResult,
         tool_call_fingerprint: &str,
-        verification_planning_available: bool,
     ) -> Option<String> {
         self.completion.observe(tool_result);
         if tool_result.ok {
-            let changed_with_verification_planning = verification_planning_available
-                && tool_result
-                    .workspace_observation()
-                    .is_some_and(|observation| {
-                        observation.mutation() == singularity_tools::WorkspaceMutation::Changed
-                    });
-            let tool_failure_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
-                if plan.plan.reason != AgentRepairReason::ToolFailure
-                    || plan.plan.required_revision.is_some()
-                    || changed_with_verification_planning
+            let tool_failure_resolved = self.repair_state.as_ref().is_some_and(|state| {
+                if state.reason != AgentRepairReason::ToolFailure
+                    || state.required_revision.is_some()
                 {
                     return false;
                 }
-                match plan.failed_tool_name.as_deref() {
+                match state.failed_tool_name.as_deref() {
                     Some(failed_tool_name) => failed_tool_name == tool_result.tool_name,
-                    None => tool_result.tool_name != UPDATE_PLAN_TOOL,
+                    None => true,
                 }
             });
-            let verification_gap_resolved = tool_result.tool_name == TOOL_COMMAND
-                && self.completion.verification_satisfied()
-                && self.repair_plan.as_ref().is_some_and(|plan| {
-                    plan.plan.reason == AgentRepairReason::VerificationFailed
-                        && plan.plan.required_revision.is_none()
-                });
-            if tool_failure_resolved || verification_gap_resolved {
+            if tool_failure_resolved {
                 // Input, policy and execution failures require a successful call to the same
                 // tool. Other unresolved failure groups remain in CompletionTracker and cannot
                 // be erased by closing this concrete decision. A visibility failure names no
-                // executable tool, so a successful visible replacement resolves it. A missing
-                // verification action also resolves without consuming a mutation-bound attempt
-                // once its exact evidence is observed.
-                self.repair_plan = None;
+                // executable tool, so a successful visible replacement resolves it.
+                self.repair_state = None;
             }
             self.last_repair_failure = None;
             return None;
@@ -2454,20 +1493,6 @@ impl AgentLoopState {
             .and_then(|audit| audit.get("argument_validation_code"))
             .and_then(Value::as_str)
             .unwrap_or(error_code);
-        // A command-shaped call is a verification failure only after it crossed the execution
-        // boundary and produced a revision observation. Schema/policy rejections and other
-        // pre-execution failures are tool-input repairs; a corrected call to the same tool must
-        // resolve them without consuming a mutation-bound repair attempt.
-        let verification_failure = tool_result.tool_name == TOOL_COMMAND
-            && tool_result.workspace_observation().is_some()
-            && self
-                .verification_plan
-                .as_ref()
-                .is_some_and(|plan| !plan.plan.requirements().is_empty());
-        if verification_failure {
-            self.verification_failure_history
-                .insert(error_code.chars().take(128).collect());
-        }
         let signature = repair_failure_signature(tool_call_fingerprint, repair_error_code);
         let consecutive_count = if self
             .last_repair_failure
@@ -2489,42 +1514,33 @@ impl AgentLoopState {
             .as_ref()
             .map(|failure| failure.signature.clone())
             .unwrap_or_default();
-        let repair_reason = if verification_failure {
-            AgentRepairReason::VerificationFailed
-        } else {
-            AgentRepairReason::ToolFailure
-        };
+        let repair_reason = AgentRepairReason::ToolFailure;
         let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure
             && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
         .then_some(tool_result.tool_name.as_str());
         if let Err(exhausted) =
             self.schedule_repair(repair_reason, repair_signature, failed_tool_name)
         {
-            self.repair_plan = Some(RepairPlanState {
-                plan: exhausted,
+            self.repair_state = Some(RepairState {
+                reason: exhausted.reason,
+                attempt: exhausted.attempt,
+                max_attempts: exhausted.max_attempts,
+                required_revision: exhausted.required_revision,
                 signature: String::new(),
                 failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure
                     && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
                 .then(|| tool_result.tool_name.clone()),
             });
-            return Some(
-                "repair planning budget exhausted; refusing another repair attempt".to_string(),
-            );
+            return Some("repair budget exhausted; refusing another repair attempt".to_string());
         }
-        (consecutive_count >= 2).then(|| {
-            if repair_error_code == "repair_action_mismatch" {
-                REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS.to_string()
-            } else {
-                REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string()
-            }
-        })
+        (consecutive_count >= 2).then(|| REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
     }
 
-    /// Drop only the active plan after a successful workspace/verification operation. Read-only
+    /// Drop only the active repair state after a successful workspace/verification operation. Read-only
     /// reads and bookkeeping calls must not reset a bounded repair episode. The attempt ledger is
     /// monotonic for the lifetime of the run and is deliberately retained across this transition.
     fn clear_repair_episode(&mut self) {
-        self.repair_plan = None;
+        self.repair_state = None;
         self.last_repair_failure = None;
     }
 
@@ -2626,7 +1642,7 @@ fn batch_rejection_contract_result(
     trigger: &BatchRejectionTrigger,
     mut result: ToolResult,
 ) -> ToolResult {
-    const REQUIRED_NEXT_ACTION: &str = "Correct any preflight failure first. Submit each exclusive, mutation, command, plan, or approval-sensitive call alone, then wait for its result before submitting dependent calls. Independent read-only calls may be submitted together.";
+    const REQUIRED_NEXT_ACTION: &str = "Correct any preflight failure first. Submit each exclusive, mutation, command, or approval-sensitive call alone, then wait for its result before submitting dependent calls. Independent read-only calls may be submitted together.";
 
     let audit = result.audit_metadata().cloned();
     let mut content = match result.content.take() {
@@ -2697,7 +1713,7 @@ enum ToolBatchControl {
 }
 
 /// Result of committing a revision-bound repair cycle.  The committed attempt is kept separate
-/// from the active plan's prospective attempt so exhaustion never leaks an attempt four event.
+/// from the active repair state's prospective attempt so exhaustion never leaks an attempt four event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepairCycleCommit {
     attempt: u32,
@@ -2797,12 +1813,6 @@ where
         }
         let messages = model_messages_from_input(input, &context, 1);
         let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
-        let requirements = verification_requirements(input)?;
-        state.completion = CompletionTracker::from_requirements(&requirements)?;
-        state.verification_plan = (!requirements.is_empty()).then(|| VerificationPlanState {
-            plan: AgentVerificationPlan::from_requirements(requirements),
-            revision: None,
-        });
         state.context_trace = Some(AgentContextTrace::from(&context));
         state
             .turn_checkpoint(input, 0, Vec::new())
@@ -2984,26 +1994,10 @@ where
         mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
         mut on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> AgentLoopResult {
-        let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
+        let state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
-        let requirements = match verification_requirements(input) {
-            Ok(requirements) => requirements,
-            Err(error) => {
-                return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
-            }
-        };
-        state.completion = match CompletionTracker::from_requirements(&requirements) {
-            Ok(completion) => completion,
-            Err(error) => {
-                return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
-            }
-        };
-        state.verification_plan = (!requirements.is_empty()).then(|| VerificationPlanState {
-            plan: AgentVerificationPlan::from_requirements(requirements),
-            revision: None,
-        });
         let (capabilities, mut state) =
             match self.negotiate_tool_capabilities(input, state, 0, &mut on_event) {
                 ControlFlow::Continue(result) => result,
@@ -3100,16 +2094,16 @@ where
         // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
         for turn_index in model_turn_offset..=max_turns {
             if state
-                .repair_plan
+                .repair_state
                 .as_ref()
-                .is_some_and(|plan| plan.plan.attempt > plan.plan.max_attempts)
+                .is_some_and(|state| state.attempt > state.max_attempts)
             {
                 return state.finish(
                     AgentStatus::Failed,
                     false,
                     None,
                     actual_model_turns,
-                    Some("repair planning budget exhausted".to_string()),
+                    Some("repair budget exhausted".to_string()),
                 );
             }
             let finalization_only = state.finalization_ready();
@@ -3118,18 +2112,6 @@ where
             }
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
-            }
-            state.clear_pending_exact_verification_instruction();
-            let required_verification_input = (!finalization_only)
-                .then(|| state.required_verification_command_input())
-                .flatten();
-            let repair_strategy_change_required =
-                !finalization_only && state.repair_strategy_change_required();
-            if let Some(command_input) = &required_verification_input {
-                state.messages.push(ModelMessage::text(
-                    ModelRole::Developer,
-                    pending_exact_verification_instruction(command_input),
-                ));
             }
             if !matches!(
                 self.emit_checkpoint_event(
@@ -3225,32 +2207,7 @@ where
                 ModelToolView::finalization()
             } else {
                 match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
-                    Ok(mut tool_view) => {
-                        if let Some(command_input) = &required_verification_input {
-                            if let Err(error) = tool_view.restrict_command_input(command_input) {
-                                return state.finish(
-                                    AgentStatus::Failed,
-                                    false,
-                                    None,
-                                    turn_index,
-                                    Some(error),
-                                );
-                            }
-                            tool_view.tools.retain(|tool| tool.name == TOOL_COMMAND);
-                            tool_view.max_tool_calls = 1;
-                        } else if state.verification_planning_required {
-                            // A mutation must install its revision-bound plan before any
-                            // verification command can be submitted. Keep update_plan visible so
-                            // the model can satisfy that prerequisite, but do not advertise the
-                            // command tool that the execution boundary would reject.
-                            tool_view.tools.retain(|tool| tool.name != TOOL_COMMAND);
-                        } else if repair_strategy_change_required {
-                            tool_view.tools.retain(|tool| {
-                                tool.name != TOOL_COMMAND && tool.name != UPDATE_PLAN_TOOL
-                            });
-                        }
-                        tool_view
-                    }
+                    Ok(tool_view) => tool_view,
                     Err(error) => {
                         if emit_prompt_assembly_finished(
                             &mut on_event,
@@ -3357,7 +2314,6 @@ where
             );
             // The projection is request-scoped. Tool-result and later checkpoints must derive the
             // next action from trusted state instead of persisting a now-stale command instruction.
-            state.clear_pending_exact_verification_instruction();
             let request_validation =
                 validate_model_request_with_capabilities(&request, Some(capabilities));
             if !request_validation.valid {
@@ -3844,30 +2800,13 @@ where
                             REVIEW_REPAIR_SIGNATURE,
                             None,
                         ) {
-                            Ok(plan) => {
-                                if emit_repair_planning_occurrence(
-                                    &mut on_event,
-                                    input,
-                                    turn_index,
-                                    state.recovery_metrics.completion_rejection_count,
-                                    &plan,
-                                    RepairPlanningStatus::Planned,
-                                )
-                                .is_err()
-                                {
-                                    return state.finish(
-                                        AgentStatus::Failed,
-                                        false,
-                                        None,
-                                        actual_model_turns,
-                                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                                    );
-                                }
-                                true
-                            }
+                            Ok(_state) => true,
                             Err(exhausted) => {
-                                state.repair_plan = Some(RepairPlanState {
-                                    plan: exhausted,
+                                state.repair_state = Some(RepairState {
+                                    reason: exhausted.reason,
+                                    attempt: exhausted.attempt,
+                                    max_attempts: exhausted.max_attempts,
+                                    required_revision: exhausted.required_revision,
                                     signature: REVIEW_REPAIR_SIGNATURE.to_string(),
                                     failed_tool_name: None,
                                 });
@@ -3898,7 +2837,7 @@ where
                         state.last_completion_error = Some(if repair_requested {
                             format!("final review rejected: {}", review.reason)
                         } else {
-                            "repair planning budget exhausted".to_string()
+                            "repair budget exhausted".to_string()
                         });
                         state
                             .messages
@@ -3910,8 +2849,7 @@ where
                             if repair_requested {
                                 state.repair_feedback()
                             } else {
-                                "Repair planning budget exhausted; do not claim completion."
-                                    .to_string()
+                                "Repair budget exhausted; do not claim completion.".to_string()
                             },
                         ));
                         continue;
@@ -4046,35 +2984,6 @@ where
                         None,
                     );
                 }
-                if state.verification_plan.is_some() {
-                    let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
-                    let plan = state
-                        .verification_plan
-                        .as_ref()
-                        .expect("verification plan present");
-                    let summary = state.completion.summary();
-                    if emit_verification_plan_occurrence(
-                        &mut on_event,
-                        input,
-                        turn_index,
-                        occurrence_ordinal,
-                        plan.revision,
-                        u32::try_from(plan.plan.risks.len()).unwrap_or(u32::MAX),
-                        u32::try_from(plan.plan.checks.len()).unwrap_or(u32::MAX),
-                        summary.satisfied_command_count,
-                        VerificationPlanStatus::Rejected,
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
-                }
                 let repair_requested = if state.completion.allows_final() {
                     false
                 } else {
@@ -4083,30 +2992,13 @@ where
                         REVIEW_REPAIR_SIGNATURE,
                         None,
                     ) {
-                        Ok(plan) => {
-                            if emit_repair_planning_occurrence(
-                                &mut on_event,
-                                input,
-                                turn_index,
-                                state.recovery_metrics.completion_rejection_count,
-                                &plan,
-                                RepairPlanningStatus::Planned,
-                            )
-                            .is_err()
-                            {
-                                return state.finish(
-                                    AgentStatus::Failed,
-                                    false,
-                                    None,
-                                    actual_model_turns,
-                                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                                );
-                            }
-                            true
-                        }
+                        Ok(_state) => true,
                         Err(exhausted) => {
-                            state.repair_plan = Some(RepairPlanState {
-                                plan: exhausted,
+                            state.repair_state = Some(RepairState {
+                                reason: exhausted.reason,
+                                attempt: exhausted.attempt,
+                                max_attempts: exhausted.max_attempts,
+                                required_revision: exhausted.required_revision,
                                 signature: REVIEW_REPAIR_SIGNATURE.to_string(),
                                 failed_tool_name: None,
                             });
@@ -4332,13 +3224,6 @@ where
                 None,
             );
         }
-        let caller_requirements = match verification_requirements(input) {
-            Ok(requirements) => requirements,
-            Err(error) => return failed_result(error),
-        };
-        if let Err(error) = CompletionTracker::from_requirements(&caller_requirements) {
-            return failed_result(error);
-        }
         let call = match pending
             .pending_tool_call()
             .to_model_tool_call()
@@ -4547,10 +3432,8 @@ where
         let runtime = self.execute_tool(
             &prepared,
             observed_decision.decision,
-            &mut state,
             &occurrence.context,
             &mut on_event,
-            &caller_requirements,
         );
         match self.record_tool_results(
             input,
@@ -4805,10 +3688,6 @@ where
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
         }
-        let caller_requirements = match verification_requirements(input) {
-            Ok(requirements) => requirements,
-            Err(error) => return ToolBatchControl::Failed(error),
-        };
         let mut prepared = occurrences
             .iter()
             .map(|occurrence| {
@@ -5034,13 +3913,11 @@ where
             let result = self.execute_tool(
                 &prepared,
                 decision,
-                state,
                 &occurrences
                     .first()
                     .expect("single approval occurrence is present")
                     .context,
                 on_event,
-                &caller_requirements,
             );
             state.append_hidden_tool_result(result.result);
             if emit_event(
@@ -5089,13 +3966,11 @@ where
         let result = self.execute_tool(
             &prepared,
             decision,
-            state,
             &occurrences
                 .first()
                 .expect("single tool occurrence is present")
                 .context,
             on_event,
-            &caller_requirements,
         );
         let control = self.record_tool_results(
             input,
@@ -5179,28 +4054,6 @@ where
                 rejection: Some(invalid_tool_arguments_result(
                     execution_call,
                     ToolInputValidationError::new(validation_code),
-                    self.tool_broker.get(&execution_call.tool_name),
-                )),
-            };
-        }
-        if let Some(required_input) = state.required_verification_command_input()
-            && (execution_call.tool_name != TOOL_COMMAND
-                || execution_call.arguments != required_input)
-        {
-            if !invalid_was_observed {
-                state.recovery_metrics.invalid_tool_call_count = state
-                    .recovery_metrics
-                    .invalid_tool_call_count
-                    .saturating_add(1);
-            }
-            return PreparedToolCall {
-                call: execution_call.clone(),
-                fingerprint: fingerprint.to_string(),
-                bound: None,
-                decision: None,
-                rejection: Some(invalid_tool_arguments_result(
-                    execution_call,
-                    ToolInputValidationError::new("repair_action_mismatch"),
                     self.tool_broker.get(&execution_call.tool_name),
                 )),
             };
@@ -5440,13 +4293,8 @@ where
         on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     ) -> ToolBatchControl {
         debug_assert_eq!(results.len(), occurrences.len());
-        let caller_requirements = match verification_requirements(input) {
-            Ok(requirements) => requirements,
-            Err(error) => return ToolBatchControl::Failed(error),
-        };
         let mut failure = None;
         let mut repairable_failure = None;
-        let verification_planning_available = self.verification_planning_available();
         for ((prepared, runtime), occurrence) in results.into_iter().zip(occurrences) {
             if runtime.event_sink_failed {
                 return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
@@ -5460,7 +4308,6 @@ where
             } else {
                 result
             };
-            let previous_verification_plan = state.verification_plan.clone();
             let recoverable = is_repairable_tool_result(&result)
                 || (batch_rejected && result.failure_kind == Some(ToolFailureKind::Approval));
             let non_repairable_error = (!result.ok && !recoverable).then(|| {
@@ -5499,37 +4346,7 @@ where
                     return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
                 }
             }
-            let recovery_feedback = state.observe_tool_result(
-                &result,
-                &prepared.fingerprint,
-                verification_planning_available,
-            );
-            if prepared.call.tool_name == TOOL_COMMAND
-                && !result.ok
-                && state.verification_plan.is_some()
-            {
-                let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
-                let plan = state
-                    .verification_plan
-                    .as_ref()
-                    .expect("verification plan present");
-                let summary = state.completion.summary();
-                if emit_verification_plan_occurrence(
-                    on_event,
-                    input,
-                    occurrence.context.model_turn_ordinal,
-                    occurrence_ordinal,
-                    plan.revision,
-                    u32::try_from(plan.plan.risks.len()).unwrap_or(u32::MAX),
-                    u32::try_from(plan.plan.checks.len()).unwrap_or(u32::MAX),
-                    summary.satisfied_command_count,
-                    VerificationPlanStatus::Rejected,
-                )
-                .is_err()
-                {
-                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-                }
-            }
+            let recovery_feedback = state.observe_tool_result(&result, &prepared.fingerprint);
             let changed = result.workspace_observation().is_some_and(|observation| {
                 observation.mutation() == singularity_tools::WorkspaceMutation::Changed
             });
@@ -5541,9 +4358,6 @@ where
                     state
                         .completion
                         .mark_workspace_revision_invalid("mutation_revision_missing");
-                    state.verification_planning_required = true;
-                    state.verification_plan = None;
-                    let _ = state.completion.replace_requirements(&caller_requirements);
                     return ToolBatchControl::Failed(
                         "workspace mutation revision is missing".to_string(),
                     );
@@ -5554,126 +4368,14 @@ where
                         state
                             .completion
                             .mark_workspace_revision_invalid("mutation_diff_summary_invalid");
-                        state.verification_planning_required = true;
-                        state.verification_plan = None;
-                        let _ = state.completion.replace_requirements(&caller_requirements);
                         return ToolBatchControl::Failed(error);
                     }
-                }
-                let had_bound_plan = state
-                    .verification_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.revision.is_some());
-                let caller_only_plan = state
-                    .verification_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.plan.entries.is_empty());
-                if (had_bound_plan || caller_only_plan) && verification_planning_available {
-                    state.verification_plan = None;
-                    state.verification_planning_required = true;
-                    // A mutation clears stale revision evidence but never the caller-declared
-                    // floor; the next installed plan is unioned with it again.
-                    if let Err(error) = state.completion.replace_requirements(&caller_requirements)
-                    {
-                        return ToolBatchControl::Failed(error);
-                    }
-                } else if state.verification_plan.is_none() && verification_planning_available {
-                    state.verification_planning_required = true;
                 }
                 state.note_repair_mutation(revision);
             }
-            let plan_bound = state.bind_verification_plan(changed);
-            if plan_bound {
-                state.note_repair_verification_binding();
-            }
-            let plan_started = (plan_bound
-                && state.verification_plan.as_ref().is_some_and(|plan| {
-                    previous_verification_plan
-                        .as_ref()
-                        .is_none_or(|previous| previous.revision != plan.revision)
-                }))
-                || (prepared.call.tool_name == UPDATE_PLAN_TOOL
-                    && state
-                        .verification_plan
-                        .as_ref()
-                        .is_some_and(|plan| plan.revision.is_some()));
-            if plan_started {
-                let requirements = match CompletionTracker::merged_requirements(
-                    &caller_requirements,
-                    &state
-                        .verification_plan
-                        .as_ref()
-                        .expect("bound verification plan")
-                        .plan
-                        .requirements(),
-                ) {
-                    Ok(requirements) => requirements,
-                    Err(error) => return ToolBatchControl::Failed(error),
-                };
-                if let Err(error) = state.completion.activate_requirements(&requirements) {
-                    return ToolBatchControl::Failed(error);
-                }
-            }
-            if plan_started {
-                let plan = state
-                    .verification_plan
-                    .as_ref()
-                    .expect("bound verification plan")
-                    .plan
-                    .clone();
-                let summary = state.completion.summary();
-                let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
-                if emit_verification_plan_occurrence(
-                    on_event,
-                    input,
-                    occurrence.context.model_turn_ordinal,
-                    occurrence_ordinal,
-                    state
-                        .verification_plan
-                        .as_ref()
-                        .and_then(|plan| plan.revision),
-                    u32::try_from(plan.risks.len()).unwrap_or(u32::MAX),
-                    u32::try_from(plan.checks.len()).unwrap_or(u32::MAX),
-                    summary.satisfied_command_count,
-                    VerificationPlanStatus::Planned,
-                )
-                .is_err()
-                {
-                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-                }
-            }
             let repair_cycle =
                 state.consume_repair_cycle_if_complete(&prepared.call.tool_name, &result);
-            if !result.ok
-                && is_repairable_tool_result(&result)
-                && let Some(mut plan) = state.repair_plan()
-            {
-                let exhausted = repair_cycle.is_some_and(|commit| commit.exhausted)
-                    || plan.attempt > plan.max_attempts;
-                if let Some(commit) = repair_cycle {
-                    // The active plan has already advanced to the next prospective attempt (or
-                    // its internal exhaustion sentinel).  Project only the cycle that this
-                    // terminal command actually committed.
-                    plan.attempt = commit.attempt.min(plan.max_attempts);
-                }
-                let status = if exhausted {
-                    RepairPlanningStatus::Exhausted
-                } else {
-                    RepairPlanningStatus::Planned
-                };
-                if emit_repair_planning_occurrence(
-                    on_event,
-                    input,
-                    occurrence.context.model_turn_ordinal,
-                    occurrence.context.tool_call_ordinal,
-                    &plan,
-                    status,
-                )
-                .is_err()
-                {
-                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-                }
-            }
+            let _ = repair_cycle;
             if let Some((identity, required_command_count, occurrence_count)) =
                 verification_occurrence
             {
@@ -5712,14 +4414,12 @@ where
             state.messages.retain(|message| {
                 message.role != ModelRole::Developer
                     || (message.content != REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
-                        && message.content != REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS
-                        && !message.content.starts_with(REPAIR_PLAN_INSTRUCTIONS))
+                        && !message.content.starts_with(REPAIR_STATE_INSTRUCTIONS))
             });
-            // Append before projecting repair context so the current typed pre-execution failure
-            // participates in the exact-action recovery decision.
+            // Append before projecting repair context so the current typed failure is included.
             state.append_visible_tool_result(result.clone());
             let repair_feedback = state
-                .repair_plan
+                .repair_state
                 .is_some()
                 .then(|| state.repair_feedback_with_failure(Some(&result)));
             if let Some(feedback) = recovery_feedback {
@@ -5731,43 +4431,6 @@ where
                 state
                     .messages
                     .push(ModelMessage::text(ModelRole::Developer, repair_feedback));
-            }
-            if changed
-                && state.verification_planning_required
-                && verification_planning_available
-                && let Some(change) = &state.verification_change
-            {
-                let failure_hint = if state.verification_failure_history.is_empty() {
-                    "none".to_string()
-                } else {
-                    state
-                        .verification_failure_history
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
-                let trusted_change = serde_json::to_string(&json!({
-                    "changed_paths": change.changed_paths,
-                    "diff_digest": change.diff_digest,
-                    "prior_verification_failures": failure_hint,
-                }))
-                .unwrap_or_else(|_| "{}".to_string());
-                let (sandbox_mode, network_access) = effective_command_policy(&self.policy.profile);
-                let current_session_profile = serde_json::to_string(&json!({
-                    "sandbox_mode": sandbox_mode,
-                    "network_access": network_access,
-                }))
-                .unwrap_or_else(|_| "{}".to_string());
-                let caller_verification_commands =
-                    serde_json::to_string(&input.verification_commands)
-                        .unwrap_or_else(|_| "[]".to_string());
-                state.messages.push(ModelMessage::text(
-                    ModelRole::Developer,
-                    format!(
-                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. The caller-owned verification commands are exact and must all appear as actions with their required_success_count: caller_verification_commands={caller_verification_commands}. The current session profile is fixed and must be used exactly for every verification action: current_session_profile={current_session_profile}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile. When one command proves multiple risks, reuse the identical command, cwd, timeout and profile for those entries; after installing the plan, execute every distinct planned action exactly instead of substituting a semantically equivalent command."
-                    ),
-                ));
             }
             if failure.is_none() {
                 failure = non_repairable_error;
@@ -5802,11 +4465,11 @@ where
         if self.is_cancelled(input) {
             ToolBatchControl::Cancelled
         } else if state
-            .repair_plan
+            .repair_state
             .as_ref()
-            .is_some_and(|plan| plan.plan.attempt > plan.plan.max_attempts)
+            .is_some_and(|state| state.attempt > state.max_attempts)
         {
-            ToolBatchControl::Failed("repair planning budget exhausted".to_string())
+            ToolBatchControl::Failed("repair budget exhausted".to_string())
         } else if let Some(error_code) = failure {
             ToolBatchControl::Failed(format!("tool execution failed: {error_code}"))
         } else {
@@ -5818,28 +4481,11 @@ where
         &self,
         prepared: &PreparedToolCall,
         decision: ToolBrokerDecision,
-        state: &mut AgentLoopState,
         occurrence: &ToolOccurrenceContext,
         on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-        caller_requirements: &[AgentVerificationRequirement],
     ) -> RuntimeToolResult {
         let started = std::time::Instant::now();
         let call = &prepared.call;
-        if call.tool_name == TOOL_COMMAND
-            && state.verification_planning_required
-            && self.verification_planning_available()
-        {
-            return RuntimeToolResult {
-                result: ToolResult::failed_with_kind(
-                    &tool_call_request(call),
-                    ToolFailureKind::Input,
-                    "verification_plan_required",
-                    "declare a revision-bound verification plan with update_plan before running a verification command",
-                ),
-                duration_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-                event_sink_failed: false,
-            };
-        }
         let bound = prepared
             .bound
             .as_ref()
@@ -5851,9 +4497,6 @@ where
         let mut result = self
             .tool_broker
             .execute(&envelope, decision.clone(), |executor, _| match executor {
-                ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan) => {
-                    self.execute_plan_update(call, state, caller_requirements)
-                }
                 ToolExecutor::Workspace(_) => {
                     let execution = self.execute_workspace_tool(
                         call,
@@ -5890,156 +4533,6 @@ where
             duration_ms: Some(duration_ms),
             event_sink_failed,
         }
-    }
-
-    fn verification_planning_available(&self) -> bool {
-        self.tool_broker
-            .prepare_model_input(
-                UPDATE_PLAN_TOOL,
-                &json!({
-                    "steps": [{"step": "verification", "status": "pending"}]
-                }),
-            )
-            .is_ok()
-    }
-
-    fn execute_plan_update(
-        &self,
-        call: &ModelToolCall,
-        state: &mut AgentLoopState,
-        caller_requirements: &[AgentVerificationRequirement],
-    ) -> ToolOutput {
-        let update = match update_plan_tool_input(&call.arguments) {
-            Ok(update) => update,
-            Err(error) => {
-                return ToolOutput::failure(
-                    "invalid_tool_arguments",
-                    json!({"summary": error.to_string()}),
-                );
-            }
-        };
-        let verification_plan = if state.verification_planning_required {
-            let Some(entries) = update.verification.as_ref() else {
-                return ToolOutput::failure(
-                    "invalid_tool_arguments",
-                    json!({
-                        "summary": "verification entries are required after a workspace mutation"
-                    }),
-                );
-            };
-            match self.verification_plan_from_entries(entries, state) {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    return ToolOutput::failure(
-                        "invalid_tool_arguments",
-                        json!({"summary": error}),
-                    );
-                }
-            }
-        } else if let Some(entries) = update.verification.as_ref() {
-            let repeated_plan = match self.verification_plan_from_entries(entries, state) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    return ToolOutput::failure(
-                        "invalid_tool_arguments",
-                        json!({"summary": error}),
-                    );
-                }
-            };
-            let exact_installed_plan = state.verification_plan.as_ref().is_some_and(|installed| {
-                installed.revision == state.completion.workspace_revision
-                    && installed.plan == repeated_plan
-            });
-            if !exact_installed_plan {
-                return ToolOutput::failure(
-                    "invalid_tool_arguments",
-                    json!({
-                        "summary": "verification entries may only repeat the exact plan already bound to the current workspace revision"
-                    }),
-                );
-            }
-            // Repeating the installed plan while updating ordinary step statuses is idempotent.
-            // The existing revision binding and terminal command evidence remain authoritative.
-            None
-        } else {
-            None
-        };
-        if let Some(plan) = verification_plan
-            && let Err(error) = state.install_verification_plan(plan, caller_requirements)
-        {
-            return ToolOutput::failure("invalid_tool_arguments", json!({"summary": error}));
-        }
-        state.plan_update_count = state.plan_update_count.saturating_add(1);
-        state.plan = Some(update.plan.clone());
-        if state.input_revision > state.replanned_input_revision {
-            state.replanned_input_revision = state.input_revision;
-            state.completion.clear_user_input_invalidation();
-        }
-        ToolOutput::success(json!({
-            "plan": safe_plan_summary(&update.plan),
-            "verification": update.verification.as_ref().map(|entries| {
-                entries.iter().map(safe_verification_entry_summary).collect::<Vec<_>>()
-            }),
-            "plan_update_count": state.plan_update_count,
-        }))
-    }
-
-    fn verification_plan_from_entries(
-        &self,
-        entries: &[AgentVerificationEntry],
-        state: &AgentLoopState,
-    ) -> Result<AgentVerificationPlan, String> {
-        let change = state
-            .verification_change
-            .as_ref()
-            .ok_or_else(|| "verification change summary is unavailable".to_string())?;
-        let (sandbox_mode, network_access) = effective_command_policy(&self.policy.profile);
-        let mut risks = Vec::new();
-        let mut checks = Vec::new();
-        for entry in entries {
-            if !risks.contains(&entry.risk) {
-                risks.push(entry.risk);
-            }
-            if !change
-                .changed_paths
-                .iter()
-                .any(|path| path == &entry.affected_path)
-            {
-                return Err(
-                    "verification affected path is not present in the observed mutation"
-                        .to_string(),
-                );
-            }
-            if entry.action.sandbox_mode != sandbox_mode
-                || entry.action.network_access != network_access
-            {
-                return Err(
-                    "verification action sandbox profile does not match the current session"
-                        .to_string(),
-                );
-            }
-            let digest = command_script_scope_digest_with_policy(
-                &entry.action.command,
-                &entry.action.cwd,
-                entry.action.timeout_seconds,
-                entry.action.sandbox_mode.clone(),
-                entry.action.network_access.clone(),
-            );
-            checks.push(AgentVerificationCheck::new(
-                entry.risk,
-                AgentVerificationRequirement::new(digest, 1),
-            ));
-        }
-        if risks.is_empty() {
-            return Err("verification plan must contain at least one entry".to_string());
-        }
-        let plan = AgentVerificationPlan {
-            risks,
-            checks,
-            entries: entries.to_vec(),
-        };
-        plan.validate()?;
-        Ok(plan)
     }
 
     fn execute_workspace_tool(
@@ -6124,8 +4617,6 @@ fn execute_workspace_tool_call(
                     .grep_cancellable(input, cancellation)
                     .map_err(Into::into)
             }),
-        ToolExecutor::Workspace(WorkspaceToolExecutor::Edit) => edit_tool_input(&call.arguments)
-            .and_then(|input| workspace_tools.edit(input, decision).map_err(Into::into)),
         ToolExecutor::Workspace(WorkspaceToolExecutor::Patch) => patch_tool_input(&call.arguments)
             .and_then(|input| workspace_tools.patch(input, decision).map_err(Into::into)),
         ToolExecutor::Workspace(WorkspaceToolExecutor::Command) => {
@@ -6198,11 +4689,6 @@ fn execute_workspace_tool_call(
                 Err(error) => Err(error),
             }
         }
-        ToolExecutor::AgentControl(_) => Ok(ToolOutput::failure_with_kind(
-            ToolFailureKind::Backend,
-            "backend_unavailable",
-            json!({"summary": "tool backend is unavailable"}),
-        )),
     };
     WorkspaceToolExecution {
         output: result.unwrap_or_else(workspace_tool_failure),
@@ -6681,32 +5167,6 @@ fn compacted_tool_result_message(
 fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> String {
     let verification = state.completion.summary();
     let active_control_instructions = compaction_control_instructions(state);
-    let plan = state.plan.as_ref().map(|plan| {
-        let completed = plan
-            .steps
-            .iter()
-            .filter(|step| step.status == AgentPlanStepStatus::Completed)
-            .count();
-        let in_progress = plan
-            .steps
-            .iter()
-            .find(|step| step.status == AgentPlanStepStatus::InProgress);
-        let next_pending = plan
-            .steps
-            .iter()
-            .find(|step| step.status == AgentPlanStepStatus::Pending);
-        let current_step = in_progress.or(next_pending).map(|step| {
-            safe_plan_step_text(&step.step)
-                .chars()
-                .take(MAX_COMPACTION_PLAN_STEP_CHARS)
-                .collect::<String>()
-        });
-        json!({
-            "step_count": plan.steps.len(),
-            "completed_step_count": completed,
-            "current_step": current_step,
-        })
-    });
     let failed_tool_result_count = state
         .tool_result_occurrences
         .iter()
@@ -6718,7 +5178,6 @@ fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> S
         "compacted_message_count": compacted_message_count,
         "tool_result_count": state.tool_result_occurrences.len(),
         "failed_tool_result_count": failed_tool_result_count,
-        "plan": plan,
         "verification": {
             "required": verification.required,
             "passed": verification.passed,
@@ -6736,9 +5195,6 @@ fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
     let mut instructions = Vec::new();
     if !state.completion.allows_final() {
         instructions.push(state.completion.feedback());
-    }
-    if state.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
-        instructions.push(PLAN_COMPLETION_REQUIRED.to_string());
     }
     if state
         .last_repair_failure
@@ -6834,52 +5290,13 @@ fn restore_checkpoint(
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let caller_requirements = verification_requirements(input)?;
-    let requirements = match checkpoint_state.verification_plan.as_ref() {
-        Some(plan) => {
-            CompletionTracker::merged_requirements(&caller_requirements, &plan.plan.requirements())?
-        }
-        None => caller_requirements.clone(),
-    };
-    let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
-    for occurrence in &tool_result_occurrences {
-        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
-            derived_completion.observe(occurrence.result());
-        }
-    }
-    if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
-        if checkpoint_state.verification_plan.is_some() {
-            return Err("approval checkpoint verification plan survived user steer".to_string());
-        }
-        derived_completion.mark_workspace_revision_invalid("user_input_revision");
-        derived_completion.replace_requirements(&caller_requirements)?;
-    }
-    if !derived_completion.is_consistent() {
-        return Err("approval checkpoint derived workspace revision state is invalid".to_string());
-    }
+    let derived_completion = restore_completion_from_history(
+        checkpoint_history_messages,
+        &tool_result_occurrences,
+        &checkpoint_state.completion,
+    )?;
     if derived_completion != checkpoint_state.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
-    }
-    if let Some(checkpoint_plan) = &checkpoint_state.verification_plan {
-        checkpoint_plan
-            .plan
-            .validate()
-            .map_err(|error| format!("approval checkpoint verification plan mismatch: {error}"))?;
-    }
-    if let Some(plan) = &checkpoint_state.verification_plan
-        && let Some(revision) = plan.revision
-        && Some(revision) != derived_completion.workspace_revision
-    {
-        return Err("approval checkpoint verification plan revision mismatch".to_string());
-    }
-    let derived_plan_update_count = tool_result_occurrences
-        .iter()
-        .filter(|occurrence| {
-            occurrence.result().tool_name == UPDATE_PLAN_TOOL && occurrence.result().ok
-        })
-        .count() as u32;
-    if derived_plan_update_count != checkpoint_state.plan_update_count {
-        return Err("approval checkpoint plan update count mismatch".to_string());
     }
     let seen_tool_call_fingerprints = checkpoint_state
         .seen_tool_call_fingerprints
@@ -6891,30 +5308,94 @@ fn restore_checkpoint(
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint_state.approval_count;
     state.completion = derived_completion;
-    state.verification_plan = checkpoint_state.verification_plan;
     state.verification_change = checkpoint_state.verification_change;
-    state.verification_failure_history = checkpoint_state
-        .verification_failure_history
-        .into_iter()
-        .collect();
-    state.verification_planning_required =
-        state.verification_plan.is_none() && state.completion.workspace_mutated();
-    state.repair_plan = checkpoint_state.repair_plan;
+    state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
     state.final_review_verdict = checkpoint_state.final_review_verdict;
     state.last_completion_error = checkpoint_state.last_completion_error;
-    state.plan = checkpoint_state.plan;
-    state.plan_update_count = checkpoint_state.plan_update_count;
     state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
     state.provider_attempts = checkpoint_state.provider_attempts;
     state.context_trace = checkpoint_state.context_trace;
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
     state.last_repair_failure = checkpoint_state.last_repair_failure;
-    state.input_revision = checkpoint_state.input_revision;
-    state.replanned_input_revision = checkpoint_state.replanned_input_revision;
     Ok((state, checkpoint_state.model_turns))
+}
+
+/// Rebuild completion from checkpoint occurrences while preserving the post-input invalidation
+/// boundary. Omitted occurrences still prove workspace revision, but cannot prove terminal
+/// verification after a newer user input unless a later visible/compacted assistant call binds it.
+fn restore_completion_from_history(
+    messages: &[ModelMessage],
+    tool_result_occurrences: &[ToolResultOccurrence],
+    checkpoint_completion: &CompletionTracker,
+) -> Result<CompletionTracker, String> {
+    let occurrences = tool_result_message_occurrences(messages, tool_result_occurrences)
+        .ok_or_else(|| "turn checkpoint tool result occurrence bindings are invalid".to_string())?;
+    let mut derived = CompletionTracker::default();
+    for occurrence in tool_result_occurrences {
+        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
+            derived.observe(occurrence.result());
+        }
+    }
+    if !derived.is_consistent() {
+        return Err("turn checkpoint derived workspace revision state is invalid".to_string());
+    }
+
+    let user_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == ModelRole::User).then_some(index))
+        .collect::<Vec<_>>();
+    if user_indices.len() > 1 {
+        let latest_user_index = *user_indices.last().expect("user count checked");
+        let has_post_input_occurrence = occurrences
+            .iter()
+            .any(|occurrence| occurrence.assistant_index > latest_user_index);
+        if has_post_input_occurrence {
+            derived.invalidate_after_user_input();
+            for occurrence in occurrences
+                .iter()
+                .filter(|occurrence| occurrence.assistant_index > latest_user_index)
+            {
+                let result = tool_result_occurrences
+                    .get(occurrence.result_index)
+                    .ok_or_else(|| {
+                        "turn checkpoint tool result occurrence index is invalid".to_string()
+                    })?
+                    .result();
+                if result.error_code.as_deref() == Some("not_executed_due_to_user_input") {
+                    continue;
+                }
+                if result.tool_name == TOOL_COMMAND
+                    && result.ok
+                    && let Some(observation) = result.workspace_observation()
+                    && observation.mutation() == WorkspaceMutation::Unchanged
+                    && let Some(revision) = observation.revision()
+                {
+                    derived.record_terminal_command_observation(
+                        successful_command_scope_digest(result),
+                        revision,
+                        1,
+                    );
+                }
+            }
+        } else if checkpoint_completion.requires_post_input_verification() {
+            // Context compaction may omit the post-input assistant/tool messages. The persisted
+            // reducer bit is then the only remaining proof; retain its fail-closed state.
+            derived.invalidate_after_user_input();
+        }
+    } else if checkpoint_completion.requires_post_input_verification() {
+        // Context compaction may retain only the newest user message. The persisted reducer bit
+        // still proves that this message superseded the previous terminal evidence.
+        derived.invalidate_after_user_input();
+    }
+
+    if !derived.is_consistent() || derived != *checkpoint_completion {
+        return Err("turn checkpoint completion state mismatch".to_string());
+    }
+    Ok(derived)
 }
 
 /// Restore the shared state of an ordinary turn checkpoint. Unlike approval restore, this path
@@ -6948,70 +5429,22 @@ fn restore_turn_checkpoint(
     {
         return Err("turn checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let caller_requirements = verification_requirements(input)?;
-    let requirements = match checkpoint_state.verification_plan.as_ref() {
-        Some(plan) => {
-            CompletionTracker::merged_requirements(&caller_requirements, &plan.plan.requirements())?
-        }
-        None => caller_requirements.clone(),
-    };
-    let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
-    for occurrence in &checkpoint_state.tool_result_occurrences {
-        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
-            derived_completion.observe(occurrence.result());
-        }
-    }
-    if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
-        if checkpoint_state.verification_plan.is_some() {
-            return Err("turn checkpoint verification plan survived user steer".to_string());
-        }
-        derived_completion.mark_workspace_revision_invalid("user_input_revision");
-        derived_completion.replace_requirements(&caller_requirements)?;
-    }
-    if !derived_completion.is_consistent() || derived_completion != checkpoint_state.completion {
-        return Err("turn checkpoint completion state mismatch".to_string());
-    }
-    if let Some(plan) = &checkpoint_state.verification_plan {
-        plan.plan
-            .validate()
-            .map_err(|error| format!("turn checkpoint verification plan mismatch: {error}"))?;
-        if plan
-            .revision
-            .is_some_and(|revision| Some(revision) != derived_completion.workspace_revision)
-        {
-            return Err("turn checkpoint verification plan revision mismatch".to_string());
-        }
-    }
-    let derived_plan_update_count = checkpoint_state
-        .tool_result_occurrences
-        .iter()
-        .filter(|occurrence| {
-            occurrence.result().tool_name == UPDATE_PLAN_TOOL && occurrence.result().ok
-        })
-        .count() as u32;
-    if derived_plan_update_count != checkpoint_state.plan_update_count {
-        return Err("turn checkpoint plan update count mismatch".to_string());
-    }
+    let derived_completion = restore_completion_from_history(
+        &checkpoint_state.messages,
+        &checkpoint_state.tool_result_occurrences,
+        &checkpoint_state.completion,
+    )?;
     let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
     state.tool_result_occurrences = checkpoint_state.tool_result_occurrences;
     state.used_approval_grants = checkpoint_state.used_approval_grants.into_iter().collect();
     state.prior_approval_count = checkpoint_state.approval_count;
     state.completion = derived_completion;
-    state.verification_plan = checkpoint_state.verification_plan;
     state.verification_change = checkpoint_state.verification_change;
-    state.verification_failure_history = checkpoint_state
-        .verification_failure_history
-        .into_iter()
-        .collect();
-    state.verification_planning_required =
-        state.verification_plan.is_none() && state.completion.workspace_mutated();
-    state.repair_plan = checkpoint_state.repair_plan;
+    state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
     state.final_review_verdict = checkpoint_state.final_review_verdict;
     state.last_completion_error = checkpoint_state.last_completion_error;
-    state.plan = checkpoint_state.plan;
-    state.plan_update_count = checkpoint_state.plan_update_count;
     state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
     state.provider_attempts = checkpoint_state.provider_attempts;
@@ -7021,8 +5454,6 @@ fn restore_turn_checkpoint(
         .into_iter()
         .collect();
     state.last_repair_failure = checkpoint_state.last_repair_failure;
-    state.input_revision = checkpoint_state.input_revision;
-    state.replanned_input_revision = checkpoint_state.replanned_input_revision;
     Ok((state, checkpoint_state.model_turns))
 }
 
@@ -7075,8 +5506,6 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         pending_approvals: Vec::new(),
         tool_results: Vec::new(),
         verification: AgentVerification::default(),
-        plan: None,
-        plan_update_count: 0,
         recovery_metrics: AgentRecoveryMetrics::default(),
         model_usage: ModelUsage::default(),
         provider_attempts: ProviderAttemptMetadata::default(),
@@ -7088,87 +5517,6 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         provider_protocol_contract: None,
         provider_capability_metadata: None,
     }
-}
-
-fn validate_verification_entry_shape(entry: &AgentVerificationEntry) -> Result<(), String> {
-    if entry.evidence.trim().is_empty()
-        || entry.affected_symbol.trim().is_empty()
-        || entry.current_gap.trim().is_empty()
-    {
-        return Err("verification entry text fields must not be empty".to_string());
-    }
-    if entry.evidence.chars().count() > MAX_VERIFICATION_TEXT_CHARS
-        || entry.affected_path.chars().count() > MAX_VERIFICATION_TEXT_CHARS
-        || entry.affected_symbol.chars().count() > MAX_VERIFICATION_TEXT_CHARS
-        || entry.current_gap.chars().count() > MAX_VERIFICATION_TEXT_CHARS
-    {
-        return Err(format!(
-            "verification entry text must not exceed {MAX_VERIFICATION_TEXT_CHARS} characters"
-        ));
-    }
-    if contains_sensitive_text(&entry.evidence)
-        || contains_sensitive_text(&entry.affected_symbol)
-        || contains_sensitive_text(&entry.current_gap)
-    {
-        return Err("verification entry contains sensitive text".to_string());
-    }
-    if !is_bounded_workspace_relative_path(&entry.affected_path) {
-        return Err("verification entry affected_path is not a bounded relative path".to_string());
-    }
-    validate_verification_action(&entry.action)?;
-    Ok(())
-}
-
-fn verification_requirements(
-    input: &AgentLoopInput,
-) -> Result<Vec<AgentVerificationRequirement>, String> {
-    if input.verification_commands.len() > MAX_VERIFICATION_REQUIREMENTS {
-        return Err(format!(
-            "verification commands must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
-        ));
-    }
-    input
-        .verification_commands
-        .iter()
-        .map(|command| {
-            validate_verification_action(&command.action)?;
-            if command.required_success_count == 0
-                || command.required_success_count > MAX_VERIFICATION_REQUIREMENTS as u32
-            {
-                return Err(
-                    "verification command required count is outside the command contract"
-                        .to_string(),
-                );
-            }
-            Ok(command.requirement())
-        })
-        .collect()
-}
-
-fn validate_verification_action(action: &AgentVerificationAction) -> Result<(), String> {
-    if action.command.trim().is_empty()
-        || action.command.chars().count() > MAX_VERIFICATION_COMMAND_CHARS
-        || action.command.contains('\0')
-    {
-        return Err("verification command is invalid".to_string());
-    }
-    if !is_bounded_workspace_relative_path(&action.cwd) {
-        return Err("verification command cwd must be a bounded relative path".to_string());
-    }
-    if action.timeout_seconds == 0 || action.timeout_seconds > MAX_VERIFICATION_TIMEOUT_SECONDS {
-        return Err("verification command timeout is outside the command contract".to_string());
-    }
-    Ok(())
-}
-
-fn verification_action_scope_digest(action: &AgentVerificationAction) -> String {
-    command_script_scope_digest_with_policy(
-        &action.command,
-        &action.cwd,
-        action.timeout_seconds,
-        action.sandbox_mode.clone(),
-        action.network_access.clone(),
-    )
 }
 
 fn provider_error_model_response(
@@ -7566,25 +5914,6 @@ fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
     }
 }
 
-/// Stable pre-execution boundaries that make an installed exact command impossible to submit.
-///
-/// These categories are deliberately narrower than all repairable failures: malformed input and
-/// approval-sensitive calls still require the trusted exact action, while capability/policy/path
-/// boundaries must release it for a bounded strategy change.
-fn is_pre_execution_replan_failure(tool_result: &ToolResult) -> bool {
-    !tool_result.ok
-        && tool_result.workspace_observation().is_none()
-        && matches!(
-            tool_result.failure_kind,
-            Some(
-                ToolFailureKind::Capability
-                    | ToolFailureKind::Policy
-                    | ToolFailureKind::PermissionProfile
-                    | ToolFailureKind::ProtectedPath
-            )
-        )
-}
-
 /// Binding may materialize absent optional object fields as `null`; those two JSON forms have the
 /// same executable meaning, while every non-null value and every array position remains exact.
 fn checkpoint_arguments_equivalent(model: &Value, pending: &Value) -> bool {
@@ -7637,7 +5966,7 @@ fn parse_final_review_response(
             "final review verification evidence does not match current requirements".to_string(),
         );
     }
-    if review.reason.chars().count() > MAX_VERIFICATION_TEXT_CHARS
+    if review.reason.chars().count() > MAX_REVIEW_TEXT_CHARS
         || contains_sensitive_text(&review.reason)
     {
         return Err("final review response contains invalid bounded text".to_string());
@@ -7656,35 +5985,6 @@ fn parse_final_review_response(
         }
         FinalReviewVerdict::Cancelled => Err("invalid final review verdict".to_string()),
     }
-}
-
-fn safe_plan_summary(plan: &AgentPlan) -> Value {
-    serde_json::to_value(safe_agent_plan(plan)).expect("safe agent plan serializes")
-}
-
-fn safe_verification_entry_summary(entry: &AgentVerificationEntry) -> Value {
-    json!({
-        "risk": entry.risk,
-        "affected_path": entry.affected_path,
-        "affected_symbol": entry.affected_symbol.chars().take(MAX_VERIFICATION_TEXT_CHARS).collect::<String>(),
-        "action": {
-            // The action is already bounded and validated as the model-declared verification
-            // contract. Echo it so the next model turn can reproduce the exact scope instead of
-            // guessing from the digest.
-            "command": entry.action.command,
-            "cwd": entry.action.cwd,
-            "timeout_seconds": entry.action.timeout_seconds,
-            "sandbox_mode": entry.action.sandbox_mode,
-            "network_access": entry.action.network_access,
-        },
-        "action_scope_digest": command_script_scope_digest_with_policy(
-            &entry.action.command,
-            &entry.action.cwd,
-            entry.action.timeout_seconds,
-            entry.action.sandbox_mode.clone(),
-            entry.action.network_access.clone(),
-        ),
-    })
 }
 
 fn verification_change_summary(
@@ -7733,7 +6033,7 @@ fn verification_change_summary(
 
 fn is_bounded_workspace_relative_path(path: &str) -> bool {
     !path.is_empty()
-        && path.chars().count() <= MAX_VERIFICATION_TEXT_CHARS
+        && path.chars().count() <= MAX_REVIEW_TEXT_CHARS
         && !path.contains('\0')
         && !std::path::Path::new(path).is_absolute()
         && std::path::Path::new(path).components().all(|component| {
@@ -7746,11 +6046,6 @@ fn is_bounded_workspace_relative_path(path: &str) -> bool {
 
 fn mutation_paths_from_call(call: &ModelToolCall) -> Result<Vec<String>, String> {
     let paths = match call.tool_name.as_str() {
-        TOOL_EDIT => vec![
-            serde_json::from_value::<EditToolInput>(call.arguments.clone())
-                .map_err(|_| "workspace edit arguments are invalid".to_string())?
-                .path,
-        ],
         TOOL_PATCH => serde_json::from_value::<WorkspacePatch>(call.arguments.clone())
             .map_err(|_| "workspace patch arguments are invalid".to_string())?
             .changes
@@ -7761,26 +6056,6 @@ fn mutation_paths_from_call(call: &ModelToolCall) -> Result<Vec<String>, String>
         _ => return Err("workspace mutation summary has an unexpected tool".to_string()),
     };
     Ok(paths)
-}
-
-fn safe_agent_plan(plan: &AgentPlan) -> AgentPlan {
-    AgentPlan {
-        steps: plan
-            .steps
-            .iter()
-            .map(|plan_step| AgentPlanStep {
-                step: safe_plan_step_text(&plan_step.step),
-                status: plan_step.status,
-            })
-            .collect(),
-    }
-}
-
-fn safe_plan_step_text(step: &str) -> String {
-    if contains_sensitive_text(step) {
-        return "[redacted plan step]".to_string();
-    }
-    step.chars().take(MAX_PLAN_STEP_CHARS).collect()
 }
 
 fn canonical_json(value: &Value) -> Value {
@@ -7822,51 +6097,6 @@ fn repair_reason_text(reason: AgentRepairReason) -> &'static str {
 
 fn bounded_repair_text(value: &str) -> String {
     value.chars().take(MAX_REPAIR_CONTEXT_CHARS).collect()
-}
-
-/// Project one trusted exact verification action without mixing policy facts into tool input.
-fn repair_verification_action(
-    entry: &AgentVerificationEntry,
-    required_success_count: u32,
-    remaining_success_count: u32,
-) -> Value {
-    json!({
-        "command_tool_input": repair_command_tool_input(entry),
-        "enforced_policy_context": {
-            "sandbox_mode": entry.action.sandbox_mode,
-            "network_access": entry.action.network_access,
-        },
-        "submit_only_command_tool_input": true,
-        "next_action": "execute_command_tool_input_exactly",
-        "replan_or_mutate_before_execution": false,
-        "command_scope_digest": command_script_scope_digest_with_policy(
-            &entry.action.command,
-            &entry.action.cwd,
-            entry.action.timeout_seconds,
-            entry.action.sandbox_mode.clone(),
-            entry.action.network_access.clone(),
-        ),
-        "required_success_count": required_success_count,
-        "remaining_success_count": remaining_success_count,
-    })
-}
-
-fn repair_command_tool_input(entry: &AgentVerificationEntry) -> Value {
-    json!({
-        // The exact command must not be truncated because that changes its scope.
-        "command": entry.action.command,
-        "cwd": bounded_repair_text(&entry.action.cwd),
-        "timeout_seconds": entry.action.timeout_seconds,
-    })
-}
-
-/// Project the installed next action as trusted request guidance without claiming provider support
-/// for required tool choice.
-fn pending_exact_verification_instruction(command_input: &Value) -> String {
-    let command_input = serde_json::to_string(command_input).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "{PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX} Do not finalize, replan, mutate, or choose another tool; submit only the exact command input below as the next action, then wait for its ToolResult before deciding what follows. exact_command_input={command_input}"
-    )
 }
 
 /// Project only the already-redacted public tool result payload into bounded repair evidence.
@@ -7988,24 +6218,12 @@ fn grep_tool_input(arguments: &Value) -> Result<GrepToolInput, AgentLoopToolErro
     serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
 }
 
-fn edit_tool_input(arguments: &Value) -> Result<EditToolInput, AgentLoopToolError> {
-    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
-}
-
 fn patch_tool_input(arguments: &Value) -> Result<WorkspacePatch, AgentLoopToolError> {
     serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
 }
 
 fn command_tool_input(arguments: &Value) -> Result<CommandToolInput, AgentLoopToolError> {
     serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
-}
-
-fn update_plan_tool_input(arguments: &Value) -> Result<ValidatedPlanUpdate, AgentLoopToolError> {
-    let input: AgentPlanUpdateRequest =
-        serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)?;
-    input
-        .into_update()
-        .map_err(AgentLoopToolError::InvalidArguments)
 }
 
 fn permission_failure_kind(cause: &PermissionCause) -> ToolFailureKind {
@@ -8018,16 +6236,6 @@ fn permission_failure_kind(cause: &PermissionCause) -> ToolFailureKind {
             ToolFailureKind::Policy
         }
     }
-}
-
-fn validate_plan_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
-    let input: AgentPlanUpdateRequest = serde_json::from_value(input.clone())
-        .map_err(|_| ToolInputValidationError::new("plan_input_shape_invalid"))?;
-    planning::validate_code(&input.steps).map_err(ToolInputValidationError::new)?;
-    input
-        .into_update()
-        .map(|_| ())
-        .map_err(|_| ToolInputValidationError::new("plan_input_invalid"))
 }
 
 fn invalid_tool_arguments_result(
@@ -8056,25 +6264,6 @@ fn invalid_tool_arguments_result(
                 "validation_code": error.code,
             }),
         )
-    } else if call.tool_name == UPDATE_PLAN_TOOL
-        && matches!(
-            error.code.as_str(),
-            "plan_input_shape_invalid" | "plan_input_invalid"
-        )
-    {
-        let summary = if error.code == "plan_input_shape_invalid" {
-            "update_plan requires one JSON object whose steps field is an array; verification, when present, is a sibling array. Do not encode either array or the whole object as a JSON string."
-        } else {
-            "update_plan verification entries must use bounded workspace-relative affected_path and action.cwd values; use cwd \".\" for the workspace root. Commands, evidence, symbols and gaps must be non-empty and stay within their declared limits."
-        };
-        ToolOutput::failure_with_kind(
-            ToolFailureKind::Input,
-            "invalid_tool_arguments",
-            json!({
-                "summary": summary,
-                "validation_code": error.code,
-            }),
-        )
     } else if call.tool_name == TOOL_COMMAND {
         invalid_command_arguments_output(&error.code, spec)
     } else {
@@ -8096,12 +6285,6 @@ fn invalid_command_arguments_output(validation_code: &str, spec: Option<&ToolSpe
     // validation code and schema hints useful to the model, but never echo
     // the raw argument payload through a public tool result.
     let mut summary = format!("invalid command arguments ({validation_code})");
-    let retry_inputs = spec.map(ToolSpec::exact_model_inputs).unwrap_or_default();
-    if !retry_inputs.is_empty() {
-        summary.push_str(
-            ". The command field must be a shell command string. Copy one complete retry_inputs object exactly",
-        );
-    }
     if let Some(schema) = spec.map(|spec| &spec.input_schema) {
         let schema = schema.to_string();
         let mut hint = schema
@@ -8120,7 +6303,6 @@ fn invalid_command_arguments_output(validation_code: &str, spec: Option<&ToolSpe
         json!({
             "summary": summary,
             "validation_code": validation_code,
-            "retry_inputs": retry_inputs,
         }),
     )
 }
@@ -8546,7 +6728,7 @@ mod audit_projection_tests {
         before_mutation = before_mutation.with_workspace_observation(
             WorkspaceObservation::unchanged(WorkspaceRevision::initial()),
         );
-        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+        let mutation = ToolResult::summary("patch", TOOL_PATCH, true, "changed")
             .with_workspace_observation(WorkspaceObservation::changed(
                 WorkspaceRevision::initial().next().expect("revision"),
             ));
@@ -8566,7 +6748,7 @@ mod audit_projection_tests {
     fn terminal_command_observations_preserve_revision_across_unexecuted_failures() {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let revision = WorkspaceRevision::initial().next().expect("revision");
-        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+        let mutation = ToolResult::summary("patch", TOOL_PATCH, true, "changed")
             .with_workspace_observation(WorkspaceObservation::changed(revision));
         let rejected = ToolResult::summary("invalid", TOOL_COMMAND, false, "invalid arguments");
         let mut verified = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
@@ -8585,7 +6767,7 @@ mod audit_projection_tests {
         let mut tracker = CompletionTracker::default();
         let revision = WorkspaceRevision::initial().next().expect("revision");
         tracker.observe(
-            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            &ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::changed(revision)),
         );
 
@@ -8610,107 +6792,85 @@ mod audit_projection_tests {
     }
 
     #[test]
-    fn exact_verification_supersedes_side_effect_free_mutation_input_failure() {
+    fn follow_up_invalidates_terminal_evidence_across_restore_and_compaction() {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut tracker =
-            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
-                .expect("completion tracker");
         let revision = WorkspaceRevision::initial().next().expect("revision");
-        tracker.observe(
-            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision)),
-        );
-        let mut rejected = ToolResult::summary("patch", TOOL_PATCH, false, "invalid input");
-        rejected.failure_kind = Some(ToolFailureKind::Input);
-        rejected.error_code = Some("invalid_tool_input".to_string());
-        tracker.observe(&rejected);
-        assert_eq!(
-            tracker.summary().unresolved_failures,
-            vec!["workspace_mutation:invalid_tool_input".to_string()]
-        );
+        let patch = ToolResult::summary("patch", TOOL_PATCH, true, "changed")
+            .with_workspace_observation(WorkspaceObservation::changed(revision));
+        let mut command = ToolResult::summary("command", TOOL_COMMAND, true, "verified");
+        command.result_id = Some(digest.to_string());
+        command = command.with_workspace_observation(WorkspaceObservation::unchanged(revision));
+        let occurrences = vec![
+            ToolResultOccurrence::new(patch.clone(), ToolResultVisibility::Visible),
+            ToolResultOccurrence::new(command.clone(), ToolResultVisibility::Visible),
+        ];
+        let mut messages = vec![
+            ModelMessage::text(ModelRole::User, "initial task"),
+            assistant_tool_message_for("patch", TOOL_PATCH),
+            tool_message("patch", "changed"),
+            assistant_tool_message_for("command", TOOL_COMMAND),
+            tool_message("command", "verified"),
+        ];
+        messages.push(ModelMessage::text(ModelRole::User, "follow-up task"));
 
-        let mut verified = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
-        verified.result_id = Some(digest.to_string());
-        tracker.observe(
-            &verified.with_workspace_observation(WorkspaceObservation::unchanged(revision)),
-        );
+        let mut expected = CompletionTracker::default();
+        expected.observe(&patch);
+        expected.observe(&command);
+        expected.invalidate_after_user_input();
+        assert!(!expected.verification_satisfied());
+        let restored = restore_completion_from_history(&messages, &occurrences, &expected)
+            .expect("follow-up restore");
+        assert_eq!(restored, expected);
+        assert!(!restored.verification_satisfied());
 
-        assert!(tracker.allows_final());
-        assert!(tracker.summary().unresolved_failures.is_empty());
+        messages.push(assistant_tool_message_for("command-2", TOOL_COMMAND));
+        messages.push(tool_message("command-2", "verified again"));
+        let mut command_after_follow_up = command.clone();
+        command_after_follow_up.tool_call_id = "command-2".to_string();
+        let mut occurrences_after_follow_up = occurrences.clone();
+        occurrences_after_follow_up.push(ToolResultOccurrence::new(
+            command_after_follow_up.clone(),
+            ToolResultVisibility::Visible,
+        ));
+        let mut expected_after_follow_up = expected.clone();
+        expected_after_follow_up.observe(&command_after_follow_up);
+        let restored_after_follow_up = restore_completion_from_history(
+            &messages,
+            &occurrences_after_follow_up,
+            &expected_after_follow_up,
+        )
+        .expect("post-follow-up restore");
+        assert!(restored_after_follow_up.verification_satisfied());
+
+        let compacted_messages = vec![ModelMessage::text(ModelRole::User, "follow-up task")];
+        let compacted_occurrences = occurrences
+            .into_iter()
+            .map(|occurrence| {
+                ToolResultOccurrence::new(occurrence.into_result(), ToolResultVisibility::Omitted)
+            })
+            .collect::<Vec<_>>();
+        let compacted =
+            restore_completion_from_history(&compacted_messages, &compacted_occurrences, &expected)
+                .expect("compacted follow-up restore");
+        assert_eq!(compacted, expected);
+        assert!(!compacted.verification_satisfied());
     }
 
-    #[test]
-    fn exact_verification_only_supersedes_input_failures_after_a_verified_mutation() {
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let verified = |revision| {
-            let mut result = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
-            result.result_id = Some(digest.to_string());
-            result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
-        };
-
-        let mut before_mutation =
-            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
-                .expect("completion tracker");
-        let mut rejected = ToolResult::summary("patch", TOOL_PATCH, false, "invalid input");
-        rejected.failure_kind = Some(ToolFailureKind::Input);
-        rejected.error_code = Some("invalid_tool_input".to_string());
-        before_mutation.observe(&rejected);
-        before_mutation.observe(&verified(WorkspaceRevision::initial()));
-        assert!(!before_mutation.allows_final());
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        before_mutation.observe(
-            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision)),
-        );
-        before_mutation.observe(&verified(revision));
-        assert!(before_mutation.allows_final());
-
-        let mut executed_failure =
-            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
-                .expect("completion tracker");
-        executed_failure.observe(
-            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision)),
-        );
-        let mut failed = ToolResult::summary("patch", TOOL_PATCH, false, "execution failed");
-        failed.failure_kind = Some(ToolFailureKind::Execution);
-        failed.error_code = Some("expected_content_missing".to_string());
-        executed_failure.observe(&failed);
-        executed_failure.observe(&verified(revision));
-        assert!(!executed_failure.allows_final());
-        assert_eq!(
-            executed_failure.summary().unresolved_failures,
-            vec!["workspace_mutation:expected_content_missing".to_string()]
-        );
+    fn assistant_tool_message_for(tool_call_id: &str, tool_name: &str) -> ModelMessage {
+        ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: json!({}),
+            raw_arguments: "{}".to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        }])
     }
 
-    #[test]
-    fn exact_completion_requires_required_commands_as_the_terminal_multiset() {
-        let required = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut tracker =
-            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(required, 2)])
-                .expect("completion tracker");
-        let command = |call_id: &str, digest: &str, revision: WorkspaceRevision| {
-            let mut result = ToolResult::summary(call_id, TOOL_COMMAND, true, "ok");
-            result.result_id = Some(digest.to_string());
-            result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
-        };
-        let initial = WorkspaceRevision::initial();
-        let changed = initial.next().expect("revision");
-
-        tracker.observe(&command("smoke-1", required, initial));
-        tracker.observe(&command("smoke-2", required, initial));
-        assert!(tracker.verification_satisfied());
-
-        tracker.observe(
-            &ToolResult::summary("write-after-smoke", TOOL_COMMAND, true, "ok")
-                .with_workspace_observation(WorkspaceObservation::changed(changed)),
-        );
-        assert!(!tracker.verification_satisfied());
-        tracker.observe(&command("smoke-3", required, changed));
-        assert!(!tracker.verification_satisfied());
-        tracker.observe(&command("smoke-4", required, changed));
-        assert!(tracker.verification_satisfied());
+    fn tool_message(tool_call_id: &str, content: &str) -> ModelMessage {
+        let mut message = ModelMessage::text(ModelRole::Tool, content);
+        message.tool_call_id = Some(tool_call_id.to_string());
+        message
     }
 }
 

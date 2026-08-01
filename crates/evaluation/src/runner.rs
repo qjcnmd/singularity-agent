@@ -24,8 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationAction, AgentVerificationCommand, agent_control_tool_entries,
-    terminal_command_scope_digests,
+    AgentStatus,
 };
 use singularity_app_server::TraceProjector;
 use singularity_core::{
@@ -36,11 +35,7 @@ use singularity_model::{
     ProviderCapabilityMetadata, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
     ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
 };
-use singularity_policy::{
-    ApprovalPolicy, CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome,
-    PermissionOperation, PermissionProfile, PermissionResource, PermissionRule, PolicyEngine,
-    SettingsScope, WorkspaceRelativePath,
-};
+use singularity_policy::{ApprovalPolicy, PermissionProfileName, workspace_policy};
 use singularity_protocol::{
     TraceEvent, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
 };
@@ -49,15 +44,14 @@ use singularity_sandbox::PreparedWorkspaceObservation;
 use singularity_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest,
-    CommandResult, CommandScriptRequest, CommandSemanticStatus, EDIT_TOOL as TOOL_EDIT,
-    ExecutableAvailability, PATCH_TOOL as TOOL_PATCH, SandboxBackend, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightOutcome,
-    SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor,
-    ToolRegistry, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
-    command_script_scope_digest_with_policy, workspace_tool_entries,
+    CommandResult, CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability,
+    PATCH_TOOL as TOOL_PATCH, SandboxBackend, SandboxCapabilities, SandboxNetworkMode,
+    SandboxPreflightFact, SandboxPreflightOutcome, SandboxPreflightReport, ToolBroker,
+    ToolRegistry, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceTools,
+    workspace_tool_entries,
 };
 #[cfg(test)]
-use singularity_tools::{GREP_TOOL as TOOL_GREP, LIST_TOOL as TOOL_LIST, READ_TOOL as TOOL_READ};
+use singularity_tools::{READ_TOOL as TOOL_READ, SandboxFilesystemMode};
 
 mod command;
 mod evidence;
@@ -65,20 +59,19 @@ mod workspace;
 
 use command::{
     CommandDiagnostic, command_blocker, command_succeeded, infrastructure_blocker,
-    project_command_spec, run_command_spec, run_raw_command, run_task_workspace_preflight_command,
+    run_command_spec, run_raw_command, run_task_workspace_preflight_command,
     run_workspace_preparation_command, run_workspace_preparation_read_only_command,
-    sandbox_network_mode, unchanged_command_succeeded,
+    unchanged_command_succeeded,
 };
 use evidence::{
-    agent_command_observation, build_evaluation_evidence, build_zero_sampling_evidence,
+    agent_command_projection, build_evaluation_evidence, build_zero_sampling_evidence,
     canonical_json_digest, content_digest,
 };
 use workspace::{
     ObservedPreparedSource, WorkspaceChangeEvidence, WorkspaceObservationMetric, WorkspaceSnapshot,
     copy_tree_for_preparation, evaluation_changed_paths, materialize_prepared_workspace,
-    patch_evidence_digest, path_is_allowed, snapshot_workspace_incremental,
-    snapshot_workspace_with_work, workspace_change_evidence, workspace_root_identity,
-    workspace_snapshot_digest,
+    patch_evidence_digest, snapshot_workspace_incremental, snapshot_workspace_with_work,
+    workspace_change_evidence, workspace_root_identity, workspace_snapshot_digest,
 };
 #[cfg(test)]
 use workspace::{copy_tree_checked, snapshot_workspace};
@@ -285,13 +278,9 @@ struct TaskDiagnostics {
     patch_evidence: Vec<WorkspaceChangeEvidence>,
     patch_digest: Option<String>,
     patch_evidence_path: Option<String>,
-    disallowed_changed_files: Vec<String>,
-    smoke_command_satisfied: bool,
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
-    plan_update_count: u32,
-    plan_completed: bool,
     invalid_tool_call_count: u32,
     repeated_tool_call_count: u32,
     repair_attempt_count: u32,
@@ -311,7 +300,6 @@ struct TaskDiagnostics {
     agent_duration_ms: u64,
     local_process_fallback_count: usize,
     local_process_fallback_unknown_count: usize,
-    observed_smoke_scope_digests: Vec<String>,
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
@@ -392,13 +380,9 @@ struct AgentStageExecution {
     patch_evidence: Vec<WorkspaceChangeEvidence>,
     patch_digest: Option<String>,
     patch_evidence_path: Option<String>,
-    disallowed_changed_files: Vec<String>,
-    smoke_command_satisfied: bool,
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
-    plan_update_count: u32,
-    plan_completed: bool,
     recovery_metrics: AgentRecoveryMetrics,
     compaction_count: u32,
     verification_required_command_count: u32,
@@ -407,7 +391,6 @@ struct AgentStageExecution {
     provider_attempts: ProviderAttemptMetadata,
     agent_duration_ms: u64,
     audit_events: Vec<Value>,
-    observed_smoke_scope_digests: Vec<String>,
     local_process_fallback_unknown_count: usize,
     trace_path: Option<String>,
     error: Option<String>,
@@ -652,9 +635,6 @@ struct ResolvedEvaluationTools {
     registry: ToolRegistry,
     names: Vec<String>,
     schema_fingerprint: String,
-    allow_read: bool,
-    allow_write: bool,
-    allow_command: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1452,7 +1432,6 @@ fn blocked_task_trials(
                 source: Some(source.clone()),
                 source_commands: source_commands.clone(),
                 source_preparation_duration_ms,
-                smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
                 error: Some(blocker.message.clone()),
                 ..TaskDiagnostics::default()
             };
@@ -1485,7 +1464,6 @@ fn task_evaluation_from_trials(plan: &WorkspacePlan, trials: Vec<TaskExecution>)
     let result = EvaluationTaskResult::from_trials(
         plan.task_id.clone(),
         plan.capabilities.clone(),
-        plan.agent.projection.required_tool_capabilities.clone(),
         trials.iter().map(|trial| trial.result.clone()).collect(),
     );
     TaskEvaluation { result, trials }
@@ -1549,7 +1527,6 @@ fn run_task_inner(
         source_tree_content_reads: prepared.source_metrics.source_tree_content_reads,
         source_tree_content_bytes: prepared.source_metrics.source_tree_content_bytes,
         source_image_bytes: prepared.source_metrics.source_image_bytes,
-        smoke_command_satisfied: prepared.plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
     if let Err(error) = fs::create_dir(&task_dir) {
@@ -1670,13 +1647,9 @@ fn run_task_inner(
     diagnostics.patch_evidence = agent_execution.patch_evidence.clone();
     diagnostics.patch_digest = agent_execution.patch_digest.clone();
     diagnostics.patch_evidence_path = agent_execution.patch_evidence_path.clone();
-    diagnostics.disallowed_changed_files = agent_execution.disallowed_changed_files.clone();
-    diagnostics.smoke_command_satisfied = agent_execution.smoke_command_satisfied;
     diagnostics.model_turns = agent_execution.model_turns;
     diagnostics.tool_calls = agent_execution.tool_calls;
     diagnostics.approval_count = agent_execution.approval_count;
-    diagnostics.plan_update_count = agent_execution.plan_update_count;
-    diagnostics.plan_completed = agent_execution.plan_completed;
     diagnostics.invalid_tool_call_count = agent_execution.recovery_metrics.invalid_tool_call_count;
     diagnostics.repeated_tool_call_count =
         agent_execution.recovery_metrics.repeated_tool_call_count;
@@ -1697,7 +1670,6 @@ fn run_task_inner(
     diagnostics.provider_retry_count = agent_execution.provider_attempts.retry_count;
     diagnostics.provider_latency_ms = agent_execution.provider_attempts.latency_ms;
     diagnostics.agent_duration_ms = agent_execution.agent_duration_ms;
-    diagnostics.observed_smoke_scope_digests = agent_execution.observed_smoke_scope_digests.clone();
     diagnostics.local_process_fallback_unknown_count =
         agent_execution.local_process_fallback_unknown_count;
     diagnostics.trace_path = agent_execution.trace_path.clone();
@@ -1712,13 +1684,9 @@ fn run_task_inner(
         .iter()
         .filter_map(|event| event.get("workspace_observation_metrics").cloned())
         .collect();
-    diagnostics.local_process_fallback_count = agent_execution
-        .audit_events
-        .iter()
-        .filter(|event| event.get("local_process_fallback").and_then(Value::as_bool) == Some(true))
-        .count();
-
-    if agent_execution.stage.result.status == StageStatus::Blocked {
+    if agent_execution.stage.result.status == StageStatus::Blocked
+        && (agent_execution.workspace.is_none() || agent_execution.patch_evidence.is_empty())
+    {
         return finish_task(
             &prepared.plan.task_id,
             trial,
@@ -1929,11 +1897,6 @@ fn finish_task(
     let agent_completed = stages.agent.status == StageStatus::Passed;
     let tests_passed =
         stages.public.status == StageStatus::Passed && stages.hidden.status == StageStatus::Passed;
-    let evaluation_passed = stages.baseline.status == StageStatus::Passed
-        && agent_completed
-        && tests_passed
-        && diagnostics.local_process_fallback_count == 0
-        && diagnostics.local_process_fallback_unknown_count == 0;
     let strict_sandbox_command_count = diagnostics
         .source_commands
         .iter()
@@ -1943,6 +1906,27 @@ fn finish_task(
         .chain(diagnostics.hidden.commands.iter())
         .filter(|command| command.is_strictly_sandboxed())
         .count();
+    let agent_command_count = diagnostics.agent.commands.len();
+    let functional_task_success = stages.baseline.status == StageStatus::Passed
+        && !diagnostics.patch_evidence.is_empty()
+        && tests_passed;
+    let agent_protocol_success = agent_completed
+        && diagnostics.error.is_none()
+        && diagnostics.completion_rejection_count == 0;
+    let sandbox_security_success = agent_command_count > 0
+        && strict_sandbox_command_count > 0
+        && diagnostics.local_process_fallback_count == 0
+        && diagnostics.local_process_fallback_unknown_count == 0
+        && diagnostics
+            .source_commands
+            .iter()
+            .chain(diagnostics.baseline.commands.iter())
+            .chain(diagnostics.agent.commands.iter())
+            .chain(diagnostics.public.commands.iter())
+            .chain(diagnostics.hidden.commands.iter())
+            .all(|command| command.is_strictly_sandboxed());
+    let evaluation_passed =
+        functional_task_success && agent_protocol_success && sandbox_security_success;
     let status = if blocker.is_some() {
         EvaluationStatus::Blocked
     } else if evaluation_passed {
@@ -1957,6 +1941,9 @@ fn finish_task(
         stages,
         agent_completed,
         tests_passed,
+        functional_task_success,
+        agent_protocol_success,
+        sandbox_security_success,
         evaluation_passed,
         evidence: EvaluationEvidenceSummary {
             workspace_change_count: u32::try_from(diagnostics.patch_evidence.len())
@@ -1965,8 +1952,6 @@ fn finish_task(
             tool_calls: diagnostics.tool_calls,
             model_turns: diagnostics.model_turns,
             approval_count: diagnostics.approval_count,
-            plan_update_count: diagnostics.plan_update_count,
-            plan_completed: diagnostics.plan_completed,
             invalid_tool_call_count: diagnostics.invalid_tool_call_count,
             repeated_tool_call_count: diagnostics.repeated_tool_call_count,
             repair_attempt_count: diagnostics.repair_attempt_count,
@@ -1983,7 +1968,6 @@ fn finish_task(
             total_tokens: diagnostics.total_tokens,
             provider_latency_ms: diagnostics.provider_latency_ms,
             agent_duration_ms: diagnostics.agent_duration_ms,
-            smoke_command_satisfied: diagnostics.smoke_command_satisfied,
             strict_sandbox_command_count: u32::try_from(strict_sandbox_command_count)
                 .unwrap_or(u32::MAX),
             local_process_fallback_count: u32::try_from(diagnostics.local_process_fallback_count)
@@ -2691,10 +2675,7 @@ fn agent_snapshot_plan(
             observed_contract = Some(contract);
         }
 
-        let is_write_tool = matches!(
-            tool_result.tool_name.as_str(),
-            TOOL_EDIT | TOOL_PATCH | TOOL_COMMAND
-        );
+        let is_write_tool = matches!(tool_result.tool_name.as_str(), TOOL_PATCH | TOOL_COMMAND);
         let Some(observation) = tool_result.workspace_observation() else {
             if summary.is_some() {
                 return Err(format!(
@@ -2843,17 +2824,8 @@ fn run_agent_stage(
         );
     }
     let pristine_source = prepared.source_snapshot;
-    let command_diagnostics = Vec::new();
-    let projection = match project_agent_task(agent_dir, &plan.projection) {
-        Ok(projection) => projection,
-        Err(error) => {
-            return blocked_agent_stage(
-                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-                command_diagnostics,
-            );
-        }
-    };
-    let projection = &projection;
+    let mut command_diagnostics = Vec::new();
+    let projection = &plan.projection;
     let mut agent_observer = match prepared
         .sandbox_backend
         .observe_prepared_workspace(agent_dir)
@@ -2931,7 +2903,7 @@ fn run_agent_stage(
         }
     };
 
-    let resolved_tools = match evaluation_registry(projection) {
+    let resolved_tools = match evaluation_registry() {
         Ok(resolved_tools) => resolved_tools,
         Err(error) => {
             return blocked_agent_stage(
@@ -2940,7 +2912,7 @@ fn run_agent_stage(
             );
         }
     };
-    let policy = evaluation_policy(agent_dir, projection, &resolved_tools);
+    let policy = workspace_policy(PermissionProfileName::WorkspaceWrite, ApprovalPolicy::Never);
     let prompt = agent_prompt(projection, &resolved_tools.names);
     let project_instructions_fingerprint = project_instructions
         .as_ref()
@@ -2950,14 +2922,10 @@ fn run_agent_stage(
         model_message_roles: vec!["developer".to_string(), "user".to_string()],
         section_kinds: vec![
             "task_instructions".to_string(),
-            "allowed_paths".to_string(),
             "resolved_tools".to_string(),
-            "smoke_requirements".to_string(),
             "completion_instruction".to_string(),
         ],
-        allowed_path_count: u32::try_from(projection.allowed_paths.len()).unwrap_or(u32::MAX),
         resolved_tool_count: u32::try_from(resolved_tools.names.len()).unwrap_or(u32::MAX),
-        smoke_command_count: u32::try_from(projection.smoke_commands.len()).unwrap_or(u32::MAX),
         project_instructions_fingerprint: project_instructions_fingerprint.clone(),
     };
     let tool_schema_fingerprint = resolved_tools.schema_fingerprint.clone();
@@ -2968,15 +2936,6 @@ fn run_agent_stage(
         "tool_schema_fingerprint": &tool_schema_fingerprint,
     }))
     .expect("evaluation prompt fingerprint inputs serialize canonically");
-    let verification_commands = match agent_verification_commands(agent_dir, projection) {
-        Ok(commands) => commands,
-        Err(error) => {
-            return blocked_agent_stage(
-                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-                command_diagnostics,
-            );
-        }
-    };
     let mut input = AgentLoopInput::new(
         projection.task_id.as_str(),
         format!(
@@ -2986,18 +2945,11 @@ fn run_agent_stage(
         ),
         prompt,
     )
-    .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
-    .with_verification_commands(verification_commands);
+    .with_max_turns(DEFAULT_AGENT_MAX_TURNS);
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions);
     }
-    let command_runtime_executables = projection
-        .smoke_commands
-        .iter()
-        .filter_map(|command| command.argv.as_slice().first().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let command_runtime_executables = Vec::new();
     let workspace_tools = match WorkspaceTools::new(agent_dir) {
         Ok(tools) => tools
             .with_shared_sandbox_backend(Arc::clone(prepared.sandbox_backend))
@@ -3033,6 +2985,8 @@ fn run_agent_stage(
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     diagnostics.agent_duration_ms = agent_duration_ms;
     let run_status = result.to_run_status();
+    let agent_command_projection = agent_command_projection(&result);
+    command_diagnostics = agent_command_projection.diagnostics.clone();
     if let Err(error) = projector.project_result(&run_status) {
         record_trace_failure(
             prepared.trace_failures,
@@ -3044,8 +2998,7 @@ fn run_agent_stage(
         run_status.provider_protocol_contract.as_ref(),
         run_status.provider_capability_metadata.as_ref(),
     );
-    let (observed_smoke_scope_digests, local_process_fallback_unknown_count) =
-        agent_command_observation(&result, projection.smoke_commands.len());
+    let local_process_fallback_unknown_count = agent_command_projection.unknown_count;
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
     let trace = match evaluation_agent_trace(
         prepared.trace_store,
@@ -3066,13 +3019,9 @@ fn run_agent_stage(
                 patch_evidence: Vec::new(),
                 patch_digest: None,
                 patch_evidence_path: None,
-                disallowed_changed_files: Vec::new(),
-                smoke_command_satisfied: false,
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                plan_update_count: result.plan_update_count,
-                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
                 recovery_metrics: result.recovery_metrics.clone(),
                 compaction_count: result
                     .context_trace
@@ -3084,7 +3033,6 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
-                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
                 local_process_fallback_unknown_count,
                 trace_path: None,
                 error: Some(safe_text(error)),
@@ -3109,13 +3057,9 @@ fn run_agent_stage(
                 patch_evidence: Vec::new(),
                 patch_digest: None,
                 patch_evidence_path: None,
-                disallowed_changed_files: Vec::new(),
-                smoke_command_satisfied: false,
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                plan_update_count: result.plan_update_count,
-                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
                 recovery_metrics: result.recovery_metrics.clone(),
                 compaction_count: result
                     .context_trace
@@ -3127,7 +3071,6 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
-                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
                 local_process_fallback_unknown_count,
                 trace_path: None,
                 error: Some(safe_text(error)),
@@ -3177,13 +3120,9 @@ fn run_agent_stage(
                 patch_evidence: Vec::new(),
                 patch_digest: None,
                 patch_evidence_path: None,
-                disallowed_changed_files: Vec::new(),
-                smoke_command_satisfied: false,
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                plan_update_count: result.plan_update_count,
-                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
                 recovery_metrics: result.recovery_metrics.clone(),
                 compaction_count: result
                     .context_trace
@@ -3195,7 +3134,6 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
-                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
                 local_process_fallback_unknown_count,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
@@ -3222,13 +3160,9 @@ fn run_agent_stage(
             patch_evidence: Vec::new(),
             patch_digest: None,
             patch_evidence_path: None,
-            disallowed_changed_files: Vec::new(),
-            smoke_command_satisfied: false,
             model_turns: result.model_turns,
             tool_calls: result.tool_calls,
             approval_count: result.approval_count,
-            plan_update_count: result.plan_update_count,
-            plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
             recovery_metrics: result.recovery_metrics.clone(),
             compaction_count: result
                 .context_trace
@@ -3240,7 +3174,6 @@ fn run_agent_stage(
             provider_attempts: result.provider_attempts.clone(),
             agent_duration_ms,
             audit_events: run_status.audit_events,
-            observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
             local_process_fallback_unknown_count,
             trace_path: trace_path_string,
             error: Some(safe_text(error)),
@@ -3255,8 +3188,7 @@ fn run_agent_stage(
         u64::try_from(snapshot_after_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let patch_digest_started = Instant::now();
     let changed_files = evaluation_changed_paths(&before, &after, pristine_source);
-    let patch_evidence =
-        workspace_change_evidence(&before, &after, pristine_source, &projection.allowed_paths);
+    let patch_evidence = workspace_change_evidence(&before, &after, pristine_source);
     let patch_digest = patch_evidence_digest(&patch_evidence);
     diagnostics.agent_patch_digest_ms =
         u64::try_from(patch_digest_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -3274,13 +3206,9 @@ fn run_agent_stage(
                 patch_evidence,
                 patch_digest,
                 patch_evidence_path: None,
-                disallowed_changed_files: Vec::new(),
-                smoke_command_satisfied: false,
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                plan_update_count: result.plan_update_count,
-                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
                 recovery_metrics: result.recovery_metrics.clone(),
                 compaction_count: result
                     .context_trace
@@ -3292,7 +3220,6 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
-                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
                 local_process_fallback_unknown_count,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
@@ -3304,15 +3231,9 @@ fn run_agent_stage(
             };
         }
     };
-    let disallowed_changed_files = changed_files
-        .iter()
-        .filter(|path| !path_is_allowed(path, &projection.allowed_paths))
-        .cloned()
-        .collect::<Vec<_>>();
-    let smoke_command_satisfied = smoke_commands_satisfied(agent_dir, projection, &result);
     let loop_completed = result.completed && result.status == AgentStatus::Completed;
     let error = result.error.clone().map(safe_text);
-    let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
+    let sandbox_blocker = agent_sandbox_blocker(&agent_command_projection);
     let stage = if let Some(blocker) = sandbox_blocker {
         StageExecution::blocked(blocker, command_diagnostics)
     } else if let Some(kind) = agent_blocker_kind(
@@ -3345,19 +3266,6 @@ fn run_agent_stage(
                 .unwrap_or_else(|| format!("agent loop ended as {}", result.status.as_str())),
             command_diagnostics,
         )
-    } else if !disallowed_changed_files.is_empty() {
-        StageExecution::failed(
-            format!(
-                "agent changed paths outside the manifest allowlist: {}",
-                disallowed_changed_files.join(", ")
-            ),
-            command_diagnostics,
-        )
-    } else if !smoke_command_satisfied {
-        StageExecution::failed(
-            "agent did not produce successful exact results for every declared smoke command",
-            command_diagnostics,
-        )
     } else {
         StageExecution::passed(command_diagnostics)
     };
@@ -3369,13 +3277,9 @@ fn run_agent_stage(
         patch_evidence,
         patch_digest,
         patch_evidence_path,
-        disallowed_changed_files,
-        smoke_command_satisfied,
         model_turns: result.model_turns,
         tool_calls: result.tool_calls,
         approval_count: result.approval_count,
-        plan_update_count: result.plan_update_count,
-        plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
         recovery_metrics: result.recovery_metrics.clone(),
         compaction_count: result
             .context_trace
@@ -3387,7 +3291,6 @@ fn run_agent_stage(
         provider_attempts: result.provider_attempts.clone(),
         agent_duration_ms,
         audit_events: run_status.audit_events,
-        observed_smoke_scope_digests,
         local_process_fallback_unknown_count,
         trace_path: trace_path_string,
         error,
@@ -3397,19 +3300,6 @@ fn run_agent_stage(
         tool_schema_fingerprint: Some(tool_schema_fingerprint),
         provider_evidence: Some(provider_evidence),
     }
-}
-
-fn project_agent_task(
-    workspace: &Path,
-    projection: &AgentTaskProjection,
-) -> Result<AgentTaskProjection, String> {
-    let mut projected = projection.clone();
-    projected.smoke_commands = projection
-        .smoke_commands
-        .iter()
-        .map(|command| project_command_spec(workspace, command))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(projected)
 }
 
 fn blocked_agent_stage(
@@ -3423,13 +3313,9 @@ fn blocked_agent_stage(
         patch_evidence: Vec::new(),
         patch_digest: None,
         patch_evidence_path: None,
-        disallowed_changed_files: Vec::new(),
-        smoke_command_satisfied: false,
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
-        plan_update_count: 0,
-        plan_completed: false,
         recovery_metrics: AgentRecoveryMetrics::default(),
         compaction_count: 0,
         verification_required_command_count: 0,
@@ -3438,7 +3324,6 @@ fn blocked_agent_stage(
         provider_attempts: ProviderAttemptMetadata::default(),
         agent_duration_ms: 0,
         audit_events: Vec::new(),
-        observed_smoke_scope_digests: Vec::new(),
         local_process_fallback_unknown_count: 0,
         trace_path: None,
         error: Some(blocker.message),
@@ -3489,70 +3374,10 @@ fn provider_evidence(
     }
 }
 
-fn evaluation_registry(
-    projection: &AgentTaskProjection,
-) -> Result<ResolvedEvaluationTools, String> {
-    let mut catalog = ToolRegistry::default();
-    for entry in workspace_tool_entries()
-        .into_iter()
-        .chain(agent_control_tool_entries())
-    {
-        catalog.register(entry)?;
-    }
-    let mut selected = std::collections::BTreeMap::new();
-    for requirement in &projection.required_tool_capabilities {
-        let capability = serde_json::from_value::<ToolCapability>(Value::String(
-            requirement.capability.as_str().to_string(),
-        ))
-        .map_err(|_| {
-            format!(
-                "unsupported evaluation tool capability {}",
-                requirement.capability.as_str()
-            )
-        })?;
-        let entries = catalog.entries_for_capability(capability, requirement.minimum_version);
-        if entries.is_empty() {
-            return Err(format!(
-                "evaluation tool capability {} requires version {} but the registry has no matching model-visible entry",
-                requirement.capability.as_str(),
-                requirement.minimum_version
-            ));
-        }
-        for entry in entries {
-            selected.insert(entry.id.as_str().to_string(), entry.clone());
-        }
-    }
+fn evaluation_registry() -> Result<ResolvedEvaluationTools, String> {
     let mut registry = ToolRegistry::default();
-    let mut allow_read = false;
-    let mut allow_write = false;
-    let mut allow_command = false;
-    for (_, mut entry) in selected {
-        allow_read |= matches!(
-            entry.authorization,
-            ToolAuthorization::WorkspaceRead | ToolAuthorization::AgentControl
-        );
-        allow_write |= entry.authorization == ToolAuthorization::WorkspaceWrite;
-        allow_command |= entry.authorization == ToolAuthorization::Command;
-        if entry.executor == ToolExecutor::Workspace(WorkspaceToolExecutor::Command) {
-            let bindings = projection
-                .smoke_commands
-                .iter()
-                .map(|command| {
-                    (
-                        smoke_command_model_input(command),
-                        smoke_command_execution_input(command),
-                    )
-                })
-                .collect::<Vec<_>>();
-            entry.spec.restrict_to_input_bindings(bindings)?;
-        }
+    for entry in workspace_tool_entries() {
         registry.register(entry)?;
-    }
-    if !projection.smoke_commands.is_empty() && !allow_command {
-        return Err(
-            "evaluation smoke commands require a registry-resolved command execution tool"
-                .to_string(),
-        );
     }
     let names = registry
         .schema_payloads()
@@ -3565,163 +3390,20 @@ fn evaluation_registry(
         registry,
         names,
         schema_fingerprint,
-        allow_read,
-        allow_write,
-        allow_command,
     })
 }
 
-fn evaluation_policy(
-    _workspace: &Path,
-    projection: &AgentTaskProjection,
-    resolved_tools: &ResolvedEvaluationTools,
-) -> PolicyEngine {
-    let mut profile = PermissionProfile::workspace_write();
-    profile.approval_policy = ApprovalPolicy::Never;
-    if projection
-        .smoke_commands
-        .iter()
-        .any(|command| command.network_access == NetworkAccess::Allowed)
-    {
-        profile.network_access = NetworkAccess::Allowed;
-    }
-    let mut policy = PolicyEngine::new(profile);
-    if resolved_tools.allow_read {
-        policy = policy.with_rule(
-            PermissionRule::new(
-                "allow_evaluation_read_tools",
-                SettingsScope::Project,
-                PermissionDecisionOutcome::Allow,
-            )
-            .for_operation(PermissionOperation::Read),
-        );
-    }
-    if resolved_tools.allow_write {
-        for (index, path) in projection.allowed_paths.iter().enumerate() {
-            policy = policy.with_rule(
-                PermissionRule::new(
-                    format!("allow_evaluation_write_{index}"),
-                    SettingsScope::Project,
-                    PermissionDecisionOutcome::Allow,
-                )
-                .for_operation(PermissionOperation::Write)
-                .for_workspace_subtree(
-                    WorkspaceRelativePath::from_canonical(path.as_str())
-                        .expect("evaluation paths are canonical workspace-relative paths"),
-                ),
-            );
-        }
-    }
-    if resolved_tools.allow_command {
-        for (index, command) in projection.smoke_commands.iter().enumerate() {
-            let network = sandbox_network_mode(command.network_access);
-            let resource = PermissionResource::CommandScope(
-                CommandScopeDigest::new(command_script_scope_digest_with_policy(
-                    &command_script_from_argv(command.argv.as_slice()),
-                    command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
-                    command
-                        .timeout_seconds
-                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                    SandboxFilesystemMode::WorkspaceWrite,
-                    network.clone(),
-                ))
-                .expect("evaluation command scope digest is valid"),
-            );
-            policy = policy.with_rule(
-                PermissionRule::new(
-                    format!("allow_evaluation_command_{index}"),
-                    SettingsScope::Project,
-                    PermissionDecisionOutcome::Allow,
-                )
-                .for_operation(PermissionOperation::Execute)
-                .for_resource(resource.clone()),
-            );
-            if command.network_access == NetworkAccess::Allowed {
-                policy = policy.with_rule(
-                    PermissionRule::new(
-                        format!("allow_evaluation_command_network_{index}"),
-                        SettingsScope::Project,
-                        PermissionDecisionOutcome::Allow,
-                    )
-                    .for_operation(PermissionOperation::Network)
-                    .for_resource(resource),
-                );
-            }
-        }
-    }
-    policy
-}
-
 fn agent_prompt(projection: &AgentTaskProjection, resolved_tools: &[String]) -> String {
-    let allowed_paths = projection
-        .allowed_paths
-        .iter()
-        .map(|path| path.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
     let allowed_tools = resolved_tools.join(", ");
     let mut sections = vec![
         projection.instructions.clone(),
-        format!("Only modify these workspace paths: {allowed_paths}."),
         format!("Only these tools are available: {allowed_tools}."),
     ];
-    for (index, command) in projection.smoke_commands.iter().enumerate() {
-        sections.push(format!(
-            "Before the final answer, call {TOOL_COMMAND} for smoke command {} with exactly this JSON input: {}. The task is not agent-completed unless that exact tool result succeeds.",
-            index + 1,
-            smoke_command_model_input(command)
-        ));
-    }
     sections.push(
         "Finish with a concise answer describing the change and the verification actually run."
             .to_string(),
     );
     sections.join("\n\n")
-}
-
-fn smoke_command_model_input(command: &CommandSpec) -> Value {
-    json!({
-        "command": command_script_from_argv(command.argv.as_slice()),
-        "cwd": command.cwd.as_ref().map(|cwd| cwd.as_str()).unwrap_or("."),
-        "timeout_seconds": command.timeout_seconds.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-    })
-}
-
-fn smoke_command_execution_input(command: &CommandSpec) -> Value {
-    smoke_command_model_input(command)
-}
-
-fn command_script_from_argv(argv: &[String]) -> String {
-    argv.iter()
-        .map(|argument| {
-            if !argument.is_empty() && argument.chars().all(shell_unquoted_character_is_safe) {
-                argument.clone()
-            } else {
-                quote_shell_argument(argument)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(unix)]
-fn shell_unquoted_character_is_safe(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':')
-}
-
-#[cfg(windows)]
-fn shell_unquoted_character_is_safe(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\' | ':')
-}
-
-#[cfg(unix)]
-fn quote_shell_argument(argument: &str) -> String {
-    format!("'{}'", argument.replace('\'', "'\\''"))
-}
-
-#[cfg(windows)]
-fn quote_shell_argument(argument: &str) -> String {
-    format!("'{}'", argument.replace('\'', "''"))
 }
 
 fn evaluation_agent_trace(
@@ -3750,122 +3432,23 @@ fn evaluation_agent_trace(
     .map_err(|error| format!("failed to serialize evaluation SQLite trace: {error}"))
 }
 
-fn agent_verification_commands(
-    workspace: &Path,
-    projection: &AgentTaskProjection,
-) -> Result<Vec<AgentVerificationCommand>, String> {
-    projection
-        .smoke_commands
+fn agent_sandbox_blocker(
+    projection: &evidence::AgentCommandProjection,
+) -> Option<EvaluationBlocker> {
+    if projection.unknown_count > 0 {
+        return Some(evaluation_blocker(
+            BlockerKind::Sandbox,
+            "agent command sandbox evidence was incomplete or unbound",
+        ));
+    }
+    if projection
+        .diagnostics
         .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let action = smoke_verification_action(workspace, command).map_err(|_| {
-                format!(
-                    "evaluation smoke command {} cwd could not be resolved inside the prepared workspace",
-                    index + 1
-                )
-            })?;
-            Ok(AgentVerificationCommand::new(action, 1))
-        })
-        .collect()
-}
-
-fn smoke_commands_satisfied(
-    workspace: &Path,
-    projection: &AgentTaskProjection,
-    result: &AgentLoopResult,
-) -> bool {
-    let expected_results = projection
-        .smoke_commands
-        .iter()
-        .map(|command| smoke_command_scope_digest(workspace, command))
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(expected_results) = expected_results else {
-        return false;
-    };
-    let observed_results =
-        terminal_command_scope_digests(&result.tool_results, expected_results.len());
-    let mut matched_results = vec![false; observed_results.len()];
-    expected_results.iter().all(|expected| {
-        let Some(index) = observed_results
-            .iter()
-            .enumerate()
-            .position(|(index, tool_result)| !matched_results[index] && tool_result == expected)
-        else {
-            return false;
-        };
-        matched_results[index] = true;
-        true
-    })
-}
-
-// 统一 Agent completion、post-agent smoke 和 evidence 使用的精确 command scope。
-fn smoke_command_scope_digest(workspace: &Path, command: &CommandSpec) -> Result<String, String> {
-    let action = smoke_verification_action(workspace, command)?;
-    Ok(command_script_scope_digest_with_policy(
-        &action.command,
-        &action.cwd,
-        action.timeout_seconds,
-        action.sandbox_mode,
-        action.network_access,
-    ))
-}
-
-fn smoke_verification_action(
-    workspace: &Path,
-    command: &CommandSpec,
-) -> Result<AgentVerificationAction, String> {
-    let command = project_command_spec(workspace, command)?;
-    let cwd = resolved_smoke_cwd(workspace, &command)
-        .ok_or_else(|| "evaluation smoke command cwd is unavailable".to_string())?;
-    Ok(AgentVerificationAction {
-        command: command_script_from_argv(command.argv.as_slice()),
-        cwd,
-        timeout_seconds: command
-            .timeout_seconds
-            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-        sandbox_mode: SandboxFilesystemMode::WorkspaceWrite,
-        network_access: sandbox_network_mode(command.network_access),
-    })
-}
-
-fn resolved_smoke_cwd(workspace: &Path, command: &CommandSpec) -> Option<String> {
-    let workspace = fs::canonicalize(workspace).ok()?;
-    let cwd = command
-        .cwd
-        .as_ref()
-        .map_or_else(|| workspace.clone(), |cwd| workspace.join(cwd.as_str()));
-    let cwd = fs::canonicalize(cwd).ok()?;
-    let relative = cwd.strip_prefix(&workspace).ok()?;
-    let relative = if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative
-            .components()
-            .map(|component| component.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()?
-            .join("/")
-    };
-    WorkspaceRelativePath::from_canonical(relative)
-        .ok()
-        .map(|path| path.as_str().to_string())
-}
-fn agent_sandbox_blocker(audit_events: &[Value]) -> Option<EvaluationBlocker> {
-    if audit_events
-        .iter()
-        .any(|event| event.get("local_process_fallback").and_then(Value::as_bool) == Some(true))
+        .any(|command| !command.is_strictly_sandboxed())
     {
         return Some(evaluation_blocker(
             BlockerKind::Sandbox,
-            "agent command used forbidden local process fallback",
-        ));
-    }
-    if audit_events.iter().any(|event| {
-        event.get("sandbox_enforcement").and_then(Value::as_str) == Some("unavailable")
-    }) {
-        return Some(evaluation_blocker(
-            BlockerKind::Sandbox,
-            "agent command sandbox enforcement was unavailable",
+            "agent command sandbox enforcement was not strict",
         ));
     }
     None
@@ -4077,7 +3660,6 @@ fn required_host_executables(plans: &[WorkspacePlan]) -> std::collections::BTree
         let commands = plan
             .setup_commands
             .iter()
-            .chain(&plan.agent.projection.smoke_commands)
             .chain(&plan.baseline.commands)
             .chain(&plan.public.commands)
             .chain(&plan.hidden.commands);
@@ -4959,14 +4541,14 @@ fn safe_text(text: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Argv, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
-        ToolCapabilityRequirement,
-    };
+    use crate::{Argv, GitCommit, RemoteRepository};
     #[cfg(windows)]
     use crate::{EvaluationStage, WorkspaceSeed};
     use serde::Serializer;
-    use singularity_agent::UPDATE_PLAN_TOOL;
+    use singularity_policy::{
+        ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
+        PermissionProfileName, PermissionResource, WorkspaceRelativePath,
+    };
     use singularity_tools::{
         CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackendEnforcement,
         SandboxCapabilities, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceObservation,
@@ -4986,18 +4568,6 @@ mod tests {
             cwd: None,
             timeout_seconds: Some(30),
             network_access: NetworkAccess::Denied,
-        }
-    }
-
-    fn requirement(capability: ToolCapability) -> ToolCapabilityRequirement {
-        let name = serde_json::to_value(capability)
-            .expect("capability serializes")
-            .as_str()
-            .expect("capability serializes as string")
-            .to_string();
-        ToolCapabilityRequirement {
-            capability: ToolCapabilityName::new(name).expect("capability name"),
-            minimum_version: 1,
         }
     }
 
@@ -5026,93 +4596,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn command_script_projection_preserves_argument_boundaries() {
-        let argv = vec![
-            "python".to_string(),
-            "script with spaces.py".to_string(),
-            "it's-safe".to_string(),
-            "back\\slash".to_string(),
-        ];
-        #[cfg(unix)]
-        assert_eq!(
-            command_script_from_argv(&argv),
-            "python 'script with spaces.py' 'it'\\''s-safe' 'back\\slash'"
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            command_script_from_argv(&argv),
-            "python 'script with spaces.py' 'it''s-safe' back\\slash"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_script_projection_executes_with_exact_posix_arguments() {
-        let argv = vec![
-            "printf".to_string(),
-            "<%s>\\n".to_string(),
-            "script with spaces.py".to_string(),
-            "it's-safe".to_string(),
-            "back\\slash".to_string(),
-        ];
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &command_script_from_argv(&argv)])
-            .output()
-            .expect("POSIX shell");
-
-        assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("utf8 output"),
-            "<script with spaces.py>\n<it's-safe>\n<back\\slash>\n"
-        );
-    }
-
-    fn successful_command_result(
-        tool_call_id: &str,
-        command: &CommandSpec,
-        workspace: &Path,
-    ) -> singularity_tools::ToolResult {
-        successful_command_result_at_revision(
-            tool_call_id,
-            command,
-            workspace,
-            WorkspaceRevision::initial(),
-        )
-    }
-
-    fn successful_command_result_at_revision(
-        tool_call_id: &str,
-        command: &CommandSpec,
-        workspace: &Path,
-        revision: WorkspaceRevision,
-    ) -> singularity_tools::ToolResult {
-        let mut result =
-            singularity_tools::ToolResult::summary(tool_call_id, TOOL_COMMAND, true, "ok");
-        result.result_id = Some(command_script_scope_digest_with_policy(
-            &command_script_from_argv(command.argv.as_slice()),
-            &resolved_smoke_cwd(workspace, command).expect("resolved smoke cwd"),
-            command
-                .timeout_seconds
-                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-            SandboxFilesystemMode::WorkspaceWrite,
-            sandbox_network_mode(command.network_access),
-        ));
-        result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
-    }
-
-    fn changed_command_result(
-        tool_call_id: &str,
-        command: &CommandSpec,
-        workspace: &Path,
-    ) -> singularity_tools::ToolResult {
-        let mut result = successful_command_result(tool_call_id, command, workspace);
-        result = result.with_workspace_observation(WorkspaceObservation::changed(
-            WorkspaceRevision::initial().next().expect("revision"),
-        ));
-        result
-    }
-
     fn completed_agent_result(tool_results: Vec<singularity_tools::ToolResult>) -> AgentLoopResult {
         AgentLoopResult {
             status: AgentStatus::Completed,
@@ -5124,8 +4607,6 @@ mod tests {
             pending_approvals: Vec::new(),
             tool_results,
             verification: singularity_agent::AgentVerification::default(),
-            plan: None,
-            plan_update_count: 0,
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
@@ -5157,7 +4638,7 @@ mod tests {
     fn agent_snapshot_plan_reads_only_producer_reported_mutations() {
         let revision = WorkspaceRevision::initial().next().expect("revision");
         let result = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::changed(revision))
                 .with_workspace_change_summary(WorkspaceChangeSummary::new(
                     vec!["src/lib.rs".to_string()],
@@ -5225,7 +4706,7 @@ mod tests {
     fn agent_snapshot_plan_rejects_out_of_band_observer_paths() {
         let revision = WorkspaceRevision::initial().next().expect("revision");
         let result = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::changed(revision))
                 .with_workspace_change_summary(WorkspaceChangeSummary::new(
                     vec!["src/lib.rs".to_string()],
@@ -5290,7 +4771,7 @@ mod tests {
 
         let revision = WorkspaceRevision::initial().next().expect("revision");
         let source_result = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::changed(revision))
                 .with_workspace_change_summary(WorkspaceChangeSummary::new(
                     vec!["src/lib.rs".to_string()],
@@ -5311,7 +4792,7 @@ mod tests {
         let summary =
             WorkspaceChangeSummary::new(vec!["src/lib.rs".to_string()], OBSERVER_PATH_DIGEST);
         let missing_observation = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_change_summary(summary.clone()),
         ]);
         assert!(
@@ -5325,7 +4806,7 @@ mod tests {
         );
 
         let unchanged_observation = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::unchanged(
                     WorkspaceRevision::initial(),
                 ))
@@ -5345,7 +4826,7 @@ mod tests {
     #[test]
     fn agent_snapshot_plan_rejects_invalid_summary_before_scanning() {
         let result = completed_agent_result(vec![
-            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            singularity_tools::ToolResult::summary("patch", TOOL_PATCH, true, "changed")
                 .with_workspace_observation(WorkspaceObservation::unchanged(
                     WorkspaceRevision::initial(),
                 ))
@@ -5469,24 +4950,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_prompt_contains_only_projection_and_exact_smoke_input() {
+    fn agent_prompt_contains_only_task_instructions_and_stable_tools() {
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
             description: "description".to_string(),
             instructions: "fix the bug".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![
-                requirement(ToolCapability::WorkspaceRead),
-                requirement(ToolCapability::CommandExecution),
-            ],
-            smoke_commands: vec![command(&["cargo", "test"])],
         };
 
         let prompt = agent_prompt(
             &projection,
             &[TOOL_READ.to_string(), TOOL_COMMAND.to_string()],
         );
-        assert!(prompt.contains("\"command\":\"cargo test\""));
+        assert!(prompt.contains("fix the bug"));
+        assert!(prompt.contains("read, command"));
+        assert!(!prompt.contains("cargo test"));
         assert!(!prompt.contains("sandbox_mode"));
         assert!(!prompt.contains("network_access"));
         assert!(!prompt.contains("evaluator"));
@@ -5628,322 +5105,92 @@ mod tests {
         assert!(!serialized.contains("raw_response"));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn agent_projection_exposes_the_proven_windows_venv_command() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        fs::create_dir_all(workspace.path().join(".venv").join("Scripts"))
-            .expect("venv scripts directory");
-        fs::write(
-            workspace.path().join(".venv").join("pyvenv.cfg"),
-            "home = C:\\Python",
+    fn evaluation_registry_exposes_the_stable_workspace_tool_surface() {
+        let registry = evaluation_registry().expect("registry");
+        let schemas = registry.registry.schema_payloads();
+        let names = schemas
+            .iter()
+            .filter_map(|payload| payload["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["command", "grep", "list", "patch", "read"]);
+        assert!(registry.registry.get("update_plan").is_none());
+        assert!(registry.registry.get("edit").is_none());
+    }
+
+    #[test]
+    fn agent_command_projection_separates_not_executed_from_unknown() {
+        let mut missing_evidence =
+            singularity_tools::ToolResult::summary("command-unknown", TOOL_COMMAND, true, "ok");
+        missing_evidence.result_id = Some(format!("sha256:{}", "b".repeat(64)));
+        let missing_projection =
+            agent_command_projection(&completed_agent_result(vec![missing_evidence]));
+        assert_eq!(missing_projection.unknown_count, 1);
+        assert!(missing_projection.diagnostics.is_empty());
+
+        let mut rejected = singularity_tools::ToolResult::summary(
+            "command-rejected",
+            TOOL_COMMAND,
+            false,
+            "invalid arguments",
+        );
+        rejected.failure_kind = Some(singularity_tools::ToolFailureKind::Input);
+        let rejected_projection = agent_command_projection(&completed_agent_result(vec![rejected]));
+        assert_eq!(rejected_projection.unknown_count, 0);
+        assert!(rejected_projection.diagnostics.is_empty());
+
+        let explicitly_not_executed = singularity_tools::ToolResult::summary(
+            "command-not-executed",
+            TOOL_COMMAND,
+            false,
+            "policy denied",
         )
-        .expect("venv marker");
-        fs::write(
-            workspace
-                .path()
-                .join(".venv")
-                .join("Scripts")
-                .join("python.exe"),
-            b"fixture",
-        )
-        .expect("venv executable");
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("python-task").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
-            smoke_commands: vec![command(&[".venv/bin/python", "-m", "pytest"])],
-        };
-
-        let projected = project_agent_task(workspace.path(), &projection).expect("projection");
-        let executable = &projected.smoke_commands[0].argv.as_slice()[0];
-        assert_eq!(
-            Path::new(executable),
-            Path::new(".venv").join("Scripts").join("python.exe")
-        );
-        let prompt = agent_prompt(&projected, &[TOOL_COMMAND.to_string()]);
-        assert!(!prompt.contains(".venv/bin/python"));
-        let model_input = smoke_command_model_input(&projected.smoke_commands[0]);
-        assert_eq!(
-            model_input["command"],
-            command_script_from_argv(projected.smoke_commands[0].argv.as_slice())
-        );
-        assert!(prompt.contains(&serde_json::to_string(&model_input).expect("model input")));
-        let expected_scope =
-            smoke_command_scope_digest(workspace.path(), &projected.smoke_commands[0])
-                .expect("scope digest");
-        assert_eq!(
-            smoke_command_scope_digest(workspace.path(), &projection.smoke_commands[0])
-                .expect("original manifest scope digest"),
-            expected_scope
-        );
-        assert_eq!(
-            expected_scope,
-            command_script_scope_digest_with_policy(
-                &command_script_from_argv(projected.smoke_commands[0].argv.as_slice()),
-                ".",
-                projected.smoke_commands[0]
-                    .timeout_seconds
-                    .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                SandboxFilesystemMode::WorkspaceWrite,
-                SandboxNetworkMode::Denied,
-            )
-        );
-        let verification_commands =
-            agent_verification_commands(workspace.path(), &projected).expect("commands");
-        assert_eq!(verification_commands.len(), 1);
-        assert_eq!(
-            verification_commands[0].action.command,
-            command_script_from_argv(projected.smoke_commands[0].argv.as_slice())
-        );
-        assert_eq!(verification_commands[0].action.cwd, ".");
-        assert_eq!(verification_commands[0].required_success_count, 1);
+        .with_audit(json!({
+            "command_provenance": "agent_requested",
+            "sandbox_backend": "not_executed"
+        }));
+        let not_executed_projection =
+            agent_command_projection(&completed_agent_result(vec![explicitly_not_executed]));
+        assert_eq!(not_executed_projection.unknown_count, 0);
+        assert!(not_executed_projection.diagnostics.is_empty());
     }
 
     #[test]
-    fn duplicate_smoke_commands_require_distinct_successful_tool_results() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let smoke = command(&["cargo", "test"]);
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
-            smoke_commands: vec![smoke.clone(), smoke.clone()],
-        };
-        let tool_result = successful_command_result("call-1", &smoke, workspace.path());
-        let result = completed_agent_result(vec![tool_result.clone()]);
-        assert!(!smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &result
-        ));
+    fn agent_command_projection_rejects_non_strict_and_counts_strict_typed_evidence() {
+        let strict_digest = format!("sha256:{}", "c".repeat(64));
+        let mut strict =
+            singularity_tools::ToolResult::summary("strict-command", TOOL_COMMAND, true, "ok")
+                .with_audit(json!({
+                    "command_scope_digest": strict_digest.clone(),
+                    "command_provenance": "agent_requested",
+                    "sandbox_backend": "strict-test",
+                    "sandbox_enforcement": "strict",
+                    "local_process_fallback": false
+                }));
+        strict.result_id = Some(strict_digest);
+        let strict_projection = agent_command_projection(&completed_agent_result(vec![strict]));
+        assert_eq!(strict_projection.unknown_count, 0);
+        assert_eq!(strict_projection.diagnostics.len(), 1);
+        assert!(agent_sandbox_blocker(&strict_projection).is_none());
+        assert!(strict_projection.diagnostics[0].is_strictly_sandboxed());
 
-        let result = completed_agent_result(vec![tool_result.clone(), tool_result]);
-        assert!(smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &result
-        ));
-
-        let other = command(&["touch", "result.txt"]);
-        let other_result = changed_command_result("call-other", &other, workspace.path());
-        let result = completed_agent_result(vec![
-            successful_command_result("call-smoke-1", &smoke, workspace.path()),
-            successful_command_result("call-smoke-2", &smoke, workspace.path()),
-            other_result,
-        ]);
-        assert!(!smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &result
-        ));
-    }
-
-    #[test]
-    fn smoke_commands_must_run_after_the_last_workspace_mutation() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let smoke = command(&["cargo", "test"]);
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![
-                requirement(ToolCapability::WorkspaceWrite),
-                requirement(ToolCapability::CommandExecution),
-            ],
-            smoke_commands: vec![smoke.clone()],
-        };
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        let mutation =
-            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision));
-        let smoke_result =
-            successful_command_result_at_revision("call-smoke", &smoke, workspace.path(), revision);
-
-        let stale = completed_agent_result(vec![smoke_result.clone(), mutation.clone()]);
-        assert!(!smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &stale
-        ));
-
-        let current = completed_agent_result(vec![mutation, smoke_result]);
-        assert!(smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &current
-        ));
-    }
-
-    #[test]
-    fn smoke_commands_must_be_the_terminal_successful_command_suffix() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let smoke = command(&["cargo", "test"]);
-        let write = command(&["touch", "result.txt"]);
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
-            smoke_commands: vec![smoke.clone()],
-        };
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
-        let write_result = changed_command_result("call-write", &write, workspace.path());
-
-        let stale = completed_agent_result(vec![smoke_result.clone(), write_result.clone()]);
-        assert!(!smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &stale
-        ));
-
-        let current_smoke =
-            successful_command_result_at_revision("call-smoke", &smoke, workspace.path(), revision);
-        let current = completed_agent_result(vec![write_result, current_smoke]);
-        assert!(smoke_commands_satisfied(
-            workspace.path(),
-            &projection,
-            &current
-        ));
-    }
-
-    #[test]
-    fn smoke_observation_rejects_failed_result_even_when_digest_matches() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let smoke = command(&["cargo", "test"]);
-        let mut failed = successful_command_result("call-failed", &smoke, workspace.path());
-        failed.ok = false;
-        let result = completed_agent_result(vec![failed]);
-
-        let (observed, unknown_count) = agent_command_observation(&result, 1);
-
-        assert!(observed.is_empty());
-        assert_eq!(unknown_count, 1);
-    }
-
-    #[test]
-    fn smoke_observation_preserves_post_mutation_order_and_duplicates() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let smoke = command(&["cargo", "test"]);
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        let mutation =
-            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision));
-        let first = successful_command_result_at_revision(
-            "call-smoke-1",
-            &smoke,
-            workspace.path(),
-            revision,
-        );
-        let second = successful_command_result_at_revision(
-            "call-smoke-2",
-            &smoke,
-            workspace.path(),
-            revision,
-        );
-        let expected = first.result_id.clone().expect("scope digest");
-
-        let result = completed_agent_result(vec![mutation, first, second]);
-        let (observed, _) = agent_command_observation(&result, 2);
-
-        assert_eq!(observed, vec![expected.clone(), expected]);
-    }
-
-    #[test]
-    fn registry_exposes_only_manifest_tools() {
-        let mut projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceRead)],
-            smoke_commands: Vec::new(),
-        };
-        let registry = evaluation_registry(&projection).expect("registry");
-        assert!(registry.registry.get(TOOL_READ).is_some());
-        assert!(registry.registry.get(TOOL_LIST).is_some());
-        assert!(registry.registry.get(UPDATE_PLAN_TOOL).is_none());
-        assert!(registry.registry.get(TOOL_COMMAND).is_none());
-        assert!(registry.registry.get(TOOL_EDIT).is_none());
-
-        projection.required_tool_capabilities = vec![requirement(ToolCapability::WorkspaceSearch)];
-        let registry = evaluation_registry(&projection).expect("search registry");
-        assert!(registry.registry.get(TOOL_GREP).is_some());
-        assert!(registry.registry.get(TOOL_READ).is_none());
-    }
-
-    #[test]
-    fn registry_command_schema_exposes_only_allowed_smoke_inputs() {
-        let smoke = command(&["cargo", "test"]);
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
-            smoke_commands: vec![smoke.clone()],
-        };
-
-        let registry = evaluation_registry(&projection).expect("registry");
-        let command = registry.registry.get(TOOL_COMMAND).expect("command tool");
-        let payload = smoke_command_model_input(&smoke);
-
-        assert_eq!(
-            command.input_schema["properties"]["command"]["const"],
-            payload["command"]
-        );
-        assert!(singularity_model::is_strict_tool_schema_compatible(
-            &command.input_schema
-        ));
-        assert!(command.input_schema.get("sandbox_mode").is_none());
-        assert!(!command.input_schema.to_string().contains("network_access"));
-        let (_, execution_input) = registry
-            .registry
-            .prepare_model_input(TOOL_COMMAND, &payload)
-            .expect("declared command model input");
-        assert_eq!(execution_input, payload);
-        assert!(
-            registry
-                .registry
-                .validate_execution_input(TOOL_COMMAND, &execution_input)
-                .is_ok()
-        );
-        let mut undeclared = payload;
-        undeclared["command"] = json!("cargo check");
-        assert_eq!(
-            registry
-                .registry
-                .prepare_model_input(TOOL_COMMAND, &undeclared)
-                .expect_err("undeclared command must fail locally")
-                .code,
-            "input_not_allowed"
-        );
-    }
-
-    #[test]
-    fn smoke_commands_require_a_registry_resolved_command_capability() {
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceRead)],
-            smoke_commands: vec![command(&["cargo", "test"])],
-        };
-
-        let error = evaluation_registry(&projection).expect_err("missing command capability");
-        assert!(
-            error
-                .to_string()
-                .contains("registry-resolved command execution tool")
-        );
+        let restricted_digest = format!("sha256:{}", "d".repeat(64));
+        let mut restricted =
+            singularity_tools::ToolResult::summary("restricted-command", TOOL_COMMAND, true, "ok")
+                .with_audit(json!({
+                    "command_scope_digest": restricted_digest.clone(),
+                    "command_provenance": "agent_requested",
+                    "sandbox_backend": "restricted-test",
+                    "sandbox_enforcement": "restricted_token",
+                    "local_process_fallback": false
+                }));
+        restricted.result_id = Some(restricted_digest);
+        let restricted_projection =
+            agent_command_projection(&completed_agent_result(vec![restricted]));
+        assert_eq!(restricted_projection.unknown_count, 0);
+        assert_eq!(restricted_projection.diagnostics.len(), 1);
+        assert!(agent_sandbox_blocker(&restricted_projection).is_some());
+        assert!(!restricted_projection.diagnostics[0].is_strictly_sandboxed());
     }
 
     #[test]
@@ -6243,12 +5490,8 @@ mod tests {
             StageExecution::skipped("hidden stage skipped"),
             diagnostics,
         );
-        let task_result = EvaluationTaskResult::from_trials(
-            task_id,
-            Vec::new(),
-            Vec::new(),
-            vec![task.result.clone()],
-        );
+        let task_result =
+            EvaluationTaskResult::from_trials(task_id, Vec::new(), vec![task.result.clone()]);
         let execution = TaskEvaluation {
             result: task_result,
             trials: vec![task],
@@ -6280,7 +5523,7 @@ mod tests {
         let run_id = "a".repeat(40);
         let task_id = "b".repeat(40);
         let manifest = json!({
-            "schema_version": "evaluation.task_set/v5",
+            "schema_version": "evaluation.task_set/v6",
             "trial_count": 1,
             "tasks": [{
                 "task_id": task_id,
@@ -6290,11 +5533,7 @@ mod tests {
                     "source": {"type": "local", "path": "missing-source"}
                 },
                 "agent": {
-                    "instructions": "inspect",
-                    "allowed_paths": ["README.md"],
-                    "required_tool_capabilities": [
-                        {"capability": "workspace_read", "minimum_version": 1}
-                    ]
+                    "instructions": "inspect"
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
@@ -6351,7 +5590,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_change_evidence_ignores_toolchain_artifacts_but_keeps_disallowed_source() {
+    fn evaluation_change_evidence_ignores_toolchain_artifacts_but_keeps_source_changes() {
         let temp = tempfile::tempdir().expect("workspace");
         fs::create_dir_all(temp.path().join("src")).expect("src");
         fs::create_dir_all(temp.path().join("target")).expect("tracked target");
@@ -6381,12 +5620,11 @@ mod tests {
             .expect("modify tracked target file");
         fs::remove_file(temp.path().join("coverage/tracked.txt"))
             .expect("delete tracked coverage file");
-        fs::write(temp.path().join("src/disallowed.rs"), "user source").expect("disallowed source");
+        fs::write(temp.path().join("src/new.rs"), "user source").expect("new source");
         let after = snapshot_workspace(temp.path()).expect("after");
-        let allowed_paths = [RelativePath::new("src/lib.rs").expect("allowed path")];
         let changed_files = evaluation_changed_paths(&before, &after, &pristine_source);
 
-        let evidence = workspace_change_evidence(&before, &after, &pristine_source, &allowed_paths);
+        let evidence = workspace_change_evidence(&before, &after, &pristine_source);
         let paths = evidence
             .iter()
             .map(|change| change.path.as_str())
@@ -6397,7 +5635,7 @@ mod tests {
             [
                 "coverage/tracked.txt",
                 "generated/cache.bin",
-                "src/disallowed.rs",
+                "src/new.rs",
                 "target/tracked.rs",
                 "unknown-empty",
             ]
@@ -6407,52 +5645,33 @@ mod tests {
             [
                 "coverage/tracked.txt",
                 "generated/cache.bin",
-                "src/disallowed.rs",
+                "src/new.rs",
                 "target/tracked.rs",
                 "unknown-empty",
             ]
         );
-        assert!(evidence.iter().all(|change| !change.allowed));
     }
 
     #[test]
-    fn evaluation_write_policy_allows_only_declared_path_trees() {
-        let projection = AgentTaskProjection {
-            task_id: TaskId::new("task-1").expect("task id"),
-            description: "description".to_string(),
-            instructions: "fix".to_string(),
-            allowed_paths: vec![RelativePath::new("src").expect("path")],
-            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceWrite)],
-            smoke_commands: Vec::new(),
-        };
-        let resolved_tools = evaluation_registry(&projection).expect("resolved write tools");
-        assert!(resolved_tools.registry.get(TOOL_EDIT).is_some());
-        assert!(resolved_tools.registry.get(TOOL_PATCH).is_some());
-        let policy = evaluation_policy(Path::new("C:/workspace"), &projection, &resolved_tools);
-        let allowed = policy.evaluate(&singularity_policy::PermissionRequest::new(
-            singularity_policy::ToolId::new(TOOL_EDIT).expect("tool id"),
-            PermissionOperation::Write,
-            PermissionResource::WorkspacePath(
-                WorkspaceRelativePath::from_canonical("src/lib.rs").expect("path"),
-            ),
-        ));
-        let denied = policy.evaluate(&singularity_policy::PermissionRequest::new(
-            singularity_policy::ToolId::new(TOOL_EDIT).expect("tool id"),
+    fn evaluation_reuses_standard_workspace_policy_for_write_and_command_operations() {
+        let policy = workspace_policy(PermissionProfileName::WorkspaceWrite, ApprovalPolicy::Never);
+        let write = policy.evaluate(&singularity_policy::PermissionRequest::new(
+            singularity_policy::ToolId::new(TOOL_PATCH).expect("tool id"),
             PermissionOperation::Write,
             PermissionResource::WorkspacePath(
                 WorkspaceRelativePath::from_canonical("src2/lib.rs").expect("path"),
             ),
         ));
+        let command = policy.evaluate(&singularity_policy::PermissionRequest::new(
+            singularity_policy::ToolId::new(TOOL_COMMAND).expect("tool id"),
+            PermissionOperation::Execute,
+            PermissionResource::Tool(
+                singularity_policy::ToolId::new(TOOL_COMMAND).expect("tool id"),
+            ),
+        ));
 
-        assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
-        assert_eq!(denied.outcome, PermissionDecisionOutcome::Deny);
-    }
-
-    #[test]
-    fn allowed_paths_cover_exact_file_or_descendants_only() {
-        let allowed = [RelativePath::new("src").expect("path")];
-        assert!(path_is_allowed("src/lib.rs", &allowed));
-        assert!(!path_is_allowed("src2/lib.rs", &allowed));
+        assert_eq!(write.outcome, PermissionDecisionOutcome::Allow);
+        assert_eq!(command.outcome, PermissionDecisionOutcome::Allow);
     }
 
     struct SourceSandboxBackend;
@@ -6495,18 +5714,6 @@ mod tests {
                     SandboxFilesystemMode::WorkspaceWrite
                 );
                 assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
-                #[cfg(windows)]
-                assert!(
-                    request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "1"]
-                        || request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "0"]
-                        || request.argv.as_slice() == ["cmd.exe", "/d", "/c", "rem", "hidden"]
-                );
-                #[cfg(not(windows))]
-                assert!(
-                    request.argv.as_slice() == ["false"]
-                        || request.argv.as_slice() == ["true"]
-                        || request.argv.as_slice() == ["printf", "hidden"]
-                );
                 #[cfg(windows)]
                 let is_baseline = request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "1"];
                 #[cfg(not(windows))]
@@ -6746,12 +5953,9 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            CommandResult::backend_error(
-                &request.command_id,
-                "executable preflight must prevent command execution",
-            )
-            .with_workspace_mutation(WorkspaceMutation::Unknown)
-            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+            CommandResult::completed(&request.command_id, "task workspace available")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
 
@@ -7524,7 +6728,7 @@ mod tests {
         #[cfg(not(windows))]
         let hidden_verification_argv = json!(["printf", "hidden"]);
         let manifest_json = json!({
-            "schema_version": "evaluation.task_set/v5",
+            "schema_version": "evaluation.task_set/v6",
             "trial_count": 3,
             "tasks": [{
                 "task_id": "source-reuse",
@@ -7532,11 +6736,7 @@ mod tests {
                 "capabilities": ["repository_context"],
                 "workspace": {"source": {"type": "local", "path": "fixture"}},
                 "agent": {
-                    "instructions": "inspect",
-                    "allowed_paths": ["README.md"],
-                    "required_tool_capabilities": [
-                        {"capability": "workspace_read", "minimum_version": 1}
-                    ]
+                    "instructions": "inspect"
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": baseline_argv}]},
@@ -7645,7 +6845,7 @@ mod tests {
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
-                "schema_version": "evaluation.task_set/v5",
+                "schema_version": "evaluation.task_set/v6",
                 "trial_count": trial_count,
                 "tasks": [{
                     "task_id": task_id,
@@ -7653,11 +6853,7 @@ mod tests {
                     "capabilities": ["repository_context"],
                     "workspace": {"source": source},
                     "agent": {
-                        "instructions": "inspect README.md",
-                        "allowed_paths": ["README.md"],
-                        "required_tool_capabilities": [
-                            {"capability": "workspace_read", "minimum_version": 1}
-                        ]
+                        "instructions": "inspect README.md"
                     },
                     "evaluator": {
                         "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
@@ -7895,7 +7091,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         let provider_calls = provider.join().expect("provider fixture join");
 
         assert_eq!(
@@ -8102,11 +7298,7 @@ mod tests {
                 "capabilities": ["repository_context"],
                 "workspace": {"source": {"type": "local", "path": source}},
                 "agent": {
-                    "instructions": "inspect README.md",
-                    "allowed_paths": ["README.md"],
-                    "required_tool_capabilities": [
-                        {"capability": "workspace_read", "minimum_version": 1}
-                    ]
+                    "instructions": "inspect README.md"
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
@@ -8119,7 +7311,7 @@ mod tests {
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
-                "schema_version": "evaluation.task_set/v5",
+                "schema_version": "evaluation.task_set/v6",
                 "trial_count": 1,
                 "tasks": [task("source-ok", "fixture"), task("source-blocked", "missing-source")]
             }))
@@ -8155,7 +7347,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert!(result.tasks.is_empty());
         assert_eq!(result.summary.task_count, 2);
         assert_eq!(result.summary.trials_per_task, 1);
@@ -8229,7 +7421,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert_eq!(
             result.blocker.as_ref().map(|blocker| blocker.kind),
             Some(BlockerKind::ProviderConfiguration)
@@ -8297,7 +7489,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert!(result.tasks.is_empty());
         assert_eq!(result.summary.configured_trial_count, 2);
         assert_eq!(result.summary.sampled_trial_count, 0);
@@ -8371,7 +7563,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result artifact"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert_eq!(result.summary.configured_trial_count, 2);
         assert_eq!(result.summary.sampled_trial_count, 0);
         assert_eq!(result.summary.trial_count, 0);
@@ -8451,7 +7643,11 @@ mod tests {
 
         assert_eq!(response.status, "blocked");
         assert!(response.tasks.is_empty());
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the ordinary strict task-workspace probe runs before executable discovery"
+        );
         let no_provider_attempt = match trace_store.list_trace("executable-blocked-run") {
             Ok(events) => events
                 .iter()
@@ -8467,7 +7663,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert_eq!(result.summary.configured_trial_count, 2);
         assert_eq!(result.summary.sampled_trial_count, 0);
         assert_eq!(result.summary.trial_count, 0);
@@ -8583,7 +7779,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert_eq!(result.summary.configured_trial_count, 2);
         assert_eq!(result.summary.sampled_trial_count, 0);
         assert_eq!(
@@ -8636,7 +7832,7 @@ mod tests {
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
         assert!(result.tasks.is_empty());
         assert_eq!(result.summary.configured_trial_count, 2);
         assert_eq!(result.summary.sampled_trial_count, 0);
@@ -8671,17 +7867,29 @@ mod tests {
     }
 
     #[test]
-    fn v5_blocked_run_publishes_v8_result_and_v3_evidence_as_one_artifact_set() {
+    fn v6_blocked_run_publishes_v9_result_and_v4_evidence_as_one_artifact_set() {
         let temp = tempfile::tempdir().expect("temp");
         let fixture = temp.path().join("fixture");
         let output_root = temp.path().join("output");
         fs::create_dir(&fixture).expect("fixture");
         fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        #[cfg(windows)]
+        let baseline_argv = json!(["cmd.exe", "/d", "/c", "exit", "1"]);
+        #[cfg(windows)]
+        let public_argv = json!(["cmd.exe", "/d", "/c", "exit", "0"]);
+        #[cfg(windows)]
+        let hidden_argv = json!(["cmd.exe", "/d", "/c", "rem", "hidden"]);
+        #[cfg(not(windows))]
+        let baseline_argv = json!(["false"]);
+        #[cfg(not(windows))]
+        let public_argv = json!(["true"]);
+        #[cfg(not(windows))]
+        let hidden_argv = json!(["printf", "hidden"]);
         let manifest_path = temp.path().join("manifest.json");
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
-                "schema_version": "evaluation.task_set/v5",
+                "schema_version": "evaluation.task_set/v6",
                 "trial_count": 2,
                 "tasks": [{
                     "task_id": "blocked-artifacts",
@@ -8689,16 +7897,12 @@ mod tests {
                     "capabilities": ["repository_context"],
                     "workspace": {"source": {"type": "local", "path": "fixture"}},
                     "agent": {
-                        "instructions": "inspect",
-                        "allowed_paths": ["README.md"],
-                        "required_tool_capabilities": [
-                            {"capability": "workspace_read", "minimum_version": 1}
-                        ]
+                        "instructions": "inspect"
                     },
                     "evaluator": {
-                        "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
-                        "public": {"commands": [{"argv": ["cargo", "test"]}]},
-                        "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
+                        "baseline": {"commands": [{"argv": baseline_argv}]},
+                        "public": {"commands": [{"argv": public_argv}]},
+                        "hidden": {"commands": [{"argv": hidden_argv}]}
                     }
                 }]
             }))
@@ -8726,17 +7930,17 @@ mod tests {
         )
         .expect("blocked run still publishes typed artifacts");
 
-        assert_eq!(response.status, "blocked");
         let result_path = PathBuf::from(response.result_path.expect("result path"));
         let evidence_path = PathBuf::from(response.evidence_path.expect("evidence path"));
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(&result_path).expect("result artifact"),
         )
-        .expect("result v8");
+        .expect("result v9");
+        assert_eq!(response.status, "blocked", "result={result:?}");
         let evidence = crate::EvaluationEvidence::from_json_str(
             &fs::read_to_string(&evidence_path).expect("evidence artifact"),
         )
-        .expect("evidence v3");
+        .expect("evidence v4");
         evidence
             .validate_against_result(&result)
             .expect("result/evidence binding");
@@ -8835,7 +8039,7 @@ mod tests {
             &run_id,
             &json!({"status": "completed"}),
             &json!({"runner": RUNNER_NAME}),
-            &json!({"schema_version": "evaluation.evidence/v3"}),
+            &json!({"schema_version": "evaluation.evidence/v4"}),
         )
         .expect_err("publish must fail");
 
@@ -8870,9 +8074,9 @@ mod tests {
         let published = publish_evaluation_artifacts(
             temp.path(),
             &run_id,
-            &json!({"schema_version": "evaluation.result/v8"}),
+            &json!({"schema_version": "evaluation.result/v9"}),
             &json!({"runner": RUNNER_NAME}),
-            &json!({"schema_version": "evaluation.evidence/v3"}),
+            &json!({"schema_version": "evaluation.evidence/v4"}),
         )
         .expect("publish artifact set");
 

@@ -73,25 +73,6 @@ impl WorkspaceTools {
         }
     }
 
-    /// 以单文件 patch 语义执行受保护的替换。
-    pub fn edit(
-        &self,
-        input: EditToolInput,
-        decision: &ToolBrokerDecision,
-    ) -> Result<ToolOutput, WorkspaceToolError> {
-        input.validate()?;
-        self.patch(
-            WorkspacePatch {
-                changes: vec![WorkspacePatchChange {
-                    path: input.path,
-                    expected: Some(input.expected),
-                    replacement: input.replacement,
-                }],
-            },
-            decision,
-        )
-    }
-
     /// 先整批预检再原子写入多个文件变更。
     pub fn patch(
         &self,

@@ -63,13 +63,11 @@ pub struct CreateStartedTurnParams<'a> {
     pub history_turn_limit: usize,
 }
 
-/// turn 的原子结果，以及相关的持久化计划、助手条目和追踪（如有）。
+/// turn 的原子结果，以及助手条目和追踪（如有）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     /// 提交后的 turn 状态。
     pub turn: Turn,
-    /// 可选的持久化 plan item。
-    pub plan_item: Option<Item>,
     /// 可选的持久化 assistant item。
     pub assistant_item: Option<Item>,
     /// 与结果提交绑定的 trace event。
@@ -95,8 +93,6 @@ pub struct CommitTurnOutcomeParams<'a> {
     pub assistant_item_id: Option<&'a AllocatedAssistantItemId>,
     /// 可选的 assistant 增量。
     pub assistant_delta: Option<&'a str>,
-    /// 可选的 plan payload。
-    pub plan: Option<&'a Value>,
     /// 与提交绑定的 trace event。
     pub trace: &'a TraceEvent,
 }
@@ -569,7 +565,6 @@ impl SessionStore {
             agent_loop_status,
             assistant_item_id,
             assistant_delta,
-            plan,
             trace,
         } = params;
         let current = transaction
@@ -637,16 +632,6 @@ impl SessionStore {
             agent_loop_status: agent_loop_status.to_string(),
             ..current
         };
-        let plan_item = plan
-            .map(|plan| -> StoreResult<Item> {
-                let kind = ItemKind::Plan;
-                let (payload, redacted) = sanitize_item_payload(&kind, plan.clone())?;
-                let item = Self::new_item(turn_id, kind, payload);
-                let item_sequence = Self::next_item_sequence(transaction, turn_id)?;
-                Self::insert_item(transaction, &item, item_sequence, redacted)?;
-                Ok(item)
-            })
-            .transpose()?;
         let assistant_item = assistant_item_id
             .zip(assistant_delta)
             .map(|(item_id, delta)| -> StoreResult<Item> {
@@ -667,7 +652,6 @@ impl SessionStore {
         let trace = Self::insert_turn_trace(transaction, &trace, &trace_thread_id, turn_id)?;
         Ok(CommittedTurnOutcome {
             turn,
-            plan_item,
             assistant_item,
             trace,
         })

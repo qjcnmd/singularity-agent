@@ -39,8 +39,6 @@ pub enum AgentObservation {
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
     Verification(VerificationObservation),
-    VerificationPlan(VerificationPlanObservation),
-    RepairPlanning(RepairPlanningObservation),
     FinalReview(FinalReviewObservation),
 }
 
@@ -188,47 +186,6 @@ pub enum VerificationStatus {
     GatePassed,
     GateRejected,
     RepairRequested,
-}
-
-/// Verification plan lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationPlanStatus {
-    Planned,
-    Rejected,
-    Cancelled,
-}
-
-/// Safe projection of a revision-bound verification plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct VerificationPlanObservation {
-    pub identity: OccurrenceIdentity,
-    pub lifecycle: OccurrenceLifecycle<VerificationPlanStatus>,
-    pub revision: Option<singularity_tools::WorkspaceRevision>,
-    pub risk_count: u32,
-    pub requirement_count: u32,
-    pub satisfied_requirement_count: u32,
-}
-
-/// Repair planning lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RepairPlanningStatus {
-    Planned,
-    Exhausted,
-    Cancelled,
-}
-
-/// Safe projection of bounded repair planning.  It intentionally carries no raw error, prompt,
-/// arguments, path, or audit metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct RepairPlanningObservation {
-    pub identity: OccurrenceIdentity,
-    pub lifecycle: OccurrenceLifecycle<RepairPlanningStatus>,
-    pub reason: crate::AgentRepairReason,
-    pub attempt: u32,
-    pub max_attempts: u32,
-    pub required_revision: Option<singularity_tools::WorkspaceRevision>,
 }
 
 /// verification occurrence 的安全计数与真实 command duration 关联。

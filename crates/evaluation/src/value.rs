@@ -91,41 +91,6 @@ impl<'de> Deserialize<'de> for RunId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-/// 由运行时 `ToolRegistry` 解释的能力名称；本类型不维护能力白名单。
-pub struct ToolCapabilityName(String);
-
-impl ToolCapabilityName {
-    /// 创建只受稳定语法约束的 capability name。
-    pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        let value = value.into();
-        validate_capability_name(&value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Serialize for ToolCapabilityName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolCapabilityName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// manifest 内允许的相对路径。
 pub struct RelativePath(String);
 
@@ -305,27 +270,6 @@ fn validate_identifier(kind: &str, value: &str) -> Result<(), String> {
         return Err(format!(
             "{kind} may contain only ASCII letters, digits, '-', '_', and '.'"
         ));
-    }
-    Ok(())
-}
-
-fn validate_capability_name(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > IDENTIFIER_MAX_BYTES {
-        return Err(format!(
-            "tool capability name must contain between 1 and {IDENTIFIER_MAX_BYTES} ASCII bytes"
-        ));
-    }
-    if !value.is_ascii()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        || value.starts_with('_')
-        || value.ends_with('_')
-        || value.contains("__")
-    {
-        return Err(
-            "tool capability name must use lowercase snake_case without empty segments".to_string(),
-        );
     }
     Ok(())
 }

@@ -9,10 +9,11 @@ use serde::Serialize;
 use singularity_policy::NetworkAccess;
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode, WorkspaceObservationMetrics,
-    command_scope_digest,
+    CommandSemanticStatus, SandboxBackendEnforcement, SandboxFilesystemMode, SandboxNetworkMode,
+    ToolFailureKind, ToolResult, WorkspaceObservationMetrics, command_scope_digest,
 };
 
+use super::evidence::is_sha256_digest;
 use super::workspace::canonical_or_original;
 use super::{SharedSandboxBackend, evaluation_blocker};
 
@@ -22,14 +23,23 @@ static COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Evaluation command 的脱敏执行诊断。
 pub(super) struct CommandDiagnostic {
     pub(super) phase: String,
-    execution_status: CommandExecutionStatus,
-    semantic_status: CommandSemanticStatus,
+    /// Agent ToolResult does not carry evaluator-owned process details; those fields stay absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_status: Option<CommandExecutionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_status: Option<CommandSemanticStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
-    duration_ms: u64,
-    timed_out: bool,
-    output_truncated: bool,
-    stdout_preview: String,
-    stderr_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timed_out: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr_preview: Option<String>,
     sandbox_backend: String,
     sandbox_enforcement: singularity_tools::SandboxBackendEnforcement,
     pub(super) local_process_fallback: bool,
@@ -44,20 +54,129 @@ impl CommandDiagnostic {
     pub(super) fn new(phase: impl Into<String>, result: &CommandResult) -> Self {
         Self {
             phase: phase.into(),
-            execution_status: result.execution_status.clone(),
-            semantic_status: result.semantic_status.clone(),
+            execution_status: Some(result.execution_status.clone()),
+            semantic_status: Some(result.semantic_status.clone()),
             exit_code: result.exit_code,
-            duration_ms: result.duration_ms,
-            timed_out: result.timed_out,
-            output_truncated: result.output_truncated,
-            stdout_preview: result.stdout_preview.clone(),
-            stderr_preview: result.stderr_preview.clone(),
+            duration_ms: Some(result.duration_ms),
+            timed_out: Some(result.timed_out),
+            output_truncated: Some(result.output_truncated),
+            stdout_preview: Some(result.stdout_preview.clone()),
+            stderr_preview: Some(result.stderr_preview.clone()),
             sandbox_backend: result.sandbox.backend.clone(),
             sandbox_enforcement: result.sandbox.enforcement.clone(),
             local_process_fallback: result.sandbox.local_process_fallback,
             scope_digest: None,
             workspace_observation_metrics: result.workspace_observation_metrics.clone(),
         }
+    }
+
+    /// Project one producer-owned Agent command result without inventing process details.
+    pub(super) fn from_agent_tool_result(result: &ToolResult) -> AgentCommandDiagnosticProjection {
+        let Some(audit) = result.audit_metadata().and_then(|value| value.as_object()) else {
+            return if result.result_id.is_none()
+                && matches!(
+                    result.failure_kind,
+                    Some(
+                        ToolFailureKind::Input
+                            | ToolFailureKind::Visibility
+                            | ToolFailureKind::Capability
+                            | ToolFailureKind::Policy
+                            | ToolFailureKind::PermissionProfile
+                            | ToolFailureKind::WorkspaceBoundary
+                            | ToolFailureKind::ProtectedPath
+                            | ToolFailureKind::Approval
+                            | ToolFailureKind::Cancelled
+                    )
+                ) {
+                AgentCommandDiagnosticProjection::NotExecuted
+            } else {
+                AgentCommandDiagnosticProjection::Unknown
+            };
+        };
+        if result.result_id.is_none()
+            && (audit
+                .get("executor_started")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+                || audit
+                    .get("sandbox_backend")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("not_executed")
+                || audit
+                    .get("sandbox_enforcement")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("not_executed"))
+        {
+            return AgentCommandDiagnosticProjection::NotExecuted;
+        }
+        let enforcement = match audit
+            .get("sandbox_enforcement")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("strict") => SandboxBackendEnforcement::Strict,
+            Some("restricted_token") => SandboxBackendEnforcement::RestrictedToken,
+            Some("unavailable") => SandboxBackendEnforcement::Unavailable,
+            _ => return AgentCommandDiagnosticProjection::Unknown,
+        };
+        let Some(result_id) = result
+            .result_id
+            .as_deref()
+            .filter(|id| is_sha256_digest(id))
+        else {
+            return AgentCommandDiagnosticProjection::Unknown;
+        };
+        let Some(scope_digest) = audit
+            .get("command_scope_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| is_sha256_digest(digest))
+        else {
+            return AgentCommandDiagnosticProjection::Unknown;
+        };
+        if scope_digest != result_id
+            || audit
+                .get("command_provenance")
+                .and_then(serde_json::Value::as_str)
+                != Some("agent_requested")
+            || audit
+                .get("sandbox_backend")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            || audit
+                .get("local_process_fallback")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+            || audit
+                .get("executor_started")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+        {
+            return AgentCommandDiagnosticProjection::Unknown;
+        }
+        let sandbox_backend = audit
+            .get("sandbox_backend")
+            .and_then(serde_json::Value::as_str)
+            .expect("backend checked above")
+            .to_string();
+        let local_process_fallback = audit
+            .get("local_process_fallback")
+            .and_then(serde_json::Value::as_bool)
+            .expect("fallback checked above");
+        AgentCommandDiagnosticProjection::Executed(Self {
+            phase: "agent.command".to_string(),
+            execution_status: None,
+            semantic_status: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: None,
+            output_truncated: None,
+            stdout_preview: None,
+            stderr_preview: None,
+            sandbox_backend,
+            sandbox_enforcement: enforcement,
+            local_process_fallback,
+            scope_digest: Some(result_id.to_string()),
+            workspace_observation_metrics: None,
+        })
     }
 
     /// 为 manifest 命令补充稳定 scope digest。
@@ -79,6 +198,13 @@ impl CommandDiagnostic {
         !self.local_process_fallback
             && self.sandbox_enforcement == singularity_tools::SandboxBackendEnforcement::Strict
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum AgentCommandDiagnosticProjection {
+    Executed(CommandDiagnostic),
+    NotExecuted,
+    Unknown,
 }
 
 /// 计算 manifest 命令的稳定 scope digest。

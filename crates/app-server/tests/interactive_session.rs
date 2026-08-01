@@ -16,7 +16,6 @@ const ORIGINAL_INPUT: &str = "Complete this turn interactively";
 const FIRST_FOLLOW_UP: &str = "First follow-up";
 const SECOND_FOLLOW_UP: &str = "Second follow-up";
 const STEERING_INPUT: &str = "Do not execute the pending action; explain instead";
-const PLAN_CALL_ID: &str = "interactive_plan_call";
 const COMMAND_CALL_ID: &str = "interactive_command_call";
 
 #[test]
@@ -29,9 +28,7 @@ fn follow_up_is_consumed_once_in_order_before_same_turn_finalizes_and_terminal_i
     process.initialize();
     let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
     let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
-    provider
-        .next_request()
-        .complete(replan_response("initial_completed_plan"));
+    provider.next_request().complete(list_response());
     let first_request = provider.next_request();
     assert_eq!(user_texts(&first_request.request), vec![ORIGINAL_INPUT]);
 
@@ -49,7 +46,7 @@ fn follow_up_is_consumed_once_in_order_before_same_turn_finalizes_and_terminal_i
         vec![ORIGINAL_INPUT, FIRST_FOLLOW_UP, SECOND_FOLLOW_UP],
         "follow-up inputIds must be idempotent and distinct inputs must retain arrival order"
     );
-    follow_up_request.complete(replan_response("follow_up_replan"));
+    follow_up_request.complete(list_response());
     provider
         .next_request()
         .complete(final_response("answer including both follow-ups"));
@@ -86,7 +83,7 @@ fn steer_waits_for_the_next_safe_boundary_and_invalidates_a_pending_action() {
     let thread_id = process.start_thread(&workspace, "workspace-write", "never", 2);
     let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
 
-    provider.next_request().complete(plan_response());
+    provider.next_request().complete(list_response());
     let already_issued_request = provider.next_request();
     assert!(
         !user_texts(&already_issued_request.request).contains(&STEERING_INPUT),
@@ -101,10 +98,7 @@ fn steer_waits_for_the_next_safe_boundary_and_invalidates_a_pending_action() {
         user_texts(&steered_request.request),
         vec![ORIGINAL_INPUT, STEERING_INPUT]
     );
-    steered_request.complete(replan_response("steer_replan"));
-    provider
-        .next_request()
-        .complete(final_response("steered answer"));
+    steered_request.complete(final_response("steered answer"));
     let completed = process.output.recv_id(3, Duration::from_secs(10));
     assert_eq!(completed["result"]["turn"]["status"], "completed");
     assert!(
@@ -124,9 +118,7 @@ fn pause_is_distinct_and_resume_consumes_queued_user_messages_without_synthetic_
     process.initialize();
     let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
     let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
-    provider
-        .next_request()
-        .complete(replan_response("pause_initial_plan"));
+    provider.next_request().complete(list_response());
     let in_flight_request = provider.next_request();
 
     process.send_request(4, "turn/pause", json!({"turnId": turn_id}));
@@ -166,7 +158,7 @@ fn pause_is_distinct_and_resume_consumes_queued_user_messages_without_synthetic_
         ],
         "turn/resume must preserve queued user order without synthesizing continue"
     );
-    resumed_request.complete(replan_response("pause_replan"));
+    resumed_request.complete(list_response());
     provider
         .next_request()
         .complete(final_response("resumed answer"));
@@ -200,9 +192,7 @@ fn resume_worker_keeps_stdin_live_and_streams_before_final_response() {
     process.expect_ok(100);
     let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
     let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
-    provider
-        .next_request()
-        .complete(replan_response("resume_initial_plan"));
+    provider.next_request().complete(list_response());
     let in_flight = provider.next_request();
 
     process.send_request(4, "turn/pause", json!({"turnId": turn_id}));
@@ -241,9 +231,10 @@ fn resume_worker_keeps_stdin_live_and_streams_before_final_response() {
         vec![ORIGINAL_INPUT, "pause after this response"],
         "resume worker must observe queued input at a safe model boundary"
     );
-    follow_up_request.complete(replan_response("resume_replan"));
-    let final_request = provider.next_request();
-    final_request.complete(final_response("resume finished"));
+    follow_up_request.complete(list_response());
+    provider
+        .next_request()
+        .complete(final_response("resume finished"));
     let resumed = process.output.recv_id(8, Duration::from_secs(10));
     assert_eq!(resumed["result"]["turn"]["turn_id"], turn_id);
     assert_eq!(resumed["result"]["turn"]["status"], "completed");
@@ -261,9 +252,7 @@ fn interrupt_and_shutdown_remain_responsive_during_resume() {
     process.initialize();
     let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
     let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
-    provider
-        .next_request()
-        .complete(replan_response("interrupt_initial_plan"));
+    provider.next_request().complete(list_response());
     let in_flight = provider.next_request();
     process.send_request(4, "turn/pause", json!({"turnId": turn_id}));
     process.expect_ok(4);
@@ -313,7 +302,7 @@ fn queued_steer_survives_process_restart_without_mutating_the_issued_model_reque
         vec![ORIGINAL_INPUT, STEERING_INPUT],
         "checkpoint recovery must consume durable steer before the next new ModelTurnRequest"
     );
-    replayed.complete(replan_response("restart_replan"));
+    replayed.complete(list_response());
     provider
         .next_request()
         .complete(final_response("completed after durable steer"));
@@ -718,35 +707,16 @@ fn user_texts(request: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn plan_response() -> Value {
+fn list_response() -> Value {
     json!({
-        "id": "response_plan",
+        "id": "response_list",
         "object": "response",
         "status": "completed",
         "output": [{
             "type": "function_call",
-            "call_id": PLAN_CALL_ID,
-            "name": "update_plan",
-            "arguments": json!({
-                "steps": [{"step": "execute the pending action", "status": "pending"}]
-            }).to_string()
-        }],
-        "usage": usage()
-    })
-}
-
-fn replan_response(call_id: &str) -> Value {
-    json!({
-        "id": "response_plan",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "update_plan",
-            "arguments": json!({
-                "steps": [{"step": "address the latest user input", "status": "completed"}]
-            }).to_string()
+            "call_id": "interactive_list_call",
+            "name": "list",
+            "arguments": json!({"path": "."}).to_string()
         }],
         "usage": usage()
     })
@@ -960,7 +930,12 @@ impl JsonOutput {
             let message = self
                 .receiver
                 .recv_timeout(remaining)
-                .expect("app-server output message");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "app-server output message: {error}; buffered messages: {:?}",
+                        self.buffered
+                    )
+                });
             if predicate(&message) {
                 return message;
             }

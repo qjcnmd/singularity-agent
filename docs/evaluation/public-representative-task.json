@@ -1,5 +1,5 @@
 {
-  "schema_version": "evaluation.task_set/v5",
+  "schema_version": "evaluation.task_set/v6",
   "trial_count": 2,
   "tasks": [
     {
@@ -61,28 +61,7 @@
         ]
       },
       "agent": {
-        "instructions": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 must emit exactly \"Use 'COALESCE' instead of 'IFNULL'.\" for IFNULL and exactly \"Use 'COALESCE' instead of 'NVL'.\" for NVL. Apply the smallest focused change to src/sqlfluff/rules/L060.py, then call command with the exact command string derived from agent.smoke_commands without substituting another Python executable or command, and report the verification result.",
-        "allowed_paths": [
-          "src/sqlfluff/rules/L060.py"
-        ],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "workspace_search", "minimum_version": 1},
-          {"capability": "workspace_write", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1},
-          {"capability": "plan_management", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-B",
-              "-c",
-              "import ast, pathlib; ast.parse(pathlib.Path('src/sqlfluff/rules/L060.py').read_text(encoding='utf-8'))"
-            ],
-            "timeout_seconds": 30
-          }
-        ]
+        "instructions": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 must emit exactly \"Use 'COALESCE' instead of 'IFNULL'.\" for IFNULL and exactly \"Use 'COALESCE' instead of 'NVL'.\" for NVL. Apply the smallest focused change to src/sqlfluff/rules/L060.py, then run a relevant verification command through the command tool and report the result."
       },
       "evaluator": {
         "public_test_patch": {
@@ -151,28 +130,7 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Use the host Python executable and call command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits. Continue until that exact smoke command succeeds, then report the verification result.",
-        "allowed_paths": [
-          "pricing.py",
-          "receipt.py"
-        ],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "workspace_search", "minimum_version": 1},
-          {"capability": "workspace_write", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1},
-          {"capability": "plan_management", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {
-            "argv": [
-              "python",
-              "-B",
-              "smoke_test.py"
-            ],
-            "timeout_seconds": 30
-          }
-        ]
+        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
       },
       "evaluator": {
         "public_test_patch": {
@@ -258,28 +216,7 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run both exact smoke commands through command and continue until both succeed.",
-        "allowed_paths": [
-          "src/lib.rs",
-          "calculator.mjs"
-        ],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "workspace_search", "minimum_version": 1},
-          {"capability": "workspace_write", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1},
-          {"capability": "plan_management", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {
-            "argv": ["cargo", "test", "--locked", "--lib"],
-            "timeout_seconds": 120
-          },
-          {
-            "argv": ["node", "smoke_test.mjs"],
-            "timeout_seconds": 30
-          }
-        ]
+        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run relevant verification commands through the command tool and report the results."
       },
       "evaluator": {
         "public_test_patch": {
@@ -327,27 +264,7 @@
         }
       },
       "agent": {
-        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Use command with exactly [\"node\", \"smoke_test.mjs\"] after your focused edits; continue until it succeeds and report the verification result.",
-        "allowed_paths": [
-          "catalog.mjs",
-          "inventory.mjs"
-        ],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "workspace_search", "minimum_version": 1},
-          {"capability": "workspace_write", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1},
-          {"capability": "plan_management", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {
-            "argv": [
-              "node",
-              "smoke_test.mjs"
-            ],
-            "timeout_seconds": 30
-          }
-        ]
+        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
       },
       "evaluator": {
         "public_test_patch": {
@@ -411,28 +328,7 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use list, grep, and read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Use command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits; continue until it succeeds and report the verification result.",
-        "allowed_paths": [
-          "src/billing/ledger.py",
-          "src/billing/report.py"
-        ],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "workspace_search", "minimum_version": 1},
-          {"capability": "workspace_write", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1},
-          {"capability": "plan_management", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {
-            "argv": [
-              "python",
-              "-B",
-              "smoke_test.py"
-            ],
-            "timeout_seconds": 30
-          }
-        ]
+        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use list, grep, and read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
       },
       "evaluator": {
         "public_test_patch": {

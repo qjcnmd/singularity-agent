@@ -288,6 +288,55 @@ impl PermissionProfile {
     }
 }
 
+/// 创建产品运行时与 Evaluation 共享的标准 workspace policy。
+///
+/// `Never` 只跳过真正的 approval 请求：workspace-write 下的工作区写入由
+/// 这个标准规则直接允许，read-only、网络、受保护资源和显式 `Ask` 仍由
+/// `PolicyEngine` 的硬拒绝与 approval 语义约束。
+pub fn workspace_policy(
+    profile_name: PermissionProfileName,
+    approval_policy: ApprovalPolicy,
+) -> PolicyEngine {
+    let mut profile = match profile_name {
+        PermissionProfileName::ReadOnly => PermissionProfile::read_only(),
+        PermissionProfileName::WorkspaceWrite => PermissionProfile::workspace_write(),
+    };
+    profile.approval_policy = approval_policy;
+
+    let mut policy = PolicyEngine::new(profile)
+        .with_rule(
+            PermissionRule::new(
+                "allow_workspace_read_tools",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Read),
+        )
+        .with_rule(
+            PermissionRule::new(
+                "allow_sandbox_commands",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Execute),
+        );
+
+    if profile_name == PermissionProfileName::WorkspaceWrite
+        && approval_policy == ApprovalPolicy::Never
+    {
+        policy = policy.with_rule(
+            PermissionRule::new(
+                "allow_workspace_writes_without_approval",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        );
+    }
+
+    policy
+}
+
 /// 待评估的工具、操作和资源请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionRequest {

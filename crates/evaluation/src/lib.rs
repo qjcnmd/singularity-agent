@@ -19,8 +19,8 @@ pub use manifest::{
     AgentStagePlan, AgentTaskProjection, AgentTaskSpec, BaselineStagePlan, CommandExpectation,
     CommandSpec, EvaluationCapability, EvaluationManifest, EvaluationStage, EvaluationTask,
     EvaluationTaskSet, EvaluatorSpec, EvaluatorStageSpec, EvaluatorTestPatch, PatchFormat,
-    PlannedWorkspaceSource, TaskSetSchemaVersion, ToolCapabilityRequirement, VerificationStagePlan,
-    WorkspacePlan, WorkspaceSeed, WorkspaceSource, WorkspaceSpec,
+    PlannedWorkspaceSource, TaskSetSchemaVersion, VerificationStagePlan, WorkspacePlan,
+    WorkspaceSeed, WorkspaceSource, WorkspaceSpec,
 };
 pub use result::{
     BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,
@@ -29,18 +29,16 @@ pub use result::{
     EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, EvaluationTaskSummary,
     EvaluationTrialResult, FiniteStatistics, StageResult, StageStatus,
 };
-pub use value::{
-    Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolCapabilityName,
-};
+pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId};
 
 /// 当前 task set schema 版本。
-pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v5";
+pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v6";
 /// 当前稳定 result schema 版本。
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v8";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v9";
 /// 当前 evidence schema 版本。
-pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v3";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v4";
 /// 核心任务成功率门禁的 basis points 阈值。
-pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
+pub const TASK_DIMENSION_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 
 #[derive(Debug, thiserror::Error)]
 /// Evaluation 输入、执行和结果校验错误。

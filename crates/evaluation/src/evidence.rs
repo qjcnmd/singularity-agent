@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation evidence 的 schema 版本。
 pub enum EvaluationEvidenceSchemaVersion {
-    #[serde(rename = "evaluation.evidence/v3")]
-    V3,
+    #[serde(rename = "evaluation.evidence/v4")]
+    V4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,9 +73,7 @@ pub struct EvaluationPromptStructure {
     pub contract: String,
     pub model_message_roles: Vec<String>,
     pub section_kinds: Vec<String>,
-    pub allowed_path_count: u32,
     pub resolved_tool_count: u32,
-    pub smoke_command_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_instructions_fingerprint: Option<String>,
 }
@@ -163,8 +161,6 @@ pub struct EvaluationTrialEvidence {
     pub trial: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_paths_digest: Option<String>,
-    pub allowlist: EvidenceVerdict,
-    pub smoke: EvaluationScopeEvidence,
     pub baseline: EvaluationScopeEvidence,
     pub public: EvaluationScopeEvidence,
     pub hidden: EvaluationScopeEvidence,
@@ -217,7 +213,6 @@ impl EvaluationTrialEvidence {
         if let Some(provider) = &self.provider {
             provider.validate(&context)?;
         }
-        self.smoke.validate(&format!("{context} smoke"))?;
         self.baseline.validate(&format!("{context} baseline"))?;
         self.public.validate(&format!("{context} public"))?;
         self.hidden.validate(&format!("{context} hidden"))
@@ -233,22 +228,13 @@ pub struct EvaluationTaskEvidence {
     pub source_tree_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_commit: Option<GitCommit>,
-    pub allowed_paths_digest: String,
-    pub tool_capability_requirements_digest: String,
     pub trials: Vec<EvaluationTrialEvidence>,
 }
 
 impl EvaluationTaskEvidence {
     fn validate_identity(&self) -> Result<()> {
         let context = format!("evaluation evidence task {}", self.task_id);
-        for digest in [
-            self.source_tree_digest.as_deref(),
-            Some(self.allowed_paths_digest.as_str()),
-            Some(self.tool_capability_requirements_digest.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for digest in self.source_tree_digest.iter() {
             validate_sha256_digest(digest, &context)?;
         }
         Ok(())
@@ -276,7 +262,7 @@ impl EvaluationTaskEvidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 与 EvaluationResult/v8 逐 trial 或 run-level preflight blocker 绑定的脱敏 evidence。
+/// 与 EvaluationResult/v9 逐 trial 或 run-level preflight blocker 绑定的脱敏 evidence。
 pub struct EvaluationEvidence {
     pub schema_version: EvaluationEvidenceSchemaVersion,
     pub run_id: RunId,
@@ -421,9 +407,7 @@ impl EvaluationEvidence {
                     )));
                 }
                 if trial.evaluation_passed
-                    && (evidence.allowlist != EvidenceVerdict::Passed
-                        || evidence.smoke.required_scopes_satisfied != EvidenceVerdict::Passed
-                        || evidence.baseline.required_scopes_satisfied != EvidenceVerdict::Passed
+                    && (evidence.baseline.required_scopes_satisfied != EvidenceVerdict::Passed
                         || evidence.public.required_scopes_satisfied != EvidenceVerdict::Passed
                         || evidence.hidden.required_scopes_satisfied != EvidenceVerdict::Passed
                         || evidence.trace_digest.is_none()

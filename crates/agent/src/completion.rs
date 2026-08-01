@@ -3,7 +3,7 @@
 //! The reducer is the sole owner of workspace revision and terminal command evidence. Public
 //! scope helpers only project the reducer's result; they do not maintain a second state machine.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,14 +13,10 @@ use singularity_tools::{
 };
 
 use super::{
-    AgentVerification, AgentVerificationRequirement, EXACT_VERIFICATION_REQUIRED,
-    MAX_VERIFICATION_REQUIREMENTS, POST_MUTATION_VERIFICATION_REQUIRED, TOOL_COMMAND, TOOL_EDIT,
-    TOOL_PATCH, TOOL_SELECTION_FAILURE_GROUP, TOOL_SELECTION_FAILURE_PREFIX,
-    is_repairable_tool_result, is_sha256_fingerprint,
+    AgentVerification, POST_MUTATION_VERIFICATION_REQUIRED, TOOL_COMMAND, TOOL_PATCH,
+    TOOL_SELECTION_FAILURE_GROUP, TOOL_SELECTION_FAILURE_PREFIX, is_repairable_tool_result,
+    is_sha256_fingerprint,
 };
-
-/// Exact pre-execution failure recorded when a command arrives before its mutation-bound plan.
-const VERIFICATION_PLAN_REQUIRED_FAILURE: &str = "verification:verification_plan_required";
 
 /// 由 tool 结果和 approval 检查点共享的完成门禁状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -30,487 +26,14 @@ pub(super) struct CompletionTracker {
     pub(super) workspace_revision: Option<WorkspaceRevision>,
     successful_command_count: u32,
     #[serde(default)]
-    required_command_counts: BTreeMap<String, u32>,
-    #[serde(default)]
     terminal_command_scope_digests: Vec<String>,
     #[serde(default)]
     terminal_command_revisions: Vec<WorkspaceRevision>,
+    /// User input invalidates prior terminal evidence until a later unchanged command succeeds.
+    #[serde(default)]
+    verification_required_after_user_input: bool,
     unresolved_failures: BTreeSet<String>,
 }
-
-impl CompletionTracker {
-    pub(super) fn from_requirements(
-        requirements: &[AgentVerificationRequirement],
-    ) -> Result<Self, String> {
-        if requirements.len() > MAX_VERIFICATION_REQUIREMENTS {
-            return Err(format!(
-                "verification requirements must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
-            ));
-        }
-        let mut required_command_counts = BTreeMap::new();
-        for requirement in requirements {
-            if !is_sha256_fingerprint(&requirement.command_scope_digest) {
-                return Err("verification requirement command digest is invalid".to_string());
-            }
-            if requirement.required_success_count == 0 {
-                return Err(
-                    "verification requirement success count must be greater than zero".to_string(),
-                );
-            }
-            let count = required_command_counts
-                .entry(requirement.command_scope_digest.clone())
-                .or_insert(0u32);
-            *count = count
-                .checked_add(requirement.required_success_count)
-                .ok_or_else(|| {
-                    "verification requirement success count exceeds the supported range".to_string()
-                })?;
-        }
-        Ok(Self {
-            required_command_counts,
-            ..Self::default()
-        })
-    }
-
-    /// Merge the caller floor with a model plan without changing either side's duplicate rules.
-    ///
-    /// Caller requirements are reduced by `from_requirements`, whose checked-add semantics keep
-    /// repeated caller declarations additive. The caller supplies `plan` after
-    /// `AgentVerificationPlan::requirements` has already reduced model duplicates by maximum;
-    /// merging the two validated maps then takes the maximum for a digest shared by both sets.
-    pub(super) fn merged_requirements(
-        caller: &[AgentVerificationRequirement],
-        plan: &[AgentVerificationRequirement],
-    ) -> Result<Vec<AgentVerificationRequirement>, String> {
-        let caller = Self::from_requirements(caller)?;
-        let plan = Self::from_requirements(plan)?;
-        let mut required_command_counts = caller.required_command_counts;
-        for (digest, count) in plan.required_command_counts {
-            required_command_counts
-                .entry(digest)
-                .and_modify(|current| *current = (*current).max(count))
-                .or_insert(count);
-        }
-        if required_command_counts.len() > MAX_VERIFICATION_REQUIREMENTS {
-            return Err(format!(
-                "verification requirements must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
-            ));
-        }
-        Ok(required_command_counts
-            .into_iter()
-            .map(
-                |(command_scope_digest, required_success_count)| AgentVerificationRequirement {
-                    command_scope_digest,
-                    required_success_count,
-                },
-            )
-            .collect())
-    }
-
-    /// Activate exact command requirements once a real workspace mutation creates a verification
-    /// boundary. Read-only turns keep the legacy requirement state unchanged until this point.
-    pub(super) fn activate_requirements(
-        &mut self,
-        requirements: &[AgentVerificationRequirement],
-    ) -> Result<(), String> {
-        let next = Self::from_requirements(requirements)?;
-        if self.required_command_counts.is_empty() {
-            self.required_command_counts = next.required_command_counts;
-            return Ok(());
-        }
-        if self.required_command_counts == next.required_command_counts {
-            Ok(())
-        } else {
-            Err("verification requirements changed after execution began".to_string())
-        }
-    }
-
-    /// Replace exact requirements after a new mutation invalidates the prior evidence window.
-    pub(super) fn replace_requirements(
-        &mut self,
-        requirements: &[AgentVerificationRequirement],
-    ) -> Result<(), String> {
-        let next = Self::from_requirements(requirements)?;
-        self.required_command_counts = next.required_command_counts;
-        self.clear_terminal_command_observations();
-        Ok(())
-    }
-
-    pub(super) fn workspace_mutated(&self) -> bool {
-        self.workspace_mutated
-    }
-
-    pub(super) fn observe(&mut self, tool_result: &ToolResult) {
-        self.observe_with_window(tool_result, None);
-    }
-
-    /// Clear only the typed failure produced by submitting a command before installing a plan.
-    ///
-    /// A valid revision-bound plan makes that command legally submitable; it does not erase any
-    /// failure from a command that actually crossed the execution boundary.
-    pub(super) fn clear_verification_plan_required_failure(&mut self) {
-        self.unresolved_failures
-            .remove(VERIFICATION_PLAN_REQUIRED_FAILURE);
-    }
-
-    fn observe_with_window(&mut self, tool_result: &ToolResult, terminal_window: Option<usize>) {
-        let failure_group = match tool_result.failure_kind.as_ref() {
-            Some(ToolFailureKind::Visibility) => TOOL_SELECTION_FAILURE_GROUP,
-            _ => match tool_result.tool_name.as_str() {
-                TOOL_EDIT | TOOL_PATCH => "workspace_mutation",
-                TOOL_COMMAND => "verification",
-                tool_name => tool_name,
-            },
-        };
-
-        let observed_mutation = tool_result
-            .workspace_observation()
-            .map(|observation| self.observe_workspace_observation(observation));
-        if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH)
-            && tool_result.ok
-            && !matches!(
-                observed_mutation,
-                Some(Some((WorkspaceMutation::Changed, _)))
-            )
-        {
-            self.mark_workspace_revision_invalid("mutation_observation_missing");
-            self.workspace_mutated = true;
-            self.clear_terminal_command_observations();
-        }
-        if tool_result.ok {
-            self.unresolved_failures.retain(|failure| {
-                !failure.starts_with(failure_group)
-                    && !failure.starts_with(TOOL_SELECTION_FAILURE_PREFIX)
-            });
-            if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
-                self.workspace_mutated = true;
-                self.clear_terminal_command_observations();
-            } else if tool_result.tool_name == TOOL_COMMAND {
-                self.successful_command_count = self.successful_command_count.saturating_add(1);
-                if let Some(Some((WorkspaceMutation::Unchanged, revision))) = observed_mutation {
-                    let window_len =
-                        terminal_window.unwrap_or_else(|| self.terminal_command_window_len());
-                    self.record_terminal_command_observation(
-                        successful_command_scope_digest(tool_result),
-                        revision,
-                        window_len,
-                    );
-                    self.clear_superseded_workspace_input_failures();
-                } else if observed_mutation.is_none() {
-                    self.mark_workspace_revision_invalid("verification_observation_missing");
-                }
-            }
-        } else if is_repairable_tool_result(tool_result) {
-            let error_code = tool_result
-                .error_code
-                .as_deref()
-                .unwrap_or("tool_execution_failed");
-            self.unresolved_failures
-                .insert(format!("{failure_group}:{error_code}"));
-        }
-    }
-
-    pub(super) fn observe_workspace_observation(
-        &mut self,
-        observation: &WorkspaceObservation,
-    ) -> Option<(WorkspaceMutation, WorkspaceRevision)> {
-        let Some(revision) = observation.revision() else {
-            self.mark_workspace_revision_invalid("revision_missing");
-            return None;
-        };
-        let mutation = observation.mutation();
-        if mutation == WorkspaceMutation::Unknown {
-            self.mark_workspace_revision_invalid("change_unknown");
-            return None;
-        }
-        let valid_revision = match (self.workspace_revision, mutation) {
-            (None, WorkspaceMutation::Unchanged) => revision == WorkspaceRevision::initial(),
-            (None, WorkspaceMutation::Changed) => {
-                WorkspaceRevision::initial().next() == Some(revision)
-            }
-            (None, WorkspaceMutation::Unknown) => false,
-            (Some(current), WorkspaceMutation::Unchanged) => current == revision,
-            (Some(current), WorkspaceMutation::Changed) => current.next() == Some(revision),
-            (Some(_), WorkspaceMutation::Unknown) => false,
-        };
-        if !valid_revision {
-            self.mark_workspace_revision_invalid("revision_mismatch");
-            return None;
-        }
-        self.workspace_revision = Some(revision);
-        if mutation == WorkspaceMutation::Changed {
-            self.workspace_mutated = true;
-            self.clear_terminal_command_observations();
-        }
-        Some((mutation, revision))
-    }
-
-    pub(super) fn mark_workspace_revision_invalid(&mut self, reason: &str) {
-        self.clear_terminal_command_observations();
-        self.unresolved_failures
-            .insert(format!("workspace_revision:{reason}"));
-    }
-
-    pub(super) fn clear_user_input_invalidation(&mut self) {
-        self.unresolved_failures
-            .remove("workspace_revision:user_input_revision");
-    }
-
-    pub(super) fn clear_terminal_command_observations(&mut self) {
-        self.terminal_command_scope_digests.clear();
-        self.terminal_command_revisions.clear();
-    }
-
-    /// Clear only side-effect-free mutation input failures superseded by complete verification.
-    fn clear_superseded_workspace_input_failures(&mut self) {
-        if !self.workspace_mutated || !self.verification_satisfied() {
-            return;
-        }
-        self.unresolved_failures.retain(|failure| {
-            !matches!(
-                failure.as_str(),
-                "workspace_mutation:invalid_tool_arguments"
-                    | "workspace_mutation:invalid_tool_input"
-            )
-        });
-    }
-
-    pub(super) fn record_terminal_command_observation(
-        &mut self,
-        scope_digest: Option<&str>,
-        revision: WorkspaceRevision,
-        max_count: usize,
-    ) {
-        let Some(scope_digest) = scope_digest else {
-            self.clear_terminal_command_observations();
-            return;
-        };
-        self.terminal_command_scope_digests
-            .push(scope_digest.to_string());
-        self.terminal_command_revisions.push(revision);
-        let excess = self
-            .terminal_command_scope_digests
-            .len()
-            .saturating_sub(max_count);
-        if excess > 0 {
-            self.terminal_command_scope_digests.drain(..excess);
-            self.terminal_command_revisions.drain(..excess);
-        }
-    }
-
-    pub(super) fn allows_final(&self) -> bool {
-        self.unresolved_failures.is_empty() && self.verification_satisfied()
-    }
-
-    pub(super) fn has_unresolved_failures(&self) -> bool {
-        !self.unresolved_failures.is_empty()
-    }
-
-    pub(super) fn rejection_reason(&self) -> String {
-        if !self.unresolved_failures.is_empty() {
-            return format!(
-                "completion gate rejected final answer: unresolved failures: {}",
-                self.unresolved_failures
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !self.required_command_counts.is_empty() {
-            return EXACT_VERIFICATION_REQUIRED.to_string();
-        }
-        POST_MUTATION_VERIFICATION_REQUIRED.to_string()
-    }
-
-    pub(super) fn feedback(&self) -> String {
-        if !self.unresolved_failures.is_empty() {
-            return format!(
-                "Do not finalize yet. Resolve these failures and rerun the relevant verification: {}.",
-                self.unresolved_failures
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !self.required_command_counts.is_empty() {
-            return format!(
-                "Do not finalize yet. Run every exact verification command required by the task as the final successful command sequence after the latest workspace mutation. {} of {} required successful command results are currently satisfied.",
-                self.satisfied_command_count(),
-                self.required_command_count()
-            );
-        }
-        "Do not finalize yet. Run a relevant verification command after the latest workspace mutation, inspect its result, and only then provide the final answer."
-            .to_string()
-    }
-
-    pub(super) fn summary(&self) -> AgentVerification {
-        let required_command_count = self.required_command_count();
-        let satisfied_command_count = self.satisfied_command_count();
-        let required = self.workspace_mutated || required_command_count > 0;
-        AgentVerification {
-            required,
-            passed: required && self.allows_final(),
-            successful_command_count: self.successful_command_count,
-            required_command_count: if required_command_count > 0 {
-                required_command_count
-            } else {
-                u32::from(self.workspace_mutated)
-            },
-            satisfied_command_count: if required_command_count > 0 {
-                satisfied_command_count
-            } else {
-                u32::from(self.workspace_mutated && !self.terminal_command_scope_digests.is_empty())
-            },
-            unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
-            final_review_verdict: None,
-        }
-    }
-
-    pub(super) fn verification_satisfied(&self) -> bool {
-        if self.required_command_counts.is_empty() {
-            return !self.workspace_mutated
-                || (!self.terminal_command_scope_digests.is_empty()
-                    && self.terminal_command_scope_digests.len()
-                        == self.terminal_command_revisions.len()
-                    && self
-                        .terminal_command_revisions
-                        .iter()
-                        .all(|revision| Some(*revision) == self.workspace_revision));
-        }
-        usize::try_from(self.required_command_count()).is_ok_and(|required_count| {
-            self.terminal_command_scope_digests.len() == required_count
-                && self.terminal_command_revisions.len() == required_count
-                && self
-                    .terminal_command_revisions
-                    .iter()
-                    .all(|revision| Some(*revision) == self.workspace_revision)
-                && self.terminal_command_counts() == self.required_command_counts
-        })
-    }
-
-    pub(super) fn required_command_count(&self) -> u32 {
-        self.required_command_counts
-            .values()
-            .copied()
-            .fold(0u32, u32::saturating_add)
-    }
-
-    /// Return the authoritative merged requirement count for one exact command scope.
-    pub(super) fn required_command_count_for(&self, command_scope_digest: &str) -> u32 {
-        self.required_command_counts
-            .get(command_scope_digest)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Return the exact scopes covered by the merged caller and model requirements.
-    pub(super) fn required_command_scope_digests(&self) -> Vec<String> {
-        self.required_command_counts.keys().cloned().collect()
-    }
-
-    pub(super) fn terminal_command_scope_digests(&self) -> Vec<String> {
-        self.terminal_command_scope_digests.clone()
-    }
-
-    pub(super) fn satisfied_command_count(&self) -> u32 {
-        let terminal_counts = self.terminal_command_counts();
-        self.required_command_counts
-            .iter()
-            .map(|(digest, required)| {
-                terminal_counts
-                    .get(digest)
-                    .copied()
-                    .unwrap_or(0)
-                    .min(*required)
-            })
-            .fold(0u32, u32::saturating_add)
-    }
-
-    pub(super) fn terminal_command_window_len(&self) -> usize {
-        usize::try_from(self.required_command_count().max(1)).unwrap_or(usize::MAX)
-    }
-
-    pub(super) fn terminal_command_counts(&self) -> BTreeMap<String, u32> {
-        let mut counts = BTreeMap::new();
-        for digest in &self.terminal_command_scope_digests {
-            let count = counts.entry(digest.clone()).or_insert(0u32);
-            *count = count.saturating_add(1);
-        }
-        counts
-    }
-
-    pub(super) fn is_consistent(&self) -> bool {
-        if self.workspace_mutated && self.workspace_revision.is_none() {
-            return false;
-        }
-        if self.terminal_command_scope_digests.len() != self.terminal_command_revisions.len() {
-            return false;
-        }
-        if self
-            .terminal_command_scope_digests
-            .iter()
-            .any(|digest| !is_sha256_fingerprint(digest))
-        {
-            return false;
-        }
-        self.terminal_command_revisions
-            .iter()
-            .all(|revision| Some(*revision) == self.workspace_revision)
-    }
-}
-
-#[cfg(test)]
-mod requirement_merge_tests {
-    use super::*;
-
-    fn requirement(digest: &str, count: u32) -> AgentVerificationRequirement {
-        AgentVerificationRequirement::new(digest, count)
-    }
-
-    #[test]
-    fn merged_requirements_preserves_caller_addition_and_plan_max() {
-        let caller_digest = format!("sha256:{}", "a".repeat(64));
-        let plan_digest = format!("sha256:{}", "b".repeat(64));
-        let model_plan = super::super::AgentVerificationPlan {
-            risks: vec![super::super::AgentVerificationRisk::GeneralMutation],
-            checks: vec![
-                super::super::AgentVerificationCheck::new(
-                    super::super::AgentVerificationRisk::GeneralMutation,
-                    requirement(&plan_digest, 1),
-                ),
-                super::super::AgentVerificationCheck::new(
-                    super::super::AgentVerificationRisk::GeneralMutation,
-                    requirement(&plan_digest, 3),
-                ),
-            ],
-            entries: Vec::new(),
-        };
-        let caller = vec![
-            requirement(&caller_digest, 2),
-            requirement(&caller_digest, 3),
-        ];
-        let merged = CompletionTracker::merged_requirements(&caller, &model_plan.requirements())
-            .expect("valid requirement union");
-        assert_eq!(
-            merged,
-            vec![requirement(&caller_digest, 5), requirement(&plan_digest, 3)]
-        );
-    }
-
-    #[test]
-    fn merged_requirements_rejects_caller_overflow() {
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let error = CompletionTracker::merged_requirements(
-            &[requirement(&digest, u32::MAX), requirement(&digest, 1)],
-            &[],
-        )
-        .expect_err("caller duplicate overflow must fail closed");
-        assert!(error.contains("exceeds the supported range"));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct RepairFailureState {
     pub(super) signature: String,
@@ -731,4 +254,260 @@ pub fn successful_command_scope_digest(tool_result: &ToolResult) -> Option<&str>
     .then_some(tool_result.result_id.as_deref())
     .flatten()
     .filter(|digest| is_sha256_fingerprint(digest))
+}
+
+impl CompletionTracker {
+    pub(super) fn workspace_mutated(&self) -> bool {
+        self.workspace_mutated
+    }
+
+    pub(super) fn observe(&mut self, tool_result: &ToolResult) {
+        self.observe_with_window(tool_result, None);
+    }
+
+    fn observe_with_window(&mut self, tool_result: &ToolResult, terminal_window: Option<usize>) {
+        let failure_group = match tool_result.failure_kind.as_ref() {
+            Some(ToolFailureKind::Visibility) => TOOL_SELECTION_FAILURE_GROUP,
+            _ => match tool_result.tool_name.as_str() {
+                TOOL_PATCH => "workspace_mutation",
+                TOOL_COMMAND => "verification",
+                tool_name => tool_name,
+            },
+        };
+
+        let observed_mutation = tool_result
+            .workspace_observation()
+            .map(|observation| self.observe_workspace_observation(observation));
+        if tool_result.tool_name == TOOL_PATCH
+            && tool_result.ok
+            && !matches!(
+                observed_mutation,
+                Some(Some((WorkspaceMutation::Changed, _)))
+            )
+        {
+            self.mark_workspace_revision_invalid("mutation_observation_missing");
+            self.workspace_mutated = true;
+            self.clear_terminal_command_observations();
+        }
+        if tool_result.ok {
+            self.unresolved_failures.retain(|failure| {
+                !failure.starts_with(failure_group)
+                    && !failure.starts_with(TOOL_SELECTION_FAILURE_PREFIX)
+            });
+            if tool_result.tool_name == TOOL_PATCH {
+                self.workspace_mutated = true;
+                self.clear_terminal_command_observations();
+            } else if tool_result.tool_name == TOOL_COMMAND {
+                self.successful_command_count = self.successful_command_count.saturating_add(1);
+                if let Some(Some((WorkspaceMutation::Unchanged, revision))) = observed_mutation {
+                    let window_len =
+                        terminal_window.unwrap_or_else(|| self.terminal_command_window_len());
+                    self.record_terminal_command_observation(
+                        successful_command_scope_digest(tool_result),
+                        revision,
+                        window_len,
+                    );
+                    self.clear_superseded_workspace_input_failures();
+                } else if observed_mutation.is_none() {
+                    self.mark_workspace_revision_invalid("verification_observation_missing");
+                }
+            }
+        } else if is_repairable_tool_result(tool_result) {
+            let error_code = tool_result
+                .error_code
+                .as_deref()
+                .unwrap_or("tool_execution_failed");
+            self.unresolved_failures
+                .insert(format!("{failure_group}:{error_code}"));
+        }
+    }
+
+    pub(super) fn observe_workspace_observation(
+        &mut self,
+        observation: &WorkspaceObservation,
+    ) -> Option<(WorkspaceMutation, WorkspaceRevision)> {
+        let Some(revision) = observation.revision() else {
+            self.mark_workspace_revision_invalid("revision_missing");
+            return None;
+        };
+        let mutation = observation.mutation();
+        if mutation == WorkspaceMutation::Unknown {
+            self.mark_workspace_revision_invalid("change_unknown");
+            return None;
+        }
+        let valid_revision = match (self.workspace_revision, mutation) {
+            (None, WorkspaceMutation::Unchanged) => revision == WorkspaceRevision::initial(),
+            (None, WorkspaceMutation::Changed) => {
+                WorkspaceRevision::initial().next() == Some(revision)
+            }
+            (None, WorkspaceMutation::Unknown) => false,
+            (Some(current), WorkspaceMutation::Unchanged) => current == revision,
+            (Some(current), WorkspaceMutation::Changed) => current.next() == Some(revision),
+            (Some(_), WorkspaceMutation::Unknown) => false,
+        };
+        if !valid_revision {
+            self.mark_workspace_revision_invalid("revision_mismatch");
+            return None;
+        }
+        self.workspace_revision = Some(revision);
+        if mutation == WorkspaceMutation::Changed {
+            self.workspace_mutated = true;
+            self.clear_terminal_command_observations();
+        }
+        Some((mutation, revision))
+    }
+
+    pub(super) fn mark_workspace_revision_invalid(&mut self, reason: &str) {
+        self.clear_terminal_command_observations();
+        self.unresolved_failures
+            .insert(format!("workspace_revision:{reason}"));
+    }
+
+    pub(super) fn clear_terminal_command_observations(&mut self) {
+        self.terminal_command_scope_digests.clear();
+        self.terminal_command_revisions.clear();
+    }
+
+    /// Invalidate terminal verification after a steer/follow-up input.
+    pub(super) fn invalidate_after_user_input(&mut self) {
+        self.clear_terminal_command_observations();
+        self.verification_required_after_user_input = true;
+    }
+
+    pub(super) fn requires_post_input_verification(&self) -> bool {
+        self.verification_required_after_user_input
+    }
+
+    /// Clear only side-effect-free mutation input failures superseded by complete verification.
+    fn clear_superseded_workspace_input_failures(&mut self) {
+        if !self.workspace_mutated || !self.verification_satisfied() {
+            return;
+        }
+        self.unresolved_failures.retain(|failure| {
+            !matches!(
+                failure.as_str(),
+                "workspace_mutation:invalid_tool_arguments"
+                    | "workspace_mutation:invalid_tool_input"
+            )
+        });
+    }
+
+    pub(super) fn record_terminal_command_observation(
+        &mut self,
+        scope_digest: Option<&str>,
+        revision: WorkspaceRevision,
+        max_count: usize,
+    ) {
+        let Some(scope_digest) = scope_digest else {
+            self.clear_terminal_command_observations();
+            return;
+        };
+        self.terminal_command_scope_digests
+            .push(scope_digest.to_string());
+        self.terminal_command_revisions.push(revision);
+        self.verification_required_after_user_input = false;
+        let excess = self
+            .terminal_command_scope_digests
+            .len()
+            .saturating_sub(max_count);
+        if excess > 0 {
+            self.terminal_command_scope_digests.drain(..excess);
+            self.terminal_command_revisions.drain(..excess);
+        }
+    }
+
+    pub(super) fn allows_final(&self) -> bool {
+        self.unresolved_failures.is_empty() && self.verification_satisfied()
+    }
+
+    pub(super) fn has_unresolved_failures(&self) -> bool {
+        !self.unresolved_failures.is_empty()
+    }
+
+    pub(super) fn rejection_reason(&self) -> String {
+        if !self.unresolved_failures.is_empty() {
+            return format!(
+                "completion gate rejected final answer: unresolved failures: {}",
+                self.unresolved_failures
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        POST_MUTATION_VERIFICATION_REQUIRED.to_string()
+    }
+
+    pub(super) fn feedback(&self) -> String {
+        if !self.unresolved_failures.is_empty() {
+            return format!(
+                "Do not finalize yet. Resolve these failures and rerun the relevant verification: {}.",
+                self.unresolved_failures
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        "Do not finalize yet. Run a relevant verification command after the latest workspace mutation, inspect its result, and only then provide the final answer."
+            .to_string()
+    }
+
+    pub(super) fn summary(&self) -> AgentVerification {
+        let required = self.workspace_mutated;
+        AgentVerification {
+            required,
+            passed: required && self.allows_final(),
+            successful_command_count: self.successful_command_count,
+            required_command_count: u32::from(self.workspace_mutated),
+            satisfied_command_count: u32::from(
+                self.workspace_mutated && self.verification_satisfied(),
+            ),
+            unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
+            final_review_verdict: None,
+        }
+    }
+
+    pub(super) fn verification_satisfied(&self) -> bool {
+        !self.workspace_mutated
+            || (self.terminal_command_scope_digests.len() == 1
+                && self.terminal_command_revisions.len() == 1
+                && self
+                    .terminal_command_revisions
+                    .iter()
+                    .all(|revision| Some(*revision) == self.workspace_revision))
+    }
+
+    pub(super) fn terminal_command_scope_digests(&self) -> Vec<String> {
+        self.terminal_command_scope_digests.clone()
+    }
+
+    pub(super) fn terminal_command_window_len(&self) -> usize {
+        1
+    }
+
+    pub(super) fn is_consistent(&self) -> bool {
+        if self.workspace_mutated && self.workspace_revision.is_none() {
+            return false;
+        }
+        if self.terminal_command_scope_digests.len() != self.terminal_command_revisions.len() {
+            return false;
+        }
+        if self
+            .terminal_command_scope_digests
+            .iter()
+            .any(|digest| !is_sha256_fingerprint(digest))
+        {
+            return false;
+        }
+        if self.verification_required_after_user_input
+            && (!self.terminal_command_scope_digests.is_empty()
+                || !self.terminal_command_revisions.is_empty())
+        {
+            return false;
+        }
+        self.terminal_command_revisions
+            .iter()
+            .all(|revision| Some(*revision) == self.workspace_revision)
+    }
 }

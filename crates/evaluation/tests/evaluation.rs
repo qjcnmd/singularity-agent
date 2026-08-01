@@ -1,33 +1,24 @@
 #![recursion_limit = "256"]
 
-//! Evaluation v5/v7/v2 schema、task/trial 指标和证据绑定合同测试。
+//! Evaluation v6/v9/v4 schema、task/trial 指标和证据绑定合同测试。
 
 use serde_json::{Value, json};
 use singularity_evaluation::{
     BlockerKind, EvaluationBlocker, EvaluationCapability, EvaluationError, EvaluationEvidence,
     EvaluationEvidenceSchemaVersion, EvaluationEvidenceSummary, EvaluationManifest,
-    EvaluationPromptStructure, EvaluationProviderEvidence, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationSandboxPreflight,
-    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationScopeEvidence,
-    EvaluationStageResults, EvaluationStatus, EvaluationTaskEvidence, EvaluationTaskResult,
-    EvaluationTrialEvidence, EvaluationTrialResult, EvidenceVerdict, RunId, StageResult,
-    StageStatus, TaskId, TaskSetSchemaVersion, ToolCapabilityName, ToolCapabilityRequirement,
-    task_selection_digest,
+    EvaluationPromptStructure, EvaluationProviderEvidence, EvaluationResult, EvaluationRunSummary,
+    EvaluationSandboxPreflight, EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome,
+    EvaluationScopeEvidence, EvaluationStageResults, EvaluationStatus, EvaluationTaskEvidence,
+    EvaluationTaskResult, EvaluationTrialEvidence, EvaluationTrialResult, EvidenceVerdict, RunId,
+    StageResult, StageStatus, TaskId, TaskSetSchemaVersion, task_selection_digest,
 };
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const IMMUTABLE_COMMIT: &str = "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030";
 
-fn requirement(name: &str) -> ToolCapabilityRequirement {
-    ToolCapabilityRequirement {
-        capability: ToolCapabilityName::new(name).expect("capability name"),
-        minimum_version: 1,
-    }
-}
-
 fn valid_manifest() -> Value {
     json!({
-        "schema_version": "evaluation.task_set/v5",
+        "schema_version": "evaluation.task_set/v6",
         "trial_count": 2,
         "tasks": [{
             "task_id": "representative-task",
@@ -42,14 +33,7 @@ fn valid_manifest() -> Value {
                 "setup_commands": [{"argv": ["cargo", "fetch"]}]
             },
             "agent": {
-                "instructions": "Apply a focused fix.",
-                "allowed_paths": ["src/lib.rs"],
-                "required_tool_capabilities": [
-                    {"capability": "workspace_read", "minimum_version": 1},
-                    {"capability": "workspace_write", "minimum_version": 1},
-                    {"capability": "command_execution", "minimum_version": 1}
-                ],
-                "smoke_commands": [{"argv": ["cargo", "check"], "timeout_seconds": 60}]
+                "instructions": "Apply a focused fix."
             },
             "evaluator": {
                 "public_test_patch": {"format": "unified_diff", "content": "public patch"},
@@ -75,17 +59,16 @@ fn public_representative_task_uses_the_current_runtime_contract() {
         .join("../../docs/evaluation/public-representative-task.json");
     let manifest = EvaluationManifest::load(manifest_path).expect("public manifest is runnable");
 
-    assert_eq!(manifest.task_set().schema_version, TaskSetSchemaVersion::V5);
+    assert_eq!(manifest.task_set().schema_version, TaskSetSchemaVersion::V6);
     assert_eq!(manifest.task_set().trial_count, 2);
     assert_eq!(manifest.task_set().tasks.len(), 5);
-    assert!(manifest.task_set().tasks.iter().all(|task| {
-        !task.agent.required_tool_capabilities.is_empty()
-            && task
-                .agent
-                .required_tool_capabilities
-                .iter()
-                .all(|requirement| requirement.minimum_version == 1)
-    }));
+    assert!(
+        manifest
+            .task_set()
+            .tasks
+            .iter()
+            .all(|task| !task.agent.instructions.trim().is_empty())
+    );
 }
 
 #[test]
@@ -125,10 +108,12 @@ fn passed_trial(trial: u32) -> EvaluationTrialResult {
         stages: stages(passed_stage(), passed_stage(), passed_stage()),
         agent_completed: true,
         tests_passed: true,
+        functional_task_success: true,
+        agent_protocol_success: true,
+        sandbox_security_success: true,
         evaluation_passed: true,
         evidence: EvaluationEvidenceSummary {
             patch_digest: Some(DIGEST.to_string()),
-            smoke_command_satisfied: true,
             strict_sandbox_command_count: 4,
             model_turns: trial + 1,
             tool_calls: trial + 2,
@@ -142,21 +127,43 @@ fn passed_trial(trial: u32) -> EvaluationTrialResult {
     }
 }
 
+fn dimension_trial(
+    trial: u32,
+    functional: bool,
+    protocol: bool,
+    sandbox: bool,
+) -> EvaluationTrialResult {
+    let mut result = passed_trial(trial);
+    result.functional_task_success = functional;
+    result.agent_protocol_success = protocol;
+    result.sandbox_security_success = sandbox;
+    result.evaluation_passed = functional && protocol && sandbox;
+    result.status = if result.evaluation_passed {
+        EvaluationStatus::Completed
+    } else {
+        EvaluationStatus::Failed
+    };
+    result
+}
+
 fn failed_trial(trial: u32) -> EvaluationTrialResult {
     EvaluationTrialResult {
         trial,
         status: EvaluationStatus::Failed,
         blocker: None,
         stages: stages(
-            passed_stage(),
             StageResult {
                 status: StageStatus::Failed,
                 blocker: None,
             },
             passed_stage(),
+            passed_stage(),
         ),
-        agent_completed: true,
+        agent_completed: false,
         tests_passed: false,
+        functional_task_success: false,
+        agent_protocol_success: false,
+        sandbox_security_success: false,
         evaluation_passed: false,
         evidence: EvaluationEvidenceSummary {
             model_turns: 2,
@@ -197,6 +204,9 @@ fn blocked_trial(trial: u32) -> EvaluationTrialResult {
         },
         agent_completed: false,
         tests_passed: false,
+        functional_task_success: false,
+        agent_protocol_success: false,
+        sandbox_security_success: false,
         evaluation_passed: false,
         evidence: EvaluationEvidenceSummary::default(),
     }
@@ -206,7 +216,6 @@ fn task_result_for(task_id: &str, trials: Vec<EvaluationTrialResult>) -> Evaluat
     EvaluationTaskResult::from_trials(
         TaskId::new(task_id).expect("task id"),
         vec![EvaluationCapability::RequiredVerification],
-        vec![requirement("workspace_read")],
         trials,
     )
 }
@@ -273,12 +282,6 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
     EvaluationTrialEvidence {
         trial: trial.trial,
         changed_paths_digest: complete.then(|| DIGEST.to_string()),
-        allowlist: if complete {
-            EvidenceVerdict::Passed
-        } else {
-            EvidenceVerdict::Unknown
-        },
-        smoke: empty_scope(),
         baseline: empty_scope(),
         public: empty_scope(),
         hidden: empty_scope(),
@@ -288,9 +291,7 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
             contract: "evaluation.agent_prompt/v1".to_string(),
             model_message_roles: vec!["developer".to_string(), "user".to_string()],
             section_kinds: vec!["task_instructions".to_string()],
-            allowed_path_count: 1,
             resolved_tool_count: 1,
-            smoke_command_count: 0,
             project_instructions_fingerprint: None,
         }),
         prompt_fingerprint: complete.then(|| DIGEST.to_string()),
@@ -311,7 +312,7 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
 fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence {
     let task = &result.tasks[0];
     EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        schema_version: EvaluationEvidenceSchemaVersion::V4,
         run_id: result.run_id.clone(),
         manifest_digest: DIGEST.to_string(),
         task_selection_digest: task_selection_digest(std::slice::from_ref(&task.task_id)),
@@ -324,8 +325,6 @@ fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence
             task_id: task.task_id.clone(),
             source_tree_digest: complete.then(|| DIGEST.to_string()),
             source_commit: None,
-            allowed_paths_digest: DIGEST.to_string(),
-            tool_capability_requirements_digest: DIGEST.to_string(),
             trials: task
                 .trials
                 .iter()
@@ -337,17 +336,15 @@ fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence
 }
 
 #[test]
-fn task_set_v5_uses_explicit_versioned_capability_requirements() {
-    let manifest = parse_manifest(&valid_manifest()).expect("valid v5 manifest");
+fn task_set_v6_exposes_only_instructions_to_the_agent() {
+    let manifest = parse_manifest(&valid_manifest()).expect("valid v6 manifest");
     assert_eq!(manifest.task_set().trial_count, 2);
     let projection = manifest.task_set().tasks[0].agent_projection();
-    assert_eq!(projection.required_tool_capabilities.len(), 3);
-    assert_eq!(
-        projection.required_tool_capabilities[0].capability.as_str(),
-        "workspace_read"
-    );
+    assert_eq!(projection.instructions, "Apply a focused fix.");
     let serialized = serde_json::to_string(&projection).expect("projection JSON");
-    assert!(!serialized.contains("allowed_tools"));
+    assert!(!serialized.contains("allowed_paths"));
+    assert!(!serialized.contains("required_tool_capabilities"));
+    assert!(!serialized.contains("smoke_commands"));
 }
 
 #[test]
@@ -363,41 +360,34 @@ fn old_schema_and_tool_name_artifacts_fail_closed() {
     legacy_field["tasks"][0]["agent"]["allowed_tools"] = json!(["read"]);
     let error = parse_manifest(&legacy_field).expect_err("legacy field must be rejected");
     assert!(error.to_string().contains("unknown field"));
+
+    let mut retired_field = valid_manifest();
+    retired_field["tasks"][0]["agent"]["allowed_paths"] = json!(["src/lib.rs"]);
+    let error = parse_manifest(&retired_field).expect_err("retired field must be rejected");
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn trial_count_and_capability_versions_are_bounded() {
+fn trial_count_is_bounded() {
     for invalid in [0, 33] {
         let mut manifest = valid_manifest();
         manifest["trial_count"] = json!(invalid);
         assert!(parse_manifest(&manifest).is_err());
     }
-    let mut zero_version = valid_manifest();
-    zero_version["tasks"][0]["agent"]["required_tool_capabilities"][0]["minimum_version"] =
-        json!(0);
-    assert!(parse_manifest(&zero_version).is_err());
 }
 
 #[test]
-fn duplicate_capability_names_are_rejected_even_with_different_versions() {
+fn duplicate_task_capabilities_are_rejected() {
     let mut manifest = valid_manifest();
-    manifest["tasks"][0]["agent"]["required_tool_capabilities"] = json!([
-        {"capability": "workspace_read", "minimum_version": 1},
-        {"capability": "workspace_read", "minimum_version": 2}
-    ]);
+    manifest["tasks"][0]["capabilities"] = json!(["rust", "rust"]);
     let error = parse_manifest(&manifest).expect_err("duplicate capabilities");
-    assert!(error.to_string().contains("duplicate capability"));
+    assert!(error.to_string().contains("duplicates"));
 }
 
 #[test]
-fn capability_names_are_syntax_checked_without_a_local_whitelist() {
+fn task_capability_taxonomy_rejects_unknown_names() {
     let mut manifest = valid_manifest();
-    manifest["tasks"][0]["agent"]["required_tool_capabilities"][0]["capability"] =
-        json!("future_registry_capability");
-    parse_manifest(&manifest).expect("registry owns semantic capability validation");
-
-    manifest["tasks"][0]["agent"]["required_tool_capabilities"][0]["capability"] =
-        json!("Invalid-Capability");
+    manifest["tasks"][0]["capabilities"] = json!(["future_registry_capability"]);
     assert!(parse_manifest(&manifest).is_err());
 }
 
@@ -405,7 +395,10 @@ fn capability_names_are_syntax_checked_without_a_local_whitelist() {
 fn command_and_path_trust_boundaries_remain_fail_closed() {
     for invalid in ["../secret", "C:/secret", "src\\secret", "src/file:stream"] {
         let mut manifest = valid_manifest();
-        manifest["tasks"][0]["agent"]["allowed_paths"] = json!([invalid]);
+        manifest["tasks"][0]["workspace"]["source"] = json!({
+            "type": "local",
+            "path": invalid
+        });
         assert!(parse_manifest(&manifest).is_err(), "{invalid}");
     }
     let mut shell = valid_manifest();
@@ -415,7 +408,7 @@ fn command_and_path_trust_boundaries_remain_fail_closed() {
 }
 
 #[test]
-fn result_v8_keeps_blocked_trials_out_of_trial_diagnostics() {
+fn result_v9_keeps_blocked_trials_out_of_trial_diagnostics() {
     let task = task_result(vec![passed_trial(1), blocked_trial(2)]);
     assert_eq!(task.summary.completed_trial_count, 1);
     assert_eq!(task.summary.failed_trial_count, 0);
@@ -423,63 +416,44 @@ fn result_v8_keeps_blocked_trials_out_of_trial_diagnostics() {
     assert_eq!(task.summary.agent_scored_trial_count, 1);
     assert_eq!(task.summary.agent_completed_count, 1);
     assert_eq!(task.summary.agent_failed_count, 0);
+    assert_eq!(task.summary.functional_task_success_count, 1);
+    assert_eq!(task.summary.agent_protocol_success_count, 1);
+    assert_eq!(task.summary.sandbox_security_success_count, 1);
 
     let result = result_for(task, 2);
     result.validate().expect("valid blocked-denominator result");
     assert_eq!(result.summary.blocked_trial_count, 1);
     assert_eq!(result.summary.agent_scored_trial_count, 1);
-    assert_eq!(result.summary.trial_success_count, 1);
-    assert_eq!(result.summary.trial_success_rate_basis_points, 10_000);
-    assert_eq!(result.summary.task_success_count, 0);
-    assert_eq!(result.summary.task_success_rate_basis_points, 0);
-    assert!(!result.summary.meets_core_task_success_threshold);
+    assert_eq!(result.summary.functional_task_success_count, 0);
+    assert_eq!(result.summary.agent_protocol_success_count, 0);
+    assert_eq!(result.summary.sandbox_security_success_count, 0);
 }
 
 #[test]
-fn task_success_gate_differs_from_trial_success_rate() {
-    let task_a = task_result_for(
-        "task-a",
-        vec![passed_trial(1), passed_trial(2), passed_trial(3)],
-    );
-    let task_b = task_result_for(
-        "task-b",
-        vec![passed_trial(1), passed_trial(2), failed_trial(3)],
-    );
-    let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V8,
-        run_id: RunId::new("run-1").expect("run id"),
-        status: EvaluationStatus::Failed,
-        blocker: None,
-        evaluation_passed: false,
-        summary: EvaluationRunSummary {
-            task_count: 2,
-            trials_per_task: 3,
-            configured_trial_count: 6,
-            sampled_trial_count: 6,
-            trial_count: 6,
-            completed_trial_count: 5,
-            failed_trial_count: 1,
-            blocked_trial_count: 0,
-            agent_scored_trial_count: 6,
-            agent_completed_count: 6,
-            agent_failed_count: 0,
-            task_success_count: 1,
-            trial_success_count: 5,
-            trial_success_rate_basis_points: 5 * 10_000 / 6,
-            task_success_rate_basis_points: 10_000 / 2,
-            meets_core_task_success_threshold: false,
-        },
-        tasks: vec![task_a, task_b],
-        sandbox_preflight: Some(supported_preflight()),
-    };
+fn run_gate_uses_four_of_five_functional_and_protocol_tasks_and_all_sandbox_tasks() {
+    let tasks = vec![
+        task_result_for("task-a", vec![passed_trial(1)]),
+        task_result_for("task-b", vec![passed_trial(1)]),
+        task_result_for("task-c", vec![passed_trial(1)]),
+        task_result_for("task-d", vec![dimension_trial(1, false, true, true)]),
+        task_result_for("task-e", vec![dimension_trial(1, true, false, true)]),
+    ];
+    let mut result = result_for_tasks(tasks, 1);
+    result.validate().expect("dimension gate result");
 
-    result.validate().expect("task/trial metrics are valid");
-    assert_eq!(result.summary.task_success_count, 1);
-    assert_eq!(result.summary.trial_success_count, 5);
-    assert_eq!(result.summary.task_success_rate_basis_points, 5_000);
-    assert_eq!(result.summary.trial_success_rate_basis_points, 8_333);
-    assert!(result.summary.trial_success_rate_basis_points >= 8_000);
-    assert!(!result.summary.meets_core_task_success_threshold);
+    assert_eq!(result.summary.functional_task_success_count, 4);
+    assert_eq!(result.summary.agent_protocol_success_count, 4);
+    assert_eq!(result.summary.sandbox_security_success_count, 5);
+    assert!(result.summary.meets_functional_task_success_threshold);
+    assert!(result.summary.meets_agent_protocol_success_threshold);
+    assert!(result.summary.meets_sandbox_security_success_threshold);
+    assert!(result.evaluation_passed);
+
+    result.tasks[4] = task_result_for("task-e", vec![dimension_trial(1, true, false, false)]);
+    result.summary = EvaluationRunSummary::from_tasks(&result.tasks, 1);
+    result.evaluation_passed = false;
+    result.validate().expect("sandbox gate result");
+    assert!(!result.summary.meets_sandbox_security_success_threshold);
     assert!(!result.evaluation_passed);
 }
 
@@ -560,7 +534,7 @@ fn source_preparation_blocker_binds_zero_sampling_with_supported_preflight() {
         .expect("source blocker is valid before sampling");
 
     let evidence = EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        schema_version: EvaluationEvidenceSchemaVersion::V4,
         run_id: result.run_id.clone(),
         manifest_digest: DIGEST.to_string(),
         task_selection_digest: task_selection_digest(&task_ids),
@@ -576,8 +550,6 @@ fn source_preparation_blocker_binds_zero_sampling_with_supported_preflight() {
                 task_id,
                 source_tree_digest: None,
                 source_commit: None,
-                allowed_paths_digest: DIGEST.to_string(),
-                tool_capability_requirements_digest: DIGEST.to_string(),
                 trials: Vec::new(),
             })
             .collect(),
@@ -637,7 +609,7 @@ fn unsupported_past_and_future_schemas_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut value = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
-    value["schema_version"] = json!("evaluation.evidence/v1");
+    value["schema_version"] = json!("evaluation.evidence/v3");
     assert!(matches!(
         EvaluationEvidence::from_json_str(&serde_json::to_string(&value).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -645,7 +617,7 @@ fn unsupported_past_and_future_schemas_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut future = serde_json::to_value(result).expect("result JSON");
-    future["schema_version"] = json!("evaluation.result/v9");
+    future["schema_version"] = json!("evaluation.result/v10");
     assert!(matches!(
         EvaluationResult::from_json_str(&serde_json::to_string(&future).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -653,7 +625,7 @@ fn unsupported_past_and_future_schemas_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut future = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
-    future["schema_version"] = json!("evaluation.evidence/v4");
+    future["schema_version"] = json!("evaluation.evidence/v5");
     assert!(matches!(
         EvaluationEvidence::from_json_str(&serde_json::to_string(&future).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -661,7 +633,7 @@ fn unsupported_past_and_future_schemas_fail_closed() {
 }
 
 #[test]
-fn previous_result_is_rejected_and_current_v3_evidence_binds_to_v8_result() {
+fn previous_result_is_rejected_and_current_v4_evidence_binds_to_v9_result() {
     let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
     let mut legacy_result = serde_json::to_value(&result).expect("result JSON");
     legacy_result["schema_version"] = json!("evaluation.result/v6");
@@ -676,18 +648,18 @@ fn previous_result_is_rejected_and_current_v3_evidence_binds_to_v8_result() {
     let parsed_evidence = EvaluationEvidence::from_json_str(
         &serde_json::to_string(&evidence).expect("current evidence JSON"),
     )
-    .expect("current v3 evidence parses directly");
+    .expect("current v4 evidence parses directly");
     parsed_evidence
         .validate_against_result(&result)
-        .expect("current v3 evidence binds to v8 result");
+        .expect("current v4 evidence binds to v9 result");
     assert_eq!(
         serde_json::to_value(parsed_evidence).expect("current evidence JSON")["schema_version"],
-        json!("evaluation.evidence/v3")
+        json!("evaluation.evidence/v4")
     );
 }
 
 #[test]
-fn evidence_v3_binds_every_trial_and_safe_reproducibility_identity() {
+fn evidence_v4_binds_every_trial_and_safe_reproducibility_identity() {
     let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
     let evidence = evidence_for(&result, true);
     evidence

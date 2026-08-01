@@ -5,16 +5,16 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS, EvaluationCapability, EvaluationError,
-    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, ToolCapabilityRequirement,
-    require_schema_version, validation_error,
+    EvaluationCapability, EvaluationError, RESULT_SCHEMA_VERSION, Result, RunId,
+    TASK_DIMENSION_SUCCESS_THRESHOLD_BASIS_POINTS, TaskId, require_schema_version,
+    validation_error,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation result 的 schema 版本。
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v8")]
-    V8,
+    #[serde(rename = "evaluation.result/v9")]
+    V9,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,8 +27,6 @@ pub struct EvaluationEvidenceSummary {
     pub tool_calls: u32,
     pub model_turns: u32,
     pub approval_count: u32,
-    pub plan_update_count: u32,
-    pub plan_completed: bool,
     pub invalid_tool_call_count: u32,
     pub repeated_tool_call_count: u32,
     pub repair_attempt_count: u32,
@@ -45,7 +43,6 @@ pub struct EvaluationEvidenceSummary {
     pub total_tokens: u64,
     pub provider_latency_ms: u64,
     pub agent_duration_ms: u64,
-    pub smoke_command_satisfied: bool,
     pub strict_sandbox_command_count: u32,
     pub local_process_fallback_count: u32,
     pub local_process_fallback_unknown_count: u32,
@@ -262,6 +259,12 @@ pub struct EvaluationTrialResult {
     pub stages: EvaluationStageResults,
     pub agent_completed: bool,
     pub tests_passed: bool,
+    /// Public/hidden functional correctness, independent of AgentLoop protocol completion.
+    pub functional_task_success: bool,
+    /// AgentLoop lifecycle and terminal review contract outcome.
+    pub agent_protocol_success: bool,
+    /// Strict sandbox, network denial, evaluator protection, and no-fallback outcome.
+    pub sandbox_security_success: bool,
     /// 该 trial 是否满足 manifest evaluator 定义的完成条件。
     pub evaluation_passed: bool,
     pub evidence: EvaluationEvidenceSummary,
@@ -290,25 +293,38 @@ impl EvaluationTrialResult {
                 "{context} tests_passed requires passed public and hidden stages"
             )));
         }
-        if self.evaluation_passed
+        if self.functional_task_success
             && (self.stages.baseline.status != StageStatus::Passed
-                || !self.agent_completed
                 || !self.tests_passed
-                || self.status != EvaluationStatus::Completed)
+                || self.status == EvaluationStatus::Blocked)
         {
             return Err(validation_error(format!(
-                "{context} evaluation_passed requires completed baseline, agent, and tests"
+                "{context} functional_task_success requires baseline and evaluator tests"
+            )));
+        }
+        if self.agent_protocol_success
+            && (!self.agent_completed || self.status == EvaluationStatus::Blocked)
+        {
+            return Err(validation_error(format!(
+                "{context} agent_protocol_success requires a completed AgentLoop"
+            )));
+        }
+        if self.sandbox_security_success
+            && (self.evidence.strict_sandbox_command_count == 0
+                || self.evidence.local_process_fallback_count != 0
+                || self.evidence.local_process_fallback_unknown_count != 0)
+        {
+            return Err(validation_error(format!(
+                "{context} sandbox_security_success requires strict sandbox and complete zero-fallback evidence"
             )));
         }
         if self.evaluation_passed
-            && (!self.evidence.smoke_command_satisfied
-                || self.evidence.strict_sandbox_command_count == 0
-                || self.evidence.local_process_fallback_count != 0
-                || self.evidence.local_process_fallback_unknown_count != 0
-                || self.evidence.patch_digest.is_none())
+            != (self.functional_task_success
+                && self.agent_protocol_success
+                && self.sandbox_security_success)
         {
             return Err(validation_error(format!(
-                "{context} evaluation_passed requires patch, smoke, strict sandbox, and complete zero-fallback evidence"
+                "{context} evaluation_passed must equal the three success dimensions"
             )));
         }
         if self.evidence.provider_retry_count > self.evidence.provider_attempt_count {
@@ -331,8 +347,12 @@ pub struct EvaluationTaskSummary {
     pub agent_scored_trial_count: u32,
     pub agent_completed_count: u32,
     pub agent_failed_count: u32,
-    /// 满足任务定义完成条件的 trial 数；仅对非 blocked trial 作为 trial rate 的分子。
-    pub trial_success_count: u32,
+    pub functional_task_success_count: u32,
+    pub functional_task_success_rate_basis_points: u32,
+    pub agent_protocol_success_count: u32,
+    pub agent_protocol_success_rate_basis_points: u32,
+    pub sandbox_security_success_count: u32,
+    pub sandbox_security_success_rate_basis_points: u32,
 }
 
 impl EvaluationTaskSummary {
@@ -356,7 +376,27 @@ impl EvaluationTaskSummary {
             agent_scored_trial_count,
             agent_completed_count,
             agent_failed_count: agent_scored_trial_count.saturating_sub(agent_completed_count),
-            trial_success_count: count_trials(trials, |trial| trial.evaluation_passed),
+            functional_task_success_count: count_trials(trials, |trial| {
+                trial.functional_task_success
+            }),
+            functional_task_success_rate_basis_points: rate_basis_points(
+                count_trials(trials, |trial| trial.functional_task_success),
+                agent_scored_trial_count,
+            ),
+            agent_protocol_success_count: count_trials(trials, |trial| {
+                trial.agent_protocol_success
+            }),
+            agent_protocol_success_rate_basis_points: rate_basis_points(
+                count_trials(trials, |trial| trial.agent_protocol_success),
+                agent_scored_trial_count,
+            ),
+            sandbox_security_success_count: count_trials(trials, |trial| {
+                trial.sandbox_security_success
+            }),
+            sandbox_security_success_rate_basis_points: rate_basis_points(
+                count_trials(trials, |trial| trial.sandbox_security_success),
+                agent_scored_trial_count,
+            ),
         }
     }
 }
@@ -465,12 +505,14 @@ impl EvaluationStabilitySummary {
 pub struct EvaluationTaskResult {
     pub task_id: TaskId,
     pub capabilities: Vec<EvaluationCapability>,
-    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
     pub status: EvaluationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<EvaluationBlocker>,
     /// 任务成功：该任务的每个 trial 都满足任务定义的完成条件。
     pub evaluation_passed: bool,
+    pub functional_task_success: bool,
+    pub agent_protocol_success: bool,
+    pub sandbox_security_success: bool,
     pub summary: EvaluationTaskSummary,
     pub stability: EvaluationStabilitySummary,
     pub trials: Vec<EvaluationTrialResult>,
@@ -481,7 +523,6 @@ impl EvaluationTaskResult {
     pub fn from_trials(
         task_id: TaskId,
         capabilities: Vec<EvaluationCapability>,
-        required_tool_capabilities: Vec<ToolCapabilityRequirement>,
         trials: Vec<EvaluationTrialResult>,
     ) -> Self {
         let summary = EvaluationTaskSummary::from_trials(&trials);
@@ -489,16 +530,24 @@ impl EvaluationTaskResult {
         let blocker = (status == EvaluationStatus::Blocked)
             .then(|| trials.iter().find_map(|trial| trial.blocker.clone()))
             .flatten();
+        let functional_task_success =
+            !trials.is_empty() && trials.iter().all(|trial| trial.functional_task_success);
+        let agent_protocol_success =
+            !trials.is_empty() && trials.iter().all(|trial| trial.agent_protocol_success);
+        let sandbox_security_success =
+            !trials.is_empty() && trials.iter().all(|trial| trial.sandbox_security_success);
         let evaluation_passed =
-            !trials.is_empty() && trials.iter().all(|trial| trial.evaluation_passed);
+            functional_task_success && agent_protocol_success && sandbox_security_success;
         let stability = EvaluationStabilitySummary::from_trials(&trials);
         Self {
             task_id,
             capabilities,
-            required_tool_capabilities,
             status,
             blocker,
             evaluation_passed,
+            functional_task_success,
+            agent_protocol_success,
+            sandbox_security_success,
             summary,
             stability,
             trials,
@@ -508,10 +557,6 @@ impl EvaluationTaskResult {
     fn validate(&self, trials_per_task: u32) -> Result<()> {
         let context = format!("evaluation task {}", self.task_id);
         validate_nonempty_unique(&self.capabilities, &format!("{context} capabilities"))?;
-        validate_nonempty_unique(
-            &self.required_tool_capabilities,
-            &format!("{context} required_tool_capabilities"),
-        )?;
         if self.trials.len() != usize::try_from(trials_per_task).unwrap_or(usize::MAX) {
             return Err(validation_error(format!(
                 "{context} trial count must match trials_per_task"
@@ -549,6 +594,27 @@ impl EvaluationTaskResult {
                 "{context} evaluation_passed must match all trials"
             )));
         }
+        if self.functional_task_success
+            != self
+                .trials
+                .iter()
+                .all(|trial| trial.functional_task_success)
+            || self.agent_protocol_success
+                != self.trials.iter().all(|trial| trial.agent_protocol_success)
+            || self.sandbox_security_success
+                != self
+                    .trials
+                    .iter()
+                    .all(|trial| trial.sandbox_security_success)
+            || self.evaluation_passed
+                != (self.functional_task_success
+                    && self.agent_protocol_success
+                    && self.sandbox_security_success)
+        {
+            return Err(validation_error(format!(
+                "{context} success dimensions must match all trials and their conjunction"
+            )));
+        }
         let expected_stability = EvaluationStabilitySummary::from_trials(&self.trials);
         if self.stability != expected_stability {
             return Err(validation_error(format!(
@@ -576,16 +642,15 @@ pub struct EvaluationRunSummary {
     pub agent_scored_trial_count: u32,
     pub agent_completed_count: u32,
     pub agent_failed_count: u32,
-    /// 满足任务定义完成条件的 task 数；task rate 的分母是所有选定 task。
-    pub task_success_count: u32,
-    /// 所有 task 的 trial success 数，仅用于稳定性/模型波动观测。
-    pub trial_success_count: u32,
-    /// 非 blocked trial 中满足完成条件的比例，仅用于稳定性/模型波动观测。
-    pub trial_success_rate_basis_points: u32,
-    /// 满足全部 trial 完成条件的 task 比例，唯一用于核心能力门禁。
-    pub task_success_rate_basis_points: u32,
-    /// 是否达到核心 task success rate 门槛。
-    pub meets_core_task_success_threshold: bool,
+    pub functional_task_success_count: u32,
+    pub functional_task_success_rate_basis_points: u32,
+    pub meets_functional_task_success_threshold: bool,
+    pub agent_protocol_success_count: u32,
+    pub agent_protocol_success_rate_basis_points: u32,
+    pub meets_agent_protocol_success_threshold: bool,
+    pub sandbox_security_success_count: u32,
+    pub sandbox_security_success_rate_basis_points: u32,
+    pub meets_sandbox_security_success_threshold: bool,
 }
 
 impl EvaluationRunSummary {
@@ -616,14 +681,10 @@ impl EvaluationRunSummary {
             .iter()
             .map(|task| task.summary.agent_failed_count)
             .sum();
-        let task_success_count = count_tasks(tasks, |task| task.evaluation_passed);
-        let trial_success_count: u32 = tasks
-            .iter()
-            .map(|task| task.summary.trial_success_count)
-            .fold(0, u32::saturating_add);
-        let trial_success_rate_basis_points =
-            rate_basis_points(trial_success_count, agent_scored_trial_count);
-        let task_success_rate_basis_points = rate_basis_points(task_success_count, task_count);
+        let functional_task_success_count = count_tasks(tasks, |task| task.functional_task_success);
+        let agent_protocol_success_count = count_tasks(tasks, |task| task.agent_protocol_success);
+        let sandbox_security_success_count =
+            count_tasks(tasks, |task| task.sandbox_security_success);
         Self {
             task_count,
             trials_per_task,
@@ -636,12 +697,33 @@ impl EvaluationRunSummary {
             agent_scored_trial_count,
             agent_completed_count,
             agent_failed_count,
-            task_success_count,
-            trial_success_count,
-            trial_success_rate_basis_points,
-            task_success_rate_basis_points,
-            meets_core_task_success_threshold: task_success_rate_basis_points
-                >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
+            functional_task_success_count,
+            functional_task_success_rate_basis_points: rate_basis_points(
+                functional_task_success_count,
+                task_count,
+            ),
+            meets_functional_task_success_threshold: rate_basis_points(
+                functional_task_success_count,
+                task_count,
+            )
+                >= TASK_DIMENSION_SUCCESS_THRESHOLD_BASIS_POINTS,
+            agent_protocol_success_count,
+            agent_protocol_success_rate_basis_points: rate_basis_points(
+                agent_protocol_success_count,
+                task_count,
+            ),
+            meets_agent_protocol_success_threshold: rate_basis_points(
+                agent_protocol_success_count,
+                task_count,
+            )
+                >= TASK_DIMENSION_SUCCESS_THRESHOLD_BASIS_POINTS,
+            sandbox_security_success_count,
+            sandbox_security_success_rate_basis_points: rate_basis_points(
+                sandbox_security_success_count,
+                task_count,
+            ),
+            meets_sandbox_security_success_threshold: task_count > 0
+                && sandbox_security_success_count == task_count,
         }
     }
 
@@ -703,15 +785,17 @@ impl EvaluationResult {
         let blocker = (status == EvaluationStatus::Blocked)
             .then(|| tasks.iter().find_map(|task| task.blocker.clone()))
             .flatten();
-        let evaluation_passed =
-            !tasks.is_empty() && tasks.iter().all(|task| task.evaluation_passed);
+        let summary = EvaluationRunSummary::from_tasks(&tasks, trials_per_task);
+        let evaluation_passed = summary.meets_functional_task_success_threshold
+            && summary.meets_agent_protocol_success_threshold
+            && summary.meets_sandbox_security_success_threshold;
         Self {
-            schema_version: EvaluationResultSchemaVersion::V8,
+            schema_version: EvaluationResultSchemaVersion::V9,
             run_id,
             status,
             blocker,
             evaluation_passed,
-            summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
+            summary,
             tasks,
             sandbox_preflight: None,
         }
@@ -746,7 +830,7 @@ impl EvaluationResult {
         sandbox_preflight: EvaluationSandboxPreflight,
     ) -> Self {
         Self {
-            schema_version: EvaluationResultSchemaVersion::V8,
+            schema_version: EvaluationResultSchemaVersion::V9,
             run_id,
             status: EvaluationStatus::Blocked,
             blocker: Some(blocker),
@@ -847,9 +931,12 @@ impl EvaluationResult {
             ));
         }
         validate_evaluation_blocker(self.status, self.blocker.as_ref(), "evaluation run")?;
-        if self.evaluation_passed != self.tasks.iter().all(|task| task.evaluation_passed) {
+        let expected_evaluation_passed = self.summary.meets_functional_task_success_threshold
+            && self.summary.meets_agent_protocol_success_threshold
+            && self.summary.meets_sandbox_security_success_threshold;
+        if self.evaluation_passed != expected_evaluation_passed {
             return Err(validation_error(
-                "evaluation run evaluation_passed must equal all task values",
+                "evaluation run evaluation_passed must equal the functional, protocol, and sandbox gates",
             ));
         }
         Ok(())

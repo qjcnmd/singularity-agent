@@ -1,4 +1,4 @@
-//! Evaluation workspace 的安全复制、快照、变更归因和 allowlist 校验。
+//! Evaluation workspace 的安全复制、快照和变更归因。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -176,7 +176,6 @@ pub(super) struct WorkspaceChangeEvidence {
     pub change_kind: &'static str,
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
-    pub allowed: bool,
 }
 
 /// 在排除 `.git` 且不跟随链接的前提下安全复制工作区。
@@ -1567,12 +1566,11 @@ fn is_new_changed_directory_ancestor(
         .any(|candidate| candidate.starts_with(&prefix))
 }
 
-/// 将变更路径转换为带 allowlist 结果的 evidence。
+/// 将工作区变更路径转换为前后内容 evidence。
 pub(super) fn workspace_change_evidence(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
     pristine_source: &WorkspaceSnapshot,
-    allowed_paths: &[crate::RelativePath],
 ) -> Vec<WorkspaceChangeEvidence> {
     evaluation_changed_paths(before, after, pristine_source)
         .into_iter()
@@ -1589,7 +1587,6 @@ pub(super) fn workspace_change_evidence(
             after_sha256: after
                 .get(&path)
                 .and_then(|entry| entry.content_digest.clone()),
-            allowed: path_is_allowed(&path, allowed_paths),
             path,
         })
         .collect()
@@ -1602,17 +1599,6 @@ pub(super) fn patch_evidence_digest(evidence: &[WorkspaceChangeEvidence]) -> Opt
     }
     let canonical = serde_json::to_vec(evidence).expect("workspace evidence serializes");
     Some(format!("sha256:{:x}", Sha256::digest(canonical)))
-}
-
-/// 判断变更路径是否落在任务允许路径内。
-pub(super) fn path_is_allowed(path: &str, allowed_paths: &[crate::RelativePath]) -> bool {
-    allowed_paths.iter().any(|allowed| {
-        let allowed = allowed.as_str();
-        path == allowed
-            || path
-                .strip_prefix(allowed)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
 }
 
 /// 优先返回规范化路径，失败时保留原路径。

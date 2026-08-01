@@ -13,10 +13,11 @@ use crate::{
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
-use singularity_tools::ToolResult;
+use singularity_agent::AgentLoopResult;
 
-use super::command::command_scope_digest_for_spec;
+use super::command::{
+    AgentCommandDiagnosticProjection, CommandDiagnostic, command_scope_digest_for_spec,
+};
 use super::{
     AGENT_DIR, DEFAULT_COMMAND_TIMEOUT_SECONDS, StageDiagnostics, TOOL_COMMAND, TaskEvaluation,
     TaskExecution,
@@ -45,7 +46,7 @@ pub(super) fn build_evaluation_evidence(
         .collect::<Vec<_>>();
     let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
     let evidence = EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        schema_version: EvaluationEvidenceSchemaVersion::V4,
         run_id: run_id.clone(),
         manifest_digest,
         task_selection_digest: task_selection_digest(&task_ids),
@@ -91,49 +92,19 @@ pub(super) fn build_zero_sampling_evidence(
         .collect::<Vec<_>>();
     let tasks = plans
         .iter()
-        .map(|plan| {
-            let allowed_paths = plan
-                .agent
-                .projection
-                .allowed_paths
-                .iter()
-                .map(|path| path.as_str().to_string())
-                .collect::<Vec<_>>();
-            let required_capabilities = plan
-                .agent
-                .projection
-                .required_tool_capabilities
-                .iter()
-                .map(|requirement| {
-                    format!(
-                        "{}@{}",
-                        requirement.capability.as_str(),
-                        requirement.minimum_version
-                    )
-                })
-                .collect::<Vec<_>>();
-            EvaluationTaskEvidence {
-                task_id: plan.task_id.clone(),
-                source_tree_digest: None,
-                source_commit: match &plan.source {
-                    PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
-                    PlannedWorkspaceSource::Local { .. } => None,
-                },
-                allowed_paths_digest: set_strings_digest(
-                    "evaluation.allowed_paths/v2",
-                    &allowed_paths,
-                ),
-                tool_capability_requirements_digest: set_strings_digest(
-                    "evaluation.tool_capability_requirements/v1",
-                    &required_capabilities,
-                ),
-                trials: Vec::new(),
-            }
+        .map(|plan| EvaluationTaskEvidence {
+            task_id: plan.task_id.clone(),
+            source_tree_digest: None,
+            source_commit: match &plan.source {
+                PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
+                PlannedWorkspaceSource::Local { .. } => None,
+            },
+            trials: Vec::new(),
         })
         .collect::<Vec<_>>();
     let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
     let evidence = EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        schema_version: EvaluationEvidenceSchemaVersion::V4,
         run_id: run_id.clone(),
         manifest_digest,
         task_selection_digest: task_selection_digest(&task_ids),
@@ -198,47 +169,31 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Strin
     Ok(())
 }
 
-/// 从 Agent 结果提取 command scope 与未知审计计数。
-pub(super) fn agent_command_observation(
-    result: &AgentLoopResult,
-    expected_count: usize,
-) -> (Vec<String>, usize) {
-    let observed = terminal_command_scope_digests(&result.tool_results, expected_count);
-    let mut unknown_count = 0usize;
+/// Agent command 的 producer-owned typed projection；普通 audit 仅作为追踪输出。
+#[derive(Debug, Default)]
+pub(super) struct AgentCommandProjection {
+    pub(super) diagnostics: Vec<CommandDiagnostic>,
+    pub(super) unknown_count: usize,
+}
+
+pub(super) fn agent_command_projection(result: &AgentLoopResult) -> AgentCommandProjection {
+    let mut projection = AgentCommandProjection::default();
     for tool_result in result
         .tool_results
         .iter()
         .filter(|tool_result| tool_result.tool_name == TOOL_COMMAND)
     {
-        let Some(_scope_digest) = safe_command_scope_digest(tool_result) else {
-            if tool_result.result_id.is_some() {
-                unknown_count = unknown_count.saturating_add(1);
+        match CommandDiagnostic::from_agent_tool_result(tool_result) {
+            AgentCommandDiagnosticProjection::Executed(diagnostic) => {
+                projection.diagnostics.push(diagnostic);
             }
-            continue;
-        };
-        let observation_complete = tool_result.audit_metadata().is_some_and(|audit| {
-            audit
-                .get("local_process_fallback")
-                .and_then(Value::as_bool)
-                .is_some()
-                && audit
-                    .get("sandbox_enforcement")
-                    .and_then(Value::as_str)
-                    .is_some()
-        });
-        if !observation_complete {
-            unknown_count = unknown_count.saturating_add(1);
+            AgentCommandDiagnosticProjection::Unknown => {
+                projection.unknown_count = projection.unknown_count.saturating_add(1);
+            }
+            AgentCommandDiagnosticProjection::NotExecuted => {}
         }
     }
-    (observed, unknown_count)
-}
-
-/// 只接受格式正确的 command scope digest。
-pub(super) fn safe_command_scope_digest(tool_result: &ToolResult) -> Option<&str> {
-    (tool_result.tool_name == TOOL_COMMAND)
-        .then_some(tool_result.result_id.as_deref())
-        .flatten()
-        .filter(|digest| is_sha256_digest(digest))
+    projection
 }
 
 fn build_task_evidence(
@@ -246,26 +201,6 @@ fn build_task_evidence(
     execution: &TaskEvaluation,
     run_dir: &Path,
 ) -> Result<EvaluationTaskEvidence, String> {
-    let allowed_paths = plan
-        .agent
-        .projection
-        .allowed_paths
-        .iter()
-        .map(|path| path.as_str().to_string())
-        .collect::<Vec<_>>();
-    let requirements = plan
-        .agent
-        .projection
-        .required_tool_capabilities
-        .iter()
-        .map(|requirement| {
-            format!(
-                "{}@{}",
-                requirement.capability.as_str(),
-                requirement.minimum_version
-            )
-        })
-        .collect::<Vec<_>>();
     let source_commit = match &plan.source {
         PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
         PlannedWorkspaceSource::Local { .. } => None,
@@ -283,11 +218,6 @@ fn build_task_evidence(
             .and_then(|trial| trial.diagnostics.source.as_ref())
             .and_then(|source| source.tree_digest.clone()),
         source_commit,
-        allowed_paths_digest: set_strings_digest("evaluation.allowed_paths/v2", &allowed_paths),
-        tool_capability_requirements_digest: set_strings_digest(
-            "evaluation.tool_capability_requirements/v1",
-            &requirements,
-        ),
         trials,
     })
 }
@@ -305,13 +235,6 @@ fn build_trial_evidence(
         .patch_evidence_path
         .as_ref()
         .map(|_| set_strings_digest("evaluation.changed_paths/v1", &diagnostics.changed_files));
-    let allowlist = if diagnostics.patch_evidence_path.is_none() {
-        EvidenceVerdict::Unknown
-    } else if diagnostics.disallowed_changed_files.is_empty() {
-        EvidenceVerdict::Passed
-    } else {
-        EvidenceVerdict::Failed
-    };
     let trace_digest = diagnostics
         .trace_path
         .as_deref()
@@ -320,12 +243,6 @@ fn build_trial_evidence(
     Ok(EvaluationTrialEvidence {
         trial: execution.result.trial,
         changed_paths_digest,
-        allowlist,
-        smoke: smoke_scope_evidence(
-            &task_dir.join(AGENT_DIR),
-            &plan.agent.projection.smoke_commands,
-            &diagnostics.observed_smoke_scope_digests,
-        ),
         baseline: scope_evidence(
             &task_dir.join(AGENT_DIR),
             &plan.baseline.commands,
@@ -376,17 +293,6 @@ fn scope_evidence(
 ) -> EvaluationScopeEvidence {
     scope_evidence_with(commands, observed_scope_digests, |command| {
         command_scope_digest_for_spec(workspace, command, default_timeout_seconds)
-    })
-}
-
-// smoke 收据必须复用 Agent completion 使用的 command string scope，避免产生第二事实源。
-fn smoke_scope_evidence(
-    workspace: &Path,
-    commands: &[CommandSpec],
-    observed_scope_digests: &[String],
-) -> EvaluationScopeEvidence {
-    scope_evidence_with(commands, observed_scope_digests, |command| {
-        super::smoke_command_scope_digest(workspace, command)
     })
 }
 
@@ -468,44 +374,8 @@ fn update_digest_value(digest: &mut Sha256, value: &str) {
     digest.update(value.as_bytes());
 }
 
-fn is_sha256_digest(value: &str) -> bool {
+pub(super) fn is_sha256_digest(value: &str) -> bool {
     value
         .strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{Argv, CommandSpec, EvidenceVerdict};
-    use singularity_policy::NetworkAccess;
-    use singularity_tools::{SandboxFilesystemMode, command_script_scope_digest_with_policy};
-
-    use super::smoke_scope_evidence;
-    use crate::runner::command::sandbox_network_mode;
-    use crate::runner::{
-        DEFAULT_COMMAND_TIMEOUT_SECONDS, command_script_from_argv, resolved_smoke_cwd,
-    };
-
-    #[test]
-    fn smoke_scope_evidence_uses_the_agent_command_script_contract() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let command = CommandSpec {
-            argv: Argv::new(vec!["python".to_string(), "smoke_test.py".to_string()]).expect("argv"),
-            cwd: None,
-            timeout_seconds: None,
-            network_access: NetworkAccess::Denied,
-        };
-        let cwd = resolved_smoke_cwd(workspace.path(), &command).expect("smoke cwd");
-        let observed = command_script_scope_digest_with_policy(
-            &command_script_from_argv(command.argv.as_slice()),
-            &cwd,
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            SandboxFilesystemMode::WorkspaceWrite,
-            sandbox_network_mode(command.network_access),
-        );
-
-        let evidence = smoke_scope_evidence(workspace.path(), &[command], &[observed]);
-
-        assert_eq!(evidence.required_scopes_satisfied, EvidenceVerdict::Passed);
-    }
 }

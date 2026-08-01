@@ -36,7 +36,6 @@ const EVENT_TYPES: &[&str] = &[
     "thread/started",
     "turn/started",
     "turn/completed",
-    "turn/plan/updated",
     "turn/diff/updated",
     "approval/requested",
     "item/started",
@@ -939,21 +938,6 @@ fn validate_event_recovery(
                 }
                 _ => Err(
                     "turn lifecycle event has an invalid turn/status recovery query".to_string(),
-                ),
-            }
-        }
-        "turn/plan/updated" => {
-            let turn_id = notification.params["turnId"]
-                .as_str()
-                .ok_or_else(|| "turn/plan/updated event has no turn id".to_string())?;
-            match metadata.recovery_query.as_ref() {
-                Some(EventRecoveryQuery::TurnStatus { turn_id: query_id })
-                    if query_id == turn_id =>
-                {
-                    Ok(())
-                }
-                _ => Err(
-                    "turn/plan/updated event has an invalid turn/status recovery query".to_string(),
                 ),
             }
         }
