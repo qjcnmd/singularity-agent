@@ -505,7 +505,9 @@ fn materialize_prepared_image(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind prepared source image: {error}"))?;
     let mut payloads = image.payloads.iter().collect::<Vec<_>>();
-    payloads.sort_by_key(|(_, payload)| payload.offset);
+    // 同 offset 的零长度 payload 必须先于推进位置的 payload 处理（写入顺序如此）；
+    // 仅按 offset 排序时路径序会颠倒二者，导致布局校验误判。
+    payloads.sort_by_key(|(_, payload)| (payload.offset, payload.length));
     let mut work = ImageMaterializationWork::default();
     let mut image_position = 0u64;
     for (relative, payload) in payloads {
@@ -612,7 +614,8 @@ fn validate_image_layout(
         return Err("prepared source image does not match its authoritative snapshot".to_string());
     }
     let mut payloads = image.payloads.values().collect::<Vec<_>>();
-    payloads.sort_by_key(|payload| payload.offset);
+    // 同 offset 的零长度 payload 必须先于推进位置的 payload 处理（写入顺序如此）。
+    payloads.sort_by_key(|payload| (payload.offset, payload.length));
     let mut expected_length = 0u64;
     for payload in payloads {
         if payload.offset != expected_length {
@@ -2056,6 +2059,69 @@ mod tests {
 
         assert!(error.contains("root identity"));
         assert!(!destination.exists());
+    }
+
+    /// 回归：零长度文件与紧随其后写入的非空文件共享同一 image offset（写入顺序为
+    /// 空文件先、不推进位置）。读取端必须按 (offset, length) 排序（同 offset 时
+    /// 零长度在前），否则路径序会把非空文件排在空文件前，位置推进后空文件
+    /// offset 不匹配而误报 "layout is not sequential"（Linux ext4 readdir 顺序
+    /// 触发；Windows NTFS 顺序未触发）。
+    #[test]
+    fn image_layout_zero_length_payload_before_advancing_payload_is_sequential() {
+        let mut file = anonymous_image_file().expect("image file");
+        use std::io::Write as _;
+        file.write_all(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabtai")
+            .expect("image bytes");
+        // 布局（写入顺序）：offset 0 处先写入空文件（0 字节，位置不推进），
+        // 再写入 28 字节文件（位置推进到 28），offset 28 处 3 字节文件。
+        let mut payloads = BTreeMap::new();
+        payloads.insert(
+            "empty.yml".to_string(),
+            ImagePayload {
+                offset: 0,
+                length: 0,
+            },
+        );
+        payloads.insert(
+            "data.sql".to_string(),
+            ImagePayload {
+                offset: 0,
+                length: 28,
+            },
+        );
+        payloads.insert(
+            "tail.txt".to_string(),
+            ImagePayload {
+                offset: 28,
+                length: 3,
+            },
+        );
+        let image = PreparedSourceImage { file, payloads };
+        let mut expected = BTreeMap::new();
+        let entry = |kind, length| WorkspaceSnapshotEntry {
+            kind,
+            content_digest: None,
+            platform_permissions: 0o644,
+            length,
+        };
+        expected.insert(
+            ".".to_string(),
+            entry(WorkspaceSnapshotEntryKind::Directory, 0),
+        );
+        expected.insert(
+            "empty.yml".to_string(),
+            entry(WorkspaceSnapshotEntryKind::File, 0),
+        );
+        expected.insert(
+            "data.sql".to_string(),
+            entry(WorkspaceSnapshotEntryKind::File, 28),
+        );
+        expected.insert(
+            "tail.txt".to_string(),
+            entry(WorkspaceSnapshotEntryKind::File, 3),
+        );
+
+        validate_image_layout(&image, &expected).expect("zero-length payload layout must validate");
     }
 
     #[test]
