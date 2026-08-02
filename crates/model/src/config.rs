@@ -456,14 +456,14 @@ fn validate_reasoning_variants(
         if let Some(wire_effort) = descriptor.wire_effort.as_deref() {
             validate_identifier(wire_effort, "wire reasoning effort")?;
         }
-        if descriptor.enabled {
-            if protocol == ProviderApiProtocol::OpenAiResponses && descriptor.wire_effort.is_none()
-            {
-                return Err(configuration_error(
-                    "Responses enabled reasoning variants require wire_effort",
-                    "provider_configuration_invalid",
-                ));
-            }
+        if descriptor.enabled
+            && protocol == ProviderApiProtocol::OpenAiResponses
+            && descriptor.wire_effort.is_none()
+        {
+            return Err(configuration_error(
+                "Responses enabled reasoning variants require wire_effort",
+                "provider_configuration_invalid",
+            ));
         }
     }
     if protocol == ProviderApiProtocol::OpenAiChatCompletions {

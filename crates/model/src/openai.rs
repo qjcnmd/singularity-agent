@@ -63,6 +63,7 @@ pub fn provider_error_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
@@ -198,10 +199,9 @@ pub(super) fn openai_responses_request_payload(
         };
         payload["reasoning"] = json!({"effort": wire_effort});
         payload["include"] = json!(["reasoning.encrypted_content"]);
-    } else if reasoning_disabled {
-        payload["reasoning"] = json!({"effort": "none"});
-    } else if request_uses_tool_protocol(request)
-        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
+    } else if reasoning_disabled
+        || (request_uses_tool_protocol(request)
+            && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls)
     {
         payload["reasoning"] = json!({"effort": "none"});
     }
