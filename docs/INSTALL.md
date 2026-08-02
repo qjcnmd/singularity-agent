@@ -61,7 +61,35 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 2. 否则从启动目录向父目录查找最近的 `.env`。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。
+多个 provider 使用 `SINGULARITY_MODELS_CONFIG` 指向一个 JSON 文件。`default_model` 和 `thread.start.model` 使用完整 `provider_id/model_id`，`providers` 的键和 `models` 的键分别构成 provider 与模型 allowlist。每个模型必须明确声明 `api_protocol`（`chat` 或 `responses`）、`max_context_tokens` 和 `max_output_tokens`；`adapter` 当前只支持 `openai_compatible`。`api_key_env` 只能是环境变量名，密钥不会写入 JSON、快照 debug 或上游请求的 model 字段。示例：
+
+```json
+{
+  "default_model": "opencode-go/deepseek-v4-flash",
+  "providers": {
+    "opencode-go": {
+      "adapter": "openai_compatible",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_API_KEY",
+      "models": {
+        "deepseek-v4-flash": {
+          "api_protocol": "chat",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 384000
+        }
+      }
+    }
+  }
+}
+```
+
+进程启动时一次性读取该文件及所引用的密钥环境变量，并建立不可变 snapshot；不读取动态 `/models` catalog，不根据 base URL 猜协议，也不自动轮换 provider/model。显式未知 provider、未 allowlist 的 model 或 malformed selector 会 fail closed。legacy `.env` 输入仍可用，但新 JSON 配置优先且不会与 legacy 字段混合。
+
+思考档位必须逐模型声明，`reasoning_variants` 是唯一事实源；每个 variant 都写 `enabled`，启用档位可写一个 `wire_effort`，而 `off` 必须显式写成 `enabled:false`。`default_variant` 必须精确命中；无 map 表示不支持。Chat 纯开关只允许一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位必须写 wire。selector 可用 `provider_id/model_id#variant` 精确选择，未知档位、未声明的 `#off` 和不支持的模型 fail closed，不承诺自动 catalog 识别。
+
+Provider 私有 reasoning/output items 为 approval、重启和跨 turn 的官方续接保留在私有 checkpoint/本地 SQLite 中；它们不投影到公共 conversation、trace、Evaluation 或错误正文。SQLite 不是内容加密层，Responses `encrypted_content` 仍是 provider opaque blob。
+
+可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
 Provider 配置值不会被静默 trim 或纠正。进程环境和 `.env` 中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会在启动时以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；`.env` 的标准 `CRLF` 行尾仍会正常解析。
 

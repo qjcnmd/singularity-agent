@@ -17,7 +17,7 @@ use super::{
     CAPABILITY_PROBE_DEADLINE_SECONDS, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
     HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
     HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_RESPONSE_BODY_BYTES, ModelError,
-    ModelErrorKind, ModelPreferences, ModelTurnRequest, ModelTurnResponse, ModelUsage,
+    ModelErrorKind, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     OpenAiProvider, OpenAiProviderConfig, PROVIDER_CANCELLATION_POLL_MS,
     PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
     PROVIDER_RUNTIME_WORKER_THREADS, PROVIDER_TIMEOUT_SECONDS, Provider, ProviderApiProtocol,
@@ -225,6 +225,7 @@ impl OpenAiProvider {
             .map_err(provider_client_initialization_error)?;
         Ok(Self {
             config,
+            selected_model: None,
             client,
             runtime: Arc::new(runtime),
             request_timeout_seconds,
@@ -245,7 +246,236 @@ impl OpenAiProvider {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        Self::new(OpenAiProviderConfig::from_env(get_env)?)
+        super::ProviderConfigSnapshot::capture(get_env).provider()
+    }
+
+    /// Clone a provider for one allowlisted model while freezing its protocol
+    /// and token limits. The clone shares the HTTP client, runtime and caches.
+    pub(super) fn with_selected_model(&self, selected_model: super::SelectedModel) -> Self {
+        let mut selected = self.clone();
+        selected.config.model_name = selected_model.model_name.clone();
+        selected.config.max_context_tokens = selected_model.max_context_tokens;
+        selected.config.max_output_tokens = selected_model.max_output_tokens;
+        selected.selected_model = Some(selected_model);
+        selected
+    }
+
+    pub(super) fn configured_provider_name(&self) -> &str {
+        &self.config.provider_name
+    }
+
+    pub(super) fn config_snapshot(&self) -> OpenAiProviderConfig {
+        self.config.clone()
+    }
+
+    /// Return the immutable catalog protocol, if this is a catalog selection.
+    pub fn selected_api_protocol(&self) -> Option<ProviderApiProtocol> {
+        self.selected_model
+            .as_ref()
+            .map(|selection| selection.api_protocol)
+    }
+
+    pub(super) fn protocol_candidates(&self) -> Vec<ProviderApiProtocol> {
+        self.selected_model
+            .as_ref()
+            .map(|selection| vec![selection.api_protocol])
+            .unwrap_or_else(|| self.config.api_protocol_candidates())
+    }
+
+    /// Convert the internal composite selector to the bare upstream model id.
+    /// Explicit catalog clones also reject attempts to change their selected
+    /// model inside a turn.
+    fn normalize_request_model(
+        &self,
+        request: &ModelTurnRequest,
+    ) -> Result<ModelTurnRequest, ProviderError> {
+        let Some(selector) = request.model_preferences.model_name.as_deref() else {
+            let mut normalized = request.clone();
+            if self
+                .selected_model
+                .as_ref()
+                .is_none_or(|selection| !selection.reasoning_enabled)
+            {
+                normalized.provider_reasoning_history.clear();
+            } else {
+                self.validate_reasoning_history(&normalized)?;
+            }
+            return Ok(normalized);
+        };
+        let mut normalized = request.clone();
+        let model_name = if let Some((provider_name, model_and_effort)) = selector.split_once('/') {
+            if provider_name.is_empty() || model_and_effort.is_empty() {
+                return Err(super::config::model_selector_error(
+                    "provider/model selector must contain non-empty provider and model ids",
+                    "provider_selector_invalid",
+                ));
+            }
+            if provider_name != self.config.provider_name {
+                return Err(super::config::model_selector_error(
+                    "model selector references an unknown provider",
+                    "provider_selector_unknown_provider",
+                ));
+            }
+            model_and_effort
+        } else {
+            selector
+        };
+        let (model_name, requested_effort) = match model_name.rsplit_once('#') {
+            Some((model_name, effort)) if !model_name.is_empty() && !effort.is_empty() => {
+                (model_name, Some(effort))
+            }
+            Some(_) => {
+                return Err(super::config::model_selector_error(
+                    "model selector reasoning variant is malformed",
+                    "provider_selector_invalid",
+                ));
+            }
+            None => (model_name, None),
+        };
+        if self.selected_model.is_some() && model_name != self.config.model_name {
+            return Err(super::config::model_selector_error(
+                "model selector is not the fixed model for this provider turn",
+                "provider_selector_unknown_model",
+            ));
+        }
+        let requested_effort_matches = match requested_effort {
+            Some(effort) => {
+                self.selected_model
+                    .as_ref()
+                    .and_then(|selection| selection.reasoning_variant.as_deref())
+                    == Some(effort)
+            }
+            None => true,
+        };
+        if !requested_effort_matches {
+            return Err(super::config::model_selector_error(
+                "model selector is not the fixed reasoning variant for this provider turn",
+                "provider_selector_unknown_reasoning_variant",
+            ));
+        }
+        normalized.model_preferences.model_name = Some(model_name.to_string());
+        if self
+            .selected_model
+            .as_ref()
+            .is_none_or(|selection| !selection.reasoning_enabled)
+        {
+            normalized.provider_reasoning_history.clear();
+        } else {
+            self.validate_reasoning_history(&normalized)?;
+        }
+        Ok(normalized)
+    }
+
+    fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
+        if request.provider_reasoning_history.is_empty() {
+            return Ok(());
+        }
+        let Some(selection) = self.selected_model.as_ref() else {
+            return Err(provider_tool_reasoning_history_error(
+                &ModelTurnResponse::completed(
+                    request.request_id.clone(),
+                    "provider_reasoning_history",
+                    "",
+                ),
+                ProviderToolReasoningMode::Unspecified,
+            ));
+        };
+        if !selection.reasoning_enabled
+            || selection.tool_reasoning_mode == ProviderToolReasoningMode::Unspecified
+        {
+            return Err(provider_tool_reasoning_history_error(
+                &ModelTurnResponse::completed(
+                    request.request_id.clone(),
+                    "provider_reasoning_history",
+                    "",
+                ),
+                selection.tool_reasoning_mode,
+            ));
+        }
+        let variant = selection.reasoning_variant.as_deref().ok_or_else(|| {
+            provider_tool_reasoning_history_error(
+                &ModelTurnResponse::completed(
+                    request.request_id.clone(),
+                    "provider_reasoning_history",
+                    "",
+                ),
+                selection.tool_reasoning_mode,
+            )
+        })?;
+        for replay in &request.provider_reasoning_history {
+            if replay
+                .validate_for(
+                    &self.config.provider_name,
+                    &self.config.model_name,
+                    variant,
+                    selection.tool_reasoning_mode,
+                )
+                .is_err()
+            {
+                return Err(provider_tool_reasoning_history_error(
+                    &ModelTurnResponse::completed(
+                        request.request_id.clone(),
+                        "provider_reasoning_history",
+                        "",
+                    ),
+                    selection.tool_reasoning_mode,
+                ));
+            }
+        }
+        if matches!(
+            selection.tool_reasoning_mode,
+            ProviderToolReasoningMode::ReplayReasoningContent
+                | ProviderToolReasoningMode::ReplayResponsesItems
+        ) {
+            for message in request.messages.iter().filter(|message| {
+                message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
+            }) {
+                let ids = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect::<Vec<_>>();
+                if !request
+                    .provider_reasoning_history
+                    .iter()
+                    .any(|replay| replay.matches_tool_call_ids(&ids))
+                {
+                    return Err(provider_tool_reasoning_history_error(
+                        &ModelTurnResponse::completed(
+                            request.request_id.clone(),
+                            "provider_reasoning_history",
+                            "",
+                        ),
+                        selection.tool_reasoning_mode,
+                    ));
+                }
+            }
+        }
+        if selection.requires_reasoning_content_for_tool_calls {
+            for message in request.messages.iter().filter(|message| {
+                message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
+            }) {
+                let has_bound_reasoning = request.provider_reasoning_history.iter().any(|replay| {
+                    let ids = message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.tool_call_id.clone())
+                        .collect::<Vec<_>>();
+                    replay.matches_tool_call_ids(&ids)
+                });
+                if !has_bound_reasoning {
+                    return Err(provider_tool_reasoning_history_error(
+                        &ModelTurnResponse::completed(
+                            request.request_id.clone(),
+                            "provider_reasoning_history",
+                            "",
+                        ),
+                        selection.tool_reasoning_mode,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -269,7 +499,10 @@ impl OpenAiProvider {
                 (
                     self.protocol_contract(),
                     None,
-                    self.config.completion_protocol_without_tools(),
+                    self.selected_model
+                        .as_ref()
+                        .map(|selection| selection.api_protocol)
+                        .unwrap_or_else(|| self.config.completion_protocol_without_tools()),
                 )
             } else {
                 let effective_model_name = request
@@ -359,11 +592,35 @@ impl OpenAiProvider {
             None,
             on_attempt,
         )?;
-        if request_uses_tool_protocol(request) && completion.reasoning_content_present {
-            return Err(provider_tool_reasoning_history_error(
-                &completion.response,
-                capabilities.tool_reasoning_mode,
-            ));
+        let missing_required_reasoning = self
+            .selected_model
+            .as_ref()
+            .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls)
+            && !completion.response.tool_calls.is_empty()
+            && completion.response.provider_reasoning_history.is_empty();
+        let missing_configured_replay = matches!(
+            capabilities.tool_reasoning_mode,
+            ProviderToolReasoningMode::ReplayReasoningContent
+                | ProviderToolReasoningMode::ReplayResponsesItems
+        ) && !completion.response.tool_calls.is_empty()
+            && completion.response.provider_reasoning_history.is_empty();
+        if request_uses_tool_protocol(request)
+            && (completion.reasoning_content_present
+                || missing_required_reasoning
+                || missing_configured_replay)
+        {
+            if completion.response.provider_reasoning_history.is_empty()
+                || completion
+                    .response
+                    .provider_reasoning_history
+                    .iter()
+                    .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode)
+            {
+                return Err(provider_tool_reasoning_history_error(
+                    &completion.response,
+                    capabilities.tool_reasoning_mode,
+                ));
+            }
         }
         Ok(completion.response)
     }
@@ -378,12 +635,28 @@ impl OpenAiProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
+        self.validate_reasoning_history(request)?;
         let runtime = self.runtime.as_ref();
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = responses_endpoint(&self.config.base_url);
-        let request_payload =
-            openai_responses_stream_request_payload(request, model_name, capabilities);
+        let request_payload = openai_responses_stream_request_payload(
+            request,
+            model_name,
+            capabilities,
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.reasoning_enabled),
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| !selection.reasoning_enabled),
+            self.selected_model
+                .as_ref()
+                .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
+            self.selected_model
+                .as_ref()
+                .is_none_or(|selection| selection.supports_tool_choice),
+        );
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -538,6 +811,9 @@ impl OpenAiProvider {
                 payload,
                 capabilities,
                 model_name,
+                self.selected_model
+                    .as_ref()
+                    .and_then(|selection| selection.reasoning_variant.as_deref()),
             );
             return match parsed {
                 Ok(mut response) => {
@@ -597,11 +873,47 @@ impl OpenAiProvider {
             }
         };
         let request_payload = match api_protocol {
-            ProviderApiProtocol::OpenAiResponses => {
-                openai_responses_request_payload(request, model_name, capabilities)
-            }
+            ProviderApiProtocol::OpenAiResponses => openai_responses_request_payload(
+                request,
+                model_name,
+                capabilities,
+                self.selected_model
+                    .as_ref()
+                    .is_some_and(|selection| selection.reasoning_enabled),
+                self.selected_model
+                    .as_ref()
+                    .is_some_and(|selection| !selection.reasoning_enabled),
+                self.selected_model
+                    .as_ref()
+                    .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
+                self.selected_model
+                    .as_ref()
+                    .is_none_or(|selection| selection.supports_tool_choice),
+            ),
             ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                openai_request_payload(request, model_name, capabilities)
+                openai_request_payload(
+                    request,
+                    model_name,
+                    capabilities,
+                    self.selected_model
+                        .as_ref()
+                        .is_some_and(|selection| selection.reasoning_enabled),
+                    self.selected_model
+                        .as_ref()
+                        .is_some_and(|selection| !selection.reasoning_enabled),
+                    self.selected_model
+                        .as_ref()
+                        .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
+                    self.selected_model
+                        .as_ref()
+                        .is_none_or(|selection| selection.supports_developer_role),
+                    self.selected_model
+                        .as_ref()
+                        .is_none_or(|selection| selection.supports_tool_choice),
+                    self.selected_model.as_ref().is_some_and(|selection| {
+                        selection.requires_assistant_content_for_tool_calls
+                    }),
+                )
             }
         };
         let operation_phase = if probe_deadline.is_some() {
@@ -775,9 +1087,21 @@ impl OpenAiProvider {
                     payload,
                     capabilities,
                     model_name,
+                    self.selected_model
+                        .as_ref()
+                        .and_then(|selection| selection.reasoning_variant.as_deref()),
                 ),
                 ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                    parse_openai_response(request, &self.config, payload, capabilities, model_name)
+                    parse_openai_response(
+                        request,
+                        &self.config,
+                        payload,
+                        capabilities,
+                        model_name,
+                        self.selected_model
+                            .as_ref()
+                            .and_then(|selection| selection.reasoning_variant.as_deref()),
+                    )
                 }
             };
             return match parsed {
@@ -849,6 +1173,19 @@ impl Provider for OpenAiProvider {
         cancellation: &CancellationToken,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        let model_preferences = if model_preferences.model_name.is_some() {
+            let request = ModelTurnRequest {
+                request_id: "provider_capability_selection".to_string(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: Default::default(),
+                model_preferences: model_preferences.clone(),
+                provider_reasoning_history: Vec::new(),
+            };
+            self.normalize_request_model(&request)?.model_preferences
+        } else {
+            model_preferences.clone()
+        };
         self.negotiate_openai_tool_capabilities_bound_observed(
             model_preferences
                 .model_name
@@ -881,8 +1218,9 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
+        let request = self.normalize_request_model(request)?;
         let context =
-            self.prepare_completion_context_observed(request, cancellation, on_attempt)?;
+            self.prepare_completion_context_observed(&request, cancellation, on_attempt)?;
         if self.streaming_capability(context.api_protocol)
             != ProviderStreamingCapability::OutputTextDelta
         {
@@ -898,7 +1236,7 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&self.config.model_name);
         let result = self
             .complete_responses_stream(
-                request,
+                &request,
                 cancellation,
                 &context.capabilities,
                 model_name,
@@ -906,11 +1244,38 @@ impl Provider for OpenAiProvider {
                 on_attempt,
             )
             .and_then(|completion| {
-                if request_uses_tool_protocol(request) && completion.reasoning_content_present {
-                    Err(provider_tool_reasoning_history_error(
-                        &completion.response,
-                        context.capabilities.tool_reasoning_mode,
-                    ))
+                let missing_required_reasoning =
+                    self.selected_model.as_ref().is_some_and(|selection| {
+                        selection.requires_reasoning_content_for_tool_calls
+                    }) && !completion.response.tool_calls.is_empty()
+                        && completion.response.provider_reasoning_history.is_empty();
+                let missing_configured_replay = matches!(
+                    context.capabilities.tool_reasoning_mode,
+                    ProviderToolReasoningMode::ReplayReasoningContent
+                        | ProviderToolReasoningMode::ReplayResponsesItems
+                ) && !completion.response.tool_calls.is_empty()
+                    && completion.response.provider_reasoning_history.is_empty();
+                if request_uses_tool_protocol(&request)
+                    && (completion.reasoning_content_present
+                        || missing_required_reasoning
+                        || missing_configured_replay)
+                {
+                    if completion.response.provider_reasoning_history.is_empty()
+                        || completion
+                            .response
+                            .provider_reasoning_history
+                            .iter()
+                            .any(|replay| {
+                                replay.mode_internal() != context.capabilities.tool_reasoning_mode
+                            })
+                    {
+                        Err(provider_tool_reasoning_history_error(
+                            &completion.response,
+                            context.capabilities.tool_reasoning_mode,
+                        ))
+                    } else {
+                        Ok(completion.response)
+                    }
                 } else {
                     Ok(completion.response)
                 }
@@ -941,8 +1306,9 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
+        let request = self.normalize_request_model(request)?;
         let context =
-            self.prepare_completion_context_observed(request, cancellation, on_attempt)?;
+            self.prepare_completion_context_observed(&request, cancellation, on_attempt)?;
         let effective_model_name = request
             .model_preferences
             .model_name
@@ -950,7 +1316,7 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&self.config.model_name);
         let result = self
             .complete_with_contract_observed(
-                request,
+                &request,
                 cancellation,
                 &context.capabilities,
                 context.api_protocol,

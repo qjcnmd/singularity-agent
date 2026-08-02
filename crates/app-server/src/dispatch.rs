@@ -253,6 +253,12 @@ impl AppServer {
             Ok(cwd) => cwd,
             Err(_) => return invalid_params_response(message.required_id()),
         };
+        if self
+            .validate_model_selector(params.model.as_deref())
+            .is_err()
+        {
+            return invalid_params_response(message.required_id());
+        }
         let (thread, _trace) = self.store.create_thread_with_trace_and_policy(
             params.model.as_deref(),
             Some(&cwd),
@@ -301,8 +307,12 @@ impl AppServer {
             Ok(cwd) => cwd,
             Err(_) => return invalid_params_response(message.required_id()),
         };
+        let selected_model = params.model.as_deref().or(source.model.as_deref());
+        if self.validate_model_selector(selected_model).is_err() {
+            return invalid_params_response(message.required_id());
+        }
         let thread = self.store.create_thread_with_policy(
-            params.model.as_deref().or(source.model.as_deref()),
+            selected_model,
             Some(&cwd),
             params.sandbox_mode.unwrap_or(source.sandbox_mode),
             params.approval_policy.unwrap_or(source.approval_policy),

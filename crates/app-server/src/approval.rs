@@ -443,7 +443,7 @@ impl AppServer {
                         true,
                     )
                 } else {
-                    let provider = self.provider_snapshot.provider().map_err(|_| {
+                    let provider = self.provider_for_thread(invocation.thread).map_err(|_| {
                         AppServerError::TurnExecution {
                             stage: TurnFailureStage::AgentLoop,
                             cause: TurnFailureCause::Internal,

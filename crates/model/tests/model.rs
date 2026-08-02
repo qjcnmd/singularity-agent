@@ -2,15 +2,16 @@
 
 use schemars::schema_for;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelError,
-    ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences, ModelProviderConfig,
-    ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
-    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ProviderStreamEvent, ProviderStreamingCapability,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_MODELS_CONFIG, ModelBlockerKind,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences,
+    ModelProviderConfig, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
+    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider,
+    OpenAiProviderConfig, Provider, ProviderApiProtocol, ProviderAttemptEvent,
+    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
+    ProviderAttemptStatus, ProviderCapabilityCacheLookupResult, ProviderCapabilityMetadata,
+    ProviderCapabilityProfile, ProviderConfigSnapshot, ProviderConfigSource,
+    ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract,
+    ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, resolve_provider_config, responses_endpoint, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
@@ -1270,6 +1271,21 @@ fn responses_capability_probe_response(request_body: &str) -> Option<String> {
         "name": tool_name,
         "arguments": arguments.to_string(),
     })];
+    if request
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|effort| effort != "none")
+    {
+        calls.insert(
+            0,
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "probe_reasoning",
+                "summary": []
+            }),
+        );
+    }
     if !continuation
         && names.contains(&"singularity_capability_probe_b")
         && request["parallel_tool_calls"] == true
@@ -5759,6 +5775,350 @@ fn model_response_validation_reports_unknown_tools_without_hiding_structural_err
     assert!(!result.valid);
     assert_eq!(result.errors, vec!["invalid_json"]);
     assert_eq!(result.warnings, vec!["unknown_tool", "schema detail"]);
+}
+
+#[test]
+fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
+    let directory = tempdir().expect("model catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "first/chat-model",
+            "providers": {
+                "first": {
+                    "adapter": "openai_compatible",
+                    "base_url": "https://first.example/v1",
+                    "api_key_env": "FIRST_KEY",
+                    "models": {
+                        "chat-model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000
+                        }
+                    }
+                },
+                "second": {
+                    "adapter": "openai_compatible",
+                    "base_url": "https://second.example/v1",
+                    "api_key_env": "SECOND_KEY",
+                    "models": {
+                        "responses_model": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 200000,
+                            "max_output_tokens": 100000
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write model catalog");
+    let config_path = config_path.to_string_lossy().into_owned();
+    let mut reads = std::collections::HashMap::<String, usize>::new();
+    let snapshot = ProviderConfigSnapshot::capture(|name| {
+        let count = reads.entry(name.to_string()).or_default();
+        *count += 1;
+        assert_eq!(*count, 1, "configuration value {name} was captured twice");
+        match name {
+            "SINGULARITY_MODELS_CONFIG" => Some(config_path.clone()),
+            "FIRST_KEY" => Some("first-secret".to_string()),
+            "SECOND_KEY" => Some("second-secret".to_string()),
+            _ => None,
+        }
+    });
+
+    assert!(snapshot.configuration().configured);
+    assert_eq!(
+        snapshot.redacted_config().model_name.as_deref(),
+        Some("first/chat-model")
+    );
+    let chat = snapshot
+        .provider_for_selector(Some("first/chat-model"))
+        .expect("chat selection");
+    assert_eq!(
+        chat.selected_api_protocol(),
+        Some(ProviderApiProtocol::OpenAiChatCompletions)
+    );
+    assert_eq!(chat.protocol_contract().max_context_tokens, 1_000_000);
+    assert_eq!(chat.protocol_contract().max_output_tokens, 384_000);
+    let unsupported_off = snapshot
+        .provider_for_selector(Some("first/chat-model#off"))
+        .expect_err("#off must not be exposed without an explicit thinking contract");
+    assert_eq!(
+        unsupported_off.error.code.as_deref(),
+        Some("provider_selector_unknown_reasoning_variant")
+    );
+    let responses = snapshot
+        .provider_for_selector(Some("second/responses_model"))
+        .expect("responses selection");
+    assert_eq!(
+        responses.selected_api_protocol(),
+        Some(ProviderApiProtocol::OpenAiResponses)
+    );
+    assert_eq!(responses.protocol_contract().max_output_tokens, 100_000);
+    let unknown = snapshot
+        .provider_for_selector(Some("second/not-allowlisted"))
+        .expect_err("unknown model must fail closed");
+    assert_eq!(
+        unknown.error.code.as_deref(),
+        Some("provider_selector_unknown_model")
+    );
+    let malformed = snapshot
+        .provider_for_selector(Some("bare-model"))
+        .expect_err("bare catalog selector must fail closed");
+    assert_eq!(
+        malformed.error.code.as_deref(),
+        Some("provider_selector_invalid")
+    );
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("first-secret"));
+    assert!(!debug.contains("second-secret"));
+    assert!(!debug.contains("first.example"));
+    assert!(!debug.contains("second.example"));
+}
+
+#[test]
+fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"chat_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "deep/chat#high",
+            "providers": {
+                "deep": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "DEEP_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "DEEP_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("deep/chat#high"))
+        .expect("selected Chat provider");
+    let call = tool_call("call_1", "read");
+    let mut request = ModelTurnRequest::new(
+        "reasoning_chat_request",
+        vec![
+            ModelMessage::text(ModelRole::Developer, "instruction"),
+            ModelMessage::assistant_tool_calls(vec![call.clone()]),
+        ],
+    );
+    request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "deep".to_string(),
+        model_name: "chat".to_string(),
+        reasoning_effort: "high".to_string(),
+        tool_call_ids: vec![call.tool_call_id.clone()],
+        reasoning_content: "opaque-deepseek-state".to_string(),
+    }];
+    assert!(!format!("{request:?}").contains("opaque-deepseek-state"));
+    assert!(
+        serde_json::to_value(&request)
+            .expect("serialize public request")
+            .get("provider_reasoning_history")
+            .is_none()
+    );
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("Chat reasoning completion");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Chat request"),
+    )
+    .expect("Chat payload JSON");
+    assert_eq!(payload["model"], "chat");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+    assert_eq!(payload["reasoning_effort"], "high");
+    assert_eq!(payload["messages"][0]["role"], "system");
+    assert_eq!(payload["messages"][1]["content"], "");
+    assert_eq!(
+        payload["messages"][1]["reasoning_content"],
+        "opaque-deepseek-state"
+    );
+    assert!(payload.get("tools").is_none());
+    assert!(payload.get("tool_choice").is_none());
+}
+
+#[test]
+fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
+        "id": "response_done",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }]
+    }));
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "longcat/responses#high",
+            "providers": {
+                "longcat": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "LONGCAT_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("longcat/responses#high"))
+        .expect("selected Responses provider");
+    let unknown = snapshot
+        .provider_for_selector(Some("longcat/responses#max"))
+        .expect_err("unknown per-model variant must fail closed");
+    assert_eq!(
+        unknown.error.code.as_deref(),
+        Some("provider_selector_unknown_reasoning_variant")
+    );
+    let call = tool_call("call_1", "read");
+    let mut request = ModelTurnRequest::new(
+        "reasoning_responses_request",
+        vec![ModelMessage::assistant_tool_calls(vec![call.clone()])],
+    );
+    request.provider_reasoning_history = vec![ProviderReasoningReplay::Responses {
+        provider_name: "longcat".to_string(),
+        model_name: "responses".to_string(),
+        reasoning_effort: "high".to_string(),
+        tool_call_ids: vec![call.tool_call_id.clone()],
+        items: vec![
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "opaque-encrypted-state"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            }),
+        ],
+    }];
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("Responses reasoning completion");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Responses requests");
+    let payload: serde_json::Value =
+        serde_json::from_str(&captured.last().expect("actual Responses request").1)
+            .expect("Responses payload JSON");
+    assert_eq!(payload["model"], "responses");
+    assert_eq!(payload["reasoning"]["effort"], "high");
+    assert_eq!(payload["include"][0], "reasoning.encrypted_content");
+    assert!(payload.get("thinking").is_none());
+    assert_eq!(payload["input"][0]["type"], "reasoning");
+    assert_eq!(
+        payload["input"][0]["encrypted_content"],
+        "opaque-encrypted-state"
+    );
+    assert_eq!(payload["input"][1]["type"], "function_call");
+}
+
+#[test]
+fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "provider/responses#high",
+            "providers": {
+                "provider": {
+                    "adapter": "openai_compatible",
+                    "base_url": "https://provider.example/v1",
+                    "api_key_env": "PROVIDER_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true}
+                            },
+                            "default_variant": "high"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().into_owned();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let error = snapshot
+        .provider()
+        .expect_err("Responses reasoning without a wire map must fail closed");
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_configuration_invalid")
+    );
 }
 
 #[test]

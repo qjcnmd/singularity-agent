@@ -4,12 +4,14 @@
 //! completion, and history bindings before a checkpoint can be resumed.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_model::{
-    ModelMessage, ModelToolCall, ModelToolParseStatus, ModelUsage, ProviderAttemptMetadata,
+    ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelUsage,
+    ProviderAttemptMetadata, ProviderReasoningReplay,
 };
 use singularity_policy::{ApprovalRequest, PermissionResource, ToolId};
 use singularity_tools::BoundToolCall;
@@ -169,6 +171,8 @@ pub(super) struct CheckpointState {
     pub(super) turn_id: String,
     pub(super) project_instructions_digest: Option<String>,
     pub(super) messages: Vec<ModelMessage>,
+    #[serde(default)]
+    pub(super) provider_reasoning_history: Vec<ProviderReasoningReplay>,
     pub(super) tool_result_occurrences: Vec<ToolResultOccurrence>,
     pub(super) used_approval_grants: Vec<String>,
     pub(super) approval_count: u32,
@@ -194,10 +198,112 @@ pub(super) struct CheckpointState {
 ///
 /// Validated calls are retained only until execution starts. Once the store records `Running`,
 /// owner loss becomes `Unknown` and this checkpoint can no longer authorize automatic execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnCheckpoint {
     pub(super) state: CheckpointState,
     pub(super) pending_tool_calls: Vec<PendingToolCall>,
+}
+
+/// A private, provider-facing transcript fragment recovered from one completed historical turn.
+///
+/// The public conversation stores only the final assistant text.  This value keeps the exact
+/// assistant tool-call and tool-result messages that belong to the opaque reasoning replay, while
+/// binding the fragment to the public assistant item that owns the turn.  It is intentionally not
+/// serializable: checkpoints remain the single durable source and this projection is rebuilt on
+/// demand after a process restart.
+#[derive(Clone, PartialEq)]
+pub struct ProviderHistorySegment {
+    assistant_item_id: String,
+    messages: Vec<ModelMessage>,
+    provider_reasoning_history: Vec<ProviderReasoningReplay>,
+}
+
+impl fmt::Debug for ProviderHistorySegment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHistorySegment")
+            .field("assistant_item_id", &self.assistant_item_id)
+            .field("message_count", &self.messages.len())
+            .field(
+                "reasoning_item_count",
+                &self.provider_reasoning_history.len(),
+            )
+            .finish()
+    }
+}
+
+impl ProviderHistorySegment {
+    fn new(
+        assistant_item_id: impl Into<String>,
+        messages: Vec<ModelMessage>,
+        provider_reasoning_history: Vec<ProviderReasoningReplay>,
+    ) -> Result<Self, String> {
+        let assistant_item_id = assistant_item_id.into();
+        if assistant_item_id.trim().is_empty() {
+            return Err("provider history segment assistant item identity is missing".to_string());
+        }
+        if messages.is_empty() || provider_reasoning_history.is_empty() {
+            return Err("provider history segment payload is incomplete".to_string());
+        }
+        Ok(Self {
+            assistant_item_id,
+            messages,
+            provider_reasoning_history,
+        })
+    }
+
+    /// Return the public assistant item that owns this private fragment.
+    pub(crate) fn assistant_item_id(&self) -> &str {
+        &self.assistant_item_id
+    }
+
+    /// Return whether two segments are attached to the same public assistant item.
+    pub fn same_assistant_item(&self, other: &Self) -> bool {
+        self.assistant_item_id == other.assistant_item_id
+    }
+
+    /// Return the exact provider-facing tool-call/result messages in original order.
+    pub(crate) fn messages(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+
+    /// Return the opaque provider reasoning items paired with these tool calls.
+    pub(crate) fn provider_reasoning_history(&self) -> &[ProviderReasoningReplay] {
+        &self.provider_reasoning_history
+    }
+
+    /// Return true when this segment contains a replay binding that overlaps
+    /// another segment.  Only the conflict result crosses the app boundary.
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.provider_reasoning_history.iter().any(|replay| {
+            other.provider_reasoning_history.iter().any(|candidate| {
+                self.messages
+                    .iter()
+                    .flat_map(|message| message.tool_calls.iter())
+                    .any(|call| {
+                        replay.has_tool_call_id(&call.tool_call_id)
+                            && candidate.has_tool_call_id(&call.tool_call_id)
+                    })
+            })
+        })
+    }
+
+    /// Return true when the segment carries no public assistant projection.
+    pub fn has_replay(&self) -> bool {
+        !self.provider_reasoning_history.is_empty()
+    }
+
+    /// Approximate the private payload cost for context selection and request budgeting.
+    pub fn token_count(&self) -> u32 {
+        let message_tokens = serde_json::to_string(&self.messages).map_or(u32::MAX, |payload| {
+            singularity_tools::approximate_token_count(&payload)
+        });
+        let reasoning_tokens = serde_json::to_string(&self.provider_reasoning_history)
+            .map_or(u32::MAX, |payload| {
+                singularity_tools::approximate_token_count(&payload)
+            });
+        message_tokens.saturating_add(reasoning_tokens)
+    }
 }
 
 /// Durable-boundary notifications consumed by the process owner. The callback is invoked only at
@@ -352,20 +458,178 @@ impl TurnCheckpoint {
     pub fn pending_tool_calls(&self) -> &[PendingToolCall] {
         &self.pending_tool_calls
     }
+
+    /// Return the private provider-bound reasoning state needed for history replay.
+    /// Return whether the durable checkpoint contains provider-private replay.
+    pub fn has_provider_reasoning_history(&self) -> bool {
+        !self.state.provider_reasoning_history.is_empty()
+    }
+
+    /// Derive the current turn's private tool transcript from the durable message snapshot.
+    ///
+    /// Checkpoints carry cumulative replay state because a resumed turn is allowed to retain
+    /// earlier history.  Only replay items paired with assistant tool calls after the latest user
+    /// message belong to this completed turn; older pairs are recovered from their own turn
+    /// checkpoints.  Any globally orphaned replay is rejected before provider content is exposed.
+    pub fn provider_history_segment(
+        &self,
+        assistant_item_id: impl Into<String>,
+    ) -> Result<Option<ProviderHistorySegment>, String> {
+        let assistant_item_id = assistant_item_id.into();
+        if self.state.provider_reasoning_history.is_empty() {
+            return Ok(None);
+        }
+        let latest_user_index = self
+            .state
+            .messages
+            .iter()
+            .rposition(|message| message.role == ModelRole::User)
+            .ok_or_else(|| "provider history checkpoint has no user message".to_string())?;
+
+        let mut matched_assistant_indices = Vec::new();
+        for replay in &self.state.provider_reasoning_history {
+            if !replay.is_valid() {
+                return Err("provider history replay tool-call identity is invalid".to_string());
+            }
+            let matches = self
+                .state
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message.role == ModelRole::Assistant
+                        && replay.matches_tool_call_ids(
+                            &message
+                                .tool_calls
+                                .iter()
+                                .map(|call| call.tool_call_id.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(
+                    "provider history replay is not bound to a tool-call message".to_string(),
+                );
+            }
+            if matches.len() > 1 {
+                return Err("provider history replay has ambiguous tool-call binding".to_string());
+            }
+            matched_assistant_indices.push(matches[0]);
+        }
+        if matched_assistant_indices
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != matched_assistant_indices.len()
+        {
+            return Err("provider history replay has duplicate assistant binding".to_string());
+        }
+
+        let current_replay = self
+            .state
+            .provider_reasoning_history
+            .iter()
+            .zip(matched_assistant_indices.iter())
+            .filter(|(_, index)| **index > latest_user_index)
+            .map(|(replay, index)| (replay.clone(), *index))
+            .collect::<Vec<_>>();
+        if current_replay.is_empty() {
+            return Ok(None);
+        }
+
+        let current_assistant_indices = current_replay
+            .iter()
+            .map(|(_, index)| *index)
+            .collect::<BTreeSet<_>>();
+        let current_call_ids = current_replay
+            .iter()
+            .filter_map(|(_, index)| self.state.messages.get(*index))
+            .flat_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.tool_call_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut selected_indices = BTreeSet::new();
+        for assistant_index in current_assistant_indices {
+            selected_indices.insert(assistant_index);
+            let assistant_calls = self
+                .state
+                .messages
+                .get(assistant_index)
+                .map(|message| {
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.tool_call_id.clone())
+                        .collect::<BTreeSet<_>>()
+                })
+                .ok_or_else(|| "provider history assistant message is missing".to_string())?;
+            let mut result_ids = BTreeSet::new();
+            for (index, message) in self
+                .state
+                .messages
+                .iter()
+                .enumerate()
+                .skip(assistant_index + 1)
+            {
+                if message.role != ModelRole::Tool {
+                    if !assistant_calls.is_disjoint(&current_call_ids) {
+                        break;
+                    }
+                    continue;
+                }
+                let tool_call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+                    "provider history tool result identity is missing".to_string()
+                })?;
+                if assistant_calls.contains(tool_call_id) {
+                    selected_indices.insert(index);
+                    if !result_ids.insert(tool_call_id.to_string()) {
+                        return Err("provider history tool result binding is invalid".to_string());
+                    }
+                }
+            }
+            if result_ids != assistant_calls {
+                return Err("provider history tool result binding is invalid".to_string());
+            }
+        }
+        let messages = selected_indices
+            .into_iter()
+            .filter_map(|index| self.state.messages.get(index).cloned())
+            .collect::<Vec<_>>();
+        let replay = current_replay
+            .into_iter()
+            .map(|(replay, _)| replay)
+            .collect::<Vec<_>>();
+        ProviderHistorySegment::new(assistant_item_id, messages, replay).map(Some)
+    }
 }
 
 impl ApprovalCheckpoint {
+    pub(crate) fn validate_for_restore(&self) -> Result<(), String> {
+        self.validate_serialized()
+    }
+
     pub(super) fn validate_serialized(&self) -> Result<(), String> {
         self.pending_tool_call.validate()?;
         self.state
-            .validate_serialized(APPROVAL_CHECKPOINT_VERSION, true)
+            .validate_serialized(APPROVAL_CHECKPOINT_VERSION, true)?;
+        validate_provider_replay_bindings(&self.state)
     }
 }
 
 impl TurnCheckpoint {
+    pub(crate) fn validate_for_restore(&self) -> Result<(), String> {
+        self.validate_serialized()
+    }
+
     fn validate_serialized(&self) -> Result<(), String> {
         self.state
             .validate_serialized(super::TURN_CHECKPOINT_VERSION, false)?;
+        validate_provider_replay_bindings(&self.state)?;
         let mut ids = BTreeSet::new();
         for pending in &self.pending_tool_calls {
             pending.validate()?;
@@ -386,6 +650,34 @@ impl TurnCheckpoint {
     }
 }
 
+fn validate_provider_replay_bindings(state: &CheckpointState) -> Result<(), String> {
+    let mut replay_call_ids = BTreeSet::new();
+    for replay in &state.provider_reasoning_history {
+        if !replay.is_valid() || replay.bound_assistant_count(&state.messages) != 1 {
+            return Err("provider history replay binding is invalid".to_string());
+        }
+        for message in state.messages.iter().filter(|message| {
+            message.role == ModelRole::Assistant
+                && replay.matches_tool_call_ids(
+                    &message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.tool_call_id.clone())
+                        .collect::<Vec<_>>(),
+                )
+        }) {
+            for call in &message.tool_calls {
+                if !replay_call_ids.insert(call.tool_call_id.clone()) {
+                    return Err(
+                        "provider history replay tool-call binding is duplicated".to_string()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl CheckpointState {
     fn validate_serialized(&self, expected_version: u32, approval: bool) -> Result<(), String> {
         if self.checkpoint_version != expected_version {
@@ -402,6 +694,11 @@ impl CheckpointState {
         }
         if self.messages.is_empty() {
             return Err("approval checkpoint messages are missing".to_string());
+        }
+        for replay in &self.provider_reasoning_history {
+            if !replay.is_valid() {
+                return Err("provider reasoning replay state is invalid".to_string());
+            }
         }
         let used_approval_grants = self.used_approval_grants.iter().collect::<BTreeSet<_>>();
         if used_approval_grants.len() != self.used_approval_grants.len() {

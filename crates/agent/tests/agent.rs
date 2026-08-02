@@ -7,8 +7,8 @@ use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentStatus, ApprovalGrant,
     OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus,
-    PromptAssemblyStatus, SandboxExecutionStatus, ToolCallStatus, TurnCheckpointPhase,
-    VerificationStatus, assemble_context_items,
+    PromptAssemblyStatus, SandboxExecutionStatus, ToolCallStatus, TurnCheckpoint,
+    TurnCheckpointPhase, VerificationStatus, assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -19,7 +19,7 @@ use singularity_model::{
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
     ProviderCapabilityCacheObservation, ProviderCapabilityMetadata, ProviderCapabilityProfile,
     ProviderError, ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
-    ProviderStreamEvent, ToolChoiceMode,
+    ProviderReasoningReplay, ProviderStreamEvent, ToolChoiceMode,
 };
 use singularity_policy::{
     CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -3459,6 +3459,144 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
             .expect_err("missing repair ledger must fail")
             .contains("invalid approval checkpoint")
     );
+}
+
+#[test]
+fn orphan_provider_reasoning_replay_is_rejected_before_checkpoint_persistence() {
+    let replay = ProviderReasoningReplay::Responses {
+        provider_name: "deepseek".to_string(),
+        model_name: "deepseek-reasoner".to_string(),
+        reasoning_effort: "high".to_string(),
+        tool_call_ids: vec!["call_1".to_string()],
+        items: vec![
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_opaque",
+                "encrypted_content": "opaque-provider-state"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            }),
+        ],
+    };
+    let initial_input = AgentLoopInput::new("thread_restart", "turn_restart", "continue")
+        .with_provider_reasoning_history(vec![replay.clone()]);
+    let agent_loop = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("request_1", "response_1", "done"),
+        allow_read_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let error = agent_loop
+        .initial_turn_checkpoint(&initial_input)
+        .expect_err("orphan replay must be rejected");
+    assert!(error.contains("provider history replay"), "{error}");
+}
+
+#[test]
+fn historical_provider_segment_replays_tool_transcript_before_next_user_turn() {
+    let mut tool_response = ModelTurnResponse::completed("request_1", "response_tool", "");
+    let call = tool_call(
+        "call_history",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    );
+    tool_response.tool_calls = vec![call.clone()];
+    tool_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    let replay = ProviderReasoningReplay::Chat {
+        provider_name: "history-provider".to_string(),
+        model_name: "history-model".to_string(),
+        reasoning_effort: "medium".to_string(),
+        tool_call_ids: vec!["call_history".to_string()],
+        reasoning_content: "private reasoning".to_string(),
+    };
+    tool_response.provider_reasoning_history = vec![replay.clone()];
+    let seen_first = Arc::new(Mutex::new(Vec::new()));
+    let first_loop = agent_loop_with_responses_and_requests(
+        vec![
+            tool_response,
+            ModelTurnResponse::completed("request_2", "response_final", "first final"),
+        ],
+        allow_read_policy(),
+        Arc::clone(&seen_first),
+    );
+    let first_input = AgentLoopInput::new("thread_1", "turn_1", "first user");
+    let mut checkpoint = None;
+    let first_result =
+        first_loop.run_with_events_and_checkpoints(&first_input, &mut |_| Ok(()), &mut |event| {
+            checkpoint = Some(event.checkpoint);
+            Ok(())
+        });
+    assert_eq!(
+        first_result.status,
+        AgentStatus::Completed,
+        "status={:?} error={:?} requests={}",
+        first_result.status,
+        first_result.error,
+        seen_first.lock().expect("first requests").len()
+    );
+    let checkpoint = checkpoint.expect("completed turn checkpoint");
+    let checkpoint = TurnCheckpoint::decode(&checkpoint.encode().expect("encode checkpoint"))
+        .expect("decode checkpoint after restart");
+    let segment = checkpoint
+        .provider_history_segment("assistant_1")
+        .expect("derive provider history segment")
+        .expect("tool turn has provider replay");
+    assert!(segment.has_replay());
+
+    let seen_second = Arc::new(Mutex::new(Vec::new()));
+    let second_loop = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("request_3", "response_next", "second final"),
+        allow_read_policy(),
+        Arc::clone(&seen_second),
+    );
+    let second_input = AgentLoopInput::new("thread_1", "turn_2", "second user")
+        .with_history([
+            AgentContextItem::history_user("user_1", "first user"),
+            AgentContextItem::history_assistant("assistant_1", "first final"),
+        ])
+        .with_provider_history_segments([segment]);
+    let serialized_input = serde_json::to_value(&second_input).expect("serialize input");
+    assert!(
+        !serialized_input
+            .as_object()
+            .expect("input object")
+            .contains_key("provider_history_segments")
+    );
+    let second_result = second_loop.run(&second_input);
+    assert_eq!(
+        second_result.status,
+        AgentStatus::Completed,
+        "status={:?} error={:?} requests={}",
+        second_result.status,
+        second_result.error,
+        seen_second.lock().expect("second requests").len()
+    );
+    let requests = seen_second.lock().expect("second requests");
+    let request = &requests[0];
+    assert_eq!(request.provider_reasoning_history, vec![replay]);
+    let messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role != ModelRole::Developer)
+        .collect::<Vec<_>>();
+    assert_eq!(messages[0].role, ModelRole::User);
+    assert_eq!(messages[0].content, "first user");
+    assert_eq!(messages[1].role, ModelRole::Assistant);
+    assert_eq!(messages[1].tool_calls[0].tool_call_id, "call_history");
+    assert_eq!(messages[2].role, ModelRole::Tool);
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_history"));
+    assert_eq!(messages[3].role, ModelRole::Assistant);
+    assert_eq!(messages[3].content, "first final");
+    assert_eq!(messages[4].role, ModelRole::User);
+    assert_eq!(messages[4].content, "second user");
 }
 
 #[test]

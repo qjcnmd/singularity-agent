@@ -7,8 +7,8 @@ use super::{
     CHAT_COMPLETIONS_PATH, ModelError, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
     ModelUsage, OpenAiProviderConfig, ProviderError, ProviderErrorStage, ProviderProtocolContract,
-    ProviderToolReasoningMode, RESPONSES_PATH, ToolChoiceMode, V1_CHAT_COMPLETIONS_PATH,
-    V1_RESPONSES_PATH, validate_model_turn_response,
+    ProviderReasoningReplay, ProviderToolReasoningMode, RESPONSES_PATH, ToolChoiceMode,
+    V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH, validate_model_turn_response,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -59,6 +59,7 @@ pub fn provider_error_response(
         model_name: request.model_preferences.model_name.clone(),
         provider_attempt_metadata,
         provider_capability_metadata: None,
+        provider_reasoning_history: Vec::new(),
     }
 }
 
@@ -66,6 +67,12 @@ pub(super) fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
+    reasoning_enabled: bool,
+    reasoning_disabled: bool,
+    wire_reasoning_effort: Option<&str>,
+    supports_developer_role: bool,
+    supports_tool_choice: bool,
+    requires_assistant_content_for_tool_calls: bool,
 ) -> Value {
     let mut payload = json!({
         "model": request
@@ -76,7 +83,14 @@ pub(super) fn openai_request_payload(
         "messages": request
             .messages
             .iter()
-            .map(openai_message_payload)
+            .map(|message| {
+                openai_message_payload_with_reasoning(
+                    message,
+                    &request.provider_reasoning_history,
+                    supports_developer_role,
+                    requires_assistant_content_for_tool_calls,
+                )
+            })
             .collect::<Vec<_>>(),
         "stream": false,
     });
@@ -92,6 +106,14 @@ pub(super) fn openai_request_payload(
     if request.model_preferences.json_mode {
         payload["response_format"] = json!({"type": "json_object"});
     }
+    if reasoning_enabled {
+        payload["thinking"] = json!({"type": "enabled"});
+        if let Some(wire_effort) = wire_reasoning_effort {
+            payload["reasoning_effort"] = json!(wire_effort);
+        }
+    } else if reasoning_disabled {
+        payload["thinking"] = json!({"type": "disabled"});
+    }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
             request
@@ -100,8 +122,10 @@ pub(super) fn openai_request_payload(
                 .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_tool_choice_payload(request);
-        payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        if supports_tool_choice {
+            payload["tool_choice"] = openai_tool_choice_payload(request);
+            payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        }
     }
     if request_uses_tool_protocol(request)
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
@@ -115,8 +139,13 @@ pub(super) fn openai_responses_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
+    reasoning_enabled: bool,
+    reasoning_disabled: bool,
+    wire_reasoning_effort: Option<&str>,
+    supports_tool_choice: bool,
 ) -> Value {
-    let (instructions, input) = openai_responses_input(&request.messages);
+    let (instructions, input) =
+        openai_responses_input(&request.messages, &request.provider_reasoning_history);
     let mut payload = json!({
         "model": request
             .model_preferences
@@ -158,10 +187,20 @@ pub(super) fn openai_responses_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_responses_tool_choice_payload(request);
-        payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        if supports_tool_choice {
+            payload["tool_choice"] = openai_responses_tool_choice_payload(request);
+            payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        }
     }
-    if request_uses_tool_protocol(request)
+    if reasoning_enabled {
+        let Some(wire_effort) = wire_reasoning_effort else {
+            return payload;
+        };
+        payload["reasoning"] = json!({"effort": wire_effort});
+        payload["include"] = json!(["reasoning.encrypted_content"]);
+    } else if reasoning_disabled {
+        payload["reasoning"] = json!({"effort": "none"});
+    } else if request_uses_tool_protocol(request)
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
     {
         payload["reasoning"] = json!({"effort": "none"});
@@ -173,13 +212,28 @@ pub(super) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
+    reasoning_enabled: bool,
+    reasoning_disabled: bool,
+    wire_reasoning_effort: Option<&str>,
+    supports_tool_choice: bool,
 ) -> Value {
-    let mut payload = openai_responses_request_payload(request, model_name, capabilities);
+    let mut payload = openai_responses_request_payload(
+        request,
+        model_name,
+        capabilities,
+        reasoning_enabled,
+        reasoning_disabled,
+        wire_reasoning_effort,
+        supports_tool_choice,
+    );
     payload["stream"] = json!(true);
     payload
 }
 
-pub(super) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
+pub(super) fn openai_responses_input(
+    messages: &[ModelMessage],
+    reasoning_history: &[ProviderReasoningReplay],
+) -> (Option<String>, Vec<Value>) {
     let instruction_count = messages
         .iter()
         .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))
@@ -201,21 +255,36 @@ pub(super) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<Strin
                 }));
             }
             ModelRole::Assistant => {
-                if !message_text(message).is_empty() {
-                    items.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": message_text(message),
+                let call_ids = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(ProviderReasoningReplay::Responses {
+                    items: replay_items,
+                    ..
+                }) = reasoning_history
+                    .iter()
+                    .find(|replay| replay.matches_tool_call_ids(&call_ids))
+                {
+                    items.extend(replay_items.iter().cloned());
+                } else {
+                    if !message_text(message).is_empty() {
+                        items.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": message_text(message),
+                        }));
+                    }
+                    items.extend(message.tool_calls.iter().map(|call| {
+                        json!({
+                            "type": "function_call",
+                            "call_id": call.tool_call_id,
+                            "name": call.tool_name,
+                            "arguments": call.raw_arguments,
+                        })
                     }));
                 }
-                items.extend(message.tool_calls.iter().map(|call| {
-                    json!({
-                        "type": "function_call",
-                        "call_id": call.tool_call_id,
-                        "name": call.tool_name,
-                        "arguments": call.raw_arguments,
-                    })
-                }));
             }
             ModelRole::System | ModelRole::Developer | ModelRole::User => {
                 let role = match message.role {
@@ -243,14 +312,32 @@ pub(super) fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -
     }
 }
 
-pub(super) fn openai_message_payload(message: &ModelMessage) -> Value {
+fn openai_message_payload_with_reasoning(
+    message: &ModelMessage,
+    reasoning_history: &[ProviderReasoningReplay],
+    supports_developer_role: bool,
+    requires_assistant_content_for_tool_calls: bool,
+) -> Value {
     let role = serde_json::to_value(&message.role)
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "user".to_string());
+    let role = if message.role == ModelRole::Developer && !supports_developer_role {
+        "system".to_string()
+    } else {
+        role
+    };
+    let mut content = openai_message_content(message);
+    if message.role == ModelRole::Assistant
+        && !message.tool_calls.is_empty()
+        && requires_assistant_content_for_tool_calls
+        && content.is_null()
+    {
+        content = json!("");
+    }
     let mut payload = json!({
         "role": role,
-        "content": openai_message_content(message),
+        "content": content,
     });
     if let Some(tool_call_id) = &message.tool_call_id {
         payload["tool_call_id"] = json!(tool_call_id);
@@ -263,6 +350,21 @@ pub(super) fn openai_message_payload(message: &ModelMessage) -> Value {
                 .map(openai_tool_call_payload)
                 .collect::<Vec<_>>()
         );
+    }
+    if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() {
+        let call_ids = message
+            .tool_calls
+            .iter()
+            .map(|call| call.tool_call_id.clone())
+            .collect::<Vec<_>>();
+        if let Some(ProviderReasoningReplay::Chat {
+            reasoning_content, ..
+        }) = reasoning_history
+            .iter()
+            .find(|replay| replay.matches_tool_call_ids(&call_ids))
+        {
+            payload["reasoning_content"] = json!(reasoning_content);
+        }
     }
     payload
 }
@@ -328,24 +430,10 @@ pub(super) fn openai_responses_reasoning_content_present(payload: &Value) -> boo
         .get("output")
         .and_then(Value::as_array)
         .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("reasoning")
-                    && ["content", "summary", "encrypted_content", "text"]
-                        .iter()
-                        .filter_map(|field| item.get(*field))
-                        .any(value_has_content)
-            })
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
         })
-}
-
-pub(super) fn value_has_content(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-        Value::Bool(_) | Value::Number(_) => true,
-    }
 }
 
 pub(super) fn parse_openai_responses_response(
@@ -354,6 +442,7 @@ pub(super) fn parse_openai_responses_response(
     payload: Value,
     capabilities: &ProviderProtocolContract,
     model_name: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
     if payload.get("error").is_some_and(|error| !error.is_null()) {
         return Err(provider_response_validation_error(
@@ -384,11 +473,29 @@ pub(super) fn parse_openai_responses_response(
             )
         })?;
     let mut content = String::new();
-    let mut tool_calls = Vec::new();
+    let mut tool_calls: Vec<ModelToolCall> = Vec::new();
+    let mut replay_items = Vec::new();
     for (index, item) in output.iter().enumerate() {
-        match item.get("type").and_then(Value::as_str) {
-            Some("message") => {
-                let message = parse_openai_responses_message(item).map_err(|evidence| {
+        let item = item.as_object().ok_or_else(|| {
+            provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses output item was not an object",
+                vec!["responses_output_item_invalid".to_string()],
+            )
+        })?;
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses output item type was missing",
+                vec!["responses_output_item_type_missing".to_string()],
+            )
+        })?;
+        match item_type {
+            "message" => {
+                let item_value = Value::Object(item.clone());
+                let message = parse_openai_responses_message(&item_value).map_err(|evidence| {
                     provider_response_validation_error(
                         config,
                         model_name,
@@ -398,15 +505,45 @@ pub(super) fn parse_openai_responses_response(
                 })?;
                 content.push_str(&message);
             }
-            Some("function_call") => tool_calls.push(parse_openai_responses_tool_call(index, item)),
-            Some("reasoning") if !openai_responses_reasoning_item_has_content(item) => {}
-            Some("reasoning") => {
-                return Err(provider_response_validation_error(
-                    config,
-                    model_name,
-                    "provider returned reasoning content that cannot be replayed safely",
-                    vec!["responses_reasoning_content_present".to_string()],
-                ));
+            "function_call" => {
+                let item_value = Value::Object(item.clone());
+                let call = parse_openai_responses_tool_call(index, &item_value);
+                if call.tool_call_id.is_empty() {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses function_call id was missing",
+                        vec!["responses_function_call_id_missing".to_string()],
+                    ));
+                }
+                if tool_calls
+                    .iter()
+                    .any(|existing| existing.tool_call_id == call.tool_call_id)
+                {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses function_call ids were duplicated",
+                        vec!["responses_function_call_id_duplicate".to_string()],
+                    ));
+                }
+                tool_calls.push(call);
+                replay_items.push(Value::Object(item.clone()));
+            }
+            "reasoning" => {
+                if item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses reasoning item id was missing",
+                        vec!["responses_reasoning_item_id_missing".to_string()],
+                    ));
+                }
+                replay_items.push(Value::Object(item.clone()));
             }
             _ => {
                 return Err(provider_response_validation_error(
@@ -417,11 +554,49 @@ pub(super) fn parse_openai_responses_response(
                 ));
             }
         }
+        if item_type == "message" {
+            replay_items.push(Value::Object(item.clone()));
+        }
     }
     let assistant_message = Some(ModelMessage {
         tool_calls: tool_calls.clone(),
         ..ModelMessage::text(ModelRole::Assistant, content)
     });
+    let provider_reasoning_history = if !replay_items.is_empty() && !tool_calls.is_empty() {
+        let tool_call_ids: Vec<String> = tool_calls
+            .iter()
+            .map(|call| call.tool_call_id.clone())
+            .collect();
+        vec![ProviderReasoningReplay::Responses {
+            provider_name: config.provider_name.clone(),
+            model_name: model_name.to_string(),
+            reasoning_effort: reasoning_effort.unwrap_or("off").to_string(),
+            tool_call_ids,
+            items: replay_items,
+        }]
+    } else {
+        Vec::new()
+    };
+    if !tool_calls.is_empty()
+        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::ReplayResponsesItems
+    {
+        let Some(replay) = provider_reasoning_history.first() else {
+            return Err(provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses tool calls did not include a valid reasoning replay",
+                vec!["responses_reasoning_replay_missing".to_string()],
+            ));
+        };
+        if replay.validate().is_err() {
+            return Err(provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses reasoning replay was invalid",
+                vec!["responses_reasoning_replay_invalid".to_string()],
+            ));
+        }
+    }
     finalize_provider_response(
         request,
         config,
@@ -437,13 +612,10 @@ pub(super) fn parse_openai_responses_response(
         parse_openai_responses_usage(payload.get("usage")),
         status.map(str::to_string),
     )
-}
-
-pub(super) fn openai_responses_reasoning_item_has_content(item: &Value) -> bool {
-    ["content", "summary", "encrypted_content", "text"]
-        .iter()
-        .filter_map(|field| item.get(*field))
-        .any(value_has_content)
+    .map(|mut response| {
+        response.provider_reasoning_history = provider_reasoning_history;
+        response
+    })
 }
 
 pub(super) fn parse_openai_responses_message(message: &Value) -> Result<String, &'static str> {
@@ -486,7 +658,6 @@ pub(super) fn parse_openai_responses_tool_call(_index: usize, call: &Value) -> M
     ModelToolCall {
         tool_call_id: call
             .get("call_id")
-            .or_else(|| call.get("id"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
@@ -537,6 +708,7 @@ pub(super) fn parse_openai_response(
     payload: Value,
     capabilities: &ProviderProtocolContract,
     model_name: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
     let response_id = payload
         .get("id")
@@ -582,6 +754,24 @@ pub(super) fn parse_openai_response(
         .get("finish_reason")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let provider_reasoning_history = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .filter(|_| !tool_calls.is_empty())
+        .map(|reasoning_content| {
+            vec![ProviderReasoningReplay::Chat {
+                provider_name: config.provider_name.clone(),
+                model_name: model_name.to_string(),
+                reasoning_effort: reasoning_effort.unwrap_or("off").to_string(),
+                tool_call_ids: tool_calls
+                    .iter()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect(),
+                reasoning_content: reasoning_content.to_string(),
+            }]
+        })
+        .unwrap_or_default();
     finalize_provider_response(
         request,
         config,
@@ -593,6 +783,10 @@ pub(super) fn parse_openai_response(
         parse_openai_usage(payload.get("usage")),
         finish_reason,
     )
+    .map(|mut response| {
+        response.provider_reasoning_history = provider_reasoning_history;
+        response
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -621,6 +815,7 @@ pub(super) fn finalize_provider_response(
         model_name: Some(model_name.to_string()),
         provider_attempt_metadata: None,
         provider_capability_metadata: None,
+        provider_reasoning_history: Vec::new(),
     };
     let available_tool_names = request
         .tools

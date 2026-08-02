@@ -60,6 +60,7 @@ pub(super) fn model_turn_request(
             max_output_tokens: Some(budget.reserved_output_tokens),
             ..input.model_preferences.clone()
         },
+        provider_reasoning_history: state.provider_reasoning_history.clone(),
     };
     if finalization_only {
         request.tool_choice.mode = ToolChoiceMode::None;

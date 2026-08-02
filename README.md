@@ -46,7 +46,52 @@ SINGULARITY_MODEL=your-model-name
 
 只要进程环境中出现任一 provider 变量，Singularity 就只使用该环境层；否则从当前目录向父目录查找最近的 `.env`。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。
+需要多个 provider 或固定每个模型的协议时，设置 `SINGULARITY_MODELS_CONFIG` 指向 JSON 文件。该文件只保存环境变量名，不保存密钥；`default_model` 和 thread 的 `--model`/`thread.start.model` 都使用完整的 `provider_id/model_id`：
+
+```json
+{
+  "default_model": "opencode-go/deepseek-v4-flash",
+  "providers": {
+    "opencode-go": {
+      "adapter": "openai_compatible",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_API_KEY",
+      "models": {
+        "deepseek-v4-flash": {
+          "api_protocol": "chat",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 384000
+        }
+      }
+    }
+  }
+}
+```
+
+配置在 app-server 或 Evaluation 进程启动时只捕获一次；provider、model、协议和 limits 在一个 turn/trial 内保持不变。每个模型必须明确写 `chat` 或 `responses`，不会根据 URL 推断或跨协议 fallback；model id 不在 allowlist、provider 不存在或 selector 不是 `provider_id/model_id` 时 fail closed。
+
+思考档位也是模型配置的一部分，不按 provider 名称猜测、自动 catalog 或静默降档。`reasoning_variants` 是唯一事实源：每个 variant 必须写 `enabled`，启用档位可写一个 `wire_effort`；`off` 只有显式写成 `enabled:false` 才可选择，`default_variant` 必须精确命中。没有 map 表示不支持思考。Chat 纯开关只能声明一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位都必须写 wire。
+
+例如 DeepSeek 的 high/max/off 选择：
+
+```json
+"deepseek-v4-flash": {
+  "api_protocol": "chat",
+  "max_context_tokens": 1000000,
+  "max_output_tokens": 384000,
+  "reasoning_variants": {
+    "off": {"enabled": false},
+    "high": {"enabled": true, "wire_effort": "high"},
+    "max": {"enabled": true, "wire_effort": "max"}
+  },
+  "default_variant": "high",
+  "tool_reasoning_history": "reasoning_content"
+}
+```
+
+选择 `provider_id/model_id#off` 时必须显式使用该 disabled variant。Chat 发送 `thinking.type=enabled` 与单一解析后的 wire effort；Responses 发送 `reasoning.effort` 与 `include=["reasoning.encrypted_content"]`。工具循环所需的 `reasoning_content` 或 Responses 原始 output items 只在 provider 私有 checkpoint/本地 SQLite 中为 approval、重启和跨 turn 官方续接保留，不进入用户消息、公共 trace、Evaluation 或错误正文；SQLite 不是内容加密层，Responses `encrypted_content` 仍是 provider opaque blob。
+
+可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
 工具能力由运行时自动协商，不是用户配置项；协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](docs/singularity.md#7-model-与-provider) 为准。
 

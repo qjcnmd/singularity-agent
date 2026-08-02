@@ -3785,6 +3785,56 @@ fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
     ));
 }
 
+#[test]
+fn turn_checkpoint_provider_reasoning_payload_survives_store_reopen_and_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let checkpoint = serde_json::json!({
+        "checkpoint_version": 5,
+        "thread_id": thread.thread_id,
+        "turn_id": turn.turn_id,
+        "provider_reasoning_history": [{
+            "kind": "responses",
+            "provider_name": "deepseek",
+            "model_name": "deepseek-reasoner",
+            "reasoning_effort": "high",
+            "tool_call_ids": ["call_1"],
+            "item": {
+                "type": "reasoning",
+                "id": "rs_opaque",
+                "encrypted_content": "opaque-provider-state"
+            }
+        }]
+    });
+    store
+        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 5)
+        .expect("save checkpoint");
+    drop(store);
+
+    // Reopening the SQLite store models a process restart. The payload remains opaque to Store,
+    // but its exact bytes must be available to the typed Agent checkpoint decoder on resume.
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    assert_eq!(
+        reopened
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint lookup")
+            .expect("checkpoint row"),
+        checkpoint
+    );
+    reopened
+        .recover_unowned_workspace_executions()
+        .expect("suspend running turn after owner loss");
+    let (_claimed, resumed_checkpoint) = reopened
+        .claim_suspended_turn(&turn.turn_id)
+        .expect("claim resumable turn");
+    assert_eq!(resumed_checkpoint, checkpoint);
+}
+
 // 两个独立连接并发恢复同一安全 checkpoint 时，Store CAS 只能交给一个 owner。
 #[test]
 fn suspended_turn_claim_allows_only_one_owner() {

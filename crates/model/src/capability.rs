@@ -52,6 +52,16 @@ impl ProviderCapabilityProbeKey {
             probe_contract_version: self.probe_contract_version,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
+            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_variant_enabled: self.reasoning_variant_enabled,
+            wire_reasoning_effort: self.wire_reasoning_effort.clone(),
+            tool_reasoning_mode: self.tool_reasoning_mode,
+            supports_developer_role: self.supports_developer_role,
+            supports_tool_choice: self.supports_tool_choice,
+            requires_reasoning_content_for_tool_calls: self
+                .requires_reasoning_content_for_tool_calls,
+            requires_assistant_content_for_tool_calls: self
+                .requires_assistant_content_for_tool_calls,
         }
     }
 }
@@ -1031,6 +1041,12 @@ fn valid_cache_contract(
             ) | (
                 ProviderApiProtocol::OpenAiChatCompletions,
                 ProviderToolReasoningMode::DisabledForToolCalls
+            ) | (
+                ProviderApiProtocol::OpenAiChatCompletions,
+                ProviderToolReasoningMode::ReplayReasoningContent
+            ) | (
+                ProviderApiProtocol::OpenAiResponses,
+                ProviderToolReasoningMode::ReplayResponsesItems
             )
         )
         || (contract.supports_parallel_tool_calls
@@ -1082,19 +1098,37 @@ fn normalize_endpoint(endpoint: &str) -> String {
 
 fn provider_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> String {
     let material = format!(
-        "singularity-provider-fingerprint-v1\nprovider_name={}\nendpoint_sha256={}\nadapter_version={}\nprobe_contract_version={}\nmax_context_tokens={}\nmax_output_tokens={}",
+        "singularity-provider-fingerprint-v3\nprovider_name={}\nendpoint_sha256={}\nadapter_version={}\nprobe_contract_version={}\nmax_context_tokens={}\nmax_output_tokens={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\ntool_reasoning_mode={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
         key.provider_name,
         key.endpoint_sha256,
         key.adapter_version,
         key.probe_contract_version,
         key.max_context_tokens,
         key.max_output_tokens,
+        key.reasoning_effort.as_deref().unwrap_or("off"),
+        key.reasoning_variant_enabled,
+        key.wire_reasoning_effort.as_deref().unwrap_or("none"),
+        provider_tool_reasoning_mode_name(key.tool_reasoning_mode),
+        key.supports_developer_role,
+        key.supports_tool_choice,
+        key.requires_reasoning_content_for_tool_calls,
+        key.requires_assistant_content_for_tool_calls,
     );
     format!("sha256:{}", sha256_hex(&material))
 }
 
-fn model_fingerprint_for_name(model_name: &str) -> String {
-    let material = format!("singularity-model-fingerprint-v1\neffective_model={model_name}");
+fn model_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> String {
+    let material = format!(
+        "singularity-model-fingerprint-v2\neffective_model={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
+        key.model_name,
+        key.reasoning_effort.as_deref().unwrap_or("off"),
+        key.reasoning_variant_enabled,
+        key.wire_reasoning_effort.as_deref().unwrap_or("none"),
+        key.supports_developer_role,
+        key.supports_tool_choice,
+        key.requires_reasoning_content_for_tool_calls,
+        key.requires_assistant_content_for_tool_calls,
+    );
     format!("sha256:{}", sha256_hex(&material))
 }
 
@@ -1104,7 +1138,7 @@ fn negotiation_fingerprint_for_probe_key_and_contract(
     contract: &ProviderProtocolContract,
 ) -> String {
     let provider_fingerprint = provider_fingerprint_for_probe_key(probe_key);
-    let model_fingerprint = model_fingerprint_for_name(&probe_key.model_name);
+    let model_fingerprint = model_fingerprint_for_probe_key(probe_key);
     let material = format!(
         "singularity-negotiation-fingerprint-v1\nprovider_fingerprint={}\nmodel_fingerprint={}\napi_protocol={}\nsupports_tools={}\nsupports_parallel_tool_calls={}\nsupports_required_tool_choice={}\nsupports_strict_tool_schema={}\ntool_reasoning_mode={}\nmax_tools_per_request={}\nsupports_json_mode={}\nsupports_system_message={}\nsupports_developer_message={}\ncontract_max_context_tokens={}\ncontract_max_output_tokens={}",
         provider_fingerprint,
@@ -1137,6 +1171,8 @@ fn provider_tool_reasoning_mode_name(mode: ProviderToolReasoningMode) -> &'stati
     match mode {
         ProviderToolReasoningMode::Unspecified => "unspecified",
         ProviderToolReasoningMode::DisabledForToolCalls => "disabled_for_tool_calls",
+        ProviderToolReasoningMode::ReplayReasoningContent => "replay_reasoning_content",
+        ProviderToolReasoningMode::ReplayResponsesItems => "replay_responses_items",
     }
 }
 
@@ -1473,6 +1509,40 @@ impl OpenAiProvider {
             probe_contract_version: CAPABILITY_PROBE_CONTRACT_VERSION,
             max_context_tokens: self.config.max_context_tokens,
             max_output_tokens: self.config.max_output_tokens,
+            reasoning_effort: self
+                .selected_model
+                .as_ref()
+                .and_then(|selection| selection.reasoning_variant.clone()),
+            reasoning_variant_enabled: self
+                .selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.reasoning_enabled),
+            wire_reasoning_effort: self
+                .selected_model
+                .as_ref()
+                .and_then(|selection| selection.wire_reasoning_effort.clone()),
+            tool_reasoning_mode: self
+                .selected_model
+                .as_ref()
+                .map_or(ProviderToolReasoningMode::Unspecified, |selection| {
+                    selection.tool_reasoning_mode
+                }),
+            supports_developer_role: self
+                .selected_model
+                .as_ref()
+                .is_none_or(|selection| selection.supports_developer_role),
+            supports_tool_choice: self
+                .selected_model
+                .as_ref()
+                .is_none_or(|selection| selection.supports_tool_choice),
+            requires_reasoning_content_for_tool_calls: self
+                .selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
+            requires_assistant_content_for_tool_calls: self
+                .selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
         }
     }
 
@@ -1500,7 +1570,7 @@ impl OpenAiProvider {
         let probe_key = self.capability_probe_key(model_name);
         ProviderRuntimeFingerprint {
             provider_fingerprint: provider_fingerprint_for_probe_key(&probe_key),
-            model_fingerprint: model_fingerprint_for_name(model_name),
+            model_fingerprint: model_fingerprint_for_probe_key(&probe_key),
             negotiation_fingerprint: None,
         }
     }
@@ -1515,7 +1585,7 @@ impl OpenAiProvider {
         let probe_key = self.capability_probe_key(model_name);
         ProviderRuntimeFingerprint {
             provider_fingerprint: provider_fingerprint_for_probe_key(&probe_key),
-            model_fingerprint: model_fingerprint_for_name(model_name),
+            model_fingerprint: model_fingerprint_for_probe_key(&probe_key),
             negotiation_fingerprint: Some(negotiation_fingerprint_for_probe_key_and_contract(
                 &probe_key,
                 negotiation.metadata.api_protocol,
@@ -1787,7 +1857,7 @@ impl OpenAiProvider {
                 on_attempt,
             );
         };
-        let protocols = self.config.api_protocol_candidates();
+        let protocols = self.protocol_candidates();
         let candidate_keys = if protocols.is_empty() {
             vec![self.capability_cache_key(model_name, ProviderApiProtocol::OpenAiChatCompletions)]
         } else {
@@ -1892,7 +1962,7 @@ impl OpenAiProvider {
         let probe_key = self.capability_probe_key(model_name);
         let deadline = Instant::now() + self.capability_probe_deadline;
         let mut epochs = HashMap::new();
-        for api_protocol in self.config.api_protocol_candidates() {
+        for api_protocol in self.protocol_candidates() {
             let key = self.capability_cache_key(model_name, api_protocol);
             epochs.insert(key.clone(), self.current_cache_epoch(&key)?);
         }
@@ -1910,7 +1980,7 @@ impl OpenAiProvider {
                     cache_observations,
                 ));
             }
-            for api_protocol in self.config.api_protocol_candidates() {
+            for api_protocol in self.protocol_candidates() {
                 let cache_key = self.capability_cache_key(model_name, api_protocol);
                 match self.cached_tool_capability_negotiation(&cache_key, cancellation, deadline) {
                     Ok(CapabilityCacheLookup::Hit(cached, observation)) => {
@@ -2076,7 +2146,7 @@ impl OpenAiProvider {
         deadline: Instant,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        let protocols = self.config.api_protocol_candidates();
+        let protocols = self.protocol_candidates();
         let mut accumulated_metadata: Option<ProviderCapabilityMetadata> = None;
         for (index, api_protocol) in protocols.iter().copied().enumerate() {
             match self.probe_tool_capabilities_for_protocol(
@@ -2134,7 +2204,19 @@ impl OpenAiProvider {
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let mut probe_usage = ModelUsage::default();
         let mut probe_attempt_metadata = ProviderAttemptMetadata::zero();
-        let profiles = capability_probe_profiles(&self.config, model_name, api_protocol);
+        let profiles = capability_probe_profiles(
+            &self.config,
+            model_name,
+            api_protocol,
+            self.selected_model
+                .as_ref()
+                .map_or(ProviderToolReasoningMode::Unspecified, |selection| {
+                    selection.tool_reasoning_mode
+                }),
+            self.selected_model
+                .as_ref()
+                .and_then(|selection| selection.reasoning_variant.as_deref()),
+        );
         let profile_count = profiles.len();
 
         for (index, profile) in profiles.into_iter().enumerate() {
@@ -2207,7 +2289,33 @@ impl OpenAiProvider {
             let mut negotiated_profile =
                 capability_probe_profile_match(&completion.response, &profile);
             let mut contract = profile.contract.clone();
-            if negotiated_profile.is_some() && completion.reasoning_content_present {
+            let replay_reasoning = matches!(
+                profile.contract.tool_reasoning_mode,
+                ProviderToolReasoningMode::ReplayReasoningContent
+                    | ProviderToolReasoningMode::ReplayResponsesItems
+            );
+            if negotiated_profile.is_some()
+                && completion.reasoning_content_present
+                && !replay_reasoning
+            {
+                if self
+                    .selected_model
+                    .as_ref()
+                    .is_some_and(|selection| selection.reasoning_enabled)
+                {
+                    return Err(capability_probe_tool_reasoning_error(
+                        &completion.response,
+                        "tool_reasoning_history_not_configured_for_selected_variant",
+                    )
+                    .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
+                        profile.profile,
+                        index as u32 + 1,
+                        index as u32,
+                        &probe_usage,
+                        &probe_attempt_metadata,
+                    )));
+                }
                 contract.tool_reasoning_mode = ProviderToolReasoningMode::DisabledForToolCalls;
                 completion = match self.complete_capability_probe(
                     &profile.request,
@@ -2271,6 +2379,24 @@ impl OpenAiProvider {
                 }
                 let continuation_request =
                     capability_probe_continuation_request(&profile, &completion.response);
+                if replay_reasoning
+                    && completion.reasoning_content_present
+                    && continuation_request.provider_reasoning_history
+                        != completion.response.provider_reasoning_history
+                {
+                    return Err(capability_probe_tool_reasoning_error(
+                        &completion.response,
+                        "tool_reasoning_history_not_bound_to_continuation",
+                    )
+                    .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
+                        profile.profile,
+                        index as u32 + 1,
+                        index as u32,
+                        &probe_usage,
+                        &probe_attempt_metadata,
+                    )));
+                }
                 let continuation_validation = validate_model_request_with_capabilities(
                     &continuation_request,
                     Some(&contract),
@@ -2327,7 +2453,7 @@ impl OpenAiProvider {
                         )));
                     }
                 };
-                if continuation.reasoning_content_present {
+                if continuation.reasoning_content_present && !replay_reasoning {
                     let error = capability_probe_tool_reasoning_error(
                         &continuation.response,
                         "tool_reasoning_content_present_after_tool_result",
@@ -2451,6 +2577,8 @@ fn capability_probe_profiles(
     config: &OpenAiProviderConfig,
     model_name: &str,
     api_protocol: ProviderApiProtocol,
+    selected_tool_reasoning_mode: ProviderToolReasoningMode,
+    selected_reasoning_variant: Option<&str>,
 ) -> Vec<CapabilityProbeProfile> {
     let base = config.protocol_contract();
     let schema_branch = |label: &str| {
@@ -2530,7 +2658,13 @@ fn capability_probe_profiles(
             ProviderProtocolContract {
                 supports_parallel_tool_calls,
                 supports_strict_tool_schema: strict,
-                tool_reasoning_mode: if api_protocol == ProviderApiProtocol::OpenAiResponses {
+                tool_reasoning_mode: if selected_tool_reasoning_mode
+                    != ProviderToolReasoningMode::Unspecified
+                {
+                    selected_tool_reasoning_mode
+                } else if api_protocol == ProviderApiProtocol::OpenAiResponses
+                    && selected_reasoning_variant.is_none()
+                {
                     ProviderToolReasoningMode::DisabledForToolCalls
                 } else {
                     ProviderToolReasoningMode::Unspecified
@@ -2639,6 +2773,7 @@ fn capability_probe_continuation_request(
 ) -> ModelTurnRequest {
     let mut request = profile.request.clone();
     request.request_id = CAPABILITY_PROBE_CONTINUATION_REQUEST_ID.to_string();
+    request.provider_reasoning_history = response.provider_reasoning_history.clone();
     request.messages.push(ModelMessage::assistant_tool_calls(
         response.tool_calls.clone(),
     ));

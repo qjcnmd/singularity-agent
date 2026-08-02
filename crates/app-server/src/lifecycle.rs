@@ -400,7 +400,7 @@ impl AppServer {
                         true,
                     )
                 } else {
-                    let provider = self.provider_snapshot.provider().map_err(|_| {
+                    let provider = self.provider_for_thread(&thread).map_err(|_| {
                         AppServerError::TurnExecution {
                             stage: TurnFailureStage::AgentLoop,
                             cause: TurnFailureCause::Internal,
@@ -1128,7 +1128,7 @@ impl AppServer {
                 result => result,
             };
         }
-        let provider = match self.provider_snapshot.provider() {
+        let provider = match self.provider_for_thread(invocation.thread) {
             Ok(provider) => provider,
             Err(error) => {
                 let category = error.error.category();
@@ -1200,7 +1200,7 @@ impl AppServer {
                 true,
             );
         }
-        let provider = match self.provider_snapshot.provider() {
+        let provider = match self.provider_for_thread(thread) {
             Ok(provider) => provider,
             Err(error) => {
                 let category = error.error.category();
@@ -1387,6 +1387,7 @@ impl AppServer {
             &turn.turn_id,
             DEFAULT_THREAD_HISTORY_TURN_LIMIT,
         )?;
+        let provider_history_segments = self.provider_history_segments_for(&history.messages)?;
         let registry = workspace_tool_registry();
         let policy = workspace_policy(thread.sandbox_mode, thread.approval_policy);
         let loop_input = match agent_loop_input(
@@ -1395,6 +1396,7 @@ impl AppServer {
             &turn.turn_id,
             &workspace_root,
             &history.messages,
+            &provider_history_segments,
         ) {
             Ok(input) => input.with_approval_grant(grant),
             Err(_error) => {
@@ -1615,12 +1617,14 @@ impl AppServer {
             invocation.thread.sandbox_mode,
             invocation.thread.approval_policy,
         );
+        let provider_history_segments = self.provider_history_segments_for(invocation.history)?;
         let loop_input = agent_loop_input(
             invocation.thread,
             invocation.params,
             invocation.turn_id,
             &workspace_root,
             invocation.history,
+            &provider_history_segments,
         )?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
@@ -1771,12 +1775,14 @@ impl AppServer {
             invocation.thread.sandbox_mode,
             invocation.thread.approval_policy,
         );
+        let provider_history_segments = self.provider_history_segments_for(invocation.history)?;
         let loop_input = agent_loop_input(
             invocation.thread,
             invocation.params,
             invocation.turn_id,
             &workspace_root,
             invocation.history,
+            &provider_history_segments,
         )?
         .with_resume_attempt(checkpoint.resume_attempt());
         let mut projector = if project_observability {
@@ -1920,13 +1926,12 @@ impl AppServer {
                 project_observability,
             )
         } else {
-            let provider =
-                self.provider_snapshot
-                    .provider()
-                    .map_err(|_| AppServerError::TurnExecution {
-                        stage: TurnFailureStage::AgentLoop,
-                        cause: TurnFailureCause::Internal,
-                    })?;
+            let provider = self.provider_for_thread(invocation.thread).map_err(|_| {
+                AppServerError::TurnExecution {
+                    stage: TurnFailureStage::AgentLoop,
+                    cause: TurnFailureCause::Internal,
+                }
+            })?;
             self.run_resumed_agent_loop_with_provider_and_tools(
                 provider,
                 invocation,

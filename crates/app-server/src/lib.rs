@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
-    project_audit_event,
+    PendingApprovalOccurrence, ProviderHistorySegment, TurnCheckpoint, TurnCheckpointEvent,
+    TurnCheckpointPhase, project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -1066,6 +1066,7 @@ fn agent_loop_input(
     turn_id: &str,
     workspace_root: &std::path::Path,
     history: &[ConversationMessage],
+    provider_history_segments: &[ProviderHistorySegment],
 ) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
         .input
@@ -1085,7 +1086,8 @@ fn agent_loop_input(
     });
     let mut input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
         .with_history(history)
-        .with_model_name(thread.model.clone());
+        .with_model_name(thread.model.clone())
+        .with_provider_history_segments(provider_history_segments.iter().cloned());
     if let Some(instructions) = load_project_instructions(workspace_root, workspace_root)? {
         input = input.with_project_instructions(instructions);
     }
@@ -1128,6 +1130,102 @@ fn provider_configuration(snapshot: &ProviderConfigSnapshot) -> ProviderConfigur
         api_key_present: config.api_key_present,
         base_url_present: config.base_url_present,
         model_present: config.model_name.is_some(),
+    }
+}
+
+impl AppServer {
+    /// Validate an explicit thread/fork selector against the startup snapshot
+    /// before any Store row is created.  This never performs provider I/O.
+    pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
+        if let Some(selector) = selector {
+            // Legacy environment configuration historically accepted a bare model name.
+            // Composite selectors and every explicit catalog configuration remain strict.
+            if self.provider_snapshot.has_explicit_model_selection()
+                || selector.contains('/')
+                || selector.contains('#')
+            {
+                self.provider_snapshot
+                    .provider_for_selector(Some(selector))
+                    .map(|_| ())
+                    .map_err(|_| {
+                        AppServerError::InvalidParams("invalid model selector".to_string())
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the persisted thread selector against the one process snapshot.
+    fn provider_for_thread(
+        &self,
+        thread: &Thread,
+    ) -> Result<singularity_model::OpenAiProvider, singularity_model::ProviderError> {
+        self.provider_snapshot
+            .provider_for_selector(thread.model.as_deref())
+    }
+
+    /// Recover provider-bound reasoning items from private turn checkpoints.
+    /// Public conversation history remains text-only; malformed opaque state fails closed.
+    fn provider_history_segments_for(
+        &self,
+        history: &[ConversationMessage],
+    ) -> AppServerResult<Vec<ProviderHistorySegment>> {
+        let mut turn_ids = BTreeSet::new();
+        let mut segments = Vec::new();
+        for message in history {
+            if !turn_ids.insert(message.turn_id.clone()) {
+                continue;
+            }
+            let Some(payload) = self.store.get_turn_checkpoint(&message.turn_id)? else {
+                continue;
+            };
+            let checkpoint = TurnCheckpoint::decode(&payload).map_err(|error| {
+                AppServerError::Store(StoreError::InvalidState(format!(
+                    "provider reasoning checkpoint is invalid: {error}"
+                )))
+            })?;
+            if !checkpoint.has_provider_reasoning_history() {
+                continue;
+            }
+            let assistant_items = history
+                .iter()
+                .filter(|candidate| {
+                    candidate.turn_id == message.turn_id
+                        && candidate.role == ConversationRole::Assistant
+                })
+                .collect::<Vec<_>>();
+            if assistant_items.len() != 1 {
+                return Err(AppServerError::Store(StoreError::InvalidState(
+                    "provider reasoning checkpoint assistant history binding is ambiguous"
+                        .to_string(),
+                )));
+            }
+            let assistant_item_id = assistant_items[0].item_id.clone();
+            if assistant_item_id.trim().is_empty() {
+                return Err(AppServerError::Store(StoreError::InvalidState(
+                    "provider reasoning checkpoint assistant item identity is missing".to_string(),
+                )));
+            }
+            let segment = checkpoint
+                .provider_history_segment(assistant_item_id)
+                .map_err(|error| {
+                    AppServerError::Store(StoreError::InvalidState(format!(
+                        "provider reasoning checkpoint is invalid: {error}"
+                    )))
+                })?;
+            if let Some(segment) = segment {
+                if segments.iter().any(|existing: &ProviderHistorySegment| {
+                    existing.same_assistant_item(&segment) || existing.conflicts_with(&segment)
+                }) {
+                    return Err(AppServerError::Store(StoreError::InvalidState(
+                        "provider reasoning history contains duplicate assistant binding"
+                            .to_string(),
+                    )));
+                }
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
     }
 }
 

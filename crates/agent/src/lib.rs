@@ -19,8 +19,9 @@ use singularity_model::{
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
     PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptMetadata,
     ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError, ProviderErrorStage,
-    ProviderProtocolContract, is_strict_tool_schema_compatible, provider_error_response,
-    validate_model_request_with_capabilities, validate_model_turn_response,
+    ProviderProtocolContract, ProviderReasoningReplay, is_strict_tool_schema_compatible,
+    provider_error_response, validate_model_request_with_capabilities,
+    validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -47,8 +48,8 @@ mod observation;
 mod tool_occurrence;
 
 pub use checkpoint::{
-    ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall, TurnCheckpoint,
-    TurnCheckpointEvent, TurnCheckpointPhase,
+    ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall, ProviderHistorySegment,
+    TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
 };
 
 impl TurnCheckpoint {
@@ -191,7 +192,10 @@ pub use context::{
     AgentContextItem, AgentContextItemPriority, AgentContextTrace, ContextBundle,
     assemble_context_items,
 };
-use context::{ContextBudget, assemble_context_items_with_budget, current_turn_excluded};
+use context::{
+    ContextBudget, assemble_context_items_with_budget_and_provider_history, current_turn_excluded,
+    provider_reasoning_history_from_context,
+};
 use model_turn::*;
 use observation::OccurrenceTimer;
 pub use observation::{
@@ -457,6 +461,12 @@ pub struct AgentLoopInput {
     #[serde(skip)]
     #[schemars(skip)]
     resume_attempt: u32,
+    #[serde(skip)]
+    #[schemars(skip)]
+    provider_reasoning_history: Vec<ProviderReasoningReplay>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    provider_history_segments: Vec<ProviderHistorySegment>,
 }
 
 impl AgentLoopInput {
@@ -478,6 +488,8 @@ impl AgentLoopInput {
             max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
             approval_grants: Vec::new(),
             resume_attempt: 0,
+            provider_reasoning_history: Vec::new(),
+            provider_history_segments: Vec::new(),
         }
     }
 
@@ -521,6 +533,24 @@ impl AgentLoopInput {
     /// 设置 approval 恢复授权。
     pub fn with_approval_grant(mut self, grant: ApprovalGrant) -> Self {
         self.approval_grants.push(grant);
+        self
+    }
+
+    /// Bind opaque provider reasoning history restored from the private checkpoint boundary.
+    pub fn with_provider_reasoning_history(
+        mut self,
+        history: impl IntoIterator<Item = ProviderReasoningReplay>,
+    ) -> Self {
+        self.provider_reasoning_history = history.into_iter().collect();
+        self
+    }
+
+    /// Bind private historical transcript fragments reconstructed from completed turn checkpoints.
+    pub fn with_provider_history_segments(
+        mut self,
+        segments: impl IntoIterator<Item = ProviderHistorySegment>,
+    ) -> Self {
+        self.provider_history_segments = segments.into_iter().collect();
         self
     }
 }
@@ -642,6 +672,7 @@ impl AgentLoopResult {
 /// 在形成 `AgentLoopResult` 前跨模型提供方 turn 累积的可变状态。
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
+    provider_reasoning_history: Vec<ProviderReasoningReplay>,
     tool_result_occurrences: Vec<ToolResultOccurrence>,
     pending_approvals: Vec<PendingApprovalOccurrence>,
     used_approval_grants: BTreeSet<String>,
@@ -696,6 +727,7 @@ impl AgentLoopState {
     ) -> Self {
         Self {
             messages,
+            provider_reasoning_history: Vec::new(),
             tool_result_occurrences: Vec::new(),
             pending_approvals: Vec::new(),
             used_approval_grants: BTreeSet::new(),
@@ -971,6 +1003,7 @@ impl AgentLoopState {
             turn_id: input.turn_id.clone(),
             project_instructions_digest: input.project_instructions_digest.clone(),
             messages: self.messages.clone(),
+            provider_reasoning_history: self.provider_reasoning_history.clone(),
             tool_result_occurrences: self.tool_result_occurrences.clone(),
             used_approval_grants: self.used_approval_grants.iter().cloned().collect(),
             approval_count: if approval {
@@ -1666,12 +1699,19 @@ where
         &self,
         input: &AgentLoopInput,
     ) -> Result<TurnCheckpoint, String> {
-        let context = assemble_context_items(&input.input, u32::MAX);
+        let public_budget = ContextBudget::for_public_assembly(u32::MAX);
+        let context = assemble_context_items_with_budget_and_provider_history(
+            &input.input,
+            &public_budget,
+            &input.provider_history_segments,
+        );
         if current_turn_excluded(input, &context) {
             return Err(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string());
         }
         let messages = model_messages_from_input(input, &context, 1);
         let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
+        state.provider_reasoning_history =
+            provider_reasoning_history_with_context(&input.provider_reasoning_history, &context);
         state.context_trace = Some(AgentContextTrace::from(&context));
         state
             .turn_checkpoint(input, 0, Vec::new())
@@ -1869,7 +1909,11 @@ where
                 return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
             }
         };
-        let context = assemble_context_items_with_budget(&input.input, &budget);
+        let context = assemble_context_items_with_budget_and_provider_history(
+            &input.input,
+            &budget,
+            &input.provider_history_segments,
+        );
         if current_turn_excluded(input, &context) {
             return state.finish(
                 AgentStatus::Failed,
@@ -1880,6 +1924,8 @@ where
             );
         }
         state.messages = model_messages_from_input(input, &context, max_tool_calls);
+        state.provider_reasoning_history =
+            provider_reasoning_history_with_context(&input.provider_reasoning_history, &context);
         state.context_trace = Some(AgentContextTrace::from(&context));
         if let Some(callback) = on_checkpoint.as_deref_mut() {
             let checkpoint = match state.turn_checkpoint(input, 0, Vec::new()) {
@@ -2107,6 +2153,7 @@ where
                 &tool_view.tools,
                 &state.messages,
                 &state.tool_result_occurrences,
+                &state.provider_reasoning_history,
                 budget,
             ) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
@@ -2117,6 +2164,7 @@ where
                         &tool_view.tools,
                         &state.messages,
                         &state.tool_result_occurrences,
+                        &state.provider_reasoning_history,
                         budget,
                     );
                     if emit_prompt_assembly_finished(
@@ -2156,6 +2204,9 @@ where
                 }
                 state.messages = compaction.messages;
                 state.tool_result_occurrences = compaction.tool_result_occurrences;
+                state
+                    .provider_reasoning_history
+                    .retain(|replay| replay.is_bound_to_messages(&state.messages));
             }
             let request = model_turn_request(
                 input,
@@ -2178,6 +2229,7 @@ where
                     &request.tools,
                     &request.messages,
                     &state.tool_result_occurrences,
+                    &state.provider_reasoning_history,
                     budget,
                 );
                 if emit_prompt_assembly_finished(
@@ -2221,6 +2273,7 @@ where
                 &request.tools,
                 &request.messages,
                 &state.tool_result_occurrences,
+                &state.provider_reasoning_history,
                 budget,
             );
             if emit_prompt_assembly_finished(
@@ -2313,8 +2366,28 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
+            if response
+                .provider_reasoning_history
+                .iter()
+                .any(|replay| !replay.is_valid())
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some("provider reasoning replay is invalid".to_string()),
+                );
+            }
             let buffered_text_deltas = provider_events.into_buffered_text_deltas();
             state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
+            if !response.provider_reasoning_history.is_empty() {
+                for replay in &response.provider_reasoning_history {
+                    if !state.provider_reasoning_history.contains(replay) {
+                        state.provider_reasoning_history.push(replay.clone());
+                    }
+                }
+            }
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
                 return state.finish(
@@ -2834,7 +2907,11 @@ where
             }
         };
         refresh_developer_instructions(&mut state.messages, input, max_tool_calls);
-        let context = assemble_context_items_with_budget(&input.input, &budget);
+        let context = assemble_context_items_with_budget_and_provider_history(
+            &input.input,
+            &budget,
+            &input.provider_history_segments,
+        );
         if let Some(context_trace) = &mut state.context_trace {
             context_trace.refresh_context(&context);
         } else {
@@ -4323,20 +4400,40 @@ fn context_budget(
     })
 }
 
+fn provider_reasoning_history_with_context(
+    input_history: &[ProviderReasoningReplay],
+    context: &ContextBundle,
+) -> Vec<ProviderReasoningReplay> {
+    let mut history = provider_reasoning_history_from_context(context);
+    for replay in input_history {
+        if !history.contains(replay) {
+            history.push(replay.clone());
+        }
+    }
+    history
+}
+
 fn model_request_fits_context(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
     tool_result_occurrences: &[ToolResultOccurrence],
+    provider_reasoning_history: &[ProviderReasoningReplay],
     budget: &ContextBudget,
 ) -> bool {
-    model_request_token_count(tools, messages, tool_result_occurrences, budget)
-        <= budget.model_context_window
+    model_request_token_count(
+        tools,
+        messages,
+        tool_result_occurrences,
+        provider_reasoning_history,
+        budget,
+    ) <= budget.model_context_window
 }
 
 fn model_request_token_count(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
     tool_result_occurrences: &[ToolResultOccurrence],
+    provider_reasoning_history: &[ProviderReasoningReplay],
     budget: &ContextBudget,
 ) -> u32 {
     let projected_messages = messages
@@ -4374,25 +4471,59 @@ fn model_request_token_count(
         .collect::<Vec<_>>();
     let payload_tokens = serde_json::to_string(&(projected_messages, projected_tools))
         .map_or(u32::MAX, |payload| approximate_token_count(&payload));
-    let tool_result_accounting =
-        tool_result_context_token_adjustment(messages, tool_result_occurrences);
+    let tool_result_accounting = tool_result_context_token_adjustment_with_provider(
+        messages,
+        tool_result_occurrences,
+        provider_reasoning_history,
+    );
     let message_framing = u32::try_from(messages.len())
         .unwrap_or(u32::MAX)
         .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
     payload_tokens
+        .saturating_add(provider_reasoning_token_count(provider_reasoning_history))
         .saturating_add(tool_result_accounting)
         .saturating_add(budget.reserved_output_tokens)
         .saturating_add(message_framing)
         .saturating_add(budget.fixed_overhead_tokens)
 }
 
+fn provider_reasoning_token_count(history: &[ProviderReasoningReplay]) -> u32 {
+    serde_json::to_string(history).map_or(u32::MAX, |payload| approximate_token_count(&payload))
+}
+
+fn provider_reasoning_tool_call_ids(
+    history: &[ProviderReasoningReplay],
+    messages: &[ModelMessage],
+) -> BTreeSet<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Assistant)
+        .flat_map(|message| {
+            message
+                .tool_calls
+                .iter()
+                .filter(|call| {
+                    history
+                        .iter()
+                        .any(|replay| replay.has_tool_call_id(&call.tool_call_id))
+                })
+                .map(|call| call.tool_call_id.clone())
+        })
+        .collect()
+}
+
 /// 将真实追加顺序中的 tool occurrence 与安全结果 accounting 对齐；压缩占位消息不重复计入。
-fn tool_result_context_token_adjustment(
+fn tool_result_context_token_adjustment_with_provider(
     messages: &[ModelMessage],
     tool_result_occurrences: &[ToolResultOccurrence],
+    provider_reasoning_history: &[ProviderReasoningReplay],
 ) -> u32 {
-    let Some(occurrences) = tool_result_message_occurrences(messages, tool_result_occurrences)
-    else {
+    let private_call_ids = provider_reasoning_tool_call_ids(provider_reasoning_history, messages);
+    let Some(occurrences) = tool_result_message_occurrences_with_private_call_ids(
+        messages,
+        tool_result_occurrences,
+        &private_call_ids,
+    ) else {
         return u32::MAX;
     };
     occurrences
@@ -4410,6 +4541,14 @@ fn tool_result_context_token_adjustment(
         .fold(0, u32::saturating_add)
 }
 
+#[cfg(test)]
+fn tool_result_context_token_adjustment(
+    messages: &[ModelMessage],
+    tool_result_occurrences: &[ToolResultOccurrence],
+) -> u32 {
+    tool_result_context_token_adjustment_with_provider(messages, tool_result_occurrences, &[])
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ToolResultMessageOccurrence {
     assistant_index: usize,
@@ -4419,9 +4558,22 @@ struct ToolResultMessageOccurrence {
 }
 
 /// 按 occurrence 顺序验证当前 tool message 与结果的一一绑定。
+#[cfg(test)]
 fn tool_result_message_occurrences(
     messages: &[ModelMessage],
     tool_result_occurrences: &[ToolResultOccurrence],
+) -> Option<Vec<ToolResultMessageOccurrence>> {
+    tool_result_message_occurrences_with_private_call_ids(
+        messages,
+        tool_result_occurrences,
+        &BTreeSet::new(),
+    )
+}
+
+fn tool_result_message_occurrences_with_private_call_ids(
+    messages: &[ModelMessage],
+    tool_result_occurrences: &[ToolResultOccurrence],
+    private_call_ids: &BTreeSet<String>,
 ) -> Option<Vec<ToolResultMessageOccurrence>> {
     if tool_result_occurrences
         .iter()
@@ -4456,6 +4608,36 @@ fn tool_result_message_occurrences(
                 .then_some((index, occurrence.visibility()))
         })
         .collect::<Vec<_>>();
+    let result_call_ids = result_occurrences
+        .iter()
+        .filter_map(|(index, _)| {
+            tool_result_occurrences
+                .get(*index)
+                .map(|occurrence| occurrence.result().tool_call_id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    if messages.iter().any(|message| {
+        message.role == ModelRole::Assistant
+            && message.tool_calls.iter().any(|call| {
+                !result_call_ids.contains(call.tool_call_id.as_str())
+                    && !private_call_ids.contains(&call.tool_call_id)
+            })
+    }) || messages.iter().any(|message| {
+        message.role == ModelRole::Tool
+            && message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| !result_call_ids.contains(id) && !private_call_ids.contains(id))
+    }) {
+        return None;
+    }
+    // Historical provider-private tool transcripts are present in the request messages but have
+    // no current-turn ToolResultOccurrence.  Only pair the occurrence-owned calls here; private
+    // messages still contribute their serialized payload tokens above.
+    let assistant_calls = assistant_calls
+        .into_iter()
+        .filter(|(_, _, call_id)| result_call_ids.contains(call_id))
+        .collect::<Vec<_>>();
     if assistant_calls.len() != result_occurrences.len() {
         return None;
     }
@@ -4478,7 +4660,14 @@ fn tool_result_message_occurrences(
     let tool_message_indices = messages
         .iter()
         .enumerate()
-        .filter_map(|(index, message)| (message.role == ModelRole::Tool).then_some(index))
+        .filter_map(|(index, message)| {
+            (message.role == ModelRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| result_call_ids.contains(id)))
+            .then_some(index)
+        })
         .collect::<Vec<_>>();
     let visible_result_occurrences = occurrences
         .iter()
@@ -4551,13 +4740,19 @@ fn compact_model_messages(
         tools,
         &state.messages,
         &state.tool_result_occurrences,
+        &state.provider_reasoning_history,
         budget,
     );
     if before_tokens <= budget.model_context_window {
         return None;
     }
-    let occurrences =
-        tool_result_message_occurrences(&state.messages, &state.tool_result_occurrences)?;
+    let private_call_ids =
+        provider_reasoning_tool_call_ids(&state.provider_reasoning_history, &state.messages);
+    let occurrences = tool_result_message_occurrences_with_private_call_ids(
+        &state.messages,
+        &state.tool_result_occurrences,
+        &private_call_ids,
+    )?;
 
     let authority_indices = state
         .messages
@@ -4629,8 +4824,19 @@ fn compact_model_messages(
         }
     }
 
-    let after_tokens =
-        model_request_token_count(tools, &messages, &tool_result_occurrences, budget);
+    let retained_reasoning_history = state
+        .provider_reasoning_history
+        .iter()
+        .filter(|replay| replay.is_bound_to_messages(&messages))
+        .cloned()
+        .collect::<Vec<_>>();
+    let after_tokens = model_request_token_count(
+        tools,
+        &messages,
+        &tool_result_occurrences,
+        &retained_reasoning_history,
+        budget,
+    );
     if after_tokens >= before_tokens || after_tokens > budget.model_context_window {
         return None;
     }
@@ -4750,6 +4956,7 @@ fn restore_checkpoint(
 ) -> Result<(AgentLoopState, u32), String> {
     pending.validate_binding()?;
     let checkpoint = pending.checkpoint().clone();
+    checkpoint.validate_for_restore()?;
     let checkpoint_state = checkpoint.state.clone();
     let pending_tool_call = pending.pending_tool_call();
     if checkpoint_state.thread_id != input.thread_id {
@@ -4821,15 +5028,24 @@ fn restore_checkpoint(
     let tool_result_occurrences = checkpoint_state.tool_result_occurrences.clone();
     let checkpoint_history_messages =
         &checkpoint_state.messages[..checkpoint_state.messages.len() - 1];
-    if tool_result_message_occurrences(checkpoint_history_messages, &tool_result_occurrences)
-        .is_none()
+    let private_call_ids = provider_reasoning_tool_call_ids(
+        &checkpoint_state.provider_reasoning_history,
+        checkpoint_history_messages,
+    );
+    if tool_result_message_occurrences_with_private_call_ids(
+        checkpoint_history_messages,
+        &tool_result_occurrences,
+        &private_call_ids,
+    )
+    .is_none()
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let derived_completion = restore_completion_from_history(
+    let derived_completion = restore_completion_from_history_with_provider(
         checkpoint_history_messages,
         &tool_result_occurrences,
         &checkpoint_state.completion,
+        &checkpoint_state.provider_reasoning_history,
     )?;
     if derived_completion != checkpoint_state.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
@@ -4840,6 +5056,7 @@ fn restore_checkpoint(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
+    state.provider_reasoning_history = checkpoint_state.provider_reasoning_history;
     state.tool_result_occurrences = tool_result_occurrences;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint_state.approval_count;
@@ -4860,13 +5077,33 @@ fn restore_checkpoint(
 /// Rebuild completion from checkpoint occurrences while preserving the post-input invalidation
 /// boundary. Omitted occurrences still prove workspace revision, but cannot prove terminal
 /// verification after a newer user input unless a later visible/compacted assistant call binds it.
+#[cfg(test)]
 fn restore_completion_from_history(
     messages: &[ModelMessage],
     tool_result_occurrences: &[ToolResultOccurrence],
     checkpoint_completion: &CompletionTracker,
 ) -> Result<CompletionTracker, String> {
-    let occurrences = tool_result_message_occurrences(messages, tool_result_occurrences)
-        .ok_or_else(|| "turn checkpoint tool result occurrence bindings are invalid".to_string())?;
+    restore_completion_from_history_with_provider(
+        messages,
+        tool_result_occurrences,
+        checkpoint_completion,
+        &[],
+    )
+}
+
+fn restore_completion_from_history_with_provider(
+    messages: &[ModelMessage],
+    tool_result_occurrences: &[ToolResultOccurrence],
+    checkpoint_completion: &CompletionTracker,
+    provider_reasoning_history: &[ProviderReasoningReplay],
+) -> Result<CompletionTracker, String> {
+    let private_call_ids = provider_reasoning_tool_call_ids(provider_reasoning_history, messages);
+    let occurrences = tool_result_message_occurrences_with_private_call_ids(
+        messages,
+        tool_result_occurrences,
+        &private_call_ids,
+    )
+    .ok_or_else(|| "turn checkpoint tool result occurrence bindings are invalid".to_string())?;
     let mut derived = CompletionTracker::default();
     for occurrence in tool_result_occurrences {
         if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
@@ -4938,6 +5175,7 @@ fn restore_turn_checkpoint(
     input: &AgentLoopInput,
     checkpoint: &TurnCheckpoint,
 ) -> Result<(AgentLoopState, u32), String> {
+    checkpoint.validate_for_restore()?;
     let checkpoint_state = checkpoint.state.clone();
     if checkpoint_state.thread_id != input.thread_id {
         return Err("turn checkpoint thread mismatch".to_string());
@@ -4955,20 +5193,29 @@ fn restore_turn_checkpoint(
     if checkpoint_state.messages.is_empty() {
         return Err("turn checkpoint messages are missing".to_string());
     }
-    if tool_result_message_occurrences(
+    let private_call_ids = provider_reasoning_tool_call_ids(
+        &checkpoint_state.provider_reasoning_history,
+        &checkpoint_state.messages,
+    );
+    if tool_result_message_occurrences_with_private_call_ids(
         &checkpoint_state.messages,
         &checkpoint_state.tool_result_occurrences,
+        &private_call_ids,
     )
     .is_none()
     {
         return Err("turn checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let derived_completion = restore_completion_from_history(
+    let derived_completion = restore_completion_from_history_with_provider(
         &checkpoint_state.messages,
         &checkpoint_state.tool_result_occurrences,
         &checkpoint_state.completion,
+        &checkpoint_state.provider_reasoning_history,
     )?;
     let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
+    // Provider-private reasoning replay is part of the durable turn snapshot. Restore it before
+    // the next model request so a process restart cannot silently drop opaque provider state.
+    state.provider_reasoning_history = checkpoint_state.provider_reasoning_history;
     state.tool_result_occurrences = checkpoint_state.tool_result_occurrences;
     state.used_approval_grants = checkpoint_state.used_approval_grants.into_iter().collect();
     state.prior_approval_count = checkpoint_state.approval_count;

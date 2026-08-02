@@ -13,7 +13,7 @@ use singularity_tools::approximate_token_count;
 
 use super::{
     ASSISTANT_MESSAGE_ROLE, AgentLoopInput, ContextCompactionOutcome, DEFAULT_MAX_CONTEXT_TOKENS,
-    USER_MESSAGE_ROLE,
+    MODEL_MESSAGE_FRAMING_TOKENS, ProviderHistorySegment, USER_MESSAGE_ROLE,
 };
 
 /// 为模型提供方请求选择公开上下文时使用的优先级。
@@ -134,7 +134,7 @@ impl ContextBudget {
         })
     }
 
-    fn for_public_assembly(max_tokens: u32) -> Self {
+    pub(super) fn for_public_assembly(max_tokens: u32) -> Self {
         Self {
             model_context_window: DEFAULT_MAX_CONTEXT_TOKENS,
             reserved_output_tokens: 0,
@@ -156,6 +156,14 @@ pub(super) fn assemble_context_items_with_budget(
     items: &[AgentContextItem],
     budget: &ContextBudget,
 ) -> ContextBundle {
+    assemble_context_items_with_budget_and_provider_history(items, budget, &[])
+}
+
+pub(super) fn assemble_context_items_with_budget_and_provider_history(
+    items: &[AgentContextItem],
+    budget: &ContextBudget,
+    provider_history_segments: &[ProviderHistorySegment],
+) -> ContextBundle {
     let max_tokens = budget.input_token_budget;
     let mut candidates: Vec<(usize, &AgentContextItem)> = items
         .iter()
@@ -171,10 +179,11 @@ pub(super) fn assemble_context_items_with_budget(
     let mut used_tokens = 0;
     let mut included_indices = HashSet::new();
     for (index, item) in candidates {
-        if item.token_count > max_tokens.saturating_sub(used_tokens) {
+        let item_tokens = context_item_token_count(item, provider_history_segments);
+        if item_tokens > max_tokens.saturating_sub(used_tokens) {
             continue;
         }
-        used_tokens = used_tokens.saturating_add(item.token_count);
+        used_tokens = used_tokens.saturating_add(item_tokens);
         included_indices.insert(index);
     }
 
@@ -198,11 +207,15 @@ pub(super) fn assemble_context_items_with_budget(
         {
             history_start -= 1;
         }
-        let group_tokens = history_indices[history_start..history_end]
-            .iter()
-            .fold(0u32, |total, index| {
-                total.saturating_add(items[*index].token_count)
-            });
+        let group_tokens =
+            history_indices[history_start..history_end]
+                .iter()
+                .fold(0u32, |total, index| {
+                    total.saturating_add(context_item_token_count(
+                        items.get(*index).expect("history item index remains bound"),
+                        provider_history_segments,
+                    ))
+                });
         if group_tokens > max_tokens.saturating_sub(used_tokens) {
             break;
         }
@@ -214,6 +227,7 @@ pub(super) fn assemble_context_items_with_budget(
     let mut included_item_ids = Vec::new();
     let mut excluded_item_ids = Vec::new();
     let mut messages = Vec::new();
+    let mut selected_provider_history_segments = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if !included_indices.contains(&index) {
             excluded_item_ids.push(item.item_id.clone());
@@ -224,6 +238,12 @@ pub(super) fn assemble_context_items_with_budget(
             "role": item.role,
             "content": item.content,
         }));
+        if let Some(segment) = provider_history_segments
+            .iter()
+            .find(|segment| segment.assistant_item_id() == item.item_id)
+        {
+            selected_provider_history_segments.push(segment.clone());
+        }
     }
 
     ContextBundle {
@@ -231,7 +251,25 @@ pub(super) fn assemble_context_items_with_budget(
         included_item_ids,
         excluded_item_ids,
         budget: budget.metadata(used_tokens),
+        provider_history_segments: selected_provider_history_segments,
     }
+}
+
+fn context_item_token_count(
+    item: &AgentContextItem,
+    provider_history_segments: &[ProviderHistorySegment],
+) -> u32 {
+    let private_tokens = provider_history_segments
+        .iter()
+        .find(|segment| segment.assistant_item_id() == item.item_id)
+        .map_or(0, |segment| {
+            segment.token_count().saturating_add(
+                u32::try_from(segment.messages().len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS),
+            )
+        });
+    item.token_count.saturating_add(private_tokens)
 }
 
 pub(super) fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> bool {
@@ -249,6 +287,9 @@ pub struct ContextBundle {
     pub included_item_ids: Vec<String>,
     pub excluded_item_ids: Vec<String>,
     pub budget: Value,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(super) provider_history_segments: Vec<ProviderHistorySegment>,
 }
 
 /// 随运行持久化的追踪安全上下文选择和压缩计数器。
@@ -301,7 +342,8 @@ pub(super) fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelM
     context
         .messages
         .iter()
-        .filter_map(|message| {
+        .enumerate()
+        .flat_map(|(index, message)| {
             let role = match message.get("role").and_then(Value::as_str) {
                 Some("system") => ModelRole::System,
                 Some("developer") => ModelRole::Developer,
@@ -309,10 +351,43 @@ pub(super) fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelM
                 Some("tool") => ModelRole::Tool,
                 _ => ModelRole::User,
             };
-            message
+            let public_message = message
                 .get("content")
                 .and_then(Value::as_str)
-                .map(|content| ModelMessage::text(role, content))
+                .map(|content| ModelMessage::text(role.clone(), content));
+            let private_messages = if role == ModelRole::Assistant {
+                context
+                    .included_item_ids
+                    .get(index)
+                    .and_then(|item_id| {
+                        context
+                            .provider_history_segments
+                            .iter()
+                            .find(|segment| segment.assistant_item_id() == item_id)
+                    })
+                    .map_or_else(Vec::new, |segment| segment.messages().to_vec())
+            } else {
+                Vec::new()
+            };
+            private_messages
+                .into_iter()
+                .chain(public_message)
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+pub(super) fn provider_reasoning_history_from_context(
+    context: &ContextBundle,
+) -> Vec<singularity_model::ProviderReasoningReplay> {
+    context
+        .provider_history_segments
+        .iter()
+        .flat_map(|segment| segment.provider_reasoning_history().iter().cloned())
+        .fold(Vec::new(), |mut history, replay| {
+            if !history.contains(&replay) {
+                history.push(replay);
+            }
+            history
+        })
 }
