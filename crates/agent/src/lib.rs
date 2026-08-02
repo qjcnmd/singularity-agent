@@ -2532,8 +2532,9 @@ where
                     );
                 }
                 if state.allows_final() {
-                    if !finalization_only && state.completion_ready() {
-                        if emit_verification_occurrence(
+                    if !finalization_only
+                        && state.completion_ready()
+                        && emit_verification_occurrence(
                             &mut on_event,
                             input,
                             turn_index,
@@ -2543,15 +2544,14 @@ where
                             &state.completion.summary(),
                         )
                         .is_err()
-                        {
-                            return state.finish(
-                                AgentStatus::Failed,
-                                false,
-                                None,
-                                actual_model_turns,
-                                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                            );
-                        }
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
                     }
                     for delta in buffered_text_deltas {
                         if emit_event(&mut on_event, AgentLoopEvent::FinalTextDelta { delta })
@@ -3288,6 +3288,7 @@ where
     }
 
     /// 对模型提供方的 tool 批次执行预检、授权、执行或创建检查点。
+    #[allow(clippy::too_many_arguments)]
     fn process_tool_calls(
         &self,
         input: &AgentLoopInput,

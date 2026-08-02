@@ -1761,6 +1761,7 @@ fn run_task_trials_inner(
     task_evaluation_from_trials(plan, trials)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blocked_task_trials(
     plan: &WorkspacePlan,
     trials_per_task: u32,
@@ -3156,6 +3157,7 @@ fn snapshot_agent_workspace_after(
     Ok((snapshot, work, observation, full_scans))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_agent_stage(
     prepared: &PreparedTaskContext<'_, '_>,
     task_dir: &Path,
@@ -3234,13 +3236,13 @@ fn run_agent_stage(
             );
         }
     }
-    if let Some(observer) = agent_observer.as_mut() {
-        if let Err(error) = require_agent_baseline_unchanged(observer.checkpoint()) {
-            return blocked_agent_stage(
-                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-                command_diagnostics,
-            );
-        }
+    if let Some(observer) = agent_observer.as_mut()
+        && let Err(error) = require_agent_baseline_unchanged(observer.checkpoint())
+    {
+        return blocked_agent_stage(
+            evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+            command_diagnostics,
+        );
     }
     let project_instructions = match load_project_instructions(agent_dir, agent_dir) {
         Ok(instructions) => instructions,
@@ -3330,7 +3332,7 @@ fn run_agent_stage(
             }
         };
         let mut projector = TraceProjector::new_external(
-            &**store,
+            &store,
             &trace_run_id,
             &trace_session_id,
             &trace_turn_span_id,
@@ -3355,7 +3357,7 @@ fn run_agent_stage(
     match trace_store.lock() {
         Ok(store) => {
             let mut projector = TraceProjector::new_external(
-                &**store,
+                &store,
                 &trace_run_id,
                 &trace_session_id,
                 &trace_turn_span_id,
@@ -3839,7 +3841,7 @@ fn evaluation_agent_trace_shared(
     let store = store
         .lock()
         .map_err(|_| "evaluation trace store mutex poisoned while querying trace".to_string())?;
-    let events = evaluation_agent_trace_events(&**store, run_id, session_id, task_span_id)?;
+    let events = evaluation_agent_trace_events(&store, run_id, session_id, task_span_id)?;
     drop(store);
     evaluation_agent_trace_value(run_id, session_id, events)
 }
@@ -5027,7 +5029,7 @@ fn diagnostic_blocked_run_result(
         .as_ref()
         .map(blocker_code)
         .transpose()
-        .map_err(|error| EvaluationRunError::infrastructure(error))?;
+        .map_err(EvaluationRunError::infrastructure)?;
     Ok(EvaluationRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),

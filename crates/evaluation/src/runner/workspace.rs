@@ -212,16 +212,15 @@ impl ObservedPreparedSource {
             .get(".")
             .cloned()
             .ok_or_else(|| "prepared workspace snapshot has no root entry".to_string())?;
-        if let Some(observer) = observer.as_mut() {
-            if observer.checkpoint()? != PreparedWorkspaceObservation::Unchanged
+        if let Some(observer) = observer.as_mut()
+            && (observer.checkpoint()? != PreparedWorkspaceObservation::Unchanged
                 || workspace_root_identity(&root)? != capture.root_identity
-                || prepared_root_entry(&root)? != root_entry
-            {
-                return Err(
-                    "prepared source changed while its observation token was being published"
-                        .to_string(),
-                );
-            }
+                || prepared_root_entry(&root)? != root_entry)
+        {
+            return Err(
+                "prepared source changed while its observation token was being published"
+                    .to_string(),
+            );
         }
         let contract = serde_json::to_vec(&(preflight, PREPARED_OBSERVATION_POLICY))
             .map_err(|error| format!("failed to encode prepared workspace contract: {error}"))?;
