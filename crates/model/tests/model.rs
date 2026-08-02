@@ -432,15 +432,16 @@ fn strict_probe_server() -> (String, Receiver<Vec<String>>) {
         let parameters = request
             .pointer("/tools/0/function/parameters")
             .expect("strict probe parameters");
-        let branch = parameters
-            .pointer("/oneOf/0")
-            .unwrap_or(&serde_json::Value::Null);
-        let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
-            && branch["type"] == "object"
-            && branch["required"] == serde_json::json!(["probe", "values"])
-            && branch["additionalProperties"] == false
-            && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
-            && branch["properties"]["values"]["type"] == "array";
+        let valid_schema = parameters.get("oneOf").is_none()
+            && parameters["type"] == "object"
+            && parameters["required"] == serde_json::json!(["probe", "values"])
+            && parameters["additionalProperties"] == false
+            && parameters["properties"]["probe"]["type"] == "string"
+            && parameters["properties"]["probe"]["enum"]
+                == serde_json::json!(["schema_sentinel_alpha", "schema_sentinel_beta"])
+            && parameters["properties"]["values"]["type"] == "array"
+            && parameters["properties"]["values"]["items"]["type"] == "integer"
+            && parameters["properties"]["values"]["items"]["enum"] == serde_json::json!([7]);
         let valid_roles = request["messages"][0]["role"] == "developer"
             && request["messages"][1]["role"] == "user";
         if valid_schema && valid_roles {
@@ -2884,23 +2885,28 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     let parameters = &request["tools"][0]["function"]["parameters"];
     assert_eq!(request["messages"][0]["role"], "developer");
     assert_eq!(request["messages"][1]["role"], "user");
-    let branches = parameters["oneOf"]
-        .as_array()
-        .expect("strict probe top-level oneOf branches");
-    assert_eq!(branches.len(), 2);
-    let parameters = &branches[0];
+    assert!(parameters.get("oneOf").is_none());
+    assert_eq!(parameters["type"], "object");
     assert_eq!(
         parameters["required"],
         serde_json::json!(["probe", "values"])
     );
     assert_eq!(parameters["additionalProperties"], false);
     assert_eq!(
-        parameters["properties"]["probe"]["const"],
-        "schema_sentinel_alpha"
+        parameters["properties"]["probe"]["enum"],
+        serde_json::json!(["schema_sentinel_alpha", "schema_sentinel_beta"])
     );
     assert_eq!(parameters["properties"]["values"]["type"], "array");
     assert_eq!(parameters["properties"]["values"]["minItems"], 2);
     assert_eq!(parameters["properties"]["values"]["maxItems"], 2);
+    assert_eq!(
+        parameters["properties"]["values"]["items"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        parameters["properties"]["values"]["items"]["enum"],
+        serde_json::json!([7])
+    );
     let instruction = request["messages"][1]["content"]
         .as_str()
         .expect("strict probe instruction");

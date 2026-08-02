@@ -2581,33 +2581,31 @@ fn capability_probe_profiles(
     selected_reasoning_variant: Option<&str>,
 ) -> Vec<CapabilityProbeProfile> {
     let base = config.protocol_contract();
-    let schema_branch = |label: &str| {
-        json!({
-            "type": "object",
-            "properties": {
-                "probe": {
-                    "type": "string",
-                    "const": label
-                },
-                "values": {
-                    "type": "array",
-                    "minItems": 2,
-                    "maxItems": 2,
-                    "items": {
-                        "type": "integer",
-                        "const": CAPABILITY_PROBE_EXPECTED_VALUE
-                    }
-                }
-            },
-            "required": ["probe", "values"],
-            "additionalProperties": false
-        })
-    };
+    // Keep the probe schema in the common strict-tool subset.  In particular,
+    // do not use a root `oneOf`: some OpenAI-compatible Chat providers reject
+    // that keyword even when each branch is otherwise valid.
     let tool_schema = json!({
-        "oneOf": [
-            schema_branch(CAPABILITY_PROBE_EXPECTED_LABEL),
-            schema_branch(CAPABILITY_PROBE_ALTERNATE_LABEL)
-        ]
+        "type": "object",
+        "properties": {
+            "probe": {
+                "type": "string",
+                "enum": [
+                    CAPABILITY_PROBE_EXPECTED_LABEL,
+                    CAPABILITY_PROBE_ALTERNATE_LABEL
+                ]
+            },
+            "values": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                    "type": "integer",
+                    "enum": [CAPABILITY_PROBE_EXPECTED_VALUE]
+                }
+            }
+        },
+        "required": ["probe", "values"],
+        "additionalProperties": false
     });
     let strict_arguments = json!({
         "probe": CAPABILITY_PROBE_EXPECTED_LABEL,
