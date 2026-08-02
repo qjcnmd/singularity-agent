@@ -78,6 +78,11 @@ use workspace::{
 use workspace::{copy_tree_checked, snapshot_workspace};
 
 const RUNNER_NAME: &str = "agent_loop";
+
+/// 说明 run 级 `status` 与 `evaluation_passed` 的语义差异：`status` 是 trial 级聚合
+/// （任一 trial Failed 即 failed），`evaluation_passed` 是 task 级三维门禁判定
+/// （functional>=4/5、protocol>=4/5、sandbox=5/5）；两者可并存，不矛盾。
+const RUN_STATUS_SEMANTICS: &str = "status is the per-trial aggregate (failed when any trial failed); evaluation_passed is the task-level gate verdict (functional>=4/5, protocol>=4/5, sandbox=5/5)";
 const OUTPUT_ROOT_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const DEFAULT_AGENT_MAX_TURNS: u32 = 24;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 300;
@@ -1333,6 +1338,7 @@ pub fn run_evaluation_with_selection(
         "tasks": task_reports,
         "summary": result.summary,
         "sandbox_preflight": sandbox_preflight_evidence(&preflight),
+        "status_semantics": RUN_STATUS_SEMANTICS,
         "result_path": result_path.to_string_lossy(),
         "report_path": report_path.to_string_lossy(),
         "evidence_path": evidence_path.to_string_lossy(),
@@ -1538,6 +1544,7 @@ fn publish_zero_sampling_blocked_run(
         "tasks": [],
         "summary": result.summary,
         "sandbox_preflight": preflight,
+        "status_semantics": RUN_STATUS_SEMANTICS,
         "result_path": result_path.to_string_lossy(),
         "report_path": report_path.to_string_lossy(),
         "evidence_path": evidence_path.to_string_lossy(),
