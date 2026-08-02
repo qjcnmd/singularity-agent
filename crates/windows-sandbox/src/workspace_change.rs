@@ -318,6 +318,27 @@ fn merge_changes(
     changes: Vec<WorkspacePathChange>,
 ) -> bool {
     for change in changes {
+        if change.kind == WorkspacePathChangeKind::Removed {
+            let path = change.path.as_str();
+            let added = accumulated.contains_key(&(
+                change.path.clone(),
+                change_kind_order(WorkspacePathChangeKind::Added),
+            ));
+            let preexisting_transition = [
+                WorkspacePathChangeKind::Removed,
+                WorkspacePathChangeKind::RenamedOld,
+                WorkspacePathChangeKind::RenamedNew,
+            ]
+            .into_iter()
+            .any(|kind| accumulated.contains_key(&(change.path.clone(), change_kind_order(kind))));
+            if added && !preexisting_transition {
+                let descendant_prefix = format!("{path}/");
+                accumulated.retain(|(observed, _), _| {
+                    observed != path && !observed.starts_with(&descendant_prefix)
+                });
+                continue;
+            }
+        }
         if added_ancestor(accumulated, &change.path) {
             continue;
         }
@@ -477,6 +498,20 @@ mod tests {
     }
 
     #[test]
+    fn monitor_coalesces_a_created_then_removed_temporary_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let monitor = WorkspaceChangeMonitor::start(workspace.path()).expect("start monitor");
+        let temporary = workspace.path().join("temporary.txt");
+        std::fs::write(&temporary, b"temporary").expect("write temporary file");
+        std::fs::remove_file(temporary).expect("remove temporary file");
+
+        assert_eq!(
+            monitor.finish().expect("finish temporary monitor"),
+            WorkspaceChangeObservation::Unchanged
+        );
+    }
+
+    #[test]
     fn monitor_coalesces_a_large_added_subtree_without_losing_the_observation() {
         const FILES: usize = 5_000;
         let workspace = tempfile::tempdir().expect("workspace");
@@ -533,6 +568,48 @@ mod tests {
                 kind: WorkspacePathChangeKind::Added,
             }]
         );
+    }
+
+    #[test]
+    fn added_then_removed_path_returns_to_no_observed_change() {
+        let mut accumulated = BTreeMap::new();
+        assert!(merge_changes(
+            &mut accumulated,
+            vec![WorkspacePathChange {
+                path: "temporary.txt".to_string(),
+                kind: WorkspacePathChangeKind::Added,
+            }],
+        ));
+        assert!(merge_changes(
+            &mut accumulated,
+            vec![WorkspacePathChange {
+                path: "temporary.txt".to_string(),
+                kind: WorkspacePathChangeKind::Removed,
+            }],
+        ));
+
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn removed_then_added_path_remains_observed_as_a_replacement() {
+        let mut accumulated = BTreeMap::new();
+        assert!(merge_changes(
+            &mut accumulated,
+            vec![WorkspacePathChange {
+                path: "existing.txt".to_string(),
+                kind: WorkspacePathChangeKind::Removed,
+            }],
+        ));
+        assert!(merge_changes(
+            &mut accumulated,
+            vec![WorkspacePathChange {
+                path: "existing.txt".to_string(),
+                kind: WorkspacePathChangeKind::Added,
+            }],
+        ));
+
+        assert_eq!(accumulated.len(), 2);
     }
 
     #[test]
