@@ -422,35 +422,6 @@ impl OpenAiProvider {
                 ));
             }
         }
-        if matches!(
-            selection.tool_reasoning_mode,
-            ProviderToolReasoningMode::ReplayReasoningContent
-                | ProviderToolReasoningMode::ReplayResponsesItems
-        ) {
-            for message in request.messages.iter().filter(|message| {
-                message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
-            }) {
-                let ids = message
-                    .tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-                    .collect::<Vec<_>>();
-                if !request
-                    .provider_reasoning_history
-                    .iter()
-                    .any(|replay| replay.matches_tool_call_ids(&ids))
-                {
-                    return Err(provider_tool_reasoning_history_error(
-                        &ModelTurnResponse::completed(
-                            request.request_id.clone(),
-                            "provider_reasoning_history",
-                            "",
-                        ),
-                        selection.tool_reasoning_mode,
-                    ));
-                }
-            }
-        }
         if selection.requires_reasoning_content_for_tool_calls {
             for message in request.messages.iter().filter(|message| {
                 message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
@@ -1140,16 +1111,16 @@ fn validate_response_tool_reasoning_contract(
     let disabled_mode_not_honored = capabilities.tool_reasoning_mode
         == ProviderToolReasoningMode::DisabledForToolCalls
         && completion.reasoning_content_present;
+    let reasoning_content_present = completion.reasoning_content_present;
+    let missing_replay_for_present_reasoning = response_has_tool_calls
+        && reasoning_content_present
+        && completion.response.provider_reasoning_history.is_empty();
     let missing_required_reasoning = requires_reasoning_content_for_tool_calls
         && response_has_tool_calls
-        && completion.response.provider_reasoning_history.is_empty();
-    let missing_configured_replay = matches!(
-        capabilities.tool_reasoning_mode,
-        ProviderToolReasoningMode::ReplayReasoningContent
-            | ProviderToolReasoningMode::ReplayResponsesItems
-    ) && response_has_tool_calls
-        && completion.response.provider_reasoning_history.is_empty();
-    if (disabled_mode_not_honored || missing_required_reasoning || missing_configured_replay)
+        && !reasoning_content_present;
+    if (disabled_mode_not_honored
+        || missing_required_reasoning
+        || missing_replay_for_present_reasoning)
         && (completion.response.provider_reasoning_history.is_empty()
             || completion
                 .response

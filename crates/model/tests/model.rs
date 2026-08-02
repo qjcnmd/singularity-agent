@@ -6698,6 +6698,254 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
     assert_eq!(payload["thinking"]["type"], "enabled");
 }
 
+/// 矩阵项 3b：Chat non-stream，ReplayReasoningContent 模式（未声明
+/// `requires_reasoning_content_for_tool_calls`，即 flag=false），响应含 tool call
+/// 但无 `reasoning_content` → 成功（thinking 模式不保证每轮输出 reasoning，
+/// 无 reasoning 即无可回放内容；真实 deepseek-v4-flash#high 续接轮已观察到）。
+#[test]
+fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{
+            "id": "chat_tool_call_no_reasoning",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Chat tool call without reasoning must succeed when not required");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert!(response.provider_reasoning_history.is_empty());
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Chat request"),
+    )
+    .expect("Chat payload JSON");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+}
+
+/// 矩阵项 3c：Chat 请求侧，flag=false 时 Replay 模式不再要求每个 tool-call
+/// 消息都有匹配 replay——历史里只有另一组 tool_call_ids 的 replay 时请求仍合法
+/// （无 reasoning 的上一轮没有可回放内容）。
+#[test]
+fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_succeeds() {
+    let (base_url, _request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{
+            "id": "chat_final_answer",
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let mut request = ModelTurnRequest::new(
+        "reasoning_chat_request",
+        vec![
+            ModelMessage::text(ModelRole::Developer, "instruction"),
+            ModelMessage::assistant_tool_calls(vec![tool_call("call_2", "read")]),
+        ],
+    );
+    request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "reasoning_test".to_string(),
+        model_name: "chat".to_string(),
+        reasoning_effort: "high".to_string(),
+        tool_call_ids: vec!["call_1".to_string()],
+        reasoning_content: "opaque-deepseek-state".to_string(),
+    }];
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("request without matching replay must succeed when not required");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+}
+
+/// 矩阵项 3d：Chat 请求侧，flag=true（严格声明）时每个 tool-call 消息仍必须
+/// 有绑定 reasoning 的 replay；历史里只有另一组 ids 的 replay 时 fail-closed。
+#[test]
+fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fails_closed_strict()
+{
+    let (base_url, _request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{
+            "id": "chat_final_answer",
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let mut request = ModelTurnRequest::new(
+        "reasoning_chat_request",
+        vec![
+            ModelMessage::text(ModelRole::Developer, "instruction"),
+            ModelMessage::assistant_tool_calls(vec![tool_call("call_2", "read")]),
+        ],
+    );
+    request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "reasoning_test".to_string(),
+        model_name: "chat".to_string(),
+        reasoning_effort: "high".to_string(),
+        tool_call_ids: vec!["call_1".to_string()],
+        reasoning_content: "opaque-deepseek-state".to_string(),
+    }];
+    let error = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("strict request without bound reasoning must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_history_unsupported")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
+    );
+}
+
 /// 矩阵项 4：Responses non-stream，ReplayResponsesItems 模式，响应含 reasoning
 /// item + 最终 message、无 function call → 成功且无孤立 replay
 /// （`provider_reasoning_history` 为空）。
