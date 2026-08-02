@@ -592,36 +592,14 @@ impl OpenAiProvider {
             None,
             on_attempt,
         )?;
-        let missing_required_reasoning = self
-            .selected_model
-            .as_ref()
-            .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls)
-            && !completion.response.tool_calls.is_empty()
-            && completion.response.provider_reasoning_history.is_empty();
-        let missing_configured_replay = matches!(
-            capabilities.tool_reasoning_mode,
-            ProviderToolReasoningMode::ReplayReasoningContent
-                | ProviderToolReasoningMode::ReplayResponsesItems
-        ) && !completion.response.tool_calls.is_empty()
-            && completion.response.provider_reasoning_history.is_empty();
-        if request_uses_tool_protocol(request)
-            && (completion.reasoning_content_present
-                || missing_required_reasoning
-                || missing_configured_replay)
-        {
-            if completion.response.provider_reasoning_history.is_empty()
-                || completion
-                    .response
-                    .provider_reasoning_history
-                    .iter()
-                    .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode)
-            {
-                return Err(provider_tool_reasoning_history_error(
-                    &completion.response,
-                    capabilities.tool_reasoning_mode,
-                ));
-            }
-        }
+        validate_response_tool_reasoning_contract(
+            request_uses_tool_protocol(request),
+            &completion,
+            capabilities,
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
+        )?;
         Ok(completion.response)
     }
 
@@ -1142,6 +1120,51 @@ impl OpenAiProvider {
     }
 }
 
+/// Enforce the negotiated tool-reasoning contract on a completed response.
+///
+/// A response is rejected only when the contract is actually violated: the
+/// provider returned reasoning content despite `DisabledForToolCalls`, or the
+/// response carries tool calls without a mode-matching reasoning replay. A
+/// reasoning-only final answer without tool calls is legal and does not
+/// require a replay.
+fn validate_response_tool_reasoning_contract(
+    request_used_tool_protocol: bool,
+    completion: &OpenAiCompletion,
+    capabilities: &ProviderProtocolContract,
+    requires_reasoning_content_for_tool_calls: bool,
+) -> Result<(), ProviderError> {
+    if !request_used_tool_protocol {
+        return Ok(());
+    }
+    let response_has_tool_calls = !completion.response.tool_calls.is_empty();
+    let disabled_mode_not_honored = capabilities.tool_reasoning_mode
+        == ProviderToolReasoningMode::DisabledForToolCalls
+        && completion.reasoning_content_present;
+    let missing_required_reasoning = requires_reasoning_content_for_tool_calls
+        && response_has_tool_calls
+        && completion.response.provider_reasoning_history.is_empty();
+    let missing_configured_replay = matches!(
+        capabilities.tool_reasoning_mode,
+        ProviderToolReasoningMode::ReplayReasoningContent
+            | ProviderToolReasoningMode::ReplayResponsesItems
+    ) && response_has_tool_calls
+        && completion.response.provider_reasoning_history.is_empty();
+    if (disabled_mode_not_honored || missing_required_reasoning || missing_configured_replay)
+        && (completion.response.provider_reasoning_history.is_empty()
+            || completion
+                .response
+                .provider_reasoning_history
+                .iter()
+                .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode))
+    {
+        return Err(provider_tool_reasoning_history_error(
+            &completion.response,
+            capabilities.tool_reasoning_mode,
+        ));
+    }
+    Ok(())
+}
+
 impl Provider for OpenAiProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         self.config.protocol_contract()
@@ -1244,41 +1267,15 @@ impl Provider for OpenAiProvider {
                 on_attempt,
             )
             .and_then(|completion| {
-                let missing_required_reasoning =
+                validate_response_tool_reasoning_contract(
+                    request_uses_tool_protocol(&request),
+                    &completion,
+                    &context.capabilities,
                     self.selected_model.as_ref().is_some_and(|selection| {
                         selection.requires_reasoning_content_for_tool_calls
-                    }) && !completion.response.tool_calls.is_empty()
-                        && completion.response.provider_reasoning_history.is_empty();
-                let missing_configured_replay = matches!(
-                    context.capabilities.tool_reasoning_mode,
-                    ProviderToolReasoningMode::ReplayReasoningContent
-                        | ProviderToolReasoningMode::ReplayResponsesItems
-                ) && !completion.response.tool_calls.is_empty()
-                    && completion.response.provider_reasoning_history.is_empty();
-                if request_uses_tool_protocol(&request)
-                    && (completion.reasoning_content_present
-                        || missing_required_reasoning
-                        || missing_configured_replay)
-                {
-                    if completion.response.provider_reasoning_history.is_empty()
-                        || completion
-                            .response
-                            .provider_reasoning_history
-                            .iter()
-                            .any(|replay| {
-                                replay.mode_internal() != context.capabilities.tool_reasoning_mode
-                            })
-                    {
-                        Err(provider_tool_reasoning_history_error(
-                            &completion.response,
-                            context.capabilities.tool_reasoning_mode,
-                        ))
-                    } else {
-                        Ok(completion.response)
-                    }
-                } else {
-                    Ok(completion.response)
-                }
+                    }),
+                )
+                .map(|()| completion.response)
             })
             .map(|mut response| {
                 response.provider_capability_metadata = context.capability_metadata.clone();

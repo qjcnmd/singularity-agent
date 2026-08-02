@@ -797,33 +797,50 @@ fn parallel_persistent_probe_server(
     (format!("http://{addr}"), rx)
 }
 
-fn cached_capability_rejection_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind invalidation provider");
+/// 供 `openai_cached_capability_rejection_invalidates_persistent_record` 使用：
+/// probe（非 continuation）返回带 reasoning_content 的 probe 响应，协商出
+/// ReplayReasoningContent 模式；continuation 用通用 probe 响应；actual 响应为
+/// 带 tool call 但无 reasoning_content 的真实回放义务违规。共 5 个请求
+/// （first 协商 2 + actual 1 + 失效后 second 重新协商 2）。
+fn cached_reasoning_rejection_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reasoning invalidation provider");
     let addr = listener
         .local_addr()
-        .expect("invalidation provider address");
+        .expect("reasoning invalidation provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut requests = Vec::new();
         for _ in 0..5 {
-            let (mut stream, _) = listener.accept().expect("accept invalidation request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone invalidation stream"));
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept reasoning invalidation request");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone reasoning invalidation stream"),
+            );
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
             if let Some(response) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+                let body = if is_capability_probe_continuation_request(&request_body) {
+                    response
+                } else {
+                    PROBE_STRICT_PARALLEL_REASONING_RESPONSE.to_string()
+                };
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, true);
             } else {
                 write_provider_response(
                     &mut stream,
                     "HTTP/1.1 200 OK",
-                    ACTUAL_TOOL_REASONING_RESPONSE,
+                    ACTUAL_TOOL_CALL_RESPONSE,
                     true,
                 );
             }
             requests.push(request_body);
         }
-        tx.send(requests).expect("send invalidation requests");
+        tx.send(requests)
+            .expect("send reasoning invalidation requests");
     });
     (format!("http://{addr}"), rx)
 }
@@ -1058,6 +1075,24 @@ const ACTUAL_TOOL_REASONING_RESPONSE: &str = r#"{
             "role": "assistant",
             "content": "",
             "reasoning_content": "private reasoning that requires replay",
+            "tool_calls": [{
+                "id": "actual_tool_call",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            }]
+        },
+        "finish_reason": "tool_calls"
+    }]
+}"#;
+
+/// Chat 实际响应：带 tool call 但没有 reasoning_content——在 ReplayReasoningContent
+/// 模式下这是真实的回放义务违规（有 tool call 必须回放 reasoning_content）。
+const ACTUAL_TOOL_CALL_RESPONSE: &str = r#"{
+    "id": "actual_tool_call_response",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
             "tool_calls": [{
                 "id": "actual_tool_call",
                 "type": "function",
@@ -4129,14 +4164,65 @@ fn openai_cancelled_capability_probe_does_not_publish_cache() {
     );
 }
 
+/// 稳定 capability rejection 会失效持久缓存记录。
+///
+/// 行为合法变化说明：本修复前，Unspecified 模式下响应只要含 reasoning content
+/// 就会被拒绝；本修复后该场景合法——replay 义务只由已协商的回放模式
+/// （ReplayReasoningContent / ReplayResponsesItems）与响应实际包含的 tool call
+/// 触发。因此 fixture 改为：probe 返回带 reasoning_content 的响应，协商出
+/// ReplayReasoningContent；actual 响应为带 tool call 但缺失 reasoning_content
+/// 的真实合同违规，触发同一稳定错误
+/// `provider_tool_reasoning_history_unsupported` /
+/// `tool_reasoning_content_requires_adapter_history_support`；测试目的（稳定拒绝
+/// → 持久缓存记录失效）与全部断言不变。
 #[test]
 fn openai_cached_capability_rejection_invalidates_persistent_record() {
     let directory = tempdir().expect("persistent cache directory");
     let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = cached_capability_rejection_server();
-    let config = provider_test_config(base_url);
-    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
-        .expect("first provider");
+    let (base_url, requests) = cached_reasoning_rejection_server();
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let config_path = config_path.to_string_lossy().to_string();
+    let first = ProviderConfigSnapshot::capture_with_cache_path(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(config_path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        Some(cache_path.clone()),
+    )
+    .provider_for_selector(Some("reasoning_test/chat#high"))
+    .expect("selected Chat provider");
     Provider::negotiate_tool_capabilities(
         &first,
         &ModelPreferences::default(),
@@ -4174,8 +4260,16 @@ fn openai_cached_capability_rejection_invalidates_persistent_record() {
     assert_eq!(invalidated["records"].as_array().map(Vec::len), Some(0));
     drop(first);
 
-    let second =
-        OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("recreated provider");
+    let second = ProviderConfigSnapshot::capture_with_cache_path(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(config_path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        Some(cache_path),
+    )
+    .provider_for_selector(Some("reasoning_test/chat#high"))
+    .expect("recreated provider");
     let negotiation = Provider::negotiate_tool_capabilities(
         &second,
         &ModelPreferences::default(),
@@ -6271,4 +6365,933 @@ fn schema_title<T: schemars::JsonSchema>() -> String {
         .expect("schema metadata")
         .title
         .expect("schema title")
+}
+
+/// Chat 最终响应：含 reasoning_content 但没有 tool call（reasoning-only）。
+const CHAT_REASONING_ONLY_RESPONSE: &str = r#"{
+    "id": "chat_reasoning_only",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "reasoned answer",
+            "reasoning_content": "private reasoning without tool call"
+        },
+        "finish_reason": "stop"
+    }]
+}"#;
+
+/// Responses 能力探测 + SSE 实际响应共用的 fake server：探测请求用
+/// `responses_capability_probe_response` 应答，实际请求以 text/event-stream
+/// 流式返回 chunks（模式来源：`responses_provider_server` + `responses_stream_server`）。
+fn responses_stream_probe_server(chunks: Vec<Vec<u8>>) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Responses stream probe provider");
+    let addr = listener
+        .local_addr()
+        .expect("Responses stream probe provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept Responses stream probe request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/responses"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if let Some(body) = responses_capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+                continue;
+            }
+            tx.send(request_body)
+                .expect("send Responses stream probe request");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+            )
+            .expect("write Responses stream probe headers");
+            stream
+                .flush()
+                .expect("flush Responses stream probe headers");
+            for chunk in chunks {
+                stream
+                    .write_all(&chunk)
+                    .expect("write Responses stream probe chunk");
+                stream.flush().expect("flush Responses stream probe chunk");
+                thread::sleep(Duration::from_millis(1));
+            }
+            break;
+        }
+    });
+    (format!("http://{addr}/v1/responses"), rx)
+}
+
+/// 矩阵项 1：Chat non-stream，请求带 tool schema 且模式为 ReplayReasoningContent；
+/// 响应仅含 reasoning_content 而无 tool call → 成功，assistant content 保留，
+/// `provider_reasoning_history` 为空（不产生 replay 义务）。
+#[test]
+fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_replay() {
+    let (base_url, request_body) =
+        captured_request_server("HTTP/1.1 200 OK", CHAT_REASONING_ONLY_RESPONSE);
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("reasoning-only Chat response must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("reasoned answer")
+    );
+    assert!(response.tool_calls.is_empty());
+    assert!(
+        response.provider_reasoning_history.is_empty(),
+        "reasoning-only final answer must not create a replay obligation"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Chat request"),
+    )
+    .expect("Chat payload JSON");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+    assert_eq!(payload["reasoning_effort"], "high");
+}
+
+/// 矩阵项 2：Chat non-stream，ReplayReasoningContent 模式，响应含
+/// reasoning_content + tool call，且 parse 生成合法 Chat replay → 成功。
+#[test]
+fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{
+            "id": "chat_reasoning_tool_call",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "opaque chain of thought",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Chat tool call with replay must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(
+        response.tool_calls[0].parse_status,
+        ModelToolParseStatus::Valid
+    );
+    assert_eq!(response.provider_reasoning_history.len(), 1);
+    match &response.provider_reasoning_history[0] {
+        ProviderReasoningReplay::Chat {
+            tool_call_ids,
+            reasoning_content,
+            ..
+        } => {
+            assert_eq!(tool_call_ids, &vec!["call_1".to_string()]);
+            assert_eq!(reasoning_content, "opaque chain of thought");
+        }
+        other => panic!("expected Chat replay, got {other:?}"),
+    }
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Chat request"),
+    )
+    .expect("Chat payload JSON");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+    assert_eq!(payload["reasoning_effort"], "high");
+}
+
+/// 矩阵项 3：Chat non-stream，ReplayReasoningContent 模式，响应含真实 tool call
+/// 但没有 reasoning_content → parse 不产生 replay → typed fail closed
+/// （`provider_tool_reasoning_history_unsupported` /
+/// `tool_reasoning_content_requires_adapter_history_support`）。
+#[test]
+fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{
+            "id": "chat_tool_call_no_reasoning",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/chat#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "chat": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "reasoning_content",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "requires_assistant_content_for_tool_calls": true
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/chat#high"))
+        .expect("selected Chat provider");
+    let error = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("Chat tool call without replay must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_history_unsupported")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Chat request"),
+    )
+    .expect("Chat payload JSON");
+    assert_eq!(payload["thinking"]["type"], "enabled");
+}
+
+/// 矩阵项 4：Responses non-stream，ReplayResponsesItems 模式，响应含 reasoning
+/// item + 最终 message、无 function call → 成功且无孤立 replay
+/// （`provider_reasoning_history` 为空）。
+#[test]
+fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
+        "id": "response_reasoning_only",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        ]
+    }));
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("reasoning-only Responses response must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("done")
+    );
+    assert!(response.tool_calls.is_empty());
+    assert!(
+        response.provider_reasoning_history.is_empty(),
+        "reasoning-only final answer must not create an orphan replay"
+    );
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Responses requests");
+    let payload: serde_json::Value =
+        serde_json::from_str(&captured.last().expect("actual Responses request").1)
+            .expect("Responses payload JSON");
+    assert_eq!(payload["reasoning"]["effort"], "high");
+}
+
+/// 矩阵项 5：Responses stream，同一 reasoning-only、无 function call 响应 → 成功。
+#[test]
+fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response_stream_reasoning_only",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]
+        }
+    });
+    let body = format!("event: response.completed\r\ndata: {completed}\r\n\r\n");
+    let chunks = body
+        .as_bytes()
+        .chunks(3)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .expect("reasoning-only Responses stream must be accepted");
+    assert!(events.is_empty());
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("done")
+    );
+    assert!(response.tool_calls.is_empty());
+    assert!(
+        response.provider_reasoning_history.is_empty(),
+        "reasoning-only stream must not create an orphan replay"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        &requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Responses stream request"),
+    )
+    .expect("Responses stream payload JSON");
+    assert_eq!(payload["stream"], true);
+}
+
+/// 矩阵项 6（non-stream）：Responses，ReplayResponsesItems 模式，有 function call
+/// 且带合法 replay（reasoning item 随附）→ 成功且 replay 被保留。
+#[test]
+fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
+        "id": "response_reasoning_tool_call",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        ]
+    }));
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Responses function call with replay must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(
+        response.tool_calls[0].parse_status,
+        ModelToolParseStatus::Valid
+    );
+    assert_eq!(response.provider_reasoning_history.len(), 1);
+    match &response.provider_reasoning_history[0] {
+        ProviderReasoningReplay::Responses {
+            tool_call_ids,
+            items,
+            ..
+        } => {
+            assert_eq!(tool_call_ids, &vec!["call_1".to_string()]);
+            assert!(items.iter().any(|item| item["type"] == "reasoning"));
+            assert!(items.iter().any(|item| item["type"] == "function_call"));
+        }
+        other => panic!("expected Responses replay, got {other:?}"),
+    }
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Responses requests");
+    let payload: serde_json::Value =
+        serde_json::from_str(&captured.last().expect("actual Responses request").1)
+            .expect("Responses payload JSON");
+    assert_eq!(payload["reasoning"]["effort"], "high");
+}
+
+/// 矩阵项 6（non-stream）：Responses，有 function call 但缺少 reasoning item →
+/// parse 校验拒绝（`responses_reasoning_replay_invalid`）→ 失败关闭。
+#[test]
+fn reasoning_replay_obligation_responses_tool_call_without_replay_fails_closed() {
+    let (base_url, _) = responses_provider_server(serde_json::json!({
+        "id": "response_tool_call_no_reasoning",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        ]
+    }));
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let error = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("Responses function call without reasoning must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"responses_reasoning_replay_invalid".to_string())
+    );
+}
+
+/// 矩阵项 6（stream）：Responses stream，有 function call 且带合法 replay → 成功。
+#[test]
+fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds() {
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response_stream_reasoning_tool_call",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]
+        }
+    });
+    let body = format!("event: response.completed\r\ndata: {completed}\r\n\r\n");
+    let chunks = body
+        .as_bytes()
+        .chunks(3)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .expect("Responses stream function call with replay must be accepted");
+    assert!(events.is_empty());
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.provider_reasoning_history.len(), 1);
+    match &response.provider_reasoning_history[0] {
+        ProviderReasoningReplay::Responses {
+            tool_call_ids,
+            items,
+            ..
+        } => {
+            assert_eq!(tool_call_ids, &vec!["call_1".to_string()]);
+            assert!(items.iter().any(|item| item["type"] == "reasoning"));
+        }
+        other => panic!("expected Responses replay, got {other:?}"),
+    }
+    let payload: serde_json::Value = serde_json::from_str(
+        &requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Responses stream request"),
+    )
+    .expect("Responses stream payload JSON");
+    assert_eq!(payload["stream"], true);
+}
+
+/// 矩阵项 6（stream）：Responses stream，有 function call 但缺少 reasoning item →
+/// 失败关闭（`responses_reasoning_replay_invalid`）。
+#[test]
+fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_fails_closed() {
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response_stream_tool_call_no_reasoning",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]
+        }
+    });
+    let body = format!("event: response.completed\r\ndata: {completed}\r\n\r\n");
+    let chunks = body
+        .as_bytes()
+        .chunks(3)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "reasoning_test/responses#high",
+            "providers": {
+                "reasoning_test": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "REASONING_TEST_KEY",
+                    "models": {
+                        "responses": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "reasoning_variants": {
+                                "high": {"enabled": true, "wire_effort": "high"}
+                            },
+                            "default_variant": "high",
+                            "tool_reasoning_history": "responses_items"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        ENV_MODELS_CONFIG => Some(path.clone()),
+        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let provider = snapshot
+        .provider_for_selector(Some("reasoning_test/responses#high"))
+        .expect("selected Responses provider");
+    let error = provider
+        .complete_stream(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
+        .expect_err("Responses stream function call without reasoning must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"responses_reasoning_replay_invalid".to_string())
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        &requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Responses stream request"),
+    )
+    .expect("Responses stream payload JSON");
+    assert_eq!(payload["stream"], true);
+}
+
+/// 矩阵项 7：DisabledForToolCalls。`openai_chat_tool_history_finalization_rejects_reasoning_content`
+/// 已精确覆盖 Chat 无当前 tool call 时返回 reasoning content 的失败关闭（请求无 tools）；
+/// 本测试补充“请求含 tools 但响应仅 reasoning-only 无 tool call”的变体，覆盖新谓词
+/// `disabled_mode_not_honored` 不依赖响应是否有 tool call 的路径。
+#[test]
+fn reasoning_replay_obligation_disabled_mode_rejects_reasoning_only_tool_request() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 200 OK",
+        PROBE_STRICT_PARALLEL_RESPONSE,
+        CHAT_REASONING_ONLY_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+
+    let error = provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("disabled mode with reasoning content must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_mode_not_honored")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_disable_not_honored".to_string())
+    );
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured disabled-mode reasoning requests");
+    assert_eq!(captured.len(), 4);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(captured.last().expect("actual request JSON"))
+            .expect("actual request JSON")["thinking"]["type"],
+        "disabled"
+    );
 }
