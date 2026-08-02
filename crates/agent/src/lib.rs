@@ -1027,41 +1027,9 @@ impl AgentLoopState {
         }
     }
 
-    fn allows_final(&self) -> bool {
-        self.completion.allows_final() && self.repair_state.is_none()
-    }
-
     fn completion_ready(&self) -> bool {
         // The runtime completion gate is the sole authority for a terminal response.
-        self.completion.summary().passed && self.repair_state.is_none()
-    }
-
-    fn completion_rejection_reason(&self) -> String {
-        let mut reasons = Vec::new();
-        if !self.completion.allows_final() {
-            reasons.push(self.completion.rejection_reason());
-        }
-        if self.repair_state.is_some() && reasons.is_empty() {
-            reasons.push(
-                "completion gate rejected final answer: repair state remains active".to_string(),
-            );
-        }
-        reasons.join("; ")
-    }
-
-    fn completion_feedback(&self) -> String {
-        let mut feedback = Vec::new();
-        if !self.completion.allows_final() {
-            feedback.push(self.completion.feedback());
-        }
-        if self.repair_state.is_some() {
-            feedback.push(self.repair_feedback());
-        }
-        feedback.join(" ")
-    }
-
-    fn repair_feedback(&self) -> String {
-        self.repair_feedback_with_failure(None)
+        self.completion.allows_final()
     }
 
     fn repair_feedback_with_failure(&self, failure: Option<&ToolResult>) -> String {
@@ -1368,10 +1336,9 @@ impl AgentLoopState {
                 }
             });
             if tool_failure_resolved {
-                // Input, policy and execution failures require a successful call to the same
-                // tool. Other unresolved failure groups remain in CompletionTracker and cannot
-                // be erased by closing this concrete decision. A visibility failure names no
-                // executable tool, so a successful visible replacement resolves it.
+                // Mutation and verification failures require the same tool to succeed. A
+                // read-only or visibility failure may be superseded by any successful action
+                // because its typed result remains in the model-visible transcript.
                 self.repair_state = None;
             }
             self.last_repair_failure = None;
@@ -1415,9 +1382,8 @@ impl AgentLoopState {
             .map(|failure| failure.signature.clone())
             .unwrap_or_default();
         let repair_reason = AgentRepairReason::ToolFailure;
-        let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure
-            && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
-        .then_some(tool_result.tool_name.as_str());
+        let failed_tool_name = matches!(tool_result.tool_name.as_str(), TOOL_PATCH | TOOL_COMMAND)
+            .then_some(tool_result.tool_name.as_str());
         if let Err(exhausted) =
             self.schedule_repair(repair_reason, repair_signature, failed_tool_name)
         {
@@ -1427,9 +1393,7 @@ impl AgentLoopState {
                 max_attempts: exhausted.max_attempts,
                 required_revision: exhausted.required_revision,
                 signature: String::new(),
-                failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure
-                    && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
-                .then(|| tool_result.tool_name.clone()),
+                failed_tool_name: failed_tool_name.map(str::to_string),
             });
             return Some("repair budget exhausted; refusing another repair attempt".to_string());
         }
@@ -2531,9 +2495,8 @@ where
                         Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
                     );
                 }
-                if state.allows_final() {
+                if state.completion_ready() {
                     if !finalization_only
-                        && state.completion_ready()
                         && emit_verification_occurrence(
                             &mut on_event,
                             input,
@@ -2566,6 +2529,9 @@ where
                             );
                         }
                     }
+                    state.repair_state = None;
+                    state.last_repair_failure = None;
+                    state.last_completion_error = None;
                     state.messages.push(ModelMessage::text(
                         ModelRole::Assistant,
                         final_answer.clone(),
@@ -2660,7 +2626,7 @@ where
                         );
                     }
                 }
-                state.last_completion_error = Some(state.completion_rejection_reason());
+                state.last_completion_error = Some(state.completion.rejection_reason());
                 state.messages.push(
                     response
                         .assistant_message
@@ -2668,7 +2634,7 @@ where
                 );
                 state.messages.push(ModelMessage::text(
                     ModelRole::Developer,
-                    state.completion_feedback(),
+                    state.completion.feedback(),
                 ));
                 continue;
             }

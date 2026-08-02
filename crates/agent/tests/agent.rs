@@ -6283,6 +6283,141 @@ fn ready_runtime_allows_plain_terminal_response_without_semantic_review() {
 }
 
 #[test]
+fn read_only_failure_does_not_require_repeating_the_same_tool_after_verification() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let file_path = dir.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+
+    let mut patch_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "patch_response", "");
+    patch_response.tool_calls.push(tool_call(
+        "patch_1",
+        "patch",
+        serde_json::json!({
+            "changes": [{
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            }]
+        }),
+    ));
+    let mut grep_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "grep_response", "");
+    grep_response.tool_calls.push(tool_call(
+        "grep_1",
+        "grep",
+        serde_json::json!({
+            "path": "missing.txt",
+            "pattern": "needle",
+            "max_matches": 20,
+            "case_sensitive": true
+        }),
+    ));
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "command_response", "");
+    command_response.tool_calls.push(tool_call(
+        "command_1",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![
+            patch_response,
+            grep_response,
+            command_response,
+            ModelTurnResponse::completed("model_request_turn_1_3", "terminal", "done"),
+        ],
+        allow_read_execute_policy().with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        ),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "patch and verify").with_max_turns(6));
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.tool_results[1].tool_call_id, "grep_1");
+    assert_eq!(
+        result.tool_results[1].error_code.as_deref(),
+        Some("tool_read_failed")
+    );
+    assert!(result.verification.unresolved_failures.is_empty());
+    assert_eq!(result.verification.satisfied_command_count, 1);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "after"
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("grep_1")
+    }));
+}
+
+#[test]
+fn read_only_failure_remains_typed_evidence_without_becoming_a_completion_gate() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut grep_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "grep_response", "");
+    grep_response.tool_calls.push(tool_call(
+        "grep_1",
+        "grep",
+        serde_json::json!({
+            "path": "missing.txt",
+            "pattern": "needle",
+            "max_matches": 20,
+            "case_sensitive": true
+        }),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![
+            grep_response,
+            ModelTurnResponse::completed("model_request_turn_1_1", "terminal", "not found"),
+        ],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect missing file").with_max_turns(2));
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("not found"));
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.tool_results[0].tool_call_id, "grep_1");
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_read_failed")
+    );
+    assert!(result.verification.unresolved_failures.is_empty());
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("grep_1")
+    }));
+}
+
+#[test]
 fn dynamic_verification_fails_closed_when_command_omits_trusted_change_summary() {
     let workspace = tempfile::tempdir().expect("workspace");
     let file_path = workspace.path().join("README.md");

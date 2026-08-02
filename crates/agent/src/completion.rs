@@ -263,11 +263,13 @@ impl CompletionTracker {
 
     fn observe_with_window(&mut self, tool_result: &ToolResult, terminal_window: Option<usize>) {
         let failure_group = match tool_result.failure_kind.as_ref() {
-            Some(ToolFailureKind::Visibility) => TOOL_SELECTION_FAILURE_GROUP,
+            Some(ToolFailureKind::Visibility) => Some(TOOL_SELECTION_FAILURE_GROUP),
             _ => match tool_result.tool_name.as_str() {
-                TOOL_PATCH => "workspace_mutation",
-                TOOL_COMMAND => "verification",
-                tool_name => tool_name,
+                TOOL_PATCH => Some("workspace_mutation"),
+                TOOL_COMMAND => Some("verification"),
+                // Read-only failures remain in the model-visible transcript. They do not define
+                // completion state because the model may obtain equivalent evidence another way.
+                _ => None,
             },
         };
 
@@ -287,7 +289,7 @@ impl CompletionTracker {
         }
         if tool_result.ok {
             self.unresolved_failures.retain(|failure| {
-                !failure.starts_with(failure_group)
+                failure_group.is_none_or(|group| !failure.starts_with(group))
                     && !failure.starts_with(TOOL_SELECTION_FAILURE_PREFIX)
             });
             if tool_result.tool_name == TOOL_PATCH {
@@ -308,7 +310,9 @@ impl CompletionTracker {
                     self.mark_workspace_revision_invalid("verification_observation_missing");
                 }
             }
-        } else if is_repairable_tool_result(tool_result) {
+        } else if is_repairable_tool_result(tool_result)
+            && let Some(failure_group) = failure_group
+        {
             let error_code = tool_result
                 .error_code
                 .as_deref()
