@@ -1233,7 +1233,6 @@ pub enum TraceRepairReason {
     VerificationFailed,
     ToolFailure,
     RevisionConflict,
-    FinalReviewRejected,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1267,7 +1266,8 @@ pub struct TraceVerificationProjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-/// final review 的稳定终态。
+/// Legacy persisted final-review span status. The current AgentLoop emits no producer for this
+/// read-only compatibility shape.
 pub enum TraceFinalReviewStatus {
     Succeeded,
     Failed,
@@ -1276,7 +1276,7 @@ pub enum TraceFinalReviewStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-/// final review 的安全投影。
+/// Legacy persisted final-review projection retained only for decoding historical trace rows.
 pub struct TraceFinalReviewProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TraceFinalReviewStatus>,
@@ -1686,6 +1686,7 @@ pub enum TraceMetricName {
     ApprovalWaitDurationMs,
     SandboxExecutionDurationMs,
     VerificationDurationMs,
+    /// Legacy metric retained for reading historical trace rows; no current producer emits it.
     FinalReviewDurationMs,
     CompletionRejectionCount,
     CompletionRepairCount,
@@ -1913,6 +1914,7 @@ pub enum TraceSpanKind {
     ApprovalWait,
     SandboxExecution,
     Verification,
+    /// Legacy persisted span kind; current runtime has no producer.
     FinalReview,
 }
 

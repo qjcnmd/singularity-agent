@@ -181,8 +181,6 @@ pub(super) struct CheckpointState {
     pub(super) repair_attempts: u32,
     #[serde(default)]
     pub(super) repair_cycles: Vec<super::RepairCycleRecord>,
-    #[serde(default)]
-    pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
     pub(super) recovery_metrics: AgentRecoveryMetrics,
     pub(super) model_usage: ModelUsage,
@@ -516,13 +514,6 @@ impl CheckpointState {
         if self.repair_state.is_none() && self.completion.has_unresolved_failures() {
             return Err(
                 "approval checkpoint repair state is missing for unresolved failure".to_string(),
-            );
-        }
-        if self.final_review_verdict == Some(super::FinalReviewVerdict::Accept)
-            && !self.completion.allows_final()
-        {
-            return Err(
-                "approval checkpoint accepted review lacks completion evidence".to_string(),
             );
         }
         for occurrence in &self.tool_result_occurrences {

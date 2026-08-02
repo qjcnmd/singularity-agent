@@ -23,7 +23,7 @@ pub type AgentLoopEventCallback<'a> =
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentLoopEvent {
-    /// 只在 tool-free finalization 请求期间投影的 assistant 文本增量。
+    /// 完整 provider 响应校验通过后投影的 assistant 最终文本增量。
     FinalTextDelta { delta: String },
     /// 不含用户或 provider 原文的安全运行时 observation。
     Observation(AgentObservation),
@@ -39,7 +39,6 @@ pub enum AgentObservation {
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
     Verification(VerificationObservation),
-    FinalReview(FinalReviewObservation),
 }
 
 /// 一个 occurrence 在当前 turn 内的稳定身份与父子关联。
@@ -239,26 +238,6 @@ pub struct ProviderAttemptUsageObservation {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
-}
-
-/// tool-free finalization-only model request 的终态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FinalReviewStatus {
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-/// 只围绕 `finalization_ready()` 后请求产生的 FinalReview occurrence。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct FinalReviewObservation {
-    pub identity: OccurrenceIdentity,
-    pub lifecycle: OccurrenceLifecycle<FinalReviewStatus>,
-    pub model_turn_ordinal: u32,
-    /// Set only on the terminal lifecycle event; `None` on the start event.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verdict: Option<crate::FinalReviewVerdict>,
 }
 
 /// 单个 occurrence 的真实单调计时器；wall-clock 字段只用于跨层 trace 关联。

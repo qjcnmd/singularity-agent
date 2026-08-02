@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::{AgentRecoveryMetrics, AgentRunStatus, PendingToolCall};
 use singularity_model::{
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
-    ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    Provider, ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheLookupResult,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheLookupResult,
     ProviderCapabilityCacheObservation, ProviderCapabilityMetadata, ProviderCapabilityProfile,
     ProviderError, ProviderProtocolContract, ProviderStreamEvent,
 };
@@ -44,7 +44,7 @@ fn pending_approval_for_test(
         "tool_name": &request.action,
         "raw_arguments": &raw_arguments,
         "resources": &request.resources,
-        "checkpoint_version": 5,
+        "checkpoint_version": 6,
         "project_instructions_digest": null,
         "messages": [{
             "role": "assistant",
@@ -1214,46 +1214,6 @@ struct StreamingProvider {
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 }
 
-fn typed_final_review_fixture(
-    request: &ModelTurnRequest,
-    mut response: ModelTurnResponse,
-) -> ModelTurnResponse {
-    if !request.tools.is_empty() {
-        return response;
-    }
-    let Some(answer) = response
-        .assistant_message
-        .as_ref()
-        .map(|message| message.content.clone())
-        .filter(|content| !content.trim().is_empty())
-    else {
-        return response;
-    };
-    if serde_json::from_str::<Value>(&answer).is_ok() {
-        return response;
-    }
-    let Some(template) = request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == ModelRole::Developer)
-        .and_then(|message| message.content.split_once("with no markdown: "))
-        .and_then(|(_, value)| value.split_once(". The workspace_revision"))
-        .map(|(value, _)| value)
-    else {
-        return response;
-    };
-    let Ok(mut value) =
-        serde_json::from_str::<Value>(&template.replace("accept|reject|repair", "accept"))
-    else {
-        return response;
-    };
-    value["final_answer"] = json!(answer);
-    value["reason"] = json!("");
-    response.assistant_message = Some(ModelMessage::text(ModelRole::Assistant, value.to_string()));
-    response
-}
-
 impl Provider for StreamingProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract::default()
@@ -1272,34 +1232,10 @@ impl Provider for StreamingProvider {
             .responses
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("streaming response"));
-        let original_text = response
-            .assistant_message
-            .as_ref()
-            .map(|message| message.content.clone());
         let mut response = response.clone();
         response.request_id = request.request_id.clone();
-        let response = typed_final_review_fixture(request, response);
-        let terminal_text = response
-            .assistant_message
-            .as_ref()
-            .map(|message| message.content.as_str());
-        if terminal_text != original_text.as_deref() {
-            let chars = terminal_text
-                .unwrap_or_default()
-                .chars()
-                .collect::<Vec<_>>();
-            let chunks = events.len().max(1);
-            for index in 0..chunks {
-                let start = chars.len() * index / chunks;
-                let end = chars.len() * (index + 1) / chunks;
-                on_event(ProviderStreamEvent::OutputTextDelta {
-                    delta: chars[start..end].iter().collect(),
-                });
-            }
-        } else {
-            for event in events {
-                on_event(event.clone());
-            }
+        for event in events {
+            on_event(event.clone());
         }
         Ok(response)
     }
@@ -1332,7 +1268,7 @@ impl Provider for StaticProvider {
             .unwrap_or_else(|| self.responses.last().expect("static provider response"))
             .clone();
         response.request_id = request.request_id.clone();
-        Ok(typed_final_review_fixture(request, response))
+        Ok(response)
     }
 }
 
@@ -2066,14 +2002,27 @@ fn approval_resume_uses_stored_policy_snapshot_instead_of_defaults() {
             "replacement": "after"
         }]
     });
-    let pending_payload = pending_approval_for_test(&request, arguments.clone())
+    let pending_payload = pending_approval_for_test(&request, arguments)
         .encode_checkpoint()
         .expect("current checkpoint");
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(pending_payload),
+            "approval",
+            "approval requested",
+        )
+        .expect("persist pending approval");
     let decision = ApprovalDecision::new(
         request.request_id.clone(),
         ApprovalOutcome::Allow,
         "approved",
     );
+    let pending_payload = store
+        .record_approval_decision(&decision, "approval", "approval decision recorded")
+        .expect("claim approval execution")
+        .pending_tool_call
+        .expect("claimed pending checkpoint");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let resumed = app_server(store)
         .resume_agent_loop_after_gate(

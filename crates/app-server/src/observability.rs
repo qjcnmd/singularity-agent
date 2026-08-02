@@ -1,11 +1,11 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use singularity_agent::{
-    AgentLoopEvent, AgentObservation, AgentRunStatus, FinalReviewStatus, OccurrenceIdentity,
-    OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyStatus, ProviderAttemptObservation,
-    ProviderAttemptStatus as AgentProviderAttemptStatus, ProviderAttemptUsageObservation,
-    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallStatus, VerificationStatus,
+    AgentLoopEvent, AgentObservation, AgentRunStatus, OccurrenceIdentity, OccurrenceLifecycle,
+    PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus, PromptAssemblyStatus,
+    ProviderAttemptObservation, ProviderAttemptStatus as AgentProviderAttemptStatus,
+    ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
+    ToolCallStatus, VerificationStatus,
 };
 use singularity_core::Timestamp;
 use singularity_model::{
@@ -13,13 +13,12 @@ use singularity_model::{
     ProviderCapabilityCacheLookupResult,
 };
 use singularity_protocol::{
-    TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
-    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceMetricSample, TraceMetricSampleKind,
-    TracePolicyCause, TracePolicyDecision, TracePolicyProjection, TraceProviderOperationPhase,
-    TraceProviderProtocol, TraceSandboxEnforcement, TraceSandboxProjection, TraceSandboxStatus,
-    TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus, TraceToolProjection,
-    TraceToolStatus, TraceUsage, TraceVerificationProjection, TraceVerificationStatus,
-    TraceWorkspaceMutation,
+    TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent, TraceMetricSample,
+    TraceMetricSampleKind, TracePolicyCause, TracePolicyDecision, TracePolicyProjection,
+    TraceProviderOperationPhase, TraceProviderProtocol, TraceSandboxEnforcement,
+    TraceSandboxProjection, TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
+    TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
+    TraceVerificationStatus, TraceWorkspaceMutation,
 };
 use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{SandboxBackendEnforcement, WorkspaceMutation};
@@ -259,33 +258,6 @@ impl<'a> TraceProjector<'a> {
                     },
                     verification_span_status,
                     verification_metric_samples,
-                )
-            }
-            AgentObservation::FinalReview(observation) => {
-                let start = TraceFinalReviewProjection {
-                    model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
-                    ..TraceFinalReviewProjection::default()
-                };
-                self.append_lifecycle(
-                    self.observation_span(
-                        &observation.identity,
-                        TraceSpanKind::FinalReview,
-                        "final review",
-                    ),
-                    &observation.lifecycle,
-                    TraceSpanProjection {
-                        final_review: Some(start.clone()),
-                        ..TraceSpanProjection::default()
-                    },
-                    |status| TraceSpanProjection {
-                        final_review: Some(TraceFinalReviewProjection {
-                            status: Some(final_review_status(*status)),
-                            ..start.clone()
-                        }),
-                        ..TraceSpanProjection::default()
-                    },
-                    final_review_span_status,
-                    |_| Vec::new(),
                 )
             }
         }
@@ -613,22 +585,6 @@ fn sandbox_enforcement(value: SandboxBackendEnforcement) -> TraceSandboxEnforcem
         SandboxBackendEnforcement::Strict => TraceSandboxEnforcement::Strict,
         SandboxBackendEnforcement::RestrictedToken => TraceSandboxEnforcement::RestrictedToken,
         SandboxBackendEnforcement::Unavailable => TraceSandboxEnforcement::Unavailable,
-    }
-}
-
-fn final_review_status(status: FinalReviewStatus) -> TraceFinalReviewStatus {
-    match status {
-        FinalReviewStatus::Succeeded => TraceFinalReviewStatus::Succeeded,
-        FinalReviewStatus::Failed => TraceFinalReviewStatus::Failed,
-        FinalReviewStatus::Cancelled => TraceFinalReviewStatus::Cancelled,
-    }
-}
-
-fn final_review_span_status(status: &FinalReviewStatus) -> TraceSpanStatus {
-    match status {
-        FinalReviewStatus::Succeeded => TraceSpanStatus::Ok,
-        FinalReviewStatus::Failed => TraceSpanStatus::Error,
-        FinalReviewStatus::Cancelled => TraceSpanStatus::Cancelled,
     }
 }
 

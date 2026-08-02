@@ -21,12 +21,11 @@ use singularity_tools::{
 use super::observation::OccurrenceTimer;
 use super::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentLoopInput,
-    AgentObservation, AgentVerification, FinalReviewObservation, FinalReviewStatus,
-    FinalReviewVerdict, OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause,
-    PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation, PromptAssemblyStatus,
-    ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
-    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
-    VerificationObservation, VerificationStatus,
+    AgentObservation, AgentVerification, OccurrenceIdentity, OccurrenceLifecycle,
+    PolicyDecisionCause, PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation,
+    PromptAssemblyStatus, ProviderAttemptObservation, ProviderAttemptStatus,
+    ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
+    ToolCallObservation, ToolCallStatus, VerificationObservation, VerificationStatus,
 };
 
 pub(super) struct ToolOccurrenceContext {
@@ -111,47 +110,6 @@ pub(super) fn emit_prompt_assembly_finished(
     )
 }
 
-pub(super) fn emit_final_review_finished(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    final_review: &Option<(OccurrenceIdentity, OccurrenceTimer)>,
-    model_turn_ordinal: u32,
-    status: FinalReviewStatus,
-) -> Result<(), AgentLoopEventSinkError> {
-    let verdict = match status {
-        FinalReviewStatus::Succeeded => Some(FinalReviewVerdict::Accept),
-        FinalReviewStatus::Failed => Some(FinalReviewVerdict::Reject),
-        FinalReviewStatus::Cancelled => Some(FinalReviewVerdict::Cancelled),
-    };
-    emit_final_review_finished_with_verdict(
-        on_event,
-        final_review,
-        model_turn_ordinal,
-        status,
-        verdict,
-    )
-}
-
-pub(super) fn emit_final_review_finished_with_verdict(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    final_review: &Option<(OccurrenceIdentity, OccurrenceTimer)>,
-    model_turn_ordinal: u32,
-    status: FinalReviewStatus,
-    verdict: Option<FinalReviewVerdict>,
-) -> Result<(), AgentLoopEventSinkError> {
-    let Some((identity, timer)) = final_review else {
-        return Ok(());
-    };
-    emit_event(
-        on_event,
-        AgentLoopEvent::Observation(AgentObservation::FinalReview(FinalReviewObservation {
-            identity: identity.clone(),
-            lifecycle: timer.finished(status),
-            model_turn_ordinal,
-            verdict,
-        })),
-    )
-}
-
 enum ProviderAttemptIdentityScope {
     Child(OccurrenceIdentity),
     Root {
@@ -220,8 +178,7 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
 
     /// Return deltas only after the caller has validated the complete provider response.
     ///
-    /// Final-review responses are typed internal envelopes. They must remain buffered until the
-    /// runtime parses the verdict and projects only the accepted user-facing answer.
+    /// Terminal response deltas remain buffered until the complete provider response is validated.
     pub(super) fn into_buffered_text_deltas(self) -> Vec<String> {
         self.buffered_text_deltas
     }

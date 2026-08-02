@@ -460,7 +460,6 @@ impl CompletionTracker {
                 self.workspace_mutated && self.verification_satisfied(),
             ),
             unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
-            final_review_verdict: None,
         }
     }
 
@@ -472,10 +471,6 @@ impl CompletionTracker {
                     .terminal_command_revisions
                     .iter()
                     .all(|revision| Some(*revision) == self.workspace_revision))
-    }
-
-    pub(super) fn terminal_command_scope_digests(&self) -> Vec<String> {
-        self.terminal_command_scope_digests.clone()
     }
 
     pub(super) fn terminal_command_window_len(&self) -> usize {

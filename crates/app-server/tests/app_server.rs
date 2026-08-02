@@ -199,7 +199,7 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "tool_name": &request.action,
         "raw_arguments": r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,
         "resources": &request.resources,
-        "checkpoint_version": 5,
+        "checkpoint_version": 6,
         "project_instructions_digest": null,
         "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]},"raw_arguments":r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,"parse_status":"valid","validation_errors":[]}]}],
         "tool_result_occurrences": [],
@@ -226,48 +226,6 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
     })
 }
 
-fn typed_final_review_fixture(
-    request: &singularity_model::ModelTurnRequest,
-    mut response: singularity_model::ModelTurnResponse,
-) -> singularity_model::ModelTurnResponse {
-    if !request.tools.is_empty() {
-        return response;
-    }
-    let Some(answer) = response
-        .assistant_message
-        .as_ref()
-        .map(|message| message.content.clone())
-        .filter(|content| !content.trim().is_empty())
-    else {
-        return response;
-    };
-    if serde_json::from_str::<serde_json::Value>(&answer).is_ok() {
-        return response;
-    }
-    let Some(template) = request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == singularity_model::ModelRole::Developer)
-        .and_then(|message| message.content.split_once("with no markdown: "))
-        .and_then(|(_, value)| value.split_once(". The workspace_revision"))
-        .map(|(value, _)| value)
-    else {
-        return response;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(
-        &template.replace("accept|reject|repair", "accept"),
-    ) else {
-        return response;
-    };
-    value["final_answer"] = serde_json::json!(answer);
-    value["reason"] = serde_json::json!("");
-    response.assistant_message = Some(singularity_model::ModelMessage::text(
-        singularity_model::ModelRole::Assistant,
-        value.to_string(),
-    ));
-    response
-}
 #[test]
 fn app_server_enforces_initialize_and_emits_item_events() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2847,7 +2805,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
                 .unwrap_or_else(|| self.responses.last().expect("response"))
                 .clone();
             response.request_id = request.request_id.clone();
-            Ok(typed_final_review_fixture(request, response))
+            Ok(response)
         }
 
         fn complete_observed(

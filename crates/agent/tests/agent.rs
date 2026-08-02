@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentStatus, ApprovalGrant,
-    FinalReviewStatus, OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause,
-    PolicyDecisionStatus, PromptAssemblyStatus, SandboxExecutionStatus, ToolCallStatus,
-    TurnCheckpointPhase, VerificationStatus, assemble_context_items,
+    OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus,
+    PromptAssemblyStatus, SandboxExecutionStatus, ToolCallStatus, TurnCheckpointPhase,
+    VerificationStatus, assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -123,86 +123,15 @@ struct DeltaThenUnsupportedProvider {
     fallback_calls: Arc<AtomicUsize>,
 }
 
-// typed final-review parser. Real providers must return this object themselves.
-fn typed_fixture_final_review(
-    request: &ModelTurnRequest,
-    mut response: ModelTurnResponse,
-) -> ModelTurnResponse {
-    if request.tool_choice.mode != ToolChoiceMode::None || !request.tools.is_empty() {
-        return response;
-    }
-    let Some(message) = response.assistant_message.as_ref() else {
-        return response;
-    };
-    if message.content.trim().is_empty() {
-        return response;
-    }
-    if serde_json::from_str::<serde_json::Value>(&message.content).is_ok() {
-        return response;
-    }
-    let Some(instruction) = request.messages.iter().rev().find(|message| {
-        message.role == ModelRole::Developer
-            && message
-                .content
-                .contains("Return exactly one JSON object for the terminal review")
-    }) else {
-        return response;
-    };
-    let Some(template) = instruction
-        .content
-        .split_once("with no markdown: ")
-        .and_then(|(_, value)| {
-            value
-                .split_once(". The workspace_revision")
-                .map(|(value, _)| value)
-        })
-    else {
-        return response;
-    };
-    let (verdict, final_answer, reason) = match message.content.as_str() {
-        "__fixture_review_repair__" => ("repair", "", "semantic contract remains incomplete"),
-        "__fixture_review_reject__" => ("reject", "", "semantic contract remains incomplete"),
-        answer => ("accept", answer, ""),
-    };
-    let template = template.replace("accept|reject|repair", verdict);
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&template) else {
-        return response;
-    };
-    value["final_answer"] = serde_json::json!(final_answer);
-    value["reason"] = serde_json::json!(reason);
-    if let Ok(content) = serde_json::to_string(&value) {
-        response.assistant_message = Some(ModelMessage::text(ModelRole::Assistant, content));
-    }
-    response
-}
-
 fn stream_fixture_response(
-    request: &ModelTurnRequest,
     events: &[ProviderStreamEvent],
     response: ModelTurnResponse,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
 ) -> ModelTurnResponse {
-    let typed = typed_fixture_final_review(request, response.clone());
-    let original_text = response
-        .assistant_message
-        .as_ref()
-        .map(|message| message.content.as_str());
-    let typed_text = typed
-        .assistant_message
-        .as_ref()
-        .map(|message| message.content.as_str());
-    if typed_text != original_text {
-        if let Some(delta) = typed_text {
-            on_event(ProviderStreamEvent::OutputTextDelta {
-                delta: delta.to_string(),
-            });
-        }
-    } else {
-        for event in events {
-            on_event(event.clone());
-        }
+    for event in events {
+        on_event(event.clone());
     }
-    typed
+    response
 }
 
 fn project_instruction_snapshot(content: &str) -> ProjectInstructions {
@@ -227,13 +156,13 @@ impl Provider for StaticProvider {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
         seen_requests.push(request.clone());
-        Ok(typed_fixture_final_review(
-            request,
-            self.responses
-                .get(response_index)
-                .unwrap_or_else(|| self.responses.last().expect("static provider response"))
-                .clone(),
-        ))
+        let mut response = self
+            .responses
+            .get(response_index)
+            .unwrap_or_else(|| self.responses.last().expect("static provider response"))
+            .clone();
+        response.request_id = request.request_id.clone();
+        Ok(response)
     }
 }
 
@@ -255,12 +184,9 @@ impl Provider for StreamingProvider {
             .responses
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("streaming provider response"));
-        Ok(stream_fixture_response(
-            request,
-            events,
-            response.clone(),
-            on_event,
-        ))
+        let mut response = stream_fixture_response(events, response.clone(), on_event);
+        response.request_id = request.request_id.clone();
+        Ok(response)
     }
 
     fn complete(
@@ -299,13 +225,12 @@ impl Provider for FinalizationStreamProvider {
             cancellation.cancel();
         }
         match self.final_response.clone() {
-            Ok(response) if !self.cancel_on_finalization => Ok(stream_fixture_response(
-                request,
-                &self.final_events,
-                response,
-                on_event,
-            )),
-            Ok(response) => Ok(typed_fixture_final_review(request, response)),
+            Ok(response) if !self.cancel_on_finalization => {
+                let mut response = stream_fixture_response(&self.final_events, response, on_event);
+                response.request_id = request.request_id.clone();
+                Ok(response)
+            }
+            Ok(response) => Ok(response),
             Err(error) => {
                 for event in &self.final_events {
                     on_event(event.clone());
@@ -347,7 +272,7 @@ impl Provider for FinalizationAwareProvider {
                 cancellation.cancel();
             }
             return self.final_response.clone().map(|response| {
-                let mut response = typed_fixture_final_review(request, response);
+                let mut response = response;
                 response.request_id = request.request_id.clone();
                 response
             });
@@ -428,17 +353,17 @@ impl Provider for NegotiatingProvider {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
         seen_requests.push(request.clone());
-        Ok(typed_fixture_final_review(
-            request,
-            self.responses
-                .get(response_index)
-                .unwrap_or_else(|| {
-                    self.responses
-                        .last()
-                        .expect("negotiating provider response")
-                })
-                .clone(),
-        ))
+        let mut response = self
+            .responses
+            .get(response_index)
+            .unwrap_or_else(|| {
+                self.responses
+                    .last()
+                    .expect("negotiating provider response")
+            })
+            .clone();
+        response.request_id = request.request_id.clone();
+        Ok(response)
     }
 }
 
@@ -1272,10 +1197,6 @@ fn event_aware_run_reports_safe_prompt_assembly_at_the_request_boundary() {
     assert!(prompt_events[1].tool_count > 0);
     assert!(prompt_events[1].request_token_count > 0);
     assert!(prompt_events[1].request_digest.starts_with("sha256:"));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        AgentLoopEvent::Observation(AgentObservation::FinalReview(_))
-    )));
     assert!(
         !serde_json::to_string(&events)
             .expect("serialize events")
@@ -1441,7 +1362,7 @@ fn agent_loop_does_not_project_stream_deltas_before_response_validation() {
 }
 
 #[test]
-fn agent_loop_projects_only_finalization_text_deltas_in_order() {
+fn agent_loop_projects_terminal_text_deltas_in_order() {
     let verification_argv = test_command("verify");
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "intermediate");
@@ -1486,7 +1407,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
         attempt_count: 1,
         occurrences: vec![provider_attempt_occurrence(
             2,
-            "provider-finalization",
+            "provider-terminal-response",
             ProviderAttemptStatus::Ok,
         )],
         ..Default::default()
@@ -1581,7 +1502,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
     let capability = result
         .provider_capability_metadata
         .as_ref()
-        .expect("finalization capability observations");
+        .expect("terminal response capability observations");
     assert_eq!(
         capability
             .cache_observations
@@ -1786,15 +1707,8 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
 }
 
 #[test]
-fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_fails() {
+fn agent_loop_withholds_terminal_text_when_stream_validation_fails() {
     let verification_argv = test_command("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &verification_argv.join(" "),
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "intermediate");
     let call = tool_call(
@@ -1813,18 +1727,8 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_f
         tool_call_id: None,
         tool_calls: vec![call],
     });
-    let mismatched = ModelTurnResponse::completed(
-        "model_request_turn_1_1",
-        "response_final",
-        serde_json::json!({
-            "verdict": "accept",
-            "workspace_revision": 1,
-            "verification_digests": [verification_digest],
-            "final_answer": "terminal",
-            "reason": ""
-        })
-        .to_string(),
-    );
+    let mismatched =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "terminal");
     let mut deltas = Vec::new();
     let result = AgentLoop::new(
         StreamingProvider {
@@ -1870,7 +1774,7 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_f
 }
 
 #[test]
-fn agent_loop_withholds_unvalidated_final_review_text_when_stream_fails() {
+fn agent_loop_withholds_terminal_text_when_stream_fails() {
     let (workspace, input, setup_response) = finalization_stream_fixture();
     let error = ProviderError::from_model_error(
         ModelError::new(
@@ -1910,7 +1814,7 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_stream_fails() {
 }
 
 #[test]
-fn agent_loop_withholds_unvalidated_final_review_text_when_cancelled() {
+fn agent_loop_withholds_terminal_text_when_cancelled() {
     let (workspace, input, setup_response) = finalization_stream_fixture();
     let late_terminal =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_late", "late terminal");
@@ -1936,12 +1840,13 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_cancelled() {
 }
 
 #[test]
-fn malformed_final_review_retries_within_the_model_turn_budget() {
+fn structured_looking_terminal_text_is_plain_final_output() {
     let workspace = tempfile::tempdir().expect("workspace");
-    std::fs::write(workspace.path().join("README.md"), "before").expect("final-review fixture");
+    std::fs::write(workspace.path().join("README.md"), "before")
+        .expect("terminal response fixture");
     let command = test_command_script("verify");
     let mut verification =
-        ModelTurnResponse::completed("model_request_turn_review_retry_0", "response_verify", "");
+        ModelTurnResponse::completed("model_request_turn_terminal_text_0", "response_verify", "");
     verification.tool_calls.push(tool_call(
         "verify_call",
         "command",
@@ -1952,22 +1857,22 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
         }),
     ));
     let mut verification_followup = verification.clone();
-    verification_followup.request_id = "model_request_turn_review_retry_1".to_string();
+    verification_followup.request_id = "model_request_turn_terminal_text_1".to_string();
     verification_followup.tool_calls[0].tool_call_id = "verify_call_2".to_string();
-    let malformed = ModelTurnResponse::completed(
-        "model_request_turn_review_retry_2",
-        "response_malformed_review",
-        r#"{"verdict":"accept"}"#,
+    let structured_text = ModelTurnResponse::completed(
+        "model_request_turn_terminal_text_2",
+        "response_structured_text",
+        r#"{"result":"done"}"#,
     );
-    let valid = ModelTurnResponse::completed(
-        "model_request_turn_review_retry_3",
-        "response_valid_review",
-        "done",
+    let unexpected_extra = ModelTurnResponse::completed(
+        "model_request_turn_terminal_text_3",
+        "response_unexpected_extra",
+        "unexpected extra response",
     );
     let exhausted_responses = vec![
         verification.clone(),
         verification_followup.clone(),
-        malformed.clone(),
+        structured_text.clone(),
     ];
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let mut events = Vec::new();
@@ -1975,7 +1880,12 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
 
     let result = AgentLoop::new(
         StaticProvider {
-            responses: vec![verification, verification_followup, malformed, valid],
+            responses: vec![
+                verification,
+                verification_followup,
+                structured_text,
+                unexpected_extra,
+            ],
             seen_requests: Arc::clone(&seen_requests),
             capabilities: ProviderProtocolContract::default(),
         },
@@ -1992,7 +1902,7 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
             }),
     )
     .run_with_events_and_checkpoints(
-        &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
+        &AgentLoopInput::new("thread_terminal_text", "turn_terminal_text", "verify")
             .with_max_turns(4),
         &mut |event| {
             events.push(event);
@@ -2005,63 +1915,16 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
     );
 
     assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
-    assert_eq!(result.final_answer.as_deref(), Some("done"));
-    assert_eq!(result.model_turns, 4);
+    assert_eq!(result.final_answer.as_deref(), Some(r#"{"result":"done"}"#));
+    assert_eq!(result.model_turns, 3);
     assert_eq!(result.tool_results.len(), 2);
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
-    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
-    let final_review_statuses = events
-        .iter()
-        .filter_map(|event| match event {
-            AgentLoopEvent::Observation(AgentObservation::FinalReview(value)) => {
-                match value.lifecycle {
-                    OccurrenceLifecycle::Finished { status, .. } => Some(status),
-                    OccurrenceLifecycle::Started { .. } | OccurrenceLifecycle::Suspended { .. } => {
-                        None
-                    }
-                }
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        final_review_statuses,
-        [FinalReviewStatus::Failed, FinalReviewStatus::Succeeded]
-    );
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::None);
-    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::None);
-    assert!(requests[3].messages.iter().any(|message| {
-        message.role == ModelRole::Developer
-            && message
-                .content
-                .contains("previous final review response was invalid")
-    }));
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
+    assert!(!requests[2].tools.is_empty());
     drop(requests);
-    checkpoints
-        .iter()
-        .find(|event| {
-            matches!(
-                event.phase,
-                TurnCheckpointPhase::BeforeModelRequest {
-                    finalization_only: true
-                }
-            ) && event.checkpoint.encode().is_ok_and(|payload| {
-                payload["messages"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message["role"] == "assistant"
-                            && message["content"] == r#"{"verdict":"accept"}"#
-                    }) && messages.iter().any(|message| {
-                        message["role"] == "developer"
-                            && message["content"].as_str().is_some_and(|content| {
-                                content.contains("previous final review response was invalid")
-                            })
-                    })
-                })
-            })
-        })
-        .expect("retry checkpoint preserves malformed assistant and correction");
 
     let exhausted = AgentLoop::new(
         StaticProvider {
@@ -2082,13 +1945,13 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
             }),
     )
     .run(
-        &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
+        &AgentLoopInput::new("thread_terminal_text", "turn_terminal_text", "verify")
             .with_max_turns(2),
     );
-    assert_eq!(exhausted.status, AgentStatus::Failed, "{exhausted:?}");
+    assert_eq!(exhausted.status, AgentStatus::Completed, "{exhausted:?}");
     assert_eq!(
-        exhausted.error.as_deref(),
-        Some("final review response is not a strict typed JSON object")
+        exhausted.final_answer.as_deref(),
+        Some(r#"{"result":"done"}"#)
     );
     assert_eq!(exhausted.model_turns, 3);
     assert_eq!(exhausted.tool_results.len(), 2);
@@ -2096,7 +1959,7 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
 }
 
 #[test]
-fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
+fn terminal_response_failures_are_fail_closed_and_side_effect_free() {
     #[derive(Clone, Copy)]
     enum FinalizationCase {
         ProviderError,
@@ -2284,16 +2147,6 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 .iter()
                 .all(|tool_result| tool_result.tool_call_id != "terminal_call")
         );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentLoopEvent::Observation(AgentObservation::FinalReview(value))
-                if matches!(value.lifecycle, OccurrenceLifecycle::Finished { status, .. }
-                    if status == match case {
-                        FinalizationCase::Cancelled => FinalReviewStatus::Cancelled,
-                        _ => FinalReviewStatus::Failed,
-                    })
-        )));
-
         let requests = seen_requests.lock().expect("seen requests");
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
@@ -2353,7 +2206,67 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
 }
 
 #[test]
-fn approval_resume_projects_finalization_text_deltas() {
+fn endpoint_ready_allows_one_terminal_response_with_no_tools() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), "before").expect("workspace fixture");
+    let command = test_command("verify");
+    let mut setup_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_setup", "");
+    setup_response.tool_calls.push(tool_call(
+        "verify_call_1",
+        "command",
+        serde_json::json!({"command": command.join(" "), "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut verification_response = setup_response.clone();
+    verification_response.request_id = "model_request_turn_1_1".to_string();
+    verification_response.response_id = "response_verification".to_string();
+    verification_response.tool_calls[0].tool_call_id = "verify_call_2".to_string();
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let input = AgentLoopInput::new("thread_terminal", "turn_terminal", "verify").with_max_turns(2);
+    let result = AgentLoop::new(
+        FinalizationAwareProvider {
+            setup_responses: vec![setup_response.clone(), verification_response],
+            repeated_tool_response: setup_response,
+            final_response: Ok(ModelTurnResponse::completed(
+                "model_request_turn_1_2",
+                "response_terminal",
+                "done",
+            )),
+            cancel_on_finalization: false,
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(CommandMutatingBackend {
+                workspace: workspace.path().to_path_buf(),
+                calls: AtomicUsize::new(0),
+                include_summary: true,
+            }),
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].tools.is_empty());
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+    assert!(!requests[1].tools.is_empty());
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
+    assert!(requests[2].tools.is_empty());
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::None);
+    assert_eq!(requests[2].tool_choice.max_tool_calls, 0);
+}
+
+#[test]
+fn approval_resume_projects_terminal_text_deltas() {
     let verification_argv = test_command("verify");
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "approval needed");
@@ -3452,7 +3365,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         "approval_turn_1_call_1"
     );
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
-    assert_eq!(checkpoint["checkpoint_version"], 5);
+    assert_eq!(checkpoint["checkpoint_version"], 6);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
     assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");
@@ -3495,7 +3408,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         "unsupported approval checkpoint version"
     );
     let mut previous_checkpoint = checkpoint.clone();
-    previous_checkpoint["checkpoint_version"] = serde_json::json!(4);
+    previous_checkpoint["checkpoint_version"] = serde_json::json!(5);
     let previous = PendingApprovalOccurrence::from_checkpoint_payload(
         pending.request().clone(),
         &previous_checkpoint,
@@ -6091,7 +6004,9 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
                 include_summary: true,
             }),
     )
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "patch and verify").with_max_turns(6));
+    // The completion gate becomes ready on the final ordinary work turn; the inclusive endpoint
+    // then issues exactly one no-tool terminal-response request.
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "patch and verify").with_max_turns(5));
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.final_answer.as_deref(), Some("done"));
@@ -6144,34 +6059,19 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
         3
     );
     let requests = seen_requests.lock().expect("seen requests");
-    let final_review = requests
+    let terminal_response = requests
         .iter()
         .rev()
         .find(|request| request.tool_choice.mode == ToolChoiceMode::None)
-        .expect("final review request");
-    let instruction = final_review
-        .messages
-        .iter()
-        .rev()
-        .find(|message| {
-            message.role == ModelRole::Developer
-                && message
-                    .content
-                    .contains("Return exactly one JSON object for the terminal review")
-        })
-        .expect("final review instruction");
-    assert!(instruction.content.contains("workspace_revision=3"));
-    assert!(instruction.content.contains("passed_verification_digests"));
-    assert!(!instruction.content.contains("changed_paths"));
-    assert!(!instruction.content.contains("change_digest"));
-    assert_eq!(
-        result.verification.final_review_verdict,
-        Some(singularity_agent::FinalReviewVerdict::Accept)
-    );
+        .expect("terminal response request");
+    assert!(terminal_response.tools.is_empty());
+    assert!(!terminal_response.messages.iter().any(|message| {
+        message.role == ModelRole::Developer && message.content.contains("semantic review")
+    }));
 }
 
 #[test]
-fn final_review_rejection_requires_new_mutation_and_verification_before_accept() {
+fn ready_runtime_allows_plain_terminal_response_without_semantic_review() {
     let dir = tempfile::tempdir().expect("workspace");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
@@ -6208,14 +6108,7 @@ fn final_review_rejection_requires_new_mutation_and_verification_before_accept()
         vec![
             patch_response("model_request_turn_1_0", "patch_1", "before", "after"),
             command_response("model_request_turn_1_1", "command_1"),
-            ModelTurnResponse::completed(
-                "model_request_turn_1_2",
-                "review_reject",
-                "__fixture_review_reject__",
-            ),
-            patch_response("model_request_turn_1_3", "patch_2", "after", "final"),
-            command_response("model_request_turn_1_4", "command_2"),
-            ModelTurnResponse::completed("model_request_turn_1_5", "review_accept", "done"),
+            ModelTurnResponse::completed("model_request_turn_1_2", "terminal", "done"),
         ],
         allow_read_execute_policy().with_rule(
             PermissionRule::new(
@@ -6236,26 +6129,19 @@ fn final_review_rejection_requires_new_mutation_and_verification_before_accept()
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.final_answer.as_deref(), Some("done"));
-    assert_eq!(result.tool_results.len(), 4);
-    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
-    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
-    assert_eq!(
-        result.final_review_verdict(),
-        Some(singularity_agent::FinalReviewVerdict::Accept)
-    );
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
-        "final"
+        "after"
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 6);
-    assert!(requests[2].messages.iter().any(|message| {
-        message.role == ModelRole::Developer
-            && message.content.contains("passed_verification_digests")
-    }));
-    assert!(requests[5].messages.iter().any(|message| {
-        message.role == ModelRole::Developer && message.content.contains("workspace_revision=2")
-    }));
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].tools.len() >= 5);
+    assert!(requests[1].tools.len() >= 5);
+    assert!(requests[2].tools.len() >= 5);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
 }
 
 #[test]

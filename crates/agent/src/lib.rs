@@ -121,7 +121,6 @@ impl TurnCheckpoint {
                 .map(|input| ModelMessage::text(ModelRole::User, input.clone())),
         );
         self.state.repair_state = None;
-        self.state.final_review_verdict = None;
         self.state.last_completion_error = None;
         self.state.last_repair_failure = None;
         self.encode().map(|_| self)
@@ -197,12 +196,11 @@ use model_turn::*;
 use observation::OccurrenceTimer;
 pub use observation::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentObservation,
-    FinalReviewObservation, FinalReviewStatus, OccurrenceIdentity, OccurrenceLifecycle,
-    PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyObservation, PromptAssemblyStatus, ProviderAttemptObservation,
-    ProviderAttemptStatus, ProviderAttemptUsageObservation, SandboxExecutionOccurrence,
-    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
-    VerificationStatus,
+    OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation,
+    PolicyDecisionStatus, PromptAssemblyObservation, PromptAssemblyStatus,
+    ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
+    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
+    VerificationObservation, VerificationStatus,
 };
 use tool_occurrence::*;
 
@@ -214,9 +212,9 @@ use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 /// Approval checkpoints after removing the latest-only mutation summary.
-const APPROVAL_CHECKPOINT_VERSION: u32 = 5;
+const APPROVAL_CHECKPOINT_VERSION: u32 = 6;
 /// Ordinary turn checkpoints after removing the latest-only mutation summary.
-const TURN_CHECKPOINT_VERSION: u32 = 4;
+const TURN_CHECKPOINT_VERSION: u32 = 5;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise private checklist; update it when evidence or failure changes the approach, and complete the requested work before the final answer. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -241,13 +239,13 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
 ];
 const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
-const MAX_REVIEW_TEXT_CHARS: usize = 512;
 const MAX_REPAIR_ATTEMPTS: u32 = 3;
 const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
 const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
+const MAX_BOUNDED_TEXT_CHARS: usize = 512;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPAIR_STATE_INSTRUCTIONS: &str = "Follow the bounded repair guidance. Use the latest typed tool result and trusted workspace revision evidence to choose the next valid action. When a repair strategy change is required, make a materially different workspace mutation that addresses the reported failure before retrying verification. Do not claim success without new verification evidence.";
-const REVIEW_REPAIR_SIGNATURE: &str =
+const COMPLETION_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const EVENT_SINK_FAILURE_ERROR: &str = "agent event sink failed";
 
@@ -303,9 +301,6 @@ pub struct AgentVerification {
     pub required_command_count: u32,
     pub satisfied_command_count: u32,
     pub unresolved_failures: Vec<String>,
-    /// The last typed final-review verdict, when a final-review occurrence was attempted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_review_verdict: Option<FinalReviewVerdict>,
 }
 
 /// Why a bounded repair was requested.
@@ -315,18 +310,6 @@ pub enum AgentRepairReason {
     VerificationFailed,
     ToolFailure,
     RevisionConflict,
-    FinalReviewRejected,
-}
-
-/// Typed final review result.  A final answer is accepted only after the same revision-bound
-/// completion evidence has been reviewed; reject/repair never maps to `Completed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FinalReviewVerdict {
-    Accept,
-    Reject,
-    Repair,
-    Cancelled,
 }
 
 /// 无效调用、修复尝试和被拒绝完成尝试的计数器。
@@ -631,11 +614,6 @@ impl AgentLoopResult {
             .find(|occurrence| occurrence.request().request_id == request_id)
     }
 
-    /// Return the last typed final-review verdict, if review reached a terminal boundary.
-    pub fn final_review_verdict(&self) -> Option<FinalReviewVerdict> {
-        self.verification.final_review_verdict
-    }
-
     /// 将内部结果投影为持久化运行状态。
     pub fn to_run_status(&self) -> AgentRunStatus {
         AgentRunStatus {
@@ -674,7 +652,6 @@ struct AgentLoopState {
     /// after real progress, but this counter survives that transition and approval checkpoints.
     repair_attempts: u32,
     repair_cycles: Vec<RepairCycleRecord>,
-    final_review_verdict: Option<FinalReviewVerdict>,
     last_completion_error: Option<String>,
     recovery_metrics: AgentRecoveryMetrics,
     model_usage: ModelUsage,
@@ -711,19 +688,6 @@ struct RepairCycleRecord {
     verification_passed: bool,
 }
 
-/// Strict model output used by the terminal final-review request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FinalReviewResponse {
-    verdict: FinalReviewVerdict,
-    workspace_revision: Option<WorkspaceRevision>,
-    verification_digests: Vec<String>,
-    #[serde(default)]
-    final_answer: String,
-    #[serde(default)]
-    reason: String,
-}
-
 impl AgentLoopState {
     fn new(
         messages: Vec<ModelMessage>,
@@ -740,7 +704,6 @@ impl AgentLoopState {
             repair_state: None,
             repair_attempts: 0,
             repair_cycles: Vec::new(),
-            final_review_verdict: None,
             last_completion_error: None,
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
@@ -782,8 +745,7 @@ impl AgentLoopState {
             .into_iter()
             .map(ToolResultOccurrence::into_result)
             .collect::<Vec<_>>();
-        let mut verification = self.completion.summary();
-        verification.final_review_verdict = self.final_review_verdict;
+        let verification = self.completion.summary();
         AgentLoopResult {
             status,
             completed,
@@ -1022,7 +984,6 @@ impl AgentLoopState {
             repair_state: self.repair_state.clone(),
             repair_attempts: self.repair_attempts,
             repair_cycles: self.repair_cycles.clone(),
-            final_review_verdict: self.final_review_verdict,
             last_completion_error: self.last_completion_error.clone(),
             recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
@@ -1037,10 +998,8 @@ impl AgentLoopState {
         self.completion.allows_final() && self.repair_state.is_none()
     }
 
-    fn finalization_ready(&self) -> bool {
-        // `allows_final` can be true before the first model turn for simple read-only work.
-        // Passed latest-revision command evidence supplies the additional evidence that the next
-        // request is only collecting the final answer.
+    fn completion_ready(&self) -> bool {
+        // The runtime completion gate is the sole authority for a terminal response.
         self.completion.summary().passed && self.repair_state.is_none()
     }
 
@@ -1094,20 +1053,6 @@ impl AgentLoopState {
             .to_string()
         };
         format!("{REPAIR_STATE_INSTRUCTIONS} repair_context={context}")
-    }
-
-    fn final_review_instruction(&self) -> String {
-        let revision = self
-            .completion
-            .workspace_revision
-            .map(|revision| revision.value().to_string())
-            .unwrap_or_else(|| "null".to_string());
-        let verification_digests =
-            serde_json::to_string(&self.completion.terminal_command_scope_digests())
-                .unwrap_or_else(|_| "[]".to_string());
-        format!(
-            "Review the trusted current workspace revision and verification evidence together with the available conversation and tool history before deciding. workspace_revision={revision}; passed_verification_digests={verification_digests}. Return exactly one JSON object for the terminal review, with no markdown: {{\"verdict\":\"accept|reject|repair\",\"workspace_revision\":{revision},\"verification_digests\":{verification_digests},\"final_answer\":\"...\",\"reason\":\"...\"}}. The workspace_revision and verification_digests must exactly match this trusted evidence. Use accept only when all evidence is semantically valid; use reject or repair with a bounded reason when another repair cycle is required."
-        )
     }
 
     fn schedule_repair(
@@ -1183,10 +1128,7 @@ impl AgentLoopState {
         });
         let requires_strategy_change = self.repair_state.as_ref().is_some_and(|active| {
             active.required_revision.is_none()
-                && matches!(
-                    reason,
-                    AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected
-                )
+                && matches!(reason, AgentRepairReason::RevisionConflict)
         });
         let active_tool_failure = (reason == AgentRepairReason::ToolFailure)
             .then(|| {
@@ -1459,14 +1401,6 @@ impl AgentLoopState {
             return Some("repair budget exhausted; refusing another repair attempt".to_string());
         }
         (consecutive_count >= 2).then(|| REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
-    }
-
-    /// Drop only the active repair state after a successful workspace/verification operation. Read-only
-    /// reads and bookkeeping calls must not reset a bounded repair episode. The attempt ledger is
-    /// monotonic for the lifetime of the run and is deliberately retained across this transition.
-    fn clear_repair_episode(&mut self) {
-        self.repair_state = None;
-        self.last_repair_failure = None;
     }
 
     fn append_visible_tool_result(&mut self, tool_result: ToolResult) {
@@ -2002,7 +1936,7 @@ where
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
         if model_turn_offset > max_turns
-            || (model_turn_offset == max_turns && !state.finalization_ready())
+            || (model_turn_offset == max_turns && !state.completion_ready())
         {
             let model_turns = model_turn_offset.max(max_turns);
             return state.finish(
@@ -2016,7 +1950,8 @@ where
         let mut on_event = on_event;
         let mut on_checkpoint = on_checkpoint;
         let mut actual_model_turns = model_turn_offset;
-        // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
+        // The inclusive endpoint is reserved for one terminal response only when the runtime
+        // completion gate became ready on the last ordinary work turn.
         for turn_index in model_turn_offset..=max_turns {
             if state
                 .repair_state
@@ -2031,8 +1966,8 @@ where
                     Some("repair budget exhausted".to_string()),
                 );
             }
-            let finalization_only = state.finalization_ready();
-            if !finalization_only && turn_index == max_turns {
+            let finalization_only = turn_index == max_turns && state.completion_ready();
+            if turn_index == max_turns && !finalization_only {
                 break;
             }
             if self.is_cancelled(input) {
@@ -2222,12 +2157,6 @@ where
                 state.messages = compaction.messages;
                 state.tool_result_occurrences = compaction.tool_result_occurrences;
             }
-            if finalization_only {
-                state.messages.push(ModelMessage::text(
-                    ModelRole::Developer,
-                    state.final_review_instruction(),
-                ));
-            }
             let request = model_turn_request(
                 input,
                 budget,
@@ -2317,34 +2246,6 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
-            let final_review = finalization_only.then(|| {
-                (
-                    child_occurrence_identity(&prompt_identity, "final_review", 0),
-                    OccurrenceTimer::start(),
-                )
-            });
-            if let Some((identity, timer)) = &final_review
-                && emit_event(
-                    &mut on_event,
-                    AgentLoopEvent::Observation(AgentObservation::FinalReview(
-                        FinalReviewObservation {
-                            identity: identity.clone(),
-                            lifecycle: timer.started(),
-                            model_turn_ordinal: turn_index,
-                            verdict: None,
-                        },
-                    )),
-                )
-                .is_err()
-            {
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    turn_index,
-                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                );
-            }
             let provider_events = RefCell::new(ProviderEventBridge::new(
                 prompt_identity.clone(),
                 &mut on_event,
@@ -2416,25 +2317,6 @@ where
             state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
-                if finalization_only {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Cancelled);
-                }
-                if emit_final_review_finished(
-                    &mut on_event,
-                    &final_review,
-                    turn_index,
-                    FinalReviewStatus::Cancelled,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
                 return state.finish(
                     AgentStatus::Cancelled,
                     false,
@@ -2444,25 +2326,6 @@ where
                 );
             }
             if response.status != ModelTurnStatus::Success {
-                if finalization_only {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                }
-                if emit_final_review_finished(
-                    &mut on_event,
-                    &final_review,
-                    turn_index,
-                    FinalReviewStatus::Failed,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
                 let model_error = response.error.as_ref();
                 return state.finish_with_model_error(
                     AgentStatus::Failed,
@@ -2487,25 +2350,6 @@ where
             let recoverable_tool_validation = !finalization_only
                 && recoverable_tool_response_validation(&response, &validation.errors);
             if !validation.valid && !recoverable_tool_validation {
-                if finalization_only {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                }
-                if emit_final_review_finished(
-                    &mut on_event,
-                    &final_review,
-                    turn_index,
-                    FinalReviewStatus::Failed,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
                 for call in &response.tool_calls {
                     state.observe_model_tool_call(call, &provider_tool_names);
                 }
@@ -2533,25 +2377,6 @@ where
             if response.assistant_message.as_ref().is_some_and(|message| {
                 !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
             }) {
-                if finalization_only {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                }
-                if emit_final_review_finished(
-                    &mut on_event,
-                    &final_review,
-                    turn_index,
-                    FinalReviewStatus::Failed,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
                 if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
                     .is_err()
                 {
@@ -2576,25 +2401,6 @@ where
                 );
             }
             if has_duplicate_tool_call_ids(&response.tool_calls) {
-                if finalization_only {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                }
-                if emit_final_review_finished(
-                    &mut on_event,
-                    &final_review,
-                    turn_index,
-                    FinalReviewStatus::Failed,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
                 if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
                     .is_err()
                 {
@@ -2620,25 +2426,6 @@ where
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
-                    if finalization_only {
-                        state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                    }
-                    if emit_final_review_finished(
-                        &mut on_event,
-                        &final_review,
-                        turn_index,
-                        FinalReviewStatus::Failed,
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
                     state.recovery_metrics.completion_rejection_count = state
                         .recovery_metrics
                         .completion_rejection_count
@@ -2671,79 +2458,16 @@ where
                         Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
                     );
                 }
-                if finalization_only {
-                    let review = match parse_final_review_response(&response, &state) {
-                        Ok(review) => review,
-                        Err(error) => {
-                            if emit_final_review_finished(
-                                &mut on_event,
-                                &final_review,
-                                turn_index,
-                                FinalReviewStatus::Failed,
-                            )
-                            .is_err()
-                            {
-                                return state.finish(
-                                    AgentStatus::Failed,
-                                    false,
-                                    None,
-                                    actual_model_turns,
-                                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                                );
-                            }
-                            if turn_index == max_turns {
-                                state.final_review_verdict = Some(FinalReviewVerdict::Reject);
-                                return state.finish(
-                                    AgentStatus::Failed,
-                                    false,
-                                    None,
-                                    actual_model_turns,
-                                    Some(error),
-                                );
-                            }
-                            state.recovery_metrics.completion_rejection_count = state
-                                .recovery_metrics
-                                .completion_rejection_count
-                                .saturating_add(1);
-                            state.last_completion_error = Some(error);
-                            state
-                                .messages
-                                .push(response.assistant_message.unwrap_or_else(|| {
-                                    ModelMessage::text(ModelRole::Assistant, final_answer)
-                                }));
-                            state.messages.push(ModelMessage::text(
-                                ModelRole::Developer,
-                                "The previous final review response was invalid. Return exactly one strict JSON object matching the current terminal-review schema and evidence; do not use markdown, prose, or tools.",
-                            ));
-                            continue;
-                        }
-                    };
-                    if review.verdict != FinalReviewVerdict::Accept {
-                        state.final_review_verdict = Some(review.verdict);
-                        let repair_requested = match state.schedule_repair(
-                            AgentRepairReason::FinalReviewRejected,
-                            REVIEW_REPAIR_SIGNATURE,
-                            None,
-                        ) {
-                            Ok(_state) => true,
-                            Err(exhausted) => {
-                                state.repair_state = Some(RepairState {
-                                    reason: exhausted.reason,
-                                    attempt: exhausted.attempt,
-                                    max_attempts: exhausted.max_attempts,
-                                    required_revision: exhausted.required_revision,
-                                    signature: REVIEW_REPAIR_SIGNATURE.to_string(),
-                                    failed_tool_name: None,
-                                });
-                                false
-                            }
-                        };
-                        if emit_final_review_finished_with_verdict(
+                if state.allows_final() {
+                    if !finalization_only && state.completion_ready() {
+                        if emit_verification_occurrence(
                             &mut on_event,
-                            &final_review,
+                            input,
                             turn_index,
-                            FinalReviewStatus::Failed,
-                            Some(review.verdict),
+                            state.recovery_metrics.completion_rejection_count,
+                            "verification_gate",
+                            VerificationStatus::GatePassed,
+                            &state.completion.summary(),
                         )
                         .is_err()
                         {
@@ -2755,101 +2479,7 @@ where
                                 Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                             );
                         }
-                        state.recovery_metrics.completion_rejection_count = state
-                            .recovery_metrics
-                            .completion_rejection_count
-                            .saturating_add(1);
-                        state.last_completion_error = Some(if repair_requested {
-                            format!("final review rejected: {}", review.reason)
-                        } else {
-                            "repair budget exhausted".to_string()
-                        });
-                        state
-                            .messages
-                            .push(response.assistant_message.unwrap_or_else(|| {
-                                ModelMessage::text(ModelRole::Assistant, final_answer)
-                            }));
-                        state.messages.push(ModelMessage::text(
-                            ModelRole::Developer,
-                            if repair_requested {
-                                state.repair_feedback()
-                            } else {
-                                "Repair budget exhausted; do not claim completion.".to_string()
-                            },
-                        ));
-                        continue;
                     }
-                    state.clear_repair_episode();
-                    state.final_review_verdict = Some(FinalReviewVerdict::Accept);
-                    let delta_count = buffered_text_deltas.len().max(1);
-                    let answer_chars = review.final_answer.chars().collect::<Vec<_>>();
-                    for chunk_index in 0..delta_count {
-                        let start = answer_chars.len() * chunk_index / delta_count;
-                        let end = answer_chars.len() * (chunk_index + 1) / delta_count;
-                        if start == end && chunk_index + 1 != delta_count {
-                            continue;
-                        }
-                        let delta = answer_chars[start..end].iter().collect::<String>();
-                        if emit_event(&mut on_event, AgentLoopEvent::FinalTextDelta { delta })
-                            .is_err()
-                        {
-                            return state.finish(
-                                AgentStatus::Failed,
-                                false,
-                                None,
-                                actual_model_turns,
-                                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                            );
-                        }
-                    }
-                    if emit_final_review_finished_with_verdict(
-                        &mut on_event,
-                        &final_review,
-                        turn_index,
-                        FinalReviewStatus::Succeeded,
-                        Some(FinalReviewVerdict::Accept),
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
-                    state.messages.push(ModelMessage::text(
-                        ModelRole::Assistant,
-                        review.final_answer.clone(),
-                    ));
-                    if !matches!(
-                        self.emit_checkpoint_event(
-                            input,
-                            &state,
-                            TurnCheckpointPhase::ModelResponseCommitted,
-                            actual_model_turns,
-                            &mut on_checkpoint,
-                        ),
-                        ToolBatchControl::Continue
-                    ) {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
-                    return state.finish(
-                        AgentStatus::Completed,
-                        true,
-                        Some(review.final_answer),
-                        actual_model_turns,
-                        None,
-                    );
-                }
-                if state.allows_final() {
                     for delta in buffered_text_deltas {
                         if emit_event(&mut on_event, AgentLoopEvent::FinalTextDelta { delta })
                             .is_err()
@@ -2862,22 +2492,6 @@ where
                                 Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                             );
                         }
-                    }
-                    if emit_final_review_finished(
-                        &mut on_event,
-                        &final_review,
-                        turn_index,
-                        FinalReviewStatus::Succeeded,
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
                     }
                     state.messages.push(ModelMessage::text(
                         ModelRole::Assistant,
@@ -2914,7 +2528,7 @@ where
                 } else {
                     match state.schedule_repair(
                         AgentRepairReason::VerificationFailed,
-                        REVIEW_REPAIR_SIGNATURE,
+                        COMPLETION_REPAIR_SIGNATURE,
                         None,
                     ) {
                         Ok(_state) => true,
@@ -2924,16 +2538,13 @@ where
                                 attempt: exhausted.attempt,
                                 max_attempts: exhausted.max_attempts,
                                 required_revision: exhausted.required_revision,
-                                signature: REVIEW_REPAIR_SIGNATURE.to_string(),
+                                signature: COMPLETION_REPAIR_SIGNATURE.to_string(),
                                 failed_tool_name: None,
                             });
                             false
                         }
                     }
                 };
-                if repair_requested {
-                    state.final_review_verdict = Some(FinalReviewVerdict::Repair);
-                }
                 state.recovery_metrics.completion_rejection_count = state
                     .recovery_metrics
                     .completion_rejection_count
@@ -4276,9 +3887,6 @@ where
                 observation.mutation() == singularity_tools::WorkspaceMutation::Changed
             });
             if changed {
-                // A new workspace revision invalidates any earlier terminal review verdict. The
-                // next verdict must be earned from this revision's completion evidence.
-                state.final_review_verdict = None;
                 let Some(revision) = result
                     .workspace_observation()
                     .and_then(|observation| observation.revision())
@@ -5239,7 +4847,6 @@ fn restore_checkpoint(
     state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
-    state.final_review_verdict = checkpoint_state.final_review_verdict;
     state.last_completion_error = checkpoint_state.last_completion_error;
     state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
@@ -5369,7 +4976,6 @@ fn restore_turn_checkpoint(
     state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
-    state.final_review_verdict = checkpoint_state.final_review_verdict;
     state.last_completion_error = checkpoint_state.last_completion_error;
     state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
@@ -5866,46 +5472,6 @@ fn checkpoint_arguments_equivalent(model: &Value, pending: &Value) -> bool {
     }
 }
 
-fn parse_final_review_response(
-    response: &ModelTurnResponse,
-    state: &AgentLoopState,
-) -> Result<FinalReviewResponse, String> {
-    let content = assistant_message_text(response.assistant_message.as_ref());
-    let review: FinalReviewResponse = serde_json::from_str(&content)
-        .map_err(|_| "final review response is not a strict typed JSON object".to_string())?;
-    if matches!(review.verdict, FinalReviewVerdict::Cancelled) {
-        return Err("final review response used an invalid cancelled verdict".to_string());
-    }
-    if review.workspace_revision != state.completion.workspace_revision {
-        return Err("final review workspace revision does not match current evidence".to_string());
-    }
-    let expected_verification_digests = state.completion.terminal_command_scope_digests();
-    if review.verification_digests != expected_verification_digests {
-        return Err(
-            "final review verification evidence does not match current requirements".to_string(),
-        );
-    }
-    if review.reason.chars().count() > MAX_REVIEW_TEXT_CHARS
-        || contains_sensitive_text(&review.reason)
-    {
-        return Err("final review response contains invalid bounded text".to_string());
-    }
-    match review.verdict {
-        FinalReviewVerdict::Accept if review.final_answer.trim().is_empty() => {
-            Err("accepted final review omitted final_answer".to_string())
-        }
-        FinalReviewVerdict::Reject | FinalReviewVerdict::Repair
-            if review.reason.trim().is_empty() =>
-        {
-            Err("rejected final review omitted reason".to_string())
-        }
-        FinalReviewVerdict::Accept | FinalReviewVerdict::Reject | FinalReviewVerdict::Repair => {
-            Ok(review)
-        }
-        FinalReviewVerdict::Cancelled => Err("invalid final review verdict".to_string()),
-    }
-}
-
 fn validate_workspace_change_summary(
     call: &ModelToolCall,
     result: &ToolResult,
@@ -5949,7 +5515,7 @@ fn validate_workspace_change_summary(
 
 fn is_bounded_workspace_relative_path(path: &str) -> bool {
     !path.is_empty()
-        && path.chars().count() <= MAX_REVIEW_TEXT_CHARS
+        && path.chars().count() <= MAX_BOUNDED_TEXT_CHARS
         && !path.contains('\0')
         && !std::path::Path::new(path).is_absolute()
         && std::path::Path::new(path).components().all(|component| {
@@ -6007,7 +5573,6 @@ fn repair_reason_text(reason: AgentRepairReason) -> &'static str {
         AgentRepairReason::VerificationFailed => "revision-bound verification failed",
         AgentRepairReason::ToolFailure => "repairable tool failure",
         AgentRepairReason::RevisionConflict => "workspace revision conflict",
-        AgentRepairReason::FinalReviewRejected => "final review rejected the proposed result",
     }
 }
 
