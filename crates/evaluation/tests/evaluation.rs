@@ -633,6 +633,22 @@ fn unsupported_past_and_future_schemas_fail_closed() {
 }
 
 #[test]
+fn pending_and_running_statuses_are_rejected_from_result_json() {
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    for status in ["pending", "running"] {
+        let mut value = serde_json::to_value(&result).expect("result JSON");
+        value["status"] = json!(status);
+        let error =
+            EvaluationResult::from_json_str(&serde_json::to_string(&value).expect("result JSON"))
+                .expect_err("nonterminal evaluation status must be rejected");
+        assert!(
+            matches!(error, EvaluationError::Json(_)),
+            "{status} should fail during result deserialization: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn previous_result_is_rejected_and_current_v4_evidence_binds_to_v9_result() {
     let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
     let mut legacy_result = serde_json::to_value(&result).expect("result JSON");

@@ -101,10 +101,8 @@ impl FiniteStatistics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// Evaluation run 或 trial 的生命周期状态。
+/// Evaluation run 或 trial 的稳定终态。
 pub enum EvaluationStatus {
-    Pending,
-    Running,
     Completed,
     Failed,
     Blocked,
@@ -294,9 +292,7 @@ impl EvaluationTrialResult {
             )));
         }
         if self.functional_task_success
-            && (self.stages.baseline.status != StageStatus::Passed
-                || !self.tests_passed
-                || self.status == EvaluationStatus::Blocked)
+            && (self.stages.baseline.status != StageStatus::Passed || !self.tests_passed)
         {
             return Err(validation_error(format!(
                 "{context} functional_task_success requires baseline and evaluator tests"
@@ -368,6 +364,24 @@ impl EvaluationTaskSummary {
         let agent_completed_count = count_trials(trials, |trial| {
             trial.status != EvaluationStatus::Blocked && trial.agent_completed
         });
+        // A blocked trial joins a dimension's denominator only with positive evidence for that
+        // dimension; protocol success on a blocked trial is forbidden by trial validation.
+        let functional_task_success_count =
+            count_trials(trials, |trial| trial.functional_task_success);
+        let functional_blocked_success_count = count_trials(trials, |trial| {
+            trial.status == EvaluationStatus::Blocked && trial.functional_task_success
+        });
+        let functional_scored_trial_count =
+            agent_scored_trial_count.saturating_add(functional_blocked_success_count);
+        let agent_protocol_success_count =
+            count_trials(trials, |trial| trial.agent_protocol_success);
+        let sandbox_security_success_count =
+            count_trials(trials, |trial| trial.sandbox_security_success);
+        let sandbox_blocked_success_count = count_trials(trials, |trial| {
+            trial.status == EvaluationStatus::Blocked && trial.sandbox_security_success
+        });
+        let sandbox_scored_trial_count =
+            agent_scored_trial_count.saturating_add(sandbox_blocked_success_count);
         Self {
             trial_count,
             completed_trial_count,
@@ -376,26 +390,20 @@ impl EvaluationTaskSummary {
             agent_scored_trial_count,
             agent_completed_count,
             agent_failed_count: agent_scored_trial_count.saturating_sub(agent_completed_count),
-            functional_task_success_count: count_trials(trials, |trial| {
-                trial.functional_task_success
-            }),
+            functional_task_success_count,
             functional_task_success_rate_basis_points: rate_basis_points(
-                count_trials(trials, |trial| trial.functional_task_success),
-                agent_scored_trial_count,
+                functional_task_success_count,
+                functional_scored_trial_count,
             ),
-            agent_protocol_success_count: count_trials(trials, |trial| {
-                trial.agent_protocol_success
-            }),
+            agent_protocol_success_count,
             agent_protocol_success_rate_basis_points: rate_basis_points(
-                count_trials(trials, |trial| trial.agent_protocol_success),
+                agent_protocol_success_count,
                 agent_scored_trial_count,
             ),
-            sandbox_security_success_count: count_trials(trials, |trial| {
-                trial.sandbox_security_success
-            }),
+            sandbox_security_success_count,
             sandbox_security_success_rate_basis_points: rate_basis_points(
-                count_trials(trials, |trial| trial.sandbox_security_success),
-                agent_scored_trial_count,
+                sandbox_security_success_count,
+                sandbox_scored_trial_count,
             ),
         }
     }

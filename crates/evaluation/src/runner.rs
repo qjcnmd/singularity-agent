@@ -855,7 +855,6 @@ impl<'store> EvaluationTrialTrace<'store> {
 fn evaluation_status_trace_status(status: EvaluationStatus) -> TraceSpanStatus {
     match status {
         EvaluationStatus::Completed => TraceSpanStatus::Ok,
-        EvaluationStatus::Pending | EvaluationStatus::Running => TraceSpanStatus::Unset,
         EvaluationStatus::Failed | EvaluationStatus::Blocked => TraceSpanStatus::Error,
     }
 }
@@ -9050,6 +9049,136 @@ mod tests {
             },
         );
         assert!(!unfinished.result.agent_protocol_success);
+    }
+
+    #[test]
+    fn concurrent_task_result_projection_validates_functional_success_with_blocked_agent() {
+        let cancellation = CancellationToken::new();
+        let task_evaluations = run_bounded_indexed_workers(2, 2, &cancellation, |index| {
+            let task_id = TaskId::new(format!("projection-task-{index}")).expect("task id");
+            let mut trials = Vec::with_capacity(2);
+            for trial in 1..=2_u32 {
+                let strict_command = || {
+                    let result = CommandResult::completed("command", "ok")
+                        .with_sandbox_execution("test", SandboxBackendEnforcement::Strict);
+                    CommandDiagnostic::new("agent.command", &result)
+                };
+                let agent_command = strict_command();
+                let mut diagnostics = TaskDiagnostics::default();
+                diagnostics.agent.commands.push(agent_command.clone());
+                diagnostics.patch_evidence.push(WorkspaceChangeEvidence {
+                    path: format!("src/lib-{index}-{trial}.rs"),
+                    change_kind: "modified",
+                    before_sha256: Some("sha256:before".to_string()),
+                    after_sha256: Some("sha256:after".to_string()),
+                });
+                let agent = if index == 0 && trial == 2 {
+                    StageExecution::blocked(
+                        evaluation_blocker(BlockerKind::Sandbox, "agent sandbox blocker"),
+                        vec![agent_command],
+                    )
+                } else {
+                    StageExecution::passed(vec![agent_command])
+                };
+                trials.push(finish_task(
+                    &task_id,
+                    trial,
+                    StageExecution::passed(Vec::new()),
+                    agent,
+                    StageExecution::passed(Vec::new()),
+                    StageExecution::passed(Vec::new()),
+                    diagnostics,
+                ));
+            }
+            let result = EvaluationTaskResult::from_trials(
+                task_id,
+                vec![crate::EvaluationCapability::RequiredVerification],
+                trials.iter().map(|trial| trial.result.clone()).collect(),
+            );
+            TaskEvaluation { result, trials }
+        })
+        .unwrap_or_else(|_| panic!("task workers complete"));
+
+        assert_eq!(
+            task_evaluations[0].result.task_id.as_str(),
+            "projection-task-0"
+        );
+        assert_eq!(
+            task_evaluations[1].result.task_id.as_str(),
+            "projection-task-1"
+        );
+        assert_eq!(
+            task_evaluations[0].trials[0].result.status,
+            EvaluationStatus::Completed
+        );
+        assert_eq!(
+            task_evaluations[0].trials[1].result.status,
+            EvaluationStatus::Blocked
+        );
+        assert!(task_evaluations[0].trials[1].result.functional_task_success);
+        assert!(!task_evaluations[0].trials[1].result.agent_protocol_success);
+        assert!(
+            task_evaluations[0].trials[1]
+                .result
+                .sandbox_security_success
+        );
+        assert!(!task_evaluations[0].trials[1].result.evaluation_passed);
+        assert!(
+            task_evaluations[1]
+                .trials
+                .iter()
+                .all(|trial| trial.result.evaluation_passed)
+        );
+        assert!(task_evaluations[1].result.evaluation_passed);
+
+        let task = &task_evaluations[0].result;
+        assert_eq!(task.summary.agent_scored_trial_count, 1);
+        assert_eq!(task.summary.blocked_trial_count, 1);
+        assert_eq!(task.summary.functional_task_success_count, 2);
+        assert_eq!(
+            task.summary.functional_task_success_rate_basis_points,
+            10_000
+        );
+        assert_eq!(task.summary.agent_protocol_success_count, 1);
+        assert_eq!(
+            task.summary.agent_protocol_success_rate_basis_points,
+            10_000
+        );
+        assert_eq!(task.summary.sandbox_security_success_count, 2);
+        assert_eq!(
+            task.summary.sandbox_security_success_rate_basis_points,
+            10_000
+        );
+        assert!(task.summary.functional_task_success_rate_basis_points <= 10_000);
+        assert!(task.summary.agent_protocol_success_rate_basis_points <= 10_000);
+        assert!(task.summary.sandbox_security_success_rate_basis_points <= 10_000);
+        assert!(task.functional_task_success);
+        assert!(!task.agent_protocol_success);
+        assert!(task.sandbox_security_success);
+        assert!(!task.evaluation_passed);
+
+        let run_id = RunId::new("projection-contract").expect("run id");
+        let mut result = EvaluationResult::from_tasks(
+            run_id,
+            2,
+            task_evaluations
+                .iter()
+                .map(|task| task.result.clone())
+                .collect(),
+        );
+        result.sandbox_preflight = Some(sandbox_preflight_evidence(&supported_sandbox_preflight(
+            "test",
+        )));
+        result
+            .validate()
+            .expect("blocked protocol must not invalidate independent functional evidence");
+        assert_eq!(result.tasks[0].task_id.as_str(), "projection-task-0");
+        assert_eq!(result.tasks[1].task_id.as_str(), "projection-task-1");
+        assert!(result.summary.functional_task_success_rate_basis_points <= 10_000);
+        assert!(result.summary.agent_protocol_success_rate_basis_points <= 10_000);
+        assert!(result.summary.sandbox_security_success_rate_basis_points <= 10_000);
+        assert!(!result.tasks[0].evaluation_passed);
+        assert!(!result.evaluation_passed);
     }
 
     #[test]
