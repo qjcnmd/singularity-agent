@@ -1,5 +1,21 @@
 # Singularity 仓库指令
 
+## 适用范围与任务收敛
+
+本文件只保存 Singularity 仓库长期有效、可直接执行的项目规则；个人偏好、一次性任务要求和工具自身编排合同由更高层指令、当前用户消息或对应 Skill 管理，不在这里重复。子目录出现更具体的 `AGENTS.md` 时，只覆盖其目录树内的差异。
+
+- 中大型、跨模块或高风险任务先明确可验证的目标、范围、禁止变化的合同、完成条件和风险；短小明确的修改直接执行，不为形式完整增加计划、文档或验证。
+- 长任务只维护一个当前状态台账，复用已有台账优先。台账记录当前目标、候选 revision、仍有效与已失效证据、阻断和下一步，并用 `verified`、`inferred`、`unknown`、`invalidated` 区分事实状态。聊天摘要、计划勾选和代理报告不能替代当前 Git、源码、运行结果及外部状态。
+- 台账、长日志、一次性提示词和诊断文件放在已忽略的 `outputs/` 或 `work/` 中，不加入 Git。稳定架构事实进入 `docs/singularity.md`，代码历史由 Git 保存。
+- 若使用子代理，必须通过当前生效的 `codex-subagents` 或 `codex-pi` Skill；同一执行单元只有一个写入所有者。代理返回只作为调查线索，主代理采用结论前核对相关源码、diff、命令输出或外部状态。
+- 长时间 Worker、Provider、构建或 Evaluation 只按真实进展、领域 timeout、明确阻断和取消信号判断；不得自行添加短墙钟上限来强制结束仍在推进的任务，也不为证明仍在运行而短间隔轮询或重复播报无变化状态。
+
+## 事实来源与外部参考
+
+- 当前源码、Git 对象、协议 payload、可复现运行和一手官方资料是事实来源；代码图、生成文档、历史日志、搜索摘要和模型输出只用于导航或提出待验证假设。
+- 非平凡设计或根因修复前，先有界核对对应标准、平台原生机制或维护活跃的成熟实现。证据链应能回答：当前问题与约束、先例的具体机制和版本、适用差异、最终选择与明确省略项。
+- 外部先例用于复用已验证的不变量和责任边界，不因知名而整套照搬。与当前产品消费者、安全合同或平台事实不符的表面不引入兼容层或占位接口。
+- 调查预先写清待回答问题、所需证据和停止条件；检索不到直接先例时，明确标准空白，只实现最小、隔离且可删除的项目扩展。
 
 ## 代码图导航
 
@@ -25,6 +41,21 @@
 4. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
 5. Evaluation 使用 `evaluation`、`eval`、`task`、`task set`、`runner`、`result`、`report` 等主流命名，不恢复迁移期自造分类。
 
+## Sandbox 上游复用边界
+
+- `crates/windows-sandbox` 负责 Windows 账户、ACL、WFP、Job Object、setup、路径保护和进程生命周期；优先复用或轻量移植官方 `openai/codex` 中与当前威胁模型匹配的成熟 Win32 机制，但使用 Singularity 自有二进制、账户、GUID、配置和状态，不共享本机 Codex 实例或安全状态。
+- `crates/sandbox` 只把通用 permission profile 投影到平台实现并返回 typed execution result，不维护第二套 ACL、setup、observer 或进程生命周期事实。
+- 只保留当前消费者需要的 strict workspace-write/read-only、protected paths、network denied、Job Object、取消/超时、workspace change 和失败关闭。PTY、ConPTY、managed proxy、GUI/desktop、多会话服务、Codex 配置协议和 telemetry 等没有当前消费者的表面不建立兼容层。
+- 上游采用点、必要本地差异和明确省略项记录在 `crates/windows-sandbox/UPSTREAM.md`。本地严格增强必须有直接威胁或运行证据；未知变更、monitor 丢失、路径身份不明和 enforcement 不可用继续失败关闭，不使用 local-process fallback 或环境特判。
+
+## Agent、Provider 与 Evaluation 边界
+
+- 模型可见产品工具由单一注册事实源产生；功能任务不通过 Evaluation task、required capability 或内部阶段维护第二套工具表面。工具选择自由与权限控制分离，副作用由 Policy、Approval 和 OS sandbox 约束。
+- Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 从开始到结束固定 `provider_id`、`model_id`、API protocol 和相关模型参数；不在运行途中自动路由、轮换或 fallback。
+- Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
+- Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
+- `functional_task_success`、`agent_protocol_success` 与 `sandbox_security_success` 分别计算、发布和归因；外部门禁可以同时要求三者，但不得合并成无法定位责任层的单一失败。Evaluator 保护自身 patch、tests、`.git` 和依赖/系统路径，并审计异常改动，不用路径白名单向模型泄露答案位置或阻止合理跨文件修复。
+
 ## 工程原则
 
 1. 测试、Evaluation、benchmark、监控指标和验收分数是观察产品行为的证据，不是反向定义产品语义的控制信号；不得为改善某次结果增加与真实领域合同无关的特判、放宽门禁或改变安全边界。
@@ -39,7 +70,7 @@
 10. “最小改动”指在正确抽象层实现满足真实需求的最小完整机制；局部修复开始产生跨样本特判、重复分支或级联例外时，暂停实现，重新识别缺失的抽象、不变量或状态模型，并说明必要的架构范围。
 11. 验证从领域不变量和确定性边界测试开始，逐级覆盖跨模块集成、真实运行和外部验收；保留失败证据和原始 gate 语义，让验收验证架构结果，不让实现迎合测试样本。
 
-## 验收边界与任务收敛
+## 验收证据边界
 
 - 产品能力与 Evaluation 工具分别维护验收矩阵。Evaluation 只提供开发期评估证据，不得进入发布二进制、产品运行依赖或反向定义 Agent 语义；产品结论不能只靠 Evaluation 分数证明。
 - 安全、协议和恢复结论必须在拥有不变量的真实边界取证：Provider 历史检查实际 `ModelTurnRequest`，sandbox 检查操作系统实际 enforcement，workspace 身份检查 pinned handle 对应的对象身份，崩溃恢复检查真实 kill/restart 后的 Store 状态。marker、路径字符串、日志或局部 mock 不能替代这些事实。
@@ -59,19 +90,30 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 
 ## 测试与验证
 
-* 以缩短任务运行时间为优先，只运行能够直接验证本次改动的最小检查。
-* 默认只运行受影响模块的定向测试或编译检查；文档、注释和不改变行为的修改默认不运行测试。
-* 仅调整已有常量、默认值、重试次数或同类孤立参数，且没有改变控制流结构、协议或数据格式、错误分类、状态转换、持久化、安全或权限边界、公共接口时，默认只静态确认最终值及其直接引用、断言和文档已经一致，不运行额外测试，也不启动真实 Provider/Agent Task、sandbox、跨平台验证或 Evaluation。此类修改不因位于 Provider、Agent 或 Evaluation 文件中就自动视为实质修改对应链路；只有参数本身属于安全门禁、权限、数据完整性、迁移或其他高风险合同，才按实际风险运行最小直接验证。
-* 处理 CI 失败时，先定位失败检查与当前 diff 的直接关系，只修复真实根因并重跑该失败检查或能直接证明修复的最小检查。若修改只涉及文档、格式、lint、CI 元数据、测试代码或其他不进入产品运行链路的内容，不运行真实 Provider/Agent Task、sandbox、跨平台验证或 Evaluation；不得因为“CI 曾失败”就升级验证范围或更换一套全量验收。
-* 不运行全仓测试、完整构建、跨平台验证或完整评估，除非本次改动直接涉及其公共接口、构建配置、安全边界
-* 已通过且未受后续修改影响的检查不得重复运行；不得仅因任务结束而追加全量验证。
-* 最终如实报告实际运行的检查和未验证范围，不得把局部验证描述为全部通过。
-凡实质修改模型调用链路，包括 AgentLoop 的模型请求与多轮历史、工具定义或选择、Provider adapter/协议投影、结构化响应解析、工具调用恢复、reasoning/history 续接或 completion 行为，在确定性测试通过后，必须通过实际产品调用链执行至少一次针对本次改动的真实模型调用测试。至少一次是最低要求而不是调用上限；只要继续调用能够帮助定位根因、区分关键假设、验证修复或提高交付质量，就应根据证据积极执行，不得以节省模型调用成本为理由跳过。成本优化只能在不减少必要覆盖、不合并本应区分的实验且不降低质量的前提下，通过稳定和复用相同请求前缀、工具 schema 与上下文结构等方式提高缓存命中率。
-真实 provider Evaluation 用于最终端到端验收，不应作为模型调用链路修改后的首次真实模型测试。仅在改动实质影响 AgentLoop、模型调用、工具执行、sandbox、approval、completion 或 evaluation 的端到端能力，且静态检查、定向测试和上述真实模型调用仍不足以证明整体行为时执行。一次任务最终状态未变化时不得重复运行。
+验证按最终 diff 的实际风险选择最小充分层级，低层证据通过后才升级；不得把“文件位于 Provider、Agent、sandbox 或 Evaluation crate”本身当作运行昂贵验收的理由。
+
+| 改动类型 | 默认最小验证 |
+| --- | --- |
+| 文档、注释、项目指令、格式或不改变行为的元数据 | 静态阅读、引用/结构检查、`git diff --check`；不运行 Cargo、Provider、sandbox 或 Evaluation |
+| 孤立常量、默认值、retry 数或同类参数，且不改变控制流结构、协议、错误分类、状态、安全或公共接口 | 静态确认最终值、直接引用、断言与文档一致 |
+| 测试夹具、lint、CI 元数据或 hosted runner 兼容性 | 失败检查或精确受影响测试；必要时观察对应 CI，不运行 Provider Task 或 Evaluation |
+| 局部产品行为 | 受影响 crate 的精确定向测试，按编译边界补最小 `check`/`clippy`；不默认全仓 |
+| 模型调用链路、工具 schema/选择、Provider adapter、history/reasoning replay、tool recovery 或 completion | 确定性 ModelTurnRequest/状态转换回归通过后，至少一次真实普通产品调用 |
+| Sandbox、Approval、workspace observation 或安全边界 | 拥有不变量的确定性测试和实际 OS enforcement 证据；未知状态继续失败关闭 |
+| Evaluation runner、task success 归约或端到端能力 | 先做确定性归约回归，再运行实际受影响 task 的单 trial；该 trial 通过且候选稳定后，才运行一次完整冻结 Evaluation |
+
+- 已通过且未受后续 diff 影响的证据保持有效，不因任务结束、push、CI 修复或文档提交机械重跑。
+- 完整构建、全仓测试、跨平台验证和完整 Evaluation 只有在实际影响范围无法由更窄证据证明时运行。完整 Evaluation 不是模型调用链改动后的首次真实测试。
+- 不新增或操纵 Trial 重采样、预算、timeout、门禁、task、工具权限或隐藏答案来赌分。真实 Provider Task 首次正确完成即为有效证据；失败保留首个错误、阶段和耗时，只修通用根因。
+- 默认不运行 Codex Security 扫描；只有用户明确要求使用时才运行。
+- 最终回复列出实际运行的检查、精确结果和未验证范围，不把局部证据描述为全量通过。
+
 ## 文档
 
 1. `docs/singularity.md` 是唯一架构事实文档，只描述当前核心产品运行时中的 crate 边界、对象、调用链、持久化和失败路径。
 2. 主链路、协议、状态映射、sandbox、approval、provider、evaluation、trace 或 store 变化时，同步更新 `docs/singularity.md` 的相关部分。
+3. Skill、配置、提示词、架构文档和代码注释直接描述当前有效的行为、接口、约束和风险，不写对话过程、措辞迭代、临时路线或已结束方案。需要保留的失败证据和决策历史只进入对应状态台账、Issue 或 Git 历史。
+4. 说明性文字按接收者最小化上下文；传给模型、工具或子代理的任务胶囊只包含当前动作需要的事实、授权、所有权、验收和升级边界，不转发无关对话或完整历史。
 
 ## 代码注释与可读性
 
@@ -82,7 +124,9 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 
 ## 任务记录
 
-对涉及缺陷调查、跨模块修改、架构调整或复杂验证的任务，复用或创建对应 GitHub Issue，并最多追加两次简短评论：
+优先复用与任务直接相关的现有 GitHub Issue。创建新 Issue 必须先取得用户对该 Issue 的一次性明确授权；没有授权时只在本地状态台账记录，不擅自创建。
+
+对已授权或已有的复杂 Issue，最多追加两次简短评论：
 
 1. 确认可靠根因后，记录现象、根因、关键证据和处理计划。
 2. 任务完成后，记录实际修改、选择该方案的原因、验证结果、未验证范围和关联 commit。
@@ -90,6 +134,15 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 记录应使用清晰中文解释真实文件、对象和调用链，帮助维护者理解和学习。不要记录原始推理、每条命令、文件读取过程、大段日志、敏感信息或重复内容。
 
 简单、低风险且无需调查的任务不创建 Issue，只在最终回复中简要说明问题、原因、解决方式和验证结果。GitHub 写入失败时明确报告，不得静默跳过。
+
+## Git、CI 与交付
+
+- 开始前核对 `HEAD`、branch、tracked/untracked/ignored 状态并保护用户改动；不得用 reset、checkout、stash、rebase 或 clean 绕开 dirty tree，除非用户对该具体操作明确授权。
+- 中大型任务按可独立验证、审查和回滚的阶段创建范围单一的本地提交。提交只是恢复点，不代表完成；未经明确授权不 push、发布、创建 PR、评论或关闭 Issue。
+- 每次本地提交后按本文件“代码图导航”刷新索引。索引失败不回滚提交，但必须记录失败和当前索引状态。
+- Push 前冻结 candidate SHA、验收输入和仍有效证据；Push 后核对远端 SHA 与 CI 的 `headSha`。CI 只证明它实际运行的提交和检查，不把未运行、skipped 或旧 SHA 描述为通过。
+- 纯文档、注释、项目指令或测试夹具的后续提交只失效其实际影响的证据；不为与产品行为无关的文件更换 Provider/Evaluation 候选或重跑全套验收。
+- Git 只跟踪源码、测试、稳定配置和必要文档。`outputs/`、`work/`、session、prompt、probe、临时日志、一次性脚本和本机绝对路径配置保持 ignored；任务结束时只删除能够证明由本任务创建的临时产物。
 
 ## Agent skills
 
