@@ -1,8 +1,5 @@
 # Singularity 仓库指令
 
-## 沟通与交付
-
-最终回复使用中文、结论先行，重要术语附通俗解释。完成功能或修复后，在最终回复中给出维护者可以自行运行的验证命令或操作步骤。认为需求或指令在工程上不合理、有风险或有明显更好做法时，说明理由和替代方案，而不是沉默照做。
 
 ## 代码图导航
 
@@ -52,20 +49,13 @@
 
 ## 复杂度与设计门禁
 
-Singularity 当前是可实际使用、持续演进的 Rust CLI Agent，不是面向未知产品形态的通用框架。设计优先服务当前真实调用链和已确认的近期需求；不为未来插件、桌面、多租户、网络服务或数据库替换预建基础设施。
+Singularity 当前是可实际使用、持续演进的Agent，不是面向未知产品形态的通用框架。设计优先服务当前真实调用链和已确认的近期需求；不为未来插件、桌面、多租户、网络服务或数据库替换预建基础设施。
 
 - 采用“删除优先、合并其次、新增最后”。新增 crate、Trait、Manager、Service、Repository、Adapter、Schema、缓存、锁或消息机制，必须有当前消费者，或明确建立安全、事务、平台、协议、恢复或测试替身边界；否则使用私有函数、枚举或小型内部结构。
 - 同一事实只能有一个权威来源。不得用并行数组、重复 DTO、动态 JSON、JSON/SQLite 双权威、长期双轨 checkpoint、无消费者兼容表或纯转发层维持状态。
 - 保留安全和一致性所需的复杂度：受限令牌、ACL、Job Object、路径能力、TOCTOU、Approval/Policy、Checkpoint/迁移、Completion/Verification、Provider 能力协商、Tool 信任边界、JSON-RPC、Trace/Audit/Evaluation。不得以“简化”为名降低权限、恢复能力、错误区分或失败关闭。
 - App Server 当前只需清晰表达 stdio transport、JSON-RPC、请求/Turn 生命周期、事件输出、取消、关闭和 Store/Provider 初始化；不得引入 Broker、CQRS、Event Sourcing、分布式队列、多租户连接或通用工作流框架。
 - Provider、Store、Tool、Evaluation 的抽象必须对应真实消费者和不变量。指标只计算一次再投影；缓存失败是否可视为 miss 应按真实并发和安全合同决定，不为统一而制造反向依赖。
-
-## 根因修复与防止验收投机
-
-- 修改前冻结原始入口、协议、Provider、模型、Tool Schema/Exposure、配置、Task、sandbox profile、阈值、超时、重试和 Completion Gate。替代路径只能用于诊断，不能留在最终实现或替代原入口证据。
-- 每项修复形成“可观察问题 → 稳定复现 → 首个错误状态 → 责任边界/传播 → 测试为何未阻止 → 最小根因设计 → 原入口同条件复验”的证据链。修改分类为 root_cause_fix、contract_correction、compatibility_fix、migration、fallback 或 test_only；workaround 不能作为最终方案。
-- 禁止通过切换协议/Provider/模型、修改测试或 Evaluator、放宽门禁/权限、吞错/默认值/伪成功、无记录 fallback、无依据重试或超时、硬编码任务输入、测试后门、只测 mock 或删除失败断言制造绿色结果。所有降级必须触发条件明确、语义不变、可观察、分类清晰且有边界预算。
-- 失败必须保留输入拒绝、能力不支持、策略拒绝、权限边界、执行失败和基础设施故障等因果差异；未知能力、未知字段、未知状态和不完整恢复默认 fail closed。
 
 ## 测试与验证
 
