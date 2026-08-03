@@ -5038,7 +5038,7 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated provider");
     let address = listener.local_addr().expect("truncated provider address");
     let server = thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..6 {
             let (mut stream, _) = listener.accept().expect("accept provider retry");
             let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
             read_provider_request(&mut reader);
@@ -5066,10 +5066,10 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
         error.error.stage,
         Some(ProviderErrorStage::ResponseBodyRead)
     );
-    assert_eq!(metadata.attempt_count, 3);
-    assert_eq!(metadata.retry_count, 2);
-    assert!(metadata.latency_ms >= 100);
-    assert_eq!(metadata.occurrences.len(), 3);
+    assert_eq!(metadata.attempt_count, 6);
+    assert_eq!(metadata.retry_count, 5);
+    assert!(metadata.latency_ms >= 1550);
+    assert_eq!(metadata.occurrences.len(), 6);
     for (index, occurrence) in metadata.occurrences.iter().enumerate() {
         assert_eq!(occurrence.attempt_index, index as u32 + 1);
         assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
@@ -5081,7 +5081,7 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
             occurrence.diagnostic_code.as_deref(),
             Some("provider_response_body_read_failed")
         );
-        assert_eq!(occurrence.retry_scheduled, index < 2);
+        assert_eq!(occurrence.retry_scheduled, index < 5);
         assert!(occurrence.time_to_first_text_delta_ms.is_none());
     }
     server.join().expect("join truncated provider");
@@ -5109,9 +5109,9 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
         .provider_attempt_metadata
         .expect("send failure attempt metadata");
 
-    assert_eq!(metadata.attempt_count, 3);
-    assert_eq!(metadata.retry_count, 2);
-    assert_eq!(metadata.occurrences.len(), 3);
+    assert_eq!(metadata.attempt_count, 6);
+    assert_eq!(metadata.retry_count, 5);
+    assert_eq!(metadata.occurrences.len(), 6);
     for (index, occurrence) in metadata.occurrences.iter().enumerate() {
         assert_eq!(occurrence.attempt_index, index as u32 + 1);
         assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
@@ -5128,7 +5128,7 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
         assert!(occurrence.time_to_first_text_delta_ms.is_none());
         assert!(occurrence.queue_duration_ms.is_none());
         assert!(occurrence.usage.is_none());
-        assert_eq!(occurrence.retry_scheduled, index < 2);
+        assert_eq!(occurrence.retry_scheduled, index < 5);
     }
     let serialized = serde_json::to_string(&metadata).expect("serialize aggregate metadata");
     assert!(!serialized.contains("occurrences"));
@@ -5566,7 +5566,7 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
             if status_line.starts_with("HTTP/1.1 4") && !status_line.starts_with("HTTP/1.1 429") {
                 vec![(status_line, body)]
             } else {
-                vec![(status_line, body); 3]
+                vec![(status_line, body); 6]
             };
         let (base_url, attempts) = sequence_response_server(responses);
         let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
@@ -5590,8 +5590,8 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
             .as_ref()
             .expect("http attempt metadata");
         if status_line.starts_with("HTTP/1.1 429") || status_line.starts_with("HTTP/1.1 5") {
-            assert_eq!(metadata.attempt_count, 3);
-            assert_eq!(metadata.retry_count, 2);
+            assert_eq!(metadata.attempt_count, 6);
+            assert_eq!(metadata.retry_count, 5);
         } else {
             assert_eq!(metadata.attempt_count, 1);
             assert_eq!(metadata.retry_count, 0);

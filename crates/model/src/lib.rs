@@ -47,7 +47,8 @@ const PROVIDER_RUNTIME_WORKER_THREADS: usize = 2;
 const PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE: &str = "provider_runtime_initialization_failed";
 const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PROVIDER_ATTEMPTS: u32 = 3;
+/// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
+const MAX_PROVIDER_ATTEMPTS: u32 = 6;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 /// Provider boundary code used when a protocol has no normalized text stream.
 pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
