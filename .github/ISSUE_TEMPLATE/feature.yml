@@ -1,0 +1,77 @@
+name: 功能需求（Feature）
+description: 新增产品能力或用户可感知的行为改进。只记录已确认事实，推断请单独标注。
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        填写前请阅读 `docs/agents/issue-tracker.md`。
+        验收标准与验证计划是本 Issue 的关闭依据，请写成可检查的条件，而不是笼统描述。
+  - type: textarea
+    id: goal
+    attributes:
+      label: 问题或目标
+      description: 要解决什么问题、达成什么目标？一句话能说清的核心意图。
+    validations:
+      required: true
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景与已确认事实
+      description: 当前行为、相关代码位置、已验证的事实与数据来源。推断和假设请单独标注，不写成事实。
+    validations:
+      required: true
+  - type: textarea
+    id: value
+    attributes:
+      label: 用户价值
+      description: 这个功能为维护者或产品解决什么问题？没有它会失去什么？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 实现范围
+      description: 本次要做什么：涉及的对象、接口、调用链和交付物。写成可执行的边界，而不是开放探索。
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: 非目标
+      description: 明确不做什么，防止范围扩张。相邻但不属于本 Issue 的改进应另开 Issue。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 满足哪些可检查条件时，本功能视为完成。逐条列出；能绑定确定性测试或真实运行证据。
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: 验证或测试计划
+      description: 如何证明验收标准成立：定向测试、真实产品调用链验证、需要运行的检查与范围。
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: 风险与安全边界
+      description: 涉及的安全边界（sandbox、approval、协议、持久化、恢复等）、失败模式与回退方式。
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: 依赖关系（可选）
+      description: 前置条件、被哪些 Issue 阻断（blocked by）、阻断哪些 Issue。用 #编号 引用；无则写“无”。
+  - type: textarea
+    id: hierarchy
+    attributes:
+      label: 父子 Issue 关系（可选）
+      description: 从哪个父 Issue 拆出？计划拆出哪些子 Issue？用 #编号 引用；无则写“无”。

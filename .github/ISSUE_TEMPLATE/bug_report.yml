@@ -1,0 +1,62 @@
+name: 缺陷报告（Bug）
+description: 报告实际行为与预期不符的问题。只记录已确认事实，推断请单独标注。
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        填写前请阅读 `docs/agents/issue-tracker.md`。
+        验收标准与验证计划是本 Issue 的关闭依据，请写成可检查的条件，而不是笼统描述。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 实际发生了什么？包含错误信息、日志片段或异常行为出现的位置（crate、文件、命令）。
+      placeholder: "sg 在 Windows 上执行 X 时返回 Y 错误……"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤与环境
+      description: 最小复现步骤；版本号或 commit、操作系统、相关配置。无法稳定复现时，说明观察到的条件与频率。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 按当前设计或文档，正确行为应该是什么？依据是什么（文档、协议、既有约定）？
+    validations:
+      required: true
+  - type: textarea
+    id: facts
+    attributes:
+      label: 已确认事实与初步归因（可选）
+      description: 已通过日志、源码或复现确认的事实与初步根因；尚未确认的内容请写成待验证假设。没有就写“无”。
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 满足哪些可检查条件时，该缺陷视为已修复。逐条列出。
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: 验证或测试计划
+      description: 如何证明修复有效且不引入回归：定向测试、真实调用链验证、需要运行的检查与范围。
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: 风险与安全边界（可选）
+      description: 修复可能触及的安全边界（sandbox、approval、协议、持久化等）与风险。没有就写“无”。
+  - type: textarea
+    id: relations
+    attributes:
+      label: 依赖与关联 Issue（可选）
+      description: 父 Issue、阻断本 Issue 的 Issue、相关 Issue。用 #编号 引用；无则写“无”。
