@@ -3,6 +3,12 @@
 target/
 work/
 
+# Local tool output and task evidence.
+.playwright-mcp/
+.qoder-cn/
+outputs/
+plan/
+
 # Local agent state and isolated worktrees.
 .codex/
 .qoder/
