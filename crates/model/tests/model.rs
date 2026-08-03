@@ -163,11 +163,11 @@ fn captured_request_server(
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
             if let Some(probe_body) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, false);
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
                 continue;
             }
             tx.send(request_body).expect("send request body");
-            write_provider_response(&mut stream, status_line, body, false);
+            write_provider_response(&mut stream, status_line, body, true);
             break;
         }
     });

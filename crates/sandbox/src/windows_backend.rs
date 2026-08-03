@@ -2953,13 +2953,13 @@ mod tests {
     #[test]
     fn protected_path_identity_rejects_same_content_replacement() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let protected = workspace.path().join(".env");
-        create_test_file(&protected, "opaque");
         let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let protected = root.join(".env");
+        create_test_file(&protected, "opaque");
         let path = AbsolutePathBuf::from_absolute_path_checked(&protected).expect("protected path");
         let cached = capture_cached_protected_paths(&root, std::slice::from_ref(&path))
             .expect("capture identity");
-        let displaced = workspace.path().join(".env.old");
+        let displaced = root.join(".env.old");
         std::fs::rename(&protected, displaced).expect("displace protected path");
         create_test_file(&protected, "opaque");
 
