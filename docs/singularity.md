@@ -201,6 +201,8 @@ completion gate 保持以下不变量：
 
 ## 7. Model 与 provider
 
+Responses 工具响应只有在实际包含 reasoning output item 时才创建 provider-private replay；没有 reasoning item 的合法工具响应不合成 `reasoning_effort=off` 的伪状态。声明 `ReplayResponsesItems` 的严格能力仍要求可验证的 reasoning item 与工具调用绑定，否则在 provider 响应边界 fail closed。
+
 `ProviderConfigSnapshot` 在 app-server 或 Evaluation 进程启动时只捕获一次配置。legacy 进程环境层和最近 `.env` 仍按原规则投影为同一内部模型；若设置 `SINGULARITY_MODELS_CONFIG`，它优先作为唯一多-provider JSON 输入。JSON 的形状是 `{default_model, providers}`，provider 键是逻辑 `provider_id`，每个 provider 的 `models` 键是 allowlist，`api_key_env` 只引用环境变量名。`default_model`、`thread.start.model` 和 fork 的 model 使用完整 `provider_id/model_id`（按第一个 `/` 切分，后续 `/` 保留在 model id）；unknown provider/model、未 allowlist 或 malformed selector 都在本地 fail closed。当前唯一 adapter 是 `openai_compatible`；其他 adapter 以 `provider_adapter_unsupported` fail closed，不借用 OpenAI transport 伪装为已支持。每个 model 恰好声明 `chat` 或 `responses` 及 context/output limits，provider/model/protocol/limits 在一个 turn/trial 内不变。context window 默认 128000，output limit 默认 4096；配置上限分别为 2000000 和 1000000，且 output 必须严格小于 context。
 
 Provider 配置值在本地 client initialization 信任边界完整校验，不会静默 trim 或纠正。进程环境和 `.env` 的 provider、model、base URL、API key 及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，以 `provider_configuration_invalid` typed fail closed，错误不携带原始值且不会产生 provider attempt；`.env` 标准 `CRLF` 行尾由解析器正常处理。

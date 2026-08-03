@@ -2297,6 +2297,10 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         .expect("final function call envelope");
     assert!(events.is_empty());
     assert_eq!(response.tool_calls.len(), 1);
+    assert!(
+        response.provider_reasoning_history.is_empty(),
+        "Responses tool calls without reasoning must not synthesize an off replay"
+    );
     assert_eq!(response.tool_calls[0].tool_name, "read");
     assert_eq!(
         response.tool_calls[0].raw_arguments,

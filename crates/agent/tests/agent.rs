@@ -4350,15 +4350,30 @@ fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
         "read",
         serde_json::json!({"path": "README.md", "max_chars": 64}),
     ));
+    // The read-only run is completion-gate ready, so the inclusive max-turn endpoint is a
+    // finalization-only request that must be answered with plain terminal text, not a tool call.
+    let terminal_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
-    let result = agent_loop_with_response(response, allow_read_policy())
-        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-        .run(&input);
+    let result = agent_loop_with_responses_and_requests(
+        vec![response, terminal_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(&input);
 
-    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert_eq!(result.tool_results.len(), 1);
     assert!(result.tool_results[0].ok);
-    assert_eq!(result.error.as_deref(), Some("max turns exceeded"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].tools.is_empty());
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
+    assert_eq!(requests[1].tool_choice.max_tool_calls, 0);
+    drop(requests);
     let payload = result.tool_results[0].to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
     assert!(serialized.contains("README.md"));

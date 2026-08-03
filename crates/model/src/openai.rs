@@ -562,7 +562,14 @@ pub(super) fn parse_openai_responses_response(
         tool_calls: tool_calls.clone(),
         ..ModelMessage::text(ModelRole::Assistant, content)
     });
-    let provider_reasoning_history = if !replay_items.is_empty() && !tool_calls.is_empty() {
+    let has_reasoning_item = replay_items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
+    let provider_reasoning_history = if !replay_items.is_empty()
+        && !tool_calls.is_empty()
+        && (has_reasoning_item
+            || capabilities.tool_reasoning_mode == ProviderToolReasoningMode::ReplayResponsesItems)
+    {
         let tool_call_ids: Vec<String> = tool_calls
             .iter()
             .map(|call| call.tool_call_id.clone())
@@ -585,7 +592,7 @@ pub(super) fn parse_openai_responses_response(
                 config,
                 model_name,
                 "provider Responses tool calls did not include a valid reasoning replay",
-                vec!["responses_reasoning_replay_missing".to_string()],
+                vec!["responses_reasoning_replay_invalid".to_string()],
             ));
         };
         if replay.validate().is_err() {
