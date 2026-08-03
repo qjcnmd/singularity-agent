@@ -1675,6 +1675,22 @@ fn workspace_root_binding_accepts_existing_short_name_ancestor() {
         return;
     };
     let alias_root = short_parent.join("workspace");
+    // The product accepts a short-name spelling only while opening the existing
+    // root and requires the handle-derived display path to normalize to the
+    // long spelling. Skip filesystems that expose a short name but cannot
+    // resolve it back to the long identity, just like the no-short-name case.
+    let alias_identity = singularity_sandbox::expand_windows_path_alias(
+        &std::fs::canonicalize(&alias_root).expect("canonical alias root"),
+    );
+    if alias_identity.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if is_short_name_alias_component(name)
+        )
+    }) {
+        remove_workspace(&parent);
+        return;
+    }
 
     let tools = WorkspaceTools::new(&alias_root).expect("bind workspace through short ancestor");
     let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
@@ -3232,6 +3248,18 @@ fn windows_short_path(path: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(short))
+}
+
+#[cfg(windows)]
+fn is_short_name_alias_component(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    let stem = name.split('.').next().unwrap_or_default();
+    stem.rsplit_once('~').is_some_and(|(prefix, suffix)| {
+        !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.len() <= 6
+            && suffix.chars().all(|character| character.is_ascii_digit())
+    })
 }
 
 #[cfg(unix)]

@@ -432,6 +432,10 @@ mod tests {
         );
 
         assert!(!explicit_deny.as_path().exists());
-        assert!(paths.deny.contains(explicit_deny.as_path()));
+        assert!(
+            paths
+                .deny
+                .contains(&canonicalize_path_allow_missing(explicit_deny.as_path()))
+        );
     }
 }

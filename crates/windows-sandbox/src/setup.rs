@@ -2269,10 +2269,10 @@ mod tests {
             .and_then(Path::parent)
             .expect("repository root")
             .to_path_buf();
-        let work_root = repository.join("work");
+        // The repository root exists in fresh checkouts and keeps `.git` as an ancestor.
         let workspace = tempfile::Builder::new()
             .prefix("setup-filter-")
-            .tempdir_in(&work_root)
+            .tempdir_in(&repository)
             .expect("nested workspace");
         let sandbox_home = workspace.path().join("singularity-home");
         let permission_profile = workspace_write_profile(
