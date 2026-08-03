@@ -313,6 +313,12 @@ fn completed_batch(
     parse_change_buffer(bytes).map(Some)
 }
 
+/// Accumulates one monitor window's notifications into the capture map.
+///
+/// A complete same-path `Added` then `Removed` lifecycle folds back to no change only when the
+/// whole lifecycle was observed by this same monitor; cross-window merging must never apply this
+/// folding (see `merge_workspace_change_observations`). Returns `false` when the capture
+/// path/count/character bounds are exceeded so callers fail closed to `Unknown`.
 fn merge_changes(
     accumulated: &mut BTreeMap<(String, u8), WorkspacePathChange>,
     changes: Vec<WorkspacePathChange>,
@@ -347,6 +353,10 @@ fn merge_changes(
             change,
         );
     }
+    changes_within_bounds(accumulated)
+}
+
+fn changes_within_bounds(accumulated: &BTreeMap<(String, u8), WorkspacePathChange>) -> bool {
     accumulated.len() <= MAX_CAPTURED_PATHS
         && accumulated
             .keys()
@@ -355,6 +365,14 @@ fn merge_changes(
             <= MAX_CAPTURED_PATH_CHARS
 }
 
+/// Merges two observations from different monitor lifetimes, conservatively.
+///
+/// The command-window observation and the trailing stability-guard observation are merged only
+/// as a union: each monitor already applied same-window temporary-lifecycle coalescing, so this
+/// merge must not fold an `Added` from one window against a `Removed` from another. Such a pair
+/// spans two monitor lifetimes and is not a provable temporary lifecycle — an out-of-band writer
+/// between the windows would be erased. `Unknown` dominates, `Unchanged` absorbs, and identical
+/// `(path, kind)` events deduplicate while the capture bounds still fail closed.
 pub(crate) fn merge_workspace_change_observations(
     first: WorkspaceChangeObservation,
     second: WorkspaceChangeObservation,
@@ -370,13 +388,32 @@ pub(crate) fn merge_workspace_change_observations(
             WorkspaceChangeObservation::Changed(second),
         ) => {
             let mut changes = BTreeMap::new();
-            if !merge_changes(&mut changes, first) || !merge_changes(&mut changes, second) {
+            if !merge_cross_window_changes(&mut changes, first)
+                || !merge_cross_window_changes(&mut changes, second)
+            {
                 WorkspaceChangeObservation::Unknown
             } else {
                 WorkspaceChangeObservation::Changed(changes.into_values().collect())
             }
         }
     }
+}
+
+/// Unions one already-coalesced window observation into a cross-window merge.
+///
+/// No lifecycle or ancestor folding is applied across the window boundary; identical
+/// `(path, kind)` events deduplicate and the capture bounds fail closed to `Unknown`.
+fn merge_cross_window_changes(
+    accumulated: &mut BTreeMap<(String, u8), WorkspacePathChange>,
+    changes: Vec<WorkspacePathChange>,
+) -> bool {
+    for change in changes {
+        accumulated.insert(
+            (change.path.clone(), change_kind_order(change.kind)),
+            change,
+        );
+    }
+    changes_within_bounds(accumulated)
 }
 
 fn added_ancestor(accumulated: &BTreeMap<(String, u8), WorkspacePathChange>, path: &str) -> bool {
@@ -614,6 +651,9 @@ mod tests {
 
     #[test]
     fn consecutive_guard_observations_preserve_the_complete_changed_boundary() {
+        // The trailing guard window observes a modification inside the subtree the command
+        // window created. Merging must keep the descendant modification visible instead of
+        // erasing it into the ancestor boundary.
         let merged = merge_workspace_change_observations(
             WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
                 path: ".environment".to_string(),
@@ -627,9 +667,68 @@ mod tests {
 
         assert_eq!(
             merged,
+            WorkspaceChangeObservation::Changed(vec![
+                WorkspacePathChange {
+                    path: ".environment".to_string(),
+                    kind: WorkspacePathChangeKind::Added,
+                },
+                WorkspacePathChange {
+                    path: ".environment/package.py".to_string(),
+                    kind: WorkspacePathChangeKind::Modified,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn cross_window_added_then_removed_pair_remains_changed() {
+        // The command window observed the child create a file and the trailing guard window
+        // observed an out-of-band writer remove it. The same-path lifecycle spans two monitor
+        // lifetimes and must stay Changed: it is not a provable temporary lifecycle of the child.
+        let merged = merge_workspace_change_observations(
             WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
-                path: ".environment".to_string(),
+                path: "temporary.txt".to_string(),
                 kind: WorkspacePathChangeKind::Added,
+            }]),
+            WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "temporary.txt".to_string(),
+                kind: WorkspacePathChangeKind::Removed,
+            }]),
+        );
+
+        assert_eq!(
+            merged,
+            WorkspaceChangeObservation::Changed(vec![
+                WorkspacePathChange {
+                    path: "temporary.txt".to_string(),
+                    kind: WorkspacePathChangeKind::Added,
+                },
+                WorkspacePathChange {
+                    path: "temporary.txt".to_string(),
+                    kind: WorkspacePathChangeKind::Removed,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn cross_window_merge_dedupes_identical_events_and_keeps_bounds() {
+        let merged = merge_workspace_change_observations(
+            WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "shared.txt".to_string(),
+                kind: WorkspacePathChangeKind::Modified,
+            }]),
+            WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "shared.txt".to_string(),
+                kind: WorkspacePathChangeKind::Modified,
+            }]),
+        );
+
+        assert_eq!(
+            merged,
+            WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "shared.txt".to_string(),
+                kind: WorkspacePathChangeKind::Modified,
             }])
         );
     }
