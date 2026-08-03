@@ -107,7 +107,7 @@
 
 - **何时拆分**：一个 Issue 只在当前 blocker / 当前改动的 regression 范围内收敛；相邻缺陷、后续需求、可独立验收的子目标拆为子 Issue。子 Issue 必须自带完整的验收标准与验证计划，能独立关闭。
 - **创建子 Issue**：`gh issue create ... --parent <父编号>`；已存在的 Issue 可用 REST 关联：
-  `gh api repos/qjcnmd/singularity-agent/issues/<父编号>/sub_issues -X POST -f sub_issue_id=<子Issue的数据库id>`。
+  `gh api repos/qjcnmd/singularity-agent/issues/<父编号>/sub_issues -X POST -f sub_issue_id=<子Issue的数据库id>`（子 Issue 的数据库 id 用 `gh api repos/qjcnmd/singularity-agent/issues/<子编号> --jq .id` 获取）。
 - **正文约定**：子 Issue 正文的“父子 Issue 关系”写 `从 #N 分出`；父 Issue 评论中列出 `子 Issue：#a #b`。
 - **依赖与阻断**：创建时用 `--blocked-by <编号>` 声明硬依赖；运行期被阻断时加 `blocked` 标签并评论说明原因与解除条件，解除后移除。被 `blocked` 的 Issue 不得进入 `in-progress`。
 
