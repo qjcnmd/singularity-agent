@@ -3235,9 +3235,12 @@ fn create_dir_junction(target: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn windows_short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt as _;
+
     let command = format!("for %I in (\"{}\") do @echo %~sI", path.display());
     let output = std::process::Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", &command])
+        .raw_arg("/d /s /c ")
+        .raw_arg(&command)
         .output()
         .ok()?;
     if !output.status.success() {

@@ -1844,6 +1844,11 @@ mod tests {
 
     #[test]
     fn nested_new_artifact_under_existing_artifact_directory_is_incidental_when_safe() {
+        use cap_fs_ext::DirExt as _;
+        use cap_std::ambient_authority;
+        use cap_std::fs::Dir;
+        use std::time::{Duration, SystemTime};
+
         let workspace = tempfile::tempdir().expect("workspace");
         let cache = workspace.path().join("__pycache__");
         std::fs::create_dir(&cache).expect("artifact directory");
@@ -1852,6 +1857,19 @@ mod tests {
         let before = snapshot_workspace(workspace.path()).expect("before snapshot");
 
         std::fs::write(cache.join("calculator.pyc"), b"new artifact").expect("new artifact");
+        let cache_directory =
+            Dir::open_ambient_dir(&cache, ambient_authority()).expect("open artifact directory");
+        cache_directory
+            .set_times(
+                ".",
+                None,
+                Some(cap_fs_ext::SystemTimeSpec::Absolute(
+                    cap_std::time::SystemTime::from_std(
+                        SystemTime::now() + Duration::from_secs(10),
+                    ),
+                )),
+            )
+            .expect("touch artifact directory");
         let after = snapshot_workspace(workspace.path()).expect("after snapshot");
         let summary = before
             .change_summary(&after)
