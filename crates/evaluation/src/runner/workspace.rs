@@ -729,7 +729,7 @@ fn metadata_matches(before: &Metadata, after: &Metadata) -> bool {
 fn platform_permissions_cap(metadata: &Metadata) -> u32 {
     #[cfg(unix)]
     {
-        return metadata.permissions().mode();
+        metadata.permissions().mode()
     }
     #[cfg(not(unix))]
     {

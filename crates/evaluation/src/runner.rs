@@ -9015,8 +9015,10 @@ mod tests {
                 .with_sandbox_execution("test", SandboxBackendEnforcement::Strict);
             CommandDiagnostic::new("agent.command", &result)
         };
-        let mut diagnostics = TaskDiagnostics::default();
-        diagnostics.completion_rejection_count = 1;
+        let mut diagnostics = TaskDiagnostics {
+            completion_rejection_count: 1,
+            ..Default::default()
+        };
         diagnostics.agent.commands.push(strict_command());
         let recovered = finish_task(
             &task_id,
