@@ -28,7 +28,7 @@
 
 1. 本项目 Cargo 产物必须写入本地不提交的 `.cargo/config.toml` 或任务级 `CARGO_TARGET_DIR` 指定的专用 target 目录，不得静默回落到工作区 `target/`；运行 Cargo 前用 `cargo metadata --no-deps --format-version 1 --locked` 核对 `target_directory`。不提交机器专用绝对路径配置。
 2. 默认保留本项目 Cargo 增量编译缓存，不在任务结束时执行 `cargo clean`；仅当缓存损坏、Rust 工具链切换、产物归属不明、专用 target 磁盘空间不足或用户明确要求时，才在核对 target 后清理。
-3. 临时 Evaluation、日志、一次性 Worktree、测试临时目录和任务临时文件在每次任务结束时清理；用户明确要求保留时除外。
+3. Evaluation 的临时 scratch、日志、一次性 Worktree、测试临时目录和其他任务临时文件在每次任务结束时清理；Evaluation run 的发布产物和失败/取消时保留的不完整运行证据按输出契约保留，不当作临时文件删除。
 4. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
 5. 最终回复说明产物实际写入位置、保留的 Cargo 缓存、已清理内容、清理失败项和保留原因。
 
@@ -36,21 +36,22 @@
 
 1. Singularity 的核心产品运行时、公共协议、安全边界和发布二进制使用 Rust。允许为构建、测试、审计或维护引入职责明确的主流辅助工具，但不得形成第二套产品运行时、绕过 Rust 主链路或安全协议，也不得恢复 Python agent runtime、sidecar 或兼容入口。
 2. 目标仓库可以使用 Python、Rust、Node.js、Go 或其他语言；命令工具应在严格 sandbox 中使用宿主机 `PATH` 已安装的工具链，不得把实现语言边界误作目标仓库能力限制。
-3. `sg` 只通过 stdio JSON-RPC 调用 `singularity_app_server`；CLI 不直接依赖 agent、model、tools 或 store crate。
-4. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
-5. Evaluation 使用 `evaluation`、`eval`、`task`、`task set`、`runner`、`result`、`report` 等主流命名，不恢复迁移期自造分类。
+3. 当前 `sg` 的线程、turn、`AgentLoop`、工具和 `Store` 产品运行时仅通过 stdio JSON-RPC 调用 `singularity_app_server`；CLI 可直接调用共享的 `singularity_model` 配置库完成用户级 Provider 配置导入、模型目录读取/刷新和脱敏诊断，不在 CLI 中创建 `AgentLoop`、执行 turn 或维护 `Store` 状态；CLI 不直接依赖 `singularity_agent`、`singularity_tools` 或 `singularity_store`。
+4. 终端 TUI 和桌面 App 是同一无界面（headless）产品运行时的客户端；`singularity_app_server` 单一拥有 thread、turn、`AgentLoop`、工具和 `Store`，共享的 `singularity_model` 配置库是 Provider config、catalog 和 auth refs 的单一事实源，供 CLI、未来 Rust app backend 和 App Server RPC 复用。客户端接入沿该边界按需选择 transport；当前 `sg` 使用 stdio JSON-RPC，不将 stdio 固化为所有未来客户端的永久唯一 transport，也不为此预建多客户端编排、第二 daemon、插件运行时或重复状态。
+5. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
+6. Evaluation 使用 `evaluation`、`eval`、`task`、`task set`、`runner`、`result`、`report` 等主流命名，不恢复迁移期自造分类。
 
 ## Sandbox 上游复用边界
 
 - `crates/windows-sandbox` 负责 Windows 账户、ACL、WFP、Job Object、setup、路径保护和进程生命周期；优先复用或轻量移植官方 `openai/codex` 中与当前威胁模型匹配的成熟 Win32 机制，但使用 Singularity 自有二进制、账户、GUID、配置和状态，不共享本机 Codex 实例或安全状态。
 - `crates/sandbox` 只把通用 permission profile 投影到平台实现并返回 typed execution result，不维护第二套 ACL、setup、observer 或进程生命周期事实。
-- 只保留当前消费者需要的 strict workspace-write/read-only、protected paths、network denied、Job Object、取消/超时、workspace change 和失败关闭。PTY、ConPTY、managed proxy、GUI/desktop、多会话服务、Codex 配置协议和 telemetry 等没有当前消费者的表面不建立兼容层。
+- 只保留当前消费者需要的 strict workspace-write/read-only、protected paths、network denied、Job Object、取消/超时、workspace change 和失败关闭；终端 TUI 和桌面 App 复用同一无界面（headless）产品运行时，客户端 UI 与 transport surface 按实现阶段的真实需求增加。当前不预建 PTY、ConPTY、managed proxy、多会话服务、Codex 配置协议和 telemetry 等尚无具体消费者的兼容表面。
 - 上游采用点、必要本地差异和明确省略项记录在 `crates/windows-sandbox/UPSTREAM.md`。本地严格增强必须有直接威胁或运行证据；未知变更、monitor 丢失、路径身份不明和 enforcement 不可用继续失败关闭，不使用 local-process fallback 或环境特判。
 
 ## Agent、Provider 与 Evaluation 边界
 
 - 模型可见产品工具由单一注册事实源产生；功能任务不通过 Evaluation task、required capability 或内部阶段维护第二套工具表面。工具选择自由与权限控制分离，副作用由 Policy、Approval 和 OS sandbox 约束。
-- Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 从开始到结束固定 `provider_id`、`model_id`、API protocol 和相关模型参数；不在运行途中自动路由、轮换或 fallback。
+- Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 在任何完成请求前固定 `provider_id`、`model_id`、已选 API protocol 和相关模型参数；能力协商可依据声明或协议证据在完成请求前确定单一 protocol，但完成请求中不自动路由、轮换或 fallback。
 - Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
 - Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
 - `functional_task_success`、`agent_protocol_success` 与 `sandbox_security_success` 分别计算、发布和归因；外部门禁可以同时要求三者，但不得合并成无法定位责任层的单一失败。Evaluator 保护自身 patch、tests、`.git` 和依赖/系统路径，并审计异常改动，不用路径白名单向模型泄露答案位置或阻止合理跨文件修复。
@@ -84,7 +85,7 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 - 采用“删除优先、合并其次、新增最后”。新增 crate、Trait、Manager、Service、Repository、Adapter、Schema、缓存、锁或消息机制，必须有当前消费者，或明确建立安全、事务、平台、协议、恢复或测试替身边界；否则使用私有函数、枚举或小型内部结构。
 - 同一事实只能有一个权威来源。不得用并行数组、重复 DTO、动态 JSON、JSON/SQLite 双权威、长期双轨 checkpoint、无消费者兼容表或纯转发层维持状态。
 - 保留安全和一致性所需的复杂度：受限令牌、ACL、Job Object、路径能力、TOCTOU、Approval/Policy、Checkpoint/迁移、Completion/Verification、Provider 能力协商、Tool 信任边界、JSON-RPC、Trace/Audit/Evaluation。不得以“简化”为名降低权限、恢复能力、错误区分或失败关闭。
-- App Server 当前只需清晰表达 stdio transport、JSON-RPC、请求/Turn 生命周期、事件输出、取消、关闭和 Store/Provider 初始化；不得引入 Broker、CQRS、Event Sourcing、分布式队列、多租户连接或通用工作流框架。
+- App Server 当前以 stdio transport 清晰表达 JSON-RPC、请求/Turn 生命周期、事件输出、取消、关闭和 Store/Provider 初始化；未来 TUI 与桌面 App 的接入仍复用这一 runtime owner，transport 只按实际消费者需求扩展，不预建 Broker、CQRS、Event Sourcing、分布式队列、多租户连接或通用工作流框架。
 - Provider、Store、Tool、Evaluation 的抽象必须对应真实消费者和不变量。指标只计算一次再投影；缓存失败是否可视为 miss 应按真实并发和安全合同决定，不为统一而制造反向依赖。
 
 ## 测试与验证
@@ -102,6 +103,7 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 | Evaluation runner、task success 归约或端到端能力 | 先做确定性归约回归，再运行实际受影响 task 的单 trial；该 trial 通过且候选稳定后，才运行一次完整冻结 Evaluation |
 
 - 已通过且未受后续 diff 影响的证据保持有效，不因任务结束、push、CI 修复或文档提交机械重跑。
+- 本地测试默认使用显式 mock 配置（Provider、模型、地址、测试 key），不得读取真实用户级配置、凭据或外部服务；隔离后的测试失败才按产品缺陷处理。
 - 完整构建、全仓测试、跨平台验证和完整 Evaluation 只有在实际影响范围无法由更窄证据证明时运行。完整 Evaluation 不是模型调用链改动后的首次真实测试。
 - 不新增或操纵 Trial 重采样、预算、timeout、门禁、task、工具权限或隐藏答案来赌分。真实 Provider Task 首次正确完成即为有效证据；失败保留首个错误、阶段和耗时，只修通用根因。
 - 默认不运行 Codex Security 扫描；只有用户明确要求使用时才运行。
