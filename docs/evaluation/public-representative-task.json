@@ -114,90 +114,6 @@
       }
     },
     {
-      "task_id": "receipt_calculator__multi_line_receipt",
-      "description": "Small local Python representative task for multi-line decimal receipt totals.",
-      "capabilities": [
-        "multi_file_change",
-        "python",
-        "failure_diagnosis",
-        "required_verification",
-        "sandbox_enforcement"
-      ],
-      "workspace": {
-        "source": {
-          "type": "local",
-          "path": "fixtures/receipt-calculator"
-        }
-      },
-      "agent": {
-        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
-      },
-      "evaluator": {
-        "public_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/test_public_receipt.py b/tests/test_public_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_public_receipt.py\n@@ -0,0 +1,23 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class PublicReceiptTests(unittest.TestCase):\n+    def test_public_receipt_aggregates_all_lines(self):\n+        items = [(\"2.50\", 2), (\"1.25\", 3)]\n+        self.assertEqual(subtotal(items), Decimal(\"8.75\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.10\"),\n+            {\n+                \"subtotal\": Decimal(\"8.75\"),\n+                \"tax\": Decimal(\"0.88\"),\n+                \"total\": Decimal(\"9.63\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
-        },
-        "hidden_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/test_hidden_receipt.py b/tests/test_hidden_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_hidden_receipt.py\n@@ -0,0 +1,26 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class HiddenReceiptTests(unittest.TestCase):\n+    def test_empty_subtotal_is_zero(self):\n+        self.assertEqual(subtotal([]), Decimal(\"0.00\"))\n+\n+    def test_hidden_receipt_rounds_fractional_tax_after_all_lines(self):\n+        items = [(\"19.99\", 1), (\"0.01\", 1)]\n+        self.assertEqual(subtotal(items), Decimal(\"20.00\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.075\"),\n+            {\n+                \"subtotal\": Decimal(\"20.00\"),\n+                \"tax\": Decimal(\"1.50\"),\n+                \"total\": Decimal(\"21.50\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
-        },
-        "baseline": {
-          "commands": [
-            {
-              "argv": [
-                "python",
-                "-B",
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_public_receipt.py"
-              ],
-              "timeout_seconds": 60
-            }
-          ]
-        },
-        "public": {
-          "commands": [
-            {
-              "argv": [
-                "python",
-                "-B",
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_public_receipt.py"
-              ],
-              "timeout_seconds": 60
-            }
-          ]
-        },
-        "hidden": {
-          "commands": [
-            {
-              "argv": [
-                "python",
-                "-B",
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_hidden_receipt.py"
-              ],
-              "timeout_seconds": 60
-            }
-          ]
-        }
-      }
-    },
-    {
       "task_id": "rust_node_calculator__multi_line_total",
       "description": "Local cross-language task proving host Cargo and Node execution in the strict Windows sandbox.",
       "capabilities": [
@@ -229,58 +145,20 @@
         },
         "baseline": {
           "commands": [
-            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
-            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
-          ]
-        },
-        "public": {
-          "commands": [
-            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
-            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
-          ]
-        },
-        "hidden": {
-          "commands": [
-            {"argv": ["cargo", "test", "--locked", "--test", "hidden"], "timeout_seconds": 120},
-            {"argv": ["node", "hidden_test.mjs"], "timeout_seconds": 30}
-          ]
-        }
-      }
-    },
-    {
-      "task_id": "node_inventory__summary",
-      "description": "Local Node.js representative task for multi-file inventory summaries.",
-      "capabilities": [
-        "node",
-        "feature_implementation",
-        "multi_file_change",
-        "required_verification",
-        "sandbox_enforcement"
-      ],
-      "workspace": {
-        "source": {
-          "type": "local",
-          "path": "fixtures/node-inventory"
-        }
-      },
-      "agent": {
-        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
-      },
-      "evaluator": {
-        "public_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/public_inventory.mjs b/tests/public_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public_inventory.mjs\n@@ -0,0 +1,20 @@\n+import assert from \"node:assert/strict\";\n+import { inventoryLine } from \"../catalog.mjs\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(inventoryLine({\n+  sku: \"A-17\",\n+  unitPrice: 4.5,\n+  quantity: 2,\n+  reorderPoint: 3,\n+}), {\n+  sku: \"A-17\",\n+  units: 2,\n+  reorderPoint: 3,\n+  value: 9,\n+});\n+\n+const result = summarizeInventory([\n+  { sku: \"A-17\", unitPrice: 4.5, quantity: 2, reorderPoint: 3 },\n+  { sku: \"B-04\", unitPrice: 3, quantity: 5, reorderPoint: 4 },\n+]);\n+\n+assert.deepEqual(result, {\n+  totalUnits: 7,\n+  totalValue: 24,\n+  lowStockSkus: [\"A-17\"],\n+});\n"
-        },
-        "hidden_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/hidden_inventory.mjs b/tests/hidden_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/hidden_inventory.mjs\n@@ -0,0 +1,19 @@\n+import assert from \"node:assert/strict\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(summarizeInventory([]), {\n+  totalUnits: 0,\n+  totalValue: 0,\n+  lowStockSkus: [],\n+});\n+\n+const edgeCase = summarizeInventory([\n+  { sku: \"C-09\", unitPrice: 1.25, quantity: 0, reorderPoint: 0 },\n+  { sku: \"D-02\", unitPrice: 2.5, quantity: 4, reorderPoint: 5 },\n+]);\n+\n+assert.deepEqual(edgeCase, {\n+  totalUnits: 4,\n+  totalValue: 10,\n+  lowStockSkus: [\"C-09\", \"D-02\"],\n+});\n"
-        },
-        "baseline": {
-          "commands": [
+            {
+              "argv": [
+                "cargo",
+                "test",
+                "--locked",
+                "--test",
+                "public"
+              ],
+              "timeout_seconds": 120
+            },
             {
               "argv": [
                 "node",
-                "tests/public_inventory.mjs"
+                "public_test.mjs"
               ],
               "timeout_seconds": 30
             }
@@ -290,8 +168,18 @@
           "commands": [
             {
               "argv": [
+                "cargo",
+                "test",
+                "--locked",
+                "--test",
+                "public"
+              ],
+              "timeout_seconds": 120
+            },
+            {
+              "argv": [
                 "node",
-                "tests/public_inventory.mjs"
+                "public_test.mjs"
               ],
               "timeout_seconds": 30
             }
@@ -301,8 +189,18 @@
           "commands": [
             {
               "argv": [
+                "cargo",
+                "test",
+                "--locked",
+                "--test",
+                "hidden"
+              ],
+              "timeout_seconds": 120
+            },
+            {
+              "argv": [
                 "node",
-                "tests/hidden_inventory.mjs"
+                "hidden_test.mjs"
               ],
               "timeout_seconds": 30
             }

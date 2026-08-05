@@ -417,14 +417,12 @@ trusted workspace-preparation 的来源标志只由进程内 Rust API 构造，�
 
 Feedback 模式选择 manifest 中第一个本地 task（没有本地 task 时选择第一个 task）并固定执行一次 trial，不增加单独的选择配置。该模式仍执行同一 strict preflight、source、setup、baseline、Agent、public、hidden、trace 和 typed report 路径，但只写 run 根目录的 `report.json`，不生成 Result/Evidence/Publication，`gate_applicable=false`；CLI 只把执行阻塞作为错误，不把 task 失败当作门禁失败。Full 模式执行全部 task × manifest `trial_count` 并保持 Result v9、Evidence v4、Publication v1 和正式 gate。
 
-当前五个代表性 task 的 manifest capabilities 如下；它们是任务元数据，不选择工具、权限或 gate。
+当前三个代表性 task 的 manifest capabilities 如下；它们是任务元数据，不选择工具、权限或 gate。
 
 | task | 主要 capabilities | 默认 feedback |
 | --- | --- | --- |
 | `sqlfluff__sqlfluff-2419` | `single_file_fix`, `python`, `repository_context`, `required_verification`, `sandbox_enforcement` | 否 |
-| `receipt_calculator__multi_line_receipt` | `multi_file_change`, `python`, `failure_diagnosis`, `required_verification`, `sandbox_enforcement` | 是 |
-| `rust_node_calculator__multi_line_total` | `multi_file_change`, `rust`, `node`, `mixed_stack`, `failure_diagnosis`, `required_verification`, `sandbox_enforcement` | 否 |
-| `node_inventory__summary` | `node`, `feature_implementation`, `multi_file_change`, `required_verification`, `sandbox_enforcement` | 否 |
+| `rust_node_calculator__multi_line_total` | `multi_file_change`, `rust`, `node`, `mixed_stack`, `failure_diagnosis`, `required_verification`, `sandbox_enforcement` | 是 |
 | `repository_context__billing_report` | `repository_context`, `multi_file_change`, `failure_diagnosis`, `python`, `required_verification`, `sandbox_enforcement` | 否 |
 
 完整 Evaluation 的 `report.json` 使用 `evaluation.report/v1`：只投影 timing、provider usage/token、provider/capability/source-template cache、control-loop counters、failure attribution、三维 gates，以及直接复用的 `EvaluationTaskResult`（其中包含 task stability）。Report 与 Evidence/Sandbox/Trace 的职责分离：安全与归因事实由后者保存，report 不建立第二套细节 DTO。每个 report metric 都保留 `available` 或 `unavailable` 状态；没有 producer 或没有观测到数据时分别标记 `no_producer` 或 `not_observed`，不以零填充。完整 Evaluation 的 `evidence.json` 使用 `evaluation.evidence/v4`：task 级绑定 manifest、task selection 和 prepared source；run-level 零采样 blocker 只保留 task identity projection，不生成 trial evidence；正常 trial 级绑定 changed paths、真实 patch、trace、同一 trial workspace 上的 baseline/agent/public/hidden scope、sandbox/fallback 观察、真实 prompt 的安全结构投影与 SHA-256、最终实际五工具 schema SHA-256，以及不含 provider/model 原名、endpoint 或凭证的 provider/model/negotiation 指纹、API protocol 与 contract/metadata 指纹。完整脱敏 protocol contract 和 capability metadata 保存在该 trial 的 `agent-trace.json`，evidence 通过 trace digest 绑定它们；原始 prompt、raw response、raw arguments、完整 `ToolResult`、密钥和 base URL 不落盘，evaluator patch 与 hidden command 不进入模型输入。passed trial 必须同时具备 source、trace、prompt/schema 和已协商 provider 证据。

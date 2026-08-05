@@ -61,7 +61,7 @@ fn public_representative_task_uses_the_current_runtime_contract() {
 
     assert_eq!(manifest.task_set().schema_version, TaskSetSchemaVersion::V6);
     assert_eq!(manifest.task_set().trial_count, 2);
-    assert_eq!(manifest.task_set().tasks.len(), 5);
+    assert_eq!(manifest.task_set().tasks.len(), 3);
     assert!(
         manifest
             .task_set()
