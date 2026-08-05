@@ -663,22 +663,50 @@ fn derive_trace_metric(
     })
 }
 
-fn span_ends(kind: TraceSpanKind, events: &[TraceEvent]) -> Vec<&TraceEvent> {
-    events
-        .iter()
-        .filter(|event| {
-            event.span_kind == Some(kind) && event.span_phase == Some(TraceSpanPhase::End)
-        })
-        .collect()
-}
+/// Only expose terminal samples from an identity-complete span population.
+///
+/// A duration or end-derived metric must not report a partial distribution while another
+/// occurrence of the same span kind is still open (or has no matching start). Pairing by
+/// `span_id` also catches equal start/end counts with different identities.
+fn span_ends(
+    kind: TraceSpanKind,
+    events: &[TraceEvent],
+) -> Result<Vec<&TraceEvent>, TraceMetricUnavailableReason> {
+    let mut starts = BTreeSet::new();
+    let mut ends = BTreeSet::new();
+    let mut end_events = Vec::new();
+    let mut saw_kind = false;
+    let mut malformed = false;
 
-fn span_starts(kind: TraceSpanKind, events: &[TraceEvent]) -> usize {
-    events
-        .iter()
-        .filter(|event| {
-            event.span_kind == Some(kind) && event.span_phase == Some(TraceSpanPhase::Start)
-        })
-        .count()
+    for event in events.iter().filter(|event| event.span_kind == Some(kind)) {
+        saw_kind = true;
+        let Some(span_id) = event.span_id.as_deref() else {
+            malformed = true;
+            continue;
+        };
+        match event.span_phase {
+            Some(TraceSpanPhase::Start) => {
+                if !starts.insert(span_id) {
+                    malformed = true;
+                }
+            }
+            Some(TraceSpanPhase::End) => {
+                if !ends.insert(span_id) {
+                    malformed = true;
+                }
+                end_events.push(event);
+            }
+            None => malformed = true,
+        }
+    }
+
+    if !saw_kind {
+        return Err(TraceMetricUnavailableReason::NoProducer);
+    }
+    if malformed || starts != ends {
+        return Err(TraceMetricUnavailableReason::IncompleteStartEnd);
+    }
+    Ok(end_events)
 }
 
 fn duration_values(
@@ -690,23 +718,16 @@ fn duration_values(
     if legacy_only {
         return (legacy_only_availability(), Vec::new());
     }
-    let ends = span_ends(kind, events);
-    if ends.is_empty() {
-        return (
-            if span_starts(kind, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        );
-    }
+    let ends = match span_ends(kind, events) {
+        Ok(ends) => ends,
+        Err(reason) => return (unavailable(reason), Vec::new()),
+    };
     let values = ends
         .iter()
         .filter_map(|event| event.duration_ms)
         .collect::<Vec<_>>();
-    if values.len() != ends.len() {
-        return (unavailable(missing_reason), Vec::new());
+    if values.is_empty() {
+        return (unavailable(missing_reason), values);
     }
     (TraceMetricAvailability::Available, values)
 }
@@ -719,17 +740,10 @@ fn count_values(
     if legacy_only {
         return (legacy_only_availability(), Vec::new());
     }
-    let ends = span_ends(kind, events);
-    if ends.is_empty() {
-        return (
-            if span_starts(kind, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        );
-    }
+    let ends = match span_ends(kind, events) {
+        Ok(ends) => ends,
+        Err(reason) => return (unavailable(reason), Vec::new()),
+    };
     (
         TraceMetricAvailability::Available,
         std::iter::repeat_n(1, ends.len()).collect(),
@@ -749,47 +763,35 @@ where
     if legacy_only {
         return (legacy_only_availability(), Vec::new());
     }
-    let ends = span_ends(kind, events);
-    if ends.is_empty() {
-        return (
-            if span_starts(kind, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        );
-    }
+    let ends = match span_ends(kind, events) {
+        Ok(ends) => ends,
+        Err(reason) => return (unavailable(reason), Vec::new()),
+    };
     let values = ends
         .iter()
         .filter_map(|event| event.span_projection.as_ref().and_then(&select))
         .collect::<Vec<_>>();
     if values.is_empty() {
-        (unavailable(missing_reason), values)
-    } else {
-        (TraceMetricAvailability::Available, values)
+        return (unavailable(missing_reason), values);
     }
+    (TraceMetricAvailability::Available, values)
 }
 
 fn ttft_values(events: &[TraceEvent], legacy_only: bool) -> (TraceMetricAvailability, Vec<u64>) {
     if legacy_only {
         return (legacy_only_availability(), Vec::new());
     }
-    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
-    if ends.is_empty() {
-        return (
-            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        );
-    }
+    let ends = match span_ends(TraceSpanKind::ProviderAttempt, events) {
+        Ok(ends) => ends,
+        Err(reason) => return (unavailable(reason), Vec::new()),
+    };
     let values = ends
         .iter()
         .filter_map(|event| event.time_to_first_token_ms)
         .collect::<Vec<_>>();
+    if values.len() == ends.len() {
+        return (TraceMetricAvailability::Available, values);
+    }
     if !values.is_empty() {
         return (TraceMetricAvailability::Available, values);
     }
@@ -830,17 +832,10 @@ where
     if legacy_only {
         return (legacy_only_availability(), Vec::new());
     }
-    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
-    if ends.is_empty() {
-        return (
-            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        );
-    }
+    let ends = match span_ends(TraceSpanKind::ProviderAttempt, events) {
+        Ok(ends) => ends,
+        Err(reason) => return (unavailable(reason), Vec::new()),
+    };
     let values = ends
         .iter()
         .filter_map(|event| {
@@ -852,13 +847,12 @@ where
         })
         .collect::<Vec<_>>();
     if values.is_empty() {
-        (
+        return (
             unavailable(TraceMetricUnavailableReason::MissingUsage),
             values,
-        )
-    } else {
-        (TraceMetricAvailability::Available, values)
+        );
     }
+    (TraceMetricAvailability::Available, values)
 }
 
 fn provider_error_values(
@@ -868,17 +862,10 @@ fn provider_error_values(
     if legacy_only {
         return Ok((legacy_only_availability(), Vec::new()));
     }
-    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
-    if ends.is_empty() {
-        return Ok((
-            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        ));
-    }
+    let ends = match span_ends(TraceSpanKind::ProviderAttempt, events) {
+        Ok(ends) => ends,
+        Err(reason) => return Ok((unavailable(reason), Vec::new())),
+    };
     let error_count = ends
         .iter()
         .filter(|event| {
@@ -915,17 +902,10 @@ fn tool_outcomes(
     if legacy_only {
         return Ok((legacy_only_availability(), Vec::new()));
     }
-    let ends = span_ends(TraceSpanKind::ToolCall, events);
-    if ends.is_empty() {
-        return Ok((
-            if span_starts(TraceSpanKind::ToolCall, events) > 0 {
-                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
-            } else {
-                unavailable(TraceMetricUnavailableReason::NoProducer)
-            },
-            Vec::new(),
-        ));
-    }
+    let ends = match span_ends(TraceSpanKind::ToolCall, events) {
+        Ok(ends) => ends,
+        Err(reason) => return Ok((unavailable(reason), Vec::new())),
+    };
     let mut outcomes = Vec::with_capacity(ends.len());
     for event in ends {
         let generic_status = event.span_status.ok_or_else(|| {
@@ -1435,4 +1415,77 @@ pub(crate) fn select_trace_turn_bindings(
         }
     }
     Ok(bindings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metric_span(
+        event_id: &str,
+        span_id: &str,
+        phase: TraceSpanPhase,
+        duration_ms: u64,
+    ) -> TraceEvent {
+        let mut event = TraceEvent::new(event_id, "metric_run", "metric_session", "trace", "span");
+        event.span_id = Some(span_id.to_string());
+        event.span_kind = Some(TraceSpanKind::Turn);
+        event.span_phase = Some(phase);
+        if phase == TraceSpanPhase::End {
+            event.span_status = Some(TraceSpanStatus::Ok);
+            event.duration_ms = Some(duration_ms);
+        }
+        event
+    }
+
+    fn turn_duration(events: &[TraceEvent]) -> TraceMetric {
+        derive_trace_metrics("metric_run", events)
+            .expect("derive trace metrics")
+            .metric("turn_duration_ms")
+            .expect("turn duration metric")
+            .clone()
+    }
+
+    fn assert_incomplete(events: &[TraceEvent]) {
+        let metric = turn_duration(events);
+        assert_eq!(
+            metric.availability,
+            TraceMetricAvailability::Unavailable {
+                reason: TraceMetricUnavailableReason::IncompleteStartEnd
+            }
+        );
+        assert!(metric.distribution.is_none());
+    }
+
+    #[test]
+    fn span_metric_reducer_keeps_complete_pairs_available() {
+        let metric = turn_duration(&[
+            metric_span("turn_start", "turn", TraceSpanPhase::Start, 0),
+            metric_span("turn_end", "turn", TraceSpanPhase::End, 7),
+        ]);
+        assert_eq!(metric.availability, TraceMetricAvailability::Available);
+        assert_eq!(metric.distribution.as_ref().map(|value| value.sum), Some(7));
+    }
+
+    #[test]
+    fn span_metric_reducer_fails_closed_for_mismatched_span_ids() {
+        assert_incomplete(&[
+            metric_span("turn_start", "started", TraceSpanPhase::Start, 0),
+            metric_span("turn_end", "other", TraceSpanPhase::End, 7),
+        ]);
+    }
+
+    #[test]
+    fn mixed_duration_population_publishes_observed_values() {
+        let mut missing_duration = metric_span("b_end", "b", TraceSpanPhase::End, 0);
+        missing_duration.duration_ms = None;
+        let metric = turn_duration(&[
+            metric_span("a_start", "a", TraceSpanPhase::Start, 0),
+            metric_span("a_end", "a", TraceSpanPhase::End, 7),
+            metric_span("b_start", "b", TraceSpanPhase::Start, 0),
+            missing_duration,
+        ]);
+        assert_eq!(metric.availability, TraceMetricAvailability::Available);
+        assert_eq!(metric.distribution.as_ref().map(|value| value.sum), Some(7));
+    }
 }
