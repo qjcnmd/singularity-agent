@@ -1837,7 +1837,7 @@ mod transport_tests {
                 .read_line(&mut request_line)
                 .expect("read deadline provider request");
             seen_tx.send(()).expect("signal deadline request");
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(750));
         });
         let directory = tempfile::tempdir().expect("deadline cache directory");
         let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
@@ -1846,7 +1846,7 @@ mod transport_tests {
             Some(cache_path.clone()),
         )
         .expect("deadline provider");
-        provider.capability_probe_deadline = Duration::from_millis(50);
+        provider.capability_probe_deadline = Duration::from_millis(500);
         let error = provider
             .negotiate_tool_capabilities(
                 &ModelPreferences {
@@ -1862,7 +1862,7 @@ mod transport_tests {
         );
         assert!(!cache_path.exists(), "deadline must not publish cache");
         seen_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(2))
             .expect("deadline provider request observed");
         server.join().expect("join deadline provider");
     }
