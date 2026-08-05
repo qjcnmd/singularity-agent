@@ -60,7 +60,7 @@ fn public_representative_task_uses_the_current_runtime_contract() {
     let manifest = EvaluationManifest::load(manifest_path).expect("public manifest is runnable");
 
     assert_eq!(manifest.task_set().schema_version, TaskSetSchemaVersion::V6);
-    assert_eq!(manifest.task_set().trial_count, 2);
+    assert_eq!(manifest.task_set().trial_count, 1);
     assert_eq!(manifest.task_set().tasks.len(), 5);
     assert!(
         manifest
