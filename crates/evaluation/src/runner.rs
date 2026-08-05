@@ -944,9 +944,9 @@ pub fn run_evaluation_with_mode(
 ) -> Result<EvaluationRunResult, EvaluationRunError> {
     let feedback_mode = matches!(mode, EvaluationRunMode::Feedback);
     let run_started = Instant::now();
-    if !(1..=2).contains(&params.max_workers) {
+    if !(1..=8).contains(&params.max_workers) {
         return Err(EvaluationRunError::input(
-            "evaluation max_workers must be between 1 and 2",
+            "evaluation max_workers must be between 1 and 8",
         ));
     }
     if cancellation.is_cancelled() {

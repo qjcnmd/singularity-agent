@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn max_workers_cli_rejects_zero_and_values_above_two() {
-        for value in ["0", "3"] {
+        for value in ["0", "9"] {
             let error = Cli::try_parse_from([
                 "singularity-evaluation",
                 "run",
