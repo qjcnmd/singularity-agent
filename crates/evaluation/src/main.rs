@@ -270,10 +270,7 @@ mod tests {
         );
         assert_eq!(
             resolve_max_workers(&full, None, || {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "parallelism unavailable",
-                ))
+                Err(std::io::Error::other("parallelism unavailable"))
             }),
             1
         );

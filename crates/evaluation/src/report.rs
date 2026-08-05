@@ -552,6 +552,19 @@ fn validate_ratio(metric: &MetricValue<MetricRatio>, context: &str) -> Result<()
     Ok(())
 }
 
+/// Map a Result/v9 blocker to the report's typed owner.
+pub fn failure_owner_for_blocker(kind: BlockerKind) -> FailureOwner {
+    match kind {
+        BlockerKind::Environment | BlockerKind::WorkspacePreparation => FailureOwner::Environment,
+        BlockerKind::ProviderConfiguration
+        | BlockerKind::ProviderResponse
+        | BlockerKind::ProviderAuthentication
+        | BlockerKind::Network => FailureOwner::Provider,
+        BlockerKind::Sandbox => FailureOwner::Sandbox,
+        BlockerKind::AgentRuntime => FailureOwner::Harness,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,18 +590,5 @@ mod tests {
                 ..
             }
         ));
-    }
-}
-
-/// Map a Result/v9 blocker to the report's typed owner.
-pub fn failure_owner_for_blocker(kind: BlockerKind) -> FailureOwner {
-    match kind {
-        BlockerKind::Environment | BlockerKind::WorkspacePreparation => FailureOwner::Environment,
-        BlockerKind::ProviderConfiguration
-        | BlockerKind::ProviderResponse
-        | BlockerKind::ProviderAuthentication
-        | BlockerKind::Network => FailureOwner::Provider,
-        BlockerKind::Sandbox => FailureOwner::Sandbox,
-        BlockerKind::AgentRuntime => FailureOwner::Harness,
     }
 }

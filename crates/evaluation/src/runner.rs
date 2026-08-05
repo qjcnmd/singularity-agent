@@ -1091,7 +1091,6 @@ pub fn run_evaluation_with_mode(
                 &run_dir,
                 manifest_digest,
                 &plans,
-                trials_per_task,
                 result,
                 preflight,
                 elapsed_ms(run_started),
@@ -1142,7 +1141,6 @@ pub fn run_evaluation_with_mode(
             &run_dir,
             manifest_digest,
             &plans,
-            trials_per_task,
             result,
             sandbox_preflight_evidence(&preflight),
             elapsed_ms(run_started),
@@ -1188,7 +1186,6 @@ pub fn run_evaluation_with_mode(
             &run_dir,
             manifest_digest,
             &plans,
-            trials_per_task,
             result,
             sandbox_preflight_evidence(&preflight),
             elapsed_ms(run_started),
@@ -1905,24 +1902,24 @@ fn build_failure_attributions(
     executions: &[TaskEvaluation],
 ) -> Vec<FailureAttribution> {
     let mut failures = Vec::new();
-    if executions.is_empty() {
-        if let Some(blocker) = &result.blocker {
-            let (owner, stage) = source_cache_attribution_override(blocker.code.as_deref())
-                .unwrap_or_else(|| {
-                    (
-                        failure_owner_for_blocker(blocker.kind),
-                        FailureStage::Evaluation,
-                    )
-                });
-            failures.push(FailureAttribution {
-                owner,
-                stage,
-                task_id: blocker.task_id.clone(),
-                trial: None,
-                code: blocker.code.clone(),
-                message: blocker.message.clone(),
+    if executions.is_empty()
+        && let Some(blocker) = &result.blocker
+    {
+        let (owner, stage) = source_cache_attribution_override(blocker.code.as_deref())
+            .unwrap_or_else(|| {
+                (
+                    failure_owner_for_blocker(blocker.kind),
+                    FailureStage::Evaluation,
+                )
             });
-        }
+        failures.push(FailureAttribution {
+            owner,
+            stage,
+            task_id: blocker.task_id.clone(),
+            trial: None,
+            code: blocker.code.clone(),
+            message: blocker.message.clone(),
+        });
     }
     for execution in executions {
         for trial in &execution.trials {
@@ -2060,7 +2057,6 @@ fn publish_zero_sampling_blocked_run(
     run_dir: &Path,
     manifest_digest: String,
     plans: &[WorkspacePlan],
-    trials_per_task: u32,
     result: EvaluationResult,
     preflight: EvaluationSandboxPreflight,
     run_duration_ms: u64,
@@ -2078,7 +2074,7 @@ fn publish_zero_sampling_blocked_run(
         run_id,
         manifest_digest,
         plans,
-        trials_per_task,
+        result.summary.trials_per_task,
         preflight.clone(),
         &result,
     ) {
