@@ -642,7 +642,11 @@ fn validate_replay_preflight(input: &AgentLoopInput) -> Result<(), String> {
         .and_then(|selector| selector.split_once('/'))
         .and_then(|(_, model_and_effort)| model_and_effort.split_once('#'))
         .map(|(model, _)| model)
-        .or_else(|| selector.and_then(|selector| selector.split_once('/')).map(|(_, rest)| rest));
+        .or_else(|| {
+            selector
+                .and_then(|selector| selector.split_once('/'))
+                .map(|(_, rest)| rest)
+        });
     let selector_effort = selector
         .and_then(|selector| selector.rsplit_once('#'))
         .map(|(_, effort)| effort);
@@ -6821,9 +6825,7 @@ mod cancellation_tests {
     fn prepare_seed_messages_preserves_compaction_summary_and_replaces_leading_developer() {
         let summary = ModelMessage::text(
             ModelRole::Developer,
-            format!(
-                "{COMPACTION_SUMMARY_PREFIX}\"omitted_message_count\":3}}"
-            ),
+            format!("{COMPACTION_SUMMARY_PREFIX}\"omitted_message_count\":3}}"),
         );
         let old_leading = ModelMessage::text(ModelRole::Developer, "old leading instructions");
         let repair = ModelMessage::text(
@@ -6853,7 +6855,9 @@ mod cancellation_tests {
         assert!(messages[0].content.contains(AGENT_DEVELOPER_INSTRUCTIONS));
         assert!(messages.contains(&summary), "compaction summary preserved");
         assert!(
-            !messages.iter().any(|message| message.content == old_leading.content),
+            !messages
+                .iter()
+                .any(|message| message.content == old_leading.content),
             "old leading replaced"
         );
         assert!(
