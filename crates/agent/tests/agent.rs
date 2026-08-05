@@ -2,6 +2,7 @@
 
 #![allow(clippy::needless_update)]
 
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
@@ -2991,6 +2992,102 @@ fn seed_replay_model_mismatch_is_rejected_before_provider_requests() {
     );
 }
 
+// Issue #24 场景 7：ordinary checkpoint 的旧版/未来版/损坏 payload 全部 fail closed。
+// 合法 payload 由真实一轮运行产生（encode），再逐项篡改后断言 decode 拒绝。
+#[test]
+fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
+
+    let mut tool_response = ModelTurnResponse::completed("model_request_1_0", "response_1", "");
+    tool_response.tool_calls.push(tool_call(
+        "call_1",
+        "read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed("model_request_1_1", "response_2", "done");
+
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpoints = Vec::new();
+    let first = agent_loop_with_responses_and_requests(
+        vec![tool_response, final_response],
+        allow_read_policy(),
+        Arc::clone(&first_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(2),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
+                checkpoints.push(event.checkpoint.clone());
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    assert_eq!(checkpoints.len(), 1, "one committed checkpoint");
+    let payload = checkpoints[0].encode().expect("encode checkpoint");
+    let current_version = payload["checkpoint_version"]
+        .as_u64()
+        .expect("flattened checkpoint version field");
+
+    // 当前版本：decode 成功（对照基线）。
+    let decoded = TurnCheckpoint::decode(&payload).expect("current version decodes");
+    assert_eq!(decoded.thread_id(), "thread_1");
+
+    // 旧版/未来版/损坏 payload：全部 fail closed。
+    for (label, mutation, expected_error) in [
+        (
+            "future version",
+            "future" as &str,
+            "unsupported turn checkpoint version",
+        ),
+        ("old version", "old", "unsupported turn checkpoint version"),
+        ("missing field", "remove_messages", "invalid turn checkpoint"),
+        ("unknown field", "unknown_field", "invalid turn checkpoint"),
+        ("empty object", "empty", "invalid turn checkpoint version"),
+        ("null payload", "null", "invalid turn checkpoint version"),
+    ] {
+        let mut candidate = payload.clone();
+        match mutation {
+            "future" => {
+                candidate["checkpoint_version"] = json!(current_version + 1);
+            }
+            "old" => {
+                candidate["checkpoint_version"] = json!(current_version - 1);
+            }
+            "remove_messages" => {
+                candidate
+                    .as_object_mut()
+                    .expect("payload object")
+                    .remove("messages");
+            }
+            "unknown_field" => {
+                candidate["bogus_field"] = json!(1);
+            }
+            "empty" => {
+                candidate = json!({});
+            }
+            "null" => {
+                candidate = serde_json::Value::Null;
+            }
+            other => panic!("unknown mutation {other}"),
+        }
+        let error = TurnCheckpoint::decode(&candidate)
+            .expect_err(&format!("{label} payload must fail closed"));
+        assert!(
+            error.contains(expected_error),
+            "{label}: expected error containing {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
 #[test]
 fn agent_loop_rejects_nonportable_provider_tool_name_before_history() {
     let unsafe_name = "private/C:\\sensitive-tool";
@@ -4979,25 +5076,24 @@ fn compacted_turn_checkpoint_seeds_next_turn_with_summary_and_valid_tool_pairs()
     assert!(leading_count >= 1, "leading developer missing");
     // 工具轨迹：最新工具对（call_2）的 assistant tool call 与 matching tool result
     // 都必须跨轮保留（compaction 省略了更早的 call_1 对，这是其既有语义）。
-    for call_id in ["call_2"] {
-        let call_message = request.messages.iter().find(|message| {
-            message.role == ModelRole::Assistant
-                && message
-                    .tool_calls
-                    .iter()
-                    .any(|call| call.tool_call_id == call_id)
-        });
-        assert!(
-            call_message.is_some(),
-            "assistant tool call {call_id} must cross the turn seed"
-        );
-        assert!(
-            request.messages.iter().any(|message| {
-                message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some(call_id)
-            }),
-            "matching tool result for {call_id} must cross the turn seed"
-        );
-    }
+    let call_id = "call_2";
+    let call_message = request.messages.iter().find(|message| {
+        message.role == ModelRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == call_id)
+    });
+    assert!(
+        call_message.is_some(),
+        "assistant tool call {call_id} must cross the turn seed"
+    );
+    assert!(
+        request.messages.iter().any(|message| {
+            message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some(call_id)
+        }),
+        "matching tool result for {call_id} must cross the turn seed"
+    );
     // 当前 user 追加在末尾。
     assert!(
         request.messages.last().is_some_and(|message| {

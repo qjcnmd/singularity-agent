@@ -1147,3 +1147,242 @@ impl SeedProvider {
         }
     }
 }
+
+// Issue #24 场景 4：blocked approval -> kill -> 新 App Server -> approval/decision，
+// 同一 tool call 只执行一次（跨进程 approval 恢复 E2E）。
+#[test]
+fn approval_decision_after_process_kill_executes_approved_tool_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    let file_path = workspace.join("README.md");
+    std::fs::write(&file_path, "before").expect("write readme");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let provider = ApprovalProvider::start();
+
+    let (mut first_child, mut first_input, mut first_output) =
+        spawn_app_server(&db_path, &workspace, &provider.base_url);
+    initialize_process(&mut first_input, &mut first_output);
+    let thread_id = start_thread_with_policy(
+        &mut first_input,
+        &mut first_output,
+        &workspace,
+        2,
+        "workspace-write",
+        "on-request",
+    );
+    send_json(
+        &mut first_input,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "Edit README.md changing before to after"}]
+            }
+        }),
+    );
+    let started = first_output.recv_method("turn/started", Duration::from_secs(5));
+    let turn_id = started["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn id")
+        .to_string();
+
+    // 等待 turn 进入 blocked 并出现 patch 的 pending approval（轮询 store）。
+    let approval_request_id = {
+        let store = singularity_store::SessionStore::open(&db_path).expect("reopen store");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let request_id = loop {
+            let pending = store.list_pending_approvals().expect("pending approvals");
+            if let Some(approval) = pending.first() {
+                assert_eq!(approval.thread_id, thread_id);
+                assert_eq!(approval.turn_id, turn_id);
+                assert_eq!(approval.action.as_str(), "patch");
+                break approval.request_id.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn never entered blocked approval"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+        let turn = store.get_turn(&turn_id).expect("blocked turn");
+        assert_eq!(turn.status, singularity_protocol::TurnStatus::Blocked);
+        assert_eq!(turn.agent_loop_status, "blocked");
+        drop(store);
+        request_id
+    };
+
+    kill_and_reap(&mut first_child);
+
+    // 新 App Server 进程：approval/decision 恢复同一 turn。
+    let (mut second_child, mut second_input, mut second_output) =
+        spawn_app_server(&db_path, &workspace, &provider.base_url);
+    initialize_process(&mut second_input, &mut second_output);
+    send_json(
+        &mut second_input,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "approval/decision",
+            "id": 4,
+            "params": {
+                "request_id": approval_request_id,
+                "decision_id": format!("{approval_request_id}_decision"),
+                "outcome": "allow",
+                "reason": "operator approved patch"
+            }
+        }),
+    );
+    let decision = second_output.recv_id(4, Duration::from_secs(5));
+    assert_eq!(
+        decision["result"]["decision"]["request_id"], approval_request_id,
+        "approval decision must be recorded: {decision}"
+    );
+
+    let completed = loop {
+        let message = second_output.recv_next_event(Duration::from_secs(20));
+        if message["method"] == "turn/completed" {
+            break message;
+        }
+    };
+    assert_eq!(completed["params"]["turn"]["turn_id"], turn_id);
+    assert_eq!(completed["params"]["turn"]["status"], "completed");
+    assert_eq!(
+        provider.production_requests.load(Ordering::SeqCst),
+        3,
+        "exactly one patch, one verification, and one final request"
+    );
+
+    let store = singularity_store::SessionStore::open(&db_path).expect("reopen store");
+    let completed_turn = store.get_turn(&turn_id).expect("completed turn");
+    assert_eq!(
+        completed_turn.status,
+        singularity_protocol::TurnStatus::Completed
+    );
+    assert!(
+        store.list_pending_approvals().expect("pending").is_empty(),
+        "approval must be consumed"
+    );
+    drop(store);
+
+    // 同一 tool call 只执行一次：恢复历史中 patch call 恰好出现一次且 result ok
+    // （assert_resumed_after_approval）、生产请求总数恰为 3（无重放/重试请求）；
+    // workspace 被修改为 after 证明 patch 恰好成功执行一次（若重复执行，第二次
+    // 的 expected "before" 会失败并产生额外请求）。
+
+    assert_eq!(
+        std::fs::read_to_string(&file_path).expect("read readme"),
+        "after",
+        "approved patch must have mutated the workspace"
+    );
+
+    shutdown_process(&mut second_child, &mut second_input, &mut second_output, 5);
+    provider.worker.join().expect("approval provider worker");
+}
+
+struct ApprovalProvider {
+    base_url: String,
+    production_requests: Arc<AtomicUsize>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl ApprovalProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind approval provider");
+        let address = listener.local_addr().expect("provider address");
+        let production_requests = Arc::new(AtomicUsize::new(0));
+        let worker_count = Arc::clone(&production_requests);
+        let worker = thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().expect("accept approval provider");
+                let request = read_http_json(&mut stream);
+                if let Some(response) = capability_probe_response(&request) {
+                    write_json_response(&mut stream, &response);
+                    continue;
+                }
+                assert_eq!(request["stream"], true, "production request must stream");
+                let index = worker_count.fetch_add(1, Ordering::SeqCst) + 1;
+                match index {
+                    1 => write_stream_response(&mut stream, approval_patch_response()),
+                    2 => {
+                        // 恢复后的请求：patch call 只出现一次，patch result 在历史中。
+                        assert_resumed_after_approval(&request);
+                        write_stream_response(&mut stream, approval_verify_response());
+                    }
+                    3 => {
+                        write_final_stream_response(&mut stream, final_response());
+                        break;
+                    }
+                    other => panic!("unexpected approval provider production request {other}"),
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1/responses"),
+            production_requests,
+            worker,
+        }
+    }
+}
+
+fn approval_patch_response() -> Value {
+    json!({
+        "id": "response_patch",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_patch_1",
+            "name": "patch",
+            "arguments": json!({
+                "changes": [{
+                    "path": "README.md",
+                    "expected": "before",
+                    "replacement": "after"
+                }]
+            }).to_string()
+        }],
+        "usage": usage()
+    })
+}
+
+fn approval_verify_response() -> Value {
+    json!({
+        "id": "response_verify",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_verify_1",
+            "name": "command",
+            "arguments": json!({
+                "command": "type README.md",
+                "cwd": ".",
+                "timeout_seconds": 30
+            }).to_string()
+        }],
+        "usage": usage()
+    })
+}
+
+fn assert_resumed_after_approval(request: &Value) {
+    let input = request["input"].as_array().expect("Responses input array");
+    let patch_calls = input
+        .iter()
+        .filter(|item| item["type"] == "function_call" && item["call_id"] == "call_patch_1")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        patch_calls.len(),
+        1,
+        "patch call must appear exactly once in resumed history: {request}"
+    );
+    let patch_result = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_patch_1")
+        .expect("patch result must precede the resumed request");
+    let output = patch_result["output"].as_str().expect("patch result output");
+    let output: Value = serde_json::from_str(output).expect("patch result json");
+    assert_eq!(output["ok"], true, "patch must have executed exactly once");
+    assert_eq!(output["tool_name"], "patch");
+}
