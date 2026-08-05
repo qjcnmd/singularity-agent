@@ -2907,6 +2907,89 @@ fn seed_replay_mismatch_is_rejected_before_checkpoint_without_provider_requests(
 }
 
 #[test]
+fn seed_replay_model_mismatch_is_rejected_before_provider_requests() {
+    let mut tool_response = ModelTurnResponse::completed("request_1", "response_tool", "");
+    tool_response.tool_calls.push(tool_call(
+        "call_history",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    ));
+    tool_response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "history-provider".to_string(),
+        model_name: "history-model".to_string(),
+        reasoning_effort: "medium".to_string(),
+        tool_call_ids: vec!["call_history".to_string()],
+        reasoning_content: "private reasoning".to_string(),
+    }];
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpoints = Vec::new();
+    let first = agent_loop_with_responses_and_requests(
+        vec![
+            tool_response,
+            ModelTurnResponse::completed("request_2", "response_final", "first final"),
+        ],
+        allow_read_policy(),
+        Arc::clone(&first_requests),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "first user"),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            checkpoints.push(event.checkpoint);
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    let checkpoint = TurnCheckpoint::decode(
+        &checkpoints
+            .last()
+            .expect("committed checkpoint")
+            .encode()
+            .expect("encode checkpoint"),
+    )
+    .expect("decode checkpoint");
+
+    // 第二轮：provider 与 effort 相同，仅 model 不匹配——命中 preflight 的
+    // model 比较分支（同 provider 异 model）。
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut second_checkpoints = Vec::new();
+    let second = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("request_3", "response_next", "second final"),
+        allow_read_policy(),
+        Arc::clone(&second_requests),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_2", "second user")
+            .with_model_name(Some("history-provider/other-model#medium".to_string()))
+            .with_historical_checkpoint(&checkpoint),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            second_checkpoints.push(event.checkpoint);
+            Ok(())
+        },
+    );
+    assert_eq!(second.status, AgentStatus::Failed, "second={second:?}");
+    assert!(
+        second.error.is_some()
+            && second
+                .error
+                .as_ref()
+                .expect("error")
+                .contains("cannot be replayed by the resolved model"),
+        "expected replay model mismatch: {second:?}"
+    );
+    assert_eq!(
+        second_requests.lock().expect("second requests").len(),
+        0,
+        "no provider request may be issued before replay preflight"
+    );
+    assert!(
+        second_checkpoints.is_empty(),
+        "no Initial checkpoint may be persisted for an incompatible replay"
+    );
+}
+
+#[test]
 fn agent_loop_rejects_nonportable_provider_tool_name_before_history() {
     let unsafe_name = "private/C:\\sensitive-tool";
     let unsafe_argument = "C:\\private\\credential.txt";

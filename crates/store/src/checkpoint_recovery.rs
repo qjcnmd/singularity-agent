@@ -801,9 +801,10 @@ impl SessionStore {
                 let valid = match (row.decision, row.pending_state.as_deref(), terminal) {
                     (None, Some("pending"), false) => {
                         // 正常 pending approval 绑定 blocked turn；paused/suspended
-                        // 是 ownerless 状态，running 是 approval 创建与转 blocked 之间
-                        // 崩溃的中间态——这些不一致的 pending 行都留给
-                        // recover_abandoned_turns_for_thread 统一终态化（B2）。
+                        // 是 ownerless 状态（残留 pending 行交给
+                        // recover_abandoned_turns_for_thread 终态化，B2）。Running
+                        // 在 store 打开时已被 migration preflight 拒绝，此处为防御性
+                        // 放行（当前 approval 创建与 blocked 转换在同一事务内）。
                         (row.turn_status == TurnStatus::Blocked
                             && row.agent_loop_status == "blocked")
                             || row.turn_status == TurnStatus::Paused
