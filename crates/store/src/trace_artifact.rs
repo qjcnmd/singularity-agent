@@ -789,9 +789,6 @@ fn ttft_values(events: &[TraceEvent], legacy_only: bool) -> (TraceMetricAvailabi
         .iter()
         .filter_map(|event| event.time_to_first_token_ms)
         .collect::<Vec<_>>();
-    if values.len() == ends.len() {
-        return (TraceMetricAvailability::Available, values);
-    }
     if !values.is_empty() {
         return (TraceMetricAvailability::Available, values);
     }

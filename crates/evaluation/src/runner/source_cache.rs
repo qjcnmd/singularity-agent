@@ -204,7 +204,7 @@ impl SourceTemplateCache {
 
         let staging = key_dir.join(".download");
         remove_tree(&staging)
-            .map_err(|error| SourceCacheError::new(SourceCacheErrorCode::PublishFailed, error))?;
+            .map_err(|error| SourceCacheError::new(SourceCacheErrorCode::RootFailed, error))?;
         fetch(&staging)
             .map_err(|error| SourceCacheError::new(SourceCacheErrorCode::FetchFailed, error))?;
         if cancellation.is_cancelled() {

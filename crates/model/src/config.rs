@@ -1781,10 +1781,6 @@ fn user_config_error(message: impl Into<String>) -> ProviderError {
 }
 
 /// Resolve the user-level directory shared by all worktrees.
-pub fn user_config_directory() -> Option<PathBuf> {
-    user_config_directory_result().ok().flatten()
-}
-
 fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
     let explicit_home = std::env::var_os("SINGULARITY_HOME");
     let home = explicit_home

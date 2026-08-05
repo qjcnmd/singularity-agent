@@ -107,10 +107,7 @@ mod contract;
 mod openai;
 mod transport;
 
-pub use config::{
-    import_env_to_user_config, read_user_model_catalog, resolve_provider_config,
-    user_config_directory,
-};
+pub use config::{import_env_to_user_config, read_user_model_catalog, resolve_provider_config};
 pub use contract::{
     is_strict_tool_schema_compatible, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,

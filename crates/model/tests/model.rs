@@ -7845,3 +7845,126 @@ fn reasoning_replay_obligation_disabled_mode_rejects_reasoning_only_tool_request
         "disabled"
     );
 }
+
+// SINGULARITY_HOME 环境隔离：这两个端到端测试互相串行，其他测试不读该变量。
+static USER_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() {
+    let _guard = USER_CONFIG_ENV_LOCK.lock().expect("env lock");
+    let home = tempdir().expect("home directory");
+    unsafe { std::env::set_var("SINGULARITY_HOME", home.path()) };
+    let env_path = home.path().join(".env");
+    std::fs::write(
+        &env_path,
+        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+    )
+    .expect("dotenv file");
+
+    let imported = singularity_model::import_env_to_user_config(Some(&env_path))
+        .expect("import must persist the provider");
+    assert!(std::path::Path::new(&imported.config_path).exists());
+    assert!(std::path::Path::new(&imported.auth_path).exists());
+    assert!(imported.config_path.ends_with("config.json"));
+    assert!(imported.auth_path.contains("auth.v1-"));
+    assert_eq!(imported.provider_name, "openai_compatible");
+
+    // 相同 endpoint 重复导入幂等成功；endpoint 变更被拒绝。
+    singularity_model::import_env_to_user_config(Some(&env_path))
+        .expect("re-import with the same endpoint must succeed");
+    std::fs::write(
+        &env_path,
+        "SINGULARITY_BASE_URL=https://changed.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+    )
+    .expect("changed dotenv file");
+    let error = singularity_model::import_env_to_user_config(Some(&env_path))
+        .expect_err("an endpoint change must be rejected");
+    assert!(
+        error.message.contains("endpoint"),
+        "unexpected rejection message: {}",
+        error.message
+    );
+    unsafe { std::env::remove_var("SINGULARITY_HOME") };
+}
+
+#[test]
+fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_network() {
+    let _guard = USER_CONFIG_ENV_LOCK.lock().expect("env lock");
+    let home = tempdir().expect("home directory");
+    unsafe { std::env::set_var("SINGULARITY_HOME", home.path()) };
+    let env_path = home.path().join(".env");
+    std::fs::write(
+        &env_path,
+        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+    )
+    .expect("dotenv file");
+    singularity_model::import_env_to_user_config(Some(&env_path))
+        .expect("import must persist the provider");
+
+    // 预置新鲜缓存：endpoint_sha256 = sha256(normalized_endpoint_identity(base_url))。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    std::fs::write(
+        home.path().join("models-cache.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "providers": {
+                "openai_compatible": {
+                    "endpoint_sha256": "3bf8b512d9020714a393483bfc3222d451ace7965f26bbf0c50286423b8ae0ce",
+                    "fetched_at_unix_seconds": now,
+                    "model_ids": ["gpt-discovered"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("models cache file");
+
+    let catalog = singularity_model::read_user_model_catalog(false)
+        .expect("catalog read must not require network on a fresh cache");
+    assert_eq!(
+        catalog.cache_status,
+        singularity_model::ModelCacheStatus::Valid
+    );
+    let provider = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.provider_name == "openai_compatible")
+        .expect("imported provider is present");
+    assert_eq!(
+        provider.discovery,
+        singularity_model::ModelDiscoveryStatus::Fresh
+    );
+    let ids = provider
+        .models
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(ids.contains("gpt-test"), "explicit model id is listed");
+    assert!(
+        ids.contains("gpt-discovered"),
+        "cached discovered id is listed"
+    );
+    let gpt_test = provider
+        .models
+        .iter()
+        .find(|entry| entry.id == "gpt-test")
+        .expect("explicit model entry");
+    assert!(gpt_test.explicit);
+    assert!(!gpt_test.discovered);
+
+    // 再次读取仍命中同一新鲜缓存。
+    let again = singularity_model::read_user_model_catalog(false).expect("second catalog read");
+    let again_provider = again
+        .providers
+        .iter()
+        .find(|provider| provider.provider_name == "openai_compatible")
+        .expect("provider still present");
+    assert_eq!(
+        again_provider.discovery,
+        singularity_model::ModelDiscoveryStatus::Fresh
+    );
+    unsafe { std::env::remove_var("SINGULARITY_HOME") };
+}

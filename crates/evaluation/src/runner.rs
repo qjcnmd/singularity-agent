@@ -5388,7 +5388,7 @@ mod tests {
             source_template_cache_metrics(&[&observed, &not_observed]);
         assert_eq!(hits, MetricValue::available(1));
         assert_eq!(misses, MetricValue::available(0));
-        assert!(materialization.is_available());
+        assert!(matches!(materialization, MetricValue::Available { .. }));
     }
 
     /// 固定 git 能力与固定 commit 的 mock 后端，只服务于远程 git 源全路径测试。

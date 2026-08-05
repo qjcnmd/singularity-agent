@@ -42,10 +42,6 @@ impl<T> MetricValue<T> {
     pub const fn unavailable(reason: MetricUnavailableReason) -> Self {
         Self::Unavailable { reason }
     }
-
-    pub const fn is_available(&self) -> bool {
-        matches!(self, Self::Available { .. })
-    }
 }
 
 /// Why a report metric is absent.
@@ -343,6 +339,7 @@ pub struct EvaluationReport {
     pub run_id: RunId,
     pub manifest: String,
     pub runner: String,
+    /// 并发 worker 配置上限（实际生效值可能因硬件并发能力更低）。
     pub max_workers: usize,
     pub dimensions: EvaluationDimensions,
     pub system_result: EvaluationSystemResult,
