@@ -10,7 +10,7 @@ use singularity_policy::NetworkAccess;
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandSemanticStatus, SandboxBackendEnforcement, SandboxFilesystemMode, SandboxNetworkMode,
-    ToolFailureKind, ToolResult, WorkspaceObservationMetrics, command_scope_digest,
+    ToolFailureKind, ToolResult, command_scope_digest,
 };
 
 use super::evidence::is_sha256_digest;
@@ -23,30 +23,10 @@ static COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Evaluation command 的脱敏执行诊断。
 pub(super) struct CommandDiagnostic {
     pub(super) phase: String,
-    /// Agent ToolResult does not carry evaluator-owned process details; those fields stay absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    execution_status: Option<CommandExecutionStatus>,
+    pub(super) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    semantic_status: Option<CommandSemanticStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timed_out: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_truncated: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stdout_preview: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stderr_preview: Option<String>,
-    sandbox_backend: String,
-    sandbox_enforcement: singularity_tools::SandboxBackendEnforcement,
-    pub(super) local_process_fallback: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) scope_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workspace_observation_metrics: Option<WorkspaceObservationMetrics>,
+    pub(super) duration_ms: Option<u64>,
 }
 
 impl CommandDiagnostic {
@@ -54,19 +34,8 @@ impl CommandDiagnostic {
     pub(super) fn new(phase: impl Into<String>, result: &CommandResult) -> Self {
         Self {
             phase: phase.into(),
-            execution_status: Some(result.execution_status.clone()),
-            semantic_status: Some(result.semantic_status.clone()),
             exit_code: result.exit_code,
             duration_ms: Some(result.duration_ms),
-            timed_out: Some(result.timed_out),
-            output_truncated: Some(result.output_truncated),
-            stdout_preview: Some(result.stdout_preview.clone()),
-            stderr_preview: Some(result.stderr_preview.clone()),
-            sandbox_backend: result.sandbox.backend.clone(),
-            sandbox_enforcement: result.sandbox.enforcement.clone(),
-            local_process_fallback: result.sandbox.local_process_fallback,
-            scope_digest: None,
-            workspace_observation_metrics: result.workspace_observation_metrics.clone(),
         }
     }
 
@@ -152,60 +121,43 @@ impl CommandDiagnostic {
         {
             return AgentCommandDiagnosticProjection::Unknown;
         }
-        let sandbox_backend = audit
-            .get("sandbox_backend")
-            .and_then(serde_json::Value::as_str)
-            .expect("backend checked above")
-            .to_string();
         let local_process_fallback = audit
             .get("local_process_fallback")
             .and_then(serde_json::Value::as_bool)
             .expect("fallback checked above");
-        AgentCommandDiagnosticProjection::Executed(Self {
-            phase: "agent.command".to_string(),
-            execution_status: None,
-            semantic_status: None,
-            exit_code: None,
-            duration_ms: None,
-            timed_out: None,
-            output_truncated: None,
-            stdout_preview: None,
-            stderr_preview: None,
-            sandbox_backend,
-            sandbox_enforcement: enforcement,
+        AgentCommandDiagnosticProjection::Executed {
+            diagnostic: Self {
+                phase: "agent.command".to_string(),
+                exit_code: None,
+                duration_ms: None,
+            },
+            strict_sandboxed: enforcement == SandboxBackendEnforcement::Strict
+                && !local_process_fallback,
             local_process_fallback,
-            scope_digest: Some(result_id.to_string()),
-            workspace_observation_metrics: None,
-        })
+        }
     }
 
-    /// 为 manifest 命令补充稳定 scope digest。
-    pub(super) fn for_spec(
-        phase: impl Into<String>,
-        workspace: &Path,
-        command: &CommandSpec,
-        default_timeout_seconds: u64,
-        result: &CommandResult,
-    ) -> Self {
-        let mut diagnostic = Self::new(phase, result);
-        diagnostic.scope_digest =
-            command_scope_digest_for_spec(workspace, command, default_timeout_seconds).ok();
-        diagnostic
-    }
-
-    /// 判断命令是否由严格 sandbox 执行。
-    pub(super) fn is_strictly_sandboxed(&self) -> bool {
-        !self.local_process_fallback
-            && self.sandbox_enforcement == singularity_tools::SandboxBackendEnforcement::Strict
+    pub(super) fn for_spec(phase: impl Into<String>, result: &CommandResult) -> Self {
+        Self::new(phase, result)
     }
 }
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum AgentCommandDiagnosticProjection {
-    Executed(CommandDiagnostic),
+    Executed {
+        diagnostic: CommandDiagnostic,
+        strict_sandboxed: bool,
+        local_process_fallback: bool,
+    },
     NotExecuted,
     Unknown,
+}
+
+/// 判断命令是否由严格 sandbox 执行；调用方必须传入真实 producer 结果。
+pub(super) fn command_is_strictly_sandboxed(result: &CommandResult) -> bool {
+    !result.sandbox.local_process_fallback
+        && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
 }
 
 /// 计算 manifest 命令的稳定 scope digest。
@@ -605,7 +557,6 @@ mod tests {
     use super::*;
     use singularity_tools::{
         SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, WorkspaceMutation,
-        WorkspaceObservationMode, WorkspaceObservationPhaseMetrics,
     };
 
     struct EnvironmentCaptureBackend;
@@ -778,53 +729,13 @@ mod tests {
                 .with_sandbox_execution("test", enforcement)
                 .with_workspace_mutation(singularity_tools::WorkspaceMutation::Unchanged);
 
-            assert_eq!(
-                CommandDiagnostic::new("verification", &result).is_strictly_sandboxed(),
-                expected
-            );
+            assert_eq!(command_is_strictly_sandboxed(&result), expected);
             assert_eq!(command_succeeded(&result), expected);
             assert_eq!(
                 infrastructure_blocker(&result, "verification command").is_none(),
                 expected
             );
         }
-    }
-
-    #[test]
-    fn command_diagnostics_include_internal_workspace_observation_work() {
-        let result = CommandResult::completed("command", "ok")
-            .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict)
-            .with_workspace_mutation(WorkspaceMutation::Unchanged)
-            .with_workspace_observation_metrics(WorkspaceObservationMetrics {
-                contract: "windows_workspace_observation/v1".to_string(),
-                before: WorkspaceObservationPhaseMetrics {
-                    mode: WorkspaceObservationMode::Reused,
-                    duration_ms: 2,
-                    entries_read: 1,
-                    content_bytes_read: 0,
-                },
-                after: WorkspaceObservationPhaseMetrics {
-                    mode: WorkspaceObservationMode::Incremental,
-                    duration_ms: 3,
-                    entries_read: 4,
-                    content_bytes_read: 5,
-                },
-            });
-
-        let diagnostic = serde_json::to_value(CommandDiagnostic::new("verification", &result))
-            .expect("serialize diagnostic");
-        assert_eq!(
-            diagnostic["workspace_observation_metrics"]["contract"],
-            "windows_workspace_observation/v1"
-        );
-        assert_eq!(
-            diagnostic["workspace_observation_metrics"]["before"]["mode"],
-            "reused"
-        );
-        assert_eq!(
-            diagnostic["workspace_observation_metrics"]["after"]["mode"],
-            "incremental"
-        );
     }
 
     #[cfg(windows)]

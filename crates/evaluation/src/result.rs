@@ -141,6 +141,9 @@ pub struct EvaluationBlocker {
     pub code: Option<String>,
     pub kind: BlockerKind,
     pub message: String,
+    /// Task identity when a run-level blocker was observed while preparing one task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
 }
 
 impl EvaluationBlocker {
@@ -562,7 +565,7 @@ impl EvaluationTaskResult {
         }
     }
 
-    fn validate(&self, trials_per_task: u32) -> Result<()> {
+    pub(crate) fn validate(&self, trials_per_task: u32) -> Result<()> {
         let context = format!("evaluation task {}", self.task_id);
         validate_nonempty_unique(&self.capabilities, &format!("{context} capabilities"))?;
         if self.trials.len() != usize::try_from(trials_per_task).unwrap_or(usize::MAX) {

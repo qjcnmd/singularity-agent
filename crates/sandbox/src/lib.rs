@@ -117,23 +117,6 @@ pub enum WorkspaceMutation {
     Unknown,
 }
 
-/// One complete checkpoint from a continuous observer spanning multiple execution stages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparedWorkspaceObservation {
-    Unchanged,
-    Changed(Vec<String>),
-    Unknown,
-}
-
-/// Backend-owned continuous observation session for a controller-owned prepared workspace.
-///
-/// A checkpoint must cover every change since construction or the previous checkpoint. Buffer
-/// overflow, cancellation, root replacement and any other evidence gap return `Unknown` or an
-/// error; neither outcome may be treated as unchanged.
-pub trait PreparedWorkspaceObserver: Send {
-    fn checkpoint(&mut self) -> Result<PreparedWorkspaceObservation, String>;
-}
-
 /// Producer-owned summary of concrete workspace paths and published content diff digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1071,16 +1054,6 @@ pub trait SandboxBackend {
         ExecutableAvailability::Unknown
     }
 
-    /// Start a continuous observer before publishing a prepared source snapshot.
-    ///
-    /// `None` means this backend cannot prove changes across command/stage gaps. Callers must
-    /// retain full-tree verification instead of constructing a reusable observation token.
-    fn observe_prepared_workspace(
-        &self,
-        _workspace: &Path,
-    ) -> Result<Option<Box<dyn PreparedWorkspaceObserver>>, String> {
-        Ok(None)
-    }
     /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 

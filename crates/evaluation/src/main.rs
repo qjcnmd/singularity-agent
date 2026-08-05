@@ -1,14 +1,14 @@
 //! 开发期 Evaluation 命令行入口。
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use singularity_core::CancellationToken;
 use singularity_evaluation::runner::{
-    EvaluationRunParams, EvaluationRunResult, run_evaluation_with_selection,
+    EvaluationRunMode, EvaluationRunParams, EvaluationRunResult, run_evaluation_with_mode,
 };
-use singularity_evaluation::{EvaluationSelection, TaskId};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_sandbox::PlatformSandboxBackend;
 use singularity_store::SessionStore;
@@ -31,14 +31,11 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Maximum number of independent tasks to execute concurrently (1-2).
-        #[arg(long, default_value_t = 1, value_parser = parse_max_workers)]
-        max_workers: usize,
-        /// Select one task for an Evaluation-only diagnostic run (must be paired with --trial).
-        #[arg(long, value_parser = parse_task_id, requires = "trial")]
-        task_id: Option<TaskId>,
-        /// Select the manifest's one-based trial ordinal (must be paired with --task-id).
-        #[arg(long, requires = "task_id")]
-        trial: Option<u32>,
+        #[arg(long, value_parser = parse_max_workers)]
+        max_workers: Option<usize>,
+        /// Execute every manifest task for its configured trial count and publish gate artifacts.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -53,8 +50,29 @@ fn parse_max_workers(value: &str) -> Result<usize, String> {
     }
 }
 
-fn parse_task_id(value: &str) -> Result<TaskId, String> {
-    TaskId::new(value.to_string())
+/// Resolve the task worker count, capping Full at two and falling back to one on query failure.
+fn resolve_max_workers<F>(
+    mode: &EvaluationRunMode,
+    requested: Option<usize>,
+    available_parallelism: F,
+) -> usize
+where
+    F: FnOnce() -> std::io::Result<NonZeroUsize>,
+{
+    if let Some(requested) = requested {
+        return requested;
+    }
+
+    match mode {
+        EvaluationRunMode::Full => available_parallelism()
+            .map(|parallelism| if parallelism.get() >= 2 { 2 } else { 1 })
+            .unwrap_or(1),
+        EvaluationRunMode::Feedback => 1,
+    }
+}
+
+fn default_max_workers(mode: &EvaluationRunMode, requested: Option<usize>) -> usize {
+    resolve_max_workers(mode, requested, std::thread::available_parallelism)
 }
 
 fn main() {
@@ -71,9 +89,16 @@ fn run(cli: Cli) -> Result<(), String> {
             run_id,
             json,
             max_workers,
-            task_id,
-            trial,
-        } => run_manifest(manifest, run_id, json, max_workers, task_id, trial),
+            full,
+        } => run_manifest(manifest, run_id, json, max_workers, full),
+    }
+}
+
+fn run_mode_from_flags(full: bool) -> EvaluationRunMode {
+    if full {
+        EvaluationRunMode::Full
+    } else {
+        EvaluationRunMode::Feedback
     }
 }
 
@@ -81,37 +106,22 @@ fn run_manifest(
     manifest: PathBuf,
     run_id: String,
     json_output: bool,
-    max_workers: usize,
-    task_id: Option<TaskId>,
-    trial: Option<u32>,
+    requested_max_workers: Option<usize>,
+    full: bool,
 ) -> Result<(), String> {
-    let selection = match (task_id, trial) {
-        (Some(task_id), Some(trial)) => Some(
-            EvaluationSelection::new(task_id, trial)
-                .map_err(|error| format!("invalid diagnostic selection: {error}"))?,
-        ),
-        (None, None) => None,
-        _ => {
-            return Err("--task-id and --trial must be provided together".to_string());
-        }
-    };
+    let mode = run_mode_from_flags(full);
+    let max_workers = default_max_workers(&mode, requested_max_workers);
     if !manifest.is_file() {
         return Err(format!(
             "evaluation manifest not found: {}",
             manifest.display()
         ));
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to build provider runtime: {error}"))?;
-    let provider_snapshot = ProviderConfigSnapshot::capture_with_runtime_handle(
-        |name| std::env::var(name).ok(),
-        runtime.handle().clone(),
-    );
+    let provider_snapshot =
+        ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), None, None);
     let mut trace_store = SessionStore::open(":memory:")
         .map_err(|error| format!("failed to open evaluation trace store: {error}"))?;
-    let result = run_evaluation_with_selection(
+    let result = run_evaluation_with_mode(
         &EvaluationRunParams {
             manifest: manifest.to_string_lossy().into_owned(),
             run_id,
@@ -122,7 +132,7 @@ fn run_manifest(
         &provider_snapshot,
         &CancellationToken::new(),
         &mut trace_store,
-        selection,
+        mode,
     )
     .map_err(|error| {
         if let Some(partial) = error.partial_result() {
@@ -131,13 +141,21 @@ fn run_manifest(
         error.to_string()
     })?;
     print_result(&result, json_output)?;
-    if result.diagnostic_passed.unwrap_or(result.evaluation_passed) {
-        Ok(())
+    if !result.gate_applicable {
+        // Feedback is observational and non-gating; a blocked run is still an execution error.
+        if result.status != "blocked" {
+            return Ok(());
+        }
+    } else if result.evaluation_passed {
+        return Ok(());
     } else {
-        Err(result
+        return Err(result
             .blocker
-            .unwrap_or_else(|| "evaluation_failed".to_string()))
+            .unwrap_or_else(|| "evaluation_failed".to_string()));
     }
+    Err(result
+        .blocker
+        .unwrap_or_else(|| "evaluation_failed".to_string()))
 }
 
 fn print_result(result: &EvaluationRunResult, json_output: bool) -> Result<(), String> {
@@ -153,23 +171,10 @@ fn print_result(result: &EvaluationRunResult, json_output: bool) -> Result<(), S
 }
 
 fn result_text(result: &EvaluationRunResult) -> String {
-    if let Some(selection) = &result.selection {
-        format!(
-            "evaluation diagnostic {} {} task={} trial={} gate_applicable=false diagnostic_passed={} evaluation_passed=false runner={} max_workers={}",
-            result.run_id,
-            result.status,
-            selection.task_id,
-            selection.trial,
-            result.diagnostic_passed.unwrap_or(false),
-            result.runner,
-            result.max_workers
-        )
-    } else {
-        format!(
-            "evaluation {} {} runner={} max_workers={}",
-            result.run_id, result.status, result.runner, result.max_workers
-        )
-    }
+    format!(
+        "evaluation {} {} gate_applicable={} runner={} max_workers={}",
+        result.run_id, result.status, result.gate_applicable, result.runner, result.max_workers
+    )
 }
 
 #[cfg(test)]
@@ -177,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_workers_cli_defaults_to_one_and_accepts_two() {
+    fn max_workers_cli_distinguishes_omitted_and_explicit_values() {
         let cli = Cli::try_parse_from([
             "singularity-evaluation",
             "run",
@@ -187,7 +192,7 @@ mod tests {
         ])
         .expect("default max-workers parses");
         let Command::Run { max_workers, .. } = cli.command;
-        assert_eq!(max_workers, 1);
+        assert_eq!(max_workers, None);
 
         let cli = Cli::try_parse_from([
             "singularity-evaluation",
@@ -200,7 +205,20 @@ mod tests {
         ])
         .expect("max-workers=2 parses");
         let Command::Run { max_workers, .. } = cli.command;
-        assert_eq!(max_workers, 2);
+        assert_eq!(max_workers, Some(2));
+
+        let cli = Cli::try_parse_from([
+            "singularity-evaluation",
+            "run",
+            "manifest.json",
+            "--run-id",
+            "run",
+            "--max-workers",
+            "1",
+        ])
+        .expect("max-workers=1 parses");
+        let Command::Run { max_workers, .. } = cli.command;
+        assert_eq!(max_workers, Some(1));
     }
 
     #[test]
@@ -221,50 +239,68 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_selector_flags_are_typed_and_must_be_paired() {
-        let cli = Cli::try_parse_from([
-            "singularity-evaluation",
-            "run",
-            "manifest.json",
-            "--run-id",
-            "run",
-            "--task-id",
-            "task-a",
-            "--trial",
-            "2",
-        ])
-        .expect("paired diagnostic selector parses");
-        let Command::Run { task_id, trial, .. } = cli.command;
-        assert_eq!(task_id.expect("task id").as_str(), "task-a");
-        assert_eq!(trial, Some(2));
-
-        let cases: &[&[&str]] = &[
-            &[
-                "singularity-evaluation",
-                "run",
-                "manifest.json",
-                "--run-id",
-                "run",
-                "--task-id",
-                "task-a",
-            ],
-            &[
-                "singularity-evaluation",
-                "run",
-                "manifest.json",
-                "--run-id",
-                "run",
-                "--trial",
-                "2",
-            ],
-        ];
-        for args in cases {
-            assert!(Cli::try_parse_from(*args).is_err());
-        }
+    fn run_mode_defaults_to_feedback_and_supports_full() {
+        assert!(matches!(
+            run_mode_from_flags(false),
+            EvaluationRunMode::Feedback
+        ));
+        assert!(matches!(run_mode_from_flags(true), EvaluationRunMode::Full));
     }
 
     #[test]
-    fn diagnostic_text_result_is_explicitly_non_gating() {
+    fn default_max_workers_is_mode_aware_and_fails_closed() {
+        let full = EvaluationRunMode::Full;
+        assert_eq!(
+            resolve_max_workers(&full, None, || {
+                Ok(NonZeroUsize::new(1).expect("one is non-zero"))
+            }),
+            1
+        );
+        assert_eq!(
+            resolve_max_workers(&full, None, || {
+                Ok(NonZeroUsize::new(2).expect("two is non-zero"))
+            }),
+            2
+        );
+        assert_eq!(
+            resolve_max_workers(&full, None, || {
+                Ok(NonZeroUsize::new(16).expect("sixteen is non-zero"))
+            }),
+            2
+        );
+        assert_eq!(
+            resolve_max_workers(&full, None, || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "parallelism unavailable",
+                ))
+            }),
+            1
+        );
+
+        let feedback = EvaluationRunMode::Feedback;
+        assert_eq!(
+            resolve_max_workers(&feedback, None, || {
+                panic!("feedback must not query host parallelism")
+            }),
+            1
+        );
+        assert_eq!(
+            resolve_max_workers(&full, Some(1), || {
+                panic!("explicit worker count must not query host parallelism")
+            }),
+            1
+        );
+        assert_eq!(
+            resolve_max_workers(&full, Some(2), || {
+                panic!("explicit worker count must not query host parallelism")
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn feedback_text_result_is_explicitly_non_gating() {
         let result = EvaluationRunResult {
             run_id: "run".to_string(),
             manifest: "manifest.json".to_string(),
@@ -277,19 +313,11 @@ mod tests {
             report_path: None,
             evidence_path: None,
             evaluation_passed: false,
-            gate_applicable: Some(false),
-            selection: Some(
-                EvaluationSelection::new(TaskId::new("task-a").expect("task id"), 2)
-                    .expect("selection"),
-            ),
-            diagnostic_passed: Some(true),
+            gate_applicable: false,
         };
         let text = result_text(&result);
-        assert!(text.contains("evaluation diagnostic"));
-        assert!(text.contains("task=task-a trial=2"));
+        assert!(text.contains("evaluation run completed"));
         assert!(text.contains("gate_applicable=false"));
-        assert!(text.contains("diagnostic_passed=true"));
-        assert!(text.contains("evaluation_passed=false"));
-        assert_eq!(result.gate_applicable, Some(false));
+        assert!(!result.gate_applicable);
     }
 }

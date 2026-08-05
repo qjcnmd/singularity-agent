@@ -90,6 +90,17 @@ pub(super) fn build_zero_sampling_evidence(
         .iter()
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
+    if let Some(task_id) = result
+        .blocker
+        .as_ref()
+        .and_then(|blocker| blocker.task_id.as_ref())
+        && !task_ids.contains(task_id)
+    {
+        return Err(format!(
+            "zero-sampling blocker task {} is outside the selected task set",
+            task_id.as_str()
+        ));
+    }
     let tasks = plans
         .iter()
         .map(|plan| EvaluationTaskEvidence {
@@ -174,6 +185,8 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Strin
 pub(super) struct AgentCommandProjection {
     pub(super) diagnostics: Vec<CommandDiagnostic>,
     pub(super) unknown_count: usize,
+    pub(super) strict_sandbox_command_count: usize,
+    pub(super) local_process_fallback_count: usize,
 }
 
 pub(super) fn agent_command_projection(result: &AgentLoopResult) -> AgentCommandProjection {
@@ -184,8 +197,20 @@ pub(super) fn agent_command_projection(result: &AgentLoopResult) -> AgentCommand
         .filter(|tool_result| tool_result.tool_name == TOOL_COMMAND)
     {
         match CommandDiagnostic::from_agent_tool_result(tool_result) {
-            AgentCommandDiagnosticProjection::Executed(diagnostic) => {
+            AgentCommandDiagnosticProjection::Executed {
+                diagnostic,
+                strict_sandboxed,
+                local_process_fallback,
+            } => {
                 projection.diagnostics.push(diagnostic);
+                if strict_sandboxed {
+                    projection.strict_sandbox_command_count =
+                        projection.strict_sandbox_command_count.saturating_add(1);
+                }
+                if local_process_fallback {
+                    projection.local_process_fallback_count =
+                        projection.local_process_fallback_count.saturating_add(1);
+                }
             }
             AgentCommandDiagnosticProjection::Unknown => {
                 projection.unknown_count = projection.unknown_count.saturating_add(1);
@@ -215,8 +240,7 @@ fn build_task_evidence(
         source_tree_digest: execution
             .trials
             .first()
-            .and_then(|trial| trial.diagnostics.source.as_ref())
-            .and_then(|source| source.tree_digest.clone()),
+            .and_then(|trial| trial.diagnostics.source_tree_digest.clone()),
         source_commit,
         trials,
     })
@@ -246,19 +270,19 @@ fn build_trial_evidence(
         baseline: scope_evidence(
             &task_dir.join(AGENT_DIR),
             &plan.baseline.commands,
-            &observed_verification_scopes(&diagnostics.baseline),
+            &diagnostics.baseline,
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         public: scope_evidence(
             &task_dir.join(AGENT_DIR),
             &plan.public.commands,
-            &observed_verification_scopes(&diagnostics.public),
+            &diagnostics.public,
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         hidden: scope_evidence(
             &task_dir.join(AGENT_DIR),
             &plan.hidden.commands,
-            &observed_verification_scopes(&diagnostics.hidden),
+            &diagnostics.hidden,
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         trace_digest,
@@ -276,22 +300,37 @@ fn build_trial_evidence(
     })
 }
 
-fn observed_verification_scopes(diagnostics: &StageDiagnostics) -> Vec<String> {
+fn observed_verification_scopes(
+    workspace: &Path,
+    commands: &[CommandSpec],
+    diagnostics: &StageDiagnostics,
+    default_timeout_seconds: u64,
+) -> Vec<String> {
     diagnostics
         .commands
         .iter()
-        .filter(|command| command.phase.starts_with("verification.command."))
-        .filter_map(|command| command.scope_digest.clone())
+        .filter_map(|diagnostic| {
+            diagnostic
+                .phase
+                .strip_prefix("verification.command.")
+                .and_then(|index| index.parse::<usize>().ok())
+        })
+        .filter_map(|index| commands.get(index))
+        .filter_map(|command| {
+            command_scope_digest_for_spec(workspace, command, default_timeout_seconds).ok()
+        })
         .collect()
 }
 
 fn scope_evidence(
     workspace: &Path,
     commands: &[CommandSpec],
-    observed_scope_digests: &[String],
+    diagnostics: &StageDiagnostics,
     default_timeout_seconds: u64,
 ) -> EvaluationScopeEvidence {
-    scope_evidence_with(commands, observed_scope_digests, |command| {
+    let observed_scope_digests =
+        observed_verification_scopes(workspace, commands, diagnostics, default_timeout_seconds);
+    scope_evidence_with(commands, &observed_scope_digests, |command| {
         command_scope_digest_for_spec(workspace, command, default_timeout_seconds)
     })
 }

@@ -179,6 +179,7 @@ fn blocked_trial(trial: u32) -> EvaluationTrialResult {
         code: None,
         kind: BlockerKind::Network,
         message: "provider unavailable".to_string(),
+        task_id: None,
     };
     EvaluationTrialResult {
         trial,
@@ -491,6 +492,7 @@ fn preflight_blocker_binds_one_zero_sample_summary_to_the_same_error_code() {
         code: preflight.error_code.clone(),
         kind: BlockerKind::Environment,
         message: "sandbox preflight unsupported".to_string(),
+        task_id: None,
     };
     let result = EvaluationResult::blocked_by_sandbox_preflight(
         RunId::new("preflight-blocked").expect("run id"),
@@ -521,6 +523,7 @@ fn source_preparation_blocker_binds_zero_sampling_with_supported_preflight() {
         code: Some("workspace_preparation_failed".to_string()),
         kind: BlockerKind::WorkspacePreparation,
         message: "source could not be materialized".to_string(),
+        task_id: Some(task_ids[1].clone()),
     };
     let result = EvaluationResult::blocked_before_sampling(
         RunId::new("source-blocked-run").expect("run id"),
@@ -578,6 +581,7 @@ fn zero_sampling_result_rejects_post_sampling_blocker_categories_and_missing_cod
                 code: Some("provider_response_invalid".to_string()),
                 kind,
                 message: "post-sampling blocker".to_string(),
+                task_id: None,
             },
             supported_preflight(),
         );
@@ -591,6 +595,7 @@ fn zero_sampling_result_rejects_post_sampling_blocker_categories_and_missing_cod
             code: None,
             kind: BlockerKind::WorkspacePreparation,
             message: "source preparation failed".to_string(),
+            task_id: None,
         },
         supported_preflight(),
     );

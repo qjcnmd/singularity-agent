@@ -10,15 +10,13 @@ use std::time::Instant;
 use std::os::windows::ffi::OsStrExt;
 
 use super::workspace_change::{
-    CachedProtectedPath, capture_cached_protected_paths, changed_paths_are_bounded,
-    validate_cached_protected_paths, validate_cached_workspace_root,
-    validate_observed_relative_path,
+    CachedProtectedPath, capture_cached_protected_paths, validate_cached_protected_paths,
+    validate_cached_workspace_root,
 };
 use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
-    CommandSemanticStatus, ExecutableAvailability, IncrementalSnapshot,
-    PreparedWorkspaceObservation, PreparedWorkspaceObserver, SandboxBackend,
+    CommandSemanticStatus, ExecutableAvailability, IncrementalSnapshot, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
     SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation,
     WorkspaceObservationMetrics, WorkspaceObservationMode, WorkspaceObservationPhaseMetrics,
@@ -237,107 +235,6 @@ struct ObservedWorkspaceSnapshot {
     metrics: WorkspaceObservationPhaseMetrics,
 }
 
-struct WindowsPreparedWorkspaceObserver {
-    workspace: PathBuf,
-    monitor: Option<WorkspaceChangeMonitor>,
-}
-
-fn prepared_workspace_observation(
-    observation: WorkspaceChangeObservation,
-) -> PreparedWorkspaceObservation {
-    match observation {
-        WorkspaceChangeObservation::Unchanged => PreparedWorkspaceObservation::Unchanged,
-        WorkspaceChangeObservation::Unknown => PreparedWorkspaceObservation::Unknown,
-        WorkspaceChangeObservation::Changed(changes) => {
-            let Some(paths) = normalize_prepared_changed_paths(changes) else {
-                return PreparedWorkspaceObservation::Unknown;
-            };
-            PreparedWorkspaceObservation::Changed(paths)
-        }
-    }
-}
-
-/// Project typed Win32 actions to the path-only prepared-workspace contract.
-///
-/// The monitor keeps action kinds so incremental snapshots can remain conservative.  This
-/// adapter accepts only the one lossless coalescing case (Added + Modified) and rejects every
-/// action whose path-only projection could hide a removal, rename, or conflicting mutation.
-fn normalize_prepared_changed_paths(
-    changes: Vec<singularity_windows_sandbox::WorkspacePathChange>,
-) -> Option<Vec<String>> {
-    let mut by_path = std::collections::BTreeMap::<
-        String,
-        singularity_windows_sandbox::WorkspacePathChangeKind,
-    >::new();
-    for change in changes {
-        if change.path == "." || validate_observed_relative_path(&change.path).is_err() {
-            return None;
-        }
-        use singularity_windows_sandbox::WorkspacePathChangeKind as Kind;
-        match by_path.entry(change.path) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(change.kind);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let merged = match (*entry.get(), change.kind) {
-                    (Kind::Added, Kind::Modified) | (Kind::Modified, Kind::Added) => Kind::Added,
-                    (left, right) if left == right => left,
-                    _ => return None,
-                };
-                entry.insert(merged);
-            }
-        }
-    }
-
-    if by_path.is_empty()
-        || by_path.values().any(|kind| {
-            matches!(
-                kind,
-                singularity_windows_sandbox::WorkspacePathChangeKind::Removed
-                    | singularity_windows_sandbox::WorkspacePathChangeKind::RenamedOld
-                    | singularity_windows_sandbox::WorkspacePathChangeKind::RenamedNew
-            )
-        })
-    {
-        return None;
-    }
-
-    let added_ancestors = by_path
-        .iter()
-        .filter_map(|(path, kind)| {
-            matches!(
-                kind,
-                singularity_windows_sandbox::WorkspacePathChangeKind::Added
-            )
-            .then_some(path.clone())
-        })
-        .collect::<Vec<_>>();
-    let paths = by_path
-        .into_keys()
-        .filter_map(|path| {
-            (!added_ancestors
-                .iter()
-                .any(|ancestor| path.starts_with(&format!("{ancestor}/"))))
-            .then_some(path)
-        })
-        .collect::<Vec<_>>();
-    changed_paths_are_bounded(&paths).then_some(paths)
-}
-
-impl PreparedWorkspaceObserver for WindowsPreparedWorkspaceObserver {
-    fn checkpoint(&mut self) -> Result<PreparedWorkspaceObservation, String> {
-        let next = WorkspaceChangeMonitor::start(&self.workspace)
-            .map_err(|error| format!("prepared workspace observer rollover failed: {error}"))?;
-        let previous = self
-            .monitor
-            .replace(next)
-            .ok_or_else(|| "prepared workspace observer is unavailable".to_string())?;
-        previous
-            .finish()
-            .map_err(|error| format!("prepared workspace observation failed: {error}"))
-            .map(prepared_workspace_observation)
-    }
-}
 const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
     "capability_not_supported:workspace_change_summary";
 const TRUSTED_WORKSPACE_ROLLBACK_FAILED: &str = "trusted_workspace_rollback_failed";
@@ -691,20 +588,6 @@ impl SandboxBackend for WindowsSandboxBackend {
             Err(ExecutableResolutionError::Unavailable(_)) => ExecutableAvailability::Unavailable,
             Err(_) => ExecutableAvailability::Unknown,
         }
-    }
-
-    fn observe_prepared_workspace(
-        &self,
-        workspace: &Path,
-    ) -> Result<Option<Box<dyn PreparedWorkspaceObserver>>, String> {
-        let workspace = canonical_directory(workspace)
-            .map_err(|error| format!("prepared workspace root is unavailable: {error}"))?;
-        let monitor = WorkspaceChangeMonitor::start(&workspace)
-            .map_err(|error| format!("prepared workspace observer failed to start: {error}"))?;
-        Ok(Some(Box::new(WindowsPreparedWorkspaceObserver {
-            workspace,
-            monitor: Some(monitor),
-        })))
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -2566,132 +2449,6 @@ mod tests {
             assert!(!report.proves_supported_contract_for("windows"));
         }
         assert!(!workspace.path().join("singularity-preflight.txt").exists());
-    }
-
-    #[test]
-    fn prepared_observation_exposes_only_bounded_relative_changed_paths() {
-        let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
-            singularity_windows_sandbox::WorkspacePathChange {
-                path: "nested/value.txt".to_string(),
-                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
-            },
-            singularity_windows_sandbox::WorkspacePathChange {
-                path: "nested/value.txt".to_string(),
-                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
-            },
-        ]));
-        assert_eq!(
-            changed,
-            PreparedWorkspaceObservation::Changed(vec!["nested/value.txt".to_string()])
-        );
-        let PreparedWorkspaceObservation::Changed(paths) = changed else {
-            unreachable!("changed observation must retain its path set");
-        };
-        assert!(paths.iter().all(|path| {
-            !Path::new(path).is_absolute() && !path.contains(':') && !path.contains('\\')
-        }));
-        assert_eq!(
-            prepared_workspace_observation(WorkspaceChangeObservation::Unknown),
-            PreparedWorkspaceObservation::Unknown
-        );
-    }
-
-    #[test]
-    fn prepared_observation_coalesces_added_and_modified_in_either_order() {
-        use singularity_windows_sandbox::WorkspacePathChangeKind::{Added, Modified};
-        for kinds in [[Added, Modified], [Modified, Added]] {
-            let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(
-                kinds
-                    .into_iter()
-                    .map(|kind| singularity_windows_sandbox::WorkspacePathChange {
-                        path: "generated/value.txt".to_string(),
-                        kind,
-                    })
-                    .collect(),
-            ));
-            assert_eq!(
-                changed,
-                PreparedWorkspaceObservation::Changed(vec!["generated/value.txt".to_string()])
-            );
-        }
-    }
-
-    #[test]
-    fn prepared_observation_coalesces_descendant_added_after_ancestor() {
-        use singularity_windows_sandbox::WorkspacePathChangeKind::Added;
-        let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
-            singularity_windows_sandbox::WorkspacePathChange {
-                path: "generated/value.txt".to_string(),
-                kind: Added,
-            },
-            singularity_windows_sandbox::WorkspacePathChange {
-                path: "generated".to_string(),
-                kind: Added,
-            },
-        ]));
-        assert_eq!(
-            changed,
-            PreparedWorkspaceObservation::Changed(vec!["generated".to_string()])
-        );
-    }
-
-    #[test]
-    fn prepared_observation_rejects_removes_renames_and_conflicts() {
-        use singularity_windows_sandbox::WorkspacePathChangeKind::{
-            Added, Modified, Removed, RenamedNew, RenamedOld,
-        };
-        for kind in [Removed, RenamedOld, RenamedNew] {
-            assert_eq!(
-                prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
-                    singularity_windows_sandbox::WorkspacePathChange {
-                        path: "generated/value.txt".to_string(),
-                        kind,
-                    },
-                ])),
-                PreparedWorkspaceObservation::Unknown
-            );
-        }
-        assert_eq!(
-            prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
-                singularity_windows_sandbox::WorkspacePathChange {
-                    path: "generated/value.txt".to_string(),
-                    kind: Added,
-                },
-                singularity_windows_sandbox::WorkspacePathChange {
-                    path: "generated/value.txt".to_string(),
-                    kind: Removed,
-                },
-            ])),
-            PreparedWorkspaceObservation::Unknown
-        );
-        assert_eq!(
-            prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
-                singularity_windows_sandbox::WorkspacePathChange {
-                    path: "generated/value.txt".to_string(),
-                    kind: Modified,
-                },
-                singularity_windows_sandbox::WorkspacePathChange {
-                    path: "generated/value.txt".to_string(),
-                    kind: Removed,
-                },
-            ])),
-            PreparedWorkspaceObservation::Unknown
-        );
-    }
-
-    #[test]
-    fn prepared_observation_does_not_truncate_paths_past_the_existing_bound() {
-        use singularity_windows_sandbox::WorkspacePathChangeKind::Modified;
-        let changes = (0..=64)
-            .map(|index| singularity_windows_sandbox::WorkspacePathChange {
-                path: format!("generated/value-{index}.txt"),
-                kind: Modified,
-            })
-            .collect();
-        assert_eq!(
-            prepared_workspace_observation(WorkspaceChangeObservation::Changed(changes)),
-            PreparedWorkspaceObservation::Unknown
-        );
     }
 
     #[test]
