@@ -42,6 +42,17 @@ pub struct ToolExecution {
     pub payload: Value,
 }
 
+/// 无 active owner turn 的终态化参数：previous 状态、终态 agent_loop_status、
+/// recovery reason 与基础 trace（避免 helper 参数过多）。
+#[derive(Debug, Clone)]
+pub(crate) struct OwnerlessTerminalization<'a> {
+    pub(crate) previous_status: TurnStatus,
+    pub(crate) previous_agent_loop_status: &'a str,
+    pub(crate) terminal_agent_loop_status: &'a str,
+    pub(crate) recovery_reason: &'a str,
+    pub(crate) trace: &'a TraceEvent,
+}
+
 impl SessionStore {
     /// Persist a safe turn boundary before entering a model/tool side effect.
     pub fn save_turn_checkpoint(
@@ -789,7 +800,15 @@ impl SessionStore {
                 });
                 let valid = match (row.decision, row.pending_state.as_deref(), terminal) {
                     (None, Some("pending"), false) => {
-                        row.turn_status == TurnStatus::Blocked && row.agent_loop_status == "blocked"
+                        // 正常 pending approval 绑定 blocked turn；paused/suspended
+                        // 是 ownerless 状态，running 是 approval 创建与转 blocked 之间
+                        // 崩溃的中间态——这些不一致的 pending 行都留给
+                        // recover_abandoned_turns_for_thread 统一终态化（B2）。
+                        (row.turn_status == TurnStatus::Blocked
+                            && row.agent_loop_status == "blocked")
+                            || row.turn_status == TurnStatus::Paused
+                            || row.turn_status == TurnStatus::Suspended
+                            || row.turn_status == TurnStatus::Running
                     }
                     (Some(ApprovalOutcome::Allow), Some("executing"), _) => true,
                     (Some(ApprovalOutcome::Allow), None, true) => true,
@@ -954,6 +973,42 @@ impl SessionStore {
         Ok(recovered)
     }
 
+    /// 将无 active owner 的非终态 turn 终态化为 Interrupted。
+    ///
+    /// B1（用户 interrupt）与 B2（启动恢复）共用：同一事务内清理未解决 pending
+    /// approval、更新状态、写 typed trace；保留 checkpoint 与 tool_executions 审计
+    /// 证据；不执行/不重放/不删除 unknown。trace 插入失败会使事务回滚。
+    pub(crate) fn terminalize_ownerless_turn(
+        transaction: &Connection,
+        thread_id: &str,
+        turn_id: &str,
+        params: OwnerlessTerminalization<'_>,
+    ) -> StoreResult<()> {
+        Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
+        transaction.execute(
+            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
+            params![
+                TurnStatus::Interrupted.to_db_text(),
+                params.terminal_agent_loop_status,
+                turn_id
+            ],
+        )?;
+        let mut terminal_trace = params.trace.clone();
+        terminal_trace.summary = match params.recovery_reason {
+            "execution_owner_lost" => "turn interrupted after execution owner was lost".to_string(),
+            _ => "turn interrupted after inconsistent state was detected".to_string(),
+        };
+        terminal_trace.payload = serde_json::json!({
+            "turn_id": turn_id,
+            "previous_status": params.previous_status,
+            "previous_agent_loop_status": params.previous_agent_loop_status,
+            "recovery_reason": params.recovery_reason,
+            "tool_replayed": false,
+        });
+        Self::insert_turn_trace(transaction, &terminal_trace, thread_id, turn_id)?;
+        Ok(())
+    }
+
     // 将 thread 中遗留的非终态 turn 收敛为可恢复状态。
     pub(crate) fn recover_abandoned_turns_for_thread(
         transaction: &Connection,
@@ -1011,18 +1066,54 @@ impl SessionStore {
                 |row| row.get(0),
             )?;
             if status == TurnStatus::Suspended && agent_loop_status == "suspended" {
-                if !has_checkpoint {
-                    return Err(StoreError::InvalidState(format!(
-                        "suspended turn {turn_id} is missing checkpoint"
-                    )));
+                // 可归属不一致：缺 checkpoint 或残留 pending/executing。
+                // 正常 suspended（有 checkpoint、无 pending）保持可恢复。
+                if !has_checkpoint || pending_count != 0 || executing_count != 0 {
+                    let trace = TraceEvent::for_turn(
+                        format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
+                        thread_id,
+                        turn_id.clone(),
+                        "app_server",
+                        "turn interrupted after inconsistent state was detected",
+                    );
+                    Self::terminalize_ownerless_turn(
+                        transaction,
+                        thread_id,
+                        &turn_id,
+                        OwnerlessTerminalization {
+                            previous_status: status,
+                            previous_agent_loop_status: &agent_loop_status,
+                            terminal_agent_loop_status: "interrupted",
+                            recovery_reason: "inconsistent_turn_state",
+                            trace: &trace,
+                        },
+                    )?;
+                    recovered.push(turn_id);
                 }
                 continue;
             }
             if status == TurnStatus::Paused && agent_loop_status == "paused" {
                 if !has_checkpoint || pending_count != 0 || executing_count != 0 {
-                    return Err(StoreError::InvalidState(format!(
-                        "paused turn {turn_id} has inconsistent checkpoint or execution state"
-                    )));
+                    let trace = TraceEvent::for_turn(
+                        format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
+                        thread_id,
+                        turn_id.clone(),
+                        "app_server",
+                        "turn interrupted after inconsistent state was detected",
+                    );
+                    Self::terminalize_ownerless_turn(
+                        transaction,
+                        thread_id,
+                        &turn_id,
+                        OwnerlessTerminalization {
+                            previous_status: status,
+                            previous_agent_loop_status: &agent_loop_status,
+                            terminal_agent_loop_status: "interrupted",
+                            recovery_reason: "inconsistent_turn_state",
+                            trace: &trace,
+                        },
+                    )?;
+                    recovered.push(turn_id);
                 }
                 continue;
             }
@@ -1046,9 +1137,28 @@ impl SessionStore {
                 continue;
             }
             if pending_count != 0 || executing_count != 0 {
-                return Err(StoreError::InvalidState(format!(
-                    "turn {turn_id} has inconsistent pending execution state"
-                )));
+                // 可归属不一致：pending/executing 计数无法归入任何合法状态。
+                let trace = TraceEvent::for_turn(
+                    format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
+                    thread_id,
+                    turn_id.clone(),
+                    "app_server",
+                    "turn interrupted after inconsistent state was detected",
+                );
+                Self::terminalize_ownerless_turn(
+                    transaction,
+                    thread_id,
+                    &turn_id,
+                    OwnerlessTerminalization {
+                        previous_status: status,
+                        previous_agent_loop_status: &agent_loop_status,
+                        terminal_agent_loop_status: "interrupted",
+                        recovery_reason: "inconsistent_turn_state",
+                        trace: &trace,
+                    },
+                )?;
+                recovered.push(turn_id);
+                continue;
             }
 
             transaction.execute(

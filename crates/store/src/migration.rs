@@ -2063,7 +2063,9 @@ fn validate_legacy_approvals(data: &LegacyData) -> StoreResult<()> {
             ))
         })?;
         if pending.execution_state == "pending"
-            && (turn.status != TurnStatus::Blocked || turn.agent_loop_status != "blocked")
+            && !(turn.status == TurnStatus::Blocked && turn.agent_loop_status == "blocked")
+            && turn.status != TurnStatus::Paused
+            && turn.status != TurnStatus::Suspended
         {
             return Err(StoreError::InvalidState(
                 "pending approval is not bound to a blocked turn".to_string(),

@@ -1,6 +1,8 @@
 #![cfg(windows)]
 
 use serde_json::{Value, json};
+use singularity_protocol::TurnStatus;
+use singularity_store::SessionStore;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -984,4 +986,67 @@ fn thread_start_freezes_resolved_default_selector_when_model_is_omitted() {
         "legacy default model must be frozen into Thread.model: {response}"
     );
     process.shutdown(3);
+}
+
+// 启动恢复 E2E：预置一个可归属损坏 turn（suspended 缺 checkpoint）与一个健康
+// suspended turn（有 checkpoint），同一 App Server 启动成功后坏 turn 收敛为
+// interrupted，健康 turn 保持可恢复；坏 turn 不阻断启动。
+#[test]
+fn app_server_starts_with_inconsistent_turn_and_healthier_turn_survives() {
+    let provider = ControlledProvider::start();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = create_workspace(dir.path());
+    let db_path = dir.path().join("sessions.sqlite3");
+
+    let store = SessionStore::open(&db_path).expect("preload store");
+    let bad_thread = store.create_thread(None, None).expect("bad thread");
+    let bad_turn = store
+        .create_turn(&bad_thread.thread_id, "running")
+        .expect("bad turn");
+    store
+        .update_turn_state(&bad_turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend bad turn");
+    let healthy_thread = store.create_thread(None, None).expect("healthy thread");
+    let healthy_turn = store
+        .create_turn(&healthy_thread.thread_id, "running")
+        .expect("healthy turn");
+    store
+        .save_turn_checkpoint(
+            &healthy_turn.turn_id,
+            &healthy_thread.thread_id,
+            &json!({"checkpoint_version": 1, "boundary": "initial"}),
+            1,
+        )
+        .expect("healthy checkpoint");
+    store
+        .update_turn_state(&healthy_turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend healthy turn");
+    drop(store);
+
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+
+    process.send_request(2, "turn/status", json!({"turnId": bad_turn.turn_id}));
+    let bad_response = process.output.recv_id(2, Duration::from_secs(5));
+    assert_eq!(
+        bad_response["result"]["turn"]["status"], "interrupted",
+        "inconsistent turn must be terminalized during startup: {bad_response}"
+    );
+    assert_eq!(
+        bad_response["result"]["turn"]["agent_loop_status"],
+        "interrupted"
+    );
+
+    process.send_request(3, "turn/status", json!({"turnId": healthy_turn.turn_id}));
+    let healthy_response = process.output.recv_id(3, Duration::from_secs(5));
+    assert_eq!(
+        healthy_response["result"]["turn"]["status"], "suspended",
+        "healthy suspended turn must remain resumable: {healthy_response}"
+    );
+    assert_eq!(
+        healthy_response["result"]["turn"]["agent_loop_status"],
+        "suspended"
+    );
+
+    process.shutdown(4);
 }

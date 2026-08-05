@@ -1,5 +1,6 @@
 //! Thread, turn, item, and conversation-history operations.
 
+use super::checkpoint_recovery::OwnerlessTerminalization;
 use super::support::*;
 use super::*;
 
@@ -750,6 +751,26 @@ impl SessionStore {
             transaction.commit()?;
             return Ok(turn);
         }
+        // paused/suspended 已无 active owner，不会再有 worker 收敛
+        // cancel_requested；用户 interrupt 时当场终态化，避免卡死到重启。
+        if turn.status == TurnStatus::Paused || turn.status == TurnStatus::Suspended {
+            Self::terminalize_ownerless_turn(
+                &transaction,
+                &turn.thread_id,
+                &turn.turn_id,
+                OwnerlessTerminalization {
+                    previous_status: turn.status.clone(),
+                    previous_agent_loop_status: &turn.agent_loop_status,
+                    terminal_agent_loop_status: "cancelled",
+                    recovery_reason: "execution_owner_lost",
+                    trace,
+                },
+            )?;
+            turn.status = TurnStatus::Interrupted;
+            turn.agent_loop_status = "cancelled".to_string();
+            transaction.commit()?;
+            return Ok(turn);
+        }
         transaction.execute(
             "update turns set agent_loop_status = 'cancel_requested' where turn_id = ?1",
             params![turn_id],
@@ -761,8 +782,9 @@ impl SessionStore {
     }
 
     // 删除尚未开始外部执行的 pending approval 及其 checkpoint。
-    fn delete_unresolved_pending_approvals(
-        transaction: &Transaction<'_>,
+    // B1（interrupt）与 B2（启动恢复）共用同一删除语义，防止 SQL 漂移。
+    pub(crate) fn delete_unresolved_pending_approvals(
+        transaction: &Connection,
         turn_id: &str,
     ) -> StoreResult<usize> {
         let mut pending_statement = transaction.prepare(

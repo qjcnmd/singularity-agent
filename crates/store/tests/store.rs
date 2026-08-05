@@ -3216,6 +3216,344 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
     );
 }
 
+// B1：paused/suspended turn 的 interrupt 在当前进程当场收敛（无需重启），
+// checkpoint 审计证据保留，typed trace 记录 owner-loss 收敛。
+#[test]
+fn paused_and_suspended_interrupt_terminalizes_without_restart() {
+    for (status, agent_loop_status) in [
+        (TurnStatus::Paused, "paused"),
+        (TurnStatus::Suspended, "suspended"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("turn");
+        store
+            .save_turn_checkpoint(
+                &turn.turn_id,
+                &thread.thread_id,
+                &serde_json::json!({"checkpoint_version": 1, "boundary": "initial"}),
+                1,
+            )
+            .expect("checkpoint");
+        store
+            .update_turn_state(&turn.turn_id, status, agent_loop_status)
+            .expect("ownerless state");
+        let trace = TraceEvent::for_turn(
+            "trace_interrupt_ownerless",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "app_server",
+            "turn interrupt requested",
+        );
+        let interrupted = store
+            .request_turn_cancellation(&turn.turn_id, &trace)
+            .expect("interrupt");
+        assert_eq!(interrupted.status, TurnStatus::Interrupted);
+        assert_eq!(interrupted.agent_loop_status, "cancelled");
+        // 未重启：当前 Store 会话即可看到终态（同一进程收敛）。
+        let persisted = store.get_turn(&turn.turn_id).expect("turn");
+        assert_eq!(persisted.status, TurnStatus::Interrupted);
+        assert_eq!(persisted.agent_loop_status, "cancelled");
+        // checkpoint 保留为审计证据。
+        assert!(
+            store
+                .get_turn_checkpoint(&turn.turn_id)
+                .expect("checkpoint lookup")
+                .is_some()
+        );
+        let recovery_trace = store
+            .list_trace(&thread.thread_id)
+            .expect("trace list")
+            .into_iter()
+            .find(|trace| trace.event_id == "trace_interrupt_ownerless")
+            .expect("interrupt trace");
+        assert_eq!(recovery_trace.payload["tool_replayed"], false);
+        assert_eq!(
+            recovery_trace.payload["recovery_reason"],
+            "execution_owner_lost"
+        );
+        assert_eq!(recovery_trace.payload["previous_status"], agent_loop_status);
+    }
+}
+
+// B2：启动恢复将可归属不一致的 ownerless turn 终态化（Interrupted/interrupted），
+// 保留审计证据、清理未解决 pending approval，且不阻断健康 sibling。
+#[test]
+fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("store");
+
+    // 场景 1：suspended 缺 checkpoint（附 unknown execution 验证保留）。
+    let thread_1 = store.create_thread(None, None).expect("thread 1");
+    let turn_1 = store
+        .create_turn(&thread_1.thread_id, "running")
+        .expect("turn 1");
+    store
+        .update_turn_state(&turn_1.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend 1");
+    let execution_1 = format!("exec:unknown:{}", turn_1.turn_id);
+    let connection = rusqlite::Connection::open(&db_path).expect("sqlite");
+    connection
+        .execute(
+            "insert into tool_executions(
+                execution_id, thread_id, turn_id, tool_call_id, execution_state, payload
+             ) values(?1, ?2, ?3, ?4, 'unknown', ?5)",
+            rusqlite::params![
+                execution_1,
+                thread_1.thread_id,
+                turn_1.turn_id,
+                "call_1",
+                serde_json::to_string(
+                    &serde_json::json!({"kind": "tool_call", "tool_name": "read"})
+                )
+                .expect("execution payload")
+            ],
+        )
+        .expect("insert unknown execution");
+    drop(connection);
+
+    // 场景 2：paused 缺 checkpoint。
+    let thread_2 = store.create_thread(None, None).expect("thread 2");
+    let turn_2 = store
+        .create_turn(&thread_2.thread_id, "running")
+        .expect("turn 2");
+    store
+        .update_turn_state(&turn_2.turn_id, TurnStatus::Paused, "paused")
+        .expect("pause 2");
+
+    // 场景 3：paused 带未解决 pending approval（approvals + pending_tool_calls）。
+    let thread_3 = store.create_thread(None, None).expect("thread 3");
+    let turn_3 = store
+        .create_turn(&thread_3.thread_id, "running")
+        .expect("turn 3");
+    let request_3 = ApprovalRequest::new(
+        "approval_recovery_3",
+        thread_3.thread_id.clone(),
+        turn_3.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_3")
+    .with_resources([workspace_resource("README.md")]);
+    let checkpoint_3 = serde_json::json!({
+        "request_id": &request_3.request_id,
+        "thread_id": &request_3.thread_id,
+        "turn_id": &request_3.turn_id,
+        "tool_call_id": "call_3",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": &request_3.resources,
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request_3,
+            Some(checkpoint_3),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending 3");
+    store
+        .update_turn_state(&turn_3.turn_id, TurnStatus::Paused, "paused")
+        .expect("pause 3");
+
+    // 场景 4：suspended 带未解决 pending approval（ownerless 状态残留的
+    // 不一致 pending；running+pending 会被 store 打开 preflight 拒绝，属于
+    // 不可归属损坏，保持 fail-closed，不在本场景内）。
+    let thread_4 = store.create_thread(None, None).expect("thread 4");
+    let turn_4 = store
+        .create_turn(&thread_4.thread_id, "running")
+        .expect("turn 4");
+    let request_4 = ApprovalRequest::new(
+        "approval_recovery_4",
+        thread_4.thread_id.clone(),
+        turn_4.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_4")
+    .with_resources([workspace_resource("README.md")]);
+    let checkpoint_4 = serde_json::json!({
+        "request_id": &request_4.request_id,
+        "thread_id": &request_4.thread_id,
+        "turn_id": &request_4.turn_id,
+        "tool_call_id": "call_4",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": &request_4.resources,
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request_4,
+            Some(checkpoint_4),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending 4");
+    store
+        .update_turn_state(&turn_4.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend 4");
+
+    // 健康 sibling 1：suspended 有 checkpoint（正常可恢复）。
+    let thread_5 = store.create_thread(None, None).expect("thread 5");
+    let turn_5 = store
+        .create_turn(&thread_5.thread_id, "running")
+        .expect("turn 5");
+    store
+        .save_turn_checkpoint(
+            &turn_5.turn_id,
+            &thread_5.thread_id,
+            &serde_json::json!({"checkpoint_version": 1, "boundary": "initial"}),
+            1,
+        )
+        .expect("checkpoint 5");
+    store
+        .update_turn_state(&turn_5.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend 5");
+
+    // 健康 sibling 2：blocked + 1 pending approval（正常待审批）。
+    let thread_6 = store.create_thread(None, None).expect("thread 6");
+    let turn_6 = store
+        .create_turn(&thread_6.thread_id, "running")
+        .expect("turn 6");
+    let request_6 = ApprovalRequest::new(
+        "approval_recovery_6",
+        thread_6.thread_id.clone(),
+        turn_6.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_6")
+    .with_resources([workspace_resource("README.md")]);
+    let checkpoint_6 = serde_json::json!({
+        "request_id": &request_6.request_id,
+        "thread_id": &request_6.thread_id,
+        "turn_id": &request_6.turn_id,
+        "tool_call_id": "call_6",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": &request_6.resources,
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request_6,
+            Some(checkpoint_6),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending 6");
+    store
+        .update_turn_state(&turn_6.turn_id, TurnStatus::Blocked, "blocked")
+        .expect("block 6");
+
+    drop(store);
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    reopened
+        .recover_unowned_workspace_executions()
+        .expect("recover inconsistent ownerless turns");
+
+    // 四个坏 turn 全部收敛为 Interrupted/interrupted。
+    for turn in [&turn_1, &turn_2, &turn_3, &turn_4] {
+        let recovered = reopened.get_turn(&turn.turn_id).expect("recovered turn");
+        assert_eq!(recovered.status, TurnStatus::Interrupted);
+        assert_eq!(recovered.agent_loop_status, "interrupted");
+    }
+    // 场景 3 的未解决 approval/pending 行已删除，不留下孤儿。
+    assert!(
+        !reopened
+            .has_pending_tool_call(&request_3.request_id)
+            .expect("pending 3 lookup")
+    );
+    // 场景 4 的 pending approval 行已删除。
+    assert!(
+        !reopened
+            .has_pending_tool_call(&request_4.request_id)
+            .expect("pending 4 lookup")
+    );
+    // 坏 turn 的未解决 approval 已删除，健康 blocked sibling 的 pending 保留。
+    let pending_requests = reopened
+        .list_pending_approvals()
+        .expect("pending approvals");
+    assert!(
+        !pending_requests
+            .iter()
+            .any(|request| request.request_id == request_3.request_id)
+    );
+    assert!(
+        !pending_requests
+            .iter()
+            .any(|request| request.request_id == request_4.request_id)
+    );
+    assert!(
+        pending_requests
+            .iter()
+            .any(|request| request.request_id == request_6.request_id)
+    );
+    // unknown execution 保留为审计证据（不删除、不重放）。
+    assert_eq!(
+        reopened
+            .get_tool_execution(&execution_1)
+            .expect("execution lookup")
+            .expect("unknown execution")
+            .state,
+        ToolExecutionState::Unknown
+    );
+    // typed trace 记录收敛原因与 previous 状态。
+    let recovery_trace = reopened
+        .list_trace(&thread_1.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .find(|trace| {
+            trace
+                .payload
+                .get("recovery_reason")
+                .and_then(|value| value.as_str())
+                == Some("inconsistent_turn_state")
+        })
+        .expect("recovery trace");
+    assert_eq!(recovery_trace.payload["tool_replayed"], false);
+    assert_eq!(recovery_trace.payload["previous_status"], "suspended");
+    assert_eq!(
+        recovery_trace.payload["previous_agent_loop_status"],
+        "suspended"
+    );
+    // 健康 sibling 不受影响。
+    let healthy_5 = reopened.get_turn(&turn_5.turn_id).expect("turn 5");
+    assert_eq!(healthy_5.status, TurnStatus::Suspended);
+    assert_eq!(healthy_5.agent_loop_status, "suspended");
+    let healthy_6 = reopened.get_turn(&turn_6.turn_id).expect("turn 6");
+    assert_eq!(healthy_6.status, TurnStatus::Blocked);
+    assert_eq!(healthy_6.agent_loop_status, "blocked");
+    assert!(
+        reopened
+            .has_pending_tool_call(&request_6.request_id)
+            .expect("pending 6 lookup")
+    );
+}
+
 #[test]
 fn parallel_tool_result_checkpoint_clears_the_complete_batch_before_owner_recovery() {
     let dir = tempfile::tempdir().expect("temp dir");
