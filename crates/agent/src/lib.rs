@@ -580,7 +580,10 @@ fn prepare_seed_messages(
     let mut messages = Vec::with_capacity(seed.messages.len() + 2);
     let mut seed_messages = seed.messages.iter().cloned();
     for message in seed_messages.by_ref() {
-        if message.role != ModelRole::Developer {
+        if message.role != ModelRole::Developer
+            || message.content.starts_with(COMPACTION_SUMMARY_PREFIX)
+        {
+            // 旧 leading block 被替换；compaction summary 紧跟 leading 且必须保留。
             messages.push(message);
             break;
         }
@@ -634,6 +637,12 @@ fn validate_replay_preflight(input: &AgentLoopInput) -> Result<(), String> {
     let selector_provider = selector
         .and_then(|selector| selector.split_once('/'))
         .map(|(provider, _)| provider);
+    // selector 的 model 分量：`provider/model#effort` 中 `#` 前的部分。
+    let selector_model = selector
+        .and_then(|selector| selector.split_once('/'))
+        .and_then(|(_, model_and_effort)| model_and_effort.split_once('#'))
+        .map(|(model, _)| model)
+        .or_else(|| selector.and_then(|selector| selector.split_once('/')).map(|(_, rest)| rest));
     let selector_effort = selector
         .and_then(|selector| selector.rsplit_once('#'))
         .map(|(_, effort)| effort);
@@ -675,6 +684,13 @@ fn validate_replay_preflight(input: &AgentLoopInput) -> Result<(), String> {
         {
             return Err(format!(
                 "provider reasoning replay from {provider_name} cannot be replayed by the resolved provider {expected_provider}"
+            ));
+        }
+        if let Some(expected_model) = selector_model
+            && model_name != expected_model
+        {
+            return Err(format!(
+                "provider reasoning replay for {model_name} cannot be replayed by the resolved model {expected_model}"
             ));
         }
         if let Some(expected_effort) = selector_effort
@@ -6799,5 +6815,68 @@ mod cancellation_tests {
         assert!(!result.ok);
         assert_eq!(result.error_code.as_deref(), Some("tool_cancelled"));
         assert_eq!(result.failure_kind, Some(ToolFailureKind::Cancelled));
+    }
+
+    #[test]
+    fn prepare_seed_messages_preserves_compaction_summary_and_replaces_leading_developer() {
+        let summary = ModelMessage::text(
+            ModelRole::Developer,
+            format!(
+                "{COMPACTION_SUMMARY_PREFIX}\"omitted_message_count\":3}}"
+            ),
+        );
+        let old_leading = ModelMessage::text(ModelRole::Developer, "old leading instructions");
+        let repair = ModelMessage::text(
+            ModelRole::Developer,
+            format!("{REPAIR_STATE_INSTRUCTIONS} repair_context=..."),
+        );
+        let history_user = ModelMessage::text(ModelRole::User, "history user");
+        let seed = HistoricalModelContext {
+            messages: vec![
+                old_leading.clone(),
+                summary.clone(),
+                repair.clone(),
+                history_user.clone(),
+            ],
+            provider_reasoning_history: Vec::new(),
+            tool_result_occurrences: Vec::new(),
+        };
+        let input = AgentLoopInput::new("thread_1", "turn_2", "current user");
+        let messages = prepare_seed_messages(&seed, &input, 1, "current user");
+
+        // 唯一 leading 为新的 developer 指令；compaction summary 保留；repair 剔除。
+        assert_eq!(
+            messages[0].role,
+            ModelRole::Developer,
+            "new leading developer"
+        );
+        assert!(messages[0].content.contains(AGENT_DEVELOPER_INSTRUCTIONS));
+        assert!(messages.contains(&summary), "compaction summary preserved");
+        assert!(
+            !messages.iter().any(|message| message.content == old_leading.content),
+            "old leading replaced"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.starts_with(REPAIR_STATE_INSTRUCTIONS)),
+            "repair feedback dropped"
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.role == ModelRole::User && message.content == "current user"
+            }),
+            "current user appended"
+        );
+        // 顺序：leading 必须在 compaction summary 之前。
+        let leading_index = messages
+            .iter()
+            .position(|message| message.content.contains(AGENT_DEVELOPER_INSTRUCTIONS))
+            .expect("leading developer");
+        let summary_index = messages
+            .iter()
+            .position(|message| message.content == summary.content)
+            .expect("summary");
+        assert!(leading_index < summary_index, "leading precedes summary");
     }
 }
