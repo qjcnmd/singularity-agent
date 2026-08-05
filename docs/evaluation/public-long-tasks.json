@@ -1,0 +1,602 @@
+{
+  "schema_version": "evaluation.task_set/v6",
+  "trial_count": 1,
+  "tasks": [
+    {
+      "task_id": "pylint-dev__pylint-6386",
+      "description": "Public SWE-bench Verified task: pylint -v short verbose option incorrectly expects an argument.",
+      "capabilities": [
+        "python",
+        "multi_file_change",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "remote_git",
+          "repository": "https://github.com/pylint-dev/pylint.git",
+          "commit": "754b487f4d892e3d4872b6fc7468a71db4e31c13"
+        },
+        "setup_commands": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "venv",
+              ".venv"
+            ],
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-U",
+              "pip",
+              "wheel",
+              "setuptools"
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytest"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-e",
+              "."
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          }
+        ]
+      },
+      "agent": {
+        "instructions": "Fix pylint issue pylint-dev__pylint-6386. The short option -v of the verbose option incorrectly expects an argument (`pylint mytest.py -v` fails with 'error: argument --verbose/-v: expected one argument') while the long option --verbose works as a flag. Make -v behave like --verbose (no argument expected) and align the verbose help text accordingly. Apply the smallest focused change to the CLI argument configuration (pylint/config/argument.py, pylint/config/arguments_manager.py, pylint/config/utils.py, pylint/lint/base_options.py), then run a relevant verification command through the command tool and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/config/test_config.py b/tests/config/test_config.py\n--- a/tests/config/test_config.py\n+++ b/tests/config/test_config.py\n@@ -100,3 +100,10 @@ def test_unknown_py_version(capsys: CaptureFixture) -> None:\n         Run([str(EMPTY_MODULE), \"--py-version=the-newest\"], exit=False)\n     output = capsys.readouterr()\n     assert \"the-newest has an invalid format, should be a version string.\" in output.err\n+\n+\n+def test_short_verbose(capsys: CaptureFixture) -> None:\n+    \"\"\"Check that we correctly handle the -v flag.\"\"\"\n+    Run([str(EMPTY_MODULE), \"-v\"], exit=False)\n+    output = capsys.readouterr()\n+    assert \"Using config file\" in output.err\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/config/test_config.py",
+                "-k",
+                "test_unknown_py_version"
+              ],
+              "timeout_seconds": 300
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/config/test_config.py",
+                "-k",
+                "test_short_verbose"
+              ],
+              "timeout_seconds": 300
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/config/test_config.py"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "sphinx-doc__sphinx-10673",
+      "description": "Public SWE-bench Verified task: toctree references to genindex/modindex/search raise nonexisting-document warnings.",
+      "capabilities": [
+        "python",
+        "feature_implementation",
+        "multi_file_change",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "remote_git",
+          "repository": "https://github.com/sphinx-doc/sphinx.git",
+          "commit": "f35d2a6cc726f97d0e859ca7a0e1729f7da8a6c8"
+        },
+        "setup_commands": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "venv",
+              ".venv"
+            ],
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-U",
+              "pip",
+              "wheel",
+              "setuptools"
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytest"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-e",
+              "."
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          }
+        ]
+      },
+      "agent": {
+        "instructions": "Fix sphinx issue sphinx-doc__sphinx-10673. A toctree directive that references the built-in documents genindex, modindex and search emits 'toctree contains reference to nonexisting document' warnings even though those documents exist at build time; they should be accepted without warnings so users can add '.. toctree::' entries for them. Apply the smallest focused change to the toctree resolution logic (sphinx/directives/other.py, sphinx/environment/adapters/toctree.py, sphinx/environment/collectors/toctree.py), then run a relevant verification command through the command tool and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/roots/test-toctree-index/conf.py b/tests/roots/test-toctree-index/conf.py\nnew file mode 100644\ndiff --git a/tests/roots/test-toctree-index/foo.rst b/tests/roots/test-toctree-index/foo.rst\nnew file mode 100644\n--- /dev/null\n+++ b/tests/roots/test-toctree-index/foo.rst\n@@ -0,0 +1,8 @@\n+foo\n+===\n+\n+:index:`word`\n+\n+.. py:module:: pymodule\n+\n+.. py:function:: Timer.repeat(repeat=3, number=1000000)\ndiff --git a/tests/roots/test-toctree-index/index.rst b/tests/roots/test-toctree-index/index.rst\nnew file mode 100644\n--- /dev/null\n+++ b/tests/roots/test-toctree-index/index.rst\n@@ -0,0 +1,15 @@\n+test-toctree-index\n+==================\n+\n+.. toctree::\n+\n+   foo\n+\n+\n+.. toctree::\n+   :caption: Indices\n+\n+   genindex\n+   modindex\n+   search\n+\ndiff --git a/tests/test_environment_toctree.py b/tests/test_environment_toctree.py\n--- a/tests/test_environment_toctree.py\n+++ b/tests/test_environment_toctree.py\n@@ -346,3 +346,17 @@ def test_get_toctree_for_includehidden(app):\n \n     assert_node(toctree[2],\n                 [bullet_list, list_item, compact_paragraph, reference, \"baz\"])\n+\n+\n+@pytest.mark.sphinx('xml', testroot='toctree-index')\n+def test_toctree_index(app):\n+    app.build()\n+    toctree = app.env.tocs['index']\n+    assert_node(toctree,\n+                [bullet_list, ([list_item, (compact_paragraph,  # [0][0]\n+                                            [bullet_list, (addnodes.toctree,  # [0][1][0]\n+                                                           addnodes.toctree)])])])  # [0][1][1]\n+    assert_node(toctree[0][1][1], addnodes.toctree,\n+                caption=\"Indices\", glob=False, hidden=False,\n+                titlesonly=False, maxdepth=-1, numbered=0,\n+                entries=[(None, 'genindex'), (None, 'modindex'), (None, 'search')])\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/test_environment_toctree.py",
+                "-k",
+                "test_get_toctree_for_includehidden"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/test_environment_toctree.py",
+                "-k",
+                "test_toctree_index"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/test_environment_toctree.py"
+              ],
+              "timeout_seconds": 900
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "sympy__sympy-20438",
+      "description": "Public SWE-bench Verified task: FiniteSet/ProductSet is_subset gives wrong results and Eq(...).simplify() raises.",
+      "capabilities": [
+        "python",
+        "multi_file_change",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "remote_git",
+          "repository": "https://github.com/sympy/sympy.git",
+          "commit": "33b47e4bd60e2302e42616141e76285038b724d6"
+        },
+        "setup_commands": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "venv",
+              ".venv"
+            ],
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-U",
+              "pip",
+              "wheel",
+              "setuptools"
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytest"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-e",
+              "."
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          }
+        ]
+      },
+      "agent": {
+        "instructions": "Fix sympy issue sympy__sympy-20438. is_subset gives wrong results: for a = FiniteSet(1, 2), b = ProductSet(a, a) and c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2)), b.is_subset(c) must be True (it currently returns None), and Eq(c, b).simplify() must not raise AttributeError ('Complement' object has no attribute 'equals'). Apply the smallest focused change to the set comparison handlers (sympy/core/relational.py, sympy/sets/handlers/comparison.py, sympy/sets/handlers/issubset.py), then run a relevant verification command through the command tool and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/sympy/sets/tests/test_sets.py b/sympy/sets/tests/test_sets.py\n--- a/sympy/sets/tests/test_sets.py\n+++ b/sympy/sets/tests/test_sets.py\n@@ -1251,7 +1251,7 @@ def test_Eq():\n     assert Eq(FiniteSet({x, y}).subs(y, x+1), FiniteSet({x})) is S.false\n     assert Eq(FiniteSet({x, y}), FiniteSet({x})).subs(y, x+1) is S.false\n \n-    assert Eq(ProductSet({1}, {2}), Interval(1, 2)) not in (S.true, S.false)\n+    assert Eq(ProductSet({1}, {2}), Interval(1, 2)) is S.false\n     assert Eq(ProductSet({1}), ProductSet({1}, {2})) is S.false\n \n     assert Eq(FiniteSet(()), FiniteSet(1)) is S.false\n@@ -1597,6 +1597,17 @@ def test_issue_20089():\n     assert A.issubset(C)\n     assert B.issubset(C)\n \n+def test_issue_19378():\n+    a = FiniteSet(1, 2)\n+    b = ProductSet(a, a)\n+    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))\n+    assert b.is_subset(c) is True\n+    d = FiniteSet(1)\n+    assert b.is_subset(d) is False\n+    assert Eq(c, b).simplify() is S.true\n+    assert Eq(a, c).simplify() is S.false\n+    assert Eq({1}, {x}).simplify() == Eq({1}, {x})\n+\n def test_issue_20379():\n     #https://github.com/sympy/sympy/issues/20379\n     x = pi - 3.14159265358979\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "sympy/sets/tests/test_sets.py",
+                "-k",
+                "test_issue_20089"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "sympy/sets/tests/test_sets.py",
+                "-k",
+                "test_issue_19378"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "sympy/sets/tests/test_sets.py",
+                "-k",
+                "test_Eq"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "django__django-15563",
+      "description": "Public SWE-bench Verified task: queryset update writes wrong tables with multiple-inheritance models.",
+      "capabilities": [
+        "python",
+        "multi_file_change",
+        "failure_diagnosis",
+        "repository_context",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "remote_git",
+          "repository": "https://github.com/django/django.git",
+          "commit": "9ffd4eae2ce7a7100c98f681e2b6ab818df384a4"
+        },
+        "setup_commands": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "venv",
+              ".venv"
+            ],
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-U",
+              "pip",
+              "wheel",
+              "setuptools"
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytest"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytz"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-e",
+              "."
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          }
+        ]
+      },
+      "agent": {
+        "instructions": "Fix django issue django__django-15563. Queryset.update has wrong behavior when the queryset model uses multiple inheritance: for class Child(Base, OtherBase), Child.objects.update(...) updates OtherBase rows (selected by Base primary keys) instead of the Child rows, leaving Child fields unchanged. Apply the smallest focused change to the update SQL generation (django/db/models/sql/compiler.py, django/db/models/sql/subqueries.py), then run a relevant verification command through the command tool and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/model_inheritance_regress/tests.py b/tests/model_inheritance_regress/tests.py\n--- a/tests/model_inheritance_regress/tests.py\n+++ b/tests/model_inheritance_regress/tests.py\n@@ -667,3 +667,15 @@ def test_create_new_instance_with_pk_equals_none_multi_inheritance(self):\n             Politician.objects.get(pk=c1.politician_ptr_id).title,\n             \"senator 1\",\n         )\n+\n+    def test_mti_update_parent_through_child(self):\n+        Politician.objects.create()\n+        Congressman.objects.create()\n+        Congressman.objects.update(title=\"senator 1\")\n+        self.assertEqual(Congressman.objects.get().title, \"senator 1\")\n+\n+    def test_mti_update_grand_parent_through_child(self):\n+        Politician.objects.create()\n+        Senator.objects.create()\n+        Senator.objects.update(title=\"senator 1\")\n+        self.assertEqual(Senator.objects.get().title, \"senator 1\")\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "tests/runtests.py",
+                "model_inheritance_regress.tests.ModelInheritanceTest.test_abstract_base_class_m2m_relation_inheritance"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "tests/runtests.py",
+                "model_inheritance_regress.tests.MultiInheritanceTests.test_mti_update_parent_through_child",
+                "model_inheritance_regress.tests.MultiInheritanceTests.test_mti_update_grand_parent_through_child"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "tests/runtests.py",
+                "model_inheritance_regress"
+              ],
+              "timeout_seconds": 900
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "pytest-dev__pytest-5840",
+      "description": "Public SWE-bench Verified task: Windows conftest loading fails when path components contain uppercase letters.",
+      "capabilities": [
+        "python",
+        "multi_file_change",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "remote_git",
+          "repository": "https://github.com/pytest-dev/pytest.git",
+          "commit": "73c5b7f4b11a81e971f7d1bb18072e06a87060f4"
+        },
+        "setup_commands": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "venv",
+              ".venv"
+            ],
+            "timeout_seconds": 300
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-U",
+              "pip",
+              "wheel",
+              "setuptools"
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "pytest"
+            ],
+            "timeout_seconds": 300,
+            "network_access": "allowed"
+          },
+          {
+            "argv": [
+              ".venv/bin/python",
+              "-m",
+              "pip",
+              "install",
+              "-e",
+              "."
+            ],
+            "timeout_seconds": 900,
+            "network_access": "allowed"
+          }
+        ]
+      },
+      "agent": {
+        "instructions": "Fix pytest issue pytest-dev__pytest-5840. On Windows, loading a conftest.py whose qualified path contains uppercase directory names fails with ImportError/ModuleNotFoundError ('No module named python') because the path is lowercased during conftest module resolution (regression from 5.1.1 to 5.1.2). Conftest files under uppercase path components must load correctly. Apply the smallest focused change to the conftest loading and path resolution code (src/_pytest/config/__init__.py, src/_pytest/pathlib.py), then run a relevant verification command through the command tool and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/testing/test_conftest.py b/testing/test_conftest.py\n--- a/testing/test_conftest.py\n+++ b/testing/test_conftest.py\n@@ -1,12 +1,12 @@\n-import os.path\n+import os\n import textwrap\n+from pathlib import Path\n \n import py\n \n import pytest\n from _pytest.config import PytestPluginManager\n from _pytest.main import ExitCode\n-from _pytest.pathlib import unique_path\n \n \n def ConftestWithSetinitial(path):\n@@ -143,11 +143,11 @@ def test_conftestcutdir(testdir):\n     # but we can still import a conftest directly\n     conftest._importconftest(conf)\n     values = conftest._getconftestmodules(conf.dirpath())\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n     # and all sub paths get updated properly\n     values = conftest._getconftestmodules(p)\n     assert len(values) == 1\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n \n \n def test_conftestcutdir_inplace_considered(testdir):\n@@ -156,7 +156,7 @@ def test_conftestcutdir_inplace_considered(testdir):\n     conftest_setinitial(conftest, [conf.dirpath()], confcutdir=conf.dirpath())\n     values = conftest._getconftestmodules(conf.dirpath())\n     assert len(values) == 1\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n \n \n @pytest.mark.parametrize(\"name\", \"test tests whatever .dotdir\".split())\n@@ -165,11 +165,12 @@ def test_setinitial_conftest_subdirs(testdir, name):\n     subconftest = sub.ensure(\"conftest.py\")\n     conftest = PytestPluginManager()\n     conftest_setinitial(conftest, [sub.dirpath()], confcutdir=testdir.tmpdir)\n+    key = Path(str(subconftest)).resolve()\n     if name not in (\"whatever\", \".dotdir\"):\n-        assert unique_path(subconftest) in conftest._conftestpath2mod\n+        assert key in conftest._conftestpath2mod\n         assert len(conftest._conftestpath2mod) == 1\n     else:\n-        assert subconftest not in conftest._conftestpath2mod\n+        assert key not in conftest._conftestpath2mod\n         assert len(conftest._conftestpath2mod) == 0\n \n \n@@ -282,7 +283,7 @@ def fixture():\n     reason=\"only relevant for case insensitive file systems\",\n )\n def test_conftest_badcase(testdir):\n-    \"\"\"Check conftest.py loading when directory casing is wrong.\"\"\"\n+    \"\"\"Check conftest.py loading when directory casing is wrong (#5792).\"\"\"\n     testdir.tmpdir.mkdir(\"JenkinsRoot\").mkdir(\"test\")\n     source = {\"setup.py\": \"\", \"test/__init__.py\": \"\", \"test/conftest.py\": \"\"}\n     testdir.makepyfile(**{\"JenkinsRoot/%s\" % k: v for k, v in source.items()})\n@@ -292,6 +293,16 @@ def test_conftest_badcase(testdir):\n     assert result.ret == ExitCode.NO_TESTS_COLLECTED\n \n \n+def test_conftest_uppercase(testdir):\n+    \"\"\"Check conftest.py whose qualified name contains uppercase characters (#5819)\"\"\"\n+    source = {\"__init__.py\": \"\", \"Foo/conftest.py\": \"\", \"Foo/__init__.py\": \"\"}\n+    testdir.makepyfile(**source)\n+\n+    testdir.tmpdir.chdir()\n+    result = testdir.runpytest()\n+    assert result.ret == ExitCode.NO_TESTS_COLLECTED\n+\n+\n def test_no_conftest(testdir):\n     testdir.makeconftest(\"assert 0\")\n     result = testdir.runpytest(\"--noconftest\")\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "testing/test_conftest.py",
+                "-k",
+                "test_no_conftest"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "testing/test_conftest.py::test_setinitial_conftest_subdirs"
+              ],
+              "timeout_seconds": 600
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "testing/test_conftest.py"
+              ],
+              "timeout_seconds": 900
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,370 +1,13 @@
 {
   "schema_version": "evaluation.task_set/v6",
-  "trial_count": 1,
+  "trial_count": 2,
   "tasks": [
     {
-      "task_id": "pylint-dev__pylint-6386",
-      "description": "Public SWE-bench Verified task: pylint -v short verbose option incorrectly expects an argument.",
+      "task_id": "sqlfluff__sqlfluff-2419",
+      "description": "Public SWE-bench Lite representative task for the SQLFluff L060 IFNULL/NVL diagnostic wording.",
       "capabilities": [
+        "single_file_fix",
         "python",
-        "multi_file_change",
-        "failure_diagnosis",
-        "required_verification",
-        "sandbox_enforcement"
-      ],
-      "workspace": {
-        "source": {
-          "type": "remote_git",
-          "repository": "https://github.com/pylint-dev/pylint.git",
-          "commit": "754b487f4d892e3d4872b6fc7468a71db4e31c13"
-        },
-        "setup_commands": [
-          {
-            "argv": [
-              "python",
-              "-m",
-              "venv",
-              ".venv"
-            ],
-            "timeout_seconds": 300
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-U",
-              "pip",
-              "wheel",
-              "setuptools"
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "pytest"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-e",
-              "."
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          }
-        ]
-      },
-      "agent": {
-        "instructions": "Fix pylint issue pylint-dev__pylint-6386. The short option -v of the verbose option incorrectly expects an argument (`pylint mytest.py -v` fails with 'error: argument --verbose/-v: expected one argument') while the long option --verbose works as a flag. Make -v behave like --verbose (no argument expected) and align the verbose help text accordingly. Apply the smallest focused change to the CLI argument configuration (pylint/config/argument.py, pylint/config/arguments_manager.py, pylint/config/utils.py, pylint/lint/base_options.py), then run a relevant verification command through the command tool and report the result."
-      },
-      "evaluator": {
-        "public_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/config/test_config.py b/tests/config/test_config.py\n--- a/tests/config/test_config.py\n+++ b/tests/config/test_config.py\n@@ -100,3 +100,10 @@ def test_unknown_py_version(capsys: CaptureFixture) -> None:\n         Run([str(EMPTY_MODULE), \"--py-version=the-newest\"], exit=False)\n     output = capsys.readouterr()\n     assert \"the-newest has an invalid format, should be a version string.\" in output.err\n+\n+\n+def test_short_verbose(capsys: CaptureFixture) -> None:\n+    \"\"\"Check that we correctly handle the -v flag.\"\"\"\n+    Run([str(EMPTY_MODULE), \"-v\"], exit=False)\n+    output = capsys.readouterr()\n+    assert \"Using config file\" in output.err\n"
-        },
-        "baseline": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/config/test_config.py",
-                "-k",
-                "test_unknown_py_version"
-              ],
-              "timeout_seconds": 300
-            }
-          ]
-        },
-        "public": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/config/test_config.py",
-                "-k",
-                "test_short_verbose"
-              ],
-              "timeout_seconds": 300
-            }
-          ]
-        },
-        "hidden": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/config/test_config.py"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        }
-      }
-    },
-    {
-      "task_id": "sphinx-doc__sphinx-10673",
-      "description": "Public SWE-bench Verified task: toctree references to genindex/modindex/search raise nonexisting-document warnings.",
-      "capabilities": [
-        "python",
-        "feature_implementation",
-        "multi_file_change",
-        "required_verification",
-        "sandbox_enforcement"
-      ],
-      "workspace": {
-        "source": {
-          "type": "remote_git",
-          "repository": "https://github.com/sphinx-doc/sphinx.git",
-          "commit": "f35d2a6cc726f97d0e859ca7a0e1729f7da8a6c8"
-        },
-        "setup_commands": [
-          {
-            "argv": [
-              "python",
-              "-m",
-              "venv",
-              ".venv"
-            ],
-            "timeout_seconds": 300
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-U",
-              "pip",
-              "wheel",
-              "setuptools"
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "pytest"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-e",
-              "."
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          }
-        ]
-      },
-      "agent": {
-        "instructions": "Fix sphinx issue sphinx-doc__sphinx-10673. A toctree directive that references the built-in documents genindex, modindex and search emits 'toctree contains reference to nonexisting document' warnings even though those documents exist at build time; they should be accepted without warnings so users can add '.. toctree::' entries for them. Apply the smallest focused change to the toctree resolution logic (sphinx/directives/other.py, sphinx/environment/adapters/toctree.py, sphinx/environment/collectors/toctree.py), then run a relevant verification command through the command tool and report the result."
-      },
-      "evaluator": {
-        "public_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/tests/roots/test-toctree-index/conf.py b/tests/roots/test-toctree-index/conf.py\nnew file mode 100644\ndiff --git a/tests/roots/test-toctree-index/foo.rst b/tests/roots/test-toctree-index/foo.rst\nnew file mode 100644\n--- /dev/null\n+++ b/tests/roots/test-toctree-index/foo.rst\n@@ -0,0 +1,8 @@\n+foo\n+===\n+\n+:index:`word`\n+\n+.. py:module:: pymodule\n+\n+.. py:function:: Timer.repeat(repeat=3, number=1000000)\ndiff --git a/tests/roots/test-toctree-index/index.rst b/tests/roots/test-toctree-index/index.rst\nnew file mode 100644\n--- /dev/null\n+++ b/tests/roots/test-toctree-index/index.rst\n@@ -0,0 +1,15 @@\n+test-toctree-index\n+==================\n+\n+.. toctree::\n+\n+   foo\n+\n+\n+.. toctree::\n+   :caption: Indices\n+\n+   genindex\n+   modindex\n+   search\n+\ndiff --git a/tests/test_environment_toctree.py b/tests/test_environment_toctree.py\n--- a/tests/test_environment_toctree.py\n+++ b/tests/test_environment_toctree.py\n@@ -346,3 +346,17 @@ def test_get_toctree_for_includehidden(app):\n \n     assert_node(toctree[2],\n                 [bullet_list, list_item, compact_paragraph, reference, \"baz\"])\n+\n+\n+@pytest.mark.sphinx('xml', testroot='toctree-index')\n+def test_toctree_index(app):\n+    app.build()\n+    toctree = app.env.tocs['index']\n+    assert_node(toctree,\n+                [bullet_list, ([list_item, (compact_paragraph,  # [0][0]\n+                                            [bullet_list, (addnodes.toctree,  # [0][1][0]\n+                                                           addnodes.toctree)])])])  # [0][1][1]\n+    assert_node(toctree[0][1][1], addnodes.toctree,\n+                caption=\"Indices\", glob=False, hidden=False,\n+                titlesonly=False, maxdepth=-1, numbered=0,\n+                entries=[(None, 'genindex'), (None, 'modindex'), (None, 'search')])\n"
-        },
-        "baseline": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/test_environment_toctree.py",
-                "-k",
-                "test_get_toctree_for_includehidden"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        },
-        "public": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/test_environment_toctree.py",
-                "-k",
-                "test_toctree_index"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        },
-        "hidden": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "tests/test_environment_toctree.py"
-              ],
-              "timeout_seconds": 900
-            }
-          ]
-        }
-      }
-    },
-    {
-      "task_id": "sympy__sympy-20438",
-      "description": "Public SWE-bench Verified task: FiniteSet/ProductSet is_subset gives wrong results and Eq(...).simplify() raises.",
-      "capabilities": [
-        "python",
-        "multi_file_change",
-        "failure_diagnosis",
-        "required_verification",
-        "sandbox_enforcement"
-      ],
-      "workspace": {
-        "source": {
-          "type": "remote_git",
-          "repository": "https://github.com/sympy/sympy.git",
-          "commit": "33b47e4bd60e2302e42616141e76285038b724d6"
-        },
-        "setup_commands": [
-          {
-            "argv": [
-              "python",
-              "-m",
-              "venv",
-              ".venv"
-            ],
-            "timeout_seconds": 300
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-U",
-              "pip",
-              "wheel",
-              "setuptools"
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "pytest"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-e",
-              "."
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          }
-        ]
-      },
-      "agent": {
-        "instructions": "Fix sympy issue sympy__sympy-20438. is_subset gives wrong results: for a = FiniteSet(1, 2), b = ProductSet(a, a) and c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2)), b.is_subset(c) must be True (it currently returns None), and Eq(c, b).simplify() must not raise AttributeError ('Complement' object has no attribute 'equals'). Apply the smallest focused change to the set comparison handlers (sympy/core/relational.py, sympy/sets/handlers/comparison.py, sympy/sets/handlers/issubset.py), then run a relevant verification command through the command tool and report the result."
-      },
-      "evaluator": {
-        "public_test_patch": {
-          "format": "unified_diff",
-          "content": "diff --git a/sympy/sets/tests/test_sets.py b/sympy/sets/tests/test_sets.py\n--- a/sympy/sets/tests/test_sets.py\n+++ b/sympy/sets/tests/test_sets.py\n@@ -1251,7 +1251,7 @@ def test_Eq():\n     assert Eq(FiniteSet({x, y}).subs(y, x+1), FiniteSet({x})) is S.false\n     assert Eq(FiniteSet({x, y}), FiniteSet({x})).subs(y, x+1) is S.false\n \n-    assert Eq(ProductSet({1}, {2}), Interval(1, 2)) not in (S.true, S.false)\n+    assert Eq(ProductSet({1}, {2}), Interval(1, 2)) is S.false\n     assert Eq(ProductSet({1}), ProductSet({1}, {2})) is S.false\n \n     assert Eq(FiniteSet(()), FiniteSet(1)) is S.false\n@@ -1597,6 +1597,17 @@ def test_issue_20089():\n     assert A.issubset(C)\n     assert B.issubset(C)\n \n+def test_issue_19378():\n+    a = FiniteSet(1, 2)\n+    b = ProductSet(a, a)\n+    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))\n+    assert b.is_subset(c) is True\n+    d = FiniteSet(1)\n+    assert b.is_subset(d) is False\n+    assert Eq(c, b).simplify() is S.true\n+    assert Eq(a, c).simplify() is S.false\n+    assert Eq({1}, {x}).simplify() == Eq({1}, {x})\n+\n def test_issue_20379():\n     #https://github.com/sympy/sympy/issues/20379\n     x = pi - 3.14159265358979\n"
-        },
-        "baseline": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "sympy/sets/tests/test_sets.py",
-                "-k",
-                "test_issue_20089"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        },
-        "public": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "sympy/sets/tests/test_sets.py",
-                "-k",
-                "test_issue_19378"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        },
-        "hidden": {
-          "commands": [
-            {
-              "argv": [
-                ".venv/bin/python",
-                "-m",
-                "pytest",
-                "sympy/sets/tests/test_sets.py",
-                "-k",
-                "test_Eq"
-              ],
-              "timeout_seconds": 600
-            }
-          ]
-        }
-      }
-    },
-    {
-      "task_id": "django__django-15563",
-      "description": "Public SWE-bench Verified task: queryset update writes wrong tables with multiple-inheritance models.",
-      "capabilities": [
-        "python",
-        "multi_file_change",
-        "failure_diagnosis",
         "repository_context",
         "required_verification",
         "sandbox_enforcement"
@@ -372,8 +15,8 @@
       "workspace": {
         "source": {
           "type": "remote_git",
-          "repository": "https://github.com/django/django.git",
-          "commit": "9ffd4eae2ce7a7100c98f681e2b6ab818df384a4"
+          "repository": "https://github.com/sqlfluff/sqlfluff.git",
+          "commit": "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030"
         },
         "setup_commands": [
           {
@@ -394,7 +37,7 @@
               "-U",
               "pip",
               "wheel",
-              "setuptools"
+              "setuptools<81"
             ],
             "timeout_seconds": 900,
             "network_access": "allowed"
@@ -405,30 +48,12 @@
               "-m",
               "pip",
               "install",
-              "pytest"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "pytz"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
+              "-r",
+              "requirements.txt",
               "-e",
-              "."
+              ".",
+              "click<8.2",
+              "setuptools<81"
             ],
             "timeout_seconds": 900,
             "network_access": "allowed"
@@ -436,22 +61,27 @@
         ]
       },
       "agent": {
-        "instructions": "Fix django issue django__django-15563. Queryset.update has wrong behavior when the queryset model uses multiple inheritance: for class Child(Base, OtherBase), Child.objects.update(...) updates OtherBase rows (selected by Base primary keys) instead of the Child rows, leaving Child fields unchanged. Apply the smallest focused change to the update SQL generation (django/db/models/sql/compiler.py, django/db/models/sql/subqueries.py), then run a relevant verification command through the command tool and report the result."
+        "instructions": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 must emit exactly \"Use 'COALESCE' instead of 'IFNULL'.\" for IFNULL and exactly \"Use 'COALESCE' instead of 'NVL'.\" for NVL. Apply the smallest focused change to src/sqlfluff/rules/L060.py, then run a relevant verification command through the command tool and report the result."
       },
       "evaluator": {
         "public_test_patch": {
           "format": "unified_diff",
-          "content": "diff --git a/tests/model_inheritance_regress/tests.py b/tests/model_inheritance_regress/tests.py\n--- a/tests/model_inheritance_regress/tests.py\n+++ b/tests/model_inheritance_regress/tests.py\n@@ -667,3 +667,15 @@ def test_create_new_instance_with_pk_equals_none_multi_inheritance(self):\n             Politician.objects.get(pk=c1.politician_ptr_id).title,\n             \"senator 1\",\n         )\n+\n+    def test_mti_update_parent_through_child(self):\n+        Politician.objects.create()\n+        Congressman.objects.create()\n+        Congressman.objects.update(title=\"senator 1\")\n+        self.assertEqual(Congressman.objects.get().title, \"senator 1\")\n+\n+    def test_mti_update_grand_parent_through_child(self):\n+        Politician.objects.create()\n+        Senator.objects.create()\n+        Senator.objects.update(title=\"senator 1\")\n+        self.assertEqual(Senator.objects.get().title, \"senator 1\")\n"
+          "content": "diff --git a/test/rules/std_L060_test.py b/test/rules/std_L060_test.py\nnew file mode 100644\n--- /dev/null\n+++ b/test/rules/std_L060_test.py\n@@ -0,0 +1,12 @@\n+\"\"\"Tests the python routines within L060.\"\"\"\n+import sqlfluff\n+\n+\n+def test__rules__std_L060_raised() -> None:\n+    \"\"\"L060 is raised for use of ``IFNULL`` or ``NVL``.\"\"\"\n+    sql = \"SELECT\\n\\tIFNULL(NULL, 100),\\n\\tNVL(NULL,100);\"\n+    result = sqlfluff.lint(sql, rules=[\"L060\"])\n+\n+    assert len(result) == 2\n+    assert result[0][\"description\"] == \"Use 'COALESCE' instead of 'IFNULL'.\"\n+    assert result[1][\"description\"] == \"Use 'COALESCE' instead of 'NVL'.\"\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/test/rules/std_L060_hidden_test.py b/test/rules/std_L060_hidden_test.py\nnew file mode 100644\n--- /dev/null\n+++ b/test/rules/std_L060_hidden_test.py\n@@ -0,0 +1,14 @@\n+\"\"\"Independent hidden checks for L060 diagnostics.\"\"\"\n+import pytest\n+import sqlfluff\n+\n+\n+@pytest.mark.parametrize(\n+    (\"function_name\", \"description\"),\n+    [(\"IFNULL\", \"Use 'COALESCE' instead of 'IFNULL'.\"),\n+     (\"NVL\", \"Use 'COALESCE' instead of 'NVL'.\")],\n+)\n+def test__rules__std_L060_individual_diagnostics(function_name, description) -> None:\n+    result = sqlfluff.lint(f\"SELECT {function_name}(1, 2)\", rules=[\"L060\"])\n+    assert len(result) == 1\n+    assert result[0][\"description\"] == description\n"
         },
         "baseline": {
           "commands": [
             {
               "argv": [
                 ".venv/bin/python",
-                "tests/runtests.py",
-                "model_inheritance_regress.tests.ModelInheritanceTest.test_abstract_base_class_m2m_relation_inheritance"
+                "-m",
+                "pytest",
+                "test/rules/std_L060_test.py::test__rules__std_L060_raised"
               ],
-              "timeout_seconds": 600
+              "timeout_seconds": 300
             }
           ]
         },
@@ -460,11 +90,11 @@
             {
               "argv": [
                 ".venv/bin/python",
-                "tests/runtests.py",
-                "model_inheritance_regress.tests.MultiInheritanceTests.test_mti_update_parent_through_child",
-                "model_inheritance_regress.tests.MultiInheritanceTests.test_mti_update_grand_parent_through_child"
+                "-m",
+                "pytest",
+                "test/rules/std_L060_test.py::test__rules__std_L060_raised"
               ],
-              "timeout_seconds": 600
+              "timeout_seconds": 300
             }
           ]
         },
@@ -473,100 +103,59 @@
             {
               "argv": [
                 ".venv/bin/python",
-                "tests/runtests.py",
-                "model_inheritance_regress"
+                "-m",
+                "pytest",
+                "test/rules/std_L060_hidden_test.py::test__rules__std_L060_individual_diagnostics"
               ],
-              "timeout_seconds": 900
+              "timeout_seconds": 300
             }
           ]
         }
       }
     },
     {
-      "task_id": "pytest-dev__pytest-5840",
-      "description": "Public SWE-bench Verified task: Windows conftest loading fails when path components contain uppercase letters.",
+      "task_id": "receipt_calculator__multi_line_receipt",
+      "description": "Small local Python representative task for multi-line decimal receipt totals.",
       "capabilities": [
-        "python",
         "multi_file_change",
+        "python",
         "failure_diagnosis",
         "required_verification",
         "sandbox_enforcement"
       ],
       "workspace": {
         "source": {
-          "type": "remote_git",
-          "repository": "https://github.com/pytest-dev/pytest.git",
-          "commit": "73c5b7f4b11a81e971f7d1bb18072e06a87060f4"
-        },
-        "setup_commands": [
-          {
-            "argv": [
-              "python",
-              "-m",
-              "venv",
-              ".venv"
-            ],
-            "timeout_seconds": 300
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-U",
-              "pip",
-              "wheel",
-              "setuptools"
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "pytest"
-            ],
-            "timeout_seconds": 300,
-            "network_access": "allowed"
-          },
-          {
-            "argv": [
-              ".venv/bin/python",
-              "-m",
-              "pip",
-              "install",
-              "-e",
-              "."
-            ],
-            "timeout_seconds": 900,
-            "network_access": "allowed"
-          }
-        ]
+          "type": "local",
+          "path": "fixtures/receipt-calculator"
+        }
       },
       "agent": {
-        "instructions": "Fix pytest issue pytest-dev__pytest-5840. On Windows, loading a conftest.py whose qualified path contains uppercase directory names fails with ImportError/ModuleNotFoundError ('No module named python') because the path is lowercased during conftest module resolution (regression from 5.1.1 to 5.1.2). Conftest files under uppercase path components must load correctly. Apply the smallest focused change to the conftest loading and path resolution code (src/_pytest/config/__init__.py, src/_pytest/pathlib.py), then run a relevant verification command through the command tool and report the result."
+        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
       },
       "evaluator": {
         "public_test_patch": {
           "format": "unified_diff",
-          "content": "diff --git a/testing/test_conftest.py b/testing/test_conftest.py\n--- a/testing/test_conftest.py\n+++ b/testing/test_conftest.py\n@@ -1,12 +1,12 @@\n-import os.path\n+import os\n import textwrap\n+from pathlib import Path\n \n import py\n \n import pytest\n from _pytest.config import PytestPluginManager\n from _pytest.main import ExitCode\n-from _pytest.pathlib import unique_path\n \n \n def ConftestWithSetinitial(path):\n@@ -143,11 +143,11 @@ def test_conftestcutdir(testdir):\n     # but we can still import a conftest directly\n     conftest._importconftest(conf)\n     values = conftest._getconftestmodules(conf.dirpath())\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n     # and all sub paths get updated properly\n     values = conftest._getconftestmodules(p)\n     assert len(values) == 1\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n \n \n def test_conftestcutdir_inplace_considered(testdir):\n@@ -156,7 +156,7 @@ def test_conftestcutdir_inplace_considered(testdir):\n     conftest_setinitial(conftest, [conf.dirpath()], confcutdir=conf.dirpath())\n     values = conftest._getconftestmodules(conf.dirpath())\n     assert len(values) == 1\n-    assert values[0].__file__.startswith(str(unique_path(conf)))\n+    assert values[0].__file__.startswith(str(conf))\n \n \n @pytest.mark.parametrize(\"name\", \"test tests whatever .dotdir\".split())\n@@ -165,11 +165,12 @@ def test_setinitial_conftest_subdirs(testdir, name):\n     subconftest = sub.ensure(\"conftest.py\")\n     conftest = PytestPluginManager()\n     conftest_setinitial(conftest, [sub.dirpath()], confcutdir=testdir.tmpdir)\n+    key = Path(str(subconftest)).resolve()\n     if name not in (\"whatever\", \".dotdir\"):\n-        assert unique_path(subconftest) in conftest._conftestpath2mod\n+        assert key in conftest._conftestpath2mod\n         assert len(conftest._conftestpath2mod) == 1\n     else:\n-        assert subconftest not in conftest._conftestpath2mod\n+        assert key not in conftest._conftestpath2mod\n         assert len(conftest._conftestpath2mod) == 0\n \n \n@@ -282,7 +283,7 @@ def fixture():\n     reason=\"only relevant for case insensitive file systems\",\n )\n def test_conftest_badcase(testdir):\n-    \"\"\"Check conftest.py loading when directory casing is wrong.\"\"\"\n+    \"\"\"Check conftest.py loading when directory casing is wrong (#5792).\"\"\"\n     testdir.tmpdir.mkdir(\"JenkinsRoot\").mkdir(\"test\")\n     source = {\"setup.py\": \"\", \"test/__init__.py\": \"\", \"test/conftest.py\": \"\"}\n     testdir.makepyfile(**{\"JenkinsRoot/%s\" % k: v for k, v in source.items()})\n@@ -292,6 +293,16 @@ def test_conftest_badcase(testdir):\n     assert result.ret == ExitCode.NO_TESTS_COLLECTED\n \n \n+def test_conftest_uppercase(testdir):\n+    \"\"\"Check conftest.py whose qualified name contains uppercase characters (#5819)\"\"\"\n+    source = {\"__init__.py\": \"\", \"Foo/conftest.py\": \"\", \"Foo/__init__.py\": \"\"}\n+    testdir.makepyfile(**source)\n+\n+    testdir.tmpdir.chdir()\n+    result = testdir.runpytest()\n+    assert result.ret == ExitCode.NO_TESTS_COLLECTED\n+\n+\n def test_no_conftest(testdir):\n     testdir.makeconftest(\"assert 0\")\n     result = testdir.runpytest(\"--noconftest\")\n"
+          "content": "diff --git a/tests/test_public_receipt.py b/tests/test_public_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_public_receipt.py\n@@ -0,0 +1,23 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class PublicReceiptTests(unittest.TestCase):\n+    def test_public_receipt_aggregates_all_lines(self):\n+        items = [(\"2.50\", 2), (\"1.25\", 3)]\n+        self.assertEqual(subtotal(items), Decimal(\"8.75\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.10\"),\n+            {\n+                \"subtotal\": Decimal(\"8.75\"),\n+                \"tax\": Decimal(\"0.88\"),\n+                \"total\": Decimal(\"9.63\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_hidden_receipt.py b/tests/test_hidden_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_hidden_receipt.py\n@@ -0,0 +1,26 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class HiddenReceiptTests(unittest.TestCase):\n+    def test_empty_subtotal_is_zero(self):\n+        self.assertEqual(subtotal([]), Decimal(\"0.00\"))\n+\n+    def test_hidden_receipt_rounds_fractional_tax_after_all_lines(self):\n+        items = [(\"19.99\", 1), (\"0.01\", 1)]\n+        self.assertEqual(subtotal(items), Decimal(\"20.00\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.075\"),\n+            {\n+                \"subtotal\": Decimal(\"20.00\"),\n+                \"tax\": Decimal(\"1.50\"),\n+                \"total\": Decimal(\"21.50\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
         },
         "baseline": {
           "commands": [
             {
               "argv": [
-                ".venv/bin/python",
+                "python",
+                "-B",
                 "-m",
-                "pytest",
-                "testing/test_conftest.py",
-                "-k",
-                "test_no_conftest"
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_receipt.py"
               ],
-              "timeout_seconds": 600
+              "timeout_seconds": 60
             }
           ]
         },
@@ -574,12 +163,17 @@
           "commands": [
             {
               "argv": [
-                ".venv/bin/python",
+                "python",
+                "-B",
                 "-m",
-                "pytest",
-                "testing/test_conftest.py::test_setinitial_conftest_subdirs"
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_receipt.py"
               ],
-              "timeout_seconds": 600
+              "timeout_seconds": 60
             }
           ]
         },
@@ -587,12 +181,215 @@
           "commands": [
             {
               "argv": [
-                ".venv/bin/python",
+                "python",
+                "-B",
                 "-m",
-                "pytest",
-                "testing/test_conftest.py"
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_hidden_receipt.py"
               ],
-              "timeout_seconds": 900
+              "timeout_seconds": 60
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "rust_node_calculator__multi_line_total",
+      "description": "Local cross-language task proving host Cargo and Node execution in the strict Windows sandbox.",
+      "capabilities": [
+        "multi_file_change",
+        "rust",
+        "node",
+        "mixed_stack",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/rust-node-calculator"
+        }
+      },
+      "agent": {
+        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run relevant verification commands through the command tool and report the results."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/public.rs b/tests/public.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public.rs\n@@ -0,0 +1,6 @@\n+use rust_node_calculator::line_total;\n+\n+#[test]\n+fn public_quantity_is_applied() {\n+    assert_eq!(line_total(11, 4), 44);\n+}\ndiff --git a/public_test.mjs b/public_test.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/public_test.mjs\n@@ -0,0 +1,5 @@\n+import assert from \"node:assert/strict\";\n+import { grandTotal } from \"./calculator.mjs\";\n+\n+assert.equal(grandTotal([{ unitPrice: 2, quantity: 4 }, { unitPrice: 3, quantity: 5 }]), 23);\n+assert.equal(grandTotal([]), 0);\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/hidden.rs b/tests/hidden.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/hidden.rs\n@@ -0,0 +1,6 @@\n+use rust_node_calculator::line_total;\n+\n+#[test]\n+fn hidden_zero_quantity_is_zero() {\n+    assert_eq!(line_total(99, 0), 0);\n+}\ndiff --git a/hidden_test.mjs b/hidden_test.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/hidden_test.mjs\n@@ -0,0 +1,5 @@\n+import assert from \"node:assert/strict\";\n+import { grandTotal } from \"./calculator.mjs\";\n+\n+assert.equal(grandTotal([{ unitPrice: 10, quantity: 0 }, { unitPrice: -2, quantity: 3 }]), -6);\n+assert.equal(grandTotal([{ unitPrice: 4, quantity: 1 }]), 4);\n"
+        },
+        "baseline": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
+            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
+          ]
+        },
+        "public": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
+            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "hidden"], "timeout_seconds": 120},
+            {"argv": ["node", "hidden_test.mjs"], "timeout_seconds": 30}
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "node_inventory__summary",
+      "description": "Local Node.js representative task for multi-file inventory summaries.",
+      "capabilities": [
+        "node",
+        "feature_implementation",
+        "multi_file_change",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/node-inventory"
+        }
+      },
+      "agent": {
+        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/public_inventory.mjs b/tests/public_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public_inventory.mjs\n@@ -0,0 +1,20 @@\n+import assert from \"node:assert/strict\";\n+import { inventoryLine } from \"../catalog.mjs\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(inventoryLine({\n+  sku: \"A-17\",\n+  unitPrice: 4.5,\n+  quantity: 2,\n+  reorderPoint: 3,\n+}), {\n+  sku: \"A-17\",\n+  units: 2,\n+  reorderPoint: 3,\n+  value: 9,\n+});\n+\n+const result = summarizeInventory([\n+  { sku: \"A-17\", unitPrice: 4.5, quantity: 2, reorderPoint: 3 },\n+  { sku: \"B-04\", unitPrice: 3, quantity: 5, reorderPoint: 4 },\n+]);\n+\n+assert.deepEqual(result, {\n+  totalUnits: 7,\n+  totalValue: 24,\n+  lowStockSkus: [\"A-17\"],\n+});\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/hidden_inventory.mjs b/tests/hidden_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/hidden_inventory.mjs\n@@ -0,0 +1,19 @@\n+import assert from \"node:assert/strict\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(summarizeInventory([]), {\n+  totalUnits: 0,\n+  totalValue: 0,\n+  lowStockSkus: [],\n+});\n+\n+const edgeCase = summarizeInventory([\n+  { sku: \"C-09\", unitPrice: 1.25, quantity: 0, reorderPoint: 0 },\n+  { sku: \"D-02\", unitPrice: 2.5, quantity: 4, reorderPoint: 5 },\n+]);\n+\n+assert.deepEqual(edgeCase, {\n+  totalUnits: 4,\n+  totalValue: 10,\n+  lowStockSkus: [\"C-09\", \"D-02\"],\n+});\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/public_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/public_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/hidden_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "repository_context__billing_report",
+      "description": "Local Python repository-context task for signed billing reports with service fees.",
+      "capabilities": [
+        "repository_context",
+        "multi_file_change",
+        "failure_diagnosis",
+        "python",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/repository-context"
+        }
+      },
+      "agent": {
+        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use list, grep, and read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Run a relevant verification command through the command tool after your focused edits and report the result."
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_public_billing.py b/tests/test_public_billing.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_public_billing.py\n@@ -0,0 +1,26 @@\n+import unittest\n+from decimal import Decimal\n+\n+from src.billing.ledger import net_amount\n+from src.billing.report import build_report\n+\n+\n+class PublicBillingTests(unittest.TestCase):\n+    def test_sales_and_refunds_are_aggregated_before_fee(self):\n+        entries = [\n+            {\"reference\": \"sale-100\", \"amount\": \"125.50\"},\n+            {\"reference\": \"refund-20\", \"amount\": \"-20.00\"},\n+        ]\n+        self.assertEqual(net_amount(entries), Decimal(\"105.50\"))\n+        self.assertEqual(\n+            build_report(entries, \"0.05\"),\n+            {\n+                \"net\": Decimal(\"105.50\"),\n+                \"service_fee\": Decimal(\"5.28\"),\n+                \"grand_total\": Decimal(\"110.78\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_hidden_billing.py b/tests/test_hidden_billing.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_hidden_billing.py\n@@ -0,0 +1,36 @@\n+import unittest\n+from decimal import Decimal\n+\n+from src.billing.ledger import net_amount\n+from src.billing.report import build_report\n+\n+\n+class HiddenBillingTests(unittest.TestCase):\n+    def test_empty_billing_report_is_zero(self):\n+        self.assertEqual(net_amount([]), Decimal(\"0.00\"))\n+        self.assertEqual(\n+            build_report([], \"0.10\"),\n+            {\n+                \"net\": Decimal(\"0.00\"),\n+                \"service_fee\": Decimal(\"0.00\"),\n+                \"grand_total\": Decimal(\"0.00\"),\n+            },\n+        )\n+\n+    def test_fractional_fee_is_rounded_after_all_entries(self):\n+        entries = [\n+            {\"reference\": \"sale-small-1\", \"amount\": \"0.01\"},\n+            {\"reference\": \"sale-small-2\", \"amount\": \"0.02\"},\n+        ]\n+        self.assertEqual(\n+            build_report(entries, \"0.075\"),\n+            {\n+                \"net\": Decimal(\"0.03\"),\n+                \"service_fee\": Decimal(\"0.00\"),\n+                \"grand_total\": Decimal(\"0.03\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_billing.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_billing.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_hidden_billing.py"
+              ],
+              "timeout_seconds": 60
             }
           ]
         }
