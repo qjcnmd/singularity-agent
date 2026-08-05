@@ -71,7 +71,7 @@ use evidence::{
 };
 use source_cache::{SourceTemplateCache, SourceTemplateCacheStatus, SourceTemplatePreparation};
 use workspace::{
-    WorkspaceChangeEvidence, WorkspaceSnapshot, copy_tree_for_preparation,
+    WorkspaceChangeEvidence, WorkspaceSnapshot, copy_tree_checked, copy_tree_for_preparation,
     evaluation_changed_paths, materialize_prepared_workspace, patch_evidence_digest,
     snapshot_workspace, workspace_change_evidence, workspace_root_identity,
     workspace_snapshot_digest,
@@ -2881,12 +2881,7 @@ fn prepare_source(
                 &repository_identity,
                 source_dir,
                 cancellation,
-                |workspace_dir| {
-                    let source_name = workspace_dir
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(SOURCE_DIR)
-                        .to_string();
+                |staging_dir| {
                     let strategy = probe_remote_git_preparation_strategy(
                         task_dir,
                         Arc::clone(&sandbox_backend),
@@ -2903,7 +2898,7 @@ fn prepare_source(
                             "--revision".to_string(),
                             commit.as_str().to_string(),
                             repository.as_str().to_string(),
-                            source_name.clone(),
+                            SOURCE_DIR.to_string(),
                         ],
                         RemoteGitPreparationStrategy::CloneThenCheckout => vec![
                             "git".to_string(),
@@ -2911,7 +2906,7 @@ fn prepare_source(
                             "--quiet".to_string(),
                             "--no-checkout".to_string(),
                             repository.as_str().to_string(),
-                            source_name.clone(),
+                            SOURCE_DIR.to_string(),
                         ],
                     };
                     let clone = run_workspace_preparation_command(
@@ -2979,8 +2974,19 @@ fn prepare_source(
                     .map_err(|blocker| blocker.message)?;
                     // The published template must not carry Git metadata; removal happens after
                     // the controller-owned checkout verification, on the run-owned task tree.
-                    strip_source_git_metadata(workspace_dir).map_err(|error| {
+                    let prepared_source = task_dir.join(SOURCE_DIR);
+                    strip_source_git_metadata(&prepared_source).map_err(|error| {
                         format!("failed to strip .git metadata from cloned source: {error}")
+                    })?;
+                    // 把本次 run 已校验的干净代码树放入缓存 staging，由 prepare_remote 快照校验后
+                    // 原子发布为固定模板；克隆本身只写入 task_dir（sandbox 写边界内）。
+                    copy_tree_checked(&prepared_source, staging_dir).map_err(|error| {
+                        format!("failed to stage prepared source into the source-template cache: {error}")
+                    })?;
+                    // 任务侧 source 目录随后由 prepare_remote 从发布后的模板统一物化，
+                    // 这里移除本 run 的临时副本，避免与物化目标冲突。
+                    fs::remove_dir_all(&prepared_source).map_err(|error| {
+                        format!("failed to remove run-local source preparation copy: {error}")
                     })?;
                     Ok(())
                 },
@@ -5383,5 +5389,134 @@ mod tests {
         assert_eq!(hits, MetricValue::available(1));
         assert_eq!(misses, MetricValue::available(0));
         assert!(materialization.is_available());
+    }
+
+    /// 固定 git 能力与固定 commit 的 mock 后端，只服务于远程 git 源全路径测试。
+    struct SourceSandboxBackend;
+
+    impl SandboxBackend for SourceSandboxBackend {
+        fn name(&self) -> &'static str {
+            "source_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            if request.argv.as_slice() == ["git", "--version"] {
+                return CommandResult::completed(&request.command_id, "git version 2.55.0")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(
+                        self.name(),
+                        singularity_tools::SandboxBackendEnforcement::Strict,
+                    );
+            }
+            if request.argv.get(1).map(String::as_str) == Some("clone") {
+                assert_eq!(request.argv.get(2).map(String::as_str), Some("--quiet"));
+                assert_eq!(request.argv.get(3).map(String::as_str), Some("--revision"));
+                assert_eq!(
+                    request.argv.get(4).map(String::as_str),
+                    Some(REMOTE_SOURCE_COMMIT)
+                );
+                // 克隆目标必须是 sandbox 写边界（task_dir）内的固定 source 目录。
+                assert_eq!(
+                    request.argv.last().map(String::as_str),
+                    Some(SOURCE_DIR),
+                    "clone target must stay inside the task workspace"
+                );
+                let source = Path::new(&request.cwd).join(SOURCE_DIR);
+                fs::create_dir(&source).expect("source directory");
+                fs::write(source.join("README.md"), "fixture").expect("source file");
+                return CommandResult::completed(&request.command_id, "ok")
+                    .with_workspace_mutation(WorkspaceMutation::Changed)
+                    .with_sandbox_execution(
+                        self.name(),
+                        singularity_tools::SandboxBackendEnforcement::Strict,
+                    );
+            }
+            if request.argv.get(3).map(String::as_str) == Some("rev-parse") {
+                return CommandResult::completed(&request.command_id, REMOTE_SOURCE_COMMIT)
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(
+                        self.name(),
+                        singularity_tools::SandboxBackendEnforcement::Strict,
+                    );
+            }
+            if request.argv.get(3).map(String::as_str) == Some("symbolic-ref") {
+                return CommandResult::executed(&request.command_id, 1, 0, "", "", false)
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(
+                        self.name(),
+                        singularity_tools::SandboxBackendEnforcement::Strict,
+                    );
+            }
+            panic!("unexpected source preparation command: {:?}", request.argv);
+        }
+    }
+
+    const REMOTE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn remote_git_source_prepares_task_tree_and_publishes_cache_template() {
+        let temp = tempfile::tempdir().expect("temp");
+        let task_id = TaskId::new("task").expect("task id");
+        let task_dir = temp.path().join("task");
+        fs::create_dir(&task_dir).expect("task directory");
+        let source_dir = task_dir.join(SOURCE_DIR);
+        let repository = "https://example.invalid/repo.git";
+        let source = PlannedWorkspaceSource::RemoteGit {
+            repository: crate::RemoteRepository::new(repository).expect("repository"),
+            commit: crate::GitCommit::new(REMOTE_SOURCE_COMMIT).expect("commit"),
+        };
+        let cache = SourceTemplateCache::new(temp.path().join("source-cache"));
+
+        let prepared = prepare_source(
+            &source,
+            &task_id,
+            &task_dir,
+            &source_dir,
+            Arc::new(SourceSandboxBackend),
+            &cache,
+            &CancellationToken::new(),
+        )
+        .expect("first remote preparation must succeed");
+
+        // 任务侧代码树就位、无 .git 元数据，且 verify 命令已真实执行。
+        assert_eq!(
+            fs::read_to_string(source_dir.join("README.md")).unwrap(),
+            "fixture"
+        );
+        assert!(!source_dir.join(".git").exists());
+        assert!(
+            prepared
+                .commands
+                .iter()
+                .any(|command| command.phase == "source.git_verify_commit")
+        );
+
+        // 首次 fetch 后缓存模板已发布，后续命中直接物化、不再 fetch。
+        assert!(
+            cache
+                .entry_available(task_id.as_str(), repository)
+                .expect("published cache entry")
+        );
+        let second_task_dir = temp.path().join("task-second");
+        fs::create_dir(&second_task_dir).expect("second task directory");
+        let second_source_dir = second_task_dir.join(SOURCE_DIR);
+        prepare_source(
+            &source,
+            &task_id,
+            &second_task_dir,
+            &second_source_dir,
+            Arc::new(SourceSandboxBackend),
+            &cache,
+            &CancellationToken::new(),
+        )
+        .expect("cached preparation must succeed");
+        assert_eq!(
+            fs::read_to_string(second_source_dir.join("README.md")).unwrap(),
+            "fixture"
+        );
     }
 }
