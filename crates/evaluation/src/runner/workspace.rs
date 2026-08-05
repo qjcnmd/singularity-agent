@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;

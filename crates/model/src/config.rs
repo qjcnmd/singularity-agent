@@ -2795,7 +2795,7 @@ struct ConfigWriterLock {
 fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, ProviderError> {
     ensure_no_reparse_components(directory, false)?;
     let path = directory.join(".config.lock");
-    let (file, created) = match config_writer_lock_options(true).open(&path) {
+    let (file, _created) = match config_writer_lock_options(true).open(&path) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_no_reparse_components(&path, false)?;
@@ -2829,7 +2829,7 @@ fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, Prov
         }
     }
     #[cfg(windows)]
-    if created || acl_needs_repair {
+    if _created || acl_needs_repair {
         windows_auth_acl::set_owner_only_handle(&file)?;
     }
     ensure_private_lock_handle(&file)?;
