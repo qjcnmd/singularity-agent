@@ -259,8 +259,14 @@ impl AppServer {
         {
             return invalid_params_response(message.required_id());
         }
+        // 无显式 model 时，若配置能无歧义解析默认 selector 则冻结到 Thread.model，
+        // 防止重启后默认配置变化静默切换 model；无法解析时保留 NULL 契约。
+        let model = match params.model.as_deref() {
+            Some(model) => Some(model.to_string()),
+            None => self.provider_snapshot.resolved_default_selector(),
+        };
         let (thread, _trace) = self.store.create_thread_with_trace_and_policy(
-            params.model.as_deref(),
+            model.as_deref(),
             Some(&cwd),
             params
                 .sandbox_mode
@@ -311,8 +317,14 @@ impl AppServer {
         if self.validate_model_selector(selected_model).is_err() {
             return invalid_params_response(message.required_id());
         }
+        // fork 冻结源 Thread 已确定的 selector；源为 NULL 时沿用与 thread/start
+        // 相同的解析规则，不凭空写入未实际用于模型请求的值。
+        let model = match selected_model {
+            Some(model) => Some(model.to_string()),
+            None => self.provider_snapshot.resolved_default_selector(),
+        };
         let thread = self.store.create_thread_with_policy(
-            selected_model,
+            model.as_deref(),
             Some(&cwd),
             params.sandbox_mode.unwrap_or(source.sandbox_mode),
             params.approval_policy.unwrap_or(source.approval_policy),

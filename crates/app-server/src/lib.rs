@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingApprovalOccurrence, ProviderHistorySegment, TurnCheckpoint, TurnCheckpointEvent,
-    TurnCheckpointPhase, project_audit_event,
+    PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
+    project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -1066,7 +1066,7 @@ fn agent_loop_input(
     turn_id: &str,
     workspace_root: &std::path::Path,
     history: &[ConversationMessage],
-    provider_history_segments: &[ProviderHistorySegment],
+    historical_seed: Option<&TurnCheckpoint>,
 ) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
         .input
@@ -1076,18 +1076,23 @@ fn agent_loop_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let history = history.iter().map(|message| match message.role {
-        ConversationRole::User => {
-            AgentContextItem::history_user(&message.item_id, &message.content)
-        }
-        ConversationRole::Assistant => {
-            AgentContextItem::history_assistant(&message.item_id, &message.content)
-        }
-    });
-    let mut input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
-        .with_history(history)
-        .with_model_name(thread.model.clone())
-        .with_provider_history_segments(provider_history_segments.iter().cloned());
+    let mut input =
+        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone());
+    if let Some(checkpoint) = historical_seed {
+        // 跨轮 seed：完整 checkpoint 历史是唯一历史通道，不再注入公共文本历史
+        // 或 provider history segments（避免双重注入）。
+        input = input.with_historical_checkpoint(checkpoint);
+    } else {
+        let history = history.iter().map(|message| match message.role {
+            ConversationRole::User => {
+                AgentContextItem::history_user(&message.item_id, &message.content)
+            }
+            ConversationRole::Assistant => {
+                AgentContextItem::history_assistant(&message.item_id, &message.content)
+            }
+        });
+        input = input.with_history(history);
+    }
     if let Some(instructions) = load_project_instructions(workspace_root, workspace_root)? {
         input = input.with_project_instructions(instructions);
     }
@@ -1164,68 +1169,28 @@ impl AppServer {
             .provider_for_selector(thread.model.as_deref())
     }
 
-    /// Recover provider-bound reasoning items from private turn checkpoints.
-    /// Public conversation history remains text-only; malformed opaque state fails closed.
-    fn provider_history_segments_for(
-        &self,
-        history: &[ConversationMessage],
-    ) -> AppServerResult<Vec<ProviderHistorySegment>> {
-        let mut turn_ids = BTreeSet::new();
-        let mut segments = Vec::new();
-        for message in history {
-            if !turn_ids.insert(message.turn_id.clone()) {
-                continue;
-            }
-            let Some(payload) = self.store.get_turn_checkpoint(&message.turn_id)? else {
-                continue;
-            };
-            let checkpoint = TurnCheckpoint::decode(&payload).map_err(|error| {
-                AppServerError::Store(StoreError::InvalidState(format!(
-                    "provider reasoning checkpoint is invalid: {error}"
-                )))
-            })?;
-            if !checkpoint.has_provider_reasoning_history() {
-                continue;
-            }
-            let assistant_items = history
-                .iter()
-                .filter(|candidate| {
-                    candidate.turn_id == message.turn_id
-                        && candidate.role == ConversationRole::Assistant
-                })
-                .collect::<Vec<_>>();
-            if assistant_items.len() != 1 {
-                return Err(AppServerError::Store(StoreError::InvalidState(
-                    "provider reasoning checkpoint assistant history binding is ambiguous"
-                        .to_string(),
-                )));
-            }
-            let assistant_item_id = assistant_items[0].item_id.clone();
-            if assistant_item_id.trim().is_empty() {
-                return Err(AppServerError::Store(StoreError::InvalidState(
-                    "provider reasoning checkpoint assistant item identity is missing".to_string(),
-                )));
-            }
-            let segment = checkpoint
-                .provider_history_segment(assistant_item_id)
-                .map_err(|error| {
-                    AppServerError::Store(StoreError::InvalidState(format!(
-                        "provider reasoning checkpoint is invalid: {error}"
-                    )))
-                })?;
-            if let Some(segment) = segment {
-                if segments.iter().any(|existing: &ProviderHistorySegment| {
-                    existing.same_assistant_item(&segment) || existing.conflicts_with(&segment)
-                }) {
-                    return Err(AppServerError::Store(StoreError::InvalidState(
-                        "provider reasoning history contains duplicate assistant binding"
-                            .to_string(),
-                    )));
-                }
-                segments.push(segment);
-            }
+    /// 最近一个 completed turn 的完整 checkpoint，作为下一轮的历史 seed。
+    ///
+    /// 选择入口是 `turns.status=completed`（不得直接取 `turn_checkpoints` 表最新行，
+    /// 该表还保存非终态快照）；checkpoint 非法或 thread/turn 绑定不符时 fail closed。
+    fn completed_turn_seed(&self, thread_id: &str) -> AppServerResult<Option<TurnCheckpoint>> {
+        let Some(turn_id) = self.store.latest_completed_turn_id(thread_id)? else {
+            return Ok(None);
+        };
+        let Some(payload) = self.store.get_turn_checkpoint(&turn_id)? else {
+            return Ok(None);
+        };
+        let checkpoint = TurnCheckpoint::decode(&payload).map_err(|error| {
+            AppServerError::Store(StoreError::InvalidState(format!(
+                "completed turn checkpoint is invalid: {error}"
+            )))
+        })?;
+        if checkpoint.thread_id() != thread_id || checkpoint.turn_id() != turn_id {
+            return Err(AppServerError::Store(StoreError::InvalidState(
+                "completed turn checkpoint binding mismatch".to_string(),
+            )));
         }
-        Ok(segments)
+        Ok(Some(checkpoint))
     }
 }
 

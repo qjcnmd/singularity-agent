@@ -453,6 +453,19 @@ impl SessionStore {
         Ok(history)
     }
 
+    /// 返回该 thread 最近一个 completed turn 的 turn_id（跨轮 seed 选择入口）。
+    pub fn latest_completed_turn_id(&self, thread_id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "select turn_id from turns where thread_id = ?1 and status = ?2
+                 order by turn_sequence desc limit 1",
+                params![thread_id, TurnStatus::Completed.to_db_text()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// 在指定 turn sequence 之前读取一页历史。
     pub fn read_thread_history_before_turn(
         &self,
@@ -1017,11 +1030,19 @@ impl SessionStore {
                 .map(|turn| sequence_to_sql(turn.sequence, "history scan cursor"))
                 .transpose()?;
             for turn in decoded_turns {
+                // Issue #24：放宽为任意长度的 completed conversation。
+                // 首条必须为 User、末条必须为 Assistant，公共消息非空且 item
+                // sequence 严格递增；items 本身已在上面投影时过滤为已完成
+                // User/Assistant 消息。带 steer/follow-up 的轮次不再被排除。
                 if turn.status == TurnStatus::Completed
-                    && turn.messages.len() == 2
+                    && !turn.messages.is_empty()
                     && turn.messages[0].role == ConversationRole::User
-                    && turn.messages[1].role == ConversationRole::Assistant
-                    && turn.messages[0].item_sequence < turn.messages[1].item_sequence
+                    && turn.messages.last().map(|message| message.role.clone())
+                        == Some(ConversationRole::Assistant)
+                    && turn
+                        .messages
+                        .windows(2)
+                        .all(|pair| pair[0].item_sequence < pair[1].item_sequence)
                 {
                     eligible.push(turn);
                     if eligible.len() > turn_limit {

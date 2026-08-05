@@ -973,3 +973,177 @@ fn app_server_bin() -> String {
         path.to_string_lossy().to_string()
     })
 }
+
+// Issue #24 批次 A（场景 2）：completed turn -> 干净退出 -> 新 App Server -> 同 Thread
+// 新 Turn，模型请求历史包含上一轮完整工具调用与结果（跨轮 seed）。
+#[test]
+fn new_turn_after_clean_restart_seeds_completed_turn_tool_history() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let provider = SeedProvider::start();
+
+    let (mut first_child, mut first_input, mut first_output) =
+        spawn_app_server(&db_path, &workspace, &provider.base_url);
+    initialize_process(&mut first_input, &mut first_output);
+    let thread_id = start_thread(&mut first_input, &mut first_output, &workspace, 2);
+    send_json(
+        &mut first_input,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": ORIGINAL_TASK}]
+            }
+        }),
+    );
+    let started = first_output.recv_method("turn/started", Duration::from_secs(5));
+    let turn_id = started["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("started turn id")
+        .to_string();
+    let first_completed = loop {
+        let message = first_output.recv_next_event(Duration::from_secs(15));
+        if message["method"] == "turn/completed" {
+            break message;
+        }
+    };
+    assert_eq!(
+        first_completed["params"]["turn"]["status"], "completed",
+        "first turn must complete before restart: {first_completed}"
+    );
+    shutdown_process(&mut first_child, &mut first_input, &mut first_output, 4);
+
+    let (mut second_child, mut second_input, mut second_output) =
+        spawn_app_server(&db_path, &workspace, &provider.base_url);
+    initialize_process(&mut second_input, &mut second_output);
+    let second_task = "Now run the second task";
+    send_json(
+        &mut second_input,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "id": 5,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": second_task}]
+            }
+        }),
+    );
+    let second_started = second_output.recv_method("turn/started", Duration::from_secs(5));
+    let second_turn_id = second_started["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("second turn id")
+        .to_string();
+    assert_ne!(second_turn_id, turn_id, "second turn must be a new turn");
+
+    let seeded_request = match provider
+        .seeded_request
+        .recv_timeout(Duration::from_secs(10))
+    {
+        Ok(request) => request,
+        Err(RecvTimeoutError::Timeout) => {
+            let response = second_output.recv_id(5, Duration::from_secs(2));
+            panic!("second turn did not reach the provider: {response}");
+        }
+        Err(RecvTimeoutError::Disconnected) => panic!("seed provider disconnected"),
+    };
+    assert_seeded_request(&seeded_request, second_task);
+
+    let second_completed = loop {
+        let message = second_output.recv_next_event(Duration::from_secs(15));
+        if message["method"] == "turn/completed" {
+            break message;
+        }
+    };
+    assert_eq!(
+        second_completed["params"]["turn"]["status"], "completed",
+        "second turn must complete: {second_completed}"
+    );
+    shutdown_process(&mut second_child, &mut second_input, &mut second_output, 6);
+    provider.worker.join().expect("provider worker");
+}
+
+fn assert_seeded_request(request: &Value, second_task: &str) {
+    let input = request["input"].as_array().expect("Responses input array");
+    let user_messages = input
+        .iter()
+        .filter(|item| item["type"] == "message" && item["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_messages.len(),
+        2,
+        "seed history must keep both user turns: {request}"
+    );
+    assert_eq!(user_messages[0]["content"], ORIGINAL_TASK);
+    assert_eq!(user_messages[1]["content"], second_task);
+
+    let tool_call = input
+        .iter()
+        .find(|item| item["type"] == "function_call" && item["call_id"] == LIST_CALL_ID)
+        .expect("durable list ToolCall in seed history");
+    assert_eq!(tool_call["name"], "list");
+    let tool_result = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == LIST_CALL_ID)
+        .expect("durable list ToolResult in seed history");
+    let output = tool_result["output"].as_str().expect("tool result output");
+    let output: Value = serde_json::from_str(output).expect("tool result json");
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["tool_name"], "list");
+
+    let assistant_final = input
+        .iter()
+        .find(|item| {
+            item["type"] == "message"
+                && item["role"] == "assistant"
+                && item["content"] == "resumed and completed"
+        })
+        .expect("first-turn final assistant message in seed history");
+    assert_eq!(assistant_final["content"], "resumed and completed");
+}
+
+struct SeedProvider {
+    base_url: String,
+    seeded_request: Receiver<Value>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl SeedProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind seed provider");
+        let address = listener.local_addr().expect("provider address");
+        let (seeded_tx, seeded_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut production_request_index = 0;
+            loop {
+                let (mut stream, _) = listener.accept().expect("accept provider request");
+                let request = read_http_json(&mut stream);
+                if let Some(response) = capability_probe_response(&request) {
+                    write_json_response(&mut stream, &response);
+                    continue;
+                }
+                assert_eq!(request["stream"], true, "production request must stream");
+                production_request_index += 1;
+                match production_request_index {
+                    1 => write_stream_response(&mut stream, list_response()),
+                    2 => write_final_stream_response(&mut stream, final_response()),
+                    3 => {
+                        seeded_tx.send(request).expect("send seeded request");
+                        write_final_stream_response(&mut stream, final_response());
+                        break;
+                    }
+                    other => panic!("unexpected production request {other}"),
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1/responses"),
+            seeded_request: seeded_rx,
+            worker,
+        }
+    }
+}

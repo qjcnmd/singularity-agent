@@ -958,3 +958,30 @@ fn app_server_bin() -> String {
         path.to_string_lossy().to_string()
     })
 }
+
+// Issue #24 批次 A（A3）：thread/start 未显式指定 model 时，Thread.model 冻结为
+// 当前配置可无歧义解析的默认 selector（legacy 为裸 model id），防止重启后默认
+// 配置变化静默切换模型；provider 未配置时仍保留 NULL 契约（由现有测试覆盖）。
+#[test]
+fn thread_start_freezes_resolved_default_selector_when_model_is_omitted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let provider = ControlledProvider::start();
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+    process.send_request(
+        2,
+        "thread/start",
+        json!({
+            "cwd": workspace
+        }),
+    );
+    let response = process.output.recv_id(2, Duration::from_secs(5));
+    assert_eq!(
+        response["result"]["thread"]["model"], "gpt-test",
+        "legacy default model must be frozen into Thread.model: {response}"
+    );
+    process.shutdown(3);
+}

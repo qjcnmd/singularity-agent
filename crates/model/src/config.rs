@@ -296,6 +296,13 @@ impl ProviderConfigSnapshot {
         self.model_selection.is_some()
     }
 
+    /// 若当前配置能无歧义解析默认 selector，返回其完整字符串
+    /// （catalog 为 `provider/model#effort`，legacy 为裸 model id）；
+    /// provider 未配置或无法解析时返回 `None`（调用方保留 `Thread.model` 为 NULL）。
+    pub fn resolved_default_selector(&self) -> Option<String> {
+        self.provider().ok()?.resolved_selector()
+    }
+
     /// 从快照创建 provider 实例。
     pub fn provider(&self) -> Result<OpenAiProvider, ProviderError> {
         self.provider_for_selector(None)

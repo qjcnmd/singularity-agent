@@ -1387,7 +1387,6 @@ impl AppServer {
             &turn.turn_id,
             DEFAULT_THREAD_HISTORY_TURN_LIMIT,
         )?;
-        let provider_history_segments = self.provider_history_segments_for(&history.messages)?;
         let registry = workspace_tool_registry();
         let policy = workspace_policy(thread.sandbox_mode, thread.approval_policy);
         let loop_input = match agent_loop_input(
@@ -1396,7 +1395,7 @@ impl AppServer {
             &turn.turn_id,
             &workspace_root,
             &history.messages,
-            &provider_history_segments,
+            None,
         ) {
             Ok(input) => input.with_approval_grant(grant),
             Err(_error) => {
@@ -1617,14 +1616,17 @@ impl AppServer {
             invocation.thread.sandbox_mode,
             invocation.thread.approval_policy,
         );
-        let provider_history_segments = self.provider_history_segments_for(invocation.history)?;
+        // fresh turn/start：最近一个 completed turn 的完整 checkpoint 作为唯一历史 seed；
+        // 无 seed 时回退公共文本历史（旧数据路径）。seed 失败走调用方的
+        // finish_turn_failure 终态化，不会让新 turn 卡在 running。
+        let historical_seed = self.completed_turn_seed(&invocation.thread.thread_id)?;
         let loop_input = agent_loop_input(
             invocation.thread,
             invocation.params,
             invocation.turn_id,
             &workspace_root,
             invocation.history,
-            &provider_history_segments,
+            historical_seed.as_ref(),
         )?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
@@ -1775,14 +1777,15 @@ impl AppServer {
             invocation.thread.sandbox_mode,
             invocation.thread.approval_policy,
         );
-        let provider_history_segments = self.provider_history_segments_for(invocation.history)?;
+        // turn/resume 从 checkpoint restore state，不注入跨轮 seed；
+        // 输入仅提供身份/授权，历史通道无效果。
         let loop_input = agent_loop_input(
             invocation.thread,
             invocation.params,
             invocation.turn_id,
             &workspace_root,
             invocation.history,
-            &provider_history_segments,
+            None,
         )?
         .with_resume_attempt(checkpoint.resume_attempt());
         let mut projector = if project_observability {

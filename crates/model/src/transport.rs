@@ -402,6 +402,21 @@ impl OpenAiProvider {
         &self.config.provider_name
     }
 
+    /// Return the fully resolved selector (`provider/model#effort`) for catalog
+    /// clones, or the bare legacy model id otherwise. `None` when the provider
+    /// has no resolved model (unconfigured legacy provider).
+    pub(crate) fn resolved_selector(&self) -> Option<String> {
+        let Some(selection) = self.selected_model.as_ref() else {
+            return Some(self.config.model_name.clone());
+        };
+        let mut selector = format!("{}/{}", self.config.provider_name, selection.model_name);
+        if let Some(variant) = selection.reasoning_variant.as_deref() {
+            selector.push('#');
+            selector.push_str(variant);
+        }
+        Some(selector)
+    }
+
     pub(super) fn config_snapshot(&self) -> OpenAiProviderConfig {
         self.config.clone()
     }
@@ -428,16 +443,28 @@ impl OpenAiProvider {
         request: &ModelTurnRequest,
     ) -> Result<ModelTurnRequest, ProviderError> {
         let Some(selector) = request.model_preferences.model_name.as_deref() else {
-            let mut normalized = request.clone();
+            // Legacy 路径：无 selector 时无法证明 replay 兼容。
+            // reasoning disabled 或未解析出 selected_model 时不再静默清空，
+            // 显式拒绝，避免旧私有状态被悄悄丢弃后继续。
             if self
                 .selected_model
                 .as_ref()
                 .is_none_or(|selection| !selection.reasoning_enabled)
             {
-                normalized.provider_reasoning_history.clear();
-            } else {
-                self.validate_reasoning_history(&normalized)?;
+                if !request.provider_reasoning_history.is_empty() {
+                    return Err(provider_tool_reasoning_history_error(
+                        &ModelTurnResponse::completed(
+                            request.request_id.clone(),
+                            "provider_reasoning_history",
+                            "",
+                        ),
+                        ProviderToolReasoningMode::Unspecified,
+                    ));
+                }
+                return Ok(request.clone());
             }
+            let normalized = request.clone();
+            self.validate_reasoning_history(&normalized)?;
             return Ok(normalized);
         };
         let mut normalized = request.clone();
@@ -497,7 +524,16 @@ impl OpenAiProvider {
             .as_ref()
             .is_none_or(|selection| !selection.reasoning_enabled)
         {
-            normalized.provider_reasoning_history.clear();
+            if !normalized.provider_reasoning_history.is_empty() {
+                return Err(provider_tool_reasoning_history_error(
+                    &ModelTurnResponse::completed(
+                        request.request_id.clone(),
+                        "provider_reasoning_history",
+                        "",
+                    ),
+                    ProviderToolReasoningMode::Unspecified,
+                ));
+            }
         } else {
             self.validate_reasoning_history(&normalized)?;
         }

@@ -2633,6 +2633,279 @@ fn agent_loop_preserves_portable_unknown_tool_history_with_empty_arguments() {
     }));
 }
 
+// Issue #24 批次 A：无 reasoning 的 completed turn 工具轨迹应跨轮进入
+// 下一轮模型请求（跨轮 seed 通道）。
+#[test]
+fn no_reasoning_tool_history_crosses_turns_with_historical_checkpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
+
+    let mut tool_response = ModelTurnResponse::completed("model_request_1_0", "response_1", "");
+    tool_response.tool_calls.push(tool_call(
+        "call_1",
+        "read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed("model_request_1_1", "response_2", "done");
+
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpoints = Vec::new();
+    let first = agent_loop_with_responses_and_requests(
+        vec![tool_response, final_response],
+        allow_read_policy(),
+        Arc::clone(&first_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(2),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
+                checkpoints.push(event.checkpoint.clone());
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    assert_eq!(checkpoints.len(), 1, "expected one committed checkpoint");
+    let checkpoint = TurnCheckpoint::decode(&checkpoints[0].encode().expect("encode checkpoint"))
+        .expect("decode checkpoint");
+
+    // 第二轮：完整 checkpoint 作为唯一历史 seed（无 reasoning 也必须保留工具轨迹）。
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let second = agent_loop_with_responses_and_requests(
+        vec![ModelTurnResponse::completed(
+            "model_request_2_0",
+            "response",
+            "final",
+        )],
+        allow_read_policy(),
+        Arc::clone(&second_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_2", "continue please")
+            .with_historical_checkpoint(&checkpoint)
+            .with_max_turns(1),
+    );
+    assert_eq!(second.status, AgentStatus::Completed, "second={second:?}");
+
+    let requests = second_requests.lock().expect("second requests");
+    let request = requests.last().expect("second turn request");
+    let has_tool_call = request.messages.iter().any(|message| {
+        message.role == ModelRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == "call_1")
+    });
+    let has_tool_result = request.messages.iter().any(|message| {
+        message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("call_1")
+    });
+    assert!(
+        has_tool_call,
+        "missing assistant tool call in second-turn history"
+    );
+    assert!(
+        has_tool_result,
+        "missing tool result in second-turn history"
+    );
+}
+
+// Issue #24 批次 A（A0 门禁）：跨轮 seed 必须替换旧 leading Developer、
+// 剔除 repair feedback 类瞬态 Developer，并保持历史消息顺序。
+#[test]
+fn seed_replaces_leading_developer_and_drops_repair_feedback() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
+
+    let mut failed_tool = ModelTurnResponse::completed("model_request_1_0", "response_1", "");
+    failed_tool.tool_calls.push(tool_call(
+        "call_failed",
+        "run_tests",
+        serde_json::json!({"unexpected": true}),
+    ));
+    let mut repaired_tool = ModelTurnResponse::completed("model_request_1_1", "response_2", "");
+    repaired_tool.tool_calls.push(tool_call(
+        "call_read",
+        "read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_1_2", "response_3", "recovered");
+
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpoints = Vec::new();
+    let first = agent_loop_with_responses_and_requests(
+        vec![failed_tool, repaired_tool, final_response],
+        allow_read_policy(),
+        Arc::clone(&first_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(3),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
+                checkpoints.push(event.checkpoint.clone());
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    assert_eq!(checkpoints.len(), 1);
+    let checkpoint = TurnCheckpoint::decode(&checkpoints[0].encode().expect("encode checkpoint"))
+        .expect("decode checkpoint");
+
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let second = agent_loop_with_responses_and_requests(
+        vec![ModelTurnResponse::completed(
+            "model_request_2_0",
+            "response",
+            "second final",
+        )],
+        allow_read_policy(),
+        Arc::clone(&second_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_2", "second user")
+            .with_historical_checkpoint(&checkpoint)
+            .with_max_turns(1),
+    );
+    assert_eq!(second.status, AgentStatus::Completed, "second={second:?}");
+
+    let requests = second_requests.lock().expect("second requests");
+    let request = requests.last().expect("second turn request");
+    let developer_messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Developer)
+        .collect::<Vec<_>>();
+    assert_eq!(developer_messages.len(), 1, "exactly one leading developer");
+    assert!(
+        developer_messages[0]
+            .content
+            .starts_with("You are a coding agent working in the current workspace."),
+        "leading developer must be the current turn instructions"
+    );
+    assert!(
+        request.messages.iter().all(|message| {
+            message.role != ModelRole::Developer
+                || !message
+                    .content
+                    .starts_with("Follow the bounded repair guidance")
+        }),
+        "repair feedback must not cross turns"
+    );
+    let has_tool_call = request.messages.iter().any(|message| {
+        message.role == ModelRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == "call_read")
+    });
+    let has_tool_result = request.messages.iter().any(|message| {
+        message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("call_read")
+    });
+    assert!(has_tool_call, "missing tool call in seed history");
+    assert!(has_tool_result, "missing tool result in seed history");
+}
+
+// Issue #24 批次 A：seed 携带的私有 replay 与解析 selector 不匹配时，
+// 在 capability probe 与 Initial checkpoint 之前拒绝（HTTP request count 为 0）。
+#[test]
+fn seed_replay_mismatch_is_rejected_before_checkpoint_without_provider_requests() {
+    let mut tool_response = ModelTurnResponse::completed("request_1", "response_tool", "");
+    tool_response.tool_calls.push(tool_call(
+        "call_history",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    ));
+    tool_response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "history-provider".to_string(),
+        model_name: "history-model".to_string(),
+        reasoning_effort: "medium".to_string(),
+        tool_call_ids: vec!["call_history".to_string()],
+        reasoning_content: "private reasoning".to_string(),
+    }];
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpoints = Vec::new();
+    let first = agent_loop_with_responses_and_requests(
+        vec![
+            tool_response,
+            ModelTurnResponse::completed("request_2", "response_final", "first final"),
+        ],
+        allow_read_policy(),
+        Arc::clone(&first_requests),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "first user"),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            checkpoints.push(event.checkpoint);
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    let checkpoint = TurnCheckpoint::decode(
+        &checkpoints
+            .last()
+            .expect("committed checkpoint")
+            .encode()
+            .expect("encode checkpoint"),
+    )
+    .expect("decode checkpoint");
+
+    // 第二轮：解析 selector 的 provider 与 replay 来源不匹配。
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut second_checkpoints = Vec::new();
+    let second = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("request_3", "response_next", "second final"),
+        allow_read_policy(),
+        Arc::clone(&second_requests),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_2", "second user")
+            .with_model_name(Some("other-provider/other-model#high".to_string()))
+            .with_historical_checkpoint(&checkpoint),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            second_checkpoints.push(event.checkpoint);
+            Ok(())
+        },
+    );
+    assert_eq!(second.status, AgentStatus::Failed, "second={second:?}");
+    assert!(
+        second.error.is_some()
+            && second
+                .error
+                .as_ref()
+                .expect("error")
+                .contains("cannot be replayed"),
+        "expected replay provider mismatch: {second:?}"
+    );
+    assert_eq!(
+        second_requests.lock().expect("second requests").len(),
+        0,
+        "no provider request may be issued before replay preflight"
+    );
+    assert!(
+        second_checkpoints.is_empty(),
+        "no Initial checkpoint may be persisted for an incompatible replay"
+    );
+}
+
 #[test]
 fn agent_loop_rejects_nonportable_provider_tool_name_before_history() {
     let unsafe_name = "private/C:\\sensitive-tool";
@@ -3545,11 +3818,6 @@ fn historical_provider_segment_replays_tool_transcript_before_next_user_turn() {
     let checkpoint = checkpoint.expect("completed turn checkpoint");
     let checkpoint = TurnCheckpoint::decode(&checkpoint.encode().expect("encode checkpoint"))
         .expect("decode checkpoint after restart");
-    let segment = checkpoint
-        .provider_history_segment("assistant_1")
-        .expect("derive provider history segment")
-        .expect("tool turn has provider replay");
-    assert!(segment.has_replay());
 
     let seen_second = Arc::new(Mutex::new(Vec::new()));
     let second_loop = agent_loop_with_response_and_requests(
@@ -3557,18 +3825,15 @@ fn historical_provider_segment_replays_tool_transcript_before_next_user_turn() {
         allow_read_policy(),
         Arc::clone(&seen_second),
     );
+    // 跨轮 seed：完整 checkpoint（消息 + replay + occurrence）是唯一历史通道。
     let second_input = AgentLoopInput::new("thread_1", "turn_2", "second user")
-        .with_history([
-            AgentContextItem::history_user("user_1", "first user"),
-            AgentContextItem::history_assistant("assistant_1", "first final"),
-        ])
-        .with_provider_history_segments([segment]);
+        .with_historical_checkpoint(&checkpoint);
     let serialized_input = serde_json::to_value(&second_input).expect("serialize input");
     assert!(
         !serialized_input
             .as_object()
             .expect("input object")
-            .contains_key("provider_history_segments")
+            .contains_key("historical_checkpoint")
     );
     let second_result = second_loop.run(&second_input);
     assert_eq!(

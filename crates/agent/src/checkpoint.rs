@@ -4,7 +4,6 @@
 //! completion, and history bindings before a checkpoint can be resumed.
 
 use std::collections::BTreeSet;
-use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -204,105 +203,25 @@ pub struct TurnCheckpoint {
     pub(super) pending_tool_calls: Vec<PendingToolCall>,
 }
 
-/// A private, provider-facing transcript fragment recovered from one completed historical turn.
+/// 跨轮历史种子：从最近一个 completed turn 的 checkpoint 派生的完整模型上下文。
 ///
-/// The public conversation stores only the final assistant text.  This value keeps the exact
-/// assistant tool-call and tool-result messages that belong to the opaque reasoning replay, while
-/// binding the fragment to the public assistant item that owns the turn.  It is intentionally not
-/// serializable: checkpoints remain the single durable source and this projection is rebuilt on
-/// demand after a process restart.
-#[derive(Clone, PartialEq)]
-pub struct ProviderHistorySegment {
-    assistant_item_id: String,
-    messages: Vec<ModelMessage>,
-    provider_reasoning_history: Vec<ProviderReasoningReplay>,
+/// 仅存在于内存、不序列化；checkpoint 仍是唯一持久事实源。历史 tool occurrence
+/// 直接复用 checkpoint 已持久化的 `ToolResultOccurrence`，不重建投影类型。
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HistoricalModelContext {
+    pub(super) messages: Vec<ModelMessage>,
+    pub(super) provider_reasoning_history: Vec<ProviderReasoningReplay>,
+    pub(super) tool_result_occurrences: Vec<ToolResultOccurrence>,
 }
 
-impl fmt::Debug for ProviderHistorySegment {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProviderHistorySegment")
-            .field("assistant_item_id", &self.assistant_item_id)
-            .field("message_count", &self.messages.len())
-            .field(
-                "reasoning_item_count",
-                &self.provider_reasoning_history.len(),
-            )
-            .finish()
-    }
-}
-
-impl ProviderHistorySegment {
-    fn new(
-        assistant_item_id: impl Into<String>,
-        messages: Vec<ModelMessage>,
-        provider_reasoning_history: Vec<ProviderReasoningReplay>,
-    ) -> Result<Self, String> {
-        let assistant_item_id = assistant_item_id.into();
-        if assistant_item_id.trim().is_empty() {
-            return Err("provider history segment assistant item identity is missing".to_string());
+impl HistoricalModelContext {
+    /// 从 completed turn checkpoint 克隆累计快照的三项执行历史数据。
+    pub(super) fn from_checkpoint(checkpoint: &TurnCheckpoint) -> Self {
+        Self {
+            messages: checkpoint.state.messages.clone(),
+            provider_reasoning_history: checkpoint.state.provider_reasoning_history.clone(),
+            tool_result_occurrences: checkpoint.state.tool_result_occurrences.clone(),
         }
-        if messages.is_empty() || provider_reasoning_history.is_empty() {
-            return Err("provider history segment payload is incomplete".to_string());
-        }
-        Ok(Self {
-            assistant_item_id,
-            messages,
-            provider_reasoning_history,
-        })
-    }
-
-    /// Return the public assistant item that owns this private fragment.
-    pub(crate) fn assistant_item_id(&self) -> &str {
-        &self.assistant_item_id
-    }
-
-    /// Return whether two segments are attached to the same public assistant item.
-    pub fn same_assistant_item(&self, other: &Self) -> bool {
-        self.assistant_item_id == other.assistant_item_id
-    }
-
-    /// Return the exact provider-facing tool-call/result messages in original order.
-    pub(crate) fn messages(&self) -> &[ModelMessage] {
-        &self.messages
-    }
-
-    /// Return the opaque provider reasoning items paired with these tool calls.
-    pub(crate) fn provider_reasoning_history(&self) -> &[ProviderReasoningReplay] {
-        &self.provider_reasoning_history
-    }
-
-    /// Return true when this segment contains a replay binding that overlaps
-    /// another segment.  Only the conflict result crosses the app boundary.
-    pub fn conflicts_with(&self, other: &Self) -> bool {
-        self.provider_reasoning_history.iter().any(|replay| {
-            other.provider_reasoning_history.iter().any(|candidate| {
-                self.messages
-                    .iter()
-                    .flat_map(|message| message.tool_calls.iter())
-                    .any(|call| {
-                        replay.has_tool_call_id(&call.tool_call_id)
-                            && candidate.has_tool_call_id(&call.tool_call_id)
-                    })
-            })
-        })
-    }
-
-    /// Return true when the segment carries no public assistant projection.
-    pub fn has_replay(&self) -> bool {
-        !self.provider_reasoning_history.is_empty()
-    }
-
-    /// Approximate the private payload cost for context selection and request budgeting.
-    pub fn token_count(&self) -> u32 {
-        let message_tokens = serde_json::to_string(&self.messages).map_or(u32::MAX, |payload| {
-            singularity_tools::approximate_token_count(&payload)
-        });
-        let reasoning_tokens = serde_json::to_string(&self.provider_reasoning_history)
-            .map_or(u32::MAX, |payload| {
-                singularity_tools::approximate_token_count(&payload)
-            });
-        message_tokens.saturating_add(reasoning_tokens)
     }
 }
 
@@ -457,154 +376,6 @@ impl TurnCheckpoint {
     /// Return canonical validated calls that may run only when no execution became `Unknown`.
     pub fn pending_tool_calls(&self) -> &[PendingToolCall] {
         &self.pending_tool_calls
-    }
-
-    /// Return the private provider-bound reasoning state needed for history replay.
-    /// Return whether the durable checkpoint contains provider-private replay.
-    pub fn has_provider_reasoning_history(&self) -> bool {
-        !self.state.provider_reasoning_history.is_empty()
-    }
-
-    /// Derive the current turn's private tool transcript from the durable message snapshot.
-    ///
-    /// Checkpoints carry cumulative replay state because a resumed turn is allowed to retain
-    /// earlier history.  Only replay items paired with assistant tool calls after the latest user
-    /// message belong to this completed turn; older pairs are recovered from their own turn
-    /// checkpoints.  Any globally orphaned replay is rejected before provider content is exposed.
-    pub fn provider_history_segment(
-        &self,
-        assistant_item_id: impl Into<String>,
-    ) -> Result<Option<ProviderHistorySegment>, String> {
-        let assistant_item_id = assistant_item_id.into();
-        if self.state.provider_reasoning_history.is_empty() {
-            return Ok(None);
-        }
-        let latest_user_index = self
-            .state
-            .messages
-            .iter()
-            .rposition(|message| message.role == ModelRole::User)
-            .ok_or_else(|| "provider history checkpoint has no user message".to_string())?;
-
-        let mut matched_assistant_indices = Vec::new();
-        for replay in &self.state.provider_reasoning_history {
-            if !replay.is_valid() {
-                return Err("provider history replay tool-call identity is invalid".to_string());
-            }
-            let matches = self
-                .state
-                .messages
-                .iter()
-                .enumerate()
-                .filter(|(_, message)| {
-                    message.role == ModelRole::Assistant
-                        && replay.matches_tool_call_ids(
-                            &message
-                                .tool_calls
-                                .iter()
-                                .map(|call| call.tool_call_id.clone())
-                                .collect::<Vec<_>>(),
-                        )
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
-                return Err(
-                    "provider history replay is not bound to a tool-call message".to_string(),
-                );
-            }
-            if matches.len() > 1 {
-                return Err("provider history replay has ambiguous tool-call binding".to_string());
-            }
-            matched_assistant_indices.push(matches[0]);
-        }
-        if matched_assistant_indices
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != matched_assistant_indices.len()
-        {
-            return Err("provider history replay has duplicate assistant binding".to_string());
-        }
-
-        let current_replay = self
-            .state
-            .provider_reasoning_history
-            .iter()
-            .zip(matched_assistant_indices.iter())
-            .filter(|(_, index)| **index > latest_user_index)
-            .map(|(replay, index)| (replay.clone(), *index))
-            .collect::<Vec<_>>();
-        if current_replay.is_empty() {
-            return Ok(None);
-        }
-
-        let current_assistant_indices = current_replay
-            .iter()
-            .map(|(_, index)| *index)
-            .collect::<BTreeSet<_>>();
-        let current_call_ids = current_replay
-            .iter()
-            .filter_map(|(_, index)| self.state.messages.get(*index))
-            .flat_map(|message| {
-                message
-                    .tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        let mut selected_indices = BTreeSet::new();
-        for assistant_index in current_assistant_indices {
-            selected_indices.insert(assistant_index);
-            let assistant_calls = self
-                .state
-                .messages
-                .get(assistant_index)
-                .map(|message| {
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(|call| call.tool_call_id.clone())
-                        .collect::<BTreeSet<_>>()
-                })
-                .ok_or_else(|| "provider history assistant message is missing".to_string())?;
-            let mut result_ids = BTreeSet::new();
-            for (index, message) in self
-                .state
-                .messages
-                .iter()
-                .enumerate()
-                .skip(assistant_index + 1)
-            {
-                if message.role != ModelRole::Tool {
-                    if !assistant_calls.is_disjoint(&current_call_ids) {
-                        break;
-                    }
-                    continue;
-                }
-                let tool_call_id = message.tool_call_id.as_deref().ok_or_else(|| {
-                    "provider history tool result identity is missing".to_string()
-                })?;
-                if assistant_calls.contains(tool_call_id) {
-                    selected_indices.insert(index);
-                    if !result_ids.insert(tool_call_id.to_string()) {
-                        return Err("provider history tool result binding is invalid".to_string());
-                    }
-                }
-            }
-            if result_ids != assistant_calls {
-                return Err("provider history tool result binding is invalid".to_string());
-            }
-        }
-        let messages = selected_indices
-            .into_iter()
-            .filter_map(|index| self.state.messages.get(index).cloned())
-            .collect::<Vec<_>>();
-        let replay = current_replay
-            .into_iter()
-            .map(|(replay, _)| replay)
-            .collect::<Vec<_>>();
-        ProviderHistorySegment::new(assistant_item_id, messages, replay).map(Some)
     }
 }
 

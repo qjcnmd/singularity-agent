@@ -7702,6 +7702,60 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
     assert_eq!(history.messages[1].content, "safe assistant");
 }
 
+// Issue #24 批次 A（失败证据）：带追加输入（steer/follow-up）的 completed turn
+// 应完整进入下一轮历史。当前实现只收恰好 [User, Assistant] 两条消息的 turn，
+// 该 turn 会被整体排除，下一轮历史缺失追加输入前后的消息。
+#[test]
+fn completed_turn_with_follow_up_messages_is_included_in_history() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn =
+        append_completed_conversation(&store, &thread.thread_id, "user one", "assistant one");
+    store
+        .append_item(
+            &turn,
+            ItemKind::UserMessage,
+            serde_json::json!([{"type": "text", "text": "follow-up user"}]),
+        )
+        .expect("follow-up user item");
+    store
+        .append_item(
+            &turn,
+            ItemKind::AgentMessage,
+            serde_json::json!({"delta": "assistant two"}),
+        )
+        .expect("second assistant item");
+
+    let started = store
+        .create_turn_with_input_trace_and_history(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "current user"}]),
+            "test",
+            "turn started",
+            10,
+        )
+        .expect("start next turn");
+
+    assert_eq!(started.history.messages.len(), 4);
+    assert_eq!(
+        started
+            .history
+            .messages
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ConversationRole::User,
+            ConversationRole::Assistant,
+            ConversationRole::User,
+            ConversationRole::Assistant,
+        ]
+    );
+}
+
 #[test]
 fn history_decodes_all_selected_item_status_and_kind_values_before_projection() {
     let dir = tempfile::tempdir().expect("temp dir");

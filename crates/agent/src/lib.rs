@@ -47,9 +47,11 @@ mod model_turn;
 mod observation;
 mod tool_occurrence;
 
+use checkpoint::HistoricalModelContext;
+
 pub use checkpoint::{
-    ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall, ProviderHistorySegment,
-    TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
+    ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall, TurnCheckpoint,
+    TurnCheckpointEvent, TurnCheckpointPhase,
 };
 
 impl TurnCheckpoint {
@@ -192,10 +194,7 @@ pub use context::{
     AgentContextItem, AgentContextItemPriority, AgentContextTrace, ContextBundle,
     assemble_context_items,
 };
-use context::{
-    ContextBudget, assemble_context_items_with_budget_and_provider_history, current_turn_excluded,
-    provider_reasoning_history_from_context,
-};
+use context::{ContextBudget, assemble_context_items_with_budget, current_turn_excluded};
 use model_turn::*;
 use observation::OccurrenceTimer;
 pub use observation::{
@@ -466,7 +465,7 @@ pub struct AgentLoopInput {
     provider_reasoning_history: Vec<ProviderReasoningReplay>,
     #[serde(skip)]
     #[schemars(skip)]
-    provider_history_segments: Vec<ProviderHistorySegment>,
+    historical_checkpoint: Option<HistoricalModelContext>,
 }
 
 impl AgentLoopInput {
@@ -489,7 +488,7 @@ impl AgentLoopInput {
             approval_grants: Vec::new(),
             resume_attempt: 0,
             provider_reasoning_history: Vec::new(),
-            provider_history_segments: Vec::new(),
+            historical_checkpoint: None,
         }
     }
 
@@ -545,14 +544,148 @@ impl AgentLoopInput {
         self
     }
 
-    /// Bind private historical transcript fragments reconstructed from completed turn checkpoints.
-    pub fn with_provider_history_segments(
-        mut self,
-        segments: impl IntoIterator<Item = ProviderHistorySegment>,
-    ) -> Self {
-        self.provider_history_segments = segments.into_iter().collect();
+    /// Bind the complete cumulative model history of the most recent completed turn.
+    ///
+    /// When present, this seed is the only historical channel for a fresh turn: public
+    /// `with_history` items must not be mixed in (the app-server switches to this
+    /// constructor for fresh `turn/start`).
+    pub fn with_historical_checkpoint(mut self, checkpoint: &TurnCheckpoint) -> Self {
+        self.historical_checkpoint = Some(HistoricalModelContext::from_checkpoint(checkpoint));
         self
     }
+}
+
+/// Compaction summary 消息的固定 JSON 前缀，跨轮 seed 保留该 Developer 消息。
+const COMPACTION_SUMMARY_PREFIX: &str = "{\"type\":\"agent_context_compaction\"";
+
+/// completion feedback Developer 消息的固定前缀（见 `CompletionTracker::feedback`）。
+const COMPLETION_FEEDBACK_PREFIX: &str = "Do not finalize yet.";
+
+/// repair 预算耗尽提示（防御性剔除；正常不出现于 completed turn）。
+const REPAIR_BUDGET_EXHAUSTED_INSTRUCTION: &str =
+    "repair budget exhausted; refusing another repair attempt";
+
+/// 从跨轮 seed 组装新 Turn 的初始模型消息。
+///
+/// 规则：删除开头连续的旧 leading Developer；剔除 repair/repeated-failure/budget/
+/// completion 瞬态 Developer（全部为固定常量匹配，不按自由文本猜测）；保留
+/// compaction summary（固定 JSON 前缀）；插入当前唯一 leading block；末尾追加
+/// 当前 user 输入。
+fn prepare_seed_messages(
+    seed: &HistoricalModelContext,
+    input: &AgentLoopInput,
+    max_tool_calls: u32,
+    current_user_text: &str,
+) -> Vec<ModelMessage> {
+    let mut messages = Vec::with_capacity(seed.messages.len() + 2);
+    let mut seed_messages = seed.messages.iter().cloned();
+    for message in seed_messages.by_ref() {
+        if message.role != ModelRole::Developer {
+            messages.push(message);
+            break;
+        }
+    }
+    for message in seed_messages {
+        if message.role == ModelRole::Developer
+            && !message.content.starts_with(COMPACTION_SUMMARY_PREFIX)
+            && (message.content.starts_with(REPAIR_STATE_INSTRUCTIONS)
+                || message.content == REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
+                || message.content == REPAIR_BUDGET_EXHAUSTED_INSTRUCTION
+                || message.content.starts_with(COMPLETION_FEEDBACK_PREFIX))
+        {
+            continue;
+        }
+        messages.push(message);
+    }
+    messages.insert(
+        0,
+        ModelMessage::text(
+            ModelRole::Developer,
+            developer_instructions(input, max_tool_calls),
+        ),
+    );
+    messages.push(ModelMessage::text(ModelRole::User, current_user_text));
+    messages
+}
+
+/// 从输入中提取当前 turn 的用户文本（seed 路径使用）。
+fn current_user_text_from_input(input: &AgentLoopInput) -> String {
+    input
+        .input
+        .iter()
+        .filter(|item| item.role == USER_MESSAGE_ROLE)
+        .map(|item| item.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 网络前 replay 兼容性预检查：在 capability probe 与 Initial checkpoint 之前拒绝
+/// 无法证明兼容的私有 replay。不调用 provider、不发网络；transport 层的严格校验
+/// （`validate_reasoning_history`）仍为最终防线。
+fn validate_replay_preflight(input: &AgentLoopInput) -> Result<(), String> {
+    let mut replays = input.provider_reasoning_history.iter().collect::<Vec<_>>();
+    if let Some(seed) = input.historical_checkpoint.as_ref() {
+        replays.extend(seed.provider_reasoning_history.iter());
+    }
+    if replays.is_empty() {
+        return Ok(());
+    }
+    let selector = input.model_preferences.model_name.as_deref();
+    let selector_provider = selector
+        .and_then(|selector| selector.split_once('/'))
+        .map(|(provider, _)| provider);
+    let selector_effort = selector
+        .and_then(|selector| selector.rsplit_once('#'))
+        .map(|(_, effort)| effort);
+    for replay in replays {
+        let (provider_name, model_name, reasoning_effort, tool_call_ids) = match replay {
+            ProviderReasoningReplay::Chat {
+                provider_name,
+                model_name,
+                reasoning_effort,
+                tool_call_ids,
+                ..
+            } => (
+                provider_name.as_str(),
+                model_name.as_str(),
+                reasoning_effort.as_str(),
+                tool_call_ids,
+            ),
+            ProviderReasoningReplay::Responses {
+                provider_name,
+                model_name,
+                reasoning_effort,
+                tool_call_ids,
+                ..
+            } => (
+                provider_name.as_str(),
+                model_name.as_str(),
+                reasoning_effort.as_str(),
+                tool_call_ids,
+            ),
+        };
+        if provider_name.is_empty() || model_name.is_empty() || reasoning_effort.is_empty() {
+            return Err("provider reasoning replay is missing identity metadata".to_string());
+        }
+        if tool_call_ids.is_empty() {
+            return Err("provider reasoning replay is missing its tool call binding".to_string());
+        }
+        if let Some(expected_provider) = selector_provider
+            && provider_name != expected_provider
+        {
+            return Err(format!(
+                "provider reasoning replay from {provider_name} cannot be replayed by the resolved provider {expected_provider}"
+            ));
+        }
+        if let Some(expected_effort) = selector_effort
+            && reasoning_effort != expected_effort
+        {
+            return Err(format!(
+                "provider reasoning replay effort {reasoning_effort} does not match the resolved selector effort {expected_effort}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 已获批准的 tool call，并绑定到其请求、tool 和资源集合。
@@ -1663,20 +1796,26 @@ where
         &self,
         input: &AgentLoopInput,
     ) -> Result<TurnCheckpoint, String> {
+        validate_replay_preflight(input)?;
         let public_budget = ContextBudget::for_public_assembly(u32::MAX);
-        let context = assemble_context_items_with_budget_and_provider_history(
-            &input.input,
-            &public_budget,
-            &input.provider_history_segments,
-        );
-        if current_turn_excluded(input, &context) {
-            return Err(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string());
-        }
-        let messages = model_messages_from_input(input, &context, 1);
-        let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
-        state.provider_reasoning_history =
-            provider_reasoning_history_with_context(&input.provider_reasoning_history, &context);
-        state.context_trace = Some(AgentContextTrace::from(&context));
+        let state = if let Some(seed) = input.historical_checkpoint.as_ref() {
+            let current_user_text = current_user_text_from_input(input);
+            let messages = prepare_seed_messages(seed, input, 1, &current_user_text);
+            let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
+            state.provider_reasoning_history = seed.provider_reasoning_history.clone();
+            state.tool_result_occurrences = seed.tool_result_occurrences.clone();
+            state
+        } else {
+            let context = assemble_context_items_with_budget(&input.input, &public_budget);
+            if current_turn_excluded(input, &context) {
+                return Err(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string());
+            }
+            let messages = model_messages_from_input(input, &context, 1);
+            let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
+            state.provider_reasoning_history = input.provider_reasoning_history.clone();
+            state.context_trace = Some(AgentContextTrace::from(&context));
+            state
+        };
         state
             .turn_checkpoint(input, 0, Vec::new())
             .map_err(|error| format!("initial turn checkpoint invalid: {error}"))
@@ -1861,6 +2000,16 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
+        // 网络前拒绝不兼容的私有 replay，先于 capability probe 与 Initial checkpoint。
+        if let Err(error) = validate_replay_preflight(input) {
+            return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                0,
+                Some(error),
+            );
+        }
         let (capabilities, mut state) =
             match self.negotiate_tool_capabilities(input, state, 0, &mut on_event) {
                 ControlFlow::Continue(result) => result,
@@ -1873,24 +2022,27 @@ where
                 return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
             }
         };
-        let context = assemble_context_items_with_budget_and_provider_history(
-            &input.input,
-            &budget,
-            &input.provider_history_segments,
-        );
-        if current_turn_excluded(input, &context) {
-            return state.finish(
-                AgentStatus::Failed,
-                false,
-                None,
-                0,
-                Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
-            );
+        if let Some(seed) = input.historical_checkpoint.as_ref() {
+            // 跨轮 seed：完整历史消息 + 已持久化 occurrence 直接作为新 Turn 前缀。
+            let current_user_text = current_user_text_from_input(input);
+            state.messages = prepare_seed_messages(seed, input, max_tool_calls, &current_user_text);
+            state.provider_reasoning_history = seed.provider_reasoning_history.clone();
+            state.tool_result_occurrences = seed.tool_result_occurrences.clone();
+        } else {
+            let context = assemble_context_items_with_budget(&input.input, &budget);
+            if current_turn_excluded(input, &context) {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
+                );
+            }
+            state.messages = model_messages_from_input(input, &context, max_tool_calls);
+            state.provider_reasoning_history = input.provider_reasoning_history.clone();
+            state.context_trace = Some(AgentContextTrace::from(&context));
         }
-        state.messages = model_messages_from_input(input, &context, max_tool_calls);
-        state.provider_reasoning_history =
-            provider_reasoning_history_with_context(&input.provider_reasoning_history, &context);
-        state.context_trace = Some(AgentContextTrace::from(&context));
         if let Some(callback) = on_checkpoint.as_deref_mut() {
             let checkpoint = match state.turn_checkpoint(input, 0, Vec::new()) {
                 Ok(checkpoint) => checkpoint,
@@ -2873,11 +3025,7 @@ where
             }
         };
         refresh_developer_instructions(&mut state.messages, input, max_tool_calls);
-        let context = assemble_context_items_with_budget_and_provider_history(
-            &input.input,
-            &budget,
-            &input.provider_history_segments,
-        );
+        let context = assemble_context_items_with_budget(&input.input, &budget);
         if let Some(context_trace) = &mut state.context_trace {
             context_trace.refresh_context(&context);
         } else {
@@ -4367,19 +4515,6 @@ fn context_budget(
         message_framing_tokens,
         input_token_budget,
     })
-}
-
-fn provider_reasoning_history_with_context(
-    input_history: &[ProviderReasoningReplay],
-    context: &ContextBundle,
-) -> Vec<ProviderReasoningReplay> {
-    let mut history = provider_reasoning_history_from_context(context);
-    for replay in input_history {
-        if !history.contains(replay) {
-            history.push(replay.clone());
-        }
-    }
-    history
 }
 
 fn model_request_fits_context(
