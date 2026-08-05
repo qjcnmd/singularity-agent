@@ -13,13 +13,12 @@ use singularity_model::{
     ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract,
     ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, resolve_provider_config, responses_endpoint, validate_model_request,
+    classify_model_error, responses_endpoint, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::sync::{
     Arc, Barrier, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -28,24 +27,6 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
-
-static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-struct CurrentDirRestore(PathBuf);
-
-impl Drop for CurrentDirRestore {
-    fn drop(&mut self) {
-        std::env::set_current_dir(&self.0).expect("restore current dir");
-    }
-}
-
-fn in_current_dir<T>(path: &std::path::Path, action: impl FnOnce() -> T) -> T {
-    let _lock = CURRENT_DIR_LOCK.lock().expect("current dir lock");
-    let original_dir = std::env::current_dir().expect("current dir");
-    std::env::set_current_dir(path).expect("enter synthetic project");
-    let _restore = CurrentDirRestore(original_dir);
-    action()
-}
 
 fn tool_call(id: &str, name: &str) -> ModelToolCall {
     ModelToolCall {
@@ -73,7 +54,7 @@ fn provider_config_with_base_url(base_url: String) -> OpenAiProviderConfig {
         base_url,
         api_key: "sk-secret-value".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
-        max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+        max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
     }
 }
@@ -146,6 +127,22 @@ fn single_response_server(status_line: &'static str, body: &'static str) -> Stri
         }
     });
     format!("http://{addr}")
+}
+
+fn models_server(body: String) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind models provider");
+    let addr = listener.local_addr().expect("models provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept models provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone models provider stream"));
+        let (first_line, headers, _) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/models"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+        tx.send(first_line).expect("send models request line");
+    });
+    (format!("http://{addr}"), rx)
 }
 
 fn captured_request_server(
@@ -1420,6 +1417,72 @@ fn model_turn_request_serializes_provider_boundary_fields() {
 }
 
 #[test]
+fn model_discovery_rejects_any_invalid_model_entry() {
+    let invalid_payloads = [
+        ("missing id", r#"{"data":[{"id":"gpt-valid"},{}]}"#),
+        ("empty id", r#"{"data":[{"id":"gpt-valid"},{"id":""}]}"#),
+        (
+            "whitespace id",
+            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt invalid"}]}"#,
+        ),
+        (
+            "control character id",
+            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt\ninvalid"}]}"#,
+        ),
+        (
+            "duplicate id",
+            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt-valid"}]}"#,
+        ),
+    ];
+    for (label, payload) in invalid_payloads {
+        let (base_url, request) = models_server(payload.to_string());
+        let provider =
+            OpenAiProvider::new(provider_auto_test_config(base_url)).expect("models provider");
+        let error = provider.discover_model_ids().expect_err(label);
+        assert_eq!(
+            error.error.kind,
+            ModelErrorKind::JsonSchemaViolation,
+            "{label}"
+        );
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_models_schema_invalid"),
+            "{label}"
+        );
+        assert_eq!(
+            error.error.stage,
+            Some(ProviderErrorStage::ResponseValidation),
+            "{label}"
+        );
+        assert!(
+            request
+                .recv_timeout(Duration::from_secs(1))
+                .expect("models request")
+                .contains("GET /v1/models"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn model_discovery_accepts_complete_unique_model_entries() {
+    let (base_url, request) =
+        models_server(r#"{"data":[{"id":"gpt-test"},{"id":"o4-mini"}]}"#.to_string());
+    let provider =
+        OpenAiProvider::new(provider_auto_test_config(base_url)).expect("models provider");
+    assert_eq!(
+        provider.discover_model_ids().expect("complete catalog"),
+        vec!["gpt-test", "o4-mini"]
+    );
+    assert!(
+        request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("models request")
+            .contains("GET /v1/models")
+    );
+}
+
+#[test]
 fn model_turn_schema_excludes_runtime_and_trace_metadata() {
     let request = ModelTurnRequest::new(
         "request_1",
@@ -1484,18 +1547,22 @@ fn provider_config_validation_reports_missing_boundary_fields() {
 #[test]
 fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
     let mut reads = std::collections::HashMap::<String, usize>::new();
-    let snapshot = ProviderConfigSnapshot::capture(|name| {
-        let count = reads.entry(name.to_string()).or_default();
-        *count += 1;
-        assert_eq!(*count, 1, "provider setting {name} was read more than once");
-        match name {
-            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-            "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
-            "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
-            _ => None,
-        }
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| {
+            let count = reads.entry(name.to_string()).or_default();
+            *count += 1;
+            assert_eq!(*count, 1, "provider setting {name} was read more than once");
+            match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+                "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+                _ => None,
+            }
+        },
+        None,
+        None,
+    );
 
     assert_eq!(
         snapshot.source(),
@@ -1514,37 +1581,18 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
         assert!(!snapshot.snapshot_id().contains(secret));
     }
 
-    let same_config = ProviderConfigSnapshot::capture(|name| match name {
-        "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-        "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
-        "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
-        _ => None,
-    });
+    let same_config = ProviderConfigSnapshot::capture(
+        |name| match name {
+            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+            "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+            "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     assert_ne!(snapshot.snapshot_id(), same_config.snapshot_id());
-}
-
-#[test]
-fn provider_config_snapshot_preserves_the_original_configuration_error() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let snapshot = in_current_dir(temp.path(), || ProviderConfigSnapshot::capture(|_| None));
-
-    assert_eq!(snapshot.source(), None);
-    assert!(!snapshot.configuration().configured);
-    let first = snapshot.provider().expect_err("missing provider config");
-    let second = snapshot
-        .provider()
-        .expect_err("same missing provider config");
-    assert_eq!(first, second);
-    assert!(first.message.contains("SINGULARITY_MODEL"));
-    assert_eq!(
-        first.error.code.as_deref(),
-        Some("provider_configuration_missing")
-    );
-    assert_eq!(
-        first.error.stage,
-        Some(ProviderErrorStage::ClientInitialization)
-    );
 }
 
 #[test]
@@ -1556,24 +1604,28 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
         ("SINGULARITY_MODEL", "gpt\n-test"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1\0"),
     ] {
-        let snapshot = ProviderConfigSnapshot::capture(|candidate| match candidate {
-            "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
-                malformed.to_string()
-            } else {
-                "gpt-test".to_string()
-            }),
-            "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
-                malformed.to_string()
-            } else {
-                "https://provider.example/v1".to_string()
-            }),
-            "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
-                malformed.to_string()
-            } else {
-                "sk-secret-value".to_string()
-            }),
-            _ => None,
-        });
+        let snapshot = ProviderConfigSnapshot::capture(
+            |candidate| match candidate {
+                "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
+                    malformed.to_string()
+                } else {
+                    "gpt-test".to_string()
+                }),
+                "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
+                    malformed.to_string()
+                } else {
+                    "https://provider.example/v1".to_string()
+                }),
+                "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
+                    malformed.to_string()
+                } else {
+                    "sk-secret-value".to_string()
+                }),
+                _ => None,
+            },
+            None,
+            None,
+        );
 
         assert!(!snapshot.configuration().configured);
         let error = snapshot
@@ -1715,161 +1767,6 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
     let serialized = serde_json::to_string(&envelope_error.error).expect("serialize error");
     assert!(!serialized.contains("hello"));
     assert!(!serialized.contains("not-json"));
-}
-
-#[test]
-fn process_env_api_key_cannot_mix_with_project_env_model_and_base_url() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        "SINGULARITY_MODEL=project-model\nSINGULARITY_BASE_URL=https://project-provider.example/v1\n",
-    )
-    .expect("write synthetic project env");
-    let result = in_current_dir(temp.path(), || {
-        OpenAiProviderConfig::from_env(|name| match name {
-            "SINGULARITY_API_KEY" => Some("process-secret".to_string()),
-            _ => None,
-        })
-        .map_err(Box::new)
-    });
-
-    let error = result.expect_err("mixed provider sources must be rejected");
-    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
-    assert!(error.message.contains("SINGULARITY_MODEL"));
-    assert!(!error.message.contains("project-model"));
-    assert!(!error.message.contains("project-provider.example"));
-    assert!(!error.message.contains("process-secret"));
-}
-
-#[test]
-fn provider_status_does_not_fill_process_layer_from_project_env() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        "SINGULARITY_MODEL=project-model\nSINGULARITY_BASE_URL=https://project-provider.example/v1\n",
-    )
-    .expect("write synthetic project env");
-    let resolution = in_current_dir(temp.path(), || {
-        resolve_provider_config(|name| match name {
-            "SINGULARITY_API_KEY" => Some("process-secret".to_string()),
-            _ => None,
-        })
-    });
-
-    assert_eq!(
-        resolution.source,
-        Some(ProviderConfigSource::ProcessEnvironment)
-    );
-    let config = resolution.config;
-    assert_eq!(config.model_name, None);
-    assert!(!config.base_url_present);
-    assert!(config.api_key_present);
-    assert_eq!(config.provider_name.as_deref(), Some("openai_compatible"));
-}
-
-#[test]
-fn complete_project_env_configuration_has_project_file_provenance() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        concat!(
-            "SINGULARITY_MODEL_PROVIDER=openai_compatible\n",
-            "SINGULARITY_MODEL=project-model\n",
-            "SINGULARITY_BASE_URL=https://project-provider.example/v1\n",
-            "SINGULARITY_API_KEY=project-secret\n",
-        ),
-    )
-    .expect("write synthetic project env");
-    let result = in_current_dir(temp.path(), || {
-        OpenAiProviderConfig::from_env(|_| None).map_err(Box::new)
-    });
-
-    let config = result.expect("project provider config");
-    assert_eq!(config.source, ProviderConfigSource::ProjectEnvFile);
-    assert_eq!(config.provider_name, "openai_compatible");
-    assert_eq!(config.model_name, "project-model");
-}
-
-#[test]
-fn project_env_crlf_line_endings_are_parsed_without_control_characters() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        concat!(
-            "SINGULARITY_MODEL_PROVIDER=openai_compatible\r\n",
-            "SINGULARITY_MODEL=project-model\r\n",
-            "SINGULARITY_BASE_URL=https://project-provider.example/v1\r\n",
-            "SINGULARITY_API_KEY=project-secret\r\n",
-        ),
-    )
-    .expect("write CRLF project env");
-
-    let config = in_current_dir(temp.path(), || {
-        OpenAiProviderConfig::from_env(|_| None).expect("CRLF dotenv should parse")
-    });
-
-    assert_eq!(config.source, ProviderConfigSource::ProjectEnvFile);
-    assert_eq!(config.model_name, "project-model");
-    assert_eq!(config.base_url, "https://project-provider.example/v1");
-}
-
-#[test]
-fn project_env_provider_values_reject_boundary_whitespace() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        concat!(
-            "SINGULARITY_MODEL= project-model\r\n",
-            "SINGULARITY_BASE_URL=https://project-provider.example/v1\r\n",
-            "SINGULARITY_API_KEY=project-secret\r\n",
-        ),
-    )
-    .expect("write invalid project env");
-
-    let error = in_current_dir(temp.path(), || {
-        OpenAiProviderConfig::from_env(|_| None).expect_err("dotenv boundary whitespace")
-    });
-
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_configuration_invalid")
-    );
-    assert_eq!(
-        error.error.stage,
-        Some(ProviderErrorStage::ClientInitialization)
-    );
-    assert!(error.message.contains("SINGULARITY_MODEL"));
-    assert!(!error.message.contains("project-model"));
-    assert!(!error.message.contains("project-provider.example"));
-    assert!(!error.message.contains("project-secret"));
-}
-
-#[test]
-fn project_env_fields_are_not_combined_across_env_files() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    std::fs::write(
-        temp.path().join(".env"),
-        concat!(
-            "SINGULARITY_MODEL=parent-model\n",
-            "SINGULARITY_BASE_URL=https://parent-provider.example/v1\n",
-        ),
-    )
-    .expect("write parent synthetic env");
-    let child = temp.path().join("child");
-    std::fs::create_dir(&child).expect("create child project");
-    std::fs::write(child.join(".env"), "SINGULARITY_API_KEY=child-secret\n")
-        .expect("write child synthetic env");
-
-    let result = in_current_dir(&child, || {
-        OpenAiProviderConfig::from_env(|_| None).map_err(Box::new)
-    });
-
-    let error = result.expect_err("project env files must not be combined");
-    assert!(error.message.contains("SINGULARITY_MODEL"));
-    assert!(error.message.contains("source=project_env"));
-    assert!(!error.message.contains("parent-model"));
-    assert!(!error.message.contains("parent-provider.example"));
-    assert!(!error.message.contains("child-secret"));
 }
 
 #[test]
@@ -2850,7 +2747,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     .expect("provider config");
     assert_eq!(
         default_config.protocol_contract().max_context_tokens,
-        DEFAULT_MAX_CONTEXT_TOKENS
+        Some(DEFAULT_MAX_CONTEXT_TOKENS)
     );
     assert_eq!(
         default_config.protocol_contract().max_output_tokens,
@@ -2884,7 +2781,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     })
     .expect("configured provider");
     let capabilities = configured.protocol_contract();
-    assert_eq!(capabilities.max_context_tokens, 131_072);
+    assert_eq!(capabilities.max_context_tokens, Some(131_072));
     assert_eq!(capabilities.max_output_tokens, 8_192);
     assert!(!capabilities.supports_parallel_tool_calls);
     assert!(!capabilities.supports_strict_tool_schema);
@@ -4217,12 +4114,13 @@ fn openai_cached_capability_rejection_invalidates_persistent_record() {
     )
     .expect("write catalog");
     let config_path = config_path.to_string_lossy().to_string();
-    let first = ProviderConfigSnapshot::capture_with_cache_path(
+    let first = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(config_path.clone()),
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
+        None,
         Some(cache_path.clone()),
     )
     .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -4264,12 +4162,13 @@ fn openai_cached_capability_rejection_invalidates_persistent_record() {
     assert_eq!(invalidated["records"].as_array().map(Vec::len), Some(0));
     drop(first);
 
-    let second = ProviderConfigSnapshot::capture_with_cache_path(
+    let second = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(config_path.clone()),
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
+        None,
         Some(cache_path),
     )
     .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -4378,11 +4277,22 @@ fn provider_runtime_fingerprint_is_stable_partitioned_and_secret_free() {
     );
     let mut limited_config =
         provider_config_with_base_url("https://provider.example/v1".to_string());
-    limited_config.max_context_tokens += 1;
+    limited_config.max_context_tokens = limited_config.max_context_tokens.map(|value| value + 1);
     let limited_provider = OpenAiProvider::new(limited_config).expect("limited provider");
     assert_ne!(
         first_fingerprint.provider_fingerprint,
         limited_provider
+            .runtime_fingerprint(Some("gpt-test"))
+            .provider_fingerprint
+    );
+    let mut unknown_context_config =
+        provider_config_with_base_url("https://provider.example/v1".to_string());
+    unknown_context_config.max_context_tokens = None;
+    let unknown_context_provider =
+        OpenAiProvider::new(unknown_context_config).expect("unknown-context provider");
+    assert_ne!(
+        first_fingerprint.provider_fingerprint,
+        unknown_context_provider
             .runtime_fingerprint(Some("gpt-test"))
             .provider_fingerprint
     );
@@ -4424,6 +4334,73 @@ fn provider_runtime_fingerprint_is_stable_partitioned_and_secret_free() {
         negotiated.negotiation_fingerprint,
         other_protocol.negotiation_fingerprint
     );
+
+    let catalog_directory = tempdir().expect("thinking wire format catalog directory");
+    let write_catalog = |thinking_wire_format: &str| {
+        let path = catalog_directory
+            .path()
+            .join(format!("{thinking_wire_format}.json"));
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "default_model": "catalog/model",
+                "providers": {
+                    "catalog": {
+                        "adapter": "openai_compatible",
+                        "base_url": "https://provider.example/v1",
+                        "api_key_env": "CATALOG_KEY",
+                        "models": {
+                            "model": {
+                                "api_protocol": "chat",
+                                "max_context_tokens": 1000000,
+                                "max_output_tokens": 384000,
+                                "thinking_wire_format": thinking_wire_format
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write thinking wire format catalog");
+        path.to_string_lossy().into_owned()
+    };
+    let thinking_type_path = write_catalog("thinking_type");
+    let enable_thinking_path = write_catalog("enable_thinking");
+    let thinking_type_provider = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(thinking_type_path.clone()),
+            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    )
+    .provider_for_selector(Some("catalog/model"))
+    .expect("thinking_type catalog provider");
+    let enable_thinking_provider = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(enable_thinking_path.clone()),
+            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    )
+    .provider_for_selector(Some("catalog/model"))
+    .expect("enable_thinking catalog provider");
+    let thinking_type_fingerprint = thinking_type_provider.runtime_fingerprint(None);
+    let enable_thinking_fingerprint = enable_thinking_provider.runtime_fingerprint(None);
+    assert_ne!(
+        thinking_type_fingerprint.provider_fingerprint,
+        enable_thinking_fingerprint.provider_fingerprint,
+        "thinking wire format must partition provider capability identity"
+    );
+    assert_ne!(
+        thinking_type_fingerprint.model_fingerprint, enable_thinking_fingerprint.model_fingerprint,
+        "thinking wire format must partition model capability identity"
+    );
+
     let serialized = serde_json::to_string(&negotiated).expect("fingerprint JSON");
     for forbidden in [
         "provider.example",
@@ -5921,17 +5898,21 @@ fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
     .expect("write model catalog");
     let config_path = config_path.to_string_lossy().into_owned();
     let mut reads = std::collections::HashMap::<String, usize>::new();
-    let snapshot = ProviderConfigSnapshot::capture(|name| {
-        let count = reads.entry(name.to_string()).or_default();
-        *count += 1;
-        assert_eq!(*count, 1, "configuration value {name} was captured twice");
-        match name {
-            "SINGULARITY_MODELS_CONFIG" => Some(config_path.clone()),
-            "FIRST_KEY" => Some("first-secret".to_string()),
-            "SECOND_KEY" => Some("second-secret".to_string()),
-            _ => None,
-        }
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| {
+            let count = reads.entry(name.to_string()).or_default();
+            *count += 1;
+            assert_eq!(*count, 1, "configuration value {name} was captured twice");
+            match name {
+                "SINGULARITY_MODELS_CONFIG" => Some(config_path.clone()),
+                "FIRST_KEY" => Some("first-secret".to_string()),
+                "SECOND_KEY" => Some("second-secret".to_string()),
+                _ => None,
+            }
+        },
+        None,
+        None,
+    );
 
     assert!(snapshot.configuration().configured);
     assert_eq!(
@@ -5945,7 +5926,7 @@ fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
         chat.selected_api_protocol(),
         Some(ProviderApiProtocol::OpenAiChatCompletions)
     );
-    assert_eq!(chat.protocol_contract().max_context_tokens, 1_000_000);
+    assert_eq!(chat.protocol_contract().max_context_tokens, Some(1_000_000));
     assert_eq!(chat.protocol_contract().max_output_tokens, 384_000);
     let unsupported_off = snapshot
         .provider_for_selector(Some("first/chat-model#off"))
@@ -6023,11 +6004,15 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "DEEP_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "DEEP_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("deep/chat#high"))
         .expect("selected Chat provider");
@@ -6077,6 +6062,260 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
 }
 
 #[test]
+fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_projection() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"catalog_no_tool_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "catalog/model",
+            "providers": {
+                "catalog": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "CATALOG_KEY",
+                    "models": {
+                        "model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000,
+                            "supports_developer_role": false
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
+    let provider = snapshot
+        .provider_for_selector(Some("catalog/model"))
+        .expect("selected catalog provider");
+    let request = ModelTurnRequest::new(
+        "catalog_no_tool_request",
+        vec![
+            ModelMessage::text(ModelRole::System, "system instruction"),
+            ModelMessage::text(ModelRole::Developer, "developer instruction"),
+            ModelMessage::text(ModelRole::User, "hello"),
+        ],
+    );
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("catalog no-tool request");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured catalog no-tool request"),
+    )
+    .expect("catalog no-tool payload JSON");
+    let messages = payload["messages"]
+        .as_array()
+        .expect("catalog no-tool messages");
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "system");
+    assert_eq!(messages[2]["role"], "user");
+}
+
+#[test]
+fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinking_object() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"dashscope_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "dashscope/deepseek-v4-flash-0731#max",
+            "providers": {
+                "dashscope": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "DASHSCOPE_KEY",
+                    "models": {
+                        "deepseek-v4-flash-0731": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 393216,
+                            "thinking_wire_format": "enable_thinking",
+                            "reasoning_variants": {
+                                "max": {"enabled": true, "wire_effort": "max"}
+                            },
+                            "default_variant": "max"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "DASHSCOPE_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
+    let provider = snapshot
+        .provider_for_selector(Some("dashscope/deepseek-v4-flash-0731#max"))
+        .expect("selected DashScope provider");
+    provider
+        .complete(
+            &ModelTurnRequest::new(
+                "dashscope_request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("DashScope Chat completion");
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured DashScope request"),
+    )
+    .expect("DashScope payload JSON");
+    assert_eq!(payload["model"], "deepseek-v4-flash-0731");
+    assert_eq!(payload["enable_thinking"], true);
+    assert_eq!(payload["reasoning_effort"], "max");
+    assert!(payload.get("thinking").is_none());
+}
+
+#[test]
+fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"unknown_context_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "unknown/model#max",
+            "providers": {
+                "unknown": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "UNKNOWN_KEY",
+                    "models": {
+                        "model": {
+                            "api_protocol": "chat",
+                            "max_output_tokens": 4096,
+                            "reasoning_variants": {
+                                "max": {"enabled": true, "wire_effort": "max"}
+                            },
+                            "default_variant": "max"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "UNKNOWN_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
+    let provider = snapshot
+        .provider_for_selector(Some("unknown/model#max"))
+        .expect("selected unknown-context provider");
+    provider
+        .complete(
+            &ModelTurnRequest::new(
+                "unknown_context_request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("unknown-context completion");
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured unknown-context request"),
+    )
+    .expect("unknown-context payload JSON");
+    assert_eq!(payload["model"], "model");
+    assert_eq!(
+        snapshot
+            .provider()
+            .expect("default provider")
+            .protocol_contract()
+            .max_context_tokens,
+        None
+    );
+}
+
+#[test]
+fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "invalid/model",
+            "providers": {
+                "invalid": {
+                    "adapter": "openai_compatible",
+                    "base_url": "https://provider.example/v1",
+                    "api_key_env": "INVALID_KEY",
+                    "models": {
+                        "model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 4096,
+                            "max_output_tokens": 4096
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write invalid catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "INVALID_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
+    let error = snapshot
+        .provider()
+        .expect_err("invalid explicit limits must fail closed");
+    assert!(error.message.contains("max_output_tokens"));
+    assert!(error.message.contains("max_context_tokens"));
+}
+
+#[test]
 fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field() {
     let (base_url, requests) = responses_provider_server(serde_json::json!({
         "id": "response_done",
@@ -6118,11 +6357,15 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("longcat/responses#high"))
         .expect("selected Responses provider");
@@ -6211,11 +6454,15 @@ fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().into_owned();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let error = snapshot
         .provider()
         .expect_err("Responses reasoning without a wire map must fail closed");
@@ -6470,11 +6717,15 @@ fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_rep
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6565,11 +6816,15 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6668,11 +6923,15 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6760,11 +7019,15 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6785,11 +7048,10 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
     assert_eq!(payload["thinking"]["type"], "enabled");
 }
 
-/// 矩阵项 3c：Chat 请求侧，flag=false 时 Replay 模式不再要求每个 tool-call
-/// 消息都有匹配 replay——历史里只有另一组 tool_call_ids 的 replay 时请求仍合法
-/// （无 reasoning 的上一轮没有可回放内容）。
+/// 矩阵项 3c：Chat 请求侧，Replay 模式拒绝没有对应 assistant tool-call
+/// 消息的 orphan replay，即使模型没有声明每轮都必须返回 reasoning。
 #[test]
-fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_succeeds() {
+fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
     let (base_url, _request_body) = captured_request_server(
         "HTTP/1.1 200 OK",
         r#"{
@@ -6834,11 +7096,15 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_su
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6856,10 +7122,14 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_su
         tool_call_ids: vec!["call_1".to_string()],
         reasoning_content: "opaque-deepseek-state".to_string(),
     }];
-    let response = provider
+    let error = provider
         .complete(&request, &singularity_core::CancellationToken::new())
-        .expect("request without matching replay must succeed when not required");
-    assert_eq!(response.status, ModelTurnStatus::Success);
+        .expect_err("orphan replay must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_history_unsupported")
+    );
 }
 
 /// 矩阵项 3d：Chat 请求侧，flag=true（严格声明）时每个 tool-call 消息仍必须
@@ -6912,11 +7182,15 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -6998,11 +7272,15 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -7090,11 +7368,15 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -7182,11 +7464,15 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -7278,11 +7564,15 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_fails_closed()
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -7367,11 +7657,15 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -7471,11 +7765,15 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_fails_c
     )
     .expect("write catalog");
     let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        ENV_MODELS_CONFIG => Some(path.clone()),
-        "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");

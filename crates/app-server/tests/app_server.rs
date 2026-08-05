@@ -53,7 +53,20 @@ fn workspace_root() -> std::path::PathBuf {
 }
 
 fn app_server(store: SessionStore) -> AppServer {
-    AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    AppServer::new(
+        store,
+        ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            None,
+            None,
+        ),
+    )
 }
 
 struct CompletedSandboxBackend;
@@ -151,12 +164,16 @@ fn request_worker_reopens_the_initialized_file_store() {
 fn configured_app_server(store: SessionStore) -> AppServer {
     AppServer::new(
         store,
-        ProviderConfigSnapshot::capture(|name| match name {
-            "SINGULARITY_MODEL" => Some("test-model".to_string()),
-            "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("test-key".to_string()),
-            _ => None,
-        }),
+        ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL" => Some("test-model".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            None,
+            None,
+        ),
     )
 }
 
@@ -169,14 +186,15 @@ fn configured_provider_drops_cleanly_inside_app_server_runtime() {
             .expect("test Tokio runtime");
         let runtime_handle = runtime.handle().clone();
         runtime.block_on(async move {
-            let provider_snapshot = ProviderConfigSnapshot::capture_with_runtime_handle(
+            let provider_snapshot = ProviderConfigSnapshot::capture(
                 |name| match name {
                     "SINGULARITY_MODEL" => Some("drop-test-model".to_string()),
                     "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
                     "SINGULARITY_API_KEY" => Some("drop-test-key".to_string()),
                     _ => None,
                 },
-                runtime_handle,
+                Some(runtime_handle),
+                None,
             );
             assert!(provider_snapshot.configuration().configured);
             let store = SessionStore::open(":memory:").expect("open store");
@@ -783,12 +801,16 @@ fn app_server_batch_shutdown_stays_with_stdin_owner_when_unknown_method_is_prese
 fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
-        "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
-        "SINGULARITY_BASE_URL" => Some("https://snapshot.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
-        _ => None,
-    });
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+            "SINGULARITY_BASE_URL" => Some("https://snapshot.example/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
     let expected_snapshot_id = snapshot.snapshot_id().to_string();
     let mut server = AppServer::new(store, snapshot);
     server

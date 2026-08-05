@@ -1521,6 +1521,7 @@ dependencies = [
  "clap",
  "serde_json",
  "singularity_core",
+ "singularity_model",
  "singularity_protocol",
  "tempfile",
 ]

@@ -8,7 +8,7 @@ use super::contract::{
     attach_capability_metadata, provider_request_validation_error, request_uses_tool_protocol,
 };
 use super::openai::{
-    OpenAiCompletion, openai_reasoning_content_present, openai_request_payload,
+    OpenAiCompletion, models_endpoint, openai_reasoning_content_present, openai_request_payload,
     openai_responses_reasoning_content_present, openai_responses_request_payload,
     openai_responses_stream_request_payload, parse_openai_response,
     parse_openai_responses_response,
@@ -30,7 +30,7 @@ use super::{
 };
 use serde_json::Value;
 use singularity_core::CancellationToken;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -246,7 +246,145 @@ impl OpenAiProvider {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        super::ProviderConfigSnapshot::capture(get_env).provider()
+        super::ProviderConfigSnapshot::capture(get_env, None, None).provider()
+    }
+
+    /// Discover public model ids from the provider's standard `/models` endpoint.
+    ///
+    /// The response is intentionally reduced to ids only; it never becomes a
+    /// capability source and no API key is included in the returned value.
+    pub fn discover_model_ids(&self) -> Result<Vec<String>, ProviderError> {
+        let endpoint = models_endpoint(&self.config.base_url);
+        let runtime = self.runtime.as_ref();
+        let cancellation = CancellationToken::new();
+        let response = block_on_provider_future(
+            runtime,
+            &cancellation,
+            "provider_models_request_failed",
+            ProviderErrorStage::RequestSend,
+            self.request_timeout_seconds,
+            None,
+            || {
+                self.client
+                    .get(&endpoint)
+                    .bearer_auth(&self.config.api_key)
+                    .send()
+            },
+        )?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError::from_model_error(
+                model_error_from_http_status(status.as_u16(), &self.config.provider_name, "models"),
+            ));
+        }
+        let body = read_bounded_provider_response_body(
+            runtime,
+            &cancellation,
+            self.request_timeout_seconds,
+            None,
+            response,
+        )?;
+        if body.len() > super::MAX_DISCOVERY_RESPONSE_BYTES {
+            return Err(provider_response_body_too_large_error());
+        }
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
+            ProviderError::from_model_error(
+                super::ModelError::new(
+                    super::ModelErrorKind::JsonSchemaViolation,
+                    "provider models response was not valid JSON",
+                )
+                .with_provider_diagnostic(
+                    "provider_models_json_decode_failed",
+                    ProviderErrorStage::ResponseJsonDecode,
+                ),
+            )
+        })?;
+        let data = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProviderError::from_model_error(
+                    super::ModelError::new(
+                        super::ModelErrorKind::JsonSchemaViolation,
+                        "provider models response did not contain a data array",
+                    )
+                    .with_provider_diagnostic(
+                        "provider_models_schema_invalid",
+                        ProviderErrorStage::ResponseValidation,
+                    ),
+                )
+            })?;
+        if data.len() > super::MAX_DISCOVERED_MODEL_IDS {
+            return Err(ProviderError::from_model_error(
+                super::ModelError::new(
+                    super::ModelErrorKind::JsonSchemaViolation,
+                    "provider models response exceeded the model id safety limit",
+                )
+                .with_provider_diagnostic(
+                    "provider_models_too_many_ids",
+                    ProviderErrorStage::ResponseValidation,
+                ),
+            ));
+        }
+        let mut model_ids = Vec::with_capacity(data.len());
+        let mut seen_ids = HashSet::with_capacity(data.len());
+        for item in data {
+            let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::from_model_error(
+                    super::ModelError::new(
+                        super::ModelErrorKind::JsonSchemaViolation,
+                        "provider models response contained an entry without a model id",
+                    )
+                    .with_provider_diagnostic(
+                        "provider_models_schema_invalid",
+                        ProviderErrorStage::ResponseValidation,
+                    ),
+                )
+            })?;
+            if id.is_empty()
+                || id.chars().count() > super::MAX_MODEL_ID_LENGTH
+                || id
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err(ProviderError::from_model_error(
+                    super::ModelError::new(
+                        super::ModelErrorKind::JsonSchemaViolation,
+                        "provider models response contained a malformed model id",
+                    )
+                    .with_provider_diagnostic(
+                        "provider_models_schema_invalid",
+                        ProviderErrorStage::ResponseValidation,
+                    ),
+                ));
+            }
+            if !seen_ids.insert(id) {
+                return Err(ProviderError::from_model_error(
+                    super::ModelError::new(
+                        super::ModelErrorKind::JsonSchemaViolation,
+                        "provider models response contained duplicate model ids",
+                    )
+                    .with_provider_diagnostic(
+                        "provider_models_schema_invalid",
+                        ProviderErrorStage::ResponseValidation,
+                    ),
+                ));
+            }
+            model_ids.push(id.to_string());
+        }
+        if model_ids.is_empty() {
+            return Err(ProviderError::from_model_error(
+                super::ModelError::new(
+                    super::ModelErrorKind::JsonSchemaViolation,
+                    "provider models response did not contain model ids",
+                )
+                .with_provider_diagnostic(
+                    "provider_models_empty",
+                    ProviderErrorStage::ResponseValidation,
+                ),
+            ));
+        }
+        Ok(model_ids)
     }
 
     /// Clone a provider for one allowlisted model while freezing its protocol
@@ -411,6 +549,7 @@ impl OpenAiProvider {
                     selection.tool_reasoning_mode,
                 )
                 .is_err()
+                || !replay.is_bound_to_messages(&request.messages)
             {
                 return Err(provider_tool_reasoning_history_error(
                     &ModelTurnResponse::completed(
@@ -422,28 +561,30 @@ impl OpenAiProvider {
                 ));
             }
         }
-        if selection.requires_reasoning_content_for_tool_calls {
-            for message in request.messages.iter().filter(|message| {
-                message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
-            }) {
-                let has_bound_reasoning = request.provider_reasoning_history.iter().any(|replay| {
-                    let ids = message
-                        .tool_calls
-                        .iter()
-                        .map(|call| call.tool_call_id.clone())
-                        .collect::<Vec<_>>();
-                    replay.matches_tool_call_ids(&ids)
-                });
-                if !has_bound_reasoning {
-                    return Err(provider_tool_reasoning_history_error(
-                        &ModelTurnResponse::completed(
-                            request.request_id.clone(),
-                            "provider_reasoning_history",
-                            "",
-                        ),
-                        selection.tool_reasoning_mode,
-                    ));
-                }
+        for message in request.messages.iter().filter(|message| {
+            message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
+        }) {
+            let ids = message
+                .tool_calls
+                .iter()
+                .map(|call| call.tool_call_id.clone())
+                .collect::<Vec<_>>();
+            let bound_replay_count = request
+                .provider_reasoning_history
+                .iter()
+                .filter(|replay| replay.matches_tool_call_ids(&ids))
+                .count();
+            if bound_replay_count > 1
+                || (selection.requires_reasoning_content_for_tool_calls && bound_replay_count != 1)
+            {
+                return Err(provider_tool_reasoning_history_error(
+                    &ModelTurnResponse::completed(
+                        request.request_id.clone(),
+                        "provider_reasoning_history",
+                        "",
+                    ),
+                    selection.tool_reasoning_mode,
+                ));
             }
         }
         Ok(())
@@ -467,8 +608,15 @@ impl OpenAiProvider {
         let mut capability_binding = None;
         let (capabilities, capability_metadata, api_protocol) =
             if !request_uses_tool_protocol(request) {
+                let mut capabilities = self.protocol_contract();
+                if self.selected_model.is_some() {
+                    // A catalog's developer-role flag controls wire projection;
+                    // it must not reject valid internal system/developer history.
+                    capabilities.supports_system_message = true;
+                    capabilities.supports_developer_message = true;
+                }
                 (
-                    self.protocol_contract(),
+                    capabilities,
                     None,
                     self.selected_model
                         .as_ref()
@@ -853,6 +1001,10 @@ impl OpenAiProvider {
                     self.selected_model
                         .as_ref()
                         .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
+                    self.selected_model
+                        .as_ref()
+                        .map(|selection| selection.thinking_wire_format)
+                        .unwrap_or(super::ThinkingWireFormat::ThinkingType),
                     self.selected_model
                         .as_ref()
                         .is_none_or(|selection| selection.supports_developer_role),

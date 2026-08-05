@@ -36,12 +36,21 @@ const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
 const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
-const PROJECT_ENV_FILE: &str = ".env";
 const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const V1_RESPONSES_PATH: &str = "/v1/responses";
+const USER_CONFIG_DIR_NAME: &str = ".singularity";
+const USER_CONFIG_FILE_NAME: &str = "config.json";
+const USER_AUTH_GENERATION_PREFIX: &str = "auth.v1-";
+const USER_AUTH_SCHEMA_VERSION: u32 = 1;
+const USER_MODELS_CACHE_FILE_NAME: &str = "models-cache.json";
+const USER_MODELS_CACHE_SCHEMA_VERSION: u32 = 1;
+const USER_MODELS_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
+const MAX_MODEL_ID_LENGTH: usize = 512;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 const PROVIDER_RUNTIME_WORKER_THREADS: usize = 2;
 const PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE: &str = "provider_runtime_initialization_failed";
@@ -78,7 +87,7 @@ const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
 /// app-server 状态目录中 provider capability cache 的文件名。
 pub const PROVIDER_CAPABILITY_CACHE_FILE_NAME: &str = "provider-capability-cache.json";
 const PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME: &str = "provider-capability-cache.lock";
-const PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION: u32 = 2;
 const PROVIDER_CAPABILITY_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_CAPABILITY_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_CAPABILITY_CACHE_RECORDS: usize = 256;
@@ -98,13 +107,18 @@ mod contract;
 mod openai;
 mod transport;
 
-pub use config::resolve_provider_config;
+pub use config::{
+    import_env_to_user_config, read_user_model_catalog, resolve_provider_config,
+    user_config_directory,
+};
 pub use contract::{
     is_strict_tool_schema_compatible, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
-pub use openai::{chat_completions_endpoint, provider_error_response, responses_endpoint};
+pub use openai::{
+    chat_completions_endpoint, models_endpoint, provider_error_response, responses_endpoint,
+};
 
 #[cfg(all(test, windows))]
 use capability::replace_existing_atomic;
@@ -515,6 +529,83 @@ pub enum ProviderApiProtocol {
     OpenAiChatCompletions,
 }
 
+/// Chat Completions reasoning fields are selected explicitly by the model
+/// catalog.  No provider or model name is interpreted to choose a wire shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingWireFormat {
+    /// Existing `thinking: {"type": "enabled|disabled"}` fields.
+    ThinkingType,
+    /// Top-level `enable_thinking` boolean used by providers that document it.
+    EnableThinking,
+}
+
+/// State of one provider's `/models` discovery record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDiscoveryStatus {
+    Fresh,
+    Stale,
+    Unavailable,
+    NotConfigured,
+}
+
+/// Result of reading or refreshing the optional user model discovery cache.
+///
+/// Cache state never changes whether the provider configuration itself is
+/// usable; it only explains why discovery used live, stale, or no cached ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheStatus {
+    NotPresent,
+    Valid,
+    Invalid,
+    ReadFailed,
+    WriteFailed,
+}
+
+/// A discovered model id and whether an explicit capability override makes it
+/// safe to select for execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UserModelCatalogEntry {
+    pub id: String,
+    pub discovered: bool,
+    pub explicit: bool,
+    pub selectable: bool,
+    pub max_context_tokens: Option<u32>,
+    pub reasoning_variants: Vec<String>,
+    pub default_variant: Option<String>,
+}
+
+/// Redacted user-level provider catalog returned by `sg config models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UserProviderModelCatalog {
+    pub provider_name: String,
+    pub base_url_present: bool,
+    pub api_key_present: bool,
+    pub discovery: ModelDiscoveryStatus,
+    pub models: Vec<UserModelCatalogEntry>,
+    pub error: Option<String>,
+}
+
+/// Redacted user-level model catalog.  It never contains a base URL or secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UserModelCatalog {
+    pub default_selector: Option<String>,
+    pub cache_status: ModelCacheStatus,
+    pub providers: Vec<UserProviderModelCatalog>,
+}
+
+/// Outcome of importing a dotenv file into the user-level split config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UserConfigImportResult {
+    pub config_path: String,
+    pub auth_path: String,
+    pub provider_name: String,
+    pub default_selector: Option<String>,
+    pub selectable: bool,
+}
+
 /// 模型提供方必须遵守、用于构建请求和校验响应的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
@@ -527,7 +618,7 @@ pub struct ProviderProtocolContract {
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
-    pub max_context_tokens: u32,
+    pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
 
@@ -543,7 +634,7 @@ impl Default for ProviderProtocolContract {
             supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
-            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
@@ -583,7 +674,7 @@ pub struct ModelProviderConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderConfigSource {
     ProcessEnvironment,
-    ProjectEnvFile,
+    UserConfigFile,
 }
 
 impl ProviderConfigSource {
@@ -591,7 +682,7 @@ impl ProviderConfigSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProcessEnvironment => "process_env",
-            Self::ProjectEnvFile => "project_env",
+            Self::UserConfigFile => "user_config",
         }
     }
 }
@@ -1297,7 +1388,7 @@ pub struct OpenAiProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub source: ProviderConfigSource,
-    pub max_context_tokens: u32,
+    pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
 
@@ -1308,11 +1399,12 @@ pub struct OpenAiProviderConfig {
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
     pub(crate) api_protocol: ProviderApiProtocol,
-    pub(crate) max_context_tokens: u32,
+    pub(crate) max_context_tokens: Option<u32>,
     pub(crate) max_output_tokens: u32,
     pub(crate) reasoning_variant: Option<String>,
     pub(crate) reasoning_enabled: bool,
     pub(crate) wire_reasoning_effort: Option<String>,
+    pub(crate) thinking_wire_format: ThinkingWireFormat,
     pub(crate) tool_reasoning_mode: ProviderToolReasoningMode,
     pub(crate) supports_developer_role: bool,
     pub(crate) supports_tool_choice: bool,
@@ -1346,11 +1438,12 @@ struct ProviderCapabilityCacheKey {
     api_protocol: ProviderApiProtocol,
     adapter_version: u32,
     probe_contract_version: u32,
-    max_context_tokens: u32,
+    max_context_tokens: Option<u32>,
     max_output_tokens: u32,
     reasoning_effort: Option<String>,
     reasoning_variant_enabled: bool,
     wire_reasoning_effort: Option<String>,
+    thinking_wire_format: ThinkingWireFormat,
     tool_reasoning_mode: ProviderToolReasoningMode,
     supports_developer_role: bool,
     supports_tool_choice: bool,
@@ -1365,11 +1458,12 @@ struct ProviderCapabilityProbeKey {
     model_name: String,
     adapter_version: u32,
     probe_contract_version: u32,
-    max_context_tokens: u32,
+    max_context_tokens: Option<u32>,
     max_output_tokens: u32,
     reasoning_effort: Option<String>,
     reasoning_variant_enabled: bool,
     wire_reasoning_effort: Option<String>,
+    thinking_wire_format: ThinkingWireFormat,
     tool_reasoning_mode: ProviderToolReasoningMode,
     supports_developer_role: bool,
     supports_tool_choice: bool,
@@ -1462,7 +1556,7 @@ mod transport_tests {
             base_url,
             api_key: "sk-secret-value".to_string(),
             source: ProviderConfigSource::ProcessEnvironment,
-            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
@@ -1546,11 +1640,12 @@ mod transport_tests {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             adapter_version: PROVIDER_ADAPTER_VERSION,
             probe_contract_version: CAPABILITY_PROBE_CONTRACT_VERSION,
-            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
             reasoning_variant_enabled: false,
             wire_reasoning_effort: None,
+            thinking_wire_format: ThinkingWireFormat::ThinkingType,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             supports_developer_role: true,
             supports_tool_choice: true,
@@ -1889,7 +1984,7 @@ mod transport_tests {
                 base_url: format!("http://{address}"),
                 api_key: "sk-secret-value".to_string(),
                 source: ProviderConfigSource::ProcessEnvironment,
-                max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             },
             1,
@@ -1979,7 +2074,7 @@ mod transport_tests {
             base_url: format!("http://{address}"),
             api_key: "sk-secret-value".to_string(),
             source: ProviderConfigSource::ProcessEnvironment,
-            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         })
         .expect("provider");

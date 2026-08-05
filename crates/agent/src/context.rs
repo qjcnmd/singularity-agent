@@ -102,13 +102,13 @@ impl AgentContextItem {
 
 #[derive(Debug, Clone)]
 pub(super) struct ContextBudget {
-    pub(super) model_context_window: u32,
+    pub(super) model_context_window: Option<u32>,
     pub(super) reserved_output_tokens: u32,
     pub(super) fixed_overhead_tokens: u32,
     pub(super) developer_instruction_tokens: u32,
     pub(super) tool_tokens: u32,
     pub(super) message_framing_tokens: u32,
-    pub(super) input_token_budget: u32,
+    pub(super) input_token_budget: Option<u32>,
 }
 
 impl ContextBudget {
@@ -136,13 +136,13 @@ impl ContextBudget {
 
     pub(super) fn for_public_assembly(max_tokens: u32) -> Self {
         Self {
-            model_context_window: DEFAULT_MAX_CONTEXT_TOKENS,
+            model_context_window: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             reserved_output_tokens: 0,
             fixed_overhead_tokens: 0,
             developer_instruction_tokens: 0,
             tool_tokens: 0,
             message_framing_tokens: 0,
-            input_token_budget: max_tokens,
+            input_token_budget: Some(max_tokens),
         }
     }
 }
@@ -180,7 +180,8 @@ pub(super) fn assemble_context_items_with_budget_and_provider_history(
     let mut included_indices = HashSet::new();
     for (index, item) in candidates {
         let item_tokens = context_item_token_count(item, provider_history_segments);
-        if item_tokens > max_tokens.saturating_sub(used_tokens) {
+        if max_tokens.is_some_and(|max_tokens| item_tokens > max_tokens.saturating_sub(used_tokens))
+        {
             continue;
         }
         used_tokens = used_tokens.saturating_add(item_tokens);
@@ -216,7 +217,9 @@ pub(super) fn assemble_context_items_with_budget_and_provider_history(
                         provider_history_segments,
                     ))
                 });
-        if group_tokens > max_tokens.saturating_sub(used_tokens) {
+        if max_tokens
+            .is_some_and(|max_tokens| group_tokens > max_tokens.saturating_sub(used_tokens))
+        {
             break;
         }
         used_tokens = used_tokens.saturating_add(group_tokens);

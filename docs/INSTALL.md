@@ -47,7 +47,7 @@ PFX 只在 Windows runner 的临时 CurrentUser certificate store 中使用。�
 
 ## 配置 provider
 
-复制仓库中的 `.env.example` 为目标项目或其父目录下的 `.env`，填写：
+首次配置或迁移旧配置时，可以复制 `.env.example` 到任意临时位置并填写：
 
 ```dotenv
 SINGULARITY_BASE_URL=https://provider.example/v1
@@ -55,13 +55,19 @@ SINGULARITY_API_KEY=replace-with-your-api-key
 SINGULARITY_MODEL=your-model-name
 ```
 
-Singularity 在 app-server 启动时捕获一次配置快照：
+然后显式导入到用户级配置：
+
+```powershell
+sg config import-env --file C:\path\to\.env
+```
+
+导入完成后，该 `.env` 不再参与运行时解析，可以安全移出项目。Singularity 在 app-server 启动时捕获一次配置快照：
 
 1. 进程环境中只要存在任一 provider 变量，就只使用进程环境层。
-2. 否则从启动目录向父目录查找最近的 `.env`。
+2. 否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
-多个 provider 使用 `SINGULARITY_MODELS_CONFIG` 指向一个 JSON 文件。`default_model` 和 `thread.start.model` 使用完整 `provider_id/model_id`，`providers` 的键和 `models` 的键分别构成 provider 与模型 allowlist。每个模型必须明确声明 `api_protocol`（`chat` 或 `responses`）、`max_context_tokens` 和 `max_output_tokens`；`adapter` 当前只支持 `openai_compatible`。`api_key_env` 只能是环境变量名，密钥不会写入 JSON、快照 debug 或上游请求的 model 字段。示例：
+如需为当前进程临时提供完整的多-provider 配置，可以用 `SINGULARITY_MODELS_CONFIG` 指向一个 JSON 文件；该进程环境层会整体覆盖用户级默认配置。`default_model` 和 `thread.start.model` 使用完整 `provider_id/model_id`，`providers` 的键和 `models` 的键分别构成 provider 与模型 allowlist。每个模型必须明确声明 `api_protocol`（`chat` 或 `responses`）和 `max_output_tokens`；`max_context_tokens` 可以省略表示上下文窗口未知。`adapter` 当前只支持 `openai_compatible`。`api_key_env` 只能是环境变量名，密钥不会写入 JSON、快照 debug 或上游请求的 model 字段。示例：
 
 ```json
 {
@@ -83,7 +89,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 }
 ```
 
-进程启动时一次性读取该文件及所引用的密钥环境变量，并建立不可变 snapshot；不读取动态 `/models` catalog，不根据 base URL 猜协议，也不自动轮换 provider/model。显式未知 provider、未 allowlist 的 model 或 malformed selector 会 fail closed。legacy `.env` 输入仍可用，但新 JSON 配置优先且不会与 legacy 字段混合。
+进程启动时一次性读取该文件及所引用的密钥环境变量，并建立不可变 snapshot；不根据 base URL 猜协议，也不自动轮换 provider/model。显式未知 provider、未 allowlist 的 model 或 malformed selector 会 fail closed。项目 `.env` 不会被自动读取；它只可作为显式 `import-env` 的一次性输入。用户级配置的 `/models` 发现只用于公开 ID 列表，能力仍由显式覆盖决定。
 
 思考档位必须逐模型声明，`reasoning_variants` 是唯一事实源；每个 variant 都写 `enabled`，启用档位可写一个 `wire_effort`，而 `off` 必须显式写成 `enabled:false`。`default_variant` 必须精确命中；无 map 表示不支持。Chat 纯开关只允许一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位必须写 wire。selector 可用 `provider_id/model_id#variant` 精确选择，未知档位、未声明的 `#off` 和不支持的模型 fail closed，不承诺自动 catalog 识别。
 
@@ -91,11 +97,68 @@ Provider 私有 reasoning/output items 为 approval、重启和跨 turn 的官�
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
-Provider 配置值不会被静默 trim 或纠正。进程环境和 `.env` 中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会在启动时以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；`.env` 的标准 `CRLF` 行尾仍会正常解析。
+Provider 配置值不会被静默 trim 或纠正。进程环境和显式导入文件中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；导入文件的标准 `CRLF` 行尾仍会正常解析。
 
-工具能力由运行时自动协商，不是用户配置项；协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#7-model-与-provider) 为准。
+工具选择及通用工具能力由运行时自动协商；模型专属的消息角色和 reasoning history 则必须通过下面的模型字段显式声明。协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#7-model-与-provider) 为准。
 
-修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
+需要跨仓库、跨 worktree 共用同一 provider 时，运行一次：
+
+```powershell
+sg config import-env
+# 或：sg config import-env --file C:\path\to\.env
+```
+
+该命令把地址、默认 selector 和 `auth_generation` 提交点写入 `%USERPROFILE%\.singularity\config.json`，把 API key 写入同目录不可预测且权限受限的版本化 `auth.v1-<随机值>.json`；读取时先读取 config，再按其中引用读取同一 auth generation，因此不会观察到新 config 配旧 auth。命令最后输出 `selectable=true|false`：只有已有完整、有效的协议、token 限制、reasoning/thinking/tool/role 能力覆盖且认证存在时才为 `true`。新模型或缺少能力字段的模型只写入不可选择的 ID skeleton，不会从 URL、模型名或路径猜测协议、上下文或输出上限；包含 `#variant` 的 selector 只有在该模型已有显式 variant 时才允许导入。密钥不会出现在命令行参数、模型目录、缓存、诊断或 Git 中。运行时解析优先级为进程环境 > 用户目录配置，因此临时进程设置仍可覆盖用户默认值。
+
+Provider 地址必须是非空的绝对 `http`/`https` URL，且必须带 host；不得包含用户名、密码、query 或 fragment。原始合法 path 会保留，地址不会被静默 trim 或修正。Provider ID 和 reasoning variant 不得包含 `/` 或 `#`；模型 ID 可以在 selector 的第一个 `/` 之后包含内部 `/`，但不得包含空白、控制字符或 `#`，并受长度上限约束。
+
+查看 provider 的公开模型 ID，并在需要时刷新 `/models`：
+
+```powershell
+sg config models
+sg config models --refresh
+```
+
+`/models` 响应只提供模型 ID，不提供协议、上下文窗口或 reasoning 能力。模型 ID 会进入用户目录的非敏感缓存；缓存读取有 1 MiB 上限，并校验 schema、endpoint hash、记录数量和每个 ID，非法或超大缓存只报告 `invalid`/`read_failed`，不会阻断已配置运行，也不会把控制字符或换行 ID 打印到 CLI。发现结果仍明确标记 `fresh`、`stale`、`unavailable` 或 `not_configured`。只有 `config.json` 中声明 `api_protocol`、`max_output_tokens` 以及需要的 `reasoning_variants`，并且完整模型校验、合法地址和认证都通过时才会标记为可选择。`max_context_tokens` 可选；省略时运行时保留 `unknown`，不猜测窗口或写入默认值，Agent 的上下文预算会显式处理未知状态。未知能力不会从模型名、URL 或 OpenAI-compatible 适配器推断。
+
+OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wire 是否原生接受 `developer` 消息角色；设为 `false` 时，内部 developer 消息会在发送前投影为 `system`，不改变内部消息语义。省略时保持兼容默认值 `true`；provider 不接受 `developer` 角色时应显式写入 `false`。
+
+模型若在带工具调用的续接中返回 provider reasoning，必须显式设置 `tool_reasoning_history`：`disabled`（省略时的默认值）表示不回放历史 reasoning；`reasoning_content` 只适用于 `api_protocol: "chat"`，在 assistant tool-call 续接中原样回放 Chat Completions 的 `reasoning_content`；`responses_items` 只适用于 `api_protocol: "responses"`，原样回放 Responses reasoning items。启用非 `disabled` 值时，必须同时声明启用的 `reasoning_variants` 和匹配的 `default_variant`。取值应依据供应商官方协议说明或实际 wire 证据填写，不能从 `/models` 返回的模型 ID、模型名、URL 或 OpenAI-compatible 适配器推断。
+
+用户配置可以为单个模型补充显式覆盖，例如：
+
+```json
+{
+  "version": 1,
+  "default_provider": "dashscope",
+  "default_model": "dashscope/deepseek-v4-flash-0731#max",
+  "providers": {
+    "dashscope": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "models": {
+        "deepseek-v4-flash-0731": {
+          "api_protocol": "chat",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 393216,
+          "thinking_wire_format": "enable_thinking",
+          "tool_reasoning_history": "reasoning_content",
+          "reasoning_variants": {
+            "off": {"enabled": false},
+            "low": {"enabled": true, "wire_effort": "low"},
+            "medium": {"enabled": true, "wire_effort": "medium"},
+            "high": {"enabled": true, "wire_effort": "high"},
+            "xhigh": {"enabled": true, "wire_effort": "xhigh"},
+            "max": {"enabled": true, "wire_effort": "max"}
+          },
+          "default_variant": "max"
+        }
+      }
+    }
+  }
+}
+```
+
+`thinking_wire_format` 只在 Chat Completions 模型上生效：`thinking_type` 使用 `thinking: {"type": ...}`，`enable_thinking` 使用供应商明确规定的顶层 `enable_thinking` 布尔字段。Responses 仍固定使用其 `reasoning` 对象。上下文窗口未知时保留 `unknown`，不猜测或填入默认值；Agent 会跳过本地窗口上限检查，但仍遵守显式输出上限。
 
 ## Windows sandbox 首次运行
 

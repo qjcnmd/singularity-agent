@@ -7,8 +7,8 @@ use super::{
     CHAT_COMPLETIONS_PATH, ModelError, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
     ModelUsage, OpenAiProviderConfig, ProviderError, ProviderErrorStage, ProviderProtocolContract,
-    ProviderReasoningReplay, ProviderToolReasoningMode, RESPONSES_PATH, ToolChoiceMode,
-    V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH, validate_model_turn_response,
+    ProviderReasoningReplay, ProviderToolReasoningMode, RESPONSES_PATH, ThinkingWireFormat,
+    ToolChoiceMode, V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH, validate_model_turn_response,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -36,6 +36,22 @@ pub fn responses_endpoint(base_url: &str) -> String {
         format!("{trimmed}{RESPONSES_PATH}")
     } else {
         format!("{trimmed}{V1_RESPONSES_PATH}")
+    }
+}
+
+/// 将基础 URL 解析为标准 OpenAI `/models` catalog 端点。
+pub fn models_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/models") {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix(CHAT_COMPLETIONS_PATH) {
+        format!("{prefix}/models")
+    } else if let Some(prefix) = trimmed.strip_suffix(RESPONSES_PATH) {
+        format!("{prefix}/models")
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/models")
+    } else {
+        format!("{trimmed}/v1/models")
     }
 }
 
@@ -71,6 +87,7 @@ pub(super) fn openai_request_payload(
     reasoning_enabled: bool,
     reasoning_disabled: bool,
     wire_reasoning_effort: Option<&str>,
+    thinking_wire_format: ThinkingWireFormat,
     supports_developer_role: bool,
     supports_tool_choice: bool,
     requires_assistant_content_for_tool_calls: bool,
@@ -108,12 +125,26 @@ pub(super) fn openai_request_payload(
         payload["response_format"] = json!({"type": "json_object"});
     }
     if reasoning_enabled {
-        payload["thinking"] = json!({"type": "enabled"});
+        match thinking_wire_format {
+            ThinkingWireFormat::ThinkingType => {
+                payload["thinking"] = json!({"type": "enabled"});
+            }
+            ThinkingWireFormat::EnableThinking => {
+                payload["enable_thinking"] = json!(true);
+            }
+        }
         if let Some(wire_effort) = wire_reasoning_effort {
             payload["reasoning_effort"] = json!(wire_effort);
         }
     } else if reasoning_disabled {
-        payload["thinking"] = json!({"type": "disabled"});
+        match thinking_wire_format {
+            ThinkingWireFormat::ThinkingType => {
+                payload["thinking"] = json!({"type": "disabled"});
+            }
+            ThinkingWireFormat::EnableThinking => {
+                payload["enable_thinking"] = json!(false);
+            }
+        }
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -131,7 +162,14 @@ pub(super) fn openai_request_payload(
     if request_uses_tool_protocol(request)
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
     {
-        payload["thinking"] = json!({"type": "disabled"});
+        match thinking_wire_format {
+            ThinkingWireFormat::ThinkingType => {
+                payload["thinking"] = json!({"type": "disabled"});
+            }
+            ThinkingWireFormat::EnableThinking => {
+                payload["enable_thinking"] = json!(false);
+            }
+        }
     }
     payload
 }

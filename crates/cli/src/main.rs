@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
+use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
     AgentCapabilityResult, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, EmptyParams,
     EventClass, EventDelivery, EventGapReason, EventMetadata, EventRecoveryQuery,
@@ -105,6 +106,16 @@ enum Command {
 enum ConfigCommand {
     /// Print app-server client diagnostics.
     Doctor,
+    /// List discovered model ids and explicit selectable overrides.
+    Models {
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Import a dotenv file into user-level config and auth files.
+    ImportEnv {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,15 +305,76 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             client.approvals()?;
             Ok(())
         }
-        Command::Config {
-            command: ConfigCommand::Doctor,
-        } => {
-            println!("app_server_bin={}", app_server_bin()?);
-            println!("app_server_db={}", app_server_db_display());
-            println!("client=protocol-only");
-            print_readiness()?;
-            Ok(())
-        }
+        Command::Config { command } => match command {
+            ConfigCommand::Doctor => {
+                println!("app_server_bin={}", app_server_bin()?);
+                println!("app_server_db={}", app_server_db_display());
+                println!("client=protocol-only");
+                print_readiness()?;
+                Ok(())
+            }
+            ConfigCommand::Models { refresh } => {
+                let catalog = read_user_model_catalog(refresh)
+                    .map_err(|error| format!("failed to read provider models: {error}"))?;
+                println!(
+                    "default_selector={}",
+                    catalog.default_selector.as_deref().unwrap_or("none")
+                );
+                println!("cache_status={:?}", catalog.cache_status);
+                if catalog.providers.is_empty() {
+                    println!("providers=none");
+                }
+                for provider in catalog.providers {
+                    println!(
+                        "provider={} discovery={:?} api_key={} base_url={}",
+                        provider.provider_name,
+                        provider.discovery,
+                        if provider.api_key_present {
+                            "present(redacted)"
+                        } else {
+                            "missing"
+                        },
+                        if provider.base_url_present {
+                            "present(redacted)"
+                        } else {
+                            "missing"
+                        }
+                    );
+                    for model in provider.models {
+                        println!(
+                            "model={} discovered={} explicit={} selectable={} variants={} default_variant={}",
+                            model.id,
+                            model.discovered,
+                            model.explicit,
+                            model.selectable,
+                            if model.reasoning_variants.is_empty() {
+                                "none".to_string()
+                            } else {
+                                model.reasoning_variants.join(",")
+                            },
+                            model.default_variant.as_deref().unwrap_or("none")
+                        );
+                    }
+                    if let Some(error) = provider.error {
+                        println!("provider_error={error}");
+                    }
+                }
+                Ok(())
+            }
+            ConfigCommand::ImportEnv { file } => {
+                let result = import_env_to_user_config(file.as_deref())
+                    .map_err(|error| format!("failed to import provider env: {error}"))?;
+                println!("config_path={}", result.config_path);
+                println!("auth_path={}", result.auth_path);
+                println!("provider={}", result.provider_name);
+                println!(
+                    "default_selector={}",
+                    result.default_selector.as_deref().unwrap_or("none")
+                );
+                println!("selectable={}", result.selectable);
+                Ok(())
+            }
+        },
     }
 }
 
@@ -346,7 +418,7 @@ fn print_readiness() -> Result<(), String> {
 fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Result<(), String> {
     let source = match provider.source.as_deref() {
         Some("process_env") => "process_env",
-        Some("project_env") => "project_env",
+        Some("user_config") => "user_config",
         None => "unconfigured",
         _ => {
             return Err("invalid agent capability: providerConfiguration.source".to_string());

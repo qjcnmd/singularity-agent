@@ -22,8 +22,9 @@ use super::{
     ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
     ProviderCapabilityMetadata, ProviderCapabilityProbeKey, ProviderCapabilityProfile,
     ProviderError, ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
-    ProviderRuntimeFingerprint, ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    ProviderRuntimeFingerprint, ProviderToolReasoningMode, ThinkingWireFormat, ToolChoiceMode,
+    ToolChoicePolicy, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities,
 };
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt};
 use cap_fs_ext::{OpenOptionsFollowExt, OpenOptionsSyncExt};
@@ -55,6 +56,7 @@ impl ProviderCapabilityProbeKey {
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_variant_enabled: self.reasoning_variant_enabled,
             wire_reasoning_effort: self.wire_reasoning_effort.clone(),
+            thinking_wire_format: self.thinking_wire_format,
             tool_reasoning_mode: self.tool_reasoning_mode,
             supports_developer_role: self.supports_developer_role,
             supports_tool_choice: self.supports_tool_choice,
@@ -95,7 +97,7 @@ struct PersistedProviderProtocolContract {
     supports_json_mode: bool,
     supports_system_message: bool,
     supports_developer_message: bool,
-    max_context_tokens: u32,
+    max_context_tokens: Option<u32>,
     max_output_tokens: u32,
 }
 
@@ -1001,11 +1003,13 @@ fn valid_cache_key(key: &ProviderCapabilityCacheKey) -> bool {
         && !matches!(key.api_protocol, ProviderApiProtocol::Declared)
         && key.adapter_version == PROVIDER_ADAPTER_VERSION
         && key.probe_contract_version == CAPABILITY_PROBE_CONTRACT_VERSION
-        && key.max_context_tokens > 0
-        && key.max_context_tokens <= MAX_CONFIGURED_CONTEXT_TOKENS
         && key.max_output_tokens > 0
-        && key.max_output_tokens < key.max_context_tokens
         && key.max_output_tokens <= MAX_CONFIGURED_OUTPUT_TOKENS
+        && key.max_context_tokens.is_none_or(|context| {
+            context > 0
+                && context <= MAX_CONFIGURED_CONTEXT_TOKENS
+                && key.max_output_tokens < context
+        })
 }
 
 fn valid_cache_contract(
@@ -1098,16 +1102,18 @@ fn normalize_endpoint(endpoint: &str) -> String {
 
 fn provider_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> String {
     let material = format!(
-        "singularity-provider-fingerprint-v3\nprovider_name={}\nendpoint_sha256={}\nadapter_version={}\nprobe_contract_version={}\nmax_context_tokens={}\nmax_output_tokens={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\ntool_reasoning_mode={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
+        "singularity-provider-fingerprint-v4\nprovider_name={}\nendpoint_sha256={}\nadapter_version={}\nprobe_contract_version={}\nmax_context_tokens={}\nmax_output_tokens={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\nthinking_wire_format={}\ntool_reasoning_mode={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
         key.provider_name,
         key.endpoint_sha256,
         key.adapter_version,
         key.probe_contract_version,
-        key.max_context_tokens,
+        key.max_context_tokens
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         key.max_output_tokens,
         key.reasoning_effort.as_deref().unwrap_or("off"),
         key.reasoning_variant_enabled,
         key.wire_reasoning_effort.as_deref().unwrap_or("none"),
+        thinking_wire_format_name(key.thinking_wire_format),
         provider_tool_reasoning_mode_name(key.tool_reasoning_mode),
         key.supports_developer_role,
         key.supports_tool_choice,
@@ -1119,11 +1125,12 @@ fn provider_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> Strin
 
 fn model_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> String {
     let material = format!(
-        "singularity-model-fingerprint-v2\neffective_model={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
+        "singularity-model-fingerprint-v3\neffective_model={}\nreasoning_effort={}\nreasoning_variant_enabled={}\nwire_reasoning_effort={}\nthinking_wire_format={}\nsupports_developer_role={}\nsupports_tool_choice={}\nrequires_reasoning_content_for_tool_calls={}\nrequires_assistant_content_for_tool_calls={}",
         key.model_name,
         key.reasoning_effort.as_deref().unwrap_or("off"),
         key.reasoning_variant_enabled,
         key.wire_reasoning_effort.as_deref().unwrap_or("none"),
+        thinking_wire_format_name(key.thinking_wire_format),
         key.supports_developer_role,
         key.supports_tool_choice,
         key.requires_reasoning_content_for_tool_calls,
@@ -1153,7 +1160,9 @@ fn negotiation_fingerprint_for_probe_key_and_contract(
         contract.supports_json_mode,
         contract.supports_system_message,
         contract.supports_developer_message,
-        contract.max_context_tokens,
+        contract
+            .max_context_tokens
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         contract.max_output_tokens,
     );
     format!("sha256:{}", sha256_hex(&material))
@@ -1173,6 +1182,13 @@ fn provider_tool_reasoning_mode_name(mode: ProviderToolReasoningMode) -> &'stati
         ProviderToolReasoningMode::DisabledForToolCalls => "disabled_for_tool_calls",
         ProviderToolReasoningMode::ReplayReasoningContent => "replay_reasoning_content",
         ProviderToolReasoningMode::ReplayResponsesItems => "replay_responses_items",
+    }
+}
+
+fn thinking_wire_format_name(format: ThinkingWireFormat) -> &'static str {
+    match format {
+        ThinkingWireFormat::ThinkingType => "thinking_type",
+        ThinkingWireFormat::EnableThinking => "enable_thinking",
     }
 }
 
@@ -1521,6 +1537,12 @@ impl OpenAiProvider {
                 .selected_model
                 .as_ref()
                 .and_then(|selection| selection.wire_reasoning_effort.clone()),
+            thinking_wire_format: self
+                .selected_model
+                .as_ref()
+                .map_or(ThinkingWireFormat::ThinkingType, |selection| {
+                    selection.thinking_wire_format
+                }),
             tool_reasoning_mode: self
                 .selected_model
                 .as_ref()

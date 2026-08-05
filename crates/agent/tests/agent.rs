@@ -4224,7 +4224,7 @@ fn direct_tool_mode_rejects_capacity_shortfall_without_implicit_routing() {
 fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let capabilities = ProviderProtocolContract {
-        max_context_tokens: 64_000,
+        max_context_tokens: Some(64_000),
         max_output_tokens: 128,
         ..ProviderProtocolContract::default()
     };
@@ -4452,7 +4452,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let capabilities = ProviderProtocolContract {
-        max_context_tokens: 1_400,
+        max_context_tokens: Some(1_400),
         max_output_tokens: 128,
         ..ProviderProtocolContract::default()
     };
@@ -4635,7 +4635,7 @@ fn agent_loop_pairs_duplicate_tool_call_ids_by_result_occurrence_for_compaction(
         allow_read_execute_policy(),
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
-            max_context_tokens: 1_500,
+            max_context_tokens: Some(1_500),
             max_output_tokens: 128,
             ..ProviderProtocolContract::default()
         },
@@ -7619,4 +7619,49 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
     assert!(!serialized.contains("raw_arguments"));
     assert!(!serialized.contains("sha256:"));
     assert!(!serialized.contains("not-an-array"));
+}
+
+#[test]
+fn agent_loop_turn_limit_fails_closed_without_completion_or_fallback() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invalid_arguments = serde_json::json!({
+        "command": 17,
+        "timeout_seconds": 5
+    });
+    let mut first_invalid =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    first_invalid
+        .tool_calls
+        .push(tool_call("call_1", "command", invalid_arguments.clone()));
+    let mut second_invalid =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    second_invalid
+        .tool_calls
+        .push(tool_call("call_2", "command", invalid_arguments));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_capabilities(
+        vec![first_invalid, second_invalid],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "verify").with_max_turns(2));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(!result.completed);
+    assert!(result.final_answer.is_none());
+    assert_eq!(result.error.as_deref(), Some("max turns exceeded"));
+    assert_eq!(result.model_turns, 2);
+    // Rejected arguments never execute; the turn limit terminates without a model substitution.
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
+    let run_status = result.to_run_status();
+    assert_eq!(run_status.status, AgentStatus::Failed);
+    assert_eq!(run_status.error.as_deref(), Some("max turns exceeded"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
 }

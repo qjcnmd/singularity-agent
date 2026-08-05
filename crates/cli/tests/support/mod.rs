@@ -209,7 +209,7 @@ pub fn agent_loop_capability(
             "blockers": blockers,
         },
         "providerConfiguration": {
-            "source": "project_env",
+            "source": "process_env",
             "snapshotId": "provider_snapshot_fake_server",
             "configured": true,
             "configurationBlocker": null,

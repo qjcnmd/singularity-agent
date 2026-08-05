@@ -567,7 +567,7 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
                         "blockers": [],
                     },
                     "providerConfiguration": {
-                        "source": "project_env",
+                        "source": "process_env",
                         "snapshotId": "provider_snapshot_cli_test",
                         "configured": false,
                         "configurationBlocker": "required_env_missing",
@@ -580,22 +580,8 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
             .shutdown(),
     );
 
-    std::fs::write(
-        temp.path().join(".env"),
-        concat!(
-            "SINGULARITY_MODEL=project-model\n",
-            "SINGULARITY_BASE_URL=https://project-provider.example/v1\n",
-            "SINGULARITY_API_KEY=project-secret\n",
-        ),
-    )
-    .expect("write synthetic project env");
-
     let doctor = cli_with_fake_app_server(&fake_server, &db_path)
         .args(["config", "doctor"])
-        .current_dir(temp.path())
-        .env("SINGULARITY_API_KEY", "secret-value")
-        .env("SINGULARITY_BASE_URL", "https://provider.example/v1")
-        .env("SINGULARITY_MODEL", "gpt-test")
         .output()
         .expect("doctor cli");
 
@@ -604,21 +590,14 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
     assert!(doctor_stdout.contains("client=protocol-only"));
     assert!(doctor_stdout.contains("agent_loop=completed"));
     assert!(!doctor_stdout.contains("evaluation="));
-    assert!(doctor_stdout.contains("provider_config_source=project_env"));
+    assert!(doctor_stdout.contains("provider_config_source=process_env"));
     assert!(doctor_stdout.contains("provider_snapshot_id=provider_snapshot_cli_test"));
     assert!(doctor_stdout.contains("provider_configured=false"));
     assert!(doctor_stdout.contains("provider_configuration_blocker=required_env_missing"));
     assert!(doctor_stdout.contains("SINGULARITY_API_KEY=missing"));
     assert!(doctor_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
     assert!(doctor_stdout.contains("SINGULARITY_MODEL=missing"));
-    for secret in [
-        "secret-value",
-        "https://provider.example/v1",
-        "gpt-test",
-        "project-model",
-        "project-provider.example",
-        "project-secret",
-    ] {
+    for secret in ["secret-value", "https://provider.example/v1", "gpt-test"] {
         assert!(!doctor_stdout.contains(secret));
     }
 }

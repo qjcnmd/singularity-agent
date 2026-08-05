@@ -27,7 +27,20 @@ fn workspace_resource(value: &str) -> PermissionResource {
 }
 
 fn app_server(store: SessionStore) -> AppServer {
-    AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    AppServer::new(
+        store,
+        ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            None,
+            None,
+        ),
+    )
 }
 
 fn pending_approval_for_test(

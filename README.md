@@ -36,7 +36,7 @@ Singularity 的核心产品运行时由 Rust 实现，但可以处理 Python、R
 
 ## Provider 配置
 
-在目标仓库或其父目录创建 `.env`，也可以设置同名进程环境变量：
+Provider 配置持久化在用户目录的 `.singularity` 中。已有旧 `.env` 时，显式导入一次：
 
 ```dotenv
 SINGULARITY_BASE_URL=https://provider.example/v1
@@ -44,9 +44,14 @@ SINGULARITY_API_KEY=replace-with-your-api-key
 SINGULARITY_MODEL=your-model-name
 ```
 
-只要进程环境中出现任一 provider 变量，Singularity 就只使用该环境层；否则从当前目录向父目录查找最近的 `.env`。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
+```powershell
+sg config import-env --file C:\path\to\.env
+sg config models
+```
 
-需要多个 provider 或固定每个模型的协议时，设置 `SINGULARITY_MODELS_CONFIG` 指向 JSON 文件。该文件只保存环境变量名，不保存密钥；`default_model` 和 thread 的 `--model`/`thread.start.model` 都使用完整的 `provider_id/model_id`：
+运行时不会自动读取项目 `.env`。只要当前进程中出现任一 provider 变量，Singularity 就只使用该进程环境层；否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
+
+需要为当前进程临时提供一份完整的多-provider 配置时，可以设置 `SINGULARITY_MODELS_CONFIG` 指向 JSON 文件；该进程环境层会整体覆盖用户级默认配置。该文件只保存环境变量名，不保存密钥；`default_model` 和 thread 的 `--model`/`thread.start.model` 都使用完整的 `provider_id/model_id`：
 
 ```json
 {

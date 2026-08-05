@@ -4332,7 +4332,7 @@ fn context_budget(
     capabilities: &ProviderProtocolContract,
     max_tool_calls: u32,
 ) -> Result<ContextBudget, String> {
-    if capabilities.max_context_tokens == 0 || capabilities.max_output_tokens == 0 {
+    if capabilities.max_output_tokens == 0 {
         return Err("provider token capabilities must be greater than zero".to_string());
     }
     let developer_instruction_tokens =
@@ -4347,12 +4347,16 @@ fn context_budget(
         .saturating_add(developer_instruction_tokens)
         .saturating_add(tool_tokens)
         .saturating_add(message_framing_tokens);
-    if reserved_request_tokens >= capabilities.max_context_tokens {
-        return Err(
-            "provider context window cannot fit the reserved output and request overhead"
-                .to_string(),
-        );
-    }
+    let input_token_budget = match capabilities.max_context_tokens {
+        Some(context_window) if reserved_request_tokens >= context_window => {
+            return Err(
+                "provider context window cannot fit the reserved output and request overhead"
+                    .to_string(),
+            );
+        }
+        Some(context_window) => Some(context_window - reserved_request_tokens),
+        None => None,
+    };
 
     Ok(ContextBudget {
         model_context_window: capabilities.max_context_tokens,
@@ -4361,9 +4365,7 @@ fn context_budget(
         developer_instruction_tokens,
         tool_tokens,
         message_framing_tokens,
-        input_token_budget: capabilities
-            .max_context_tokens
-            .saturating_sub(reserved_request_tokens),
+        input_token_budget,
     })
 }
 
@@ -4387,13 +4389,16 @@ fn model_request_fits_context(
     provider_reasoning_history: &[ProviderReasoningReplay],
     budget: &ContextBudget,
 ) -> bool {
-    model_request_token_count(
+    let request_tokens = model_request_token_count(
         tools,
         messages,
         tool_result_occurrences,
         provider_reasoning_history,
         budget,
-    ) <= budget.model_context_window
+    );
+    budget
+        .model_context_window
+        .is_none_or(|context_window| request_tokens <= context_window)
 }
 
 fn model_request_token_count(
@@ -4710,7 +4715,10 @@ fn compact_model_messages(
         &state.provider_reasoning_history,
         budget,
     );
-    if before_tokens <= budget.model_context_window {
+    if budget
+        .model_context_window
+        .is_none_or(|context_window| before_tokens <= context_window)
+    {
         return None;
     }
     let private_call_ids =
@@ -4804,7 +4812,11 @@ fn compact_model_messages(
         &retained_reasoning_history,
         budget,
     );
-    if after_tokens >= before_tokens || after_tokens > budget.model_context_window {
+    if after_tokens >= before_tokens
+        || budget
+            .model_context_window
+            .is_some_and(|context_window| after_tokens > context_window)
+    {
         return None;
     }
     Some(ContextCompactionOutcome {

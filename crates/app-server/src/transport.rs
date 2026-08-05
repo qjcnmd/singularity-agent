@@ -505,10 +505,10 @@ fn initialize_app_server(
     store
         .recover_unowned_workspace_executions()
         .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
-    let provider_snapshot = ProviderConfigSnapshot::capture_with_runtime_handle_and_cache_path(
+    let provider_snapshot = ProviderConfigSnapshot::capture(
         |name| std::env::var(name).ok(),
+        Some(runtime_handle),
         Some(capability_cache_path),
-        runtime_handle,
     );
     Ok(AppServer::new(store, provider_snapshot))
 }
@@ -2329,7 +2329,8 @@ mod tests {
     #[test]
     fn mixed_batch_is_sequential_and_only_requests_produce_ordered_responses() {
         let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let mut server =
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
@@ -2370,7 +2371,8 @@ mod tests {
     #[test]
     fn all_notification_batch_has_no_output_even_for_unknown_method_or_invalid_params() {
         let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let mut server =
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
@@ -2391,7 +2393,8 @@ mod tests {
     #[test]
     fn notification_only_request_is_invalid_without_changing_batch_notification_contract() {
         let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let mut server =
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(2, 2);
         let payload = parse_json_rpc_payload(
@@ -2449,7 +2452,8 @@ mod tests {
     #[test]
     fn empty_batch_returns_standard_invalid_request() {
         let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let mut server =
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(1, 1);
 
