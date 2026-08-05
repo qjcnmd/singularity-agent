@@ -2144,7 +2144,8 @@ fn create_private_secret_file(path: &Path) -> Result<std::fs::File, ProviderErro
                 windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
                     | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
                     | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
             )
             .share_mode(
                 windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
@@ -2242,16 +2243,30 @@ mod windows_auth_acl {
     /// Apply and verify the owner-only DACL through the already-open file handle.
     /// The caller must set this before writing any secret bytes.
     pub(super) fn set_owner_only_handle(file: &File) -> Result<(), ProviderError> {
+        set_owner_only_security(file, true)
+    }
+
+    /// Restrict the DACL before reopening an existing file with owner-repair access.
+    pub(super) fn set_owner_only_dacl_handle(file: &File) -> Result<(), ProviderError> {
+        set_owner_only_security(file, false)
+    }
+
+    fn set_owner_only_security(file: &File, set_owner: bool) -> Result<(), ProviderError> {
         let mut sid = current_user_sid()?;
+        let owner_sid = sid.as_mut_ptr() as *mut c_void;
         let trustee = TRUSTEE_W {
             pMultipleTrustee: null_mut(),
             MultipleTrusteeOperation: 0,
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.as_mut_ptr() as *mut u16,
+            ptstrName: owner_sid as *mut u16,
         };
         let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            grfAccessPermissions: FILE_GENERIC_READ
+                | FILE_GENERIC_WRITE
+                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
             grfAccessMode: SET_ACCESS,
             grfInheritance: 0,
             Trustee: trustee,
@@ -2267,12 +2282,20 @@ mod windows_auth_acl {
             ));
         }
         let handle = file.as_raw_handle() as HANDLE;
+        let mut security_information =
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        let owner = if set_owner {
+            security_information |= OWNER_SECURITY_INFORMATION;
+            owner_sid
+        } else {
+            null_mut()
+        };
         let status = unsafe {
             SetSecurityInfo(
                 handle,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
+                security_information,
+                owner,
                 null_mut(),
                 dacl,
                 null_mut(),
@@ -2284,7 +2307,11 @@ mod windows_auth_acl {
                 "user provider auth permissions could not be set",
             ));
         }
-        ensure_owner_only_handle(file)
+        if set_owner {
+            ensure_owner_only_handle(file)
+        } else {
+            Ok(())
+        }
     }
 
     /// Verify the owner and DACL of the exact object pinned by `file`.
@@ -2795,13 +2822,15 @@ struct ConfigWriterLock {
 fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, ProviderError> {
     ensure_no_reparse_components(directory, false)?;
     let path = directory.join(".config.lock");
-    let (file, _created) = match config_writer_lock_options(true).open(&path) {
+    let (file, _created) = match config_writer_lock_options(true, true).open(&path) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_no_reparse_components(&path, false)?;
-            let file = config_writer_lock_options(false).open(&path).map_err(|_| {
-                user_config_error("provider config writer lock could not be acquired")
-            })?;
+            let file = config_writer_lock_options(false, false)
+                .open(&path)
+                .map_err(|_| {
+                    user_config_error("provider config writer lock could not be acquired")
+                })?;
             (file, false)
         }
         Err(_) => {
@@ -2829,14 +2858,28 @@ fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, Prov
         }
     }
     #[cfg(windows)]
-    if _created || acl_needs_repair {
+    if _created {
         windows_auth_acl::set_owner_only_handle(&file)?;
+    } else if acl_needs_repair {
+        // `file` denies delete sharing, so the path remains bound to this object while the
+        // tightened DACL grants the current user the owner-repair access used below.
+        windows_auth_acl::set_owner_only_dacl_handle(&file)?;
+        let repair_file = config_writer_lock_options(false, true)
+            .open(&path)
+            .map_err(|_| user_config_error("provider config writer lock could not be repaired"))?;
+        ensure_config_writer_lock_identity(&file)?;
+        ensure_config_writer_lock_identity(&repair_file)?;
+        windows_auth_acl::set_owner_only_handle(&repair_file)?;
+        windows_auth_acl::ensure_owner_only_handle(&file)?;
     }
     ensure_private_lock_handle(&file)?;
     Ok(ConfigWriterLock { _file: file })
 }
 
-fn config_writer_lock_options(create_new: bool) -> std::fs::OpenOptions {
+fn config_writer_lock_options(
+    create_new: bool,
+    _request_owner_access: bool,
+) -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create_new(create_new);
     #[cfg(unix)]
@@ -2847,13 +2890,15 @@ fn config_writer_lock_options(create_new: bool) -> std::fs::OpenOptions {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        let mut access = windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+            | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+            | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+            | windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+        if _request_owner_access {
+            access |= windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+        }
         options
-            .access_mode(
-                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
-                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
-            )
+            .access_mode(access)
             .share_mode(
                 windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
                     | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
