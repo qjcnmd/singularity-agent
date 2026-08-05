@@ -65,7 +65,6 @@ const THREAD_NOT_FOUND: &str = "Thread not found";
 const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a turn";
 const THREAD_ARCHIVED_CONTINUATION: &str =
     "Thread is archived; resume it before continuing the turn";
-const THREAD_EXECUTION_ACTIVE: &str = "Thread already has an active or pending turn";
 const WORKSPACE_EXECUTION_ACTIVE: &str = "Workspace already has an active or pending turn";
 const EXECUTION_STOPPED: &str = "AppServer is stopping; execution was not started";
 const TURN_NOT_FOUND: &str = "Turn not found";

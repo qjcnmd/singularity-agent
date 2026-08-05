@@ -326,10 +326,12 @@ impl AppServer {
                                     THREAD_ARCHIVED_CONTINUATION,
                                 )?
                             }
-                            StoreError::WorkspaceHasNonterminalTurn { .. } => {
+                            StoreError::WorkspaceHasNonterminalTurn { turn_id, .. } => {
                                 invalid_state_response(
                                     message.required_id(),
-                                    WORKSPACE_EXECUTION_ACTIVE,
+                                    format!(
+                                        "workspace already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
+                                    ),
                                 )?
                             }
                             StoreError::TurnBoundaryPending { .. } => invalid_state_response(

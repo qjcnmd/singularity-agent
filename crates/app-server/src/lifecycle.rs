@@ -798,10 +798,15 @@ impl AppServer {
                 );
                 return Ok(());
             }
-            Err(StoreError::WorkspaceHasNonterminalTurn { .. }) => {
+            Err(StoreError::WorkspaceHasNonterminalTurn { turn_id, .. }) => {
                 emit_messages(
                     &mut emit,
-                    invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?,
+                    invalid_state_response(
+                        message.required_id(),
+                        format!(
+                            "workspace already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
+                        ),
+                    )?,
                 );
                 return Ok(());
             }

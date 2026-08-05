@@ -18,8 +18,8 @@ use singularity_protocol::{
     JsonRpcNotification, Method, PermissionProfileName, ProviderConfigurationStatus, RpcMethod,
     Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams, TraceEvent, TraceMetric,
     TraceMetricAvailability, TraceMetricUnavailableReason, TraceMetrics, TraceMetricsParams,
-    TraceShowParams, TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams,
-    TurnStatus, rpc_methods,
+    TraceShowParams, TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnInputDelivery,
+    TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -119,12 +119,43 @@ enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
-// turn 查询与中断命令。
+// turn 查询、中断与同一 Turn 操作命令。
 enum TurnCommand {
     /// Print the current turn status.
     Status { turn_id: String },
     /// Interrupt a running turn.
     Interrupt { turn_id: String },
+    /// Resume a suspended or paused turn from its durable checkpoint.
+    Resume { turn_id: String },
+    /// Pause a running turn without terminating its checkpoint.
+    Pause { turn_id: String },
+    /// Append a real user input to a non-terminal turn.
+    Input {
+        turn_id: String,
+        text: String,
+        /// Idempotency key for the appended input; generated once when omitted.
+        #[arg(long)]
+        input_id: Option<String>,
+        /// Delivery semantics: steer consumes at the next boundary, follow-up waits for the turn end.
+        #[arg(long, value_enum)]
+        delivery: Option<TurnDeliveryArg>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+// turn/input 的受控投递枚举表示。
+enum TurnDeliveryArg {
+    Steer,
+    FollowUp,
+}
+
+impl TurnDeliveryArg {
+    fn protocol_value(self) -> TurnInputDelivery {
+        match self {
+            Self::Steer => TurnInputDelivery::Steer,
+            Self::FollowUp => TurnInputDelivery::FollowUp,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -267,6 +298,39 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             match command {
                 TurnCommand::Status { turn_id } => client.turn_status(&turn_id),
                 TurnCommand::Interrupt { turn_id } => client.turn_interrupt(&turn_id),
+                TurnCommand::Resume { turn_id } => {
+                    client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
+                    let turn = client.turn_resume(&turn_id, true)?;
+                    fail_for_failed_turn(&turn)?;
+                    Ok(())
+                }
+                TurnCommand::Pause { turn_id } => {
+                    let turn = client.turn_pause(&turn_id)?;
+                    render_turn(&turn);
+                    Ok(())
+                }
+                TurnCommand::Input {
+                    turn_id,
+                    text,
+                    input_id,
+                    delivery,
+                } => {
+                    client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
+                    // 幂等键显式传入；缺省时生成一次，重试不得生成新 ID。
+                    let input_id = input_id.unwrap_or_else(|| {
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or_default();
+                        format!("cli-{nanos}")
+                    });
+                    let delivery = delivery.map_or(TurnInputDelivery::FollowUp, |delivery| {
+                        delivery.protocol_value()
+                    });
+                    let turn = client.turn_input(&turn_id, &text, &input_id, delivery, true)?;
+                    fail_for_failed_turn(&turn)?;
+                    Ok(())
+                }
             }
         }
         Command::Threads => {
@@ -583,36 +647,94 @@ impl AppServerClient {
                 text: text.to_string(),
             }],
         })?;
-        let mut turn = reply.result.turn;
-        if render {
-            render_messages(&reply.notifications, should_render_assistant_summary(&turn));
-            render_turn(&turn);
-        }
-        if should_poll_running_turn(&turn) {
-            turn = self.wait_for_turn_terminal(&turn.turn_id, render)?;
-        }
+        let turn = render_and_wait_terminal(
+            self,
+            reply.result.turn.clone(),
+            reply.notifications.clone(),
+            render,
+        )?;
         Ok((turn, reply.notifications))
     }
 
-    // 按固定间隔查询 running turn，直到出现终态。
-    fn wait_for_turn_terminal(&mut self, turn_id: &str, render: bool) -> Result<Turn, String> {
-        loop {
-            thread::sleep(TURN_STATUS_POLL_INTERVAL);
-            let turn = self.fetch_turn_status(turn_id)?;
-            if turn.status != TurnStatus::Running {
-                if render {
-                    println!(
-                        "turn {} {} agent_loop_status={}",
-                        turn.turn_id,
-                        turn.status.as_storage_text(),
-                        turn.agent_loop_status,
-                    );
-                }
-                return Ok(turn);
-            }
-        }
+    // 恢复暂停/挂起的 turn，从持久化 checkpoint 继续执行并渲染事件。
+    fn turn_resume(&mut self, turn_id: &str, render: bool) -> Result<Turn, String> {
+        let reply = self.request::<rpc_methods::TurnResume>(&TurnIdParams {
+            turn_id: turn_id.to_string(),
+        })?;
+        render_and_wait_terminal(self, reply.result.turn, reply.notifications, render)
     }
 
+    // 暂停 running turn；短请求，不自动轮询。
+    fn turn_pause(&mut self, turn_id: &str) -> Result<Turn, String> {
+        let reply = self.request::<rpc_methods::TurnPause>(&TurnIdParams {
+            turn_id: turn_id.to_string(),
+        })?;
+        Ok(reply.result.turn)
+    }
+
+    // 向非终态 turn 追加真实用户输入，并按 turn_start 相同规则渲染/轮询。
+    fn turn_input(
+        &mut self,
+        turn_id: &str,
+        text: &str,
+        input_id: &str,
+        delivery: TurnInputDelivery,
+        render: bool,
+    ) -> Result<Turn, String> {
+        let reply = self.request::<rpc_methods::TurnInput>(&TurnInputParams {
+            turn_id: turn_id.to_string(),
+            input_id: input_id.to_string(),
+            delivery,
+            input: vec![InputItem::Text {
+                text: text.to_string(),
+            }],
+        })?;
+        render_and_wait_terminal(self, reply.result.turn, reply.notifications, render)
+    }
+}
+
+// 渲染 turn 通知、打印状态行，并在 running 时轮询到终态。
+// turn_start / turn_resume / turn_input 共享同一渲染与轮询规则。
+fn render_and_wait_terminal(
+    client: &mut AppServerClient,
+    mut turn: Turn,
+    notifications: Vec<JsonRpcNotification>,
+    render: bool,
+) -> Result<Turn, String> {
+    if render {
+        render_messages(&notifications, should_render_assistant_summary(&turn));
+        render_turn(&turn);
+    }
+    if should_poll_running_turn(&turn) {
+        turn = wait_for_turn_terminal(client, &turn.turn_id, render)?;
+    }
+    Ok(turn)
+}
+
+// 按固定间隔查询 running turn，直到出现终态。
+fn wait_for_turn_terminal(
+    client: &mut AppServerClient,
+    turn_id: &str,
+    render: bool,
+) -> Result<Turn, String> {
+    loop {
+        thread::sleep(TURN_STATUS_POLL_INTERVAL);
+        let turn = client.fetch_turn_status(turn_id)?;
+        if turn.status != TurnStatus::Running {
+            if render {
+                println!(
+                    "turn {} {} agent_loop_status={}",
+                    turn.turn_id,
+                    turn.status.as_storage_text(),
+                    turn.agent_loop_status,
+                );
+            }
+            return Ok(turn);
+        }
+    }
+}
+
+impl AppServerClient {
     // 将 turn/status 响应投影为 CLI 所需的最小视图。
     fn fetch_turn_status(&mut self, turn_id: &str) -> Result<Turn, String> {
         let reply = self.request::<rpc_methods::TurnStatus>(&TurnIdParams {

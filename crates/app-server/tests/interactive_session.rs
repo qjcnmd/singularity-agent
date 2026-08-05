@@ -1050,3 +1050,77 @@ fn app_server_starts_with_inconsistent_turn_and_healthier_turn_survives() {
 
     process.shutdown(4);
 }
+
+// 非终态 turn 错误映射：thread/archive 与 turn/start 的 JSON-RPC error message
+// 携带已确认的 turn ID 与可操作提示（保留 error code，不新增协议字段）。
+#[test]
+fn nonterminal_turn_errors_carry_turn_id_for_actionable_cli_hint() {
+    let provider = ControlledProvider::start();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = create_workspace(dir.path());
+    let db_path = dir.path().join("sessions.sqlite3");
+
+    let store = SessionStore::open(&db_path).expect("preload store");
+    let thread = store
+        .create_thread(None, Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("running turn");
+    // 保存 checkpoint 并置为 suspended：启动恢复视其为健康非终态 turn（不终态化），
+    // 从而 thread/archive 与 turn/start 触发 nonterminal-turn 错误。
+    store
+        .save_turn_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &json!({ "checkpoint_version": 1, "boundary": "initial" }),
+            1,
+        )
+        .expect("turn checkpoint");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend turn");
+    drop(store);
+
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+
+    // thread/archive 触发 ThreadHasNonterminalTurn：消息含 turn ID 与操作提示。
+    process.send_request(2, "thread/archive", json!({ "threadId": thread.thread_id }));
+    let archive_error = process.expect_error(2);
+    let archive_message = archive_error["error"]["message"]
+        .as_str()
+        .expect("archive error message");
+    assert!(
+        archive_message.contains(&turn.turn_id),
+        "archive message must carry turn id: {archive_message}"
+    );
+    assert!(
+        archive_message.contains("use sg turn resume/pause/input"),
+        "archive message must be actionable: {archive_message}"
+    );
+
+    // turn/start 触发 WorkspaceHasNonterminalTurn：同一 thread 已有非终态 turn。
+    process.send_request(
+        3,
+        "turn/start",
+        json!({
+            "threadId": thread.thread_id,
+            "input": [{"type": "text", "text": "next task"}],
+        }),
+    );
+    let start_error = process.expect_error(3);
+    let start_message = start_error["error"]["message"]
+        .as_str()
+        .expect("start error message");
+    assert!(
+        start_message.contains(&turn.turn_id),
+        "turn/start message must carry turn id: {start_message}"
+    );
+    assert!(
+        start_message.contains("use sg turn resume/pause/input"),
+        "turn/start message must be actionable: {start_message}"
+    );
+
+    process.shutdown(4);
+}

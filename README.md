@@ -122,6 +122,17 @@ sg threads
 sg continue <thread-id> "继续完成剩余修改"
 ```
 
+`continue` 始终创建新 Turn（新任务回合）；若该线程存在未完成的 Turn（暂停/挂起/等待审批），`continue` 会提示你改用同一 Turn 命令：
+
+```powershell
+sg turn status <turn-id>
+sg turn resume <turn-id>          # 从持久化存档点恢复暂停/挂起的同一 Turn
+sg turn pause <turn-id>           # 暂停正在运行的 Turn，不终止其存档
+sg turn input <turn-id> "补充要求" --delivery follow-up   # 向非终态 Turn 追加真实用户输入
+```
+
+`turn input` 的 `--input-id` 是幂等键（缺省时自动生成一次）；`--delivery steer|follow-up` 控制投递时机（steer 在下一安全边界消费，follow-up 排队到 Turn 收尾）。
+
 状态、取消和审批：
 
 ```powershell

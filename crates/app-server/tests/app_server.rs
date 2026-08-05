@@ -1266,7 +1266,10 @@ fn pending_approval_prevents_thread_archive_and_delete() {
 
         assert_eq!(
             response[0]["error"]["message"],
-            "Thread already has an active or pending turn"
+            format!(
+                "thread already has an active or pending turn {}; use sg turn resume/pause/input {}",
+                turn.turn_id, turn.turn_id
+            )
         );
     }
     let store = SessionStore::open(&db_path).expect("reopen store");

@@ -354,9 +354,12 @@ impl AppServer {
             Err(StoreError::NotFound(_)) => {
                 not_found_response(message.required_id(), THREAD_NOT_FOUND)
             }
-            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
-                invalid_state_response(message.required_id(), THREAD_EXECUTION_ACTIVE)
-            }
+            Err(StoreError::ThreadHasNonterminalTurn { turn_id, .. }) => invalid_state_response(
+                message.required_id(),
+                format!(
+                    "thread already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
+                ),
+            ),
             Err(error) => Err(error.into()),
         }
     }
@@ -377,9 +380,12 @@ impl AppServer {
             Err(StoreError::NotFound(_)) => {
                 not_found_response(message.required_id(), THREAD_NOT_FOUND)
             }
-            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
-                invalid_state_response(message.required_id(), THREAD_EXECUTION_ACTIVE)
-            }
+            Err(StoreError::ThreadHasNonterminalTurn { turn_id, .. }) => invalid_state_response(
+                message.required_id(),
+                format!(
+                    "thread already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
+                ),
+            ),
             Err(error) => Err(error.into()),
         }
     }
