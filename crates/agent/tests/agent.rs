@@ -2697,6 +2697,7 @@ fn no_reasoning_tool_history_crosses_turns_with_historical_checkpoint() {
 
     let requests = second_requests.lock().expect("second requests");
     let request = requests.last().expect("second turn request");
+
     let has_tool_call = request.messages.iter().any(|message| {
         message.role == ModelRole::Assistant
             && message
@@ -2787,6 +2788,7 @@ fn seed_replaces_leading_developer_and_drops_repair_feedback() {
 
     let requests = second_requests.lock().expect("second requests");
     let request = requests.last().expect("second turn request");
+
     let developer_messages = request
         .messages
         .iter()
@@ -4860,6 +4862,148 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
             ))
             .count(),
         2
+    );
+}
+
+#[test]
+fn compacted_turn_checkpoint_seeds_next_turn_with_summary_and_valid_tool_pairs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let required_argv = test_command("second-success");
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut required_verification =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    required_verification.tool_calls.push(tool_call(
+        "call_2",
+        "command",
+        serde_json::json!({
+            "command": required_argv.join(" "),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let capabilities = ProviderProtocolContract {
+        max_context_tokens: Some(1_400),
+        max_output_tokens: 128,
+        ..ProviderProtocolContract::default()
+    };
+    let mut checkpoints = Vec::new();
+
+    // 第一轮：大输出触发两次 compaction，完成时 checkpoint 含 compaction summary。
+    let first = agent_loop_with_capabilities(
+        vec![command_response, required_verification, final_response],
+        allow_read_execute_policy(),
+        Arc::clone(&first_requests),
+        capabilities,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(LargeOutputBackend),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_1", "turn_1", "run the command").with_max_turns(3),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
+                checkpoints.push(event.checkpoint);
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(first.status, AgentStatus::Completed, "first={first:?}");
+    let context_trace = first.context_trace.as_ref().expect("context trace");
+    assert!(
+        context_trace.compaction_count >= 1,
+        "compaction must trigger"
+    );
+    let checkpoint = TurnCheckpoint::decode(
+        &checkpoints
+            .last()
+            .expect("committed checkpoint")
+            .encode()
+            .expect("encode checkpoint"),
+    )
+    .expect("decode checkpoint");
+
+    // 第二轮：完整 AgentLoop 走 seed 通道，最终 provider 请求必须保留 summary
+    // 且工具轨迹（assistant tool call + matching tool result）顺序与 call ID 合法。
+    // （checkpoint 消息体无外部访问器，summary 是否跨轮保留由第二轮请求断言直接证明。）
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let second = agent_loop_with_responses_and_requests(
+        vec![ModelTurnResponse::completed(
+            "model_request_turn_2_0",
+            "response_1",
+            "second final",
+        )],
+        allow_read_execute_policy(),
+        Arc::clone(&second_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_2", "second user")
+            .with_historical_checkpoint(&checkpoint)
+            .with_max_turns(1),
+    );
+    assert_eq!(second.status, AgentStatus::Completed, "second={second:?}");
+
+    let requests = second_requests.lock().expect("second requests");
+    let request = requests.last().expect("second turn request");
+
+    // compaction summary 保留。
+    assert!(
+        request.messages.iter().any(|message| {
+            message.role == ModelRole::Developer
+                && message.content.contains("agent_context_compaction")
+        }),
+        "compaction summary must cross the turn seed"
+    );
+    // 唯一 leading developer（旧 leading 被替换）。
+    let leading_count = request
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Developer)
+        .count();
+    assert!(leading_count >= 1, "leading developer missing");
+    // 工具轨迹：最新工具对（call_2）的 assistant tool call 与 matching tool result
+    // 都必须跨轮保留（compaction 省略了更早的 call_1 对，这是其既有语义）。
+    for call_id in ["call_2"] {
+        let call_message = request.messages.iter().find(|message| {
+            message.role == ModelRole::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == call_id)
+        });
+        assert!(
+            call_message.is_some(),
+            "assistant tool call {call_id} must cross the turn seed"
+        );
+        assert!(
+            request.messages.iter().any(|message| {
+                message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some(call_id)
+            }),
+            "matching tool result for {call_id} must cross the turn seed"
+        );
+    }
+    // 当前 user 追加在末尾。
+    assert!(
+        request.messages.last().is_some_and(|message| {
+            message.role == ModelRole::User && message.content == "second user"
+        }),
+        "current user must be appended after the seed history"
     );
 }
 

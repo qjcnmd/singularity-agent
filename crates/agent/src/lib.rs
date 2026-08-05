@@ -555,8 +555,11 @@ impl AgentLoopInput {
     }
 }
 
-/// Compaction summary 消息的固定 JSON 前缀，跨轮 seed 保留该 Developer 消息。
-const COMPACTION_SUMMARY_PREFIX: &str = "{\"type\":\"agent_context_compaction\"";
+/// Compaction summary 消息的固定 JSON 标记，跨轮 seed 保留该 Developer 消息。
+///
+/// 使用 `contains` 而非前缀：serde_json 默认 BTreeMap 按字母序序列化，
+/// `"type"` 键位于对象中部，前缀匹配对真实格式恒不成立。
+const COMPACTION_SUMMARY_MARKER: &str = "\"type\":\"agent_context_compaction\"";
 
 /// completion feedback Developer 消息的固定前缀（见 `CompletionTracker::feedback`）。
 const COMPLETION_FEEDBACK_PREFIX: &str = "Do not finalize yet.";
@@ -581,7 +584,7 @@ fn prepare_seed_messages(
     let mut seed_messages = seed.messages.iter().cloned();
     for message in seed_messages.by_ref() {
         if message.role != ModelRole::Developer
-            || message.content.starts_with(COMPACTION_SUMMARY_PREFIX)
+            || message.content.contains(COMPACTION_SUMMARY_MARKER)
         {
             // 旧 leading block 被替换；compaction summary 紧跟 leading 且必须保留。
             messages.push(message);
@@ -590,7 +593,7 @@ fn prepare_seed_messages(
     }
     for message in seed_messages {
         if message.role == ModelRole::Developer
-            && !message.content.starts_with(COMPACTION_SUMMARY_PREFIX)
+            && !message.content.contains(COMPACTION_SUMMARY_MARKER)
             && (message.content.starts_with(REPAIR_STATE_INSTRUCTIONS)
                 || message.content == REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
                 || message.content == REPAIR_BUDGET_EXHAUSTED_INSTRUCTION
@@ -6825,7 +6828,12 @@ mod cancellation_tests {
     fn prepare_seed_messages_preserves_compaction_summary_and_replaces_leading_developer() {
         let summary = ModelMessage::text(
             ModelRole::Developer,
-            format!("{COMPACTION_SUMMARY_PREFIX}\"omitted_message_count\":3}}"),
+            // 与 serde_json 真实序列化一致（BTreeMap 字母序，"type" 在对象中部）。
+            serde_json::json!({
+                "type": "agent_context_compaction",
+                "omitted_message_count": 3
+            })
+            .to_string(),
         );
         let old_leading = ModelMessage::text(ModelRole::Developer, "old leading instructions");
         let repair = ModelMessage::text(
