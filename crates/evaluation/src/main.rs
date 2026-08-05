@@ -30,7 +30,7 @@ enum Command {
         run_id: String,
         #[arg(long)]
         json: bool,
-        /// Maximum number of independent tasks to execute concurrently (1-2).
+        /// Maximum number of independent tasks to execute concurrently (1-8).
         #[arg(long, value_parser = parse_max_workers)]
         max_workers: Option<usize>,
         /// Execute every manifest task for its configured trial count and publish gate artifacts.
@@ -42,15 +42,15 @@ enum Command {
 fn parse_max_workers(value: &str) -> Result<usize, String> {
     let workers = value
         .parse::<usize>()
-        .map_err(|_| "max-workers must be an integer between 1 and 2".to_string())?;
-    if (1..=2).contains(&workers) {
+        .map_err(|_| "max-workers must be an integer between 1 and 8".to_string())?;
+    if (1..=8).contains(&workers) {
         Ok(workers)
     } else {
-        Err("max-workers must be between 1 and 2".to_string())
+        Err("max-workers must be between 1 and 8".to_string())
     }
 }
 
-/// Resolve the task worker count, capping Full at two and falling back to one on query failure.
+/// Resolve the task worker count, capping Full at eight and falling back to one on query failure.
 fn resolve_max_workers<F>(
     mode: &EvaluationRunMode,
     requested: Option<usize>,

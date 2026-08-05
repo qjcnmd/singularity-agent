@@ -501,7 +501,7 @@ where
     T: Send,
     F: Fn(usize) -> T + Send + Sync,
 {
-    debug_assert!((1..=2).contains(&max_workers));
+    debug_assert!((1..=8).contains(&max_workers));
     if max_workers == 1 {
         let mut results = Vec::with_capacity(item_count);
         for index in 0..item_count {
