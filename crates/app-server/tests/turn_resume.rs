@@ -1381,7 +1381,9 @@ fn assert_resumed_after_approval(request: &Value) {
         .iter()
         .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_patch_1")
         .expect("patch result must precede the resumed request");
-    let output = patch_result["output"].as_str().expect("patch result output");
+    let output = patch_result["output"]
+        .as_str()
+        .expect("patch result output");
     let output: Value = serde_json::from_str(output).expect("patch result json");
     assert_eq!(output["ok"], true, "patch must have executed exactly once");
     assert_eq!(output["tool_name"], "patch");

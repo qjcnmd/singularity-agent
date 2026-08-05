@@ -3049,7 +3049,11 @@ fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
             "unsupported turn checkpoint version",
         ),
         ("old version", "old", "unsupported turn checkpoint version"),
-        ("missing field", "remove_messages", "invalid turn checkpoint"),
+        (
+            "missing field",
+            "remove_messages",
+            "invalid turn checkpoint",
+        ),
         ("unknown field", "unknown_field", "invalid turn checkpoint"),
         ("empty object", "empty", "invalid turn checkpoint version"),
         ("null payload", "null", "invalid turn checkpoint version"),
