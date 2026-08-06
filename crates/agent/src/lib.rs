@@ -3898,9 +3898,12 @@ where
         let envelope = tool_call_request(call);
         let output = if call.tool_name == TOOL_COMMAND {
             match command_tool_input(&call.arguments) {
-                Ok(input) => {
-                    command_workspace_tool_failure(&input, error.into(), &self.policy.profile)
-                }
+                Ok(input) => command_workspace_tool_failure(
+                    &input,
+                    error.into(),
+                    &self.policy.profile,
+                    Some(false),
+                ),
                 Err(_) => workspace_tool_failure(error.into()),
             }
         } else {
@@ -4434,7 +4437,9 @@ fn execute_workspace_tool_call(
                                 json!({"summary": EVENT_SINK_FAILURE_ERROR}),
                             )
                         }
-                        Err(error) => command_workspace_tool_failure(&input, error.into(), profile),
+                        Err(error) => {
+                            command_workspace_tool_failure(&input, error.into(), profile, None)
+                        }
                     })
                 }
                 Err(error) => Err(error),
@@ -6297,10 +6302,11 @@ fn command_workspace_tool_failure(
     input: &CommandToolInput,
     error: AgentLoopToolError,
     profile: &PermissionProfile,
+    executor_started: Option<bool>,
 ) -> ToolOutput {
     let mut output = workspace_tool_failure(error);
     let (sandbox_mode, network_access) = effective_command_policy(profile);
-    output.metadata["audit"] = json!({
+    let mut audit = json!({
         "cwd": input.effective_cwd(),
         "timeout_seconds": input.effective_timeout_seconds(),
         "sandbox_mode": sandbox_mode,
@@ -6316,6 +6322,10 @@ fn command_workspace_tool_failure(
         ),
         "command_provenance": "agent_requested",
     });
+    if let Some(executor_started) = executor_started {
+        audit["executor_started"] = json!(executor_started);
+    }
+    output.metadata["audit"] = audit;
     output
 }
 

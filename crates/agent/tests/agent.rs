@@ -3518,6 +3518,54 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
 }
 
 #[test]
+fn agent_loop_marks_preflight_command_binding_rejection_as_not_executed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "allowed recovery").expect("write readme");
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "command_1",
+        "command",
+        serde_json::json!({
+            "command": "echo safe",
+            "timeout_seconds": 5
+        }),
+    ));
+    response.tool_calls.push(tool_call(
+        "read_1",
+        "read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let result = agent_loop_with_capabilities(
+        vec![response],
+        allow_read_execute_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            supports_parallel_tool_calls: true,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    let command = result
+        .tool_results
+        .iter()
+        .find(|result| result.tool_name == "command")
+        .expect("command result");
+    assert_eq!(command.error_code.as_deref(), Some("sandbox_unavailable"));
+    assert_eq!(command.failure_kind, Some(ToolFailureKind::Sandbox));
+    let audit = command.audit_metadata().expect("command audit metadata");
+    assert_eq!(audit["executor_started"], false);
+    assert_eq!(audit["sandbox_backend"], "unavailable");
+    assert_eq!(audit["sandbox_enforcement"], "unavailable");
+    assert_eq!(
+        result.to_run_status().audit_events[0]["executor_started"],
+        false
+    );
+}
+
+#[test]
 fn agent_loop_rejects_an_unsafe_batch_before_history_or_tool_results() {
     let unsafe_name = "private/C:\\sensitive-tool";
     let unsafe_argument = "C:\\private\\credential.txt";
