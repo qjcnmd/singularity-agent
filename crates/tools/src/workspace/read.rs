@@ -358,7 +358,7 @@ impl WorkspaceTools {
             let file_type = entry.file_type().map_err(io_error)?;
             #[cfg(windows)]
             let is_symlink_or_reparse = file_type.is_symlink()
-                || metadata_is_symlink_or_reparse(&entry.full_metadata().map_err(io_error)?);
+                || metadata_is_symlink_or_reparse(&entry.metadata().map_err(io_error)?);
             #[cfg(not(windows))]
             let is_symlink_or_reparse = file_type.is_symlink();
             let relative = join_relative_path(prefix, &name);

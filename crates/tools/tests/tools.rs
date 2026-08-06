@@ -1878,6 +1878,41 @@ fn workspace_patch_rejects_unicode_case_aliases_before_writing() {
 
 #[cfg(windows)]
 #[test]
+fn workspace_list_handles_reserved_named_ntfs_entry() {
+    // Windows 保留设备名 nul 只能经 verbatim 路径创建为真实 NTFS 文件；
+    // 目录枚举必须把它当作普通 file 条目，而不是让整个 list 失败。
+    let workspace = test_workspace("reserved-name");
+    std::fs::write(workspace.join("regular.txt"), "regular").expect("write regular file");
+    let nul_path = format!("\\\\?\\{}\\nul", workspace.to_string_lossy());
+    std::fs::write(&nul_path, b"x").expect("create real nul file via verbatim path");
+
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+    let out = tools
+        .list(ListToolInput {
+            path: None,
+            max_entries: None,
+            recursive: false,
+            max_depth: Some(1),
+        })
+        .expect("list must succeed with a reserved-name entry");
+    let listing = out.content.to_string();
+    assert!(
+        listing.contains("regular.txt"),
+        "regular file must be listed: {listing}"
+    );
+    assert!(
+        listing.contains("\"nul\""),
+        "real nul file must be listed as a file: {listing}"
+    );
+    drop(tools);
+
+    // 只能用 verbatim 路径删除该 fixture；普通 temp cleanup 会被设备名语义阻断。
+    std::fs::remove_file(&nul_path).expect("remove nul fixture via verbatim path");
+    remove_workspace(&workspace);
+}
+
+#[cfg(windows)]
+#[test]
 fn workspace_tools_reject_junction_escape() {
     let workspace = test_workspace("junction-escape");
     let outside_dir = workspace.with_file_name(format!(
