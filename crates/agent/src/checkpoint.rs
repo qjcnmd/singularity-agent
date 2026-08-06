@@ -212,6 +212,7 @@ pub(super) struct HistoricalModelContext {
     pub(super) messages: Vec<ModelMessage>,
     pub(super) provider_reasoning_history: Vec<ProviderReasoningReplay>,
     pub(super) tool_result_occurrences: Vec<ToolResultOccurrence>,
+    pub(super) context_trace: Option<AgentContextTrace>,
 }
 
 impl HistoricalModelContext {
@@ -221,6 +222,7 @@ impl HistoricalModelContext {
             messages: checkpoint.state.messages.clone(),
             provider_reasoning_history: checkpoint.state.provider_reasoning_history.clone(),
             tool_result_occurrences: checkpoint.state.tool_result_occurrences.clone(),
+            context_trace: checkpoint.state.context_trace.clone(),
         }
     }
 }

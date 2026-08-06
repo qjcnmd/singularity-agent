@@ -5055,7 +5055,7 @@ fn compacted_turn_checkpoint_seeds_next_turn_with_summary_and_valid_tool_pairs()
         vec![command_response, required_verification, final_response],
         allow_read_execute_policy(),
         Arc::clone(&first_requests),
-        capabilities,
+        capabilities.clone(),
     )
     .with_workspace_tools(
         WorkspaceTools::new(dir.path())
@@ -5101,10 +5101,12 @@ fn compacted_turn_checkpoint_seeds_next_turn_with_summary_and_valid_tool_pairs()
         Arc::clone(&second_requests),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-    .run(
+    .run_with_events_and_checkpoints(
         &AgentLoopInput::new("thread_1", "turn_2", "second user")
             .with_historical_checkpoint(&checkpoint)
             .with_max_turns(1),
+        &mut |_event| Ok(()),
+        &mut |_event| Ok(()),
     );
     assert_eq!(second.status, AgentStatus::Completed, "second={second:?}");
 

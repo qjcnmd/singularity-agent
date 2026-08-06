@@ -1827,6 +1827,7 @@ where
             let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
             state.provider_reasoning_history = seed.provider_reasoning_history.clone();
             state.tool_result_occurrences = seed.tool_result_occurrences.clone();
+            state.context_trace = seed.context_trace.clone();
             state
         } else {
             let context = assemble_context_items_with_budget(&input.input, &public_budget);
@@ -2051,6 +2052,7 @@ where
             state.messages = prepare_seed_messages(seed, input, max_tool_calls, &current_user_text);
             state.provider_reasoning_history = seed.provider_reasoning_history.clone();
             state.tool_result_occurrences = seed.tool_result_occurrences.clone();
+            state.context_trace = seed.context_trace.clone();
         } else {
             let context = assemble_context_items_with_budget(&input.input, &budget);
             if current_turn_excluded(input, &context) {
@@ -6860,6 +6862,7 @@ mod cancellation_tests {
             ],
             provider_reasoning_history: Vec::new(),
             tool_result_occurrences: Vec::new(),
+            context_trace: None,
         };
         let input = AgentLoopInput::new("thread_1", "turn_2", "current user");
         let messages = prepare_seed_messages(&seed, &input, 1, "current user");
