@@ -123,7 +123,7 @@ sg config models --refresh
 
 OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wire 是否原生接受 `developer` 消息角色；设为 `false` 时，内部 developer 消息会在发送前投影为 `system`，不改变内部消息语义。省略时保持兼容默认值 `true`；provider 不接受 `developer` 角色时应显式写入 `false`。
 
-模型若在带工具调用的续接中返回 provider reasoning，必须显式设置 `tool_reasoning_history`：`disabled`（省略时的默认值）表示不回放历史 reasoning；`reasoning_content` 只适用于 `api_protocol: "chat"`，在 assistant tool-call 续接中原样回放 Chat Completions 的 `reasoning_content`；`responses_items` 只适用于 `api_protocol: "responses"`，原样回放 Responses reasoning items。启用非 `disabled` 值时，必须同时声明启用的 `reasoning_variants` 和匹配的 `default_variant`。取值应依据供应商官方协议说明或实际 wire 证据填写，不能从 `/models` 返回的模型 ID、模型名、URL 或 OpenAI-compatible 适配器推断。
+模型若在带工具调用的续接中返回 provider reasoning，必须显式设置 `tool_reasoning_history`：`disabled`（省略时的默认值）表示不回放历史 reasoning；`reasoning_content` 只适用于 `api_protocol: "chat"`，在 assistant tool-call 续接中原样回放 Chat Completions 的 `reasoning_content`；`responses_items` 只适用于 `api_protocol: "responses"`，在实际返回 reasoning output item 时按原序列原样回放并绑定对应的 function-call IDs；Responses 合法 tool-call 响应未返回 reasoning item 时不合成 replay，也不因缺失而拒绝。启用非 `disabled` 值时，必须同时声明启用的 `reasoning_variants` 和匹配的 `default_variant`。取值应依据供应商官方协议说明或实际 wire 证据填写，不能从 `/models` 返回的模型 ID、模型名、URL 或 OpenAI-compatible 适配器推断。
 
 用户配置可以为单个模型补充显式覆盖，例如：
 

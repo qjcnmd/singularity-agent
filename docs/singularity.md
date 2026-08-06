@@ -203,7 +203,7 @@ completion gate 保持以下不变量：
 
 ## 7. Model 与 provider
 
-Responses 工具响应只有在实际包含 reasoning output item 时才创建 provider-private replay；没有 reasoning item 的合法工具响应不合成 `reasoning_effort=off` 的伪状态。声明 `ReplayResponsesItems` 的严格能力仍要求可验证的 reasoning item 与工具调用绑定，否则在 provider 响应边界 fail closed。
+Responses 工具响应只有在实际包含 reasoning output item 时才创建 provider-private replay，并按原序列原样保存、绑定对应的 function-call IDs，供同一工具续接回放；没有 reasoning item 的合法工具响应不合成 `reasoning_effort=off` 的伪状态，也不因缺失而拒绝。存在 reasoning item 但其 ID、输出类型或 function-call 绑定非法时，仍在 provider 响应边界 fail closed。
 
 `ProviderConfigSnapshot` 在 app-server 或 Evaluation 进程启动时只捕获一次配置。运行时优先采用显式进程环境层，否则读取用户目录的 `config.json` 及其引用的私有认证文件；项目 `.env` 只可由用户主动传给 `sg config import-env`，不会自动进入运行时。若设置 `SINGULARITY_MODELS_CONFIG`，它作为进程环境层的唯一多-provider JSON 输入。JSON 的形状是 `{default_model, providers}`，provider 键是逻辑 `provider_id`，每个 provider 的 `models` 键是 allowlist，`api_key_env` 只引用环境变量名。`default_model`、`thread.start.model` 和 fork 的 model 使用完整 `provider_id/model_id`（按第一个 `/` 切分，后续 `/` 保留在 model id）；unknown provider/model、未 allowlist 或 malformed selector 都在本地 fail closed。当前唯一 adapter 是 `openai_compatible`；其他 adapter 以 `provider_adapter_unsupported` fail closed，不借用 OpenAI transport 伪装为已支持。每个 model 恰好声明 `chat` 或 `responses` 及 context/output limits，provider/model/protocol/limits 在一个 turn/trial 内不变。context window 未声明时保持 unknown，output limit 必须显式声明；配置上限分别为 2000000 和 1000000，且已知 output 必须严格小于已知 context。
 

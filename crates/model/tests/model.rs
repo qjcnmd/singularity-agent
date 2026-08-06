@@ -7512,11 +7512,11 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
     assert_eq!(payload["reasoning"]["effort"], "high");
 }
 
-/// 矩阵项 6（non-stream）：Responses，有 function call 但缺少 reasoning item →
-/// parse 校验拒绝（`responses_reasoning_replay_invalid`）→ 失败关闭。
+/// 矩阵项 6（non-stream）：Responses，有合法 function call 但未返回 reasoning item →
+/// 成功且不合成 provider replay。
 #[test]
-fn reasoning_replay_obligation_responses_tool_call_without_replay_fails_closed() {
-    let (base_url, _) = responses_provider_server(serde_json::json!({
+fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
         "id": "response_tool_call_no_reasoning",
         "object": "response",
         "status": "completed",
@@ -7576,23 +7576,23 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_fails_closed()
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
-    let error = provider
+    let response = provider
         .complete(
             &capability_test_request(None, false, 1),
             &singularity_core::CancellationToken::new(),
         )
-        .expect_err("Responses function call without reasoning must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_response_invalid")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"responses_reasoning_replay_invalid".to_string())
-    );
+        .expect("Responses function call without reasoning must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert!(response.provider_reasoning_history.is_empty());
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Responses requests");
+    let payload: serde_json::Value =
+        serde_json::from_str(&captured.last().expect("actual Responses request").1)
+            .expect("Responses payload JSON");
+    assert_eq!(payload["reasoning"]["effort"], "high");
 }
 
 /// 矩阵项 6（stream）：Responses stream，有 function call 且带合法 replay → 成功。
@@ -7703,10 +7703,10 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
     assert_eq!(payload["stream"], true);
 }
 
-/// 矩阵项 6（stream）：Responses stream，有 function call 但缺少 reasoning item →
-/// 失败关闭（`responses_reasoning_replay_invalid`）。
+/// 矩阵项 6（stream）：Responses stream，有合法 function call 但未返回 reasoning item →
+/// 成功且不合成 provider replay。
 #[test]
-fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_fails_closed() {
+fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeeds() {
     let completed = serde_json::json!({
         "type": "response.completed",
         "response": {
@@ -7777,24 +7777,17 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_fails_c
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
-    let error = provider
+    let response = provider
         .complete_stream(
             &capability_test_request(None, false, 1),
             &singularity_core::CancellationToken::new(),
             &mut |_| {},
         )
-        .expect_err("Responses stream function call without reasoning must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_response_invalid")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"responses_reasoning_replay_invalid".to_string())
-    );
+        .expect("Responses stream function call without reasoning must be accepted");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert!(response.provider_reasoning_history.is_empty());
     let payload: serde_json::Value = serde_json::from_str(
         &requests
             .recv_timeout(Duration::from_secs(1))

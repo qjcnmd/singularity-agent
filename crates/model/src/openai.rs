@@ -603,11 +603,7 @@ pub(super) fn parse_openai_responses_response(
     let has_reasoning_item = replay_items
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
-    let provider_reasoning_history = if !replay_items.is_empty()
-        && !tool_calls.is_empty()
-        && (has_reasoning_item
-            || capabilities.tool_reasoning_mode == ProviderToolReasoningMode::ReplayResponsesItems)
-    {
+    let provider_reasoning_history = if has_reasoning_item && !tool_calls.is_empty() {
         let tool_call_ids: Vec<String> = tool_calls
             .iter()
             .map(|call| call.tool_call_id.clone())
@@ -622,7 +618,8 @@ pub(super) fn parse_openai_responses_response(
     } else {
         Vec::new()
     };
-    if !tool_calls.is_empty()
+    if has_reasoning_item
+        && !tool_calls.is_empty()
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::ReplayResponsesItems
     {
         let Some(replay) = provider_reasoning_history.first() else {
