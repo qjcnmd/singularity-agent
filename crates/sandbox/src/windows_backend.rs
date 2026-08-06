@@ -813,11 +813,16 @@ fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
     if resolved == 0 {
         return None;
     }
+    let volume_len = volume
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(volume.len());
+    let volume_root = &volume[..volume_len];
     let mut filesystem = [0u16; 64];
     let filesystem_len = u32::try_from(filesystem.len()).ok()?;
     // SAFETY: `volume` and `filesystem` are valid NUL-terminated/writable buffers for the
     // duration of this call; unused serial/flags outputs are passed as null pointers.
-    let queried = unsafe {
+    let mut queried = unsafe {
         GetVolumeInformationW(
             volume.as_ptr(),
             std::ptr::null_mut(),
@@ -829,6 +834,24 @@ fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
             filesystem_len,
         )
     };
+    if queried == 0 {
+        // `GetVolumeInformationW` 未承诺接受 verbatim 卷根；仅当原表示失败且卷根是
+        // verbatim drive/UNC 时，用语义等价的 ordinary 形式重试一次。两次失败仍 fail closed。
+        if let Some(ordinary) = ordinary_windows_volume_root(volume_root) {
+            queried = unsafe {
+                GetVolumeInformationW(
+                    ordinary.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    filesystem.as_mut_ptr(),
+                    filesystem_len,
+                )
+            };
+        }
+    }
     if queried == 0 {
         return None;
     }
@@ -842,6 +865,40 @@ fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
             .take(64)
             .collect(),
     )
+}
+
+/// 把 verbatim drive/UNC 卷根转成语义等价的 ordinary 形式（NUL 终止输出）。
+///
+/// `\\?\C:\mount\` -> `C:\mount\`；`\\?\UNC\server\share\` -> `\\server\share\`；
+/// 其他形式（如 GUID 卷路径）或不完整 UNC 返回 `None`，不构造可能改变卷身份的字符串。
+#[cfg(windows)]
+fn ordinary_windows_volume_root(volume_root: &[u16]) -> Option<Vec<u16>> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const COLON: u16 = b':' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    let verbatim = [BACKSLASH, BACKSLASH, QUESTION, BACKSLASH];
+    let root = volume_root.strip_prefix(&verbatim)?;
+    let drive_letter = root.first().copied().map(|c| c | 0x20).unwrap_or(0);
+    let is_drive = root.len() >= 3
+        && (b'a' as u16..=b'z' as u16).contains(&drive_letter)
+        && root[1] == COLON
+        && root[2] == BACKSLASH;
+    if is_drive {
+        return Some(root.iter().copied().chain(once(0)).collect());
+    }
+    if root.len() >= 4
+        && root[0] == b'U' as u16
+        && root[1] == b'N' as u16
+        && root[2] == b'C' as u16
+        && root[3] == BACKSLASH
+        && root[4..].contains(&BACKSLASH)
+    {
+        let mut ordinary = vec![BACKSLASH, BACKSLASH];
+        ordinary.extend_from_slice(&root[4..]);
+        ordinary.push(0);
+        return Some(ordinary);
+    }
+    None
 }
 
 fn windows_filesystem_gate_error(filesystem: Option<&str>) -> Option<&'static str> {
@@ -2449,6 +2506,49 @@ mod tests {
             assert!(!report.proves_supported_contract_for("windows"));
         }
         assert!(!workspace.path().join("singularity-preflight.txt").exists());
+    }
+
+    #[test]
+    fn filesystem_fact_matches_ordinary_and_verbatim_workspace_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ordinary = PathBuf::from(workspace.path());
+        let mut verbatim = std::ffi::OsString::from("\\\\?\\");
+        verbatim.push(ordinary.as_os_str());
+        let fact_ordinary = windows_filesystem_fact(&ordinary);
+        let fact_verbatim = windows_filesystem_fact(Path::new(&verbatim));
+        // Windows 上两个表示指向同一卷，文件系统事实必须一致且可识别。
+        assert_eq!(fact_ordinary, fact_verbatim);
+        assert!(fact_ordinary.is_some(), "NTFS workspace must be recognized");
+    }
+
+    #[test]
+    fn ordinary_windows_volume_root_maps_only_verbatim_drive_and_unc() {
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        let unwide = |vec: &[u16]| -> String {
+            String::from_utf16_lossy(&vec[..vec.len().saturating_sub(1)])
+        };
+        // drive（保留 mount suffix 与末尾反斜杠）
+        let cases = [
+            ("\\\\?\\C:\\", "C:\\"),
+            ("\\\\?\\C:\\mount\\volume\\", "C:\\mount\\volume\\"),
+            ("\\\\?\\D:\\", "D:\\"),
+        ];
+        for (input, expected) in cases {
+            let out = ordinary_windows_volume_root(&wide(input))
+                .unwrap_or_else(|| panic!("{input} must map"));
+            assert_eq!(unwide(&out), expected, "input {input}");
+            assert_eq!(out.last(), Some(&0), "output must be NUL terminated");
+        }
+        // verbatim UNC -> ordinary UNC
+        let out = ordinary_windows_volume_root(&wide("\\\\?\\UNC\\server\\share\\"))
+            .expect("UNC must map");
+        assert_eq!(unwide(&out), "\\\\server\\share\\");
+        // GUID 卷路径与不完整 UNC 不构造
+        assert!(ordinary_windows_volume_root(&wide("\\\\?\\Volume{abc}\\")).is_none());
+        assert!(ordinary_windows_volume_root(&wide("\\\\?\\UNC\\server")).is_none());
+        // 非 verbatim 输入不转换
+        assert!(ordinary_windows_volume_root(&wide("C:\\")).is_none());
+        assert!(ordinary_windows_volume_root(&wide("\\\\server\\share\\")).is_none());
     }
 
     #[test]

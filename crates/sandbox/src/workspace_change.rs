@@ -13,7 +13,6 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::windows::ffi::OsStrExt as _;
 
 #[cfg(windows)]
-use cap_fs_ext::DirEntryExt as _;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata, OpenOptions};
@@ -1261,7 +1260,7 @@ fn visit_directory(
         #[cfg(windows)]
         let is_link = file_type.is_symlink()
             || entry
-                .full_metadata()
+                .metadata()
                 .map_err(|error| format!("workspace change snapshot metadata failed: {error}"))?
                 .is_symlink();
         #[cfg(not(windows))]
