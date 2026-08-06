@@ -1103,7 +1103,7 @@ fn execute_prepared_command(
                 lease
                     .duplicate_root_handle()
                     .map_err(|error| error.code().to_string())
-                    .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
+                    .and_then(|handle| snapshot_trusted_workspace_from_handle(&workspace, &handle))
                     .and_then(|after| before.trusted_change_summary(&after))
             });
         let summary = match summary {
@@ -1447,8 +1447,9 @@ impl PreparedCommand {
                             .duplicate_root_handle()
                             .map_err(|error| error.code().to_string())
                     })
-                    .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
-                {
+                    .and_then(|handle| {
+                        snapshot_trusted_workspace_from_handle(&workspace_root, &handle)
+                    }) {
                     Ok(snapshot) => Some(snapshot),
                     Err(_) => {
                         if let Some(lease) = trusted_workspace.as_mut()

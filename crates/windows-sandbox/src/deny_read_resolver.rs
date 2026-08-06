@@ -795,6 +795,26 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn reserved_named_glob_entry_stays_in_deny_read_projection() {
+        let tmp = TempDir::new().expect("tempdir");
+        let verbatim = format!(r"\\?\{}\nul", tmp.path().to_string_lossy());
+        std::fs::write(&verbatim, "secret").expect("create reserved file");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/nul*",
+            tmp.path().display()
+        ))]);
+
+        let reserved = tmp.path().join("nul");
+        let actual = resolve_windows_deny_read_paths(&policy, &cwd).expect("resolve");
+        assert!(
+            actual.iter().any(|path| path.as_path() == reserved),
+            "reserved path was not retained: {actual:?}"
+        );
+    }
+
     #[test]
     fn previously_protected_directory_is_reused_without_scanning_its_children() {
         let tmp = TempDir::new().expect("tempdir");

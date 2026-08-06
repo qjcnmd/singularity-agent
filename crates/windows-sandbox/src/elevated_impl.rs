@@ -268,6 +268,9 @@ mod windows_impl {
                     if reconcile_runner_leases(sandbox_home, 50)? {
                         return Ok(Some(guard));
                     }
+                    // A live runner lease may outlast this bounded reconciliation attempt. Yield
+                    // before retrying so a slow child cannot turn lease coordination into a spin.
+                    std::thread::park_timeout(Duration::from_millis(50));
                 }
             }
         }
@@ -916,7 +919,11 @@ mod windows_impl {
         let lease_cleanup = loop {
             match reconcile_runner_leases(sandbox_home, 50) {
                 Ok(true) => break Ok(()),
-                Ok(false) => {}
+                Ok(false) => {
+                    // Keep cleanup fail-closed while yielding between bounded waits for a live
+                    // runner lease to release.
+                    std::thread::park_timeout(Duration::from_millis(50));
+                }
                 Err(error) => break Err(error),
             }
         };

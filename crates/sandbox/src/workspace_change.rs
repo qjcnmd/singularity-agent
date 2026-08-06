@@ -24,12 +24,13 @@ use singularity_core::{
 #[cfg(windows)]
 use singularity_windows_sandbox::{
     AbsolutePathBuf, WorkspaceChangeObservation, WorkspacePathChangeKind,
+    open_pinned_workspace_path,
 };
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    FILE_GENERIC_READ, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
 };
 
 use super::WorkspaceChangeSummary;
@@ -452,6 +453,7 @@ pub(super) fn update_workspace_snapshot_as_sandbox_user(
         .collect::<BTreeSet<_>>();
     for (path, kind) in changed_paths {
         match refresh_observed_path(
+            workspace,
             &root,
             &path,
             kind,
@@ -466,6 +468,7 @@ pub(super) fn update_workspace_snapshot_as_sandbox_user(
 
     for parent in parents {
         match refresh_observed_path(
+            workspace,
             &root,
             &parent,
             WorkspacePathChangeKind::Modified,
@@ -498,6 +501,7 @@ enum IncrementalRefresh {
 
 #[cfg(windows)]
 fn refresh_observed_path(
+    workspace: &Path,
     root: &Dir,
     path: &str,
     kind: WorkspacePathChangeKind,
@@ -555,6 +559,7 @@ fn refresh_observed_path(
                 .saturating_add(snapshot.protected_paths.len())
                 .saturating_add(snapshot.protected_entries.len());
             let mut state = SnapshotState {
+                workspace_root: workspace.to_path_buf(),
                 entries: BTreeMap::new(),
                 protected_paths: BTreeSet::new(),
                 protected_entries: BTreeMap::new(),
@@ -649,13 +654,18 @@ fn refresh_observed_path(
     }
     remove_snapshot_entry_bytes(snapshot.entries.get(path), total_file_bytes)?;
     let mut state = SnapshotState {
+        workspace_root: workspace.to_path_buf(),
         entries: BTreeMap::new(),
         protected_paths: BTreeSet::new(),
         protected_entries: BTreeMap::new(),
         visited_entries: 1,
         total_file_bytes: *total_file_bytes,
     };
-    let entry = snapshot_file(&parent, Path::new(&name), &mut state)?;
+    let absolute_parent = path.rsplit_once('/').map_or_else(
+        || workspace.to_path_buf(),
+        |(parent, _)| workspace.join(parent),
+    );
+    let entry = snapshot_file(&parent, Path::new(&name), &absolute_parent, &mut state)?;
     if matches!(
         &entry,
         SnapshotEntry::File {
@@ -1083,6 +1093,7 @@ pub(super) fn snapshot_trusted_workspace(workspace: &Path) -> Result<WorkspaceSn
 /// Snapshot a trusted workspace through an already pinned root handle.
 #[cfg(target_os = "windows")]
 pub(super) fn snapshot_trusted_workspace_from_handle(
+    workspace: &Path,
     handle: &std::fs::File,
 ) -> Result<WorkspaceSnapshot, String> {
     let root = Dir::from_std_file(
@@ -1090,7 +1101,7 @@ pub(super) fn snapshot_trusted_workspace_from_handle(
             .try_clone()
             .map_err(|error| format!("workspace change snapshot handle clone failed: {error}"))?,
     );
-    snapshot_opened_directory(root, false, false, &BTreeSet::new())
+    snapshot_opened_directory(root, workspace, false, false, &BTreeSet::new())
 }
 
 #[cfg(windows)]
@@ -1134,6 +1145,7 @@ fn snapshot_workspace_with_protected_paths(
         workspace_relative_protected_paths(workspace, explicit_protected_paths)?;
     snapshot_opened_directory(
         root,
+        workspace,
         protect_paths,
         inspect_public_certificates,
         &explicit_protected_paths,
@@ -1142,6 +1154,7 @@ fn snapshot_workspace_with_protected_paths(
 
 fn snapshot_opened_directory(
     root: Dir,
+    workspace: &Path,
     protect_paths: bool,
     inspect_public_certificates: bool,
     explicit_protected_paths: &BTreeSet<String>,
@@ -1149,6 +1162,7 @@ fn snapshot_opened_directory(
     let root_before = entry_metadata_from_dir(&root)
         .map_err(|error| format!("workspace root metadata failed: {error}"))?;
     let mut state = SnapshotState {
+        workspace_root: workspace.to_path_buf(),
         entries: BTreeMap::new(),
         protected_paths: BTreeSet::new(),
         protected_entries: BTreeMap::new(),
@@ -1179,6 +1193,7 @@ fn snapshot_opened_directory(
 }
 
 struct SnapshotState {
+    workspace_root: PathBuf,
     entries: BTreeMap<String, SnapshotEntry>,
     protected_paths: BTreeSet<String>,
     protected_entries: BTreeMap<String, EntryMetadata>,
@@ -1198,6 +1213,7 @@ fn visit_directory(
     if depth > MAX_SNAPSHOT_DEPTH {
         return Err("workspace change snapshot exceeds the depth bound".to_string());
     }
+    let absolute_parent = state.workspace_root.join(relative_parent);
     let mut entries = directory
         .entries()
         .map_err(|error| format!("workspace change snapshot enumeration failed: {error}"))?
@@ -1223,6 +1239,26 @@ fn visit_directory(
         let file_type = entry
             .file_type()
             .map_err(|error| format!("workspace change snapshot type failed: {error}"))?;
+        #[cfg(windows)]
+        if is_reserved_windows_name(&name) {
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("workspace change snapshot metadata failed: {error}"))?;
+            if cap_std::fs::MetadataExt::file_attributes(&metadata) & 0x0400 != 0 {
+                return Err(format!(
+                    "workspace change snapshot found a reparse point: {relative_text}"
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(format!(
+                    "workspace change snapshot found an unsupported object: {relative_text}"
+                ));
+            }
+            let snapshot_entry =
+                snapshot_file(directory, Path::new(&name), &absolute_parent, state)?;
+            state.entries.insert(relative_text, snapshot_entry);
+            continue;
+        }
         if protect_paths
             && (is_protected_path(name_text)
                 || is_protected_path(&relative_text)
@@ -1233,7 +1269,8 @@ fn visit_directory(
                 && is_public_certificate_pem_path(&relative_text)
                 && is_public_certificate_entry(directory, Path::new(&name))?
             {
-                let snapshot_entry = snapshot_file(directory, Path::new(&name), state)?;
+                let snapshot_entry =
+                    snapshot_file(directory, Path::new(&name), &absolute_parent, state)?;
                 if !is_public_certificate_entry(directory, Path::new(&name))? {
                     return Err(
                         "public certificate changed while its workspace snapshot was captured"
@@ -1298,7 +1335,7 @@ fn visit_directory(
                 .insert(relative_text, SnapshotEntry::Directory { metadata: before });
             continue;
         } else if file_type.is_file() {
-            snapshot_file(directory, Path::new(&name), state)?
+            snapshot_file(directory, Path::new(&name), &absolute_parent, state)?
         } else {
             return Err(format!(
                 "workspace change snapshot found an unsupported object: {relative_text}"
@@ -1307,6 +1344,48 @@ fn visit_directory(
         state.entries.insert(relative_text, snapshot_entry);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+    let stem = stem.trim_end().to_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM0"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT0"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    )
 }
 
 fn snapshot_symlink(directory: &Dir, name: &Path) -> Result<SnapshotEntry, String> {
@@ -1367,13 +1446,21 @@ fn is_public_certificate_entry(directory: &Dir, name: &Path) -> Result<bool, Str
 fn snapshot_file(
     directory: &Dir,
     name: &Path,
+    _absolute_parent: &Path,
     state: &mut SnapshotState,
 ) -> Result<SnapshotEntry, String> {
+    #[cfg(windows)]
+    if is_reserved_windows_name(name.as_os_str()) {
+        return snapshot_reserved_file(directory, name, _absolute_parent, state);
+    }
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let mut file = directory
-        .open_with(name, &options)
-        .map_err(|error| format!("workspace change file open failed: {error}"))?;
+    let mut file = directory.open_with(name, &options).map_err(|error| {
+        format!(
+            "workspace change file open failed for {}: {error}",
+            name.display()
+        )
+    })?;
     let before = entry_metadata_from_file(&file)
         .map_err(|error| format!("workspace change file metadata failed: {error}"))?;
     state.total_file_bytes = state
@@ -1400,6 +1487,77 @@ fn snapshot_file(
         .map_err(|error| format!("workspace change path revalidation failed: {error}"))?;
     if before != after || before != path_after {
         return Err("workspace changed while its file snapshot was being captured".to_string());
+    }
+    Ok(SnapshotEntry::File {
+        metadata: before,
+        content_digest: format!("sha256:{:x}", hasher.finalize()),
+    })
+}
+
+#[cfg(windows)]
+fn snapshot_reserved_file(
+    directory: &Dir,
+    name: &Path,
+    absolute_parent: &Path,
+    state: &mut SnapshotState,
+) -> Result<SnapshotEntry, String> {
+    let parent_handle = directory
+        .try_clone()
+        .map_err(|error| format!("workspace change reserved-file parent clone failed: {error}"))?
+        .into_std_file();
+    let target = absolute_parent.join(name);
+    let open = || {
+        open_pinned_workspace_path(&parent_handle, absolute_parent, &target, FILE_GENERIC_READ)
+            .map_err(|error| {
+                format!(
+                    "workspace change reserved-file open failed for {}: {error}",
+                    target.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "workspace change reserved-file path escaped its parent: {}",
+                    target.display()
+                )
+            })
+    };
+    let mut file = cap_std::fs::File::from_std(open()?);
+    let before = entry_metadata_from_file(&file)
+        .map_err(|error| format!("workspace change reserved-file metadata failed: {error}"))?;
+    if before.object_kind != 1 {
+        return Err(format!(
+            "workspace change snapshot found an unsupported object: {}",
+            target.display()
+        ));
+    }
+    state.total_file_bytes = state
+        .total_file_bytes
+        .checked_add(before.length)
+        .ok_or_else(|| "workspace change snapshot size overflowed".to_string())?;
+    if state.total_file_bytes > MAX_SNAPSHOT_FILE_BYTES {
+        return Err("workspace change snapshot exceeds the content bound".to_string());
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("workspace change reserved-file read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after_handle = entry_metadata_from_file(&file)
+        .map_err(|error| format!("workspace change reserved-file revalidation failed: {error}"))?;
+    let second = cap_std::fs::File::from_std(open()?);
+    let after_path = entry_metadata_from_file(&second).map_err(|error| {
+        format!("workspace change reserved-file path revalidation failed: {error}")
+    })?;
+    if before != after_handle || before != after_path {
+        return Err(
+            "workspace changed while its reserved file snapshot was being captured".to_string(),
+        );
     }
     Ok(SnapshotEntry::File {
         metadata: before,
@@ -2006,6 +2164,39 @@ mod tests {
                 .change_summary(&replaced)
                 .expect_err("protected replacement must fail closed"),
             "protected workspace state changed between trusted observations"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_tracks_reserved_named_file_content() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nul_path = format!(r"\\?\{}\nul", workspace.path().to_string_lossy());
+        std::fs::write(&nul_path, b"before").expect("create reserved-name fixture");
+
+        let before = snapshot_trusted_workspace(workspace.path()).expect("reserved-name snapshot");
+        std::fs::write(&nul_path, b"after").expect("modify reserved-name fixture");
+        let after =
+            snapshot_trusted_workspace(workspace.path()).expect("snapshot after modification");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("reserved-name change summary")
+            .expect("reserved-name content changed");
+        assert_eq!(summary.changed_files, ["nul"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_rejects_reserved_named_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nul_path = format!(r"\\?\{}\nul", workspace.path().to_string_lossy());
+        std::fs::create_dir(&nul_path).expect("create reserved-name directory fixture");
+
+        let error = snapshot_trusted_workspace(workspace.path()).expect_err("reserved directory");
+        assert!(
+            error.contains("unsupported object"),
+            "unexpected error: {error}"
         );
     }
 

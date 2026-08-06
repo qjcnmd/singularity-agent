@@ -366,8 +366,6 @@ pub fn acquire_registered_runner_lease(lease_name: &str) -> Result<RunnerLeaseGu
 /// Waits for active runner-owned leases and prunes released or abandoned entries.
 pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> Result<bool> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let deadline = (timeout_ms != INFINITE)
-        .then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
     let (state_path, leases) = {
         let lock = lock_state(&state_path)?;
         let state_path = lock.path().to_path_buf();
@@ -377,6 +375,10 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
             .collect::<Vec<_>>();
         (state_path, leases)
     };
+    // State locking and loading are serialized bookkeeping, not runner lease waiting. Start the
+    // lease deadline after the snapshot so slow state I/O cannot suppress stale-lease cleanup.
+    let deadline = (timeout_ms != INFINITE)
+        .then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
     for lease_name in leases {
         validate_runner_lease_name(&lease_name)?;
         let remaining_ms = deadline.map_or(INFINITE, |deadline| {
@@ -387,9 +389,8 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
                 remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32
             }
         });
-        if remaining_ms == 0 {
-            return Ok(false);
-        }
+        // A zero-timeout wait still observes an already-signaled or missing mutex and therefore
+        // must be allowed to prune stale bookkeeping; it only refuses to wait for a live lease.
         let Some(lease_mutex) = wait_raw_named_mutex(&lease_name, remaining_ms)? else {
             return Ok(false);
         };
@@ -1304,6 +1305,48 @@ mod tests {
         );
         let state = load_state(&sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE))
             .expect("load reconciled lease state");
+        assert!(state.active_runner_leases.is_empty());
+    }
+
+    #[test]
+    fn stale_runner_lease_is_reconciled_after_state_lock_wait_exceeds_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let username = std::env::var("USERNAME").expect("current Windows username");
+        let registration =
+            register_runner_lease(&sandbox_home, &username).expect("register runner lease");
+        let lease_name = registration.name().to_string();
+        drop(registration);
+
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let state_lock = lock_state(&state_path).expect("hold state lock during reconciliation");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_home = sandbox_home.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal reconciliation start");
+            reconcile_runner_leases(&worker_home, 1)
+        });
+        started_rx.recv().expect("wait for reconciliation start");
+        for _ in 0..20 {
+            assert!(
+                !worker.is_finished(),
+                "reconciliation must wait for the state lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(state_lock);
+
+        assert!(
+            worker
+                .join()
+                .expect("join delayed reconciliation")
+                .expect("reconcile delayed stale lease")
+        );
+        assert!(
+            super::acquire_registered_runner_lease(&lease_name).is_err(),
+            "a stale lease must be removed after a slow state snapshot"
+        );
+        let state = load_state(&state_path).expect("load reconciled lease state");
         assert!(state.active_runner_leases.is_empty());
     }
 
