@@ -26,8 +26,9 @@ pub use manifest::{
 pub use report::{
     CacheMetrics, ControlLoopMetrics, EvaluationDimensions, EvaluationMetrics, EvaluationReport,
     EvaluationReportSchemaVersion, EvaluationSystemResult, FailureAttribution, FailureOwner,
-    FailureStage, MetricRatio, MetricStatistics, MetricUnavailableReason, MetricValue,
-    ProviderUsageMetrics, REPORT_SCHEMA_VERSION, TimingMetrics, failure_owner_for_blocker,
+    FailureStage, HarnessMetrics, MetricRatio, MetricStatistics, MetricUnavailableReason,
+    MetricValue, ProviderUsageMetrics, REPORT_SCHEMA_VERSION, TimingMetrics,
+    failure_owner_for_blocker,
 };
 pub use result::{
     BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,

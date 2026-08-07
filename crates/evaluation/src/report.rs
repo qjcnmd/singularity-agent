@@ -13,17 +13,18 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 /// Current formal report schema identifier.
-pub const REPORT_SCHEMA_VERSION: &str = "evaluation.report/v1";
+pub const REPORT_SCHEMA_VERSION: &str = "evaluation.report/v2";
 
 /// Stable report schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvaluationReportSchemaVersion {
-    #[serde(rename = "evaluation.report/v1")]
-    V1,
+    #[serde(rename = "evaluation.report/v2")]
+    V2,
 }
 
 /// A metric value with an explicit producer/availability state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum MetricValue<T> {
     Available { value: T },
@@ -289,6 +290,29 @@ pub struct EvaluationMetrics {
     pub provider_usage: ProviderUsageMetrics,
     pub cache: CacheMetrics,
     pub control_loop: ControlLoopMetrics,
+    pub harness: HarnessMetrics,
+}
+
+/// Non-gating metrics whose values come from explicit Evaluation/Agent producers.
+///
+/// A metric remains `Unavailable` when its producer did not emit a trustworthy observation;
+/// unavailable values are never converted to zero or inferred from related counters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMetrics {
+    /// Token cost per successful functional task, unavailable until a producer records it.
+    pub tokens_per_functional_success: MetricValue<MetricStatistics>,
+    /// Wall-clock time per successful functional task, unavailable until a producer records it.
+    pub time_per_functional_success: MetricValue<MetricStatistics>,
+    /// First-attempt tool success projected directly from the tool-attempt producer.
+    pub tool_first_attempt_success_rate: MetricValue<MetricRatio>,
+    /// Functional pass-rate delta (non-compacted minus compacted), in basis points; positive
+    /// values indicate decay and negative values indicate an improvement after compaction.
+    pub compaction_performance_decay: MetricValue<i32>,
+    /// Completion rate for explicit recovery observations.
+    pub recovery_completion_rate: MetricValue<MetricRatio>,
+    /// Count of verified evaluator-path bypasses; unavailable when integrity evidence is absent.
+    pub verification_bypass_count: MetricValue<u64>,
 }
 
 /// Typed owner of a failed trial or evaluation stage.
@@ -331,7 +355,7 @@ pub struct FailureAttribution {
     pub message: String,
 }
 
-/// Typed `evaluation.report/v1` artifact.
+/// Typed `evaluation.report/v2` artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationReport {
@@ -369,7 +393,7 @@ impl EvaluationReport {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema != EvaluationReportSchemaVersion::V1 {
+        if self.schema != EvaluationReportSchemaVersion::V2 {
             return Err(validation_error("unsupported evaluation report schema"));
         }
         self.dimensions.validate()?;
@@ -532,6 +556,26 @@ fn validate_metrics(metrics: &EvaluationMetrics) -> Result<()> {
         &metrics.cache.capability_hit_ratio,
         "capability cache hit ratio",
     )?;
+    validate_metric_statistics(
+        &metrics.harness.tokens_per_functional_success,
+        "tokens per functional success",
+    )?;
+    validate_metric_statistics(
+        &metrics.harness.time_per_functional_success,
+        "time per functional success",
+    )?;
+    validate_ratio(
+        &metrics.harness.tool_first_attempt_success_rate,
+        "tool first-attempt success rate",
+    )?;
+    validate_ratio(
+        &metrics.harness.recovery_completion_rate,
+        "recovery completion rate",
+    )?;
+    validate_signed_basis_points(
+        &metrics.harness.compaction_performance_decay,
+        "compaction performance decay",
+    )?;
     Ok(())
 }
 
@@ -545,6 +589,17 @@ fn validate_metric_statistics(metric: &MetricValue<MetricStatistics>, context: &
 fn validate_ratio(metric: &MetricValue<MetricRatio>, context: &str) -> Result<()> {
     if let MetricValue::Available { value } = metric {
         value.validate(context)?;
+    }
+    Ok(())
+}
+
+fn validate_signed_basis_points(metric: &MetricValue<i32>, context: &str) -> Result<()> {
+    if let MetricValue::Available { value } = metric
+        && !(-10_000..=10_000).contains(value)
+    {
+        return Err(validation_error(format!(
+            "{context} must be within signed basis points"
+        )));
     }
     Ok(())
 }
@@ -577,8 +632,41 @@ mod tests {
     }
 
     #[test]
-    fn report_reader_requires_the_formal_schema_key() {
-        let error = EvaluationReport::from_json_str(r#"{"schema_version":"evaluation.report/v1"}"#)
+    fn harness_metrics_round_trip_preserves_unavailable_values() {
+        let metrics = HarnessMetrics {
+            tokens_per_functional_success: MetricValue::unavailable(
+                MetricUnavailableReason::NoProducer,
+            ),
+            time_per_functional_success: MetricValue::unavailable(
+                MetricUnavailableReason::NoProducer,
+            ),
+            tool_first_attempt_success_rate: MetricValue::available(
+                MetricRatio::new(3, 4).expect("ratio"),
+            ),
+            // A negative delta is valid and represents an improvement after compaction.
+            compaction_performance_decay: MetricValue::available(-250),
+            recovery_completion_rate: MetricValue::unavailable(
+                MetricUnavailableReason::NotObserved,
+            ),
+            verification_bypass_count: MetricValue::unavailable(
+                MetricUnavailableReason::NotObserved,
+            ),
+        };
+        let encoded = serde_json::to_string(&metrics).expect("harness metrics serialize");
+        let decoded: HarnessMetrics =
+            serde_json::from_str(&encoded).expect("harness metrics deserialize");
+        assert_eq!(decoded, metrics);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("json");
+        assert_eq!(
+            value["tokens_per_functional_success"]["state"],
+            "unavailable"
+        );
+        assert_eq!(value["verification_bypass_count"]["reason"], "not_observed");
+    }
+
+    #[test]
+    fn report_reader_requires_v2_and_rejects_v1() {
+        let error = EvaluationReport::from_json_str(r#"{"schema":"evaluation.report/v1"}"#)
             .expect_err("legacy schema key must be rejected");
         assert!(matches!(
             error,
@@ -587,5 +675,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn harness_metrics_reject_unknown_fields() {
+        let error = serde_json::from_str::<HarnessMetrics>(
+            r#"{
+                "tokens_per_functional_success": {"state":"unavailable","reason":"no_producer"},
+                "time_per_functional_success": {"state":"unavailable","reason":"no_producer"},
+                "tool_first_attempt_success_rate": {"state":"unavailable","reason":"no_producer"},
+                "compaction_performance_decay": {"state":"unavailable","reason":"not_observed"},
+                "recovery_completion_rate": {"state":"unavailable","reason":"not_observed"},
+                "verification_bypass_count": {"state":"unavailable","reason":"not_observed"},
+                "unexpected": true
+            }"#,
+        )
+        .expect_err("unknown harness metric field must be rejected");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn compaction_decay_rejects_out_of_range_basis_points() {
+        assert!(
+            validate_signed_basis_points(
+                &MetricValue::available(10_001),
+                "compaction performance decay",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_signed_basis_points(
+                &MetricValue::available(-10_001),
+                "compaction performance decay",
+            )
+            .is_err()
+        );
     }
 }

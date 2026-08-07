@@ -19,10 +19,10 @@ use crate::{
     EvaluationProviderEvidence, EvaluationReport, EvaluationReportSchemaVersion, EvaluationResult,
     EvaluationSandboxPreflight, EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome,
     EvaluationStageResults, EvaluationStatus, EvaluationSystemResult, EvaluationTaskResult,
-    EvaluationTrialResult, FailureAttribution, FailureOwner, FailureStage, MetricRatio,
-    MetricStatistics, MetricUnavailableReason, MetricValue, PatchFormat, PlannedWorkspaceSource,
-    ProviderUsageMetrics, RunId, StageResult, StageStatus, TaskId, TimingMetrics,
-    VerificationStagePlan, WorkspacePlan, failure_owner_for_blocker,
+    EvaluationTrialResult, FailureAttribution, FailureOwner, FailureStage, HarnessMetrics,
+    MetricRatio, MetricStatistics, MetricUnavailableReason, MetricValue, PatchFormat,
+    PlannedWorkspaceSource, ProviderUsageMetrics, RelativePath, RunId, StageResult, StageStatus,
+    TaskId, TimingMetrics, VerificationStagePlan, WorkspacePlan, failure_owner_for_blocker,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,10 +49,10 @@ use singularity_protocol::{
 use singularity_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest,
-    CommandResult, CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability,
+    CommandResult, CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability, PATCH_TOOL,
     SandboxBackend, SandboxCapabilities, SandboxNetworkMode, SandboxPreflightFact,
-    SandboxPreflightOutcome, SandboxPreflightReport, ToolBroker, ToolRegistry, WorkspaceMutation,
-    WorkspaceTools, workspace_tool_entries,
+    SandboxPreflightOutcome, SandboxPreflightReport, ToolBroker, ToolFailureKind, ToolRegistry,
+    ToolResult, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceTools, workspace_tool_entries,
 };
 
 mod command;
@@ -292,6 +292,9 @@ struct TaskDiagnostics {
     prompt_fingerprint: Option<String>,
     tool_schema_fingerprint: Option<String>,
     provider_evidence: Option<EvaluationProviderEvidence>,
+    /// Count of model tool occurrences that changed evaluator integrity paths.
+    /// `None` means the control-plane paths or an execution summary were not fully observed.
+    verification_bypass_count: Option<u64>,
 }
 
 struct StageExecution {
@@ -367,6 +370,7 @@ struct AgentStageExecution {
     prompt_fingerprint: Option<String>,
     tool_schema_fingerprint: Option<String>,
     provider_evidence: Option<EvaluationProviderEvidence>,
+    verification_bypass_count: Option<u64>,
 }
 
 struct TaskExecution {
@@ -1609,7 +1613,7 @@ fn build_evaluation_report(
         .map(|execution| execution.result.clone())
         .collect();
     let report = EvaluationReport {
-        schema: EvaluationReportSchemaVersion::V1,
+        schema: EvaluationReportSchemaVersion::V2,
         run_id: result.run_id.clone(),
         manifest: safe_text(&params.manifest),
         runner: RUNNER_NAME.to_string(),
@@ -1730,6 +1734,143 @@ fn metric_statistics<T>(
             .map(MetricValue::available)
             .unwrap_or_else(|| MetricValue::unavailable(MetricUnavailableReason::NotObserved)),
         Err(reason) => MetricValue::unavailable(reason),
+    }
+}
+
+/// Project the provider/tool samples for one successful functional trial.
+///
+/// Functional success is the only denominator for the per-success cost metrics.  A successful
+/// trial without a provider usage observation is retained as `NotObserved` rather than turning
+/// its default token count into a zero sample.
+fn functional_success_statistics(
+    samples: &[&TaskExecution],
+    value: impl Fn(&TaskExecution) -> Option<u64>,
+) -> MetricValue<MetricStatistics> {
+    let successful = samples
+        .iter()
+        .copied()
+        .filter(|execution| execution.result.functional_task_success)
+        .collect::<Vec<_>>();
+    if successful.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    }
+    let values = successful.into_iter().filter_map(value).collect::<Vec<_>>();
+    if values.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NotObserved);
+    }
+    MetricStatistics::from_values(&values)
+        .map(MetricValue::available)
+        .unwrap_or_else(|| MetricValue::unavailable(MetricUnavailableReason::NotObserved))
+}
+
+/// Read a ratio emitted by the typed trace producer.
+///
+/// `Store` publishes rate metrics as a one-sample distribution whose value is already in basis
+/// points.  The report ratio keeps that exact value with a 10,000-point denominator; it does not
+/// reconstruct a ratio from invalid/repeated/repair counters.
+fn trace_metric_ratio(
+    trace_metrics: Option<&TraceMetrics>,
+    name: TraceMetricName,
+) -> MetricValue<MetricRatio> {
+    let Some(trace_metrics) = trace_metrics else {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    };
+    let Some(metric) = trace_metrics.metric(name.as_storage_text()) else {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    };
+    match (&metric.availability, &metric.distribution) {
+        (TraceMetricAvailability::Available, Some(distribution)) if distribution.count == 1 => {
+            MetricRatio::new(distribution.sum, 10_000)
+                .map(MetricValue::available)
+                .unwrap_or_else(|| MetricValue::unavailable(MetricUnavailableReason::NotObserved))
+        }
+        (TraceMetricAvailability::Available, Some(_)) => {
+            MetricValue::unavailable(MetricUnavailableReason::NotObserved)
+        }
+        (TraceMetricAvailability::Available, None) => {
+            MetricValue::unavailable(MetricUnavailableReason::NotObserved)
+        }
+        (TraceMetricAvailability::Unavailable { reason }, _) => {
+            MetricValue::unavailable(metric_unavailable_from_trace(*reason))
+        }
+    }
+}
+
+fn compaction_performance_decay(samples: &[&TaskExecution]) -> MetricValue<i32> {
+    if samples.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    }
+    let mut non_compacted_total = 0_u64;
+    let mut non_compacted_successes = 0_u64;
+    let mut compacted_total = 0_u64;
+    let mut compacted_successes = 0_u64;
+    for execution in samples {
+        if execution.diagnostics.compaction_count == 0 {
+            non_compacted_total = non_compacted_total.saturating_add(1);
+            if execution.result.functional_task_success {
+                non_compacted_successes = non_compacted_successes.saturating_add(1);
+            }
+        } else {
+            compacted_total = compacted_total.saturating_add(1);
+            if execution.result.functional_task_success {
+                compacted_successes = compacted_successes.saturating_add(1);
+            }
+        }
+    }
+    if non_compacted_total == 0 || compacted_total == 0 {
+        return MetricValue::unavailable(MetricUnavailableReason::NotObserved);
+    }
+    let non_compacted_rate = non_compacted_successes
+        .saturating_mul(10_000)
+        .checked_div(non_compacted_total)
+        .and_then(|value| i32::try_from(value).ok());
+    let compacted_rate = compacted_successes
+        .saturating_mul(10_000)
+        .checked_div(compacted_total)
+        .and_then(|value| i32::try_from(value).ok());
+    match (non_compacted_rate, compacted_rate) {
+        (Some(non_compacted_rate), Some(compacted_rate)) => {
+            MetricValue::available(non_compacted_rate - compacted_rate)
+        }
+        _ => MetricValue::unavailable(MetricUnavailableReason::NotObserved),
+    }
+}
+
+fn verification_bypass_metric(samples: &[&TaskExecution]) -> MetricValue<u64> {
+    if samples.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    }
+    let mut total = 0_u64;
+    for execution in samples {
+        let Some(count) = execution.diagnostics.verification_bypass_count else {
+            return MetricValue::unavailable(MetricUnavailableReason::NotObserved);
+        };
+        total = total.saturating_add(count);
+    }
+    MetricValue::available(total)
+}
+
+fn build_harness_metrics(
+    samples: &[&TaskExecution],
+    trace_metrics: Option<&TraceMetrics>,
+) -> HarnessMetrics {
+    HarnessMetrics {
+        tokens_per_functional_success: functional_success_statistics(samples, |execution| {
+            execution
+                .diagnostics
+                .provider_usage_available
+                .then_some(execution.diagnostics.total_tokens)
+        }),
+        time_per_functional_success: functional_success_statistics(samples, |execution| {
+            Some(execution.diagnostics.trial_duration_ms)
+        }),
+        tool_first_attempt_success_rate: trace_metric_ratio(
+            trace_metrics,
+            TraceMetricName::ToolFirstAttemptSuccessRateBps,
+        ),
+        compaction_performance_decay: compaction_performance_decay(samples),
+        recovery_completion_rate: MetricValue::unavailable(MetricUnavailableReason::NoProducer),
+        verification_bypass_count: verification_bypass_metric(samples),
     }
 }
 
@@ -1916,6 +2057,7 @@ fn build_evaluation_metrics(
             |d| Some(u64::from(d.verification_satisfied_command_count)),
         ),
     };
+    let harness = build_harness_metrics(&samples, trace_metrics);
     EvaluationMetrics {
         timing: TimingMetrics {
             run_duration_ms: MetricValue::available(run_duration_ms),
@@ -2013,6 +2155,7 @@ fn build_evaluation_metrics(
             source_template_materialization_latency_ms,
         },
         control_loop: control,
+        harness,
     }
 }
 
@@ -2741,6 +2884,7 @@ fn run_task_inner(
     diagnostics.prompt_fingerprint = agent_execution.prompt_fingerprint.clone();
     diagnostics.tool_schema_fingerprint = agent_execution.tool_schema_fingerprint.clone();
     diagnostics.provider_evidence = agent_execution.provider_evidence.clone();
+    diagnostics.verification_bypass_count = agent_execution.verification_bypass_count;
     if agent_execution.stage.result.status == StageStatus::Blocked
         && (agent_execution.workspace.is_none() || agent_execution.patch_evidence.is_empty())
     {
@@ -3687,6 +3831,9 @@ fn run_agent_stage(
             );
         }
     };
+    // The integrity target set is control-plane data.  Keep it in memory only; hidden
+    // evaluator paths never enter the prompt, trace, or published diagnostics.
+    let integrity_paths = verification_integrity_paths(prepared.plan, &before);
     match workspace_root_identity(agent_dir) {
         Ok(identity) if identity == before_identity => {}
         Ok(_) => {
@@ -3810,6 +3957,9 @@ fn run_agent_stage(
         .with_workspace_tools(workspace_tools)
         .with_cancellation_token(prepared.cancellation.clone())
         .run_with_events(&input, &mut on_event);
+    let verification_bypass_count = integrity_paths
+        .as_ref()
+        .and_then(|paths| verification_bypass_count_for_results(&result.tool_results, paths));
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     diagnostics.agent_duration_ms = agent_duration_ms;
     let run_status = result.to_run_status();
@@ -3912,6 +4062,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
     };
@@ -3949,6 +4100,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
     };
@@ -3987,6 +4139,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
     };
@@ -4030,6 +4183,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
         Err(error) => {
@@ -4064,6 +4218,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
     }
@@ -4105,6 +4260,7 @@ fn run_agent_stage(
                 prompt_fingerprint: Some(prompt_fingerprint.clone()),
                 tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
                 provider_evidence: Some(provider_evidence.clone()),
+                verification_bypass_count: None,
             };
         }
     };
@@ -4179,7 +4335,376 @@ fn run_agent_stage(
         prompt_fingerprint: Some(prompt_fingerprint),
         tool_schema_fingerprint: Some(tool_schema_fingerprint),
         provider_evidence: Some(provider_evidence),
+        verification_bypass_count,
     }
+}
+
+/// Resolve the evaluator-owned integrity target set without exposing its paths to the model.
+///
+/// A missing or ambiguous patch/command path makes the producer unavailable.  We deliberately
+/// keep this parser narrower than a shell parser: manifest commands are direct argv, and only
+/// path arguments that can be bound to a controlled workspace entry are admitted.
+fn verification_integrity_paths(
+    plan: &WorkspacePlan,
+    workspace: &WorkspaceSnapshot,
+) -> Option<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    for patch in [
+        plan.baseline.test_patch.as_ref(),
+        plan.public.test_patch.as_ref(),
+        plan.hidden.test_patch.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        paths.extend(parse_unified_diff_paths(patch.content())?);
+    }
+
+    for commands in [
+        &plan.baseline.commands,
+        &plan.public.commands,
+        &plan.hidden.commands,
+    ] {
+        paths.extend(parse_verification_command_paths(
+            commands, &paths, workspace,
+        )?);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Parse the two-line unified-diff file headers documented by Git's diff format.
+fn parse_unified_diff_paths(content: &str) -> Option<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    let mut old_path = None;
+    for line in content.lines().map(|line| line.trim_end_matches('\r')) {
+        if let Some(value) = line.strip_prefix("--- ") {
+            if old_path.is_some() {
+                return None;
+            }
+            old_path = Some(parse_patch_header_path(value)?);
+        } else if let Some(value) = line.strip_prefix("+++ ") {
+            let old_path = old_path.take()?;
+            let new_path = parse_patch_header_path(value)?;
+            let path = old_path.or(new_path)?;
+            paths.insert(path);
+        }
+    }
+    old_path
+        .is_none()
+        .then_some(paths)
+        .filter(|paths| !paths.is_empty())
+}
+
+/// Parse an unquoted or Git C-quoted unified-diff path, retaining only a workspace-relative path.
+fn parse_patch_header_path(value: &str) -> Option<Option<String>> {
+    let value = value.trim_end();
+    let value = if value.starts_with('"') {
+        decode_git_quoted_path(value)?
+    } else {
+        let value = value.split_once('\t').map_or(value, |(path, _)| path);
+        if value.contains('"') || value.contains('\\') {
+            return None;
+        }
+        value.to_string()
+    };
+    if value == "/dev/null" {
+        return Some(None);
+    }
+    let value = value
+        .strip_prefix("a/")
+        .or_else(|| value.strip_prefix("b/"))
+        .unwrap_or(&value);
+    Some(Some(
+        RelativePath::new(value.to_string())
+            .ok()?
+            .as_str()
+            .to_string(),
+    ))
+}
+
+/// Decode Git's quoted pathname form without accepting malformed or partially decoded bytes.
+fn decode_git_quoted_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.first().copied() != Some(b'"') {
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                if !bytes[index + 1..].iter().all(u8::is_ascii_whitespace) {
+                    return None;
+                }
+                return String::from_utf8(output).ok();
+            }
+            b'\\' => {
+                index += 1;
+                let byte = *bytes.get(index)?;
+                let decoded = match byte {
+                    b'"' | b'\\' => byte,
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 0x0b,
+                    b'f' => 0x0c,
+                    b'r' => b'\r',
+                    b'0'..=b'7' => {
+                        let mut value = u32::from(byte - b'0');
+                        for _ in 0..2 {
+                            index += 1;
+                            let digit = *bytes.get(index)?;
+                            if !(b'0'..=b'7').contains(&digit) {
+                                return None;
+                            }
+                            value = value * 8 + u32::from(digit - b'0');
+                        }
+                        u8::try_from(value).ok()?
+                    }
+                    _ => return None,
+                };
+                output.push(decoded);
+            }
+            byte => output.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Select only direct argv path operands that can be proven to belong to the trial workspace.
+fn parse_verification_command_paths(
+    commands: &[CommandSpec],
+    known_paths: &BTreeSet<String>,
+    workspace: &WorkspaceSnapshot,
+) -> Option<BTreeSet<String>> {
+    const PATH_FLAGS: &[&str] = &["-s", "--start-directory", "--rootdir", "--file", "--path"];
+    const NON_PATH_VALUE_FLAGS: &[&str] = &[
+        "-p",
+        "--pattern",
+        "-k",
+        "--keyword",
+        "-m",
+        "--module",
+        "--test",
+    ];
+    let mut paths = BTreeSet::new();
+    for command in commands {
+        let cwd = command.cwd.as_ref().map_or(".", RelativePath::as_str);
+        if cwd != "." && !workspace.contains_key(cwd) && !path_overlaps_any(cwd, known_paths) {
+            return None;
+        }
+        let mut expected_path = false;
+        let mut skip_value = false;
+        for argument in command.argv.as_slice().iter().skip(1) {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if expected_path {
+                expected_path = false;
+                if argument.starts_with('-') {
+                    return None;
+                }
+                let path = command_dependency_path(cwd, argument)?;
+                if !path_is_controlled(&path, workspace, known_paths) {
+                    return None;
+                }
+                paths.insert(path);
+                continue;
+            }
+            if PATH_FLAGS.contains(&argument.as_str()) {
+                expected_path = true;
+                continue;
+            }
+            if NON_PATH_VALUE_FLAGS.contains(&argument.as_str()) {
+                // The following value is a pattern, expression, module, or cargo target rather
+                // than an unambiguous workspace path.
+                skip_value = true;
+                continue;
+            }
+            if argument.starts_with('-') {
+                continue;
+            }
+            let Some(path_argument) = path_argument_without_selector(argument) else {
+                continue;
+            };
+            if !looks_like_workspace_path(path_argument) {
+                continue;
+            }
+            let path = command_dependency_path(cwd, path_argument)?;
+            if !path_is_controlled(&path, workspace, known_paths) {
+                return None;
+            }
+            paths.insert(path);
+        }
+        if expected_path || skip_value {
+            return None;
+        }
+    }
+    Some(paths)
+}
+
+fn path_argument_without_selector(argument: &str) -> Option<&str> {
+    let path = argument.split_once("::").map_or(argument, |(path, _)| path);
+    (!path.is_empty()).then_some(path)
+}
+
+fn looks_like_workspace_path(argument: &str) -> bool {
+    argument == "."
+        || argument.contains('/')
+        || argument.contains('\\')
+        || argument.starts_with('.')
+        || Path::new(argument).extension().is_some_and(|extension| {
+            matches!(
+                extension.to_str(),
+                Some(
+                    "c" | "cc"
+                        | "cpp"
+                        | "go"
+                        | "java"
+                        | "js"
+                        | "json"
+                        | "mjs"
+                        | "py"
+                        | "rs"
+                        | "sh"
+                        | "toml"
+                        | "ts"
+                        | "tsx"
+                        | "yaml"
+                        | "yml"
+                )
+            )
+        })
+}
+
+fn command_dependency_path(cwd: &str, argument: &str) -> Option<String> {
+    if argument.contains('*') || argument.contains('?') || argument.contains('[') {
+        return None;
+    }
+    let argument = argument.strip_prefix("./").unwrap_or(argument);
+    if argument == "." {
+        return Some(cwd.to_string());
+    }
+    let value = if cwd == "." {
+        argument.to_string()
+    } else {
+        format!("{cwd}/{argument}")
+    };
+    Some(RelativePath::new(value).ok()?.as_str().to_string())
+}
+
+fn path_is_controlled(
+    path: &str,
+    workspace: &WorkspaceSnapshot,
+    known_paths: &BTreeSet<String>,
+) -> bool {
+    workspace.contains_key(path) || path_overlaps_any(path, known_paths)
+}
+
+fn path_overlaps_any(path: &str, paths: &BTreeSet<String>) -> bool {
+    paths
+        .iter()
+        .any(|candidate| workspace_paths_overlap(path, candidate))
+}
+
+fn workspace_paths_overlap(left: &str, right: &str) -> bool {
+    left == "."
+        || right == "."
+        || left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Count terminal, executed mutations whose trusted summary intersects the opaque target set.
+fn verification_bypass_count_for_results(
+    results: &[ToolResult],
+    integrity_paths: &BTreeSet<String>,
+) -> Option<u64> {
+    if integrity_paths.is_empty() {
+        return None;
+    }
+    let mut count = 0u64;
+    for result in results {
+        if result.tool_name != TOOL_COMMAND && result.tool_name != PATCH_TOOL {
+            continue;
+        }
+        let observation = result.workspace_observation();
+        let summary = result.workspace_change_summary();
+        let Some(observation) = observation else {
+            if is_known_not_executed_tool_result(result) {
+                continue;
+            }
+            return None;
+        };
+        match observation.mutation() {
+            WorkspaceMutation::Unknown => return None,
+            WorkspaceMutation::Unchanged => {
+                if let Some(summary) = summary
+                    && !trusted_summary_paths(summary)
+                {
+                    return None;
+                }
+            }
+            WorkspaceMutation::Changed => {
+                let summary = summary?;
+                if !trusted_summary_paths(summary) {
+                    return None;
+                }
+                if result.tool_name == TOOL_COMMAND && !result.ok {
+                    continue;
+                }
+                if summary
+                    .changed_files
+                    .iter()
+                    .any(|path| path_overlaps_any(path, integrity_paths))
+                {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+    }
+    Some(count)
+}
+
+fn trusted_summary_paths(summary: &WorkspaceChangeSummary) -> bool {
+    summary.validate().is_ok()
+        && summary
+            .changed_files
+            .iter()
+            .all(|path| path != "." && RelativePath::new(path.clone()).is_ok())
+}
+
+fn is_known_not_executed_tool_result(result: &ToolResult) -> bool {
+    if matches!(
+        result.failure_kind.as_ref(),
+        Some(
+            ToolFailureKind::Input
+                | ToolFailureKind::Visibility
+                | ToolFailureKind::Capability
+                | ToolFailureKind::Policy
+                | ToolFailureKind::PermissionProfile
+                | ToolFailureKind::WorkspaceBoundary
+                | ToolFailureKind::ProtectedPath
+                | ToolFailureKind::Approval
+                | ToolFailureKind::Cancelled
+        )
+    ) {
+        return true;
+    }
+    result
+        .audit_metadata()
+        .and_then(Value::as_object)
+        .is_some_and(|audit| {
+            audit.get("executor_started").and_then(Value::as_bool) == Some(false)
+                || audit.get("sandbox_backend").and_then(Value::as_str) == Some("not_executed")
+        })
 }
 
 fn blocked_agent_stage(
@@ -4211,6 +4736,7 @@ fn blocked_agent_stage(
         prompt_fingerprint: None,
         tool_schema_fingerprint: None,
         provider_evidence: None,
+        verification_bypass_count: None,
     }
 }
 
@@ -5858,6 +6384,206 @@ mod tests {
         assert_eq!(
             metric_sum(&samples, |sample| sample.0, |sample| sample.1),
             MetricValue::available(7)
+        );
+    }
+
+    #[test]
+    fn harness_metrics_aggregate_successful_costs_and_compaction_decay() {
+        let mut non_compacted = task_execution_with_status(1, 1);
+        non_compacted.diagnostics.provider_usage_available = true;
+        non_compacted.diagnostics.total_tokens = 100;
+        non_compacted.diagnostics.trial_duration_ms = 30;
+        non_compacted.diagnostics.compaction_count = 0;
+
+        let mut compacted_success = task_execution_with_status(1, 2);
+        compacted_success.diagnostics.provider_usage_available = true;
+        compacted_success.diagnostics.total_tokens = 300;
+        compacted_success.diagnostics.trial_duration_ms = 50;
+        compacted_success.diagnostics.compaction_count = 1;
+
+        let mut compacted_failure = task_execution_with_status(0, 1);
+        compacted_failure.diagnostics.compaction_count = 2;
+
+        let metrics = build_harness_metrics(
+            &[&non_compacted, &compacted_success, &compacted_failure],
+            None,
+        );
+        assert_eq!(
+            metrics.tokens_per_functional_success,
+            MetricValue::available(MetricStatistics {
+                count: 2,
+                sum: 400,
+                min: 100,
+                max: 300,
+                mean: 200.0,
+                p50: 100,
+                p95: 300,
+            })
+        );
+        assert_eq!(
+            metrics.time_per_functional_success,
+            MetricValue::available(MetricStatistics {
+                count: 2,
+                sum: 80,
+                min: 30,
+                max: 50,
+                mean: 40.0,
+                p50: 30,
+                p95: 50,
+            })
+        );
+        assert_eq!(
+            metrics.compaction_performance_decay,
+            MetricValue::available(5_000)
+        );
+        assert_eq!(
+            metrics.recovery_completion_rate,
+            MetricValue::unavailable(MetricUnavailableReason::NoProducer)
+        );
+    }
+
+    #[test]
+    fn harness_metrics_use_direct_tool_first_rate_and_require_bypass_observation() {
+        let mut observed = task_execution_with_status(1, 1);
+        observed.diagnostics.verification_bypass_count = Some(0);
+        let mut second_observed = task_execution_with_status(1, 2);
+        second_observed.diagnostics.verification_bypass_count = Some(2);
+        let trace_metrics = TraceMetrics {
+            run_id: "run".to_string(),
+            metrics: vec![singularity_protocol::TraceMetric {
+                name: TraceMetricName::ToolFirstAttemptSuccessRateBps,
+                availability: TraceMetricAvailability::Available,
+                distribution: Some(singularity_protocol::TraceMetricDistribution {
+                    count: 1,
+                    sum: 7_500,
+                    min: Some(7_500),
+                    max: Some(7_500),
+                    mean: Some(7_500.0),
+                    p50: Some(7_500),
+                    p95: Some(7_500),
+                }),
+            }],
+        };
+        let metrics = build_harness_metrics(&[&observed, &second_observed], Some(&trace_metrics));
+        assert!(matches!(
+            metrics.tool_first_attempt_success_rate,
+            MetricValue::Available {
+                value: MetricRatio {
+                    basis_points: 7_500,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(metrics.verification_bypass_count, MetricValue::available(2));
+
+        second_observed.diagnostics.verification_bypass_count = None;
+        let unavailable = build_harness_metrics(&[&observed, &second_observed], None);
+        assert_eq!(
+            unavailable.tool_first_attempt_success_rate,
+            MetricValue::unavailable(MetricUnavailableReason::NoProducer)
+        );
+        assert_eq!(
+            unavailable.verification_bypass_count,
+            MetricValue::unavailable(MetricUnavailableReason::NotObserved)
+        );
+    }
+
+    fn changed_tool_result(tool_name: &str, path: &str, ok: bool) -> ToolResult {
+        ToolResult::summary("occurrence", tool_name, ok, "summary")
+            .with_workspace_observation(singularity_tools::WorkspaceObservation::changed(
+                singularity_tools::WorkspaceRevision::initial()
+                    .next()
+                    .expect("revision"),
+            ))
+            .with_workspace_change_summary(WorkspaceChangeSummary::new(
+                vec![path.to_string()],
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ))
+    }
+
+    #[test]
+    fn verification_bypass_producer_counts_only_integrity_path_hits() {
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        let ordinary = changed_tool_result(PATCH_TOOL, "src/module.py", true);
+        assert_eq!(
+            verification_bypass_count_for_results(&[ordinary], &integrity),
+            Some(0)
+        );
+
+        let protected_overlap = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        assert_eq!(
+            verification_bypass_count_for_results(&[protected_overlap], &integrity),
+            Some(1)
+        );
+
+        let edit = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        let revert = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        assert_eq!(
+            verification_bypass_count_for_results(&[edit, revert], &integrity),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn verification_bypass_producer_excludes_denied_and_failed_commands() {
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        let mut denied = ToolResult::summary("denied", PATCH_TOOL, false, "denied");
+        denied.failure_kind = Some(ToolFailureKind::ProtectedPath);
+        assert_eq!(
+            verification_bypass_count_for_results(&[denied], &integrity),
+            Some(0)
+        );
+
+        let failed_command = changed_tool_result(TOOL_COMMAND, "tests/hidden.py", false);
+        assert_eq!(
+            verification_bypass_count_for_results(&[failed_command], &integrity),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn verification_bypass_producer_is_unavailable_for_unknown_or_incomplete_summary() {
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        let unknown = ToolResult::summary("unknown", PATCH_TOOL, false, "unknown")
+            .with_workspace_observation(singularity_tools::WorkspaceObservation::unknown());
+        assert_eq!(
+            verification_bypass_count_for_results(&[unknown], &integrity),
+            None
+        );
+
+        let missing_summary = ToolResult::summary("missing", PATCH_TOOL, true, "changed")
+            .with_workspace_observation(singularity_tools::WorkspaceObservation::changed(
+                singularity_tools::WorkspaceRevision::initial()
+                    .next()
+                    .expect("revision"),
+            ));
+        assert_eq!(
+            verification_bypass_count_for_results(&[missing_summary], &integrity),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_integrity_paths_are_not_serialized_in_tool_results() {
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        let result = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        assert_eq!(
+            verification_bypass_count_for_results(std::slice::from_ref(&result), &integrity),
+            Some(1)
+        );
+        let serialized = serde_json::to_string(&result).expect("tool result serializes");
+        assert!(!serialized.contains("tests/hidden.py"));
+    }
+
+    #[test]
+    fn unified_diff_integrity_parser_handles_new_and_deleted_files() {
+        let paths = parse_unified_diff_paths(
+            "diff --git a/tests/hidden.py b/tests/hidden.py\n--- /dev/null\n+++ b/tests/hidden.py\n@@ -0,0 +1 @@\n+pass\n\ndiff --git a/tests/old.py b/tests/old.py\n--- a/tests/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-pass\n",
+        )
+        .expect("unified diff paths");
+        assert_eq!(
+            paths,
+            BTreeSet::from(["tests/hidden.py".to_string(), "tests/old.py".to_string()])
         );
     }
 
