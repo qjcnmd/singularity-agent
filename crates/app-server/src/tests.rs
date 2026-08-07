@@ -1,13 +1,17 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::{AgentRecoveryMetrics, AgentRunStatus, PendingToolCall};
+use singularity_agent::{
+    AgentLoopEvent, AgentObservation, AgentRecoveryMetrics, AgentRunStatus, OccurrenceIdentity,
+    OccurrenceLifecycle, PendingToolCall, ProviderAttemptObservation, ProviderAttemptStatus,
+};
 use singularity_model::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheLookupResult,
-    ProviderCapabilityCacheObservation, ProviderCapabilityMetadata, ProviderCapabilityProfile,
-    ProviderError, ProviderProtocolContract, ProviderStreamEvent,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOperationPhase,
+    ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
+    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
+    ProviderStreamEvent,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
 use singularity_protocol::ItemKind;
@@ -3178,4 +3182,99 @@ fn provider_capability_cache_observation_projection_is_idempotent() {
         "replayed cache observation must not duplicate"
     );
     assert_eq!(samples[0].count, 1);
+}
+
+#[test]
+fn provider_observation_projection_preserves_stable_diagnostic_code() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "provider"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    let mut projector =
+        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
+            .expect("projector");
+    let identity = OccurrenceIdentity {
+        occurrence_id: "provider_diagnostic_occurrence".to_string(),
+        parent_occurrence_id: None,
+        ordinal: 0,
+    };
+    let started = ProviderAttemptObservation {
+        identity: identity.clone(),
+        lifecycle: OccurrenceLifecycle::Started {
+            queued_at_unix_ms: 1_700_000_000_000,
+            started_at_unix_ms: 1_700_000_000_001,
+        },
+        operation_phase: ProviderAttemptOperationPhase::Completion,
+        provider_name: "provider".to_string(),
+        model_name: "model".to_string(),
+        actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+        attempt_index: 1,
+        retry_count: 0,
+        request_send_to_headers_ms: None,
+        time_to_first_text_delta_ms: None,
+        retry_backoff_ms: None,
+        error_category: Some(ModelErrorCategory::JsonSchema),
+        error_stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
+        diagnostic_code: Some("provider_response_invalid".to_string()),
+        usage: None,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::ProviderAttempt(Box::new(started)),
+        ))
+        .expect("provider start");
+
+    let finished = ProviderAttemptObservation {
+        identity,
+        lifecycle: OccurrenceLifecycle::Finished {
+            queued_at_unix_ms: 1_700_000_000_000,
+            started_at_unix_ms: 1_700_000_000_001,
+            ended_at_unix_ms: 1_700_000_000_011,
+            duration_ms: 10,
+            status: ProviderAttemptStatus::Error,
+        },
+        operation_phase: ProviderAttemptOperationPhase::Completion,
+        provider_name: "provider".to_string(),
+        model_name: "model".to_string(),
+        actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+        attempt_index: 1,
+        retry_count: 0,
+        request_send_to_headers_ms: None,
+        time_to_first_text_delta_ms: None,
+        retry_backoff_ms: None,
+        error_category: Some(ModelErrorCategory::JsonSchema),
+        error_stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
+        diagnostic_code: Some("provider_response_invalid".to_string()),
+        usage: None,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::ProviderAttempt(Box::new(finished)),
+        ))
+        .expect("provider end");
+
+    let end = store
+        .list_trace(&thread.thread_id)
+        .expect("trace")
+        .into_iter()
+        .find(|event| {
+            event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
+                && event.span_phase == Some(singularity_protocol::TraceSpanPhase::End)
+        })
+        .expect("provider end trace");
+    assert_eq!(
+        end.span_projection
+            .and_then(|projection| projection.error)
+            .and_then(|error| error.code)
+            .as_deref(),
+        Some("provider_response_invalid")
+    );
 }

@@ -7,7 +7,7 @@ use singularity_agent::{
     ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
     ToolCallStatus, VerificationStatus,
 };
-use singularity_core::Timestamp;
+use singularity_core::{Timestamp, bounded_stable_code};
 use singularity_model::{
     ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase,
     ProviderCapabilityCacheLookupResult,
@@ -622,7 +622,10 @@ fn provider_observation_projection(
                     .map(|category| TraceErrorProjection {
                         category: error_category(category),
                         stage: observation.error_stage.as_ref().map(error_stage),
-                        code: observation.diagnostic_code.clone().and_then(stable_code),
+                        code: observation
+                            .diagnostic_code
+                            .as_deref()
+                            .and_then(bounded_stable_code),
                     })
             })
             .flatten(),
@@ -717,15 +720,6 @@ fn error_stage(value: &singularity_model::ProviderErrorStage) -> TraceErrorStage
         }
         singularity_model::ProviderErrorStage::Cancelled => TraceErrorStage::Cancelled,
     }
-}
-
-fn stable_code(value: String) -> Option<String> {
-    (value.len() <= 64
-        && !value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        }))
-    .then_some(value)
 }
 
 // The Agent observation does not expose a policy cause on the identity itself; only the

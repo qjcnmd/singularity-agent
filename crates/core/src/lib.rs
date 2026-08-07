@@ -320,10 +320,21 @@ pub fn contains_sensitive_text(text: &str) -> bool {
     SENSITIVE_TEXT_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
-        || contains_secret_like_token(text)
-        || contains_bearer_value(&lowered)
-        || contains_secret_assignment(&lowered)
-        || contains_secret_flag_argument(&lowered)
+        || contains_secret_shape(text, &lowered)
+}
+
+/// 投影有界 ASCII 稳定代码；机器码可以安全包含领域标记（例如 `provider_response`）。
+pub fn bounded_stable_code(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+    {
+        return None;
+    }
+    let lowered = value.to_ascii_lowercase();
+    (!contains_secret_shape(value, &lowered)).then(|| value.to_string())
 }
 
 /// 判断工作区相对路径是否命中统一的 protected path 规则。
@@ -445,6 +456,14 @@ pub fn is_public_certificate_only_pem(
         }
     }
     open_label.is_none() && certificate_count > 0
+}
+
+/// 判断文本是否命中凭据形状；不包含 `provider_response` 等领域敏感词。
+fn contains_secret_shape(text: &str, lowered: &str) -> bool {
+    contains_secret_like_token(text)
+        || contains_bearer_value(lowered)
+        || contains_secret_assignment(lowered)
+        || contains_secret_flag_argument(lowered)
 }
 
 fn contains_secret_like_token(text: &str) -> bool {

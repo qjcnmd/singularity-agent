@@ -1,7 +1,8 @@
 //! core 公共类型、脱敏和 JSON-RPC 基础合同测试。
 
 use singularity_core::{
-    CancellationToken, ClientInfo, ErrorCode, RequestId, Timestamp, contains_sensitive_text,
+    CancellationToken, ClientInfo, ErrorCode, RequestId, Timestamp, bounded_stable_code,
+    contains_sensitive_text,
 };
 
 #[test]
@@ -56,6 +57,19 @@ fn sensitive_text_detects_common_secret_label_formats() {
     assert!(!contains_sensitive_text(
         "at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:661:26)"
     ));
+}
+
+#[test]
+fn stable_code_projection_is_bounded_without_treating_domain_markers_as_secrets() {
+    assert_eq!(
+        bounded_stable_code("provider_response_invalid").as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert!(bounded_stable_code("").is_none());
+    assert!(bounded_stable_code("provider response invalid").is_none());
+    assert!(bounded_stable_code(&"a".repeat(65)).is_none());
+    assert!(bounded_stable_code("sk-abcdefgh").is_none());
+    assert!(bounded_stable_code("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature").is_none());
 }
 
 #[test]

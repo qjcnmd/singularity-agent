@@ -5466,6 +5466,81 @@ fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
     assert!(!serialized.contains("sentinel-secret-value"));
 }
 
+#[test]
+fn trace_storage_preserves_stable_provider_codes_and_redacts_invalid_codes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let identity = || TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiChatCompletions),
+        operation_phase: Some(TraceProviderOperationPhase::Completion),
+        attempt_index: Some(1),
+        retry_count: Some(0),
+        ..TraceSpanProjection::default()
+    };
+    let append_pair = |prefix: &str, code: &str| {
+        let mut start = provider_span(&format!("{prefix}_start"), TraceSpanPhase::Start);
+        start.span_id = Some(prefix.to_string());
+        start.span_projection = Some(identity());
+
+        let mut end = provider_span(&format!("{prefix}_end"), TraceSpanPhase::End);
+        end.span_id = Some(prefix.to_string());
+        end.span_status = Some(TraceSpanStatus::Error);
+        let mut projection = identity();
+        projection.error = Some(TraceErrorProjection {
+            category: TraceErrorCategory::JsonSchema,
+            stage: Some(TraceErrorStage::ResponseValidation),
+            code: Some(code.to_string()),
+        });
+        end.span_projection = Some(projection);
+
+        store.append_trace(&start).expect("provider span start");
+        store.append_trace(&end).expect("provider span end");
+    };
+
+    append_pair("stable_code", "provider_response_invalid");
+    append_pair("invalid_code", "provider response invalid");
+    append_pair("secret_code", "sk-abcdefgh");
+    append_pair(
+        "jwt_code",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+    );
+
+    let stable = store.show_trace("stable_code_end").expect("stable trace");
+    assert_eq!(
+        stable
+            .span_projection
+            .and_then(|projection| projection.error)
+            .and_then(|error| error.code)
+            .as_deref(),
+        Some("provider_response_invalid")
+    );
+
+    let invalid = store.show_trace("invalid_code_end").expect("invalid trace");
+    assert_eq!(
+        invalid
+            .span_projection
+            .and_then(|projection| projection.error)
+            .and_then(|error| error.code)
+            .as_deref(),
+        Some("[redacted]")
+    );
+
+    for event_id in ["secret_code_end", "jwt_code_end"] {
+        let redacted = store.show_trace(event_id).expect("secret trace");
+        assert_eq!(
+            redacted
+                .span_projection
+                .and_then(|projection| projection.error)
+                .and_then(|error| error.code)
+                .as_deref(),
+            Some("[redacted]"),
+            "{event_id} must not persist a credential-shaped code"
+        );
+    }
+}
+
 // 验证被篡改的 trace payload hash 会 fail closed。
 #[test]
 fn tampered_trace_payload_hash_fails_closed() {

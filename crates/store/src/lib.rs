@@ -23,7 +23,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_core::{Timestamp, contains_sensitive_text, is_protected_path};
+use singularity_core::{
+    Timestamp, bounded_stable_code, contains_sensitive_text, is_protected_path,
+};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
     PermissionProfileName, PermissionResource, ToolId, WorkspaceRelativePath,

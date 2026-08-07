@@ -706,7 +706,9 @@ fn sanitize_trace_projection(mut projection: TraceSpanProjection) -> TraceSpanPr
         .model_name
         .map(|value| redact_secret_like_text(&value));
     projection.error = projection.error.map(|mut error| {
-        error.code = error.code.map(|value| redact_secret_like_text(&value));
+        error.code = error.code.map(|value| {
+            bounded_stable_code(&value).unwrap_or_else(|| REDACTED_ARTIFACT_VALUE.to_string())
+        });
         error
     });
     projection.tool = projection.tool.map(|mut tool| {
