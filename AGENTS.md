@@ -31,7 +31,7 @@
 3. Evaluation 的临时 scratch、日志、一次性 Worktree、测试临时目录和其他任务临时文件在每次任务结束时清理；Evaluation run 的发布产物和失败/取消时保留的不完整运行证据按输出契约保留，不当作临时文件删除。
 4. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
 5. 最终回复说明产物实际写入位置、保留的 Cargo 缓存、已清理内容、清理失败项和保留原因。
-6. Evaluation 默认并行 5 个任务运行（`--max-workers 5`，上限 8），除非单次运行有特殊理由才传其他值。任务集默认使用 `docs/evaluation/public-representative-task.json`（原冒烟集：sqlfluff + 2 个本地 fixture）；`docs/evaluation/public-long-tasks.json`（5 个 SWE-bench 长任务）仅在用户明确说明要运行时才使用，其他情况一律不指定、不启用。
+6. Evaluation 默认并行 5 个任务运行（`--max-workers 5`，上限 8）；当任务数与 5 不可整除、且把并发临时提高到上限以内能减少整轮次时，允许调高并记录理由。实际并发声明必须以 trial start/end trace、进程或时间戳证据支持，参数值不构成并发事实。任务集默认使用 `docs/evaluation/public-representative-task.json`（原冒烟集：sqlfluff + 2 个本地 fixture）；`docs/evaluation/public-long-tasks.json`（5 个 SWE-bench 长任务）仅在用户明确说明要运行时才使用，其他情况一律不指定、不启用。
 
 ## 项目实现与目标仓库语言边界
 
@@ -54,6 +54,7 @@
 - 模型可见产品工具由单一注册事实源产生；功能任务不通过 Evaluation task、required capability 或内部阶段维护第二套工具表面。工具选择自由与权限控制分离，副作用由 Policy、Approval 和 OS sandbox 约束。
 - Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 在任何完成请求前固定 `provider_id`、`model_id`、已选 API protocol 和相关模型参数；能力协商可依据声明或协议证据在完成请求前确定单一 protocol，但完成请求中不自动路由、轮换或 fallback。
 - Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
+- 失败归因顺序：只有充分排除 Harness、AgentLoop、Store、checkpoint、completion gate、verification tracker、Evaluation runner、并发调度和测试环境问题后，才能把剩余失败归因于模型能力；除模型能力之外的任何问题都必须继续调查并修复，不得以“可能是模型问题”“artifact 被 redacted”“Evaluation 提前结束”为理由停止。每个失败明确分类：已确认 Harness/Evaluation 缺陷（修复）、已确认模型能力问题（保留原始证据并报告）、仍未确定（继续调查，不得作为最终 blocker）。
 - Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
 - `functional_task_success`、`agent_protocol_success` 与 `sandbox_security_success` 分别计算、发布和归因；外部门禁可以同时要求三者，但不得合并成无法定位责任层的单一失败。Evaluator 保护自身 patch、tests、`.git` 和依赖/系统路径，并审计异常改动，不用路径白名单向模型泄露答案位置或阻止合理跨文件修复。
 
@@ -107,6 +108,7 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 - 本地测试默认使用显式 mock 配置（Provider、模型、地址、测试 key），不得读取真实用户级配置、凭据或外部服务；隔离后的测试失败才按产品缺陷处理。
 - 完整构建、全仓测试、跨平台验证和完整 Evaluation 只有在实际影响范围无法由更窄证据证明时运行。完整 Evaluation 不是模型调用链改动后的首次真实测试。
 - 不新增或操纵 Trial 重采样、预算、timeout、门禁、task、工具权限或隐藏答案来赌分。真实 Provider Task 首次正确完成即为有效证据；失败保留首个错误、阶段和耗时，只修通用根因。
+- Issue 或任务文档逐条列出的真实链路要求（如同一用户轮次内多次模型与工具交互、中断后恢复、上下文压缩后续接、Provider/model/protocol 变化等），每条必须映射到可指认的真实模型调用证据，或显式标注“由确定性测试覆盖（不涉真实执行链路）”；仅 mock 或确定性测试不得作为此类要求的完成证据。
 - 默认不运行 Codex Security 扫描；只有用户明确要求使用时才运行。
 - 最终回复列出实际运行的检查、精确结果和未验证范围，不把局部证据描述为全量通过。
 
