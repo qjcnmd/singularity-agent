@@ -31,7 +31,7 @@
 3. Evaluation 的临时 scratch、日志、一次性 Worktree、测试临时目录和其他任务临时文件在每次任务结束时清理；Evaluation run 的发布产物和失败/取消时保留的不完整运行证据按输出契约保留，不当作临时文件删除。
 4. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
 5. 最终回复说明产物实际写入位置、保留的 Cargo 缓存、已清理内容、清理失败项和保留原因。
-6. Evaluation 默认并行 5 个任务运行（`--max-workers 5`，上限 8）；当任务数与 5 不可整除、且把并发临时提高到上限以内能减少整轮次时，允许调高并记录理由。实际并发声明必须以 trial start/end trace、进程或时间戳证据支持，参数值不构成并发事实。任务集默认使用 `docs/evaluation/public-representative-task.json`（原冒烟集：sqlfluff + 2 个本地 fixture）；`docs/evaluation/public-long-tasks.json`（5 个 SWE-bench 长任务）仅在用户明确说明要运行时才使用，其他情况一律不指定、不启用。
+6. 默认完整 Evaluation 使用 `docs/evaluation/public-representative-task.json`（3 个 task × 每个 2 个 trial，共 6 个 trial），并必须显式传入 `--full --max-workers 6`。并发单位是 trial：`--max-workers 6` 表示最多同时调度全部 6 个 trial，不得解释为只并发 3 个 task、再在每个 task 内串行运行 trial；实际并发声明必须以 trial start/end trace、进程或时间戳证据支持，参数值本身不构成并发事实。`docs/evaluation/public-long-tasks.json`（5 个 SWE-bench 长任务）仅在用户明确说明要运行时才使用，其他情况一律不指定、不启用。
 
 ## 项目实现与目标仓库语言边界
 
