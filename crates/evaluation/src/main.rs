@@ -30,7 +30,7 @@ enum Command {
         run_id: String,
         #[arg(long)]
         json: bool,
-        /// Maximum number of independent tasks to execute concurrently (1-8).
+        /// Maximum number of independent trials to execute concurrently (1-8).
         #[arg(long, value_parser = parse_max_workers)]
         max_workers: Option<usize>,
         /// Execute every manifest task for its configured trial count and publish gate artifacts.
@@ -50,7 +50,7 @@ fn parse_max_workers(value: &str) -> Result<usize, String> {
     }
 }
 
-/// Resolve the task worker count, capping Full at eight and falling back to one on query failure.
+/// Resolve the trial worker count, honoring an explicit parsed value and defaulting Full to at most two.
 fn resolve_max_workers<F>(
     mode: &EvaluationRunMode,
     requested: Option<usize>,
@@ -201,11 +201,11 @@ mod tests {
             "--run-id",
             "run",
             "--max-workers",
-            "2",
+            "6",
         ])
-        .expect("max-workers=2 parses");
+        .expect("max-workers=6 parses");
         let Command::Run { max_workers, .. } = cli.command;
-        assert_eq!(max_workers, Some(2));
+        assert_eq!(max_workers, Some(6));
 
         let cli = Cli::try_parse_from([
             "singularity-evaluation",
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn max_workers_cli_rejects_zero_and_values_above_two() {
+    fn max_workers_cli_rejects_zero_and_values_above_eight() {
         for value in ["0", "9"] {
             let error = Cli::try_parse_from([
                 "singularity-evaluation",
@@ -289,10 +289,10 @@ mod tests {
             1
         );
         assert_eq!(
-            resolve_max_workers(&full, Some(2), || {
+            resolve_max_workers(&full, Some(6), || {
                 panic!("explicit worker count must not query host parallelism")
             }),
-            2
+            6
         );
     }
 

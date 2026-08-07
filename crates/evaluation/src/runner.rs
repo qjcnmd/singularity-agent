@@ -31,7 +31,8 @@ use singularity_agent::{
 };
 use singularity_app_server::TraceProjector;
 use singularity_core::{
-    CancellationToken, Timestamp, contains_sensitive_text, load_project_instructions,
+    CancellationToken, Timestamp, bounded_stable_code, contains_sensitive_text,
+    load_project_instructions,
 };
 use singularity_model::{
     ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
@@ -109,7 +110,7 @@ pub struct EvaluationRunParams {
     pub manifest: String,
     pub run_id: String,
     pub output_root: Option<String>,
-    /// Number of independent tasks that may execute at once.
+    /// Number of independent trials that may execute at once.
     pub max_workers: usize,
 }
 
@@ -397,7 +398,7 @@ struct MaterializedSource {
     source_template: Option<SourceTemplatePreparation>,
 }
 
-/// The one Evaluation trace Store is shared by task workers only for short SQLite operations.
+/// The one Evaluation trace Store is shared by trial workers only for short SQLite operations.
 ///
 /// `SessionStore` owns a rusqlite connection (`Send` but not `Sync`), so workers never hold this
 /// guard while running a provider, sandbox command, or workspace operation.
@@ -476,7 +477,7 @@ fn ensure_trace_failures_empty(failures: &Arc<Mutex<Vec<String>>>) -> Result<(),
     }
 }
 
-enum TaskWorkerError {
+enum TrialWorkerError {
     Cancelled(Vec<TaskEvaluation>),
     Failed(String),
 }
@@ -487,10 +488,10 @@ enum IndexedWorkerError<T> {
     Failed(String),
 }
 
-/// Run independent tasks with a bounded dynamic worker set while preserving manifest order.
+/// Run indexed work items with a bounded dynamic worker set while preserving index order.
 ///
-/// A cancellation only exposes the completed manifest prefix in its in-memory partial result;
-/// later completed tasks remain on disk but are intentionally not presented as a resumable prefix.
+/// A cancellation only exposes the completed task/trial work prefix in its in-memory partial
+/// result; later completed work remains on disk but is intentionally not presented as resumable.
 fn run_bounded_indexed_workers<T, F>(
     item_count: usize,
     max_workers: usize,
@@ -514,7 +515,7 @@ where
                     Err(_) => {
                         cancellation.cancel();
                         return Err(IndexedWorkerError::Failed(
-                            "evaluation task worker panicked".to_string(),
+                            "evaluation trial worker panicked".to_string(),
                         ));
                     }
                 };
@@ -580,19 +581,19 @@ where
             Ok(slots) => slots,
             Err(_) => {
                 return Err(IndexedWorkerError::Failed(
-                    "evaluation task result mutex poisoned".to_string(),
+                    "evaluation trial result mutex poisoned".to_string(),
                 ));
             }
         },
         Err(_) => {
             return Err(IndexedWorkerError::Failed(
-                "evaluation task workers did not join".to_string(),
+                "evaluation trial workers did not join".to_string(),
             ));
         }
     };
     if worker_panicked {
         return Err(IndexedWorkerError::Failed(
-            "evaluation task worker panicked".to_string(),
+            "evaluation trial worker panicked".to_string(),
         ));
     }
     let mut results = Vec::with_capacity(slots.len());
@@ -609,10 +610,40 @@ where
     }
     if !complete_prefix {
         return Err(IndexedWorkerError::Failed(
-            "evaluation task worker stopped before all tasks completed".to_string(),
+            "evaluation trial worker stopped before all trials completed".to_string(),
         ));
     }
     Ok(results)
+}
+
+/// Run a flattened task/trial work list with a bounded worker set.
+///
+/// The flattened index is task-major so the indexed worker collector can restore the
+/// manifest task order and each task's trial ordinal after concurrent execution.
+fn run_bounded_trial_workers<T, F>(
+    task_count: usize,
+    trial_ordinals: &[u32],
+    max_workers: usize,
+    cancellation: &CancellationToken,
+    worker: F,
+) -> Result<Vec<T>, IndexedWorkerError<T>>
+where
+    T: Send,
+    F: Fn(usize, u32) -> T + Send + Sync,
+{
+    if task_count == 0 || trial_ordinals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trial_count = trial_ordinals.len();
+    let item_count = task_count.checked_mul(trial_count).ok_or_else(|| {
+        IndexedWorkerError::Failed("evaluation trial work item count overflowed".to_string())
+    })?;
+    let trial_ordinals = trial_ordinals.to_vec();
+    run_bounded_indexed_workers(item_count, max_workers, cancellation, move |index| {
+        let task_index = index / trial_count;
+        let trial = trial_ordinals[index % trial_count];
+        worker(task_index, trial)
+    })
 }
 
 fn run_task_workers(
@@ -622,22 +653,126 @@ fn run_task_workers(
     trials_per_task: u32,
     max_workers: usize,
     selected_trial: Option<u32>,
-) -> Result<Vec<TaskEvaluation>, TaskWorkerError> {
-    let result = run_bounded_indexed_workers(plans.len(), max_workers, context.cancellation, {
-        move |index| {
-            run_task_trials_with_prepared_source(
+) -> Result<Vec<TaskEvaluation>, TrialWorkerError> {
+    if context.cancellation.is_cancelled() {
+        return Err(TrialWorkerError::Cancelled(Vec::new()));
+    }
+    let trial_ordinals = selected_trial
+        .map(|trial| vec![trial])
+        .unwrap_or_else(|| (1..=trials_per_task).collect::<Vec<_>>());
+    let task_traces = plans
+        .iter()
+        .map(|plan| EvaluationTaskTrace::start(context, plan))
+        .collect::<Vec<_>>();
+    let result = run_bounded_trial_workers(
+        plans.len(),
+        &trial_ordinals,
+        max_workers,
+        context.cancellation,
+        move |task_index, trial| {
+            run_task_trial_with_prepared_source(
                 context,
-                &plans[index],
-                trials_per_task,
-                &prepared_sources[index],
-                selected_trial,
+                &plans[task_index],
+                &prepared_sources[task_index],
+                trial,
             )
-        }
-    });
+        },
+    );
     match result {
-        Ok(results) => Ok(results),
-        Err(IndexedWorkerError::Cancelled(results)) => Err(TaskWorkerError::Cancelled(results)),
-        Err(IndexedWorkerError::Failed(message)) => Err(TaskWorkerError::Failed(message)),
+        Ok(trials) => {
+            let task_executions = task_evaluations_from_trials(plans, &trial_ordinals, trials);
+            end_task_traces(task_traces, &task_executions);
+            refresh_trial_trace_artifacts(context, &task_executions);
+            Ok(task_executions)
+        }
+        Err(IndexedWorkerError::Cancelled(trials)) => {
+            let task_executions = task_evaluations_from_trials(plans, &trial_ordinals, trials);
+            end_task_traces(task_traces, &task_executions);
+            refresh_trial_trace_artifacts(context, &task_executions);
+            Err(TrialWorkerError::Cancelled(task_executions))
+        }
+        Err(IndexedWorkerError::Failed(message)) => {
+            end_task_traces(task_traces, &[]);
+            Err(TrialWorkerError::Failed(message))
+        }
+    }
+}
+
+fn task_evaluations_from_trials(
+    plans: &[WorkspacePlan],
+    trial_ordinals: &[u32],
+    trials: Vec<TaskExecution>,
+) -> Vec<TaskEvaluation> {
+    if trial_ordinals.is_empty() {
+        return Vec::new();
+    }
+    let mut grouped = Vec::<Vec<TaskExecution>>::new();
+    for (index, trial) in trials.into_iter().enumerate() {
+        let task_index = index / trial_ordinals.len();
+        if grouped.len() <= task_index {
+            grouped.push(Vec::new());
+        }
+        grouped[task_index].push(trial);
+    }
+    grouped
+        .into_iter()
+        .enumerate()
+        .map(|(task_index, trials)| task_evaluation_from_trials(&plans[task_index], trials))
+        .collect()
+}
+
+fn end_task_traces(task_traces: Vec<EvaluationTaskTrace<'_>>, task_executions: &[TaskEvaluation]) {
+    for (index, trace) in task_traces.into_iter().enumerate() {
+        let status = task_executions
+            .get(index)
+            .map(|execution| execution.result.status)
+            .unwrap_or(EvaluationStatus::Failed);
+        trace.end(evaluation_status_trace_status(status));
+    }
+}
+
+/// Refresh each persisted trial trace after both its trial and parent task spans have closed.
+fn refresh_trial_trace_artifacts(
+    context: &EvaluationRunContext<'_, '_>,
+    task_executions: &[TaskEvaluation],
+) {
+    for execution in task_executions {
+        let task_span_id = evaluation_span_id(
+            context.run_id,
+            &format!("task:{}", execution.result.task_id.as_str()),
+            TraceSpanKind::Task,
+        );
+        for trial in &execution.trials {
+            let Some(trace_path) = trial.diagnostics.trace_path.as_deref() else {
+                continue;
+            };
+            let session_id = format!(
+                "trial:{}:{}",
+                execution.result.task_id.as_str(),
+                trial.result.trial
+            );
+            let trace = match evaluation_agent_trace_shared(
+                &context.trace_store,
+                context.run_id.as_str(),
+                &session_id,
+                &task_span_id,
+            ) {
+                Ok(trace) => trace,
+                Err(error) => {
+                    record_trace_failure(
+                        &context.trace_failures,
+                        format!("failed to refresh evaluation trace artifact: {error}"),
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = write_json_atomic(Path::new(trace_path), &trace) {
+                record_trace_failure(
+                    &context.trace_failures,
+                    format!("failed to refresh evaluation trace artifact: {error}"),
+                );
+            }
+        }
     }
 }
 
@@ -767,6 +902,50 @@ impl<'store> EvaluationTraceSink<'store> {
                 ),
             ),
         }
+    }
+}
+
+struct EvaluationTaskTrace<'store> {
+    sink: EvaluationTraceSink<'store>,
+    session_id: String,
+    span_id: String,
+    started: Instant,
+}
+
+impl<'store> EvaluationTaskTrace<'store> {
+    fn start<'ctx>(context: &EvaluationRunContext<'store, 'ctx>, plan: &WorkspacePlan) -> Self {
+        let session_id = format!("task:{}", plan.task_id.as_str());
+        let span_id = evaluation_span_id(context.run_id, &session_id, TraceSpanKind::Task);
+        let started = Instant::now();
+        let sink = EvaluationTraceSink::new(
+            Arc::clone(&context.trace_store),
+            context.run_id,
+            &context.trace_failures,
+        );
+        sink.start(
+            &session_id,
+            &span_id,
+            None,
+            TraceSpanKind::Task,
+            "evaluation task",
+        );
+        Self {
+            sink,
+            session_id,
+            span_id,
+            started,
+        }
+    }
+
+    fn end(self, status: TraceSpanStatus) {
+        self.sink.end(
+            &self.session_id,
+            &self.span_id,
+            None,
+            TraceSpanKind::Task,
+            status,
+            self.started,
+        );
     }
 }
 
@@ -1200,7 +1379,7 @@ pub fn run_evaluation_with_mode(
         None,
     ) {
         Ok(task_executions) => task_executions,
-        Err(TaskWorkerError::Cancelled(task_executions)) => {
+        Err(TrialWorkerError::Cancelled(task_executions)) => {
             if let Err(error) = ensure_trace_failures_empty(&run_context.trace_failures) {
                 return Err(preserve_incomplete_run(
                     &run_dir,
@@ -1213,7 +1392,7 @@ pub fn run_evaluation_with_mode(
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
             ));
         }
-        Err(TaskWorkerError::Failed(message)) => {
+        Err(TrialWorkerError::Failed(message)) => {
             return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::infrastructure(message),
@@ -1963,11 +2142,12 @@ fn build_failure_attributions(
                     .diagnostics
                     .provider_diagnostic
                     .as_ref()
-                    .and_then(|diagnostic| diagnostic.code.clone()),
+                    .and_then(provider_diagnostic_code),
                 message: trial
                     .diagnostics
                     .error
-                    .clone()
+                    .as_deref()
+                    .map(safe_text)
                     .unwrap_or_else(|| "evaluation trial failed".to_string()),
             });
         }
@@ -2132,47 +2312,6 @@ fn publish_zero_sampling_blocked_run(
     })
 }
 
-fn run_task_trials_with_prepared_source(
-    context: &EvaluationRunContext<'_, '_>,
-    plan: &WorkspacePlan,
-    trials_per_task: u32,
-    prepared_source: &PreparedTaskSource,
-    selected_trial: Option<u32>,
-) -> TaskEvaluation {
-    let scope = format!("task:{}", plan.task_id.as_str());
-    let session_id = scope.clone();
-    let span_id = evaluation_span_id(context.run_id, &scope, TraceSpanKind::Task);
-    let started = Instant::now();
-    let trace = EvaluationTraceSink::new(
-        Arc::clone(&context.trace_store),
-        context.run_id,
-        &context.trace_failures,
-    );
-    trace.start(
-        &session_id,
-        &span_id,
-        None,
-        TraceSpanKind::Task,
-        "evaluation task",
-    );
-    let evaluation = run_task_trials_inner(
-        context,
-        plan,
-        trials_per_task,
-        prepared_source,
-        selected_trial,
-    );
-    trace.end(
-        &session_id,
-        &span_id,
-        None,
-        TraceSpanKind::Task,
-        evaluation_status_trace_status(evaluation.result.status),
-        started,
-    );
-    evaluation
-}
-
 fn prepare_task_source(
     context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
@@ -2257,17 +2396,16 @@ fn prepare_task_source(
     prepared
 }
 
-fn run_task_trials_inner(
+fn run_task_trial_with_prepared_source(
     context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
-    trials_per_task: u32,
     prepared_source: &PreparedTaskSource,
-    selected_trial: Option<u32>,
-) -> TaskEvaluation {
+    trial: u32,
+) -> TaskExecution {
     if let Some(blocker) = &prepared_source.blocker {
         return blocked_task_trials(
             plan,
-            trials_per_task,
+            1,
             blocker.clone(),
             prepared_source.source_commands.clone(),
             prepared_source.strict_sandbox_command_count,
@@ -2276,13 +2414,17 @@ fn run_task_trials_inner(
             prepared_source.source_template_expected,
             prepared_source.source_template.as_ref(),
             matches!(blocker.kind, BlockerKind::WorkspacePreparation),
-            selected_trial,
-        );
+            Some(trial),
+        )
+        .trials
+        .into_iter()
+        .next()
+        .expect("blocked trial projection must contain one trial");
     }
     if context.cancellation.is_cancelled() {
         return blocked_task_trials(
             plan,
-            trials_per_task,
+            1,
             evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
             prepared_source.source_commands.clone(),
             prepared_source.strict_sandbox_command_count,
@@ -2291,13 +2433,17 @@ fn run_task_trials_inner(
             prepared_source.source_template_expected,
             prepared_source.source_template.as_ref(),
             false,
-            selected_trial,
-        );
+            Some(trial),
+        )
+        .trials
+        .into_iter()
+        .next()
+        .expect("cancelled trial projection must contain one trial");
     }
     let Some(source_snapshot) = prepared_source.source_snapshot.as_ref() else {
         return blocked_task_trials(
             plan,
-            trials_per_task,
+            1,
             evaluation_blocker(
                 BlockerKind::WorkspacePreparation,
                 "prepared source snapshot is unavailable",
@@ -2309,8 +2455,12 @@ fn run_task_trials_inner(
             prepared_source.source_template_expected,
             prepared_source.source_template.as_ref(),
             true,
-            selected_trial,
-        );
+            Some(trial),
+        )
+        .trials
+        .into_iter()
+        .next()
+        .expect("missing source trial projection must contain one trial");
     };
     let prepared = PreparedTaskContext {
         run_id: context.run_id,
@@ -2330,14 +2480,7 @@ fn run_task_trials_inner(
         trace_store: Arc::clone(&context.trace_store),
         trace_failures: &context.trace_failures,
     };
-    let trials = selected_trial
-        .map(|trial| vec![run_task(&prepared, trial)])
-        .unwrap_or_else(|| {
-            (1..=trials_per_task)
-                .map(|trial| run_task(&prepared, trial))
-                .collect()
-        });
-    task_evaluation_from_trials(plan, trials)
+    run_task(&prepared, trial)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3975,8 +4118,12 @@ fn run_agent_stage(
         result.provider_diagnostic.as_ref(),
     ) {
         StageExecution::blocked(
-            evaluation_blocker(
+            evaluation_blocker_with_code(
                 kind,
+                result
+                    .provider_diagnostic
+                    .as_ref()
+                    .and_then(provider_diagnostic_code),
                 error
                     .clone()
                     .unwrap_or_else(|| "provider request failed".to_string()),
@@ -4218,15 +4365,17 @@ fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
         _ if provider_response_stage(&diagnostic) => BlockerKind::ProviderResponse,
         _ => BlockerKind::AgentRuntime,
     };
-    evaluation_blocker(kind, error.message.clone())
+    evaluation_blocker_with_code(
+        kind,
+        provider_diagnostic_code(&diagnostic),
+        error.message.clone(),
+    )
 }
 
 fn provider_configuration_blocker(error: &ProviderError) -> EvaluationBlocker {
     let diagnostic = error.error.provider_diagnostic();
     EvaluationBlocker {
-        code: diagnostic
-            .code
-            .filter(|code| !code.trim().is_empty())
+        code: provider_diagnostic_code(&diagnostic)
             .or_else(|| Some("provider_configuration_invalid".to_string())),
         kind: BlockerKind::ProviderConfiguration,
         message: safe_text(&error.message),
@@ -4300,12 +4449,24 @@ fn provider_response_stage(diagnostic: &ProviderDiagnostic) -> bool {
 }
 
 fn evaluation_blocker(kind: BlockerKind, message: impl Into<String>) -> EvaluationBlocker {
+    evaluation_blocker_with_code(kind, None, message)
+}
+
+fn evaluation_blocker_with_code(
+    kind: BlockerKind,
+    code: Option<String>,
+    message: impl Into<String>,
+) -> EvaluationBlocker {
     EvaluationBlocker {
-        code: None,
+        code,
         kind,
         message: safe_text(message.into()),
         task_id: None,
     }
+}
+
+fn provider_diagnostic_code(diagnostic: &ProviderDiagnostic) -> Option<String> {
+    diagnostic.code.as_deref().and_then(bounded_stable_code)
 }
 
 fn sandbox_preflight_blocker(
@@ -5313,7 +5474,73 @@ fn safe_text(text: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use singularity_model::{ModelError, ModelErrorKind};
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn record_max(active: &AtomicUsize, maximum: &AtomicUsize) {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut observed = maximum.load(Ordering::SeqCst);
+        while current > observed {
+            match maximum.compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+    }
+
+    fn task_execution_with_status(task_index: usize, trial: u32) -> TaskExecution {
+        let passed = !(task_index == 0 && trial == 1);
+        let status = if passed {
+            EvaluationStatus::Completed
+        } else {
+            EvaluationStatus::Failed
+        };
+        let agent_status = if passed {
+            StageStatus::Passed
+        } else {
+            StageStatus::Failed
+        };
+        let evaluator_status = if passed {
+            StageStatus::Passed
+        } else {
+            StageStatus::Skipped
+        };
+        TaskExecution {
+            result: EvaluationTrialResult {
+                trial,
+                status,
+                blocker: None,
+                stages: EvaluationStageResults {
+                    baseline: StageResult {
+                        status: StageStatus::Passed,
+                        blocker: None,
+                    },
+                    agent: StageResult {
+                        status: agent_status,
+                        blocker: None,
+                    },
+                    public: StageResult {
+                        status: evaluator_status,
+                        blocker: None,
+                    },
+                    hidden: StageResult {
+                        status: evaluator_status,
+                        blocker: None,
+                    },
+                },
+                agent_completed: passed,
+                tests_passed: passed,
+                functional_task_success: passed,
+                agent_protocol_success: passed,
+                sandbox_security_success: true,
+                evaluation_passed: passed,
+                evidence: EvaluationEvidenceSummary::default(),
+            },
+            diagnostics: TaskDiagnostics::default(),
+        }
+    }
 
     #[test]
     fn bounded_workers_preserve_manifest_order() {
@@ -5327,8 +5554,11 @@ mod tests {
     #[test]
     fn bounded_workers_fail_closed_after_panic() {
         let cancellation = CancellationToken::new();
-        let result = run_bounded_indexed_workers(1, 1, &cancellation, |_| -> usize {
-            panic!("worker failure");
+        let result = run_bounded_indexed_workers(2, 2, &cancellation, |index| -> usize {
+            if index == 0 {
+                panic!("worker failure");
+            }
+            index
         });
         assert!(matches!(
             result,
@@ -5341,18 +5571,277 @@ mod tests {
     fn bounded_workers_return_only_completed_prefix_after_cancellation() {
         let cancellation = CancellationToken::new();
         let canceller = cancellation.clone();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_worker = Arc::clone(&calls);
-        let result = run_bounded_indexed_workers(4, 1, &cancellation, move |index| {
-            if calls_for_worker.fetch_add(1, Ordering::SeqCst) == 1 {
-                canceller.cancel();
+        let barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let result = run_bounded_indexed_workers(4, 2, &cancellation, {
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |index| {
+                record_max(&active, &maximum);
+                if index < 2 {
+                    barrier.wait();
+                    if index == 1 {
+                        canceller.cancel();
+                    }
+                    barrier.wait();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                index
             }
-            index
         });
         assert!(matches!(
             result,
             Err(IndexedWorkerError::Cancelled(prefix)) if prefix == vec![0, 1]
         ));
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn trial_workers_overlap_all_trials_and_preserve_task_trial_order() {
+        let cancellation = CancellationToken::new();
+        let barrier = Arc::new(Barrier::new(6));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let results = run_bounded_trial_workers(3, &[1, 2], 6, &cancellation, {
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |task_index, trial| {
+                record_max(&active, &maximum);
+                barrier.wait();
+                active.fetch_sub(1, Ordering::SeqCst);
+                (task_index, trial)
+            }
+        })
+        .expect("trial workers complete");
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            results,
+            vec![(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn trial_workers_continue_after_failed_task_execution_without_failing_fast() {
+        let cancellation = CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let results = match run_bounded_trial_workers(3, &[1, 2], 2, &cancellation, {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |task_index, trial| {
+                record_max(&active, &maximum);
+                thread::sleep(Duration::from_millis(5));
+                let execution = task_execution_with_status(task_index, trial);
+                active.fetch_sub(1, Ordering::SeqCst);
+                execution
+            }
+        }) {
+            Ok(results) => results,
+            Err(_) => panic!("a failed trial must not fail fast"),
+        };
+
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
+        assert_eq!(results.len(), 6);
+        assert_eq!(results[0].result.status, EvaluationStatus::Failed);
+        assert!(
+            results
+                .iter()
+                .skip(1)
+                .all(|execution| execution.result.status == EvaluationStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn refresh_trial_trace_artifact_projects_terminal_spans_from_sqlite() {
+        use singularity_store::SessionStore;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let run_id = RunId::new("run").expect("run id");
+        let task_id = TaskId::new("task").expect("task id");
+        let trace_path = temp.path().join(AGENT_TRACE_FILE);
+        let cancellation = CancellationToken::new();
+        let trace_failures = Arc::new(Mutex::new(Vec::new()));
+        let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
+        let sandbox_preflight =
+            SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+        let provider_snapshot = ProviderConfigSnapshot::capture(|_| None, None, None);
+        let source_cache = SourceTemplateCache::new(temp.path().join("source-cache"));
+        let mut store = SessionStore::open(":memory:").expect("trace store");
+        let trace_store = Arc::new(Mutex::new(&mut store));
+        let context = EvaluationRunContext {
+            run_id: &run_id,
+            run_dir: temp.path(),
+            sandbox_backend: &sandbox_backend,
+            provider_snapshot: &provider_snapshot,
+            cancellation: &cancellation,
+            trace_store: Arc::clone(&trace_store),
+            trace_failures: Arc::clone(&trace_failures),
+            sandbox_preflight: &sandbox_preflight,
+            source_cache: &source_cache,
+        };
+        let sink = EvaluationTraceSink::new(Arc::clone(&trace_store), &run_id, &trace_failures);
+        let task_session_id = format!("task:{}", task_id.as_str());
+        let task_span_id = evaluation_span_id(&run_id, &task_session_id, TraceSpanKind::Task);
+        let trial_session_id = format!("trial:{}:1", task_id.as_str());
+        let trial_span_id = evaluation_span_id(&run_id, &trial_session_id, TraceSpanKind::Turn);
+        let task_started = Instant::now();
+        let trial_started = Instant::now();
+        sink.start(
+            &task_session_id,
+            &task_span_id,
+            None,
+            TraceSpanKind::Task,
+            "evaluation task",
+        );
+        sink.start(
+            &trial_session_id,
+            &trial_span_id,
+            Some(&task_span_id),
+            TraceSpanKind::Turn,
+            "evaluation trial",
+        );
+        sink.end(
+            &trial_session_id,
+            &trial_span_id,
+            Some(&task_span_id),
+            TraceSpanKind::Turn,
+            TraceSpanStatus::Ok,
+            trial_started,
+        );
+        sink.end(
+            &task_session_id,
+            &task_span_id,
+            None,
+            TraceSpanKind::Task,
+            TraceSpanStatus::Ok,
+            task_started,
+        );
+
+        let mut execution = task_execution_with_status(0, 1);
+        execution.diagnostics.trace_path = Some(trace_path.to_string_lossy().into_owned());
+        let task_result =
+            EvaluationTaskResult::from_trials(task_id, Vec::new(), vec![execution.result.clone()]);
+        refresh_trial_trace_artifacts(
+            &context,
+            &[TaskEvaluation {
+                result: task_result,
+                trials: vec![execution],
+            }],
+        );
+
+        assert!(ensure_trace_failures_empty(&trace_failures).is_ok());
+        let artifact: Value =
+            serde_json::from_str(&fs::read_to_string(&trace_path).expect("trace artifact"))
+                .expect("trace artifact JSON");
+        let events = artifact["events"].as_array().expect("trace events array");
+        assert!(events.iter().any(|event| {
+            event["span_id"] == task_span_id
+                && event["span_phase"] == "end"
+                && event["span_status"] == "ok"
+        }));
+        assert!(events.iter().any(|event| {
+            event["span_id"] == trial_span_id
+                && event["span_phase"] == "end"
+                && event["span_status"] == "ok"
+        }));
+    }
+
+    #[test]
+    fn provider_blocker_keeps_bounded_code_and_redacts_message() {
+        let error = ProviderError::from_model_error(
+            ModelError::new(
+                ModelErrorKind::UnknownProviderError,
+                "provider_response_invalid: api_key=secret",
+            )
+            .with_provider_diagnostic(
+                "provider_response_invalid",
+                ProviderErrorStage::ResponseValidation,
+            ),
+        );
+
+        let blocker = provider_blocker(&error);
+
+        assert_eq!(blocker.kind, BlockerKind::ProviderResponse);
+        assert_eq!(blocker.code.as_deref(), Some("provider_response_invalid"));
+        assert_eq!(blocker.message, "[redacted]");
+    }
+
+    #[test]
+    fn failure_attribution_keeps_bounded_provider_code_and_redacts_diagnostic_error() {
+        let task_id = TaskId::new("task").expect("task id");
+        let trial_result = EvaluationTrialResult {
+            trial: 1,
+            status: EvaluationStatus::Failed,
+            blocker: None,
+            stages: EvaluationStageResults {
+                baseline: StageResult {
+                    status: StageStatus::Passed,
+                    blocker: None,
+                },
+                agent: StageResult {
+                    status: StageStatus::Failed,
+                    blocker: None,
+                },
+                public: StageResult {
+                    status: StageStatus::Skipped,
+                    blocker: None,
+                },
+                hidden: StageResult {
+                    status: StageStatus::Skipped,
+                    blocker: None,
+                },
+            },
+            agent_completed: false,
+            tests_passed: false,
+            functional_task_success: false,
+            agent_protocol_success: false,
+            sandbox_security_success: true,
+            evaluation_passed: false,
+            evidence: EvaluationEvidenceSummary::default(),
+        };
+        let task_result = EvaluationTaskResult::from_trials(
+            task_id.clone(),
+            Vec::new(),
+            vec![trial_result.clone()],
+        );
+        let run_result = EvaluationResult::from_tasks(
+            RunId::new("run").expect("run id"),
+            1,
+            vec![task_result.clone()],
+        );
+        let execution = TaskEvaluation {
+            result: task_result,
+            trials: vec![TaskExecution {
+                result: trial_result,
+                diagnostics: TaskDiagnostics {
+                    error: Some("provider_response_invalid: api_key=secret".to_string()),
+                    provider_diagnostic: Some(ProviderDiagnostic {
+                        code: Some("provider_response_invalid".to_string()),
+                        stage: Some(ProviderErrorStage::ResponseValidation),
+                        transport_category: None,
+                        timeout_seconds: None,
+                        http_status: None,
+                        validation_errors: Vec::new(),
+                    }),
+                    ..TaskDiagnostics::default()
+                },
+            }],
+        };
+
+        let failures = build_failure_attributions(&run_result, &[execution]);
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].code.as_deref(),
+            Some("provider_response_invalid")
+        );
+        assert_eq!(failures[0].message, "[redacted]");
+        assert_eq!(failures[0].task_id.as_ref(), Some(&task_id));
+        assert_eq!(failures[0].trial, Some(1));
     }
 
     #[test]
