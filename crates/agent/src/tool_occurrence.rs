@@ -35,6 +35,7 @@ pub(super) struct ToolOccurrenceContext {
     pub(super) tool_call_ordinal: u32,
     pub(super) tool_call_id_digest: String,
     pub(super) tool_name: String,
+    pub(super) first_attempt: bool,
 }
 
 pub(super) struct ModelToolOccurrence {
@@ -415,6 +416,7 @@ pub(super) fn tool_occurrence_context(
         tool_call_ordinal,
         tool_call_id_digest: format!("sha256:{:x}", Sha256::digest(call.tool_call_id.as_bytes())),
         tool_name: safe_tool_name(call),
+        first_attempt: true,
     }
 }
 
@@ -444,6 +446,7 @@ pub(super) fn tool_call_event(
         tool_call_ordinal: context.tool_call_ordinal,
         tool_call_id_digest: context.tool_call_id_digest.clone(),
         tool_name: context.tool_name.clone(),
+        first_attempt: context.first_attempt,
     }))
 }
 
@@ -452,14 +455,20 @@ pub(super) fn emit_rejected_tool_calls(
     input: &AgentLoopInput,
     calls: &[ModelToolCall],
     model_turn_ordinal: u32,
+    first_attempts: &[bool],
 ) -> Result<(), AgentLoopEventSinkError> {
-    for (ordinal, call) in calls.iter().enumerate() {
+    if first_attempts.len() != calls.len() {
+        return Err(AgentLoopEventSinkError);
+    }
+    for (ordinal, (call, first_attempt)) in calls.iter().zip(first_attempts).enumerate() {
         let context = tool_occurrence_context(
             input,
             call,
             model_turn_ordinal,
             u32::try_from(ordinal).unwrap_or(u32::MAX),
         );
+        let mut context = context;
+        context.first_attempt = *first_attempt;
         emit_event(on_event, tool_call_event(&context, context.timer.started()))?;
         emit_event(
             on_event,

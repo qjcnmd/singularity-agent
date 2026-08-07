@@ -119,6 +119,8 @@ pub struct ToolCallObservation {
     pub tool_call_ordinal: u32,
     pub tool_call_id_digest: String,
     pub tool_name: String,
+    /// True when this span belongs to the first terminal attempt for its logical fingerprint.
+    pub first_attempt: bool,
 }
 
 /// 最终 policy 决策；不包含 resource、reason、rule ID 或原始参数。

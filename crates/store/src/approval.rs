@@ -558,7 +558,24 @@ impl SessionStore {
         summary: &str,
     ) -> StoreResult<RecordedApprovalDecision> {
         self.record_approval_decision_with_optional_turn_checkpoint(
-            decision, component, summary, None,
+            decision, component, summary, None, false,
+        )
+    }
+
+    /// Atomically resolve an approval and persist a first-attempt failure sample when requested.
+    pub fn record_approval_decision_with_first_attempt_failure(
+        &self,
+        decision: &ApprovalDecision,
+        component: &str,
+        summary: &str,
+        first_attempt_failure: bool,
+    ) -> StoreResult<RecordedApprovalDecision> {
+        self.record_approval_decision_with_optional_turn_checkpoint(
+            decision,
+            component,
+            summary,
+            None,
+            first_attempt_failure,
         )
     }
 
@@ -579,6 +596,30 @@ impl SessionStore {
             component,
             summary,
             Some((input_ids, checkpoint, checkpoint_version, pause)),
+            false,
+        )
+    }
+
+    /// Atomically hand off a denied approval at an input boundary and persist its first-attempt
+    /// failure sample in the same SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_approval_decision_with_turn_checkpoint_and_first_attempt_failure(
+        &self,
+        decision: &ApprovalDecision,
+        component: &str,
+        summary: &str,
+        input_ids: &[String],
+        checkpoint: &Value,
+        checkpoint_version: u32,
+        pause: bool,
+        first_attempt_failure: bool,
+    ) -> StoreResult<RecordedApprovalDecision> {
+        self.record_approval_decision_with_optional_turn_checkpoint(
+            decision,
+            component,
+            summary,
+            Some((input_ids, checkpoint, checkpoint_version, pause)),
+            first_attempt_failure,
         )
     }
 
@@ -588,6 +629,7 @@ impl SessionStore {
         component: &str,
         summary: &str,
         turn_checkpoint: Option<(&[String], &Value, u32, bool)>,
+        first_attempt_failure: bool,
     ) -> StoreResult<RecordedApprovalDecision> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -959,6 +1001,32 @@ impl SessionStore {
         });
         let trace =
             Self::insert_turn_trace(&transaction, &trace, &request.thread_id, &request.turn_id)?;
+        if first_attempt_failure
+            && decision.outcome == ApprovalOutcome::Deny
+            && pending_tool_call.is_some()
+        {
+            let mut metric_trace = TraceEvent::for_turn(
+                first_attempt_failure_trace_id(&decision.request_id),
+                request.thread_id.clone(),
+                request.turn_id.clone(),
+                "observability",
+                "tool first attempt approval denial",
+            );
+            metric_trace.timestamp = trace.timestamp.clone();
+            metric_trace.payload = serde_json::json!({
+                "observation": "tool_first_attempt",
+            });
+            metric_trace.metric_samples = vec![TraceMetricSample {
+                kind: TraceMetricSampleKind::ToolFirstAttemptFailure,
+                count: 1,
+            }];
+            Self::insert_turn_trace(
+                &transaction,
+                &metric_trace,
+                &request.thread_id,
+                &request.turn_id,
+            )?;
+        }
         let turn = self.turn_in_transaction(&transaction, &request.turn_id)?;
         transaction.commit()?;
         Ok(RecordedApprovalDecision {
@@ -1115,6 +1183,13 @@ fn typed_approval_wait_end_trace(
     event.span_status = Some(span_status);
     event.duration_ms = Some(duration_ms);
     Ok(event)
+}
+
+fn first_attempt_failure_trace_id(request_id: &str) -> String {
+    format!(
+        "trace_tool_first_attempt_denied_{:x}",
+        Sha256::digest(request_id.as_bytes())
+    )
 }
 
 pub(crate) fn decode_final_approval_outcome(value: &str) -> StoreResult<ApprovalOutcome> {

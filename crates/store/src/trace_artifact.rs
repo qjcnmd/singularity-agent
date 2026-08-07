@@ -482,6 +482,7 @@ const TRACE_METRIC_NAMES: &[TraceMetricName] = &[
     TraceMetricName::ToolFrequency,
     TraceMetricName::ToolSuccessCount,
     TraceMetricName::ToolSuccessRateBps,
+    TraceMetricName::ToolFirstAttemptSuccessRateBps,
     TraceMetricName::ToolDurationMs,
     TraceMetricName::ApprovalWaitDurationMs,
     TraceMetricName::SandboxExecutionDurationMs,
@@ -601,6 +602,12 @@ fn derive_trace_metric(
         }
         TraceMetricName::ToolSuccessCount => tool_success_values(events, legacy_only)?,
         TraceMetricName::ToolSuccessRateBps => tool_success_rate_values(events, legacy_only)?,
+        TraceMetricName::ToolFirstAttemptSuccessRateBps => sample_ratio_values(
+            TraceMetricSampleKind::ToolFirstAttemptSuccess,
+            TraceMetricSampleKind::ToolFirstAttemptFailure,
+            events,
+            legacy_only,
+        )?,
         TraceMetricName::ToolDurationMs => duration_values(
             TraceSpanKind::ToolCall,
             events,

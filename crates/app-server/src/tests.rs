@@ -61,7 +61,7 @@ fn pending_approval_for_test(
         "tool_name": &request.action,
         "raw_arguments": &raw_arguments,
         "resources": &request.resources,
-        "checkpoint_version": 6,
+        "checkpoint_version": 7,
         "project_instructions_digest": null,
         "messages": [{
             "role": "assistant",
@@ -95,6 +95,7 @@ fn pending_approval_for_test(
         "provider_attempts": ProviderAttemptMetadata::default(),
         "context_trace": null,
         "seen_tool_call_fingerprints": [],
+        "completed_tool_call_fingerprints": [],
         "last_repair_failure": null
     });
     decode_pending_approval(request, Some(&payload))
@@ -3276,5 +3277,161 @@ fn provider_observation_projection_preserves_stable_diagnostic_code() {
             .and_then(|error| error.code)
             .as_deref(),
         Some("provider_response_invalid")
+    );
+}
+
+#[test]
+fn tool_first_attempt_projection_emits_closed_sample_once() {
+    use singularity_agent::{ToolCallObservation, ToolCallStatus};
+    use singularity_protocol::TraceMetricSampleKind;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "tool"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    let mut projector =
+        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
+            .expect("projector");
+    let identity = OccurrenceIdentity {
+        occurrence_id: "tool_first_attempt_occurrence".to_string(),
+        parent_occurrence_id: None,
+        ordinal: 0,
+    };
+    let started = ToolCallObservation {
+        identity: identity.clone(),
+        lifecycle: OccurrenceLifecycle::Started {
+            queued_at_unix_ms: 1_700_000_000_000,
+            started_at_unix_ms: 1_700_000_000_001,
+        },
+        model_turn_ordinal: 0,
+        tool_call_ordinal: 0,
+        tool_call_id_digest:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        tool_name: "read".to_string(),
+        first_attempt: true,
+    };
+    let finished = ToolCallObservation {
+        identity,
+        lifecycle: OccurrenceLifecycle::Finished {
+            queued_at_unix_ms: 1_700_000_000_000,
+            started_at_unix_ms: 1_700_000_000_001,
+            ended_at_unix_ms: 1_700_000_000_010,
+            duration_ms: 9,
+            status: ToolCallStatus::Succeeded,
+        },
+        model_turn_ordinal: 0,
+        tool_call_ordinal: 0,
+        tool_call_id_digest:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        tool_name: "read".to_string(),
+        first_attempt: true,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
+            started,
+        )))
+        .expect("tool start");
+    projector
+        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
+            finished,
+        )))
+        .expect("tool end");
+    let repeat_identity = OccurrenceIdentity {
+        occurrence_id: "tool_first_attempt_repeat".to_string(),
+        parent_occurrence_id: None,
+        ordinal: 1,
+    };
+    let repeat = |lifecycle| ToolCallObservation {
+        identity: repeat_identity.clone(),
+        lifecycle,
+        model_turn_ordinal: 0,
+        tool_call_ordinal: 1,
+        tool_call_id_digest:
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        tool_name: "read".to_string(),
+        first_attempt: false,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
+            repeat(OccurrenceLifecycle::Started {
+                queued_at_unix_ms: 1_700_000_000_000,
+                started_at_unix_ms: 1_700_000_000_001,
+            }),
+        )))
+        .expect("repeat start");
+    projector
+        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
+            repeat(OccurrenceLifecycle::Finished {
+                queued_at_unix_ms: 1_700_000_000_000,
+                started_at_unix_ms: 1_700_000_000_001,
+                ended_at_unix_ms: 1_700_000_000_010,
+                duration_ms: 9,
+                status: ToolCallStatus::Succeeded,
+            }),
+        )))
+        .expect("repeat end");
+    let denial_request = ApprovalRequest::new(
+        format!("approval_{}_call_deny", turn.turn_id),
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id(TOOL_PATCH),
+    )
+    .with_tool_call_id("call_deny");
+    let pending_denial = pending_approval_for_test(
+        &denial_request,
+        serde_json::json!({
+            "changes": [{
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            }]
+        }),
+    );
+    projector
+        .project_approval_denied(&pending_denial)
+        .expect("approval denial failure sample");
+    projector
+        .project_approval_denied(&pending_denial)
+        .expect("replayed approval denial remains idempotent");
+    let trace = store.list_trace(&thread.thread_id).expect("trace");
+    assert_eq!(
+        trace
+            .iter()
+            .flat_map(|event| event.metric_samples.iter())
+            .filter(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptSuccess)
+            .count(),
+        1
+    );
+    let denial_event = trace
+        .iter()
+        .find(|event| {
+            event
+                .metric_samples
+                .iter()
+                .any(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptFailure)
+        })
+        .expect("approval denial failure sample");
+    assert_eq!(denial_event.payload["observation"], "tool_first_attempt");
+    assert!(
+        !denial_event
+            .payload
+            .to_string()
+            .contains("provider_capability_cache")
+    );
+    let metrics = store.trace_metrics(&thread.thread_id).expect("metrics");
+    let metric = metrics
+        .metric("tool_first_attempt_success_rate_bps")
+        .expect("first attempt metric");
+    assert_eq!(
+        metric.distribution.as_ref().map(|value| value.sum),
+        Some(5_000)
     );
 }

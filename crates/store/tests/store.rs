@@ -4749,7 +4749,12 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
         ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Deny, "denied");
 
     store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
+        .record_approval_decision_with_first_attempt_failure(
+            &decision,
+            "approval",
+            "approval decision recorded",
+            true,
+        )
         .expect("deny approval");
 
     let denied_turn = store.get_turn(&turn.turn_id).expect("denied turn");
@@ -4760,6 +4765,14 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
             .has_pending_tool_call(&request.request_id)
             .expect("pending lookup")
     );
+    let denial_samples = store
+        .list_trace(&thread.thread_id)
+        .expect("trace")
+        .iter()
+        .flat_map(|event| event.metric_samples.iter())
+        .filter(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptFailure)
+        .count();
+    assert_eq!(denial_samples, 1);
 }
 
 // 验证 allow claim 在 store 事务内重新检查 active thread。

@@ -123,6 +123,22 @@ impl PendingApprovalOccurrence {
         &self.checkpoint
     }
 
+    /// Return whether the pending logical tool call has not yet reached a terminal outcome.
+    pub fn first_attempt(&self) -> Result<bool, String> {
+        let call = self
+            .checkpoint
+            .pending_tool_call
+            .to_model_tool_call()
+            .map_err(|error| format!("invalid pending tool call arguments: {error}"))?;
+        let fingerprint = super::tool_call_fingerprint(&call);
+        Ok(!self
+            .checkpoint
+            .state
+            .completed_tool_call_fingerprints
+            .iter()
+            .any(|known| known == &fingerprint))
+    }
+
     /// Encode only when crossing the persistence boundary.
     pub fn encode_checkpoint(&self) -> Result<Value, String> {
         self.checkpoint.encode()
@@ -190,6 +206,7 @@ pub(super) struct CheckpointState {
     pub(super) provider_attempts: ProviderAttemptMetadata,
     pub(super) context_trace: Option<AgentContextTrace>,
     pub(super) seen_tool_call_fingerprints: Vec<String>,
+    pub(super) completed_tool_call_fingerprints: Vec<String>,
     pub(super) last_repair_failure: Option<RepairFailureState>,
 }
 
@@ -487,6 +504,22 @@ impl CheckpointState {
                 .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
         {
             return Err("approval checkpoint tool-call fingerprint state is invalid".to_string());
+        }
+        let completed_tool_call_fingerprints = self
+            .completed_tool_call_fingerprints
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if completed_tool_call_fingerprints.len() != self.completed_tool_call_fingerprints.len()
+            || completed_tool_call_fingerprints
+                .iter()
+                .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
+            || completed_tool_call_fingerprints
+                .iter()
+                .any(|fingerprint| !seen_tool_call_fingerprints.contains(fingerprint))
+        {
+            return Err(
+                "approval checkpoint completed tool-call fingerprint state is invalid".to_string(),
+            );
         }
         if self.last_repair_failure.as_ref().is_some_and(|failure| {
             failure.consecutive_count == 0 || !is_sha256_fingerprint(&failure.signature)

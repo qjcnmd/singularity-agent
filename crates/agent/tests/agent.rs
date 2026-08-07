@@ -3872,7 +3872,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         "approval_turn_1_call_1"
     );
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
-    assert_eq!(checkpoint["checkpoint_version"], 6);
+    assert_eq!(checkpoint["checkpoint_version"], 7);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
     assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");

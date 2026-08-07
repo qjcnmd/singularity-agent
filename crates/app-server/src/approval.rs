@@ -213,6 +213,16 @@ impl AppServer {
                         return Ok(());
                     }
                 };
+            let first_attempt_failure = if decision.outcome == ApprovalOutcome::Deny {
+                pending_before_decision
+                    .as_ref()
+                    .map(PendingApprovalOccurrence::first_attempt)
+                    .transpose()
+                    .map_err(|error| AppServerError::Store(StoreError::InvalidState(error)))?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             let build_handoff =
                 || -> AppServerResult<(Option<TurnCheckpoint>, Vec<String>, bool)> {
                     if !continues_execution {
@@ -287,15 +297,37 @@ impl AppServer {
                 let recorded_result = if let (Some(checkpoint), Some(checkpoint_version)) =
                     (encoded_handoff.as_ref(), handoff_checkpoint_version)
                 {
-                    self.store.record_approval_decision_with_turn_checkpoint(
-                        &decision,
-                        "approval",
-                        "approval decision recorded",
-                        &handoff_input_ids,
-                        checkpoint,
-                        checkpoint_version,
-                        handoff_pause,
-                    )
+                    if first_attempt_failure {
+                        self.store
+                            .record_approval_decision_with_turn_checkpoint_and_first_attempt_failure(
+                                &decision,
+                                "approval",
+                                "approval decision recorded",
+                                &handoff_input_ids,
+                                checkpoint,
+                                checkpoint_version,
+                                handoff_pause,
+                                true,
+                            )
+                    } else {
+                        self.store.record_approval_decision_with_turn_checkpoint(
+                            &decision,
+                            "approval",
+                            "approval decision recorded",
+                            &handoff_input_ids,
+                            checkpoint,
+                            checkpoint_version,
+                            handoff_pause,
+                        )
+                    }
+                } else if first_attempt_failure {
+                    self.store
+                        .record_approval_decision_with_first_attempt_failure(
+                            &decision,
+                            "approval",
+                            "approval decision recorded",
+                            true,
+                        )
                 } else {
                     self.store.record_approval_decision(
                         &decision,

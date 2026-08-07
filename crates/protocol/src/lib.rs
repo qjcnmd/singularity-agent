@@ -1109,6 +1109,9 @@ pub struct TraceToolProjection {
     pub tool_call_id_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_ordinal: Option<u64>,
+    /// Whether this terminal occurrence is the first terminal attempt for its logical tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_attempt: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TraceToolStatus>,
 }
@@ -1560,6 +1563,15 @@ impl TraceSpanProjection {
                             value.tool_call_ordinal,
                         )
                     })
+                    && same_if_start_known(
+                        self.tool
+                            .as_ref()
+                            .and_then(|value| value.first_attempt.as_ref()),
+                        other
+                            .tool
+                            .as_ref()
+                            .and_then(|value| value.first_attempt.as_ref()),
+                    )
             }
             TraceSpanKind::PolicyDecision => {
                 self.policy
@@ -1649,6 +1661,8 @@ pub enum TraceMetricSampleKind {
     WriterVisible,
     ProviderCapabilityCacheHit,
     ProviderCapabilityCacheMiss,
+    ToolFirstAttemptSuccess,
+    ToolFirstAttemptFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1682,6 +1696,7 @@ pub enum TraceMetricName {
     ToolFrequency,
     ToolSuccessCount,
     ToolSuccessRateBps,
+    ToolFirstAttemptSuccessRateBps,
     ToolDurationMs,
     ApprovalWaitDurationMs,
     SandboxExecutionDurationMs,
@@ -1717,6 +1732,7 @@ impl TraceMetricName {
             Self::ToolFrequency => "tool_frequency",
             Self::ToolSuccessCount => "tool_success_count",
             Self::ToolSuccessRateBps => "tool_success_rate_bps",
+            Self::ToolFirstAttemptSuccessRateBps => "tool_first_attempt_success_rate_bps",
             Self::ToolDurationMs => "tool_duration_ms",
             Self::ApprovalWaitDurationMs => "approval_wait_duration_ms",
             Self::SandboxExecutionDurationMs => "sandbox_execution_duration_ms",

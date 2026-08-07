@@ -217,7 +217,7 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "tool_name": &request.action,
         "raw_arguments": r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,
         "resources": &request.resources,
-        "checkpoint_version": 6,
+        "checkpoint_version": 7,
         "project_instructions_digest": null,
         "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]},"raw_arguments":r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,"parse_status":"valid","validation_errors":[]}]}],
         "tool_result_occurrences": [],
@@ -240,6 +240,7 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "provider_attempts": ProviderAttemptMetadata::default(),
         "context_trace": null,
         "seen_tool_call_fingerprints": [],
+        "completed_tool_call_fingerprints": [],
         "last_repair_failure": null
     })
 }
@@ -440,7 +441,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             .as_array()
             .unwrap()
             .len(),
-        29
+        30
     );
     assert!(
         trace_metrics[0]["result"]["metrics"]["metrics"]

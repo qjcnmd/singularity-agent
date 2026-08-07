@@ -1,5 +1,7 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use singularity_agent::PendingApprovalOccurrence;
 use singularity_agent::{
     AgentLoopEvent, AgentObservation, AgentRunStatus, OccurrenceIdentity, OccurrenceLifecycle,
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus, PromptAssemblyStatus,
@@ -125,13 +127,35 @@ impl<'a> TraceProjector<'a> {
                 };
                 self.append_metric_sample(
                     &cache_observation_identity(observation, index),
-                    &timestamp,
+                    Some(&timestamp),
                     kind,
                     "provider capability cache observation",
+                    "provider_capability_cache",
                 )?;
             }
         }
         Ok(())
+    }
+
+    /// Project an approval denial that terminates a pending tool call without resuming AgentLoop.
+    /// The standalone sample has no timing semantics, so omitting its timestamp keeps retries
+    /// byte-identical while preserving the stable event identity.
+    #[cfg(test)]
+    pub(crate) fn project_approval_denied(
+        &self,
+        pending: &PendingApprovalOccurrence,
+    ) -> Result<(), StoreError> {
+        if !pending.first_attempt().map_err(StoreError::InvalidState)? {
+            return Ok(());
+        }
+        let identity = format!("approval_deny:{}", pending.request().request_id);
+        self.append_metric_sample(
+            &identity,
+            None,
+            TraceMetricSampleKind::ToolFirstAttemptFailure,
+            "tool first attempt approval denial",
+            "tool_first_attempt",
+        )
     }
 
     fn project_observation(&mut self, observation: AgentObservation) -> Result<(), StoreError> {
@@ -176,6 +200,7 @@ impl<'a> TraceProjector<'a> {
                     tool_name: Some(observation.tool_name.clone()),
                     tool_call_id_digest: Some(observation.tool_call_id_digest.clone()),
                     tool_call_ordinal: Some(u64::from(observation.tool_call_ordinal)),
+                    first_attempt: Some(observation.first_attempt),
                     ..TraceToolProjection::default()
                 };
                 self.append_lifecycle(
@@ -197,7 +222,7 @@ impl<'a> TraceProjector<'a> {
                         ..TraceSpanProjection::default()
                     },
                     tool_span_status,
-                    |_| Vec::new(),
+                    |status| tool_metric_samples(*status, observation.first_attempt),
                 )
             }
             AgentObservation::PolicyDecision(observation) => {
@@ -430,16 +455,17 @@ impl<'a> TraceProjector<'a> {
     fn append_metric_sample(
         &self,
         identity: &str,
-        timestamp: &str,
+        timestamp: Option<&str>,
         kind: TraceMetricSampleKind,
         summary: &str,
+        observation: &str,
     ) -> Result<(), StoreError> {
         let mut event = self.new_trace_event(
             trace_event_id(&self.session_id, identity, TraceSpanPhase::End),
             summary,
         );
-        event.timestamp = Some(timestamp.to_string());
-        event.payload = json!({"observation": "provider_capability_cache"});
+        event.timestamp = timestamp.map(str::to_string);
+        event.payload = json!({"observation": observation});
         event.metric_samples = vec![TraceMetricSample { kind, count: 1 }];
         self.store.append_trace_idempotent(&event).map(|_| ())
     }
@@ -505,6 +531,22 @@ fn tool_span_status(status: &ToolCallStatus) -> TraceSpanStatus {
         ToolCallStatus::Succeeded => TraceSpanStatus::Ok,
         _ => TraceSpanStatus::Error,
     }
+}
+
+fn tool_metric_samples(status: ToolCallStatus, first_attempt: bool) -> Vec<TraceMetricSample> {
+    if !first_attempt {
+        return Vec::new();
+    }
+    let kind = match status {
+        ToolCallStatus::Succeeded => TraceMetricSampleKind::ToolFirstAttemptSuccess,
+        ToolCallStatus::Failed
+        | ToolCallStatus::Cancelled
+        | ToolCallStatus::Rejected
+        | ToolCallStatus::PolicyDenied
+        | ToolCallStatus::BatchRejected => TraceMetricSampleKind::ToolFirstAttemptFailure,
+        ToolCallStatus::ApprovalRequired => return Vec::new(),
+    };
+    vec![TraceMetricSample { kind, count: 1 }]
 }
 
 fn policy_decision(status: PolicyDecisionStatus) -> TracePolicyDecision {

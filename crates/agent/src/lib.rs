@@ -98,6 +98,22 @@ impl TurnCheckpoint {
             if !call_is_present {
                 return Err("turn checkpoint pending tool call is missing".to_string());
             }
+            let fingerprint = pending
+                .to_model_tool_call()
+                .map(|call| tool_call_fingerprint(&call))
+                .map_err(|error| {
+                    format!("turn checkpoint pending tool call is invalid: {error}")
+                })?;
+            if !self
+                .state
+                .completed_tool_call_fingerprints
+                .iter()
+                .any(|known| known == &fingerprint)
+            {
+                self.state
+                    .completed_tool_call_fingerprints
+                    .push(fingerprint);
+            }
             let mut result = ToolResult::summary(tool_call_id, tool_name, false, summary);
             result.error_code = Some(error_code.to_string());
             result.failure_kind = Some(ToolFailureKind::Cancelled);
@@ -214,10 +230,10 @@ use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
-/// Approval checkpoints after removing the latest-only mutation summary.
-const APPROVAL_CHECKPOINT_VERSION: u32 = 6;
-/// Ordinary turn checkpoints after removing the latest-only mutation summary.
-const TURN_CHECKPOINT_VERSION: u32 = 5;
+/// Approval checkpoints include the durable first-terminal tool-call ledger.
+const APPROVAL_CHECKPOINT_VERSION: u32 = 7;
+/// Ordinary turn checkpoints include the durable first-terminal tool-call ledger.
+const TURN_CHECKPOINT_VERSION: u32 = 6;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise private checklist; update it when evidence or failure changes the approach, and complete the requested work before the final answer. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -844,6 +860,12 @@ struct AgentLoopState {
     model_usage: ModelUsage,
     provider_attempts: ProviderAttemptMetadata,
     seen_tool_call_fingerprints: BTreeSet<String>,
+    /// Logical tool fingerprints that already reached a terminal outcome. This is persisted in
+    /// checkpoints so approval/process recovery cannot count a repeated fingerprint twice.
+    completed_tool_call_fingerprints: BTreeSet<String>,
+    /// Claims made by the current in-flight batch; unlike the completed ledger, this is not
+    /// persisted because suspended approval has not reached a terminal outcome.
+    first_attempt_claims: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
@@ -897,6 +919,8 @@ impl AgentLoopState {
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
             seen_tool_call_fingerprints: BTreeSet::new(),
+            completed_tool_call_fingerprints: BTreeSet::new(),
+            first_attempt_claims: BTreeSet::new(),
             last_repair_failure: None,
             model_turn_limit,
             context_trace,
@@ -1179,6 +1203,11 @@ impl AgentLoopState {
             provider_attempts,
             context_trace: self.context_trace.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
+            completed_tool_call_fingerprints: self
+                .completed_tool_call_fingerprints
+                .iter()
+                .cloned()
+                .collect(),
             last_repair_failure: self.last_repair_failure.clone(),
         }
     }
@@ -1450,7 +1479,7 @@ impl AgentLoopState {
         &mut self,
         call: &ModelToolCall,
         allowed_tool_names: &[String],
-    ) -> (String, bool) {
+    ) -> (String, bool, bool) {
         let fingerprint = tool_call_fingerprint(call);
         if !self.seen_tool_call_fingerprints.insert(fingerprint.clone()) {
             self.recovery_metrics.repeated_tool_call_count = self
@@ -1470,7 +1499,22 @@ impl AgentLoopState {
                 .invalid_tool_call_count
                 .saturating_add(1);
         }
-        (fingerprint, invalid)
+        let first_attempt = self.claim_first_attempt(&fingerprint);
+        (fingerprint, invalid, first_attempt)
+    }
+
+    /// Claim the first terminal-attempt slot for one logical tool fingerprint in this run.
+    fn claim_first_attempt(&mut self, fingerprint: &str) -> bool {
+        self.seen_tool_call_fingerprints
+            .insert(fingerprint.to_string());
+        !self.completed_tool_call_fingerprints.contains(fingerprint)
+            && self.first_attempt_claims.insert(fingerprint.to_string())
+    }
+
+    /// Record a terminal outcome before projecting its End event and checkpoint.
+    fn record_terminal_tool_call(&mut self, fingerprint: &str) {
+        self.completed_tool_call_fingerprints
+            .insert(fingerprint.to_string());
     }
 
     fn observe_tool_result(
@@ -1943,8 +1987,10 @@ where
                         );
                     }
                 };
+                let fingerprint = tool_call_fingerprint(&call);
+                let first_attempt = state.claim_first_attempt(&fingerprint);
                 occurrences.push(ModelToolOccurrence {
-                    fingerprint: tool_call_fingerprint(&call),
+                    fingerprint,
                     invalid_was_observed: false,
                     context: tool_occurrence_context(
                         input,
@@ -1954,6 +2000,9 @@ where
                     ),
                     call,
                 });
+                if let Some(occurrence) = occurrences.last_mut() {
+                    occurrence.context.first_attempt = first_attempt;
+                }
             }
             match self.process_tool_calls(
                 input,
@@ -2564,11 +2613,19 @@ where
             let recoverable_tool_validation = !finalization_only
                 && recoverable_tool_response_validation(&response, &validation.errors);
             if !validation.valid && !recoverable_tool_validation {
-                for call in &response.tool_calls {
-                    state.observe_model_tool_call(call, &provider_tool_names);
-                }
-                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
-                    .is_err()
+                let first_attempts = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| state.observe_model_tool_call(call, &provider_tool_names).2)
+                    .collect::<Vec<_>>();
+                if emit_rejected_tool_calls(
+                    &mut on_event,
+                    input,
+                    &response.tool_calls,
+                    turn_index,
+                    &first_attempts,
+                )
+                .is_err()
                 {
                     return state.finish(
                         AgentStatus::Failed,
@@ -2591,8 +2648,19 @@ where
             if response.assistant_message.as_ref().is_some_and(|message| {
                 !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
             }) {
-                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
-                    .is_err()
+                let first_attempts = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| state.observe_model_tool_call(call, &provider_tool_names).2)
+                    .collect::<Vec<_>>();
+                if emit_rejected_tool_calls(
+                    &mut on_event,
+                    input,
+                    &response.tool_calls,
+                    turn_index,
+                    &first_attempts,
+                )
+                .is_err()
                 {
                     return state.finish(
                         AgentStatus::Failed,
@@ -2615,8 +2683,19 @@ where
                 );
             }
             if has_duplicate_tool_call_ids(&response.tool_calls) {
-                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
-                    .is_err()
+                let first_attempts = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| state.observe_model_tool_call(call, &provider_tool_names).2)
+                    .collect::<Vec<_>>();
+                if emit_rejected_tool_calls(
+                    &mut on_event,
+                    input,
+                    &response.tool_calls,
+                    turn_index,
+                    &first_attempts,
+                )
+                .is_err()
                 {
                     return state.finish(
                         AgentStatus::Failed,
@@ -2836,6 +2915,13 @@ where
                     ),
                 })
                 .collect::<Vec<_>>();
+            for occurrence in &mut tool_occurrences {
+                let (fingerprint, invalid_was_observed, first_attempt) =
+                    state.observe_model_tool_call(&occurrence.call, &execution_tool_names);
+                occurrence.fingerprint = fingerprint;
+                occurrence.invalid_was_observed = invalid_was_observed;
+                occurrence.context.first_attempt = first_attempt;
+            }
             for occurrence in &tool_occurrences {
                 if emit_event(
                     &mut on_event,
@@ -2851,12 +2937,6 @@ where
                         Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                     );
                 }
-            }
-            for occurrence in &mut tool_occurrences {
-                let (fingerprint, invalid_was_observed) =
-                    state.observe_model_tool_call(&occurrence.call, &execution_tool_names);
-                occurrence.fingerprint = fingerprint;
-                occurrence.invalid_was_observed = invalid_was_observed;
             }
             match self.process_tool_calls(
                 input,
@@ -3066,6 +3146,7 @@ where
             );
         }
         let tool_call_fingerprint = tool_call_fingerprint(&call);
+        let first_attempt = state.claim_first_attempt(&tool_call_fingerprint);
         let prepared = self.prepare_tool_call(&call, &tool_call_fingerprint, false, &mut state);
         if prepared.rejection.is_some() || prepared.bound.is_none() {
             return state.finish(
@@ -3080,7 +3161,12 @@ where
             call: call.clone(),
             fingerprint: tool_call_fingerprint,
             invalid_was_observed: false,
-            context: tool_occurrence_context(input, &call, model_turn_offset.saturating_sub(1), 0),
+            context: {
+                let mut context =
+                    tool_occurrence_context(input, &call, model_turn_offset.saturating_sub(1), 0);
+                context.first_attempt = first_attempt;
+                context
+            },
         };
         if emit_event(
             &mut on_event,
@@ -4191,6 +4277,7 @@ where
             if failure.is_none() {
                 failure = non_repairable_error;
             }
+            state.record_terminal_tool_call(&prepared.fingerprint);
             let status = tool_result_status(
                 &prepared,
                 state
@@ -5214,6 +5301,10 @@ fn restore_checkpoint(
     state.provider_attempts = checkpoint_state.provider_attempts;
     state.context_trace = checkpoint_state.context_trace;
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
+    state.completed_tool_call_fingerprints = checkpoint_state
+        .completed_tool_call_fingerprints
+        .into_iter()
+        .collect();
     state.last_repair_failure = checkpoint_state.last_repair_failure;
     Ok((state, checkpoint_state.model_turns))
 }
@@ -5374,6 +5465,10 @@ fn restore_turn_checkpoint(
     state.context_trace = checkpoint_state.context_trace;
     state.seen_tool_call_fingerprints = checkpoint_state
         .seen_tool_call_fingerprints
+        .into_iter()
+        .collect();
+    state.completed_tool_call_fingerprints = checkpoint_state
+        .completed_tool_call_fingerprints
         .into_iter()
         .collect();
     state.last_repair_failure = checkpoint_state.last_repair_failure;
@@ -6491,6 +6586,21 @@ mod context_accounting_tests {
             ToolResultOccurrence::from_wire(untrusted_legacy, ToolResultVisibility::Visible)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_first_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_tool_fingerprint_is_claimed_once_and_repeated_calls_are_not_first_attempts() {
+        let mut state = AgentLoopState::new(Vec::new(), 1, None);
+        let fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(state.claim_first_attempt(fingerprint));
+        assert!(!state.claim_first_attempt(fingerprint));
+        state.record_terminal_tool_call(fingerprint);
+        assert!(!state.claim_first_attempt(fingerprint));
     }
 }
 
