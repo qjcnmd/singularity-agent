@@ -11,6 +11,8 @@ use singularity_model::{
     ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase, ProviderErrorStage,
 };
 
+use super::completion::{ToolResultOccurrence, ToolResultVisibility};
+
 /// event sink 拒绝事件时使用的不透明错误；原始 sink 错误不会进入 Agent 结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLoopEventSinkError;
@@ -36,6 +38,7 @@ pub enum AgentObservation {
     PromptAssembly(PromptAssemblyObservation),
     ProviderAttempt(Box<ProviderAttemptObservation>),
     ToolCall(ToolCallObservation),
+    ToolResult(Box<ToolResultObservation>),
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
     Verification(VerificationObservation),
@@ -121,6 +124,26 @@ pub struct ToolCallObservation {
     pub tool_name: String,
     /// True when this span belongs to the first terminal attempt for its logical fingerprint.
     pub first_attempt: bool,
+}
+
+/// A completed tool result carried only across the in-process event callback.
+///
+/// The public fields are bounded status metadata. The canonical occurrence (including its
+/// private result id, accounting, audit metadata, and workspace observation) is skipped by
+/// ordinary event serialization and is written only to the Store's private trace envelope by the
+/// observability projector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolResultObservation {
+    pub identity: OccurrenceIdentity,
+    pub tool_call_ordinal: u32,
+    pub tool_call_id_digest: String,
+    pub tool_name: String,
+    pub first_attempt: bool,
+    pub status: ToolCallStatus,
+    pub visibility: ToolResultVisibility,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub occurrence: Option<ToolResultOccurrence>,
 }
 
 /// 最终 policy 决策；不包含 resource、reason、rule ID 或原始参数。

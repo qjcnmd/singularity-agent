@@ -41,9 +41,9 @@ pub(super) struct RepairFailureState {
 }
 
 /// 一个 tool result occurrence 的模型投影状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ToolResultVisibility {
+pub enum ToolResultVisibility {
     Hidden,
     Visible,
     Compacted,
@@ -55,7 +55,7 @@ pub(super) enum ToolResultVisibility {
 /// 结果本体以及其可见性共同维护 occurrence 顺序；token accounting、审计 metadata 和
 /// workspace observation 随结果一起进入集中式 checkpoint 编解码，而不再依赖平行数组。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ToolResultOccurrence {
+pub struct ToolResultOccurrence {
     pub(super) result: ToolResult,
     visibility: ToolResultVisibility,
 }
@@ -95,6 +95,12 @@ impl Serialize for ToolResultOccurrence {
     }
 }
 
+// `ToolResult` deliberately keeps some workspace/audit values out of its public wire shape, but
+// the occurrence codec still compares those values when it validates a checkpoint.  The event
+// stream only carries this type inside an in-process callback, so retaining the same comparison
+// contract here is safe and keeps `AgentObservation` Eq-compatible.
+impl Eq for ToolResultOccurrence {}
+
 impl<'de> Deserialize<'de> for ToolResultOccurrence {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -113,7 +119,13 @@ impl ToolResultOccurrence {
         Self { result, visibility }
     }
 
-    pub(super) fn result(&self) -> &ToolResult {
+    /// Encode the canonical occurrence wire payload for the private SQLite trace envelope.
+    pub fn encode_trace_payload(&self) -> Result<Value, String> {
+        serde_json::to_value(self)
+            .map_err(|error| format!("tool result occurrence trace serialization failed: {error}"))
+    }
+
+    pub fn result(&self) -> &ToolResult {
         &self.result
     }
 
@@ -121,7 +133,7 @@ impl ToolResultOccurrence {
         self.result
     }
 
-    pub(super) fn visibility(&self) -> ToolResultVisibility {
+    pub fn visibility(&self) -> ToolResultVisibility {
         self.visibility
     }
 

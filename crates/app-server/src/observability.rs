@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use singularity_agent::PendingApprovalOccurrence;
@@ -7,7 +7,7 @@ use singularity_agent::{
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus, PromptAssemblyStatus,
     ProviderAttemptObservation, ProviderAttemptStatus as AgentProviderAttemptStatus,
     ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
-    ToolCallStatus, VerificationStatus,
+    ToolCallStatus, ToolResultObservation, VerificationStatus,
 };
 use singularity_core::{Timestamp, bounded_stable_code};
 use singularity_model::{
@@ -225,6 +225,7 @@ impl<'a> TraceProjector<'a> {
                     |status| tool_metric_samples(*status, observation.first_attempt),
                 )
             }
+            AgentObservation::ToolResult(observation) => self.project_tool_result(*observation),
             AgentObservation::PolicyDecision(observation) => {
                 let start = TracePolicyProjection {
                     operation_count: Some(u64::from(observation.operation_count)),
@@ -286,6 +287,62 @@ impl<'a> TraceProjector<'a> {
                 )
             }
         }
+    }
+
+    fn project_tool_result(&self, observation: ToolResultObservation) -> Result<(), StoreError> {
+        let occurrence = observation.occurrence.ok_or_else(|| {
+            StoreError::InvalidState(
+                "tool result observation is missing its canonical occurrence".to_string(),
+            )
+        })?;
+        let internal_payload = occurrence
+            .encode_trace_payload()
+            .map_err(StoreError::InvalidState)?;
+        let result = occurrence.result();
+        let mut public_result = serde_json::Map::new();
+        public_result.insert("tool_name".to_string(), json!(observation.tool_name));
+        public_result.insert(
+            "tool_call_id_digest".to_string(),
+            json!(observation.tool_call_id_digest),
+        );
+        public_result.insert(
+            "tool_call_ordinal".to_string(),
+            json!(observation.tool_call_ordinal),
+        );
+        public_result.insert(
+            "first_attempt".to_string(),
+            json!(observation.first_attempt),
+        );
+        public_result.insert("status".to_string(), json!(tool_status(observation.status)));
+        public_result.insert("visibility".to_string(), json!(observation.visibility));
+        public_result.insert("ok".to_string(), json!(result.ok));
+        if let Some(code) = result.error_code.as_deref().and_then(bounded_stable_code) {
+            public_result.insert("error_code".to_string(), json!(code));
+        }
+        if let Some(result_id) = result.result_id.as_deref() {
+            public_result.insert(
+                "result_id_digest".to_string(),
+                json!(digest_identifier(result_id)),
+            );
+        }
+        let result_digest = digest_json_value(&internal_payload);
+        let identity = format!(
+            "{}:tool_result:{}:{}",
+            observation.identity.occurrence_id,
+            tool_status_label(observation.status),
+            result_digest,
+        );
+        let mut event = self.new_trace_event(
+            trace_event_id(&self.session_id, &identity, TraceSpanPhase::End),
+            "tool result",
+        );
+        event.payload = json!({
+            "observation": "tool_result",
+            "tool_result": Value::Object(public_result),
+        });
+        self.store
+            .append_trace_with_internal_payload_idempotent(&event, Some(&internal_payload))
+            .map(|_| ())
     }
 
     fn project_sandbox(
@@ -500,6 +557,10 @@ fn digest_identifier(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
+fn digest_json_value(value: &Value) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.to_string().as_bytes()))
+}
+
 fn non_empty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
@@ -522,6 +583,18 @@ fn tool_status(status: ToolCallStatus) -> TraceToolStatus {
         ToolCallStatus::PolicyDenied => TraceToolStatus::PolicyDenied,
         ToolCallStatus::ApprovalRequired => TraceToolStatus::ApprovalRequired,
         ToolCallStatus::BatchRejected => TraceToolStatus::BatchRejected,
+    }
+}
+
+fn tool_status_label(status: ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Succeeded => "succeeded",
+        ToolCallStatus::Failed => "failed",
+        ToolCallStatus::Cancelled => "cancelled",
+        ToolCallStatus::Rejected => "rejected",
+        ToolCallStatus::PolicyDenied => "policy_denied",
+        ToolCallStatus::ApprovalRequired => "approval_required",
+        ToolCallStatus::BatchRejected => "batch_rejected",
     }
 }
 

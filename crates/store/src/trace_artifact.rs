@@ -29,9 +29,35 @@ impl SessionStore {
 
     /// Append one trace event, treating an identical event id and payload as an idempotent retry.
     pub fn append_trace_idempotent(&self, event: &TraceEvent) -> StoreResult<TraceEvent> {
+        self.append_trace_with_internal_payload_idempotent(event, None)
+    }
+
+    /// Append one trace event with a private typed payload bound to the same SQLite row.
+    ///
+    /// Public trace reads strip this payload after validating its envelope hash. The optional
+    /// value is intentionally generic at the Store boundary so the Agent crate remains the sole
+    /// owner of canonical ToolResult decoding.
+    pub fn append_trace_with_internal_payload_idempotent(
+        &self,
+        event: &TraceEvent,
+        internal_payload: Option<&Value>,
+    ) -> StoreResult<TraceEvent> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let sanitized = sanitize_trace_event(event);
+        if let Some(internal_payload) = internal_payload
+            && !internal_payload.is_object()
+        {
+            return Err(StoreError::InvalidState(
+                "trace internal payload must be a JSON object".to_string(),
+            ));
+        }
+        let expected_payload_hash = internal_payload
+            .map(|payload| trace_envelope_hash_with_internal(&sanitized, Some(payload)));
+        let mut sanitized = sanitized;
+        if let Some(payload_hash) = expected_payload_hash {
+            sanitized.payload_hash = payload_hash;
+        }
         validate_public_trace_binding(&transaction, &sanitized)?;
         validate_trace_batch_input(std::slice::from_ref(&sanitized))?;
         validate_trace_storage_values(std::slice::from_ref(&sanitized))?;
@@ -47,8 +73,8 @@ impl SessionStore {
             )
             .optional()?;
         if let Some(row) = existing {
-            let existing = decode_stored_trace_row(row)?;
-            if existing == sanitized {
+            let (existing, existing_internal) = decode_stored_trace_row_with_internal(row)?;
+            if existing == sanitized && existing_internal.as_ref() == internal_payload {
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -93,7 +119,8 @@ impl SessionStore {
         let mut all_events = load_trace_events(&transaction, &run_ids)?;
         all_events.push(sanitized.clone());
         validate_trace_span_batch(&all_events)?;
-        let stored = Self::insert_trace(&transaction, &sanitized)?;
+        let stored =
+            Self::insert_trace_with_internal_payload(&transaction, &sanitized, internal_payload)?;
         transaction.commit()?;
         Ok(stored)
     }
@@ -253,6 +280,30 @@ impl SessionStore {
         validate_public_trace_binding(&transaction, &event)?;
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// Read the private typed payload bound to one trace row. Public trace APIs never expose it.
+    pub fn get_trace_internal_payload(&self, event_id: &str) -> StoreResult<Option<Value>> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let row = transaction
+            .query_row(
+                "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                        span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                        span_projection, metric_samples
+                 from trace_events where event_id = ?1",
+                params![event_id],
+                stored_trace_row,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("trace event {event_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        let (_, internal_payload) = decode_stored_trace_row_with_internal(row)?;
+        transaction.commit()?;
+        Ok(internal_payload)
     }
 
     /// 从唯一 trace_events 表派生固定 metric 集合。
@@ -1491,5 +1542,89 @@ mod tests {
         ]);
         assert_eq!(metric.availability, TraceMetricAvailability::Available);
         assert_eq!(metric.distribution.as_ref().map(|value| value.sum), Some(7));
+    }
+
+    #[test]
+    fn internal_trace_payload_roundtrips_without_public_leak() {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let store =
+            SessionStore::open(directory.path().join("sessions.sqlite3")).expect("open store");
+        let mut event = TraceEvent::new(
+            "internal_payload_event",
+            "internal_payload_run",
+            "internal_payload_session",
+            "observability",
+            "tool result",
+        );
+        event.payload = serde_json::json!({
+            "observation": "tool_result",
+            "tool_result": {"ok": true, "tool_name": "read"},
+        });
+        let internal = serde_json::json!({
+            "result": {"tool_call_id": "call_1", "tool_name": "read", "ok": true},
+            "visibility": "visible",
+        });
+        store
+            .append_trace_with_internal_payload_idempotent(&event, Some(&internal))
+            .expect("append trace");
+
+        let public = store
+            .show_trace("internal_payload_event")
+            .expect("show trace");
+        let public_json = serde_json::to_value(public).expect("serialize public trace");
+        assert!(public_json.get("_internal_payload").is_none());
+        assert_eq!(
+            store
+                .get_trace_internal_payload("internal_payload_event")
+                .expect("read internal payload"),
+            Some(internal),
+        );
+    }
+
+    #[test]
+    fn tampered_internal_trace_payload_fails_closed() {
+        let directory = tempfile::tempdir().expect("trace directory");
+        let db_path = directory.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("open store");
+        let event = TraceEvent::new(
+            "tampered_internal_payload_event",
+            "tampered_internal_payload_run",
+            "tampered_internal_payload_session",
+            "observability",
+            "tool result",
+        );
+        let internal = serde_json::json!({"canonical": true});
+        store
+            .append_trace_with_internal_payload_idempotent(&event, Some(&internal))
+            .expect("append trace");
+        let connection = rusqlite::Connection::open(&db_path).expect("open connection");
+        let payload: String = connection
+            .query_row(
+                "select payload from trace_events where event_id = ?1",
+                rusqlite::params!["tampered_internal_payload_event"],
+                |row| row.get(0),
+            )
+            .expect("read trace payload");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse trace payload");
+        payload["_internal_payload"]["canonical"] = serde_json::json!(false);
+        connection
+            .execute(
+                "update trace_events set payload = ?1 where event_id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&payload).expect("serialize trace payload"),
+                    "tampered_internal_payload_event",
+                ],
+            )
+            .expect("tamper trace payload");
+        drop(connection);
+        assert!(matches!(
+            store.show_trace("tampered_internal_payload_event"),
+            Err(StoreError::TraceIntegrity(_))
+        ));
+        assert!(matches!(
+            store.get_trace_internal_payload("tampered_internal_payload_event"),
+            Err(StoreError::TraceIntegrity(_))
+        ));
     }
 }

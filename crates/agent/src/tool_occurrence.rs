@@ -18,6 +18,7 @@ use singularity_tools::{
     ToolFailureKind, ToolOutput, ToolResult, WorkspaceToolExecutor,
 };
 
+use super::completion::ToolResultOccurrence;
 use super::observation::OccurrenceTimer;
 use super::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentLoopInput,
@@ -25,7 +26,8 @@ use super::{
     PolicyDecisionCause, PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation,
     PromptAssemblyStatus, ProviderAttemptObservation, ProviderAttemptStatus,
     ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
-    ToolCallObservation, ToolCallStatus, VerificationObservation, VerificationStatus,
+    ToolCallObservation, ToolCallStatus, ToolResultObservation, VerificationObservation,
+    VerificationStatus,
 };
 
 pub(super) struct ToolOccurrenceContext {
@@ -448,6 +450,26 @@ pub(super) fn tool_call_event(
         tool_name: context.tool_name.clone(),
         first_attempt: context.first_attempt,
     }))
+}
+
+/// Emit the canonical result occurrence after the reducer has appended it to checkpoint state.
+pub(super) fn tool_result_event(
+    context: &ToolOccurrenceContext,
+    status: ToolCallStatus,
+    occurrence: &ToolResultOccurrence,
+) -> AgentLoopEvent {
+    AgentLoopEvent::Observation(AgentObservation::ToolResult(Box::new(
+        ToolResultObservation {
+            identity: context.identity.clone(),
+            tool_call_ordinal: context.tool_call_ordinal,
+            tool_call_id_digest: context.tool_call_id_digest.clone(),
+            tool_name: context.tool_name.clone(),
+            first_attempt: context.first_attempt,
+            status,
+            visibility: occurrence.visibility(),
+            occurrence: Some(occurrence.clone()),
+        },
+    )))
 }
 
 pub(super) fn emit_rejected_tool_calls(

@@ -1404,14 +1404,28 @@ impl SessionStore {
         connection: &Connection,
         event: &TraceEvent,
     ) -> StoreResult<TraceEvent> {
-        let event = sanitize_trace_event(event);
+        Self::insert_trace_with_internal_payload(connection, event, None)
+    }
+
+    /// Insert a sanitized trace event and, when present, bind one private typed payload to the
+    /// same SQLite row. The payload is never returned by public trace reads.
+    pub(crate) fn insert_trace_with_internal_payload(
+        connection: &Connection,
+        event: &TraceEvent,
+        internal_payload: Option<&Value>,
+    ) -> StoreResult<TraceEvent> {
+        let mut event = sanitize_trace_event(event);
+        if let Some(internal_payload) = internal_payload {
+            event.payload_hash = trace_envelope_hash_with_internal(&event, Some(internal_payload));
+        }
+        let payload = encode_trace_payload(&event, internal_payload)?;
         connection.execute(
             "insert into trace_events(event_id, run_id, session_id, payload) values(?1, ?2, ?3, ?4)",
             params![
                 event.event_id,
                 event.run_id,
                 event.session_id,
-                serde_json::to_string(&event)?
+                payload
             ],
         )?;
         Ok(event)

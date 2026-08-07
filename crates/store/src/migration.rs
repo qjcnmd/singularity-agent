@@ -87,6 +87,7 @@ struct LegacyItemRow {
 #[derive(Debug, Clone)]
 struct LegacyTraceRow {
     event: TraceEvent,
+    internal_payload: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1292,7 +1293,21 @@ fn read_legacy_traces(
     let mut traces = Vec::new();
     for row in rows {
         let (event_id, run_id, stored_session_id, payload) = row?;
-        let mut event: TraceEvent = serde_json::from_str(&payload).map_err(|error| {
+        let mut envelope: Value = serde_json::from_str(&payload).map_err(|error| {
+            StoreError::InvalidState(format!("trace {event_id} payload is invalid: {error}"))
+        })?;
+        let internal_payload = envelope
+            .as_object_mut()
+            .and_then(|fields| fields.remove(TRACE_INTERNAL_PAYLOAD_KEY));
+        if internal_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_object())
+        {
+            return Err(StoreError::TraceIntegrity(format!(
+                "trace {event_id} internal payload is not an object"
+            )));
+        }
+        let mut event: TraceEvent = serde_json::from_value(envelope).map_err(|error| {
             StoreError::InvalidState(format!("trace {event_id} payload is invalid: {error}"))
         })?;
         if event.event_id != event_id || event.run_id != run_id {
@@ -1391,7 +1406,7 @@ fn read_legacy_traces(
                 let expected_hash = if version <= 11 {
                     trace_payload_hash(&event.payload)
                 } else {
-                    trace_envelope_hash(&event)
+                    trace_envelope_hash_with_internal(&event, internal_payload.as_ref())
                 };
                 if event.payload_hash != expected_hash {
                     return Err(StoreError::TraceIntegrity(format!(
@@ -1409,7 +1424,10 @@ fn read_legacy_traces(
                 "stored trace {event_id} was not sanitized"
             )));
         }
-        traces.push(LegacyTraceRow { event });
+        traces.push(LegacyTraceRow {
+            event,
+            internal_payload,
+        });
     }
     Ok(traces)
 }
@@ -2179,7 +2197,11 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     )?;
     }
     for trace in &data.traces {
-        let event = sanitize_trace_event(&trace.event);
+        let mut event = sanitize_trace_event(&trace.event);
+        if let Some(internal_payload) = trace.internal_payload.as_ref() {
+            event.payload_hash = trace_envelope_hash_with_internal(&event, Some(internal_payload));
+        }
+        let payload = encode_trace_payload(&event, trace.internal_payload.as_ref())?;
         let span_projection = event
             .span_projection
             .as_ref()
@@ -2196,7 +2218,7 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
                 event.event_id,
                 event.run_id,
                 event.session_id,
-                serde_json::to_string(&event)?,
+                payload,
                 event.span_id,
                 event.parent_span_id,
                 event.span_kind.map(TraceSpanKind::as_storage_text),

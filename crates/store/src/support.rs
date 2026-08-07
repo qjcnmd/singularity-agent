@@ -611,8 +611,41 @@ pub(crate) fn stored_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stor
     })
 }
 
+/// Reserved root envelope key for private typed trace payloads. It is never part of the public
+/// `TraceEvent` value returned by Store reads.
+pub(crate) const TRACE_INTERNAL_PAYLOAD_KEY: &str = "_internal_payload";
+
+pub(crate) fn encode_trace_payload(
+    event: &TraceEvent,
+    internal_payload: Option<&Value>,
+) -> StoreResult<String> {
+    let mut envelope = serde_json::to_value(event)?;
+    if let Some(internal_payload) = internal_payload {
+        if !internal_payload.is_object() {
+            return Err(StoreError::InvalidState(
+                "trace internal payload must be a JSON object".to_string(),
+            ));
+        }
+        let fields = envelope.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidState("trace event envelope must be a JSON object".to_string())
+        })?;
+        fields.insert(
+            TRACE_INTERNAL_PAYLOAD_KEY.to_string(),
+            internal_payload.clone(),
+        );
+    }
+    Ok(serde_json::to_string(&envelope)?)
+}
+
 // 解码现行 trace 行，同时验证列与 payload 的完整投影一致。
 pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceEvent> {
+    let (event, _) = decode_stored_trace_row_with_internal(row)?;
+    Ok(event)
+}
+
+pub(crate) fn decode_stored_trace_row_with_internal(
+    row: StoredTraceRow,
+) -> StoreResult<(TraceEvent, Option<Value>)> {
     let StoredTraceRow {
         event_id,
         run_id,
@@ -628,7 +661,7 @@ pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceE
         span_projection,
         metric_samples,
     } = row;
-    let event = decode_trace_payload(&payload)?;
+    let (event, internal_payload) = decode_trace_payload_with_internal(&payload)?;
     let projected_span = span_projection
         .as_deref()
         .map(serde_json::from_str::<TraceSpanProjection>)
@@ -658,12 +691,18 @@ pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceE
             "trace {event_id} columns do not match payload"
         )));
     }
-    Ok(event)
+    Ok((event, internal_payload))
 }
 
 // 解码 trace payload 并恢复完整性校验所需对象。
-pub(crate) fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
-    let event: TraceEvent = serde_json::from_str(payload)?;
+pub(crate) fn decode_trace_payload_with_internal(
+    payload: &str,
+) -> StoreResult<(TraceEvent, Option<Value>)> {
+    let mut envelope: Value = serde_json::from_str(payload)?;
+    let internal_payload = envelope
+        .as_object_mut()
+        .and_then(|fields| fields.remove(TRACE_INTERNAL_PAYLOAD_KEY));
+    let event: TraceEvent = serde_json::from_value(envelope)?;
     if !event.redaction_applied {
         return Err(StoreError::TraceIntegrity(
             "stored trace was not sanitized".to_string(),
@@ -672,14 +711,21 @@ pub(crate) fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
     event
         .validate_span_lifecycle()
         .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
-    let expected_hash = trace_envelope_hash(&event);
+    let expected_hash = trace_envelope_hash_with_internal(&event, internal_payload.as_ref());
     if event.payload_hash != expected_hash {
         return Err(StoreError::TraceIntegrity(format!(
             "event envelope hash mismatch for {}",
             event.event_id
         )));
     }
-    Ok(event)
+    if let Some(internal_payload) = &internal_payload
+        && !internal_payload.is_object()
+    {
+        return Err(StoreError::TraceIntegrity(
+            "trace internal payload must be a JSON object".to_string(),
+        ));
+    }
+    Ok((event, internal_payload))
 }
 
 // 对 trace 的 payload 与可见文本执行脱敏投影。
@@ -734,8 +780,21 @@ pub(crate) fn trace_payload_hash(payload: &Value) -> String {
 
 // 对脱敏后的完整 event envelope 计算摘要，payload_hash 本身不参与输入。
 pub(crate) fn trace_envelope_hash(event: &TraceEvent) -> String {
+    trace_envelope_hash_with_internal(event, None)
+}
+
+pub(crate) fn trace_envelope_hash_with_internal(
+    event: &TraceEvent,
+    internal_payload: Option<&Value>,
+) -> String {
     let mut envelope = serde_json::to_value(event).expect("trace event serialization cannot fail");
     if let Value::Object(fields) = &mut envelope {
+        if let Some(internal_payload) = internal_payload {
+            fields.insert(
+                TRACE_INTERNAL_PAYLOAD_KEY.to_string(),
+                internal_payload.clone(),
+            );
+        }
         fields.remove("payload_hash");
     }
     trace_value_hash(&envelope)

@@ -36,6 +36,9 @@ enum Command {
         /// Execute every manifest task for its configured trial count and publish gate artifacts.
         #[arg(long)]
         full: bool,
+        /// Inject a process-restart recovery into every Nth trial (explicit opt-in).
+        #[arg(long, value_parser = parse_recovery_every)]
+        recovery_every: Option<NonZeroUsize>,
     },
 }
 
@@ -48,6 +51,13 @@ fn parse_max_workers(value: &str) -> Result<usize, String> {
     } else {
         Err("max-workers must be between 1 and 8".to_string())
     }
+}
+
+fn parse_recovery_every(value: &str) -> Result<NonZeroUsize, String> {
+    let every = value
+        .parse::<usize>()
+        .map_err(|_| "recovery-every must be a positive integer".to_string())?;
+    NonZeroUsize::new(every).ok_or_else(|| "recovery-every must be a positive integer".to_string())
 }
 
 /// Resolve the trial worker count, honoring an explicit parsed value and defaulting Full to at most two.
@@ -90,7 +100,8 @@ fn run(cli: Cli) -> Result<(), String> {
             json,
             max_workers,
             full,
-        } => run_manifest(manifest, run_id, json, max_workers, full),
+            recovery_every,
+        } => run_manifest(manifest, run_id, json, max_workers, full, recovery_every),
     }
 }
 
@@ -108,9 +119,14 @@ fn run_manifest(
     json_output: bool,
     requested_max_workers: Option<usize>,
     full: bool,
+    recovery_every: Option<NonZeroUsize>,
 ) -> Result<(), String> {
     let mode = run_mode_from_flags(full);
-    let max_workers = default_max_workers(&mode, requested_max_workers);
+    let max_workers = if recovery_every.is_some() {
+        1
+    } else {
+        default_max_workers(&mode, requested_max_workers)
+    };
     if !manifest.is_file() {
         return Err(format!(
             "evaluation manifest not found: {}",
@@ -127,6 +143,7 @@ fn run_manifest(
             run_id,
             output_root: std::env::var("SINGULARITY_EVAL_OUTPUT_DIR").ok(),
             max_workers,
+            recovery_every,
         },
         Arc::new(PlatformSandboxBackend::new()),
         &provider_snapshot,
@@ -236,6 +253,45 @@ mod tests {
             .expect_err("invalid max-workers must be rejected");
             assert!(error.to_string().contains("max-workers"));
         }
+    }
+
+    #[test]
+    fn recovery_every_cli_is_opt_in_and_requires_positive_integer() {
+        let cli = Cli::try_parse_from([
+            "singularity-evaluation",
+            "run",
+            "manifest.json",
+            "--run-id",
+            "run",
+        ])
+        .expect("recovery injection is disabled by default");
+        let Command::Run { recovery_every, .. } = cli.command;
+        assert_eq!(recovery_every, None);
+
+        let cli = Cli::try_parse_from([
+            "singularity-evaluation",
+            "run",
+            "manifest.json",
+            "--run-id",
+            "run",
+            "--recovery-every",
+            "3",
+        ])
+        .expect("positive recovery interval parses");
+        let Command::Run { recovery_every, .. } = cli.command;
+        assert_eq!(recovery_every.map(NonZeroUsize::get), Some(3));
+
+        let error = Cli::try_parse_from([
+            "singularity-evaluation",
+            "run",
+            "manifest.json",
+            "--run-id",
+            "run",
+            "--recovery-every",
+            "0",
+        ])
+        .expect_err("zero recovery interval must be rejected");
+        assert!(error.to_string().contains("recovery-every"));
     }
 
     #[test]

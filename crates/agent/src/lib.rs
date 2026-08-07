@@ -202,10 +202,11 @@ impl ApprovalCheckpoint {
 /// Consumer callback for durable turn-boundary persistence.
 pub type AgentLoopCheckpointCallback<'a> =
     dyn FnMut(TurnCheckpointEvent) -> Result<(), AgentLoopEventSinkError> + 'a;
-use completion::{
-    CompletionTracker, RepairFailureState, ToolResultOccurrence, ToolResultVisibility,
+use completion::{CompletionTracker, RepairFailureState};
+pub use completion::{
+    ToolResultOccurrence, ToolResultVisibility, successful_command_scope_digest,
+    terminal_command_scope_digests,
 };
-pub use completion::{successful_command_scope_digest, terminal_command_scope_digests};
 pub use context::{
     AgentContextItem, AgentContextItemPriority, AgentContextTrace, ContextBundle,
     assemble_context_items,
@@ -219,7 +220,7 @@ pub use observation::{
     PolicyDecisionStatus, PromptAssemblyObservation, PromptAssemblyStatus,
     ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
     SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
-    VerificationObservation, VerificationStatus,
+    ToolResultObservation, VerificationObservation, VerificationStatus,
 };
 use tool_occurrence::*;
 
@@ -3759,6 +3760,25 @@ where
                 on_event,
             );
             state.append_hidden_tool_result(result.result);
+            let recorded = state
+                .tool_result_occurrences
+                .last()
+                .expect("recorded approval tool occurrence");
+            if emit_event(
+                on_event,
+                tool_result_event(
+                    &occurrences
+                        .first()
+                        .expect("single approval occurrence is present")
+                        .context,
+                    ToolCallStatus::ApprovalRequired,
+                    recorded,
+                ),
+            )
+            .is_err()
+            {
+                return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+            }
             if emit_event(
                 on_event,
                 tool_call_event(
@@ -4260,6 +4280,19 @@ where
             });
             // Append before projecting repair context so the current typed failure is included.
             state.append_visible_tool_result(result.clone());
+            let recorded = state
+                .tool_result_occurrences
+                .last()
+                .expect("recorded tool occurrence");
+            let status = tool_result_status(&prepared, recorded.result(), batch_rejected);
+            if emit_event(
+                on_event,
+                tool_result_event(&occurrence.context, status, recorded),
+            )
+            .is_err()
+            {
+                return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+            }
             let repair_feedback = state
                 .repair_state
                 .is_some()
@@ -4278,15 +4311,6 @@ where
                 failure = non_repairable_error;
             }
             state.record_terminal_tool_call(&prepared.fingerprint);
-            let status = tool_result_status(
-                &prepared,
-                state
-                    .tool_result_occurrences
-                    .last()
-                    .expect("recorded tool occurrence")
-                    .result(),
-                batch_rejected,
-            );
             if emit_event(
                 on_event,
                 tool_call_event(

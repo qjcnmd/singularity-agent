@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentRecoveryMetrics, AgentStatus,
+    ToolResultOccurrence,
 };
 use singularity_app_server::TraceProjector;
 use singularity_core::{
@@ -35,15 +37,16 @@ use singularity_core::{
     load_project_instructions,
 };
 use singularity_model::{
-    ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
-    ProviderCapabilityCacheLookupResult, ProviderCapabilityMetadata, ProviderConfigSnapshot,
-    ProviderDiagnostic, ProviderError, ProviderErrorStage, ProviderProtocolContract,
-    ProviderProtocolNegotiation,
+    ModelErrorCategory, ModelUsage, OpenAiProvider, Provider, ProviderApiProtocol,
+    ProviderAttemptMetadata, ProviderCapabilityCacheLookupResult, ProviderCapabilityMetadata,
+    ProviderCapabilityProfile, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
 };
 use singularity_policy::{ApprovalPolicy, PermissionProfileName, workspace_policy};
 use singularity_protocol::{
     TraceEvent, TraceMetricAvailability, TraceMetricName, TraceMetricUnavailableReason,
-    TraceMetrics, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
+    TraceMetrics, TraceProviderProtocol, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
+    TraceSpanStatus, TraceToolStatus,
 };
 #[cfg(windows)]
 use singularity_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
@@ -57,6 +60,7 @@ use singularity_tools::{
 
 mod command;
 mod evidence;
+mod recovery;
 mod source_cache;
 mod workspace;
 
@@ -70,6 +74,7 @@ use evidence::{
     agent_command_projection, build_evaluation_evidence, build_zero_sampling_evidence,
     canonical_json_digest, content_digest,
 };
+use recovery::{RecoveryAttempt, run_recovery_trial};
 use source_cache::{SourceTemplateCache, SourceTemplateCacheStatus, SourceTemplatePreparation};
 use workspace::{
     WorkspaceChangeEvidence, WorkspaceSnapshot, copy_tree_checked, copy_tree_for_preparation,
@@ -112,6 +117,9 @@ pub struct EvaluationRunParams {
     pub output_root: Option<String>,
     /// Number of independent trials that may execute at once.
     pub max_workers: usize,
+    /// Inject a process-restart recovery into every Nth trial when explicitly enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_every: Option<NonZeroUsize>,
 }
 
 /// 一次开发期 Evaluation 运行的有限结果摘要。
@@ -264,6 +272,7 @@ struct TaskDiagnostics {
     compaction_count: u32,
     verification_required_command_count: u32,
     verification_satisfied_command_count: u32,
+    verification_observed: bool,
     provider_attempt_count: u32,
     provider_retry_count: u32,
     probe_attempt_count: u32,
@@ -295,6 +304,11 @@ struct TaskDiagnostics {
     /// Count of model tool occurrences that changed evaluator integrity paths.
     /// `None` means the control-plane paths or an execution summary were not fully observed.
     verification_bypass_count: Option<u64>,
+    /// Whether this trial was selected for explicit process-restart recovery injection.
+    recovery_injected: bool,
+    /// A conclusion is recorded only when the durable marker was observed and the resumed
+    /// turn reached a terminal state. Marker-unavailable attempts remain outside the ratio.
+    recovery_completed: Option<bool>,
 }
 
 struct StageExecution {
@@ -657,6 +671,7 @@ fn run_task_workers(
     trials_per_task: u32,
     max_workers: usize,
     selected_trial: Option<u32>,
+    recovery_every: Option<NonZeroUsize>,
 ) -> Result<Vec<TaskEvaluation>, TrialWorkerError> {
     if context.cancellation.is_cancelled() {
         return Err(TrialWorkerError::Cancelled(Vec::new()));
@@ -664,6 +679,7 @@ fn run_task_workers(
     let trial_ordinals = selected_trial
         .map(|trial| vec![trial])
         .unwrap_or_else(|| (1..=trials_per_task).collect::<Vec<_>>());
+    let trial_count = trial_ordinals.len();
     let task_traces = plans
         .iter()
         .map(|plan| EvaluationTaskTrace::start(context, plan))
@@ -674,11 +690,19 @@ fn run_task_workers(
         max_workers,
         context.cancellation,
         move |task_index, trial| {
+            let recovery_injected = recovery_every.is_some_and(|every| {
+                let ordinal = task_index
+                    .saturating_mul(trial_count)
+                    .saturating_add(usize::try_from(trial.saturating_sub(1)).unwrap_or(usize::MAX))
+                    .saturating_add(1);
+                ordinal.is_multiple_of(every.get())
+            });
             run_task_trial_with_prepared_source(
                 context,
                 &plans[task_index],
                 &prepared_sources[task_index],
                 trial,
+                recovery_injected,
             )
         },
     );
@@ -1132,6 +1156,11 @@ pub fn run_evaluation_with_mode(
             "evaluation max_workers must be between 1 and 8",
         ));
     }
+    if params.recovery_every.is_some() && params.max_workers != 1 {
+        return Err(EvaluationRunError::input(
+            "evaluation recovery mode requires max_workers=1",
+        ));
+    }
     if cancellation.is_cancelled() {
         let partial = RunId::new(params.run_id.clone())
             .ok()
@@ -1381,6 +1410,7 @@ pub fn run_evaluation_with_mode(
         trials_per_task,
         params.max_workers,
         None,
+        params.recovery_every,
     ) {
         Ok(task_executions) => task_executions,
         Err(TrialWorkerError::Cancelled(task_executions)) => {
@@ -1850,6 +1880,31 @@ fn verification_bypass_metric(samples: &[&TaskExecution]) -> MetricValue<u64> {
     MetricValue::available(total)
 }
 
+fn recovery_completion_metric(samples: &[&TaskExecution]) -> MetricValue<MetricRatio> {
+    let injected = samples
+        .iter()
+        .copied()
+        .filter(|execution| execution.diagnostics.recovery_injected)
+        .collect::<Vec<_>>();
+    if injected.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NoProducer);
+    }
+    let conclusions = injected
+        .iter()
+        .filter_map(|execution| execution.diagnostics.recovery_completed)
+        .collect::<Vec<_>>();
+    if conclusions.is_empty() {
+        return MetricValue::unavailable(MetricUnavailableReason::NotObserved);
+    }
+    let successes = conclusions.iter().filter(|completed| **completed).count();
+    MetricRatio::new(
+        u64::try_from(successes).unwrap_or(u64::MAX),
+        u64::try_from(conclusions.len()).unwrap_or(u64::MAX),
+    )
+    .map(MetricValue::available)
+    .unwrap_or_else(|| MetricValue::unavailable(MetricUnavailableReason::NotObserved))
+}
+
 fn build_harness_metrics(
     samples: &[&TaskExecution],
     trace_metrics: Option<&TraceMetrics>,
@@ -1869,7 +1924,7 @@ fn build_harness_metrics(
             TraceMetricName::ToolFirstAttemptSuccessRateBps,
         ),
         compaction_performance_decay: compaction_performance_decay(samples),
-        recovery_completion_rate: MetricValue::unavailable(MetricUnavailableReason::NoProducer),
+        recovery_completion_rate: recovery_completion_metric(samples),
         verification_bypass_count: verification_bypass_metric(samples),
     }
 }
@@ -2048,12 +2103,12 @@ fn build_evaluation_metrics(
         ),
         verification_required_commands: metric_sum(
             &diagnostics,
-            |_| true,
+            |d| d.verification_observed,
             |d| Some(u64::from(d.verification_required_command_count)),
         ),
         verification_satisfied_commands: metric_sum(
             &diagnostics,
-            |_| true,
+            |d| d.verification_observed,
             |d| Some(u64::from(d.verification_satisfied_command_count)),
         ),
     };
@@ -2544,6 +2599,7 @@ fn run_task_trial_with_prepared_source(
     plan: &WorkspacePlan,
     prepared_source: &PreparedTaskSource,
     trial: u32,
+    recovery_injected: bool,
 ) -> TaskExecution {
     if let Some(blocker) = &prepared_source.blocker {
         return blocked_task_trials(
@@ -2623,7 +2679,7 @@ fn run_task_trial_with_prepared_source(
         trace_store: Arc::clone(&context.trace_store),
         trace_failures: &context.trace_failures,
     };
-    run_task(&prepared, trial)
+    run_task(&prepared, trial, recovery_injected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2691,7 +2747,11 @@ fn task_evaluation_from_trials(plan: &WorkspacePlan, trials: Vec<TaskExecution>)
     TaskEvaluation { result, trials }
 }
 
-fn run_task(prepared: &PreparedTaskContext<'_, '_>, trial: u32) -> TaskExecution {
+fn run_task(
+    prepared: &PreparedTaskContext<'_, '_>,
+    trial: u32,
+    recovery_injected: bool,
+) -> TaskExecution {
     let scope = format!("trial:{}:{}", prepared.plan.task_id.as_str(), trial);
     let session_id = scope.clone();
     let span_id = evaluation_span_id(prepared.run_id, &scope, TraceSpanKind::Turn);
@@ -2716,7 +2776,7 @@ fn run_task(prepared: &PreparedTaskContext<'_, '_>, trial: u32) -> TaskExecution
         TraceSpanKind::Turn,
         "evaluation trial",
     );
-    let mut execution = run_task_inner(prepared, trial, &trace);
+    let mut execution = run_task_inner(prepared, trial, recovery_injected, &trace);
     execution.diagnostics.trial_duration_ms =
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     trace.sink.end(
@@ -2733,6 +2793,7 @@ fn run_task(prepared: &PreparedTaskContext<'_, '_>, trial: u32) -> TaskExecution
 fn run_task_inner(
     prepared: &PreparedTaskContext<'_, '_>,
     trial: u32,
+    recovery_injected: bool,
     trace: &EvaluationTrialTrace<'_>,
 ) -> TaskExecution {
     let task_dir = prepared.task_root.join(format!("trial-{trial:04}"));
@@ -2837,16 +2898,28 @@ fn run_task_inner(
         return finish_task(trial, baseline, agent, public, hidden, diagnostics);
     }
 
-    let agent_execution = run_agent_stage(
-        prepared,
-        &task_dir,
-        &agent_dir,
-        &prepared.plan.agent,
-        trial,
-        provider,
-        trace,
-        &mut diagnostics,
-    );
+    let agent_execution = if recovery_injected {
+        run_recovery_agent_stage(
+            prepared,
+            &task_dir,
+            &agent_dir,
+            &prepared.plan.agent,
+            trial,
+            trace,
+            &mut diagnostics,
+        )
+    } else {
+        run_agent_stage(
+            prepared,
+            &task_dir,
+            &agent_dir,
+            &prepared.plan.agent,
+            trial,
+            provider,
+            trace,
+            &mut diagnostics,
+        )
+    };
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
     diagnostics.patch_evidence = agent_execution.patch_evidence.clone();
@@ -2885,6 +2958,9 @@ fn run_task_inner(
     diagnostics.tool_schema_fingerprint = agent_execution.tool_schema_fingerprint.clone();
     diagnostics.provider_evidence = agent_execution.provider_evidence.clone();
     diagnostics.verification_bypass_count = agent_execution.verification_bypass_count;
+    if !recovery_injected {
+        diagnostics.verification_observed = true;
+    }
     if agent_execution.stage.result.status == StageStatus::Blocked
         && (agent_execution.workspace.is_none() || agent_execution.patch_evidence.is_empty())
     {
@@ -3791,6 +3867,774 @@ fn cleanup_evaluator_patch(patch_path: &Path) -> Result<(), EvaluationBlocker> {
         ));
     }
     Ok(())
+}
+
+/// Run a selected trial through an independent AppServer process pair.
+///
+/// The ordinary AgentLoop path is intentionally replaced for this trial. The child owns the
+/// same trial workspace and its own file-backed Store; recovery evidence is read back from that
+/// Store, while the existing evaluator still owns snapshots and verification stages.
+#[allow(clippy::too_many_arguments)]
+fn run_recovery_agent_stage(
+    prepared: &PreparedTaskContext<'_, '_>,
+    task_dir: &Path,
+    agent_dir: &Path,
+    plan: &AgentStagePlan,
+    _trial: u32,
+    _trace: &EvaluationTrialTrace<'_>,
+    diagnostics: &mut TaskDiagnostics,
+) -> AgentStageExecution {
+    diagnostics.recovery_injected = true;
+    let before_identity = match workspace_root_identity(agent_dir) {
+        Ok(identity) => identity,
+        Err(error) => {
+            diagnostics.recovery_completed = None;
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                Vec::new(),
+            );
+        }
+    };
+    let before = match snapshot_workspace(agent_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            diagnostics.recovery_completed = None;
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                Vec::new(),
+            );
+        }
+    };
+    let resolved_tools = match evaluation_registry() {
+        Ok(tools) => tools,
+        Err(error) => {
+            diagnostics.recovery_completed = None;
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::AgentRuntime, error),
+                Vec::new(),
+            );
+        }
+    };
+    let project_instructions = match load_project_instructions(agent_dir, agent_dir) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            diagnostics.recovery_completed = None;
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error.to_string()),
+                Vec::new(),
+            );
+        }
+    };
+    let prompt = agent_prompt(&plan.projection, &resolved_tools.names);
+    let project_instructions_fingerprint = project_instructions
+        .as_ref()
+        .map(|instructions| instructions.aggregate_digest().to_string());
+    let prompt_structure = EvaluationPromptStructure {
+        contract: "evaluation.agent_prompt/v1".to_string(),
+        model_message_roles: vec!["developer".to_string(), "user".to_string()],
+        section_kinds: vec![
+            "task_instructions".to_string(),
+            "resolved_tools".to_string(),
+            "completion_instruction".to_string(),
+        ],
+        resolved_tool_count: u32::try_from(resolved_tools.names.len()).unwrap_or(u32::MAX),
+        project_instructions_fingerprint: project_instructions_fingerprint.clone(),
+    };
+    let tool_schema_fingerprint = resolved_tools.schema_fingerprint.clone();
+    let prompt_fingerprint = canonical_json_digest(&json!({
+        "prompt_structure": &prompt_structure,
+        "user_prompt_fingerprint": content_digest(prompt.as_bytes()),
+        "project_instructions_fingerprint": project_instructions_fingerprint,
+        "tool_schema_fingerprint": &tool_schema_fingerprint,
+    }))
+    .expect("recovery prompt fingerprint inputs serialize canonically");
+
+    let recovery_db = task_dir.join("recovery.sqlite3");
+    let model_selector = prepared.provider_snapshot.resolved_default_selector();
+    let child_provider = match prepared
+        .provider_snapshot
+        .provider_for_selector(model_selector.as_deref())
+    {
+        Ok(provider) => provider,
+        Err(error) => {
+            diagnostics.recovery_completed = None;
+            return blocked_agent_stage(provider_blocker(&error), Vec::new());
+        }
+    };
+    let started = Instant::now();
+    let recovery = run_recovery_trial(
+        agent_dir,
+        &recovery_db,
+        &prompt,
+        model_selector.as_deref(),
+        prepared.cancellation,
+    );
+    let agent_duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    diagnostics.agent_duration_ms = agent_duration_ms;
+    diagnostics.recovery_completed = match recovery.attempt {
+        RecoveryAttempt::Completed => Some(true),
+        RecoveryAttempt::Failed => Some(false),
+        RecoveryAttempt::NotObserved => None,
+    };
+
+    let trace_path = task_dir.join("recovery-trace.json");
+    let _ = write_json_atomic(
+        &trace_path,
+        &json!({
+            "schema": "evaluation.recovery-trace/v1",
+            "thread_id": recovery.thread_id,
+            "turn_id": recovery.turn_id,
+            "attempt": format!("{:?}", recovery.attempt),
+            "events": &recovery.trace,
+        }),
+    );
+
+    let (command_diagnostics, strict_sandbox_count, unknown_sandbox_count) =
+        recovery_command_diagnostics(&recovery.trace);
+    diagnostics.strict_sandbox_command_count = diagnostics
+        .strict_sandbox_command_count
+        .saturating_add(strict_sandbox_count);
+    diagnostics.local_process_fallback_unknown_count = diagnostics
+        .local_process_fallback_unknown_count
+        .saturating_add(unknown_sandbox_count);
+    let (
+        provider_attempts,
+        model_usage,
+        model_turns,
+        tool_calls,
+        verification_required,
+        verification_satisfied,
+    ) = recovery_trace_metrics(&recovery.trace);
+    let verification_counts =
+        recovery_verification_counts(verification_required, verification_satisfied);
+    diagnostics.verification_observed = verification_counts.is_ok();
+    let (verification_required_command_count, verification_satisfied_command_count) =
+        match &verification_counts {
+            Ok((required, satisfied)) => (*required, *satisfied),
+            Err(_) => (0, 0),
+        };
+    diagnostics.verification_required_command_count = verification_required_command_count;
+    diagnostics.verification_satisfied_command_count = verification_satisfied_command_count;
+    let child_provider_binding_observed = model_selector.as_deref().is_some_and(|selector| {
+        recovery_provider_binding_matches(
+            &recovery.trace,
+            &recovery.turn_id,
+            selector,
+            prepared
+                .provider_snapshot
+                .redacted_config()
+                .provider_name
+                .as_deref(),
+            child_provider.selected_api_protocol(),
+        )
+    });
+    if recovery.attempt == RecoveryAttempt::Completed && !child_provider_binding_observed {
+        diagnostics.recovery_completed = None;
+    }
+    let provider_evidence = child_provider_binding_observed
+        .then(|| recovery_provider_protocol(&recovery.trace, &recovery.turn_id))
+        .flatten()
+        .map(|protocol| {
+            let metadata = ProviderCapabilityMetadata {
+                api_protocol: protocol,
+                profile: ProviderCapabilityProfile::Declared,
+                cache_hit: false,
+                profile_attempts: 0,
+                fallback_count: 0,
+                probe_usage: ModelUsage::default(),
+                probe_attempt_metadata: ProviderAttemptMetadata::default(),
+                cache_observations: Vec::new(),
+            };
+            let contract = child_provider.protocol_contract();
+            provider_evidence(&child_provider, Some(&contract), Some(&metadata))
+        });
+    diagnostics.provider_usage_available = provider_attempts.attempt_count > 0;
+    diagnostics.provider_attempt_count = provider_attempts.attempt_count;
+    diagnostics.provider_retry_count = provider_attempts.retry_count;
+    diagnostics.provider_latency_ms = provider_attempts.latency_ms;
+    diagnostics.model_turns = model_turns;
+    diagnostics.tool_calls = tool_calls;
+    diagnostics.input_tokens = model_usage.input_tokens;
+    diagnostics.output_tokens = model_usage.output_tokens;
+    diagnostics.cached_input_tokens = model_usage.cached_input_tokens;
+    diagnostics.reasoning_tokens = model_usage.reasoning_tokens;
+    diagnostics.total_tokens = model_usage.total_tokens;
+    diagnostics.prompt_structure = Some(prompt_structure.clone());
+    diagnostics.prompt_fingerprint = Some(prompt_fingerprint.clone());
+    diagnostics.tool_schema_fingerprint = Some(tool_schema_fingerprint.clone());
+    diagnostics.provider_evidence = provider_evidence.clone();
+    let integrity_paths = verification_integrity_paths(prepared.plan, &before);
+    diagnostics.verification_bypass_count = (recovery.attempt == RecoveryAttempt::Completed)
+        .then(|| {
+            recovery_verification_bypass_count(
+                &recovery_db,
+                &recovery.trace,
+                &recovery.thread_id,
+                &recovery.turn_id,
+                integrity_paths.as_ref(),
+            )
+        })
+        .flatten();
+
+    let after = match snapshot_workspace(agent_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return AgentStageExecution {
+                stage: StageExecution::blocked(
+                    evaluation_blocker(BlockerKind::WorkspacePreparation, error.clone()),
+                    command_diagnostics,
+                ),
+                workspace: Some(agent_dir.to_path_buf()),
+                changed_files: Vec::new(),
+                patch_evidence: Vec::new(),
+                patch_digest: None,
+                patch_evidence_path: None,
+                model_turns,
+                tool_calls,
+                approval_count: 0,
+                recovery_metrics: AgentRecoveryMetrics::default(),
+                compaction_count: 0,
+                verification_required_command_count,
+                verification_satisfied_command_count,
+                model_usage,
+                provider_attempts,
+                agent_duration_ms,
+                local_process_fallback_unknown_count: unknown_sandbox_count,
+                trace_path: Some(trace_path.to_string_lossy().into_owned()),
+                error: Some(safe_text(error)),
+                provider_diagnostic: None,
+                prompt_structure: Some(prompt_structure),
+                prompt_fingerprint: Some(prompt_fingerprint),
+                tool_schema_fingerprint: Some(tool_schema_fingerprint),
+                provider_evidence,
+                verification_bypass_count: None,
+            };
+        }
+    };
+    let changed_files = evaluation_changed_paths(&before, &after, prepared.source_snapshot);
+    let patch_evidence = workspace_change_evidence(&before, &after, prepared.source_snapshot);
+    let patch_digest = patch_evidence_digest(&patch_evidence);
+    let patch_evidence_path = task_dir.join(PATCH_EVIDENCE_FILE);
+    let patch_evidence_path = write_json_atomic(&patch_evidence_path, &patch_evidence)
+        .ok()
+        .map(|_| patch_evidence_path.to_string_lossy().into_owned());
+    if workspace_root_identity(agent_dir).ok() != Some(before_identity) {
+        return AgentStageExecution {
+            stage: StageExecution::blocked(
+                evaluation_blocker(
+                    BlockerKind::WorkspacePreparation,
+                    "agent workspace root identity changed during recovery trial",
+                ),
+                command_diagnostics,
+            ),
+            workspace: Some(agent_dir.to_path_buf()),
+            changed_files,
+            patch_evidence,
+            patch_digest,
+            patch_evidence_path,
+            model_turns,
+            tool_calls,
+            approval_count: 0,
+            recovery_metrics: AgentRecoveryMetrics::default(),
+            compaction_count: 0,
+            verification_required_command_count,
+            verification_satisfied_command_count,
+            model_usage,
+            provider_attempts,
+            agent_duration_ms,
+            local_process_fallback_unknown_count: unknown_sandbox_count,
+            trace_path: Some(trace_path.to_string_lossy().into_owned()),
+            error: Some("agent workspace root identity changed during recovery trial".to_string()),
+            provider_diagnostic: None,
+            prompt_structure: Some(prompt_structure),
+            prompt_fingerprint: Some(prompt_fingerprint),
+            tool_schema_fingerprint: Some(tool_schema_fingerprint),
+            provider_evidence,
+            verification_bypass_count: None,
+        };
+    }
+    let stage = match recovery.attempt {
+        RecoveryAttempt::Completed if !child_provider_binding_observed => {
+            StageExecution::blocked(recovery_provider_binding_blocker(), command_diagnostics)
+        }
+        RecoveryAttempt::Completed if diagnostics.verification_observed => {
+            StageExecution::passed(command_diagnostics)
+        }
+        RecoveryAttempt::Completed => {
+            StageExecution::blocked(recovery_verification_blocker(), command_diagnostics)
+        }
+        RecoveryAttempt::Failed | RecoveryAttempt::NotObserved => StageExecution::failed(
+            recovery
+                .reason
+                .clone()
+                .unwrap_or_else(|| "recovery trial did not complete".to_string()),
+            command_diagnostics,
+        ),
+    };
+    AgentStageExecution {
+        stage,
+        workspace: Some(agent_dir.to_path_buf()),
+        changed_files,
+        patch_evidence,
+        patch_digest,
+        patch_evidence_path,
+        model_turns,
+        tool_calls,
+        approval_count: 0,
+        recovery_metrics: AgentRecoveryMetrics::default(),
+        compaction_count: 0,
+        verification_required_command_count,
+        verification_satisfied_command_count,
+        model_usage,
+        provider_attempts,
+        agent_duration_ms,
+        local_process_fallback_unknown_count: unknown_sandbox_count,
+        trace_path: Some(trace_path.to_string_lossy().into_owned()),
+        error: (recovery.attempt != RecoveryAttempt::Completed).then(|| {
+            recovery
+                .reason
+                .unwrap_or_else(|| "recovery trial did not complete".to_string())
+        }),
+        provider_diagnostic: None,
+        prompt_structure: Some(prompt_structure),
+        prompt_fingerprint: Some(prompt_fingerprint),
+        tool_schema_fingerprint: Some(tool_schema_fingerprint),
+        provider_evidence,
+        verification_bypass_count: None,
+    }
+}
+
+fn recovery_command_diagnostics(trace: &[TraceEvent]) -> (Vec<CommandDiagnostic>, usize, usize) {
+    let mut commands = Vec::new();
+    let mut strict = 0usize;
+    let mut unknown = 0usize;
+    for start in trace.iter().filter(|event| {
+        event.span_kind == Some(TraceSpanKind::SandboxExecution)
+            && event.span_phase == Some(TraceSpanPhase::Start)
+    }) {
+        let end = trace.iter().find(|event| {
+            event.span_id == start.span_id
+                && event.span_kind == Some(TraceSpanKind::SandboxExecution)
+                && event.span_phase == Some(TraceSpanPhase::End)
+        });
+        commands.push(CommandDiagnostic {
+            phase: "recovery.command".to_string(),
+            exit_code: None,
+            duration_ms: end.and_then(|event| event.duration_ms),
+        });
+        let sandbox = end
+            .and_then(|event| event.span_projection.as_ref())
+            .and_then(|projection| projection.sandbox.as_ref());
+        if sandbox.is_some_and(|sandbox| {
+            sandbox.enforcement == Some(singularity_protocol::TraceSandboxEnforcement::Strict)
+                && sandbox.command_id_binding_valid == Some(true)
+        }) {
+            strict = strict.saturating_add(1);
+        } else {
+            unknown = unknown.saturating_add(1);
+        }
+    }
+    (commands, strict, unknown)
+}
+
+fn recovery_trace_metrics(
+    trace: &[TraceEvent],
+) -> (
+    ProviderAttemptMetadata,
+    ModelUsage,
+    u32,
+    u32,
+    Option<u32>,
+    Option<u32>,
+) {
+    let attempts = trace
+        .iter()
+        .filter(|event| {
+            event.span_kind == Some(TraceSpanKind::ProviderAttempt)
+                && event.span_phase == Some(TraceSpanPhase::Start)
+        })
+        .count();
+    let latency_ms = trace
+        .iter()
+        .filter(|event| {
+            event.span_kind == Some(TraceSpanKind::ProviderAttempt)
+                && event.span_phase == Some(TraceSpanPhase::End)
+        })
+        .filter_map(|event| event.duration_ms)
+        .fold(0u64, u64::saturating_add);
+    let mut usage = ModelUsage::default();
+    let mut model_turns = 0u32;
+    let mut verification_required = None;
+    let mut verification_satisfied = None;
+    for event in trace.iter().filter(|event| {
+        event.span_kind == Some(TraceSpanKind::ProviderAttempt)
+            && event.span_phase == Some(TraceSpanPhase::End)
+    }) {
+        if let Some(value) = event
+            .span_projection
+            .as_ref()
+            .and_then(|projection| projection.usage.as_ref())
+        {
+            usage.input_tokens = usage.input_tokens.saturating_add(value.input_tokens);
+            usage.output_tokens = usage.output_tokens.saturating_add(value.output_tokens);
+            usage.total_tokens = usage.total_tokens.saturating_add(value.total_tokens);
+            usage.cached_input_tokens = usage
+                .cached_input_tokens
+                .saturating_add(value.cached_input_tokens);
+            usage.reasoning_tokens = usage
+                .reasoning_tokens
+                .saturating_add(value.reasoning_tokens);
+        }
+        if let Some(turn) = event
+            .span_projection
+            .as_ref()
+            .and_then(|projection| projection.model_turn_ordinal)
+        {
+            model_turns =
+                model_turns.max(u32::try_from(turn.saturating_add(1)).unwrap_or(u32::MAX));
+        }
+    }
+    for event in trace.iter().filter(|event| {
+        event.span_kind == Some(TraceSpanKind::Verification)
+            && event.span_phase == Some(TraceSpanPhase::End)
+    }) {
+        if let Some(verification) = event
+            .span_projection
+            .as_ref()
+            .and_then(|projection| projection.verification.as_ref())
+        {
+            if let Some(required) = verification.required_command_count {
+                verification_required = Some(
+                    verification_required
+                        .unwrap_or(0)
+                        .max(u32::try_from(required).unwrap_or(u32::MAX)),
+                );
+            }
+            if let Some(satisfied) = verification.satisfied_command_count {
+                verification_satisfied = Some(
+                    verification_satisfied
+                        .unwrap_or(0)
+                        .max(u32::try_from(satisfied).unwrap_or(u32::MAX)),
+                );
+            }
+        }
+    }
+    let tool_calls = u32::try_from(
+        trace
+            .iter()
+            .filter(|event| {
+                event.span_kind == Some(TraceSpanKind::ToolCall)
+                    && event.span_phase == Some(TraceSpanPhase::Start)
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    (
+        ProviderAttemptMetadata {
+            attempt_count: u32::try_from(attempts).unwrap_or(u32::MAX),
+            retry_count: u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX),
+            latency_ms,
+            occurrences: Vec::new(),
+        },
+        usage,
+        model_turns,
+        tool_calls,
+        verification_required,
+        verification_satisfied,
+    )
+}
+
+/// Read the recovery trial's canonical ToolResult occurrences from the private trace envelope.
+///
+/// Recovery uses a separate SQLite Store, so its public trace projection cannot be fed to the
+/// normal reducer directly.  The Store verifies the row envelope before returning the private
+/// payload; this function then checks the public binding and hands the recovered results to the
+/// same bypass reducer used by the ordinary AgentLoop path.
+fn recovery_verification_bypass_count(
+    recovery_db: &Path,
+    trace: &[TraceEvent],
+    thread_id: &str,
+    turn_id: &str,
+    integrity_paths: Option<&BTreeSet<String>>,
+) -> Option<u64> {
+    let integrity_paths = integrity_paths?;
+    let store = singularity_store::SessionStore::open(recovery_db).ok()?;
+    let results = recovery_tool_results(&store, trace, thread_id, turn_id)?;
+    verification_bypass_count_for_results(&results, integrity_paths)
+}
+
+fn recovery_tool_results(
+    store: &singularity_store::SessionStore,
+    trace: &[TraceEvent],
+    thread_id: &str,
+    turn_id: &str,
+) -> Option<Vec<ToolResult>> {
+    let tool_result_events = trace
+        .iter()
+        .filter(|event| {
+            event.payload.get("observation").and_then(Value::as_str) == Some("tool_result")
+        })
+        .collect::<Vec<_>>();
+    let has_tool_calls = trace.iter().any(|event| {
+        event.session_id == turn_id
+            && event.span_kind == Some(TraceSpanKind::ToolCall)
+            && event.span_phase == Some(TraceSpanPhase::Start)
+    });
+    if tool_result_events.is_empty() {
+        // A completed recovery with no tool calls has a valid zero sample.  A tool-call span with
+        // no paired private result is incomplete and must remain unavailable.
+        return (!has_tool_calls).then_some(Vec::new());
+    }
+
+    let mut event_ids = BTreeSet::new();
+    let mut results = Vec::with_capacity(tool_result_events.len());
+    for event in tool_result_events {
+        if event.validate_turn_binding(thread_id, turn_id).is_err()
+            || !event_ids.insert(event.event_id.clone())
+        {
+            return None;
+        }
+        let internal_payload = store
+            .get_trace_internal_payload(&event.event_id)
+            .ok()
+            .flatten()?;
+        let occurrence =
+            serde_json::from_value::<ToolResultOccurrence>(internal_payload.clone()).ok()?;
+        if !recovery_tool_result_binding(event, &internal_payload, &occurrence, trace, turn_id) {
+            return None;
+        }
+        results.push(occurrence.result().clone());
+    }
+    Some(results)
+}
+
+fn recovery_tool_result_binding(
+    event: &TraceEvent,
+    internal_payload: &Value,
+    occurrence: &ToolResultOccurrence,
+    trace: &[TraceEvent],
+    turn_id: &str,
+) -> bool {
+    let Some(public) = event
+        .payload
+        .as_object()
+        .and_then(|payload| payload.get("tool_result"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(tool_name) = public.get("tool_name").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(tool_call_id_digest) = public.get("tool_call_id_digest").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(tool_call_ordinal) = public.get("tool_call_ordinal").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(first_attempt) = public.get("first_attempt").and_then(Value::as_bool) else {
+        return false;
+    };
+    let Ok(status) = serde_json::from_value::<TraceToolStatus>(
+        public.get("status").cloned().unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    let Ok(visibility) = serde_json::from_value::<singularity_agent::ToolResultVisibility>(
+        public.get("visibility").cloned().unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    let result = occurrence.result();
+    if result.tool_name != tool_name
+        || content_digest(result.tool_call_id.as_bytes()) != tool_call_id_digest
+        || result.ok != (status == TraceToolStatus::Succeeded)
+        || occurrence.visibility() != visibility
+        || public.get("ok").and_then(Value::as_bool) != Some(result.ok)
+        || public.get("error_code").and_then(Value::as_str)
+            != result
+                .error_code
+                .as_deref()
+                .and_then(bounded_stable_code)
+                .as_deref()
+        || public.get("result_id_digest").and_then(Value::as_str)
+            != result
+                .result_id
+                .as_deref()
+                .map(|result_id| content_digest(result_id.as_bytes()))
+                .as_deref()
+    {
+        return false;
+    }
+
+    let matching_tool_calls = trace
+        .iter()
+        .filter(|candidate| {
+            candidate.session_id == turn_id
+                && candidate.span_kind == Some(TraceSpanKind::ToolCall)
+                && candidate.span_phase == Some(TraceSpanPhase::End)
+        })
+        .filter_map(|candidate| {
+            let projection = candidate.span_projection.as_ref()?.tool.as_ref()?;
+            (projection.tool_name.as_deref() == Some(tool_name)
+                && projection.tool_call_id_digest.as_deref() == Some(tool_call_id_digest)
+                && projection.tool_call_ordinal == Some(tool_call_ordinal)
+                && projection.first_attempt == Some(first_attempt)
+                && projection.status == Some(status)
+                && candidate.span_id.as_deref().is_some_and(|span_id| {
+                    trace.iter().any(|start| {
+                        start.session_id == turn_id
+                            && start.span_id.as_deref() == Some(span_id)
+                            && start.span_kind == Some(TraceSpanKind::ToolCall)
+                            && start.span_phase == Some(TraceSpanPhase::Start)
+                    })
+                }))
+            .then_some(candidate)
+        })
+        .count();
+    if matching_tool_calls != 1 {
+        return false;
+    }
+
+    // The private payload itself is envelope-authenticated by Store.  Keep this argument in the
+    // binding helper so callers cannot accidentally validate a result against a different row.
+    internal_payload.is_object()
+}
+
+fn recovery_verification_counts(
+    required: Option<u32>,
+    satisfied: Option<u32>,
+) -> Result<(u32, u32), EvaluationBlocker> {
+    match (required, satisfied) {
+        (Some(required), Some(satisfied)) => Ok((required, satisfied)),
+        _ => Err(recovery_verification_blocker()),
+    }
+}
+
+fn recovery_verification_blocker() -> EvaluationBlocker {
+    evaluation_blocker_with_code(
+        BlockerKind::AgentRuntime,
+        Some("recovery_verification_evidence_unobserved".to_string()),
+        "recovery verification evidence was not observed in AppServer trace",
+    )
+}
+
+fn recovery_provider_protocol(trace: &[TraceEvent], turn_id: &str) -> Option<ProviderApiProtocol> {
+    trace
+        .iter()
+        .filter(|event| {
+            event.session_id == turn_id
+                && event.span_kind == Some(TraceSpanKind::ProviderAttempt)
+                && event.span_phase == Some(TraceSpanPhase::End)
+                && event
+                    .span_projection
+                    .as_ref()
+                    .and_then(|projection| projection.operation_phase)
+                    == Some(singularity_protocol::TraceProviderOperationPhase::Completion)
+        })
+        .find_map(|event| {
+            event
+                .span_projection
+                .as_ref()
+                .and_then(|projection| projection.protocol)
+                .map(trace_provider_protocol)
+        })
+}
+
+fn trace_provider_protocol(protocol: TraceProviderProtocol) -> ProviderApiProtocol {
+    match protocol {
+        TraceProviderProtocol::Declared => ProviderApiProtocol::Declared,
+        TraceProviderProtocol::OpenAiResponses => ProviderApiProtocol::OpenAiResponses,
+        TraceProviderProtocol::OpenAiChatCompletions => ProviderApiProtocol::OpenAiChatCompletions,
+    }
+}
+
+fn recovery_provider_binding_matches(
+    trace: &[TraceEvent],
+    turn_id: &str,
+    selector: &str,
+    fallback_provider_name: Option<&str>,
+    expected_protocol: Option<ProviderApiProtocol>,
+) -> bool {
+    let Some((expected_provider, expected_model)) =
+        recovery_selector_parts(selector, fallback_provider_name)
+    else {
+        return false;
+    };
+    let mut observed_completion = false;
+    let mut observed_protocol = None;
+    for event in trace.iter().filter(|event| {
+        event.session_id == turn_id
+            && event.span_kind == Some(TraceSpanKind::ProviderAttempt)
+            && event.span_phase == Some(TraceSpanPhase::End)
+    }) {
+        let Some(projection) = event.span_projection.as_ref() else {
+            return false;
+        };
+        let Some(operation_phase) = projection.operation_phase else {
+            return false;
+        };
+        // A capability probe is part of the same frozen provider selection, but its declared
+        // protocol is not the completion wire protocol.  Bind the recovery result only to the
+        // actual completion attempts.
+        if operation_phase != singularity_protocol::TraceProviderOperationPhase::Completion {
+            continue;
+        }
+        let Some(provider_name) = projection
+            .provider_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return false;
+        };
+        let Some(model_name) = projection
+            .model_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return false;
+        };
+        let Some(protocol) = projection.protocol.map(trace_provider_protocol) else {
+            return false;
+        };
+        observed_completion = true;
+        if provider_name != expected_provider
+            || model_name != expected_model
+            || expected_protocol.is_some_and(|expected| expected != protocol)
+        {
+            return false;
+        }
+        if observed_protocol.is_some_and(|observed| observed != protocol) {
+            return false;
+        }
+        observed_protocol = Some(protocol);
+    }
+    observed_completion
+}
+
+fn recovery_selector_parts(
+    selector: &str,
+    fallback_provider_name: Option<&str>,
+) -> Option<(String, String)> {
+    let (provider_name, model_and_effort) = selector
+        .split_once('/')
+        .map_or((fallback_provider_name?, selector), |(provider, rest)| {
+            (provider, rest)
+        });
+    let model_name = model_and_effort
+        .split_once('#')
+        .map_or(model_and_effort, |(model, _)| model);
+    (!provider_name.is_empty() && !model_name.is_empty())
+        .then(|| (provider_name.to_string(), model_name.to_string()))
+}
+
+fn recovery_provider_binding_blocker() -> EvaluationBlocker {
+    evaluation_blocker_with_code(
+        BlockerKind::AgentRuntime,
+        Some("recovery_provider_binding_unobserved".to_string()),
+        "recovery child provider/model/protocol did not match the frozen selector",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6388,6 +7232,43 @@ mod tests {
     }
 
     #[test]
+    fn recovery_trace_metrics_uses_typed_verification_end_counts() {
+        let mut event = TraceEvent::for_turn(
+            "verification-end",
+            "thread",
+            "turn",
+            "app_server",
+            "verification",
+        );
+        event.span_kind = Some(TraceSpanKind::Verification);
+        event.span_phase = Some(TraceSpanPhase::End);
+        event.span_status = Some(TraceSpanStatus::Ok);
+        event.span_projection = Some(TraceSpanProjection {
+            verification: Some(singularity_protocol::TraceVerificationProjection {
+                required_command_count: Some(3),
+                satisfied_command_count: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let (_, _, _, _, required, satisfied) = recovery_trace_metrics(&[event]);
+        assert_eq!(required, Some(3));
+        assert_eq!(satisfied, Some(2));
+    }
+
+    #[test]
+    fn recovery_verification_counts_rejects_missing_typed_evidence() {
+        let blocker = recovery_verification_counts(None, None)
+            .expect_err("required recovery verification must be observed");
+        assert_eq!(blocker.kind, BlockerKind::AgentRuntime);
+        assert_eq!(
+            blocker.code.as_deref(),
+            Some("recovery_verification_evidence_unobserved")
+        );
+    }
+
+    #[test]
     fn harness_metrics_aggregate_successful_costs_and_compaction_decay() {
         let mut non_compacted = task_execution_with_status(1, 1);
         non_compacted.diagnostics.provider_usage_available = true;
@@ -6573,6 +7454,238 @@ mod tests {
         );
         let serialized = serde_json::to_string(&result).expect("tool result serializes");
         assert!(!serialized.contains("tests/hidden.py"));
+    }
+
+    fn recovery_occurrence_payload(
+        result: &ToolResult,
+        visibility: singularity_agent::ToolResultVisibility,
+    ) -> Value {
+        json!({
+            "result": result,
+            "visibility": visibility,
+            "result_id": result.result_id,
+            "context_token_count": result.context_token_count(),
+            "audit_metadata": result.audit_metadata(),
+            "workspace_observation": result.workspace_observation(),
+            "workspace_change_summary": result.workspace_change_summary(),
+        })
+    }
+
+    fn recovery_tool_call_span(
+        event_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        result: &ToolResult,
+        phase: TraceSpanPhase,
+        status: TraceToolStatus,
+    ) -> TraceEvent {
+        let mut event = TraceEvent::for_turn(event_id, thread_id, turn_id, "observability", "tool");
+        event.span_id = Some("tool-span".to_string());
+        event.parent_span_id = Some(format!("turn_span_{turn_id}"));
+        event.span_kind = Some(TraceSpanKind::ToolCall);
+        event.span_phase = Some(phase);
+        event.span_projection = Some(TraceSpanProjection {
+            tool: Some(singularity_protocol::TraceToolProjection {
+                tool_name: Some(result.tool_name.clone()),
+                tool_call_id_digest: Some(content_digest(result.tool_call_id.as_bytes())),
+                tool_call_ordinal: Some(0),
+                first_attempt: Some(true),
+                status: (phase == TraceSpanPhase::End).then_some(status),
+            }),
+            ..TraceSpanProjection::default()
+        });
+        if phase == TraceSpanPhase::End {
+            event.span_status = Some(if status == TraceToolStatus::Succeeded {
+                TraceSpanStatus::Ok
+            } else {
+                TraceSpanStatus::Error
+            });
+            event.duration_ms = Some(1);
+        }
+        event
+    }
+
+    fn recovery_tool_result_event(
+        event_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        result: &ToolResult,
+        visibility: singularity_agent::ToolResultVisibility,
+        status: TraceToolStatus,
+    ) -> TraceEvent {
+        let mut event =
+            TraceEvent::for_turn(event_id, thread_id, turn_id, "observability", "tool result");
+        event.payload = json!({
+            "observation": "tool_result",
+            "tool_result": {
+                "tool_name": result.tool_name,
+                "tool_call_id_digest": content_digest(result.tool_call_id.as_bytes()),
+                "tool_call_ordinal": 0,
+                "first_attempt": true,
+                "status": status,
+                "visibility": visibility,
+                "ok": result.ok,
+            },
+        });
+        event
+    }
+
+    #[test]
+    fn recovery_verification_bypass_reads_private_occurrence_payload() {
+        let directory = tempfile::tempdir().expect("recovery trace directory");
+        let db_path = directory.path().join("recovery.sqlite3");
+        let store = singularity_store::SessionStore::open(&db_path).expect("open recovery store");
+        let thread = store
+            .create_thread(None, None)
+            .expect("create recovery thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("create recovery turn");
+        let thread_id = thread.thread_id.as_str();
+        let turn_id = turn.turn_id.as_str();
+        let result = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        store
+            .append_trace_idempotent(&recovery_tool_call_span(
+                "tool-start",
+                thread_id,
+                turn_id,
+                &result,
+                TraceSpanPhase::Start,
+                TraceToolStatus::Succeeded,
+            ))
+            .expect("append tool start");
+        store
+            .append_trace_idempotent(&recovery_tool_call_span(
+                "tool-end",
+                thread_id,
+                turn_id,
+                &result,
+                TraceSpanPhase::End,
+                TraceToolStatus::Succeeded,
+            ))
+            .expect("append tool end");
+        let event = recovery_tool_result_event(
+            "tool-result",
+            thread_id,
+            turn_id,
+            &result,
+            singularity_agent::ToolResultVisibility::Visible,
+            TraceToolStatus::Succeeded,
+        );
+        store
+            .append_trace_with_internal_payload_idempotent(
+                &event,
+                Some(&recovery_occurrence_payload(
+                    &result,
+                    singularity_agent::ToolResultVisibility::Visible,
+                )),
+            )
+            .expect("append private tool result");
+        let trace = store.list_trace(thread_id).expect("list recovery trace");
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        assert_eq!(
+            recovery_verification_bypass_count(
+                &db_path,
+                &trace,
+                thread_id,
+                turn_id,
+                Some(&integrity),
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn recovery_verification_bypass_fails_closed_for_missing_or_unknown_payload() {
+        let directory = tempfile::tempdir().expect("recovery trace directory");
+        let db_path = directory.path().join("recovery.sqlite3");
+        let store = singularity_store::SessionStore::open(&db_path).expect("open recovery store");
+        let thread = store
+            .create_thread(None, None)
+            .expect("create recovery thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("create recovery turn");
+        let thread_id = thread.thread_id.as_str();
+        let turn_id = turn.turn_id.as_str();
+        let result = changed_tool_result(PATCH_TOOL, "tests/hidden.py", true);
+        for event in [
+            recovery_tool_call_span(
+                "tool-start",
+                thread_id,
+                turn_id,
+                &result,
+                TraceSpanPhase::Start,
+                TraceToolStatus::Succeeded,
+            ),
+            recovery_tool_call_span(
+                "tool-end",
+                thread_id,
+                turn_id,
+                &result,
+                TraceSpanPhase::End,
+                TraceToolStatus::Succeeded,
+            ),
+        ] {
+            store
+                .append_trace_idempotent(&event)
+                .expect("append trace span");
+        }
+        let missing = recovery_tool_result_event(
+            "missing-result",
+            thread_id,
+            turn_id,
+            &result,
+            singularity_agent::ToolResultVisibility::Visible,
+            TraceToolStatus::Succeeded,
+        );
+        store
+            .append_trace_idempotent(&missing)
+            .expect("append missing private payload");
+        let trace = store.list_trace(thread_id).expect("list missing trace");
+        let integrity = BTreeSet::from(["tests/hidden.py".to_string()]);
+        assert_eq!(
+            recovery_verification_bypass_count(
+                &db_path,
+                &trace,
+                thread_id,
+                turn_id,
+                Some(&integrity),
+            ),
+            None
+        );
+
+        let unknown = result
+            .clone()
+            .with_workspace_observation(singularity_tools::WorkspaceObservation::unknown());
+        let unknown_event = recovery_tool_result_event(
+            "unknown-result",
+            thread_id,
+            turn_id,
+            &unknown,
+            singularity_agent::ToolResultVisibility::Visible,
+            TraceToolStatus::Succeeded,
+        );
+        store
+            .append_trace_with_internal_payload_idempotent(
+                &unknown_event,
+                Some(&recovery_occurrence_payload(
+                    &unknown,
+                    singularity_agent::ToolResultVisibility::Visible,
+                )),
+            )
+            .expect("append unknown private payload");
+        let trace = store.list_trace(thread_id).expect("list unknown trace");
+        assert_eq!(
+            recovery_verification_bypass_count(
+                &db_path,
+                &trace,
+                thread_id,
+                turn_id,
+                Some(&integrity),
+            ),
+            None
+        );
     }
 
     #[test]
