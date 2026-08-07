@@ -133,9 +133,9 @@ enum TurnCommand {
     Input {
         turn_id: String,
         text: String,
-        /// Idempotency key for the appended input; generated once when omitted.
+        /// Explicit idempotency key for the appended input.
         #[arg(long)]
-        input_id: Option<String>,
+        input_id: String,
         /// Delivery semantics: steer consumes at the next boundary, follow-up waits for the turn end.
         #[arg(long, value_enum)]
         delivery: Option<TurnDeliveryArg>,
@@ -316,14 +316,6 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                     delivery,
                 } => {
                     client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
-                    // 幂等键显式传入；缺省时生成一次，重试不得生成新 ID。
-                    let input_id = input_id.unwrap_or_else(|| {
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_nanos())
-                            .unwrap_or_default();
-                        format!("cli-{nanos}")
-                    });
                     let delivery = delivery.map_or(TurnInputDelivery::FollowUp, |delivery| {
                         delivery.protocol_value()
                     });

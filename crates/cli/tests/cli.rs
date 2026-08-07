@@ -1387,6 +1387,37 @@ fn cli_turn_input_maps_protocol_params_and_polls_running_result() {
     assert!(methods.contains("turn/status\n"), "methods={methods}");
 }
 
+// 验证 turn input 缺少显式幂等键时在 CLI 解析阶段失败，且不会启动 app-server。
+#[test]
+fn cli_turn_input_requires_input_id_without_starting_app_server() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let startup_marker = temp.path().join("app-server-started");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new().startup(vec![write_text(&startup_marker, "started")]),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args([
+            "turn",
+            "input",
+            "turn_fake",
+            "add more tests",
+            "--delivery",
+            "follow-up",
+        ])
+        .output()
+        .expect("turn input cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--input-id <INPUT_ID>"));
+    assert!(
+        !startup_marker.exists(),
+        "app-server must not start when CLI parsing fails"
+    );
+}
+
 // 验证 continue 遇到非终态 turn 时展示服务端可操作提示（含 turn ID），
 // 不重试、不自动 resume，退出非零。
 #[test]
