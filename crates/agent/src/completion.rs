@@ -441,7 +441,7 @@ impl CompletionTracker {
     pub(super) fn feedback(&self) -> String {
         if !self.unresolved_failures.is_empty() {
             return format!(
-                "Do not finalize yet. Resolve these failures and rerun the relevant verification: {}.",
+                "Do not finalize yet. Resolve these failures and rerun the relevant verification. Current failures: {}. The terminal verification command must succeed. After it finishes, leave no unaddressed semantic workspace changes: do not redirect verification output into new workspace logs or reports, and do not modify source files. Trusted toolchain cache updates may be treated as semantic Unchanged by the workspace observation and do not require cleanup. If the command causes another semantic change, clean up or stabilize that change, then rerun the relevant verification without creating further semantic changes.",
                 self.unresolved_failures
                     .iter()
                     .cloned()
@@ -449,7 +449,7 @@ impl CompletionTracker {
                     .join(", ")
             );
         }
-        "Do not finalize yet. Run a relevant verification command after the latest workspace mutation, inspect its result, and only then provide the final answer."
+        "Do not finalize yet. Run a relevant verification command after the latest workspace mutation and inspect its result. The terminal verification command must succeed. After it finishes, leave no unaddressed semantic workspace changes: do not redirect verification output into new workspace logs or reports, and do not modify source files. Trusted toolchain cache updates may be treated as semantic Unchanged by the workspace observation and do not require cleanup. If the command causes another semantic change, clean up or stabilize that change, then rerun the relevant verification without creating further semantic changes. Only then provide the final answer."
             .to_string()
     }
 
@@ -504,5 +504,45 @@ impl CompletionTracker {
         self.terminal_command_revisions
             .iter()
             .all(|revision| Some(*revision) == self.workspace_revision)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TERMINAL_VERIFICATION_FEEDBACK: &str = "The terminal verification command must succeed. After it finishes, leave no unaddressed semantic workspace changes: do not redirect verification output into new workspace logs or reports, and do not modify source files. Trusted toolchain cache updates may be treated as semantic Unchanged by the workspace observation and do not require cleanup. If the command causes another semantic change, clean up or stabilize that change, then rerun the relevant verification without creating further semantic changes.";
+
+    #[test]
+    fn feedback_with_unresolved_failures_requires_unchanged_terminal_verification() {
+        let mut tracker = CompletionTracker {
+            workspace_mutated: true,
+            ..CompletionTracker::default()
+        };
+        tracker
+            .unresolved_failures
+            .insert("verification:command_exit_nonzero".to_string());
+
+        assert_eq!(
+            tracker.feedback(),
+            format!(
+                "Do not finalize yet. Resolve these failures and rerun the relevant verification. Current failures: verification:command_exit_nonzero. {TERMINAL_VERIFICATION_FEEDBACK}"
+            )
+        );
+    }
+
+    #[test]
+    fn feedback_after_mutation_requires_unchanged_terminal_verification() {
+        let tracker = CompletionTracker {
+            workspace_mutated: true,
+            ..CompletionTracker::default()
+        };
+
+        assert_eq!(
+            tracker.feedback(),
+            format!(
+                "Do not finalize yet. Run a relevant verification command after the latest workspace mutation and inspect its result. {TERMINAL_VERIFICATION_FEEDBACK} Only then provide the final answer."
+            )
+        );
     }
 }
