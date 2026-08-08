@@ -1,4 +1,5 @@
 use crate::absolute_path::AbsolutePathBuf;
+use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
 use crate::permissions::FileSystemSandboxKind;
@@ -228,6 +229,7 @@ impl ResolvedWindowsSandboxPermissions {
 }
 
 fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
+    let isolated_cargo_target = env_map.get("CARGO_TARGET_DIR").map(PathBuf::from);
     ["TEMP", "TMP"]
         .into_iter()
         .filter_map(|key| {
@@ -237,7 +239,41 @@ fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
                 .or_else(|| std::env::var_os(key).map(PathBuf::from))
         })
         .filter(|path| path.is_absolute())
+        .flat_map(|temp_root| {
+            let mut roots = vec![temp_root.clone()];
+            if let Some(target) = isolated_cargo_target.as_deref() {
+                if let Some(cache_root) = existing_isolated_cargo_cache_root(&temp_root, target) {
+                    roots.push(cache_root);
+                }
+            }
+            roots
+        })
         .collect()
+}
+
+/// Returns the nearest existing cache ancestor for a structurally valid isolated Cargo target.
+fn existing_isolated_cargo_cache_root(temp_root: &Path, target: &Path) -> Option<PathBuf> {
+    if !target.is_absolute() {
+        return None;
+    }
+
+    let temp_root = canonicalize_path_allow_missing(temp_root);
+    let target = canonicalize_path_allow_missing(target);
+    let cache_root = temp_root.join("singularity-tool-cache");
+    let cargo_root = cache_root.join("cargo");
+    let mut relative = target.strip_prefix(&cargo_root).ok()?.components();
+    let digest = relative.next()?.as_os_str().to_str()?;
+    if relative.next().is_some()
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
+    [cargo_root, cache_root]
+        .into_iter()
+        .find(|root| root.is_dir())
+        .map(|root| canonicalize_path_allow_missing(&root))
 }
 
 #[cfg(test)]
@@ -287,6 +323,93 @@ mod tests {
         .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(expected_roots, roots);
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_includes_existing_isolated_cargo_cache_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let cargo_root = temp_dir.join("singularity-tool-cache").join("cargo");
+        let target_dir =
+            cargo_root.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&target_dir).expect("create isolated cargo target");
+
+        let env_map = HashMap::from([
+            ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let roots = permissions
+            .writable_roots_for_cwd(&cwd, &env_map)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>();
+
+        assert!(
+            roots.contains(&dunce::canonicalize(&cargo_root).expect("canonical cargo root")),
+            "existing isolated cargo cache root must be writable: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_rejects_non_isolated_cargo_targets() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let cache_root = temp_dir.join("singularity-tool-cache");
+        let cargo_root = cache_root.join("cargo");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&cargo_root).expect("create cargo cache root");
+
+        let cases = [
+            (
+                "target outside TEMP",
+                tmp.path().join("outside").join("cargo").join(digest),
+            ),
+            ("wrong digest", cargo_root.join("not-a-digest")),
+            ("nested target", cargo_root.join(digest).join("nested")),
+        ];
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let expected_cache_root = dunce::canonicalize(&cache_root).expect("canonical cache root");
+        let expected_cargo_root = dunce::canonicalize(&cargo_root).expect("canonical cargo root");
+
+        for (case, target_dir) in cases {
+            std::fs::create_dir_all(&target_dir).expect("create candidate target");
+            let env_map = HashMap::from([
+                ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    target_dir.to_string_lossy().to_string(),
+                ),
+            ]);
+            let roots = permissions
+                .writable_roots_for_cwd(&cwd, &env_map)
+                .into_iter()
+                .map(|root| root.root)
+                .collect::<Vec<_>>();
+
+            assert!(
+                !roots.contains(&expected_cargo_root),
+                "{case} must not add cargo root: {roots:?}"
+            );
+            assert!(
+                !roots.contains(&expected_cache_root),
+                "{case} must not add cache root: {roots:?}"
+            );
+        }
     }
 
     #[test]
