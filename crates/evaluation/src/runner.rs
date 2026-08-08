@@ -102,6 +102,8 @@ const PUBLICATION_SCHEMA_VERSION: &str = "evaluation.publication/v1";
 const FAILURE_SCHEMA_VERSION: &str = "evaluation.failure/v1";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
 const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
+const SETUP_DIAGNOSTICS_FILE: &str = "setup-diagnostics.json";
+const ACTIVE_TRIAL_PEAK_FILE: &str = "active-trial-peak.log";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
 const WINDOWS_MAX_PATH_CHARS: usize = 260;
 const GIT_PACK_HEX: &str = "0123456789012345678901234567890123456789";
@@ -506,6 +508,45 @@ enum IndexedWorkerError<T> {
     Failed(String),
 }
 
+#[derive(Default)]
+struct TrialActivityTracker {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    sampled: AtomicUsize,
+}
+
+impl TrialActivityTracker {
+    fn enter(&self) -> ActiveTrialGuard<'_> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.sampled.fetch_add(1, Ordering::SeqCst);
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        ActiveTrialGuard { tracker: self }
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    fn sampled(&self) -> usize {
+        self.sampled.load(Ordering::SeqCst)
+    }
+}
+
+struct ActiveTrialGuard<'a> {
+    tracker: &'a TrialActivityTracker,
+}
+
+impl Drop for ActiveTrialGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Run indexed work items with a bounded dynamic worker set while preserving index order.
 ///
 /// A cancellation only exposes the completed task/trial work prefix in its in-memory partial
@@ -643,6 +684,7 @@ fn run_bounded_trial_workers<T, F>(
     trial_ordinals: &[u32],
     max_workers: usize,
     cancellation: &CancellationToken,
+    activity: &TrialActivityTracker,
     worker: F,
 ) -> Result<Vec<T>, IndexedWorkerError<T>>
 where
@@ -658,6 +700,7 @@ where
     })?;
     let trial_ordinals = trial_ordinals.to_vec();
     run_bounded_indexed_workers(item_count, max_workers, cancellation, move |index| {
+        let _active_trial = activity.enter();
         let task_index = index / trial_count;
         let trial = trial_ordinals[index % trial_count];
         worker(task_index, trial)
@@ -672,6 +715,7 @@ fn run_task_workers(
     max_workers: usize,
     selected_trial: Option<u32>,
     recovery_every: Option<NonZeroUsize>,
+    activity: &TrialActivityTracker,
 ) -> Result<Vec<TaskEvaluation>, TrialWorkerError> {
     if context.cancellation.is_cancelled() {
         return Err(TrialWorkerError::Cancelled(Vec::new()));
@@ -689,6 +733,7 @@ fn run_task_workers(
         &trial_ordinals,
         max_workers,
         context.cancellation,
+        activity,
         move |task_index, trial| {
             let recovery_injected = recovery_every.is_some_and(|every| {
                 let ordinal = task_index
@@ -1403,7 +1448,8 @@ pub fn run_evaluation_with_mode(
             elapsed_ms(run_started),
         );
     }
-    let task_executions = match run_task_workers(
+    let trial_activity = TrialActivityTracker::default();
+    let task_workers = run_task_workers(
         &run_context,
         &plans,
         &prepared_sources,
@@ -1411,7 +1457,10 @@ pub fn run_evaluation_with_mode(
         params.max_workers,
         None,
         params.recovery_every,
-    ) {
+        &trial_activity,
+    );
+    write_active_trial_peak_sidecar(&run_dir, params.max_workers, &trial_activity);
+    let task_executions = match task_workers {
         Ok(task_executions) => task_executions,
         Err(TrialWorkerError::Cancelled(task_executions)) => {
             if let Err(error) = ensure_trace_failures_empty(&run_context.trace_failures) {
@@ -2873,6 +2922,7 @@ fn run_task_inner(
     );
     diagnostics.agent_setup_ms =
         Some(u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    write_setup_diagnostics_sidecar(&task_dir, &setup_diagnostics);
     let baseline_started = Instant::now();
     let baseline = match setup_result {
         Ok(()) => run_verification_after_setup(
@@ -6749,6 +6799,26 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
     publish_json_temp(&temp_path, path)
 }
 
+/// Best-effort setup timing evidence kept outside the Evaluation gate schemas.
+fn write_setup_diagnostics_sidecar(trial_dir: &Path, diagnostics: &[CommandDiagnostic]) {
+    let _ = write_json_atomic(&trial_dir.join(SETUP_DIAGNOSTICS_FILE), &diagnostics);
+}
+
+/// Best-effort scheduler evidence kept outside the Evaluation gate schemas.
+fn write_active_trial_peak_sidecar(
+    run_dir: &Path,
+    configured_max_workers: usize,
+    activity: &TrialActivityTracker,
+) {
+    let line = format!(
+        "peak_active_trials={} configured_max_workers={} sampled_trials={}\n",
+        activity.peak(),
+        configured_max_workers,
+        activity.sampled()
+    );
+    let _ = fs::write(run_dir.join(ACTIVE_TRIAL_PEAK_FILE), line);
+}
+
 fn write_json_temp(path: &Path, value: &impl Serialize) -> Result<PathBuf, String> {
     let parent = path
         .parent()
@@ -6913,6 +6983,55 @@ mod tests {
     }
 
     #[test]
+    fn setup_diagnostics_sidecar_contains_only_redacted_command_facts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let trial_dir = temp.path().join("trial-0001");
+        let diagnostics = vec![CommandDiagnostic {
+            phase: "setup.command.0".to_string(),
+            exit_code: Some(7),
+            duration_ms: Some(13),
+        }];
+
+        write_setup_diagnostics_sidecar(&trial_dir, &diagnostics);
+
+        let artifact: Value = serde_json::from_str(
+            &fs::read_to_string(trial_dir.join("setup-diagnostics.json"))
+                .expect("setup diagnostics sidecar"),
+        )
+        .expect("setup diagnostics JSON");
+        assert_eq!(
+            artifact,
+            json!([{
+                "phase": "setup.command.0",
+                "exit_code": 7,
+                "duration_ms": 13
+            }])
+        );
+    }
+
+    #[test]
+    fn trial_activity_is_released_and_published_after_worker_panic() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cancellation = CancellationToken::new();
+        let activity = TrialActivityTracker::default();
+
+        let result = run_bounded_trial_workers(1, &[1], 1, &cancellation, &activity, |_, _| {
+            panic!("worker failure")
+        });
+        write_active_trial_peak_sidecar(temp.path(), 1, &activity);
+
+        assert!(matches!(result, Err(IndexedWorkerError::Failed(_))));
+        assert_eq!(activity.active(), 0);
+        assert_eq!(activity.peak(), 1);
+        assert_eq!(activity.sampled(), 1);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("active-trial-peak.log"))
+                .expect("active trial peak sidecar"),
+            "peak_active_trials=1 configured_max_workers=1 sampled_trials=1\n"
+        );
+    }
+
+    #[test]
     fn bounded_workers_preserve_manifest_order() {
         let cancellation = CancellationToken::new();
         let results = run_bounded_indexed_workers(4, 2, &cancellation, |index| index * 2)
@@ -6940,15 +7059,16 @@ mod tests {
     #[test]
     fn bounded_workers_return_only_completed_prefix_after_cancellation() {
         let cancellation = CancellationToken::new();
+        let trial_activity = TrialActivityTracker::default();
         let canceller = cancellation.clone();
         let barrier = Arc::new(Barrier::new(2));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
-        let result = run_bounded_indexed_workers(4, 2, &cancellation, {
+        let result = run_bounded_trial_workers(4, &[1], 2, &cancellation, &trial_activity, {
             let barrier = Arc::clone(&barrier);
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
-            move |index| {
+            move |index, _trial| {
                 record_max(&active, &maximum);
                 if index < 2 {
                     barrier.wait();
@@ -6966,15 +7086,19 @@ mod tests {
             Err(IndexedWorkerError::Cancelled(prefix)) if prefix == vec![0, 1]
         ));
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(trial_activity.active(), 0);
+        assert_eq!(trial_activity.peak(), 2);
+        assert_eq!(trial_activity.sampled(), 2);
     }
 
     #[test]
     fn trial_workers_overlap_all_trials_and_preserve_task_trial_order() {
         let cancellation = CancellationToken::new();
+        let trial_activity = TrialActivityTracker::default();
         let barrier = Arc::new(Barrier::new(6));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
-        let results = run_bounded_trial_workers(3, &[1, 2], 6, &cancellation, {
+        let results = run_bounded_trial_workers(3, &[1, 2], 6, &cancellation, &trial_activity, {
             let barrier = Arc::clone(&barrier);
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
@@ -6988,6 +7112,9 @@ mod tests {
         .expect("trial workers complete");
 
         assert_eq!(maximum.load(Ordering::SeqCst), 6);
+        assert_eq!(trial_activity.active(), 0);
+        assert_eq!(trial_activity.peak(), 6);
+        assert_eq!(trial_activity.sampled(), 6);
         assert_eq!(
             results,
             vec![(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2)]
@@ -6997,24 +7124,29 @@ mod tests {
     #[test]
     fn trial_workers_continue_after_failed_task_execution_without_failing_fast() {
         let cancellation = CancellationToken::new();
+        let trial_activity = TrialActivityTracker::default();
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
-        let results = match run_bounded_trial_workers(3, &[1, 2], 2, &cancellation, {
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            move |task_index, trial| {
-                record_max(&active, &maximum);
-                thread::sleep(Duration::from_millis(5));
-                let execution = task_execution_with_status(task_index, trial);
-                active.fetch_sub(1, Ordering::SeqCst);
-                execution
-            }
-        }) {
-            Ok(results) => results,
-            Err(_) => panic!("a failed trial must not fail fast"),
-        };
+        let results =
+            match run_bounded_trial_workers(3, &[1, 2], 2, &cancellation, &trial_activity, {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                move |task_index, trial| {
+                    record_max(&active, &maximum);
+                    thread::sleep(Duration::from_millis(5));
+                    let execution = task_execution_with_status(task_index, trial);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    execution
+                }
+            }) {
+                Ok(results) => results,
+                Err(_) => panic!("a failed trial must not fail fast"),
+            };
 
         assert!(maximum.load(Ordering::SeqCst) <= 2);
+        assert_eq!(trial_activity.active(), 0);
+        assert!(trial_activity.peak() <= 2);
+        assert_eq!(trial_activity.sampled(), 6);
         assert_eq!(results.len(), 6);
         assert_eq!(results[0].result.status, EvaluationStatus::Failed);
         assert!(

@@ -111,6 +111,7 @@ mod windows_impl {
     use crate::ipc_framed::read_frame;
     use crate::ipc_framed::write_frame;
     use crate::logging::log_failure;
+    use crate::logging::log_note;
     use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::path_normalization::canonicalize_path_allow_missing;
@@ -133,11 +134,43 @@ mod windows_impl {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use std::time::Instant;
     use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 
     pub use crate::windows_impl::CaptureResult;
+
+    static DENY_READ_EXECUTION_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn elapsed_millis_since(started_at: Instant) -> u128 {
+        Instant::now()
+            .saturating_duration_since(started_at)
+            .as_millis()
+    }
+
+    /// Holds the deny-read execution mutex and records its release without sensitive context.
+    struct DenyReadExecutionGuard {
+        guard: Option<StateMutex>,
+        event_id: String,
+        log_dir: PathBuf,
+        acquired_at: Instant,
+    }
+
+    impl Drop for DenyReadExecutionGuard {
+        fn drop(&mut self) {
+            let hold_ms = elapsed_millis_since(self.acquired_at);
+            drop(self.guard.take());
+            log_note(
+                &format!(
+                    "kind=deny_read_execution id={} event=released hold_ms={hold_ms}",
+                    self.event_id
+                ),
+                Some(&self.log_dir),
+            );
+        }
+    }
 
     fn cancelled_capture_result() -> CaptureResult {
         CaptureResult {
@@ -253,12 +286,59 @@ mod windows_impl {
     fn acquire_deny_read_execution_guard(
         sandbox_home: &Path,
         cancellation: Option<&crate::WindowsSandboxCancellationToken>,
-    ) -> Result<Option<StateMutex>> {
+    ) -> Result<Option<DenyReadExecutionGuard>> {
+        let event_id = format!(
+            "{}-{}",
+            std::process::id(),
+            DENY_READ_EXECUTION_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let log_dir = crate::sandbox_dir(sandbox_home);
+        let wait_started_at = Instant::now();
+        log_note(
+            &format!("kind=deny_read_execution id={event_id} event=wait_start"),
+            Some(&log_dir),
+        );
         loop {
             if cancellation.is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled) {
+                log_note(
+                    &format!(
+                        "kind=deny_read_execution id={event_id} event=cancelled wait_ms={}",
+                        elapsed_millis_since(wait_started_at)
+                    ),
+                    Some(&log_dir),
+                );
                 return Ok(None);
             }
-            if let Some(guard) = try_lock_deny_read_execution(sandbox_home, 50)? {
+            let lock_result = match try_lock_deny_read_execution(sandbox_home, 50) {
+                Ok(lock_result) => lock_result,
+                Err(error) => {
+                    log_note(
+                        &format!(
+                            "kind=deny_read_execution id={event_id} event=error wait_ms={}",
+                            elapsed_millis_since(wait_started_at)
+                        ),
+                        Some(&log_dir),
+                    );
+                    return Err(error);
+                }
+            };
+            if let Some(guard) = lock_result {
+                let acquired_at = Instant::now();
+                log_note(
+                    &format!(
+                        "kind=deny_read_execution id={event_id} event=acquired wait_ms={}",
+                        acquired_at
+                            .saturating_duration_since(wait_started_at)
+                            .as_millis()
+                    ),
+                    Some(&log_dir),
+                );
+                let guard = DenyReadExecutionGuard {
+                    guard: Some(guard),
+                    event_id,
+                    log_dir,
+                    acquired_at,
+                };
                 loop {
                     if cancellation
                         .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
@@ -1125,6 +1205,8 @@ mod windows_impl {
             let temp = tempfile::tempdir().expect("tempdir");
             let sandbox_home = temp.path().join("singularity-home");
             std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+            std::fs::create_dir_all(crate::sandbox_dir(&sandbox_home))
+                .expect("create sandbox log directory");
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let holder_home = sandbox_home.clone();
@@ -1152,6 +1234,74 @@ mod windows_impl {
             assert!(guard.is_none());
             release_tx.send(()).expect("release held execution mutex");
             holder.join().expect("join execution mutex holder");
+
+            let log = std::fs::read_to_string(
+                crate::logging::current_log_file_path_for_sandbox_home(&sandbox_home),
+            )
+            .expect("read execution mutex log");
+            let wait_start = log
+                .lines()
+                .find(|line| {
+                    line.contains("kind=deny_read_execution") && line.contains("event=wait_start")
+                })
+                .expect("wait start event");
+            let id = wait_start
+                .split_whitespace()
+                .find(|field| field.starts_with("id="))
+                .expect("event id");
+            assert!(log.lines().any(|line| {
+                line.contains("kind=deny_read_execution")
+                    && line.contains(id)
+                    && line.contains("event=cancelled")
+                    && line.contains("wait_ms=")
+            }));
+            assert!(!log.contains("event=acquired"));
+            assert!(!log.contains("event=released"));
+        }
+
+        #[test]
+        fn execution_mutex_logs_acquired_and_released_for_one_id() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            std::fs::create_dir_all(crate::sandbox_dir(&sandbox_home))
+                .expect("create sandbox log directory");
+
+            let guard = acquire_deny_read_execution_guard(&sandbox_home, None)
+                .expect("execution mutex wait")
+                .expect("execution mutex acquired");
+            let log_path = crate::logging::current_log_file_path_for_sandbox_home(&sandbox_home);
+            let acquired_log = std::fs::read_to_string(&log_path).expect("read acquired log");
+            let wait_start = acquired_log
+                .lines()
+                .find(|line| {
+                    line.contains("kind=deny_read_execution") && line.contains("event=wait_start")
+                })
+                .expect("wait start event");
+            let id = wait_start
+                .split_whitespace()
+                .find(|field| field.starts_with("id="))
+                .expect("event id")
+                .to_string();
+            let sequence = id
+                .strip_prefix(&format!("id={}-", std::process::id()))
+                .expect("process-scoped event id");
+            assert!(sequence.parse::<u64>().is_ok(), "numeric event sequence");
+            assert!(acquired_log.lines().any(|line| {
+                line.contains("kind=deny_read_execution")
+                    && line.contains(&id)
+                    && line.contains("event=acquired")
+                    && line.contains("wait_ms=")
+            }));
+            assert!(!acquired_log.contains("event=released"));
+
+            drop(guard);
+            let released_log = std::fs::read_to_string(log_path).expect("read released log");
+            assert!(released_log.lines().any(|line| {
+                line.contains("kind=deny_read_execution")
+                    && line.contains(&id)
+                    && line.contains("event=released")
+                    && line.contains("hold_ms=")
+            }));
         }
 
         #[test]
