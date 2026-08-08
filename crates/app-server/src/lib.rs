@@ -1066,6 +1066,7 @@ fn agent_loop_input(
     workspace_root: &std::path::Path,
     history: &[ConversationMessage],
     historical_seed: Option<&TurnCheckpoint>,
+    resolved_default_selector: Option<String>,
 ) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
         .input
@@ -1075,8 +1076,9 @@ fn agent_loop_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let model_name = thread.model.clone().or(resolved_default_selector);
     let mut input =
-        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone());
+        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(model_name);
     if let Some(checkpoint) = historical_seed {
         // 跨轮 seed：完整 checkpoint 历史是唯一历史通道，不再注入公共文本历史
         // 或 provider history segments（避免双重注入）。

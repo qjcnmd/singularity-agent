@@ -1401,6 +1401,7 @@ impl AppServer {
             &workspace_root,
             &history.messages,
             None,
+            self.provider_snapshot.resolved_default_selector(),
         ) {
             Ok(input) => input.with_approval_grant(grant),
             Err(_error) => {
@@ -1632,6 +1633,7 @@ impl AppServer {
             &workspace_root,
             invocation.history,
             historical_seed.as_ref(),
+            self.provider_snapshot.resolved_default_selector(),
         )?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
@@ -1791,6 +1793,7 @@ impl AppServer {
             &workspace_root,
             invocation.history,
             None,
+            self.provider_snapshot.resolved_default_selector(),
         )?
         .with_resume_attempt(checkpoint.resume_attempt());
         let mut projector = if project_observability {

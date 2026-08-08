@@ -2,8 +2,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::{
-    AgentLoopEvent, AgentObservation, AgentRecoveryMetrics, AgentRunStatus, OccurrenceIdentity,
-    OccurrenceLifecycle, PendingToolCall, ProviderAttemptObservation, ProviderAttemptStatus,
+    AgentLoop, AgentLoopEvent, AgentLoopInput, AgentObservation, AgentRecoveryMetrics,
+    AgentRunStatus, OccurrenceIdentity, OccurrenceLifecycle, PendingToolCall,
+    ProviderAttemptObservation, ProviderAttemptStatus, TurnCheckpointPhase,
 };
 use singularity_model::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
@@ -11,7 +12,7 @@ use singularity_model::{
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOperationPhase,
     ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
     ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderStreamEvent,
+    ProviderProtocolNegotiation, ProviderReasoningReplay, ProviderStreamEvent,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
 use singularity_protocol::ItemKind;
@@ -1290,6 +1291,43 @@ impl Provider for StaticProvider {
     }
 }
 
+#[derive(Clone)]
+struct CountingProvider {
+    capability_requests: Arc<AtomicUsize>,
+    completion_requests: Arc<AtomicUsize>,
+}
+
+impl Provider for CountingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        _model_preferences: &singularity_model::ModelPreferences,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.capability_requests.fetch_add(1, Ordering::SeqCst);
+        Err(ProviderError::from_model_error(ModelError::new(
+            ModelErrorKind::UnsupportedCapability,
+            "capability probe must not run",
+        )))
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.completion_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelTurnResponse::completed(
+            "request_current",
+            "response_current",
+            "unexpected completion",
+        ))
+    }
+}
+
 fn failed_model_response(error: ModelError) -> ModelTurnResponse {
     let mut response = ModelTurnResponse::completed("request_1", "response_1", "unused");
     response.status = ModelTurnStatus::Failed;
@@ -1607,6 +1645,153 @@ fn agent_loop_replays_only_completed_store_history_in_order() {
     ] {
         assert!(!request_json.contains(forbidden), "leaked {forbidden}");
     }
+}
+
+#[test]
+fn null_model_thread_preflights_chat_replay_against_resolved_responses_selector() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("README.md"), "fixture").expect("workspace fixture");
+    let models_path = temp.path().join("models.json");
+    std::fs::write(
+        &models_path,
+        r#"{"default_model":"responses-provider/responses-model#medium","providers":{"responses-provider":{"adapter":"openai_compatible","base_url":"http://127.0.0.1:1/v1","api_key_env":"RESPONSES_TEST_KEY","models":{"responses-model":{"api_protocol":"responses","max_output_tokens":4096,"reasoning_variants":{"medium":{"enabled":true,"wire_effort":"medium"}},"default_variant":"medium"}}}}}"#,
+    )
+    .expect("models config");
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            singularity_model::ENV_MODELS_CONFIG => {
+                Some(models_path.to_string_lossy().into_owned())
+            }
+            "RESPONSES_TEST_KEY" => Some("test-key".to_string()),
+            _ => None,
+        },
+        None,
+        None,
+    );
+    assert_eq!(
+        snapshot.resolved_default_selector().as_deref(),
+        Some("responses-provider/responses-model#medium")
+    );
+
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(None, Some(&workspace.to_string_lossy()))
+        .expect("NULL-model thread");
+    let prior = store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("prior turn");
+
+    let mut tool_response = ModelTurnResponse::completed("request_prior_1", "response_tool", "");
+    tool_response.tool_calls.push(ModelToolCall {
+        tool_call_id: "call_history".to_string(),
+        tool_name: "read".to_string(),
+        arguments: json!({"path": "README.md"}),
+        raw_arguments: json!({"path": "README.md"}).to_string(),
+        parse_status: ModelToolParseStatus::Valid,
+        validation_errors: Vec::new(),
+    });
+    tool_response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+        provider_name: "history-provider".to_string(),
+        model_name: "history-model".to_string(),
+        reasoning_effort: "medium".to_string(),
+        tool_call_ids: vec!["call_history".to_string()],
+        reasoning_content: "private reasoning".to_string(),
+    }];
+    let fixture_provider = StaticProvider {
+        responses: vec![
+            tool_response,
+            ModelTurnResponse::completed("request_prior_2", "response_final", "prior final"),
+        ],
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let fixture_loop = AgentLoop::new(
+        fixture_provider,
+        ToolBroker::new(workspace_tool_registry()),
+        workspace_policy(thread.sandbox_mode, thread.approval_policy),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.clone())
+            .expect("workspace tools")
+            .with_shared_sandbox_backend(Arc::new(CompletedSandboxBackend)),
+    );
+    let mut checkpoint = None;
+    let fixture_status = fixture_loop.run_with_events_and_checkpoints(
+        &AgentLoopInput::new(&thread.thread_id, &prior.turn_id, "prior user").with_max_turns(2),
+        &mut |_event| Ok(()),
+        &mut |event| {
+            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
+                checkpoint = Some(event.checkpoint.clone());
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(fixture_status.status, AgentStatus::Completed);
+    let checkpoint = checkpoint.expect("completed checkpoint");
+    store
+        .save_turn_checkpoint(
+            &prior.turn_id,
+            &thread.thread_id,
+            &checkpoint.encode().expect("encode checkpoint"),
+            checkpoint.checkpoint_version(),
+        )
+        .expect("persist checkpoint");
+    store
+        .update_turn_state(
+            &prior.turn_id,
+            TurnStatus::Completed,
+            AgentStatus::Completed.as_str(),
+        )
+        .expect("complete prior turn");
+
+    let current = store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("current turn");
+    let capability_requests = Arc::new(AtomicUsize::new(0));
+    let completion_requests = Arc::new(AtomicUsize::new(0));
+    let status = AppServer::new(store, snapshot)
+        .with_sandbox_backend(CompletedSandboxBackend)
+        .run_agent_loop_with_provider(
+            CountingProvider {
+                capability_requests: Arc::clone(&capability_requests),
+                completion_requests: Arc::clone(&completion_requests),
+            },
+            &thread,
+            &TurnStartParams {
+                thread_id: thread.thread_id.clone(),
+                input: vec![singularity_protocol::InputItem::Text {
+                    text: "continue user".to_string(),
+                }],
+            },
+            &current.turn_id,
+            &[],
+            &CancellationToken::new(),
+        )
+        .expect("agent loop");
+
+    assert_eq!(
+        status.status,
+        AgentStatus::Failed,
+        "status={status:?}, capability_requests={}, completion_requests={}",
+        capability_requests.load(Ordering::SeqCst),
+        completion_requests.load(Ordering::SeqCst)
+    );
+    assert_eq!(status.error.as_deref(), Some(SAFE_AGENT_LOOP_FAILURE));
+    assert_eq!(
+        status.model_turns, 0,
+        "replay mismatch must precede model turns"
+    );
+    assert_eq!(
+        capability_requests.load(Ordering::SeqCst),
+        0,
+        "capability negotiation must not run before replay preflight"
+    );
+    assert_eq!(
+        completion_requests.load(Ordering::SeqCst),
+        0,
+        "completion must not run before replay preflight"
+    );
 }
 
 #[test]
