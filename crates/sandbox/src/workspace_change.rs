@@ -208,11 +208,13 @@ impl WorkspaceSnapshot {
             if let Some(compacted) =
                 compact_new_toolchain_artifact_paths(self, after, &changed_files)
             {
+                let verification_relevant =
+                    workspace_change_is_verification_relevant(self, after, &changed_files);
                 return self
                     .complete_diff_digest(after)
                     .map(|digest| {
                         WorkspaceChangeSummary::new(compacted, digest)
-                            .with_verification_relevant(false)
+                            .with_verification_relevant(verification_relevant)
                     })
                     .map(|summary| (true, Some(summary)));
             }
@@ -822,14 +824,22 @@ fn compact_new_toolchain_artifact_paths(
     after: &WorkspaceSnapshot,
     changed_files: &[String],
 ) -> Option<Vec<String>> {
-    if workspace_change_is_verification_relevant(before, after, changed_files) {
-        return None;
-    }
     let mut candidates = changed_files
         .iter()
-        .filter(|path| is_toolchain_artifact_path(path))
+        .filter(|path| {
+            is_toolchain_artifact_path(path)
+                && !workspace_path_change_is_verification_relevant(
+                    before,
+                    after,
+                    changed_files,
+                    path,
+                )
+        })
         .cloned()
         .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
     candidates.sort_by(|left, right| {
         left.split('/')
             .count()
@@ -837,16 +847,25 @@ fn compact_new_toolchain_artifact_paths(
             .then_with(|| left.cmp(right))
     });
     let mut roots = Vec::<String>::new();
-    for path in candidates {
+    for path in &candidates {
         if roots
             .iter()
-            .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
         {
             continue;
         }
-        roots.push(path);
+        roots.push(path.clone());
     }
-    (!roots.is_empty() && changed_paths_are_bounded(&roots)).then_some(roots)
+    let compactable = candidates.into_iter().collect::<BTreeSet<_>>();
+    let mut compacted = changed_files
+        .iter()
+        .filter(|path| !compactable.contains(*path))
+        .cloned()
+        .chain(roots)
+        .collect::<Vec<_>>();
+    compacted.sort();
+    compacted.dedup();
+    changed_paths_are_bounded(&compacted).then_some(compacted)
 }
 
 fn workspace_change_is_verification_relevant(
@@ -855,14 +874,23 @@ fn workspace_change_is_verification_relevant(
     changed_files: &[String],
 ) -> bool {
     changed_files.iter().any(|path| {
-        if is_incidental_artifact_ancestor_change(before, after, changed_files, path) {
-            return false;
-        }
-        if is_toolchain_artifact_path(path) {
-            return before.entries.contains_key(path);
-        }
-        true
+        workspace_path_change_is_verification_relevant(before, after, changed_files, path)
     })
+}
+
+fn workspace_path_change_is_verification_relevant(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    changed_files: &[String],
+    path: &str,
+) -> bool {
+    if is_incidental_artifact_ancestor_change(before, after, changed_files, path) {
+        return false;
+    }
+    if is_toolchain_artifact_path(path) {
+        return before.entries.contains_key(path);
+    }
+    true
 }
 
 fn is_incidental_artifact_ancestor_change(
@@ -1887,6 +1915,52 @@ mod tests {
         assert!(!summary.verification_relevant);
         assert!(summary.is_trusted_artifact_only());
         assert!(summary.diff_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn large_mixed_artifact_and_source_change_uses_a_bounded_complete_summary() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("calculator.mjs"), b"before").expect("source file");
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/lib.rs"), b"before").expect("source file");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+
+        let target = workspace.path().join("target/debug");
+        std::fs::create_dir_all(&target).expect("target directories");
+        for index in 0..=super::MAX_CHANGED_FILES {
+            std::fs::write(target.join(format!("artifact-{index:03}.bin")), b"artifact")
+                .expect("target artifact");
+        }
+        std::fs::write(workspace.path().join("calculator.mjs"), b"after").expect("source change");
+        std::fs::write(workspace.path().join("src/lib.rs"), b"after").expect("source change");
+
+        let cargo_home = workspace.path().join(".cargo-home");
+        std::fs::create_dir(&cargo_home).expect("cargo home");
+        for name in ["config.toml", "credentials.toml", "registry-cache"] {
+            std::fs::write(cargo_home.join(name), b"cargo state").expect("cargo home file");
+        }
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("mixed summary")
+            .expect("mixed change");
+
+        assert_eq!(
+            summary.changed_files,
+            [
+                ".cargo-home",
+                ".cargo-home/config.toml",
+                ".cargo-home/credentials.toml",
+                ".cargo-home/registry-cache",
+                "calculator.mjs",
+                "src/lib.rs",
+                "target",
+            ]
+        );
+        assert!(summary.verification_relevant);
+        assert!(summary.diff_digest.starts_with("sha256:"));
+        assert_eq!(summary.diff_digest.len(), "sha256:".len() + 64);
     }
 
     #[test]
