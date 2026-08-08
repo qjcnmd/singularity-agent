@@ -131,7 +131,7 @@ Turn 一旦持久化为 `running`，事件通知、AgentLoop、approval checkpoi
 
 ### Continue 与交互式 Turn
 
-`sg continue` 先调用 `thread/resume`，再创建一个新的 `turn/start`。app-server 从 SQLite 读取最多 64 个已完成历史 turn，公开层只投影成按 turn/item sequence 排序的 user/assistant conversation message；若该 turn 的 `TurnCheckpoint` 含 provider-private reasoning/tool transcript，则在 AgentLoop 内按历史 assistant item 绑定为临时 `ProviderHistorySegment`，只在模型请求组装时插入对应的 assistant tool-call 与 tool-result，绝不进入 conversation、trace 或错误投影。当前 turn 不会重复进入 history。
+`sg continue` 先调用 `thread/resume`，再创建一个新的 `turn/start`。app-server 优先读取最近一个 completed turn 的完整 `TurnCheckpoint`，并把它作为 fresh turn 的唯一历史 seed；AgentLoop 在进程内一次性派生 `HistoricalModelContext`，保留 checkpoint 中有序的模型消息、provider-private reasoning、`ToolResultOccurrence` 与 context trace，不按公共 assistant 文本重新拼接工具轨迹，也不建立第二个持久事实源。只有最近 completed turn 没有 checkpoint 时，app-server 才回退为最多 64 个已完成历史 turn 的公开 user/assistant conversation message。当前 turn 不会重复进入 history。
 
 `turn/input` 接受调用方提供的 `inputId`、`delivery` 和非空 `input`，只允许向非终态 Turn 写入新消息。`inputId` 是幂等键：同一 Turn、delivery 和内容的重复请求即使在 Turn 随后终态化后也返回既有结果，换绑 Turn、delivery 或内容则 fail closed；终态 Turn 的新 `inputId` 仍被拒绝。每批内容先作为真实 `ItemKind::UserMessage` 按该 Turn 的 item sequence 持久化；`turn_inputs` 只保存 `inputId`、所引用 item、`steer`/`follow_up` 和 pending/consumed 消费关系，不复制消息正文，也不是第二消息事实源。
 
