@@ -250,13 +250,12 @@ fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
         .flat_map(|temp_root| {
             let mut roots = vec![temp_root.clone()];
             let mut expected_digest = None;
-            if let Some(target) = isolated_cargo_target.as_deref() {
-                if let Some((cache_root, digest)) =
+            if let Some(target) = isolated_cargo_target.as_deref()
+                && let Some((cache_root, digest)) =
                     existing_isolated_cache_root(&temp_root, "cargo", target)
-                {
-                    roots.push(cache_root);
-                    expected_digest = Some(digest);
-                }
+            {
+                roots.push(cache_root);
+                expected_digest = Some(digest);
             }
             for (tool, path) in &tool_cache_paths {
                 let Some(path) = path.as_deref() else {
