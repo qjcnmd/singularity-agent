@@ -2370,24 +2370,54 @@ fn child_environment_from(
             let temp = std::env::temp_dir();
             temp.is_absolute().then_some(temp)
         });
-    if let Some(temp) = temp.as_ref() {
-        let cache = temp.join("singularity-tool-cache");
-        set_environment_value(
-            &mut env_map,
-            "PIP_CACHE_DIR",
-            &cache.join("pip").to_string_lossy(),
-        );
-        set_environment_value(
-            &mut env_map,
-            "NPM_CONFIG_CACHE",
-            &cache.join("npm").to_string_lossy(),
-        );
-        set_environment_value(
-            &mut env_map,
-            "PYTHONPYCACHEPREFIX",
-            &cache.join("python").to_string_lossy(),
-        );
-        let pytest_cache = cache.join("pytest").to_string_lossy().replace('\\', "/");
+    let (cache, cache_digest, isolated_cargo_target) =
+        if policy == &CommandEnvironmentPolicy::Isolated {
+            let temp = temp.ok_or_else(|| {
+                "isolated command environment has no absolute TEMP cache root".to_string()
+            })?;
+            let temp = dunce::canonicalize(&temp)
+                .map_err(|error| format!("isolated TEMP cache root is unavailable: {error}"))?;
+            if !temp.is_absolute() {
+                return Err("isolated TEMP cache root is not absolute".to_string());
+            }
+            let workspace = dunce::canonicalize(workspace)
+                .map_err(|error| format!("isolated workspace root is unavailable: {error}"))?;
+            let digest = super::workspace_tool_cache_digest(&workspace);
+            let cache = temp.join("singularity-tool-cache");
+            let target = cache.join("cargo").join(&digest);
+            if target.starts_with(&workspace) {
+                return Err(
+                    "isolated Cargo target directory would be inside the workspace".to_string(),
+                );
+            }
+            (Some(cache), Some(digest), Some(target))
+        } else {
+            (
+                temp.map(|temp| temp.join("singularity-tool-cache")),
+                None,
+                None,
+            )
+        };
+
+    if let Some(cache) = cache.as_ref() {
+        for (name, tool) in [
+            ("PIP_CACHE_DIR", "pip"),
+            ("NPM_CONFIG_CACHE", "npm"),
+            ("PYTHONPYCACHEPREFIX", "python"),
+        ] {
+            let path = cache.join(tool);
+            let path = match cache_digest.as_deref() {
+                Some(digest) => path.join(digest),
+                None => path,
+            };
+            set_environment_value(&mut env_map, name, &path.to_string_lossy());
+        }
+        let pytest_cache = cache.join("pytest");
+        let pytest_cache = match cache_digest.as_deref() {
+            Some(digest) => pytest_cache.join(digest),
+            None => pytest_cache,
+        };
+        let pytest_cache = pytest_cache.to_string_lossy().replace('\\', "/");
         let pytest_addopts = env_value(&env_map, "PYTEST_ADDOPTS")
             .map(|value| format!("{value} "))
             .unwrap_or_default();
@@ -2397,26 +2427,7 @@ fn child_environment_from(
             &format!("{pytest_addopts}-o \"cache_dir={pytest_cache}\""),
         );
     }
-    if policy == &CommandEnvironmentPolicy::Isolated {
-        let temp = temp.ok_or_else(|| {
-            "isolated command environment has no absolute TEMP cache root".to_string()
-        })?;
-        let temp = dunce::canonicalize(&temp)
-            .map_err(|error| format!("isolated TEMP cache root is unavailable: {error}"))?;
-        if !temp.is_absolute() {
-            return Err("isolated TEMP cache root is not absolute".to_string());
-        }
-        let workspace = dunce::canonicalize(workspace)
-            .map_err(|error| format!("isolated workspace root is unavailable: {error}"))?;
-        let target = temp
-            .join("singularity-tool-cache")
-            .join("cargo")
-            .join(super::workspace_tool_cache_digest(&workspace));
-        if target.starts_with(&workspace) {
-            return Err(
-                "isolated Cargo target directory would be inside the workspace".to_string(),
-            );
-        }
+    if let Some(target) = isolated_cargo_target {
         set_environment_value(&mut env_map, "CARGO_TARGET_DIR", &target.to_string_lossy());
     }
     Ok(env_map)
@@ -3187,14 +3198,14 @@ mod tests {
         let temp_path = temp_root.path().to_string_lossy().into_owned();
         let canonical_temp = dunce::canonicalize(temp_root.path()).expect("canonical temp root");
         let cache_root = temp_root.path().join("singularity-tool-cache");
-        let pip_cache = cache_root.join("pip").to_string_lossy().into_owned();
-        let npm_cache = cache_root.join("npm").to_string_lossy().into_owned();
-        let python_cache = cache_root.join("python").to_string_lossy().into_owned();
-        let pytest_cache = cache_root
+        let shared_pip_cache = cache_root.join("pip").to_string_lossy().into_owned();
+        let shared_npm_cache = cache_root.join("npm").to_string_lossy().into_owned();
+        let shared_python_cache = cache_root.join("python").to_string_lossy().into_owned();
+        let shared_pytest_cache = cache_root
             .join("pytest")
             .to_string_lossy()
             .replace('\\', "/");
-        let expected_pytest = format!("--maxfail=1 -o \"cache_dir={pytest_cache}\"");
+        let expected_shared_pytest = format!("--maxfail=1 -o \"cache_dir={shared_pytest_cache}\"");
         let environment = [
             ("Path".to_string(), "C:\\tools".to_string()),
             ("TEMP".to_string(), temp_path.clone()),
@@ -3215,22 +3226,6 @@ mod tests {
                 .expect("child environment");
             assert_eq!(env_value(&values, "PATH"), Some("C:\\tools"));
             assert_eq!(
-                env_value(&values, "PIP_CACHE_DIR"),
-                Some(pip_cache.as_str())
-            );
-            assert_eq!(
-                env_value(&values, "NPM_CONFIG_CACHE"),
-                Some(npm_cache.as_str())
-            );
-            assert_eq!(
-                env_value(&values, "PYTHONPYCACHEPREFIX"),
-                Some(python_cache.as_str())
-            );
-            assert_eq!(
-                env_value(&values, "PYTEST_ADDOPTS"),
-                Some(expected_pytest.as_str())
-            );
-            assert_eq!(
                 values
                     .keys()
                     .filter(|key| key.eq_ignore_ascii_case("TEMP"))
@@ -3238,6 +3233,35 @@ mod tests {
                 1
             );
             if policy == CommandEnvironmentPolicy::Isolated {
+                let digest = super::super::workspace_tool_cache_digest(
+                    &dunce::canonicalize(workspace.path()).expect("canonical workspace"),
+                );
+                for (name, tool) in [
+                    ("PIP_CACHE_DIR", "pip"),
+                    ("NPM_CONFIG_CACHE", "npm"),
+                    ("PYTHONPYCACHEPREFIX", "python"),
+                ] {
+                    let expected = canonical_temp
+                        .join("singularity-tool-cache")
+                        .join(tool)
+                        .join(&digest);
+                    assert_eq!(
+                        env_value(&values, name),
+                        Some(expected.to_string_lossy().as_ref())
+                    );
+                }
+                let expected_pytest_cache = canonical_temp
+                    .join("singularity-tool-cache")
+                    .join("pytest")
+                    .join(&digest)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let expected_pytest =
+                    format!("--maxfail=1 -o \"cache_dir={expected_pytest_cache}\"");
+                assert_eq!(
+                    env_value(&values, "PYTEST_ADDOPTS"),
+                    Some(expected_pytest.as_str())
+                );
                 let target = PathBuf::from(
                     env_value(&values, "CARGO_TARGET_DIR").expect("isolated Cargo target"),
                 );
@@ -3259,9 +3283,103 @@ mod tests {
                     env_value(&values, "CARGO_TARGET_DIR"),
                     Some("D:\\host-target")
                 );
+                assert_eq!(
+                    env_value(&values, "PIP_CACHE_DIR"),
+                    Some(shared_pip_cache.as_str())
+                );
+                assert_eq!(
+                    env_value(&values, "NPM_CONFIG_CACHE"),
+                    Some(shared_npm_cache.as_str())
+                );
+                assert_eq!(
+                    env_value(&values, "PYTHONPYCACHEPREFIX"),
+                    Some(shared_python_cache.as_str())
+                );
+                assert_eq!(
+                    env_value(&values, "PYTEST_ADDOPTS"),
+                    Some(expected_shared_pytest.as_str())
+                );
                 assert_eq!(env_value(&values, "SINGULARITY_MODEL"), Some("host-model"));
             }
         }
+    }
+
+    #[test]
+    fn isolated_command_environment_partitions_tool_caches_by_workspace() {
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let first_workspace = tempfile::tempdir().expect("first workspace");
+        let second_workspace = tempfile::tempdir().expect("second workspace");
+        let temp_path = temp_root.path().to_string_lossy().into_owned();
+        let environment = [("TEMP".to_string(), temp_path)];
+        let canonical_temp = dunce::canonicalize(temp_root.path()).expect("canonical temp root");
+        let first = child_environment_from(
+            environment.clone(),
+            &CommandEnvironmentPolicy::Isolated,
+            first_workspace.path(),
+        )
+        .expect("first isolated child environment");
+        let second = child_environment_from(
+            environment.clone(),
+            &CommandEnvironmentPolicy::Isolated,
+            second_workspace.path(),
+        )
+        .expect("second isolated child environment");
+        let first_again = child_environment_from(
+            environment,
+            &CommandEnvironmentPolicy::Isolated,
+            first_workspace.path(),
+        )
+        .expect("repeat isolated child environment");
+        let first_digest = super::super::workspace_tool_cache_digest(
+            &dunce::canonicalize(first_workspace.path()).expect("canonical first workspace"),
+        );
+        let second_digest = super::super::workspace_tool_cache_digest(
+            &dunce::canonicalize(second_workspace.path()).expect("canonical second workspace"),
+        );
+
+        for (name, tool, digest) in [
+            ("PIP_CACHE_DIR", "pip", first_digest.as_str()),
+            ("NPM_CONFIG_CACHE", "npm", first_digest.as_str()),
+            ("PYTHONPYCACHEPREFIX", "python", first_digest.as_str()),
+        ] {
+            let expected = canonical_temp
+                .join("singularity-tool-cache")
+                .join(tool)
+                .join(digest);
+            assert_eq!(
+                env_value(&first, name),
+                Some(expected.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                env_value(&first_again, name),
+                Some(expected.to_string_lossy().as_ref())
+            );
+        }
+        let first_pytest = canonical_temp
+            .join("singularity-tool-cache")
+            .join("pytest")
+            .join(&first_digest)
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            env_value(&first, "PYTEST_ADDOPTS")
+                .is_some_and(|value| value.contains(&format!("cache_dir={first_pytest}")))
+        );
+        assert_ne!(
+            env_value(&first, "PIP_CACHE_DIR"),
+            env_value(&second, "PIP_CACHE_DIR")
+        );
+        assert_eq!(
+            env_value(&second, "PIP_CACHE_DIR"),
+            Some(
+                canonical_temp
+                    .join("singularity-tool-cache")
+                    .join("pip")
+                    .join(second_digest)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
     }
 
     #[test]

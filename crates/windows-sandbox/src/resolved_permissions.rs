@@ -229,39 +229,101 @@ impl ResolvedWindowsSandboxPermissions {
 }
 
 fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
-    let isolated_cargo_target = env_map.get("CARGO_TARGET_DIR").map(PathBuf::from);
+    let isolated_cargo_target = env_map_value(env_map, "CARGO_TARGET_DIR").map(PathBuf::from);
+    let tool_cache_paths = [
+        (
+            "pip",
+            env_map_value(env_map, "PIP_CACHE_DIR").map(PathBuf::from),
+        ),
+        (
+            "npm",
+            env_map_value(env_map, "NPM_CONFIG_CACHE").map(PathBuf::from),
+        ),
+        (
+            "python",
+            env_map_value(env_map, "PYTHONPYCACHEPREFIX").map(PathBuf::from),
+        ),
+        (
+            "pytest",
+            env_map_value(env_map, "PYTEST_ADDOPTS").and_then(pytest_cache_dir),
+        ),
+    ];
     ["TEMP", "TMP"]
         .into_iter()
         .filter_map(|key| {
-            env_map
-                .get(key)
-                .map(|value| PathBuf::from(value.as_str()))
+            env_map_value(env_map, key)
+                .map(PathBuf::from)
                 .or_else(|| std::env::var_os(key).map(PathBuf::from))
         })
         .filter(|path| path.is_absolute())
         .flat_map(|temp_root| {
             let mut roots = vec![temp_root.clone()];
+            let mut expected_digest = None;
             if let Some(target) = isolated_cargo_target.as_deref() {
-                if let Some(cache_root) = existing_isolated_cargo_cache_root(&temp_root, target) {
+                if let Some((cache_root, digest)) =
+                    existing_isolated_cache_root(&temp_root, "cargo", target)
+                {
                     roots.push(cache_root);
+                    expected_digest = Some(digest);
                 }
+            }
+            for (tool, path) in &tool_cache_paths {
+                let Some(path) = path.as_deref() else {
+                    continue;
+                };
+                let Some((cache_root, digest)) =
+                    existing_isolated_cache_root(&temp_root, tool, path)
+                else {
+                    continue;
+                };
+                if expected_digest
+                    .as_deref()
+                    .is_some_and(|expected| expected != digest)
+                {
+                    continue;
+                }
+                expected_digest.get_or_insert(digest);
+                roots.push(cache_root);
             }
             roots
         })
         .collect()
 }
 
-/// Returns the nearest existing cache ancestor for a structurally valid isolated Cargo target.
-fn existing_isolated_cargo_cache_root(temp_root: &Path, target: &Path) -> Option<PathBuf> {
-    if !target.is_absolute() {
+fn env_map_value<'a>(env_map: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    env_map
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn pytest_cache_dir(addopts: &str) -> Option<PathBuf> {
+    let value = addopts.rsplit_once("cache_dir=")?.1;
+    let value = value.strip_prefix('"').unwrap_or(value);
+    let end = value
+        .find('"')
+        .or_else(|| value.find(char::is_whitespace))
+        .unwrap_or(value.len());
+    let value = value.get(..end).filter(|value| !value.is_empty())?;
+    Some(PathBuf::from(value))
+}
+
+/// Returns the nearest existing cache ancestor and digest for a structurally valid isolated tool
+/// cache path.
+fn existing_isolated_cache_root(
+    temp_root: &Path,
+    tool: &str,
+    path: &Path,
+) -> Option<(PathBuf, String)> {
+    if !path.is_absolute() {
         return None;
     }
 
     let temp_root = canonicalize_path_allow_missing(temp_root);
-    let target = canonicalize_path_allow_missing(target);
+    let path = canonicalize_path_allow_missing(path);
     let cache_root = temp_root.join("singularity-tool-cache");
-    let cargo_root = cache_root.join("cargo");
-    let mut relative = target.strip_prefix(&cargo_root).ok()?.components();
+    let tool_root = cache_root.join(tool);
+    let mut relative = path.strip_prefix(&tool_root).ok()?.components();
     let digest = relative.next()?.as_os_str().to_str()?;
     if relative.next().is_some()
         || digest.len() != 64
@@ -270,10 +332,11 @@ fn existing_isolated_cargo_cache_root(temp_root: &Path, target: &Path) -> Option
         return None;
     }
 
-    [cargo_root, cache_root]
+    [tool_root, cache_root]
         .into_iter()
         .find(|root| root.is_dir())
         .map(|root| canonicalize_path_allow_missing(&root))
+        .map(|root| (root, digest.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -357,6 +420,167 @@ mod tests {
         assert!(
             roots.contains(&dunce::canonicalize(&cargo_root).expect("canonical cargo root")),
             "existing isolated cargo cache root must be writable: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_includes_existing_isolated_tool_cache_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp root");
+        let cache_root = temp_dir.join("singularity-tool-cache");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pip_root = cache_root.join("pip");
+        let npm_root = cache_root.join("npm");
+        let python_root = cache_root.join("python");
+        let pytest_root = cache_root.join("pytest");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&pip_root).expect("create pip cache root");
+        std::fs::create_dir_all(&npm_root).expect("create npm cache root");
+        std::fs::create_dir_all(&python_root).expect("create python cache root");
+        std::fs::create_dir_all(&pytest_root).expect("create pytest cache root");
+
+        let env_map = HashMap::from([
+            ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+            (
+                "PIP_CACHE_DIR".to_string(),
+                pip_root.join(digest).to_string_lossy().to_string(),
+            ),
+            (
+                "PYTHONPYCACHEPREFIX".to_string(),
+                python_root.join(digest).to_string_lossy().to_string(),
+            ),
+            (
+                "NPM_CONFIG_CACHE".to_string(),
+                npm_root.join(digest).to_string_lossy().to_string(),
+            ),
+            (
+                "PYTEST_ADDOPTS".to_string(),
+                format!("-o \"cache_dir={}\"", pytest_root.join(digest).display()),
+            ),
+        ]);
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let roots = permissions
+            .writable_roots_for_cwd(&cwd, &env_map)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>();
+
+        assert!(
+            roots.contains(&dunce::canonicalize(&pip_root).expect("canonical pip root")),
+            "existing isolated pip cache root must be writable: {roots:?}"
+        );
+        assert!(
+            roots.contains(&dunce::canonicalize(&python_root).expect("canonical python root")),
+            "existing isolated python cache root must be writable: {roots:?}"
+        );
+        assert!(
+            roots.contains(&dunce::canonicalize(&npm_root).expect("canonical npm root")),
+            "existing isolated npm cache root must be writable: {roots:?}"
+        );
+        assert!(
+            roots.contains(&dunce::canonicalize(&pytest_root).expect("canonical pytest root")),
+            "existing isolated pytest cache root must be writable: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_rejects_external_and_malformed_tool_cache_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let cache_root = temp_dir.join("singularity-tool-cache");
+        let pip_root = cache_root.join("pip");
+        let cargo_root = cache_root.join("cargo");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let other_digest = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&pip_root).expect("create pip cache root");
+        std::fs::create_dir_all(&cargo_root).expect("create cargo cache root");
+
+        let cases = [
+            (
+                "external",
+                "PIP_CACHE_DIR",
+                tmp.path().join("outside").join("pip").join(digest),
+            ),
+            (
+                "wrong depth",
+                "PIP_CACHE_DIR",
+                pip_root.join(digest).join("nested"),
+            ),
+            (
+                "wrong digest",
+                "PIP_CACHE_DIR",
+                pip_root.join("not-a-digest"),
+            ),
+        ];
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let expected_pip_root = dunce::canonicalize(&pip_root).expect("canonical pip root");
+
+        for (case, name, path) in cases {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create candidate parent");
+            }
+            let value = path.to_string_lossy().into_owned();
+            let env_map = HashMap::from([
+                ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+                (name.to_string(), value),
+            ]);
+            let roots = permissions
+                .writable_roots_for_cwd(&cwd, &env_map)
+                .into_iter()
+                .map(|root| root.root)
+                .collect::<Vec<_>>();
+
+            assert!(
+                !roots.contains(&expected_pip_root),
+                "{case} tool cache path must not grant pip root: {roots:?}"
+            );
+        }
+
+        let relative = HashMap::from([
+            ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+            (
+                "PIP_CACHE_DIR".to_string(),
+                Path::new("pip").join(digest).to_string_lossy().into_owned(),
+            ),
+        ]);
+        let roots = permissions
+            .writable_roots_for_cwd(&cwd, &relative)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>();
+        assert!(
+            !roots.contains(&expected_pip_root),
+            "relative tool cache path must not grant pip root: {roots:?}"
+        );
+
+        let mismatched_digest = HashMap::from([
+            ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                cargo_root.join(digest).to_string_lossy().to_string(),
+            ),
+            (
+                "PIP_CACHE_DIR".to_string(),
+                pip_root.join(other_digest).to_string_lossy().to_string(),
+            ),
+        ]);
+        let roots = permissions
+            .writable_roots_for_cwd(&cwd, &mismatched_digest)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>();
+        assert!(
+            !roots.contains(&expected_pip_root),
+            "tool cache digest must match Cargo partition: {roots:?}"
         );
     }
 
