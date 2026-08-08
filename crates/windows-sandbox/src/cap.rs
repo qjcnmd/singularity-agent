@@ -161,10 +161,12 @@ pub fn workspace_write_root_specificity(root: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::cap_sid_file;
     use super::load_or_create_cap_sids;
     use super::workspace_cap_sid_for_cwd;
     use super::workspace_write_cap_sid_for_root;
     use super::writable_root_cap_sid_for_path;
+    use crate::path_safety::open_existing_acl_target;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -246,6 +248,28 @@ mod tests {
         });
 
         let caps = load_or_create_cap_sids(&sandbox_home).expect("load caps");
+        assert_eq!(caps.workspace_by_cwd.len(), 2);
+    }
+
+    #[test]
+    fn cap_sid_updates_replace_state_while_identity_handle_is_open() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let first_workspace = temp.path().join("first-workspace");
+        let second_workspace = temp.path().join("second-workspace");
+        std::fs::create_dir_all(&sandbox_home).expect("create singularity home");
+        std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+        std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+
+        workspace_cap_sid_for_cwd(&sandbox_home, &first_workspace).expect("first SID");
+        let held = open_existing_acl_target(&cap_sid_file(&sandbox_home), 0)
+            .expect("hold capability state identity handle");
+
+        workspace_cap_sid_for_cwd(&sandbox_home, &second_workspace)
+            .expect("second SID update while identity handle is open");
+
+        drop(held);
+        let caps = load_or_create_cap_sids(&sandbox_home).expect("load updated caps");
         assert_eq!(caps.workspace_by_cwd.len(), 2);
     }
 

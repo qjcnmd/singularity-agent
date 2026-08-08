@@ -50,6 +50,7 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -596,18 +597,48 @@ pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
         drop(file);
         let source = to_wide(&temporary);
         let destination = to_wide(path);
-        let moved = unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
+        let target_exists = match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect atomic deny-read state {}", path.display()));
+            }
         };
-        if moved == 0 {
-            anyhow::bail!(
-                "MoveFileExW failed for atomic deny-read state: {}",
-                unsafe { GetLastError() }
-            );
+        if target_exists {
+            // ReplaceFileW preserves documented target metadata/DACL and tolerates an open
+            // identity-probe handle. Its WRITE_THROUGH flag is unsupported, so the replacement
+            // file is flushed before this atomic swap.
+            let replaced = unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                )
+            };
+            if replaced == 0 {
+                anyhow::bail!(
+                    "ReplaceFileW failed for atomic deny-read state: {}",
+                    unsafe { GetLastError() }
+                );
+            }
+        } else {
+            let moved = unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved == 0 {
+                anyhow::bail!(
+                    "MoveFileExW failed for atomic deny-read state: {}",
+                    unsafe { GetLastError() }
+                );
+            }
         }
         Ok(())
     })();
@@ -1067,6 +1098,7 @@ mod tests {
     use super::DENY_READ_ACL_STATE_FILE;
     use super::ManagedDenyReadAcl;
     use super::PersistentDenyReadAclState;
+    use super::atomic_store;
     use super::load_state;
     use super::lock_state;
     use super::merge_tracked_paths;
@@ -1090,6 +1122,7 @@ mod tests {
     use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
+    use crate::path_safety::open_existing_acl_target;
     use crate::path_safety::override_case_sensitivity_for_test;
     use crate::token::LocalSid;
     use std::os::windows::process::CommandExt;
@@ -1239,6 +1272,50 @@ mod tests {
         assert!(
             !second_state.exists(),
             "retargeted alias must not redirect state I/O"
+        );
+    }
+
+    #[test]
+    fn atomic_store_allows_state_identity_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-state.json");
+
+        atomic_store(&missing, b"first").expect("create missing state atomically");
+        assert_eq!(
+            std::fs::read(&missing).expect("read created state"),
+            b"first"
+        );
+
+        let occupied = temp.path().join("occupied-state.json");
+        std::fs::create_dir(&occupied).expect("create occupied target directory");
+        let error = atomic_store(&occupied, b"must-fail").expect_err("directory target must fail");
+        assert!(error.to_string().contains("atomic deny-read state"));
+        assert!(
+            occupied.is_dir(),
+            "failed replacement must not remove target"
+        );
+        let temporary_prefix = format!(".{}.tmp-", occupied.file_name().unwrap().to_string_lossy());
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("read atomic store parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&temporary_prefix)
+            })
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "failed replacement must clean its temporary file"
+        );
+
+        let held = open_existing_acl_target(&missing, 0).expect("hold existing state handle");
+        atomic_store(&missing, b"second").expect("replace while identity handle is open");
+        drop(held);
+        assert_eq!(
+            std::fs::read(&missing).expect("read replaced state"),
+            b"second"
         );
     }
 
