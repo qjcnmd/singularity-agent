@@ -519,6 +519,26 @@ fn strict_elevated_result(result: &CommandResult) -> bool {
         && !result.sandbox.local_process_fallback
 }
 
+/// Resolves an executable from an explicit environment source before a command starts.
+fn probe_executable_from(
+    environment_values: impl IntoIterator<Item = (String, String)>,
+    workspace: &Path,
+    executable: &str,
+    environment: &CommandEnvironmentPolicy,
+) -> ExecutableAvailability {
+    let Ok(cwd) = canonical_directory(workspace) else {
+        return ExecutableAvailability::Unknown;
+    };
+    let Ok(env) = child_environment_from(environment_values, environment, &cwd) else {
+        return ExecutableAvailability::Unknown;
+    };
+    match resolve_executable(&[executable.to_string()], &cwd, &env) {
+        Ok(_) => ExecutableAvailability::Available,
+        Err(ExecutableResolutionError::Unavailable(_)) => ExecutableAvailability::Unavailable,
+        Err(_) => ExecutableAvailability::Unknown,
+    }
+}
+
 impl SandboxBackend for WindowsSandboxBackend {
     fn name(&self) -> &'static str {
         BACKEND_NAME
@@ -577,17 +597,7 @@ impl SandboxBackend for WindowsSandboxBackend {
         executable: &str,
         environment: &CommandEnvironmentPolicy,
     ) -> ExecutableAvailability {
-        let Ok(cwd) = canonical_directory(workspace) else {
-            return ExecutableAvailability::Unknown;
-        };
-        let Ok(env) = child_environment(environment, &cwd) else {
-            return ExecutableAvailability::Unknown;
-        };
-        match resolve_executable(&[executable.to_string()], &cwd, &env) {
-            Ok(_) => ExecutableAvailability::Available,
-            Err(ExecutableResolutionError::Unavailable(_)) => ExecutableAvailability::Unavailable,
-            Err(_) => ExecutableAvailability::Unknown,
-        }
+        probe_executable_from(std::env::vars(), workspace, executable, environment)
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -2370,41 +2380,110 @@ fn child_environment_from(
             let temp = std::env::temp_dir();
             temp.is_absolute().then_some(temp)
         });
-    let (cache, cache_digest, isolated_cargo_target) =
+    let (cache, cache_digest, isolated_cargo_target, isolated_temp) =
         if policy == &CommandEnvironmentPolicy::Isolated {
-            let temp = temp.ok_or_else(|| {
+            let host_temp = temp.ok_or_else(|| {
                 "isolated command environment has no absolute TEMP cache root".to_string()
             })?;
-            let temp = dunce::canonicalize(&temp)
+            let host_temp = dunce::canonicalize(&host_temp)
                 .map_err(|error| format!("isolated TEMP cache root is unavailable: {error}"))?;
-            if !temp.is_absolute() {
+            if !host_temp.is_absolute() {
                 return Err("isolated TEMP cache root is not absolute".to_string());
             }
             let workspace = dunce::canonicalize(workspace)
                 .map_err(|error| format!("isolated workspace root is unavailable: {error}"))?;
             let digest = super::workspace_tool_cache_digest(&workspace);
-            let cache = temp.join("singularity-tool-cache");
+            let isolated_parent = host_temp.join("singularity-isolated");
+            let isolated_temp = isolated_parent.join(&digest);
+            let cache = isolated_temp.join("singularity-tool-cache");
             let target = cache.join("cargo").join(&digest);
             if target.starts_with(&workspace) {
                 return Err(
                     "isolated Cargo target directory would be inside the workspace".to_string(),
                 );
             }
-            (Some(cache), Some(digest), Some(target))
+            if isolated_temp.starts_with(&workspace) {
+                return Err("isolated TEMP directory would be inside the workspace".to_string());
+            }
+            (
+                Some(cache),
+                Some(digest),
+                Some(target),
+                Some((host_temp, workspace, isolated_parent, isolated_temp)),
+            )
         } else {
             (
                 temp.map(|temp| temp.join("singularity-tool-cache")),
                 None,
                 None,
+                None,
             )
         };
 
-    if let (Some(cache), Some(digest), Some(cargo_target)) = (
+    if let (Some(_), Some(_), Some(_), Some((host_temp, workspace, isolated_parent, temp_root))) = (
         cache.as_deref(),
         cache_digest.as_deref(),
         isolated_cargo_target.as_deref(),
+        isolated_temp.as_ref(),
     ) {
-        create_isolated_cache_directories(cache, digest, cargo_target)?;
+        match std::fs::create_dir(isolated_parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to create isolated TEMP parent directory {}: {error}",
+                    isolated_parent.display()
+                ));
+            }
+        }
+        let canonical_isolated_parent = dunce::canonicalize(isolated_parent).map_err(|error| {
+            format!(
+                "isolated TEMP parent is unavailable after creation {}: {error}",
+                isolated_parent.display()
+            )
+        })?;
+        if !canonical_isolated_parent.is_absolute()
+            || !canonical_isolated_parent.is_dir()
+            || !canonical_isolated_parent.starts_with(host_temp)
+            || canonical_isolated_parent == *host_temp
+            || canonical_isolated_parent.starts_with(workspace)
+            || canonical_isolated_parent != *isolated_parent
+        {
+            return Err(
+                "isolated TEMP parent is not a distinct directory under the canonical host TEMP"
+                    .to_string(),
+            );
+        }
+        match std::fs::create_dir(temp_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to create isolated TEMP directory {}: {error}",
+                    temp_root.display()
+                ));
+            }
+        }
+        let canonical_temp_root = dunce::canonicalize(temp_root).map_err(|error| {
+            format!(
+                "isolated TEMP root is unavailable after creation {}: {error}",
+                temp_root.display()
+            )
+        })?;
+        if !canonical_temp_root.is_absolute()
+            || !canonical_temp_root.is_dir()
+            || !canonical_temp_root.starts_with(host_temp)
+            || canonical_temp_root == *host_temp
+            || canonical_temp_root.starts_with(workspace)
+            || canonical_temp_root != *temp_root
+        {
+            return Err(
+                "isolated TEMP root is not a distinct directory under the canonical host TEMP"
+                    .to_string(),
+            );
+        }
+        set_environment_value(&mut env_map, "TEMP", &canonical_temp_root.to_string_lossy());
+        set_environment_value(&mut env_map, "TMP", &canonical_temp_root.to_string_lossy());
     }
 
     if let Some(cache) = cache.as_ref() {
@@ -2439,29 +2518,6 @@ fn child_environment_from(
         set_environment_value(&mut env_map, "CARGO_TARGET_DIR", &target.to_string_lossy());
     }
     Ok(env_map)
-}
-
-/// Materializes every isolated cache leaf before Windows computes its writable ACL roots.
-fn create_isolated_cache_directories(
-    cache: &Path,
-    digest: &str,
-    cargo_target: &Path,
-) -> Result<(), String> {
-    for (label, path) in [
-        ("pip cache", cache.join("pip").join(digest)),
-        ("npm cache", cache.join("npm").join(digest)),
-        ("python cache", cache.join("python").join(digest)),
-        ("pytest cache", cache.join("pytest").join(digest)),
-        ("Cargo target", cargo_target.to_path_buf()),
-    ] {
-        std::fs::create_dir_all(&path).map_err(|error| {
-            format!(
-                "failed to create isolated {label} directory {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn set_environment_value(env_map: &mut HashMap<String, String>, name: &str, value: &str) {
@@ -2523,6 +2579,7 @@ mod tests {
     use singularity_windows_sandbox::WorkspacePathChange;
     use std::fs;
     use std::io::Write;
+    use std::os::windows::process::CommandExt;
 
     fn create_test_file(path: &Path, contents: &str) {
         let mut file = fs::File::create(path).expect("create test file");
@@ -3267,22 +3324,30 @@ mod tests {
                 let digest = super::super::workspace_tool_cache_digest(
                     &dunce::canonicalize(workspace.path()).expect("canonical workspace"),
                 );
+                let expected_temp = canonical_temp.join("singularity-isolated").join(&digest);
+                let expected_cache = expected_temp.join("singularity-tool-cache");
+                assert_eq!(
+                    env_value(&values, "TEMP"),
+                    Some(expected_temp.to_string_lossy().as_ref())
+                );
+                assert_eq!(
+                    env_value(&values, "TMP"),
+                    Some(expected_temp.to_string_lossy().as_ref())
+                );
+                assert!(expected_temp.is_dir());
+                assert!(!expected_temp.starts_with(workspace.path()));
                 for (name, tool) in [
                     ("PIP_CACHE_DIR", "pip"),
                     ("NPM_CONFIG_CACHE", "npm"),
                     ("PYTHONPYCACHEPREFIX", "python"),
                 ] {
-                    let expected = canonical_temp
-                        .join("singularity-tool-cache")
-                        .join(tool)
-                        .join(&digest);
+                    let expected = expected_cache.join(tool).join(&digest);
                     assert_eq!(
                         env_value(&values, name),
                         Some(expected.to_string_lossy().as_ref())
                     );
                 }
-                let expected_pytest_cache = canonical_temp
-                    .join("singularity-tool-cache")
+                let expected_pytest_cache = expected_cache
                     .join("pytest")
                     .join(&digest)
                     .to_string_lossy()
@@ -3301,23 +3366,13 @@ mod tests {
                 assert!(!target.starts_with(workspace.path()));
                 assert_eq!(
                     target,
-                    canonical_temp
-                        .join("singularity-tool-cache")
+                    expected_cache
                         .join("cargo")
                         .join(super::super::workspace_tool_cache_digest(
                             &dunce::canonicalize(workspace.path()).expect("canonical workspace")
                         ))
                 );
-                for tool in ["pip", "npm", "python", "pytest", "cargo"] {
-                    let root = canonical_temp
-                        .join("singularity-tool-cache")
-                        .join(tool)
-                        .join(&digest);
-                    assert!(
-                        root.is_dir(),
-                        "isolated {tool} cache directory missing: {root:?}"
-                    );
-                }
+                assert!(!expected_cache.exists());
                 assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
             } else {
                 assert_eq!(
@@ -3377,13 +3432,37 @@ mod tests {
         let second_digest = super::super::workspace_tool_cache_digest(
             &dunce::canonicalize(second_workspace.path()).expect("canonical second workspace"),
         );
+        let first_temp = canonical_temp
+            .join("singularity-isolated")
+            .join(&first_digest);
+        let second_temp = canonical_temp
+            .join("singularity-isolated")
+            .join(&second_digest);
+        assert_eq!(
+            env_value(&first, "TEMP"),
+            Some(first_temp.to_string_lossy().as_ref())
+        );
+        assert_eq!(env_value(&first, "TMP"), env_value(&first, "TEMP"));
+        assert_eq!(
+            env_value(&first_again, "TEMP"),
+            Some(first_temp.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_value(&second, "TEMP"),
+            Some(second_temp.to_string_lossy().as_ref())
+        );
+        assert_ne!(first_temp, second_temp);
+        assert!(first_temp.is_dir());
+        assert!(second_temp.is_dir());
+        assert!(!first_temp.starts_with(first_workspace.path()));
+        assert!(!second_temp.starts_with(second_workspace.path()));
 
         for (name, tool, digest) in [
             ("PIP_CACHE_DIR", "pip", first_digest.as_str()),
             ("NPM_CONFIG_CACHE", "npm", first_digest.as_str()),
             ("PYTHONPYCACHEPREFIX", "python", first_digest.as_str()),
         ] {
-            let expected = canonical_temp
+            let expected = first_temp
                 .join("singularity-tool-cache")
                 .join(tool)
                 .join(digest);
@@ -3396,7 +3475,7 @@ mod tests {
                 Some(expected.to_string_lossy().as_ref())
             );
         }
-        let first_pytest = canonical_temp
+        let first_pytest = first_temp
             .join("singularity-tool-cache")
             .join("pytest")
             .join(&first_digest)
@@ -3413,7 +3492,7 @@ mod tests {
         assert_eq!(
             env_value(&second, "PIP_CACHE_DIR"),
             Some(
-                canonical_temp
+                second_temp
                     .join("singularity-tool-cache")
                     .join("pip")
                     .join(second_digest)
@@ -3421,6 +3500,53 @@ mod tests {
                     .as_ref()
             )
         );
+    }
+
+    #[test]
+    fn isolated_environment_rejects_preexisting_isolated_parent_junction() {
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external target");
+        let canonical_temp = dunce::canonicalize(temp_root.path()).expect("canonical temp root");
+        let digest = super::super::workspace_tool_cache_digest(
+            &dunce::canonicalize(workspace.path()).expect("canonical workspace"),
+        );
+        let alias = canonical_temp.join("singularity-isolated");
+        let external_isolated = external.path().join("isolated-target");
+        fs::create_dir(&external_isolated).expect("create external isolated target");
+        let alias_quoted = format!("\"{}\"", alias.display());
+        let target_quoted = format!("\"{}\"", external_isolated.display());
+        let junction_created = std::process::Command::new("cmd.exe")
+            .raw_arg("/c")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&alias_quoted)
+            .raw_arg(&target_quoted)
+            .output()
+            .is_ok_and(|output| output.status.success() && alias.exists());
+        if !junction_created {
+            return;
+        }
+
+        let error = child_environment_from(
+            [(
+                "TEMP".to_string(),
+                temp_root.path().to_string_lossy().into_owned(),
+            )],
+            &CommandEnvironmentPolicy::Isolated,
+            workspace.path(),
+        )
+        .expect_err("isolated parent junction must fail closed");
+        assert!(
+            error.contains("isolated TEMP parent"),
+            "unexpected isolated parent error: {error}"
+        );
+        assert!(
+            !external_isolated.join(&digest).exists(),
+            "isolated preparation must not materialize a digest through an outer junction"
+        );
+
+        fs::remove_dir(&alias).expect("remove junction fixture");
     }
 
     #[test]
@@ -3460,7 +3586,7 @@ mod tests {
         )
         .expect_err("isolated TEMP file must fail cache preparation");
         assert!(
-            error.starts_with("failed to create isolated pip cache directory "),
+            error.starts_with("failed to create isolated TEMP"),
             "{error}"
         );
     }
@@ -3468,12 +3594,23 @@ mod tests {
     #[test]
     fn executable_probe_uses_windows_command_resolution() {
         let workspace = tempfile::tempdir().expect("workspace");
+        let temp_root = tempfile::tempdir().expect("test-owned TEMP root");
         let executable = std::env::current_exe().expect("current executable");
         let missing = workspace.path().join("missing-executable.exe");
-        let backend = WindowsSandboxBackend::new();
+        let environment = [
+            (
+                "TEMP".to_string(),
+                temp_root.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "TMP".to_string(),
+                temp_root.path().to_string_lossy().into_owned(),
+            ),
+        ];
 
         assert_eq!(
-            backend.probe_executable(
+            probe_executable_from(
+                environment.clone(),
                 workspace.path(),
                 &executable.to_string_lossy(),
                 &CommandEnvironmentPolicy::Isolated,
@@ -3481,7 +3618,8 @@ mod tests {
             ExecutableAvailability::Available
         );
         assert_eq!(
-            backend.probe_executable(
+            probe_executable_from(
+                environment,
                 workspace.path(),
                 &missing.to_string_lossy(),
                 &CommandEnvironmentPolicy::Isolated,
