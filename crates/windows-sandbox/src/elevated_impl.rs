@@ -91,8 +91,8 @@ mod windows_impl {
     use crate::deny_read_acl::open_existing_git_ancestor;
     use crate::deny_read_state::StateMutex;
     use crate::deny_read_state::prepare_deny_read_execution_wait;
-    use crate::deny_read_state::reconcile_runner_leases;
-    use crate::deny_read_state::register_runner_lease;
+    use crate::deny_read_state::reconcile_runner_leases_at;
+    use crate::deny_read_state::register_runner_lease_at;
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
@@ -153,9 +153,16 @@ mod windows_impl {
     /// Holds the deny-read execution mutex and records its release without sensitive context.
     struct DenyReadExecutionGuard {
         guard: Option<StateMutex>,
+        state_path: PathBuf,
         event_id: String,
         log_dir: PathBuf,
         acquired_at: Instant,
+    }
+
+    impl DenyReadExecutionGuard {
+        fn state_path(&self) -> &Path {
+            &self.state_path
+        }
     }
 
     impl Drop for DenyReadExecutionGuard {
@@ -299,6 +306,7 @@ mod windows_impl {
             Some(&log_dir),
         );
         let mut execution_wait = prepare_deny_read_execution_wait(sandbox_home)?;
+        let state_path = execution_wait.state_path().to_path_buf();
         loop {
             if cancellation.is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled) {
                 log_note(
@@ -336,6 +344,7 @@ mod windows_impl {
                 );
                 let guard = DenyReadExecutionGuard {
                     guard: Some(guard),
+                    state_path: state_path.clone(),
                     event_id,
                     log_dir,
                     acquired_at,
@@ -346,7 +355,7 @@ mod windows_impl {
                     {
                         return Ok(None);
                     }
-                    if reconcile_runner_leases(sandbox_home, 50)? {
+                    if reconcile_runner_leases_at(&state_path, 50)? {
                         return Ok(Some(guard));
                     }
                     // A live runner lease may outlast this bounded reconciliation attempt. Yield
@@ -529,11 +538,12 @@ mod windows_impl {
         // The elevated identities share one authoritative read principal. Serialize setup and the
         // complete Job Object lifetime so a concurrent workspace cannot reconcile that principal
         // to a different deny-read set while this child is still alive.
-        let Some(_deny_read_execution_guard) =
+        let Some(deny_read_execution_guard) =
             acquire_deny_read_execution_guard(sandbox_home, cancellation.as_ref())?
         else {
             return Ok((cancelled_capture_result(), None));
         };
+        let deny_read_state_path = deny_read_execution_guard.state_path().to_path_buf();
         let mut observer_creds = None;
         let (resolved_by_sandbox, mut observers) = match observers {
             Some((mut resolver, before, after)) => {
@@ -885,7 +895,7 @@ mod windows_impl {
                     // transport; the retry path may replace the initially selected identity.
                     used_sandbox_creds = Some(sandbox_creds.clone());
                     let registration =
-                        register_runner_lease(sandbox_home, &sandbox_creds.username)?;
+                        register_runner_lease_at(&deny_read_state_path, &sandbox_creds.username)?;
                     let mut request = spawn_request.clone();
                     request.deny_read_runner_lease_name = registration.name().to_string();
                     let transport = spawn_runner_transport(
@@ -999,7 +1009,7 @@ mod windows_impl {
         // registration, including startup and IPC failures, so this live parent never opens the
         // crash-only reconciliation gap.
         let lease_cleanup = loop {
-            match reconcile_runner_leases(sandbox_home, 50) {
+            match reconcile_runner_leases_at(&deny_read_state_path, 50) {
                 Ok(true) => break Ok(()),
                 Ok(false) => {
                     // Keep cleanup fail-closed while yielding between bounded waits for a live

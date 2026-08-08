@@ -163,6 +163,11 @@ pub(crate) struct DenyReadExecutionWait {
 }
 
 impl DenyReadExecutionWait {
+    /// Returns the canonical state path captured before waiting began.
+    pub(crate) fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
     fn verify_state_identity(&self) -> Result<()> {
         let current = canonicalize_case_insensitive_state_path(&self.state_path)?;
         if lexical_path_key(&current) != lexical_path_key(&self.state_path) {
@@ -298,11 +303,16 @@ pub(crate) fn prepare_deny_read_execution_wait(
 
 pub(crate) fn lock_state(path: &Path) -> Result<StateLock> {
     let path = canonicalize_case_insensitive_state_path(path)?;
-    let mutex = wait_raw_named_mutex(&mutex_name(STATE_MUTEX_PREFIX, &path), INFINITE)?
+    lock_state_at(&path)
+}
+
+/// Locks a state path that was canonicalized by the caller and must not be resolved again.
+fn lock_state_at(path: &Path) -> Result<StateLock> {
+    let mutex = wait_raw_named_mutex(&mutex_name(STATE_MUTEX_PREFIX, path), INFINITE)?
         .ok_or_else(|| anyhow::anyhow!("infinite deny-read state mutex wait timed out"))?;
     Ok(StateLock {
         _mutex: mutex,
-        path,
+        path: path.to_path_buf(),
     })
 }
 
@@ -353,12 +363,22 @@ impl RunnerLeaseGuard {
 /// The parent keeps this handle open through `SpawnReady`, preserving the exact DACL that permits
 /// both the real user and the selected sandbox user to open the mutex. The runner then owns the
 /// mutex through Job Object cleanup.
+#[cfg(test)]
 pub(crate) fn register_runner_lease(
     sandbox_home: &Path,
     sandbox_username: &str,
 ) -> Result<RegisteredRunnerLease> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let lock = lock_state(&state_path)?;
+    let state_path = canonicalize_case_insensitive_state_path(&state_path)?;
+    register_runner_lease_at(&state_path, sandbox_username)
+}
+
+/// Creates a runner lease against a caller-provided canonical state path.
+pub(crate) fn register_runner_lease_at(
+    state_path: &Path,
+    sandbox_username: &str,
+) -> Result<RegisteredRunnerLease> {
+    let lock = lock_state_at(state_path)?;
     let state_path = lock.path();
     let mut state = load_state(state_path)?;
     if state.active_runner_leases.len() >= MAX_ACTIVE_RUNNER_LEASES {
@@ -446,10 +466,17 @@ pub fn acquire_registered_runner_lease(lease_name: &str) -> Result<RunnerLeaseGu
 }
 
 /// Waits for active runner-owned leases and prunes released or abandoned entries.
+#[cfg(test)]
 pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> Result<bool> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let state_path = canonicalize_case_insensitive_state_path(&state_path)?;
+    reconcile_runner_leases_at(&state_path, timeout_ms)
+}
+
+/// Reconciles runner leases against a caller-provided canonical state path.
+pub(crate) fn reconcile_runner_leases_at(state_path: &Path, timeout_ms: u32) -> Result<bool> {
     let (state_path, leases) = {
-        let lock = lock_state(&state_path)?;
+        let lock = lock_state_at(state_path)?;
         let state_path = lock.path().to_path_buf();
         let leases = load_state(&state_path)?
             .active_runner_leases
@@ -476,14 +503,15 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
         let Some(lease_mutex) = wait_raw_named_mutex(&lease_name, remaining_ms)? else {
             return Ok(false);
         };
-        remove_runner_lease(&state_path, &lease_name)?;
+        remove_runner_lease_at(&state_path, &lease_name)?;
         drop(lease_mutex);
     }
     Ok(true)
 }
 
-fn remove_runner_lease(state_path: &Path, lease_name: &str) -> Result<()> {
-    let lock = lock_state(state_path)?;
+/// Removes one lease from a caller-provided canonical state path.
+fn remove_runner_lease_at(state_path: &Path, lease_name: &str) -> Result<()> {
+    let lock = lock_state_at(state_path)?;
     let state_path = lock.path();
     let mut state = load_state(state_path)?;
     if state.active_runner_leases.remove(lease_name) {
@@ -1184,7 +1212,9 @@ mod tests {
     use super::merge_tracked_paths;
     use super::prepare_deny_read_execution_wait;
     use super::reconcile_runner_leases;
+    use super::reconcile_runner_leases_at;
     use super::register_runner_lease;
+    use super::register_runner_lease_at;
     use super::retain_preferred_reconciliation_error;
     use super::sandbox_dir;
     use super::state_mutex_name;
@@ -1353,6 +1383,49 @@ mod tests {
         assert!(
             !second_state.exists(),
             "retargeted alias must not redirect state I/O"
+        );
+    }
+
+    #[test]
+    fn canonical_runner_lease_path_survives_alias_retarget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_home = temp.path().join("first-home");
+        let second_home = temp.path().join("second-home");
+        let alias = temp.path().join("home-alias");
+        std::fs::create_dir_all(sandbox_dir(&first_home)).expect("create first state directory");
+        std::fs::create_dir_all(sandbox_dir(&second_home)).expect("create second state directory");
+        create_junction(&alias, &first_home);
+
+        let execution_wait =
+            prepare_deny_read_execution_wait(&alias).expect("prepare canonical execution wait");
+        let state_path = execution_wait.state_path().to_path_buf();
+        let username = std::env::var("USERNAME").expect("current Windows username");
+        let registration = register_runner_lease_at(&state_path, &username)
+            .expect("register runner lease at canonical state path");
+        let lease_name = registration.name().to_string();
+        drop(registration);
+        drop(execution_wait);
+
+        std::fs::remove_dir(&alias).expect("remove first junction");
+        create_junction(&alias, &second_home);
+
+        assert!(
+            reconcile_runner_leases_at(&state_path, 1_000)
+                .expect("reconcile canonical runner lease path"),
+            "released runner lease must be reconciled"
+        );
+        assert!(
+            super::acquire_registered_runner_lease(&lease_name).is_err(),
+            "reconciled runner lease must not remain acquirable"
+        );
+
+        let first_state = sandbox_dir(&first_home).join(DENY_READ_ACL_STATE_FILE);
+        let second_state = sandbox_dir(&second_home).join(DENY_READ_ACL_STATE_FILE);
+        let state = load_state(&first_state).expect("load canonical reconciled state");
+        assert!(state.active_runner_leases.is_empty());
+        assert!(
+            !second_state.exists(),
+            "retargeted alias must not receive canonical lease state"
         );
     }
 
