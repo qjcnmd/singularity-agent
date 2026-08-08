@@ -299,7 +299,7 @@ fn pytest_cache_dir(addopts: &str) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
-/// Returns the nearest existing cache ancestor and digest for a structurally valid isolated tool
+/// Returns the existing per-workspace digest directory for a structurally valid isolated tool
 /// cache path.
 fn existing_isolated_cache_root(
     temp_root: &Path,
@@ -314,20 +314,19 @@ fn existing_isolated_cache_root(
     let path = canonicalize_path_allow_missing(path);
     let cache_root = temp_root.join("singularity-tool-cache");
     let tool_root = cache_root.join(tool);
-    let mut relative = path.strip_prefix(&tool_root).ok()?.components();
-    let digest = relative.next()?.as_os_str().to_str()?;
-    if relative.next().is_some()
-        || digest.len() != 64
-        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
+    let digest = {
+        let mut relative = path.strip_prefix(&tool_root).ok()?.components();
+        let digest = relative.next()?.as_os_str().to_str()?;
+        if relative.next().is_some()
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        digest.to_ascii_lowercase()
+    };
 
-    [tool_root, cache_root]
-        .into_iter()
-        .find(|root| root.is_dir())
-        .map(|root| canonicalize_path_allow_missing(&root))
-        .map(|root| (root, digest.to_ascii_lowercase()))
+    path.is_dir().then_some((path, digest))
 }
 
 #[cfg(test)]
@@ -459,8 +458,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            roots.contains(&dunce::canonicalize(&cargo_root).expect("canonical cargo root")),
-            "existing isolated cargo cache root must be writable: {roots:?}"
+            roots.contains(&dunce::canonicalize(&target_dir).expect("canonical cargo target")),
+            "existing isolated cargo digest directory must be writable: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&dunce::canonicalize(&cargo_root).expect("canonical cargo root")),
+            "shared cargo parent must not be writable: {roots:?}"
         );
     }
 
@@ -476,10 +479,10 @@ mod tests {
         let python_root = cache_root.join("python");
         let pytest_root = cache_root.join("pytest");
         std::fs::create_dir_all(&cwd).expect("create cwd");
-        std::fs::create_dir_all(&pip_root).expect("create pip cache root");
-        std::fs::create_dir_all(&npm_root).expect("create npm cache root");
-        std::fs::create_dir_all(&python_root).expect("create python cache root");
-        std::fs::create_dir_all(&pytest_root).expect("create pytest cache root");
+        std::fs::create_dir_all(pip_root.join(digest)).expect("create pip digest cache");
+        std::fs::create_dir_all(npm_root.join(digest)).expect("create npm digest cache");
+        std::fs::create_dir_all(python_root.join(digest)).expect("create python digest cache");
+        std::fs::create_dir_all(pytest_root.join(digest)).expect("create pytest digest cache");
 
         let env_map = HashMap::from([
             ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
@@ -510,21 +513,104 @@ mod tests {
             .map(|root| root.root)
             .collect::<Vec<_>>();
 
+        for (tool, root) in [
+            ("pip", pip_root),
+            ("python", python_root),
+            ("npm", npm_root),
+            ("pytest", pytest_root),
+        ] {
+            let digest_root = root.join(digest);
+            let canonical_digest_root =
+                dunce::canonicalize(&digest_root).expect("canonical digest root");
+            let canonical_tool_root = dunce::canonicalize(&root).expect("canonical tool root");
+            let canonical_cache_root =
+                dunce::canonicalize(&cache_root).expect("canonical cache root");
+            assert!(
+                roots.contains(&canonical_digest_root),
+                "existing isolated {tool} digest directory must be writable: {roots:?}"
+            );
+            assert!(
+                !roots.contains(&canonical_tool_root),
+                "shared {tool} parent must not be writable: {roots:?}"
+            );
+            assert!(
+                !roots.contains(&canonical_cache_root),
+                "shared tool cache parent must not be writable: {roots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_does_not_share_isolated_digest_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp root");
+        let cache_root = temp_dir.join("singularity-tool-cache");
+        let first_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let second_digest = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let pip_root = cache_root.join("pip");
+        let first_cache = pip_root.join(first_digest);
+        let second_cache = pip_root.join(second_digest);
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&first_cache).expect("create first digest cache");
+        std::fs::create_dir_all(&second_cache).expect("create second digest cache");
+
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let roots_for = |cache: &Path| {
+            let env_map = HashMap::from([
+                ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+                (
+                    "PIP_CACHE_DIR".to_string(),
+                    cache.to_string_lossy().to_string(),
+                ),
+            ]);
+            permissions
+                .writable_roots_for_cwd(&cwd, &env_map)
+                .into_iter()
+                .map(|root| root.root)
+                .collect::<Vec<_>>()
+        };
+        let first_roots = roots_for(&first_cache);
+        let second_roots = roots_for(&second_cache);
+        let canonical_first = dunce::canonicalize(&first_cache).expect("canonical first cache");
+        let canonical_second = dunce::canonicalize(&second_cache).expect("canonical second cache");
+        let canonical_tool = dunce::canonicalize(&pip_root).expect("canonical pip root");
+        let canonical_cache = dunce::canonicalize(&cache_root).expect("canonical cache root");
+
         assert!(
-            roots.contains(&dunce::canonicalize(&pip_root).expect("canonical pip root")),
-            "existing isolated pip cache root must be writable: {roots:?}"
+            first_roots.contains(&canonical_first),
+            "first digest root missing: {first_roots:?}"
         );
         assert!(
-            roots.contains(&dunce::canonicalize(&python_root).expect("canonical python root")),
-            "existing isolated python cache root must be writable: {roots:?}"
+            second_roots.contains(&canonical_second),
+            "second digest root missing: {second_roots:?}"
         );
         assert!(
-            roots.contains(&dunce::canonicalize(&npm_root).expect("canonical npm root")),
-            "existing isolated npm cache root must be writable: {roots:?}"
+            !first_roots.contains(&canonical_second),
+            "first workspace authorized second digest: {first_roots:?}"
         );
         assert!(
-            roots.contains(&dunce::canonicalize(&pytest_root).expect("canonical pytest root")),
-            "existing isolated pytest cache root must be writable: {roots:?}"
+            !second_roots.contains(&canonical_first),
+            "second workspace authorized first digest: {second_roots:?}"
+        );
+        assert!(
+            !first_roots.contains(&canonical_tool),
+            "first workspace authorized shared tool root: {first_roots:?}"
+        );
+        assert!(
+            !second_roots.contains(&canonical_tool),
+            "second workspace authorized shared tool root: {second_roots:?}"
+        );
+        assert!(
+            !first_roots.contains(&canonical_cache),
+            "first workspace authorized shared cache root: {first_roots:?}"
+        );
+        assert!(
+            !second_roots.contains(&canonical_cache),
+            "second workspace authorized shared cache root: {second_roots:?}"
         );
     }
 

@@ -2399,6 +2399,14 @@ fn child_environment_from(
             )
         };
 
+    if let (Some(cache), Some(digest), Some(cargo_target)) = (
+        cache.as_deref(),
+        cache_digest.as_deref(),
+        isolated_cargo_target.as_deref(),
+    ) {
+        create_isolated_cache_directories(cache, digest, cargo_target)?;
+    }
+
     if let Some(cache) = cache.as_ref() {
         for (name, tool) in [
             ("PIP_CACHE_DIR", "pip"),
@@ -2431,6 +2439,29 @@ fn child_environment_from(
         set_environment_value(&mut env_map, "CARGO_TARGET_DIR", &target.to_string_lossy());
     }
     Ok(env_map)
+}
+
+/// Materializes every isolated cache leaf before Windows computes its writable ACL roots.
+fn create_isolated_cache_directories(
+    cache: &Path,
+    digest: &str,
+    cargo_target: &Path,
+) -> Result<(), String> {
+    for (label, path) in [
+        ("pip cache", cache.join("pip").join(digest)),
+        ("npm cache", cache.join("npm").join(digest)),
+        ("python cache", cache.join("python").join(digest)),
+        ("pytest cache", cache.join("pytest").join(digest)),
+        ("Cargo target", cargo_target.to_path_buf()),
+    ] {
+        std::fs::create_dir_all(&path).map_err(|error| {
+            format!(
+                "failed to create isolated {label} directory {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn set_environment_value(env_map: &mut HashMap<String, String>, name: &str, value: &str) {
@@ -3277,6 +3308,16 @@ mod tests {
                             &dunce::canonicalize(workspace.path()).expect("canonical workspace")
                         ))
                 );
+                for tool in ["pip", "npm", "python", "pytest", "cargo"] {
+                    let root = canonical_temp
+                        .join("singularity-tool-cache")
+                        .join(tool)
+                        .join(&digest);
+                    assert!(
+                        root.is_dir(),
+                        "isolated {tool} cache directory missing: {root:?}"
+                    );
+                }
                 assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
             } else {
                 assert_eq!(
@@ -3407,6 +3448,19 @@ mod tests {
         .expect_err("missing TEMP must be rejected");
         assert!(
             error.starts_with("isolated TEMP cache root is unavailable:"),
+            "{error}"
+        );
+
+        let temp_file = external.path().join("temp-file");
+        std::fs::write(&temp_file, "not a directory").expect("create TEMP file");
+        let error = child_environment_from(
+            [("TEMP".to_string(), temp_file.to_string_lossy().into_owned())],
+            &CommandEnvironmentPolicy::Isolated,
+            workspace.path(),
+        )
+        .expect_err("isolated TEMP file must fail cache preparation");
+        assert!(
+            error.starts_with("failed to create isolated pip cache directory "),
             "{error}"
         );
     }
