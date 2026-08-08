@@ -301,9 +301,7 @@ impl EvaluationTrialResult {
                 "{context} functional_task_success requires baseline and evaluator tests"
             )));
         }
-        if self.agent_protocol_success
-            && (!self.agent_completed || self.status == EvaluationStatus::Blocked)
-        {
+        if self.agent_protocol_success && !self.agent_completed {
             return Err(validation_error(format!(
                 "{context} agent_protocol_success requires a completed AgentLoop"
             )));
@@ -363,12 +361,15 @@ impl EvaluationTaskSummary {
             count_trials(trials, |trial| trial.status == EvaluationStatus::Failed);
         let blocked_trial_count =
             count_trials(trials, |trial| trial.status == EvaluationStatus::Blocked);
-        let agent_scored_trial_count = completed_trial_count.saturating_add(failed_trial_count);
-        let agent_completed_count = count_trials(trials, |trial| {
-            trial.status != EvaluationStatus::Blocked && trial.agent_completed
+        let terminal_trial_count = completed_trial_count.saturating_add(failed_trial_count);
+        let blocked_agent_completed_count = count_trials(trials, |trial| {
+            trial.status == EvaluationStatus::Blocked && trial.agent_completed
         });
+        let agent_scored_trial_count =
+            terminal_trial_count.saturating_add(blocked_agent_completed_count);
+        let agent_completed_count = count_trials(trials, |trial| trial.agent_completed);
         // A blocked trial joins a dimension's denominator only with positive evidence for that
-        // dimension; protocol success on a blocked trial is forbidden by trial validation.
+        // dimension. A later evaluator blocker does not erase a completed AgentLoop.
         let functional_task_success_count =
             count_trials(trials, |trial| trial.functional_task_success);
         let functional_blocked_success_count = count_trials(trials, |trial| {

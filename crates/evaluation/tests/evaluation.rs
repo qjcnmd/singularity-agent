@@ -213,6 +213,30 @@ fn blocked_trial(trial: u32) -> EvaluationTrialResult {
     }
 }
 
+fn blocked_after_completed_agent_trial(trial: u32) -> EvaluationTrialResult {
+    let blocker = EvaluationBlocker {
+        code: None,
+        kind: BlockerKind::Environment,
+        message: "public verification environment unavailable".to_string(),
+        task_id: None,
+    };
+    let mut result = passed_trial(trial);
+    result.status = EvaluationStatus::Blocked;
+    result.blocker = Some(blocker.clone());
+    result.stages.public = StageResult {
+        status: StageStatus::Blocked,
+        blocker: Some(blocker),
+    };
+    result.stages.hidden = StageResult {
+        status: StageStatus::Skipped,
+        blocker: None,
+    };
+    result.tests_passed = false;
+    result.functional_task_success = false;
+    result.evaluation_passed = false;
+    result
+}
+
 fn task_result_for(task_id: &str, trials: Vec<EvaluationTrialResult>) -> EvaluationTaskResult {
     EvaluationTaskResult::from_trials(
         TaskId::new(task_id).expect("task id"),
@@ -428,6 +452,18 @@ fn result_v9_keeps_blocked_trials_out_of_trial_diagnostics() {
     assert_eq!(result.summary.functional_task_success_count, 0);
     assert_eq!(result.summary.agent_protocol_success_count, 0);
     assert_eq!(result.summary.sandbox_security_success_count, 0);
+}
+
+#[test]
+fn blocked_post_agent_stage_preserves_independent_protocol_success() {
+    let task = task_result(vec![blocked_after_completed_agent_trial(1)]);
+    assert_eq!(task.summary.agent_scored_trial_count, 1);
+    assert_eq!(task.summary.agent_completed_count, 1);
+    assert_eq!(task.summary.agent_protocol_success_count, 1);
+
+    result_for(task, 1)
+        .validate()
+        .expect("post-agent blocker must not erase protocol success");
 }
 
 #[test]
