@@ -260,7 +260,8 @@ impl Drop for RegisteredRunnerLease {
 }
 
 impl RunnerLeaseGuard {
-    /// Releases the lease only after the runner has completed Job Object cleanup.
+    /// The normal runner path releases the lease only after its IPC and Job/process handles
+    /// are closed.
     pub fn release(mut self) {
         drop(self.mutex.take());
     }

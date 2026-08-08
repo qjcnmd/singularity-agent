@@ -913,9 +913,10 @@ mod windows_impl {
                 output_truncated: stdout_truncated || stderr_truncated,
             })
         })();
-        // The runner releases its lease only after Job Object cleanup. Keep the execution mutex
-        // while consuming every released or abandoned registration, including startup and IPC
-        // failures, so this live parent never opens the crash-only reconciliation gap.
+        // The normal runner path releases its lease only after its IPC and Job/process handles
+        // are closed. Keep the execution mutex while consuming every released or abandoned
+        // registration, including startup and IPC failures, so this live parent never opens the
+        // crash-only reconciliation gap.
         let lease_cleanup = loop {
             match reconcile_runner_leases(sandbox_home, 50) {
                 Ok(true) => break Ok(()),

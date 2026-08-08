@@ -580,8 +580,6 @@ pub fn main() -> Result<()> {
         anyhow::bail!(message);
     }
 
-    runner_lease.release();
-
     let exit_msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
         message: Message::Exit {
@@ -602,5 +600,6 @@ pub fn main() -> Result<()> {
     drop(pipe_write);
     let _ = control_thread.join();
     drop(ipc_spawn);
+    runner_lease.release();
     std::process::exit(exit_code);
 }
