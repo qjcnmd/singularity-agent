@@ -7026,6 +7026,40 @@ mod tests {
     }
 
     #[test]
+    fn zero_sampling_blocker_builds_a_report_with_the_configured_task_denominator() {
+        let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
+        let preflight = sandbox_preflight_evidence(
+            &SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref()),
+        );
+        let result = EvaluationResult::blocked_before_sampling(
+            RunId::new("zero-sampling-report").expect("run id"),
+            1,
+            1,
+            EvaluationBlocker {
+                code: Some("workspace_preparation_failed".to_string()),
+                kind: BlockerKind::WorkspacePreparation,
+                message: "source preparation failed".to_string(),
+                task_id: None,
+            },
+            preflight,
+        );
+        let params = EvaluationRunParams {
+            manifest: "manifest.json".to_string(),
+            run_id: result.run_id.as_str().to_string(),
+            output_root: None,
+            max_workers: 1,
+            recovery_every: None,
+        };
+
+        let report = build_evaluation_report(&params, &result, &[], None, 1)
+            .expect("zero-sampling blocker report");
+
+        assert!(report.tasks.is_empty());
+        assert_eq!(report.dimensions.functional_task_count, 1);
+        assert_eq!(report.dimensions.functional_task_success_count, 0);
+    }
+
+    #[test]
     fn refresh_trial_trace_artifact_projects_terminal_spans_from_sqlite() {
         use singularity_store::SessionStore;
 

@@ -416,7 +416,14 @@ impl EvaluationReport {
                 )));
             }
         }
-        let expected_task_count = u32::try_from(task_ids.len()).unwrap_or(u32::MAX);
+        let expected_task_count = if self.tasks.is_empty()
+            && self.system_result.status == EvaluationStatus::Blocked
+            && self.system_result.blocker.is_some()
+        {
+            self.dimensions.functional_task_count
+        } else {
+            u32::try_from(task_ids.len()).unwrap_or(u32::MAX)
+        };
         validate_report_dimensions(&self.dimensions, &self.tasks, expected_task_count)?;
         if self.tasks.is_empty() {
             if self.system_result.status != EvaluationStatus::Blocked
