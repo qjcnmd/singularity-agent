@@ -90,9 +90,9 @@ mod windows_impl {
     use crate::cap::workspace_write_cap_sid_for_root;
     use crate::deny_read_acl::open_existing_git_ancestor;
     use crate::deny_read_state::StateMutex;
+    use crate::deny_read_state::prepare_deny_read_execution_wait;
     use crate::deny_read_state::reconcile_runner_leases;
     use crate::deny_read_state::register_runner_lease;
-    use crate::deny_read_state::try_lock_deny_read_execution;
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
@@ -298,6 +298,7 @@ mod windows_impl {
             &format!("kind=deny_read_execution id={event_id} event=wait_start"),
             Some(&log_dir),
         );
+        let mut execution_wait = prepare_deny_read_execution_wait(sandbox_home)?;
         loop {
             if cancellation.is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled) {
                 log_note(
@@ -309,7 +310,7 @@ mod windows_impl {
                 );
                 return Ok(None);
             }
-            let lock_result = match try_lock_deny_read_execution(sandbox_home, 50) {
+            let lock_result = match execution_wait.wait(50) {
                 Ok(lock_result) => lock_result,
                 Err(error) => {
                     log_note(

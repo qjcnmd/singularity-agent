@@ -7,6 +7,7 @@ use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
 use crate::deny_read_acl::plan_deny_read_acl_paths;
 use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::lexical_path_key;
 use crate::path_safety::canonicalize_case_insensitive_state_path;
 use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::path_safety::open_pinned_workspace_path;
@@ -122,6 +123,81 @@ pub(crate) struct StateMutex {
     handle: HANDLE,
 }
 
+/// Owns a named mutex handle before (and, after) it is acquired.
+///
+/// Keeping this handle alive across bounded waits avoids reopening the state path while another
+/// holder may be replacing the state file atomically.
+struct NamedMutex {
+    handle: HANDLE,
+}
+
+impl Drop for NamedMutex {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+impl NamedMutex {
+    fn wait(&self, timeout_ms: u32) -> Result<bool> {
+        let wait = unsafe { WaitForSingleObject(self.handle, timeout_ms) };
+        match wait {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => anyhow::bail!("WaitForSingleObject failed for deny-read state: {wait}"),
+        }
+    }
+
+    fn into_state_mutex(self) -> StateMutex {
+        let handle = self.handle;
+        std::mem::forget(self);
+        StateMutex { handle }
+    }
+}
+
+/// Keeps one canonical state identity and one native mutex handle across bounded waits.
+pub(crate) struct DenyReadExecutionWait {
+    state_path: PathBuf,
+    mutex: Option<NamedMutex>,
+}
+
+impl DenyReadExecutionWait {
+    fn verify_state_identity(&self) -> Result<()> {
+        let current = canonicalize_case_insensitive_state_path(&self.state_path)?;
+        if lexical_path_key(&current) != lexical_path_key(&self.state_path) {
+            anyhow::bail!(
+                "deny-read execution state path identity changed: {}",
+                self.state_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Waits on the already-open handle and validates its canonical path only after acquisition.
+    pub(crate) fn wait(&mut self, timeout_ms: u32) -> Result<Option<StateMutex>> {
+        let ready = self
+            .mutex
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("deny-read execution mutex was already acquired"))?
+            .wait(timeout_ms)?;
+        if !ready {
+            return Ok(None);
+        }
+
+        let mutex = self
+            .mutex
+            .take()
+            .expect("execution mutex handle remains until acquisition");
+        let mutex = mutex.into_state_mutex();
+        if let Err(error) = self.verify_state_identity() {
+            drop(mutex);
+            return Err(error);
+        }
+        Ok(Some(mutex))
+    }
+}
+
 /// Couples a state mutex with the exact canonical path identity used to name it.
 pub(crate) struct StateLock {
     _mutex: StateMutex,
@@ -167,21 +243,11 @@ fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex
             GetLastError()
         });
     }
-    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
-    match wait {
-        WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Some(StateMutex { handle })),
-        WAIT_TIMEOUT => {
-            unsafe {
-                CloseHandle(handle);
-            }
-            Ok(None)
-        }
-        _ => {
-            unsafe {
-                CloseHandle(handle);
-            }
-            anyhow::bail!("WaitForSingleObject failed for deny-read state: {wait}");
-        }
+    let mutex = NamedMutex { handle };
+    if mutex.wait(timeout_ms)? {
+        Ok(Some(mutex.into_state_mutex()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -211,9 +277,23 @@ fn wait_existing_runner_mutex(name: &str) -> Result<StateMutex> {
     }
 }
 
-fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
-    let path = canonicalize_case_insensitive_state_path(path)?;
-    wait_raw_named_mutex(&mutex_name(prefix, &path), timeout_ms)
+/// Prepares one execution-mutex wait using the canonical state path and one native handle.
+pub(crate) fn prepare_deny_read_execution_wait(
+    sandbox_home: &Path,
+) -> Result<DenyReadExecutionWait> {
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let state_path = canonicalize_case_insensitive_state_path(&state_path)?;
+    let name = to_wide(mutex_name(EXECUTION_MUTEX_PREFIX, &state_path));
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle == 0 {
+        anyhow::bail!("CreateMutexW failed for deny-read execution: {}", unsafe {
+            GetLastError()
+        });
+    }
+    Ok(DenyReadExecutionWait {
+        state_path,
+        mutex: Some(NamedMutex { handle }),
+    })
 }
 
 pub(crate) fn lock_state(path: &Path) -> Result<StateLock> {
@@ -227,12 +307,12 @@ pub(crate) fn lock_state(path: &Path) -> Result<StateLock> {
 }
 
 /// Attempts to hold the shared read principal across one complete sandbox child lifecycle.
+#[cfg(test)]
 pub(crate) fn try_lock_deny_read_execution(
     sandbox_home: &Path,
     timeout_ms: u32,
 ) -> Result<Option<StateMutex>> {
-    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    wait_named_mutex(EXECUTION_MUTEX_PREFIX, &state_path, timeout_ms)
+    prepare_deny_read_execution_wait(sandbox_home)?.wait(timeout_ms)
 }
 
 /// Runner-owned mutex guard that survives loss of the calling parent process.
@@ -1102,6 +1182,7 @@ mod tests {
     use super::load_state;
     use super::lock_state;
     use super::merge_tracked_paths;
+    use super::prepare_deny_read_execution_wait;
     use super::reconcile_runner_leases;
     use super::register_runner_lease;
     use super::retain_preferred_reconciliation_error;
@@ -1316,6 +1397,75 @@ mod tests {
         assert_eq!(
             std::fs::read(&missing).expect("read replaced state"),
             b"second"
+        );
+    }
+
+    #[test]
+    fn execution_wait_keeps_one_handle_during_atomic_state_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state directory");
+        atomic_store(&state_path, b"initial").expect("create initial state");
+
+        let (holder_ready_tx, holder_ready_rx) = std::sync::mpsc::channel();
+        let (holder_release_tx, holder_release_rx) = std::sync::mpsc::channel();
+        let holder_home = sandbox_home.clone();
+        let holder = std::thread::spawn(move || {
+            let _holder = try_lock_deny_read_execution(&holder_home, u32::MAX)
+                .expect("hold execution mutex")
+                .expect("execution mutex acquired");
+            holder_ready_tx
+                .send(())
+                .expect("signal execution mutex held");
+            holder_release_rx
+                .recv()
+                .expect("wait for execution mutex release");
+        });
+        holder_ready_rx
+            .recv()
+            .expect("wait for execution mutex holder");
+        let mut waiter = prepare_deny_read_execution_wait(&sandbox_home)
+            .expect("prepare execution wait before state replacement");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let replacement_path = state_path.clone();
+        let replacer = std::thread::spawn(move || {
+            for index in 0..64 {
+                atomic_store(&replacement_path, format!("replacement-{index}").as_bytes())
+                    .expect("replace state atomically");
+            }
+            done_tx.send(()).expect("signal replacements complete");
+        });
+
+        let mut observed_wait = false;
+        while done_rx.try_recv().is_err() {
+            assert!(
+                waiter
+                    .wait(5)
+                    .expect("wait on stable execution mutex handle")
+                    .is_none(),
+                "execution mutex must remain held while replacements run"
+            );
+            observed_wait = true;
+        }
+        replacer.join().expect("join state replacement thread");
+        assert!(
+            observed_wait,
+            "replacement must overlap a bounded mutex wait"
+        );
+        holder_release_tx
+            .send(())
+            .expect("release execution mutex holder");
+        holder.join().expect("join execution mutex holder");
+
+        assert!(
+            waiter
+                .wait(1_000)
+                .expect("acquire after state replacements")
+                .is_some(),
+            "waiter must acquire after the holder releases"
         );
     }
 
