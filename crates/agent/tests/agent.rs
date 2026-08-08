@@ -2992,7 +2992,7 @@ fn seed_replay_model_mismatch_is_rejected_before_provider_requests() {
     );
 }
 
-// Issue #24 场景 7：ordinary checkpoint 的旧版/未来版/损坏 payload 全部 fail closed。
+// Issue #24 场景 7：支持的 v5 升级；更旧版、未来版和损坏 payload fail closed。
 // 合法 payload 由真实一轮运行产生（encode），再逐项篡改后断言 decode 拒绝。
 #[test]
 fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
@@ -3014,6 +3014,7 @@ fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
 
     let first_requests = Arc::new(Mutex::new(Vec::new()));
     let mut checkpoints = Vec::new();
+    let mut pending_checkpoints = Vec::new();
     let first = agent_loop_with_responses_and_requests(
         vec![tool_response, final_response],
         allow_read_policy(),
@@ -3026,6 +3027,9 @@ fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
         &mut |event| {
             if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
                 checkpoints.push(event.checkpoint.clone());
+            }
+            if matches!(event.phase, TurnCheckpointPhase::ToolCallsReady { .. }) {
+                pending_checkpoints.push(event.checkpoint.clone());
             }
             Ok(())
         },
@@ -3040,6 +3044,40 @@ fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
     // 当前版本：decode 成功（对照基线）。
     let decoded = TurnCheckpoint::decode(&payload).expect("current version decodes");
     assert_eq!(decoded.thread_id(), "thread_1");
+
+    // v5 合法 checkpoint：仅移除 v6 新增的终态工具指纹字段，并保留其余真实 payload。
+    let mut legacy_v5 = payload.clone();
+    legacy_v5
+        .as_object_mut()
+        .expect("payload object")
+        .remove("completed_tool_call_fingerprints");
+    legacy_v5["checkpoint_version"] = json!(5);
+    let migrated = TurnCheckpoint::decode(&legacy_v5)
+        .expect("v5 checkpoint should migrate to the current codec");
+    assert_eq!(migrated.checkpoint_version(), current_version as u32);
+    assert_eq!(
+        migrated.encode().expect("migrated checkpoint encodes")["completed_tool_call_fingerprints"],
+        payload["completed_tool_call_fingerprints"]
+    );
+
+    // A real v5 ToolCallsReady checkpoint keeps the pending fingerprint out of the terminal set.
+    let pending_payload = pending_checkpoints
+        .first()
+        .expect("tool-call checkpoint")
+        .encode()
+        .expect("encode pending checkpoint");
+    let mut legacy_pending_v5 = pending_payload;
+    legacy_pending_v5
+        .as_object_mut()
+        .expect("pending payload object")
+        .remove("completed_tool_call_fingerprints");
+    legacy_pending_v5["checkpoint_version"] = json!(5);
+    let migrated_pending =
+        TurnCheckpoint::decode(&legacy_pending_v5).expect("pending v5 checkpoint should migrate");
+    assert_eq!(
+        migrated_pending.encode().expect("encode migrated pending")["completed_tool_call_fingerprints"],
+        json!([])
+    );
 
     // 旧版/未来版/损坏 payload：全部 fail closed。
     for (label, mutation, expected_error) in [
@@ -3064,7 +3102,7 @@ fn ordinary_checkpoint_decode_rejects_old_future_and_corrupt_payloads() {
                 candidate["checkpoint_version"] = json!(current_version + 1);
             }
             "old" => {
-                candidate["checkpoint_version"] = json!(current_version - 1);
+                candidate["checkpoint_version"] = json!(current_version - 2);
             }
             "remove_messages" => {
                 candidate
@@ -3903,6 +3941,23 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert_eq!(
         checkpoint,
         pending.encode_checkpoint().expect("checkpoint roundtrip")
+    );
+    let mut legacy_checkpoint = checkpoint.clone();
+    legacy_checkpoint
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("completed_tool_call_fingerprints");
+    legacy_checkpoint["checkpoint_version"] = serde_json::json!(6);
+    let migrated_legacy = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &legacy_checkpoint,
+    )
+    .expect("v6 approval checkpoint should migrate");
+    assert_eq!(
+        migrated_legacy
+            .encode_checkpoint()
+            .expect("migrated approval checkpoint")["checkpoint_version"],
+        7
     );
     let mut future_checkpoint = checkpoint.clone();
     future_checkpoint["checkpoint_version"] = serde_json::json!(999);

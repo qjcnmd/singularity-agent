@@ -290,6 +290,11 @@ struct CheckpointVersion {
     checkpoint_version: u32,
 }
 
+/// The only ordinary-turn checkpoint version that can be upgraded in-place.
+const LEGACY_TURN_CHECKPOINT_VERSION: u32 = 5;
+/// The approval checkpoint version immediately before the terminal-tool ledger was added.
+const LEGACY_APPROVAL_CHECKPOINT_VERSION: u32 = 6;
+
 impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
     fn from(checkpoint: &ApprovalCheckpoint) -> Self {
         Self {
@@ -307,18 +312,18 @@ impl ApprovalCheckpoint {
             .map_err(|error| format!("approval checkpoint serialization failed: {error}"))
     }
 
-    /// Decode a persisted checkpoint and reject every non-current version.
+    /// Decode the current codec or the one explicitly supported legacy codec.
     pub fn decode(payload: &Value) -> Result<Self, String> {
         let version: CheckpointVersion = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid approval checkpoint version: {error}"))?;
-        let checkpoint = match version.checkpoint_version {
-            APPROVAL_CHECKPOINT_VERSION => {
-                let wire: ApprovalCheckpointWire = serde_json::from_value(payload.clone())
-                    .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
-                Self::from_wire(wire)
-            }
+        let payload = match version.checkpoint_version {
+            APPROVAL_CHECKPOINT_VERSION => payload.clone(),
+            LEGACY_APPROVAL_CHECKPOINT_VERSION => migrate_v6_approval_checkpoint(payload)?,
             _ => return Err("unsupported approval checkpoint version".to_string()),
         };
+        let wire: ApprovalCheckpointWire = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
+        let checkpoint = Self::from_wire(wire);
         checkpoint.validate_serialized()?;
         Ok(checkpoint)
     }
@@ -347,14 +352,16 @@ impl TurnCheckpoint {
         .map_err(|error| format!("turn checkpoint serialization failed: {error}"))
     }
 
-    /// Decode and fail closed on old, future, or unknown checkpoint fields.
+    /// Decode the current codec or the one explicitly supported legacy codec.
     pub fn decode(payload: &Value) -> Result<Self, String> {
         let version: CheckpointVersion = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid turn checkpoint version: {error}"))?;
-        if version.checkpoint_version != super::TURN_CHECKPOINT_VERSION {
-            return Err("unsupported turn checkpoint version".to_string());
-        }
-        let wire: TurnCheckpointWire = serde_json::from_value(payload.clone())
+        let payload = match version.checkpoint_version {
+            super::TURN_CHECKPOINT_VERSION => payload.clone(),
+            LEGACY_TURN_CHECKPOINT_VERSION => migrate_v5_turn_checkpoint(payload)?,
+            _ => return Err("unsupported turn checkpoint version".to_string()),
+        };
+        let wire: TurnCheckpointWire = serde_json::from_value(payload)
             .map_err(|error| format!("invalid turn checkpoint: {error}"))?;
         let checkpoint = Self {
             state: wire.state,
@@ -396,6 +403,117 @@ impl TurnCheckpoint {
     pub fn pending_tool_calls(&self) -> &[PendingToolCall] {
         &self.pending_tool_calls
     }
+}
+
+/// Upgrade the v5 payload without weakening the current strict wire decoder.
+fn migrate_v5_turn_checkpoint(payload: &Value) -> Result<Value, String> {
+    let provisional = migrate_payload_shape(payload, super::TURN_CHECKPOINT_VERSION, "turn")?;
+    let wire: TurnCheckpointWire = serde_json::from_value(provisional.clone())
+        .map_err(|error| format!("invalid turn checkpoint: {error}"))?;
+    let completed = legacy_completed(&wire.state, &wire.pending_tool_calls, "turn")?;
+    insert_completed(provisional, completed, "turn")
+}
+
+/// Upgrade the approval checkpoint version that predates the terminal-tool ledger.
+fn migrate_v6_approval_checkpoint(payload: &Value) -> Result<Value, String> {
+    let provisional =
+        migrate_payload_shape(payload, super::APPROVAL_CHECKPOINT_VERSION, "approval")?;
+    let wire: ApprovalCheckpointWire = serde_json::from_value(provisional.clone())
+        .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
+    let completed = legacy_completed(
+        &wire.state,
+        std::slice::from_ref(&wire.pending_tool_call),
+        "approval",
+    )?;
+    insert_completed(provisional, completed, "approval")
+}
+
+/// Add only the current version and an empty ledger before strict typed parsing.
+fn migrate_payload_shape(
+    payload: &Value,
+    current_version: u32,
+    kind: &str,
+) -> Result<Value, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| format!("invalid {kind} checkpoint: payload is not an object"))?;
+    if object.contains_key("completed_tool_call_fingerprints") {
+        return Err(format!(
+            "invalid {kind} checkpoint: legacy payload contains a current field"
+        ));
+    }
+    let mut migrated = payload.clone();
+    let object = migrated
+        .as_object_mut()
+        .ok_or_else(|| format!("invalid {kind} checkpoint: payload is not an object"))?;
+    object.insert(
+        "checkpoint_version".to_string(),
+        Value::from(current_version),
+    );
+    object.insert(
+        "completed_tool_call_fingerprints".to_string(),
+        Value::Array(Vec::new()),
+    );
+    Ok(migrated)
+}
+
+fn insert_completed(
+    mut payload: Value,
+    completed: Vec<String>,
+    kind: &str,
+) -> Result<Value, String> {
+    payload
+        .as_object_mut()
+        .ok_or_else(|| format!("invalid {kind} checkpoint: payload is not an object"))?
+        .insert(
+            "completed_tool_call_fingerprints".to_string(),
+            serde_json::to_value(completed)
+                .map_err(|error| format!("invalid {kind} checkpoint: {error}"))?,
+        );
+    Ok(payload)
+}
+
+/// Derive terminal fingerprints as the validated seen ledger minus validated pending calls.
+fn legacy_completed(
+    state: &CheckpointState,
+    pending_tool_calls: &[PendingToolCall],
+    kind: &str,
+) -> Result<Vec<String>, String> {
+    let seen = state
+        .seen_tool_call_fingerprints
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if seen.len() != state.seen_tool_call_fingerprints.len()
+        || seen
+            .iter()
+            .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
+    {
+        return Err(format!(
+            "invalid {kind} checkpoint: tool-call fingerprint state is invalid"
+        ));
+    }
+    let mut pending_fingerprints = BTreeSet::new();
+    for pending in pending_tool_calls {
+        pending
+            .validate()
+            .map_err(|error| format!("invalid {kind} checkpoint: {error}"))?;
+        let fingerprint = pending
+            .to_model_tool_call()
+            .map(|call| super::tool_call_fingerprint(&call))
+            .map_err(|error| format!("invalid {kind} checkpoint: {error}"))?;
+        if !seen.contains(&fingerprint) {
+            return Err(format!(
+                "invalid {kind} checkpoint: pending tool-call binding is invalid"
+            ));
+        }
+        pending_fingerprints.insert(fingerprint);
+    }
+    let mut completed = seen;
+    for fingerprint in pending_fingerprints {
+        completed.remove(&fingerprint);
+    }
+    Ok(completed.into_iter().collect())
 }
 
 impl ApprovalCheckpoint {
