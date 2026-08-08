@@ -1287,32 +1287,10 @@ pub fn run_evaluation_with_mode(
     })?;
 
     let source_cache = SourceTemplateCache::new(source_template_cache_root(&output_root));
-    let cached_remote_repositories =
-        match plans
-            .iter()
-            .try_fold(BTreeSet::new(), |mut repositories, plan| {
-                let PlannedWorkspaceSource::RemoteGit { repository, .. } = &plan.source else {
-                    return Ok(repositories);
-                };
-                match source_cache.entry_available(
-                    plan.task_id.as_str(),
-                    &redacted_remote_repository(repository.as_str()),
-                ) {
-                    Ok(true) => {
-                        repositories.insert(repository.as_str().to_string());
-                        Ok(repositories)
-                    }
-                    Ok(false) => Ok(repositories),
-                    Err(error) => Err(EvaluationRunError::infrastructure(format!(
-                        "{}: source-template cache lookup failed for task {}: {error}",
-                        error.stable_code(),
-                        plan.task_id.as_str()
-                    ))),
-                }
-            }) {
-            Ok(repositories) => repositories,
-            Err(error) => return Err(preserve_incomplete_run(&run_dir, error)),
-        };
+    let cached_remote_repositories = match cached_remote_repository_set(&plans, &source_cache) {
+        Ok(repositories) => repositories,
+        Err(error) => return Err(preserve_incomplete_run(&run_dir, error)),
+    };
 
     let cancellable_sandbox_backend =
         cancellation_aware_sandbox_backend(&sandbox_backend, cancellation);
@@ -3292,6 +3270,7 @@ fn prepare_source(
             let preparation = source_cache.prepare_remote(
                 task_id.as_str(),
                 &repository_identity,
+                commit.as_str(),
                 source_dir,
                 cancellation,
                 |staging_dir| {
@@ -5944,6 +5923,45 @@ enum RemoteSourcePreflightFailure {
     Probe,
 }
 
+/// Return repositories whose every planned task/revision cache entry is available.
+fn cached_remote_repository_set(
+    plans: &[WorkspacePlan],
+    source_cache: &SourceTemplateCache,
+) -> Result<BTreeSet<String>, EvaluationRunError> {
+    let (all_repositories, uncached_repositories) = plans.iter().try_fold(
+        (BTreeSet::new(), BTreeSet::new()),
+        |(mut all_repositories, mut uncached_repositories), plan| {
+            let PlannedWorkspaceSource::RemoteGit { repository, commit } = &plan.source else {
+                return Ok((all_repositories, uncached_repositories));
+            };
+            let repository_identity = repository.as_str().to_string();
+            all_repositories.insert(repository_identity.clone());
+            match source_cache.entry_available(
+                plan.task_id.as_str(),
+                &redacted_remote_repository(repository.as_str()),
+                commit.as_str(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    uncached_repositories.insert(repository_identity);
+                }
+                Err(error) => {
+                    return Err(EvaluationRunError::infrastructure(format!(
+                        "{}: source-template cache lookup failed for task {}: {error}",
+                        error.stable_code(),
+                        plan.task_id.as_str()
+                    )));
+                }
+            }
+            Ok((all_repositories, uncached_repositories))
+        },
+    )?;
+    Ok(all_repositories
+        .into_iter()
+        .filter(|repository| !uncached_repositories.contains(repository))
+        .collect())
+}
+
 fn remote_git_repositories(plans: &[WorkspacePlan]) -> Vec<String> {
     let mut repositories = Vec::new();
     for plan in plans {
@@ -7885,6 +7903,81 @@ mod tests {
         assert!(matches!(materialization, MetricValue::Available { .. }));
     }
 
+    fn remote_workspace_plan(task_id: &str, repository: &str, commit: &str) -> WorkspacePlan {
+        let task_id = TaskId::new(task_id).expect("task id");
+        WorkspacePlan {
+            task_id: task_id.clone(),
+            capabilities: Vec::new(),
+            source: PlannedWorkspaceSource::RemoteGit {
+                repository: crate::RemoteRepository::new(repository).expect("repository"),
+                commit: crate::GitCommit::new(commit).expect("commit"),
+            },
+            setup_commands: Vec::new(),
+            baseline: crate::BaselineStagePlan {
+                stage: crate::EvaluationStage::Baseline,
+                seed: crate::WorkspaceSeed::TaskSource,
+                expectation: CommandExpectation::Failure,
+                test_patch: None,
+                commands: Vec::new(),
+            },
+            agent: crate::AgentStagePlan {
+                stage: crate::EvaluationStage::Agent,
+                seed: crate::WorkspaceSeed::TaskSource,
+                projection: crate::AgentTaskProjection {
+                    task_id,
+                    description: String::new(),
+                    instructions: String::new(),
+                },
+            },
+            public: crate::VerificationStagePlan {
+                stage: crate::EvaluationStage::Public,
+                seed: crate::WorkspaceSeed::AgentOutput,
+                expectation: CommandExpectation::Success,
+                test_patch: None,
+                commands: Vec::new(),
+            },
+            hidden: crate::VerificationStagePlan {
+                stage: crate::EvaluationStage::Hidden,
+                seed: crate::WorkspaceSeed::AgentOutput,
+                expectation: CommandExpectation::Success,
+                test_patch: None,
+                commands: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn mixed_revision_cache_does_not_mark_repository_cached() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repository = "https://example.invalid/repo.git";
+        let hit_commit = "0123456789abcdef0123456789abcdef01234567";
+        let miss_commit = "fedcba9876543210fedcba9876543210fedcba98";
+        let plans = vec![
+            remote_workspace_plan("task-hit", repository, hit_commit),
+            remote_workspace_plan("task-miss", repository, miss_commit),
+        ];
+        let cache = SourceTemplateCache::new(temp.path().join("source-cache"));
+        let hit_destination = temp.path().join("hit-destination");
+        cache
+            .prepare_remote(
+                "task-hit",
+                repository,
+                hit_commit,
+                &hit_destination,
+                &CancellationToken::new(),
+                |staging| {
+                    fs::create_dir_all(staging).map_err(|error| error.to_string())?;
+                    fs::write(staging.join("README.md"), "fixture")
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .expect("cache hit fixture");
+
+        let cached = cached_remote_repository_set(&plans, &cache).expect("cache lookup");
+        assert!(!cached.contains(repository));
+    }
+
     /// 固定 git 能力与固定 commit 的 mock 后端，只服务于远程 git 源全路径测试。
     struct SourceSandboxBackend;
 
@@ -7992,7 +8085,7 @@ mod tests {
         // 首次 fetch 后缓存模板已发布，后续命中直接物化、不再 fetch。
         assert!(
             cache
-                .entry_available(task_id.as_str(), repository)
+                .entry_available(task_id.as_str(), repository, REMOTE_SOURCE_COMMIT)
                 .expect("published cache entry")
         );
         let second_task_dir = temp.path().join("task-second");

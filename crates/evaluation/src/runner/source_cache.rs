@@ -1,8 +1,8 @@
 //! Persistent remote source-template cache for Evaluation.
 //!
-//! Each task/repository identity owns one fixed template directory. The first fetch is staged,
-//! checked, and atomically renamed into place while a per-key lock is held. Later runs copy the
-//! existing directory directly.
+//! Each task/repository/revision identity owns one fixed template directory. The first fetch is
+//! staged, checked, and atomically renamed into place while a per-key lock is held. Later runs
+//! copy the existing directory directly.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -109,8 +109,9 @@ impl SourceTemplateCache {
         &self,
         task_id: &str,
         repository: &str,
+        revision: &str,
     ) -> Result<bool, SourceCacheError> {
-        let key = Self::cache_key(task_id, repository);
+        let key = Self::cache_key(task_id, repository, revision);
         let key_dir = self.key_dir(&key);
         let path = key_dir.join(TEMPLATE_DIR);
         match fs::metadata(&path) {
@@ -137,6 +138,7 @@ impl SourceTemplateCache {
         &self,
         task_id: &str,
         repository: &str,
+        revision: &str,
         workspace_dir: &Path,
         cancellation: &CancellationToken,
         fetch: F,
@@ -156,7 +158,7 @@ impl SourceTemplateCache {
                 format!("failed to create source-template cache root: {error}"),
             )
         })?;
-        let key = Self::cache_key(task_id, repository);
+        let key = Self::cache_key(task_id, repository, revision);
         let key_dir = self.key_dir(&key);
         fs::create_dir_all(&key_dir).map_err(|error| {
             SourceCacheError::new(
@@ -237,11 +239,12 @@ impl SourceTemplateCache {
         })
     }
 
-    pub(crate) fn cache_key(task_id: &str, repository: &str) -> String {
+    pub(crate) fn cache_key(task_id: &str, repository: &str, revision: &str) -> String {
         let mut digest = Sha256::new();
         digest.update(b"evaluation.source-template\0");
         update_digest_value(&mut digest, task_id);
         update_digest_value(&mut digest, repository);
+        update_digest_value(&mut digest, revision);
         format!("sha256:{:x}", digest.finalize())
     }
 
@@ -327,6 +330,7 @@ mod tests {
             .prepare_remote(
                 "task",
                 "https://example.invalid/repo.git",
+                "commit-a",
                 &destination,
                 &CancellationToken::new(),
                 |staging| {
@@ -342,7 +346,7 @@ mod tests {
         );
         assert!(
             cache
-                .entry_available("task", "https://example.invalid/repo.git")
+                .entry_available("task", "https://example.invalid/repo.git", "commit-a")
                 .expect("entry availability")
         );
 
@@ -351,6 +355,7 @@ mod tests {
             .prepare_remote(
                 "task",
                 "https://example.invalid/repo.git",
+                "commit-a",
                 &second_destination,
                 &CancellationToken::new(),
                 |_| panic!("cache hit must not fetch"),
@@ -371,19 +376,24 @@ mod tests {
             .prepare_remote(
                 "task",
                 "repo",
+                "commit-a",
                 &destination,
                 &CancellationToken::new(),
                 |_| Err("network failed".to_string()),
             )
             .expect_err("fetch failure");
         assert_eq!(error.code, SourceCacheErrorCode::FetchFailed);
-        assert!(!cache.entry_available("task", "repo").expect("lookup"));
+        assert!(
+            !cache
+                .entry_available("task", "repo", "commit-a")
+                .expect("lookup")
+        );
     }
 
     #[test]
     fn invalid_template_entry_fails_closed_without_fetching_again() {
         let (temp, cache) = cache_with_temp();
-        let key = SourceTemplateCache::cache_key("task", "repo");
+        let key = SourceTemplateCache::cache_key("task", "repo", "commit-a");
         let key_dir = cache.key_dir(&key);
         fs::create_dir_all(&key_dir).expect("cache key directory");
         fs::write(key_dir.join(TEMPLATE_DIR), b"not a directory").expect("invalid entry");
@@ -392,11 +402,76 @@ mod tests {
             .prepare_remote(
                 "task",
                 "repo",
+                "commit-a",
                 &temp.path().join("destination"),
                 &CancellationToken::new(),
                 |_| panic!("invalid cache entry must not trigger a new fetch"),
             )
             .expect_err("invalid template entry must fail closed");
         assert_eq!(error.code, SourceCacheErrorCode::LookupFailed);
+    }
+
+    #[test]
+    fn different_revision_uses_distinct_key_and_does_not_hit_legacy_entry() {
+        let (temp, cache) = cache_with_temp();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), b"source").expect("source file");
+
+        // Recreate the pre-revision cache layout: task + repository only.
+        let mut legacy_digest = Sha256::new();
+        legacy_digest.update(b"evaluation.source-template\0");
+        update_digest_value(&mut legacy_digest, "task");
+        update_digest_value(&mut legacy_digest, "repo");
+        let legacy_key = format!("{:x}", legacy_digest.finalize());
+        let legacy_template = cache.root.join(legacy_key).join(TEMPLATE_DIR);
+        fs::create_dir_all(&legacy_template).expect("legacy template");
+        fs::write(legacy_template.join("README.md"), b"legacy").expect("legacy file");
+
+        assert_ne!(
+            SourceTemplateCache::cache_key("task", "repo", "commit-a"),
+            SourceTemplateCache::cache_key("task", "repo", "commit-b")
+        );
+        assert!(
+            !cache
+                .entry_available("task", "repo", "commit-a")
+                .expect("revision-specific lookup")
+        );
+
+        let destination = temp.path().join("destination");
+        let preparation = cache
+            .prepare_remote(
+                "task",
+                "repo",
+                "commit-a",
+                &destination,
+                &CancellationToken::new(),
+                |staging| {
+                    copy_tree_checked(&source, staging).map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .expect("revision-specific fetch");
+        assert_eq!(preparation.status, SourceTemplateCacheStatus::Miss);
+        assert_eq!(
+            fs::read_to_string(destination.join("README.md")).unwrap(),
+            "source"
+        );
+
+        let second_destination = temp.path().join("destination-second");
+        let second_preparation = cache
+            .prepare_remote(
+                "task",
+                "repo",
+                "commit-b",
+                &second_destination,
+                &CancellationToken::new(),
+                |staging| {
+                    copy_tree_checked(&source, staging).map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .expect("different revision fetch");
+        assert_eq!(second_preparation.status, SourceTemplateCacheStatus::Miss);
     }
 }
