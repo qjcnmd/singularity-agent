@@ -7,7 +7,6 @@ use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::NetworkSandboxPolicy;
 use crate::permissions::PermissionProfile;
 use anyhow::Result;
-use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -195,17 +194,9 @@ impl ResolvedWindowsSandboxPermissions {
 
         if self.has_writable_tmpdir_entry() {
             roots.extend(windows_temp_env_roots(env_map).into_iter().map(|root| {
-                let read_only_subpaths = if self.protect_workspace_metadata {
-                    PROTECTED_METADATA_PATH_NAMES
-                        .iter()
-                        .map(|name| root.join(name))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
                 WindowsWritableRoot {
                     root,
-                    read_only_subpaths,
+                    read_only_subpaths: Vec::new(),
                 }
             }));
         }
@@ -350,6 +341,7 @@ mod tests {
     use crate::permissions::ManagedFileSystemPermissions;
     use crate::permissions::project_roots_glob_pattern;
     use pretty_assertions::assert_eq;
+    use singularity_core::PROTECTED_METADATA_PATH_NAMES;
     use tempfile::TempDir;
 
     fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
@@ -386,6 +378,55 @@ mod tests {
         .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(expected_roots, roots);
+    }
+
+    #[test]
+    fn permission_profile_workspace_write_protects_metadata_only_in_workspace_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let tmp_dir = tmp.path().join("tmp");
+        for name in PROTECTED_METADATA_PATH_NAMES {
+            std::fs::create_dir_all(cwd.join(name)).expect("create protected workspace metadata");
+        }
+        std::fs::create_dir_all(&temp_dir).expect("create TEMP dir");
+        std::fs::create_dir_all(&tmp_dir).expect("create TMP dir");
+
+        let env_map = HashMap::from([
+            ("TEMP".to_string(), temp_dir.to_string_lossy().to_string()),
+            ("TMP".to_string(), tmp_dir.to_string_lossy().to_string()),
+        ]);
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+            &PermissionProfile::workspace_write(),
+        )
+        .expect("managed permission profile");
+        let roots = permissions.writable_roots_for_cwd(&cwd, &env_map);
+
+        let workspace_root = roots
+            .iter()
+            .find(|root| root.root == dunce::canonicalize(&cwd).expect("canonical workspace"))
+            .expect("workspace writable root");
+        assert_eq!(
+            workspace_root
+                .read_only_subpaths
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            PROTECTED_METADATA_PATH_NAMES
+                .iter()
+                .map(|name| workspace_root.root.join(name))
+                .collect::<std::collections::HashSet<_>>()
+        );
+        for temp_root in [temp_dir, tmp_dir] {
+            let writable_root = roots
+                .iter()
+                .find(|root| root.root == temp_root)
+                .expect("temporary writable root");
+            assert!(
+                writable_root.read_only_subpaths.is_empty(),
+                "temporary writable roots must not synthesize workspace metadata protections: {writable_root:?}"
+            );
+        }
     }
 
     #[test]

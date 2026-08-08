@@ -213,12 +213,16 @@ mod tests {
     }
 
     #[test]
-    fn includes_tmp_env_vars_when_requested() {
+    fn includes_tmp_env_roots_without_synthesizing_metadata_denies() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
         let temp_dir = tmp.path().join("temp");
-        let _ = fs::create_dir_all(&command_cwd);
+        let tmp_dir = tmp.path().join("tmp");
+        for name in PROTECTED_METADATA_PATH_NAMES {
+            fs::create_dir_all(command_cwd.join(name)).expect("create workspace metadata");
+        }
         let _ = fs::create_dir_all(&temp_dir);
+        let _ = fs::create_dir_all(&tmp_dir);
 
         let permission_profile = workspace_write_profile(
             &[],
@@ -227,7 +231,7 @@ mod tests {
         );
         let mut env_map = HashMap::new();
         env_map.insert("TEMP".into(), temp_dir.to_string_lossy().to_string());
-        env_map.insert("TMP".into(), temp_dir.to_string_lossy().to_string());
+        env_map.insert("TMP".into(), tmp_dir.to_string_lossy().to_string());
         let workspace_roots = workspace_roots_for(command_cwd.as_path());
 
         let paths = compute_allow_paths(
@@ -240,14 +244,24 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [
             dunce::canonicalize(&command_cwd).unwrap(),
             dunce::canonicalize(&temp_dir).unwrap(),
+            dunce::canonicalize(&tmp_dir).unwrap(),
         ]
         .into_iter()
         .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        let mut expected_deny = expected_existing_protected_paths(&[&command_cwd]);
-        expected_deny.extend(expected_all_protected_paths(&temp_dir));
+        let expected_deny = expected_all_protected_paths(&command_cwd);
         assert_eq!(expected_deny, paths.deny);
+        assert!(
+            paths
+                .deny
+                .is_disjoint(&expected_all_protected_paths(&temp_dir))
+        );
+        assert!(
+            paths
+                .deny
+                .is_disjoint(&expected_all_protected_paths(&tmp_dir))
+        );
     }
 
     #[test]
