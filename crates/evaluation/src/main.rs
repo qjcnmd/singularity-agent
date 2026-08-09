@@ -10,7 +10,7 @@ use singularity_evaluation::runner::{
     EvaluationRunMode, EvaluationRunParams, EvaluationRunResult, run_evaluation_with_mode,
 };
 use singularity_model::ProviderConfigSnapshot;
-use singularity_sandbox::PlatformSandboxBackend;
+use singularity_sandbox::WindowsSandboxBackend;
 use singularity_store::SessionStore;
 
 #[derive(Debug, Parser)]
@@ -145,7 +145,7 @@ fn run_manifest(
             max_workers,
             recovery_every,
         },
-        Arc::new(PlatformSandboxBackend::new()),
+        Arc::new(WindowsSandboxBackend::new()),
         &provider_snapshot,
         &CancellationToken::new(),
         &mut trace_store,

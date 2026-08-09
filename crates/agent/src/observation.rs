@@ -11,7 +11,7 @@ use singularity_model::{
     ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase, ProviderErrorStage,
 };
 
-use super::completion::{ToolResultOccurrence, ToolResultVisibility};
+use super::occurrence::{ToolResultOccurrence, ToolResultVisibility};
 
 /// event sink 拒绝事件时使用的不透明错误；原始 sink 错误不会进入 Agent 结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,6 @@ pub enum AgentObservation {
     ToolResult(Box<ToolResultObservation>),
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
-    Verification(VerificationObservation),
 }
 
 /// 一个 occurrence 在当前 turn 内的稳定身份与父子关联。
@@ -97,7 +96,6 @@ pub struct PromptAssemblyObservation {
     pub request_token_count: u32,
     pub request_digest: String,
     pub compacted: bool,
-    pub finalization_only: bool,
 }
 
 /// model 返回的一次 tool occurrence 的稳定终态。
@@ -199,28 +197,6 @@ pub struct SandboxExecutionOccurrence {
     pub command_id_binding_valid: Option<bool>,
     pub workspace_mutation: Option<singularity_tools::WorkspaceMutation>,
     pub enforcement: Option<singularity_tools::SandboxBackendEnforcement>,
-}
-
-/// CompletionTracker 的真实 command 观察或 completion gate 结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationStatus {
-    CommandPassed,
-    CommandFailed,
-    GatePassed,
-    GateRejected,
-    RepairRequested,
-}
-
-/// verification occurrence 的安全计数与真实 command duration 关联。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct VerificationObservation {
-    pub identity: OccurrenceIdentity,
-    pub lifecycle: OccurrenceLifecycle<VerificationStatus>,
-    pub required_command_count: u32,
-    pub satisfied_command_count: u32,
-    pub occurrence_count: u32,
-    pub command_duration_ms: Option<u64>,
 }
 
 /// provider transport attempt 的终态。

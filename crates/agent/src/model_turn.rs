@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelToolSchema, ModelTurnRequest, ToolChoiceMode,
+    ModelToolSchema, ModelTurnRequest,
 };
 use singularity_tools::{ToolBroker, ToolCallRequest, ToolResult, approximate_token_count};
 
@@ -27,15 +27,6 @@ pub(super) struct ModelToolView {
     pub(super) max_tool_calls: u32,
 }
 
-impl ModelToolView {
-    pub(super) fn finalization() -> Self {
-        Self {
-            tools: Vec::new(),
-            max_tool_calls: 0,
-        }
-    }
-}
-
 pub(super) fn model_turn_request(
     input: &AgentLoopInput,
     budget: &ContextBudget,
@@ -43,7 +34,6 @@ pub(super) fn model_turn_request(
     state: &AgentLoopState,
     tool_view: ModelToolView,
     capabilities: &ProviderProtocolContract,
-    finalization_only: bool,
 ) -> ModelTurnRequest {
     let tools = tool_view.tools;
     let strict_tool_schema = !tools.is_empty()
@@ -62,9 +52,6 @@ pub(super) fn model_turn_request(
         },
         provider_reasoning_history: state.provider_reasoning_history.clone(),
     };
-    if finalization_only {
-        request.tool_choice.mode = ToolChoiceMode::None;
-    }
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request

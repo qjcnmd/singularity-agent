@@ -34,17 +34,17 @@ use singularity_tools::{
     PATCH_TOOL as TOOL_PATCH, ReadToolInput,
     SandboxExecutionSinkError as ToolSandboxExecutionSinkError, SandboxFilesystemMode,
     SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolExecutionMode, ToolExecutor,
-    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspaceMutation,
-    WorkspacePatch, WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
+    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch,
+    WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
     approximate_token_count, command_script_scope_digest_with_policy,
 };
 use thiserror::Error;
 
 mod checkpoint;
-mod completion;
 mod context;
 mod model_turn;
 mod observation;
+mod occurrence;
 mod tool_occurrence;
 
 use checkpoint::HistoricalModelContext;
@@ -71,7 +71,6 @@ impl TurnCheckpoint {
             self = self.with_pending_tool_failure(
                 "not_executed_due_to_user_input",
                 "tool was not executed because newer user input changed the task",
-                false,
             )?;
         }
         self.append_user_inputs(inputs)
@@ -81,7 +80,6 @@ impl TurnCheckpoint {
         mut self,
         error_code: &str,
         summary: &str,
-        observe_completion: bool,
     ) -> Result<Self, String> {
         if self.pending_tool_calls.is_empty() {
             return Err("turn checkpoint pending tool call is missing".to_string());
@@ -117,9 +115,6 @@ impl TurnCheckpoint {
             let mut result = ToolResult::summary(tool_call_id, tool_name, false, summary);
             result.error_code = Some(error_code.to_string());
             result.failure_kind = Some(ToolFailureKind::Cancelled);
-            if observe_completion {
-                self.state.completion.observe(&result);
-            }
             self.state.messages.push(tool_result_message(&result));
             self.state
                 .tool_result_occurrences
@@ -133,15 +128,11 @@ impl TurnCheckpoint {
     }
 
     fn append_user_inputs(mut self, inputs: &[String]) -> Result<Self, String> {
-        self.state.completion.invalidate_after_user_input();
         self.state.messages.extend(
             inputs
                 .iter()
                 .map(|input| ModelMessage::text(ModelRole::User, input.clone())),
         );
-        self.state.repair_state = None;
-        self.state.last_completion_error = None;
-        self.state.last_repair_failure = None;
         self.encode().map(|_| self)
     }
 }
@@ -189,7 +180,6 @@ impl ApprovalCheckpoint {
         .with_pending_tool_failure(
             "approval_denied",
             "tool was not executed because approval was denied",
-            true,
         )?;
         if inputs.is_empty() {
             checkpoint.encode().map(|_| checkpoint)
@@ -202,11 +192,6 @@ impl ApprovalCheckpoint {
 /// Consumer callback for durable turn-boundary persistence.
 pub type AgentLoopCheckpointCallback<'a> =
     dyn FnMut(TurnCheckpointEvent) -> Result<(), AgentLoopEventSinkError> + 'a;
-use completion::{CompletionTracker, RepairFailureState};
-pub use completion::{
-    ToolResultOccurrence, ToolResultVisibility, successful_command_scope_digest,
-    terminal_command_scope_digests,
-};
 pub use context::{
     AgentContextItem, AgentContextItemPriority, AgentContextTrace, ContextBundle,
     assemble_context_items,
@@ -220,21 +205,25 @@ pub use observation::{
     PolicyDecisionStatus, PromptAssemblyObservation, PromptAssemblyStatus,
     ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
     SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
-    ToolResultObservation, VerificationObservation, VerificationStatus,
+    ToolResultObservation,
+};
+pub use occurrence::{
+    ToolResultOccurrence, ToolResultVisibility, successful_command_scope_digest,
+    terminal_command_scope_digests,
 };
 use tool_occurrence::*;
 
 #[cfg(test)]
-use completion::ToolResultOccurrenceWire;
+use occurrence::ToolResultOccurrenceWire;
 #[cfg(test)]
 use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
-/// Approval checkpoints include the durable first-terminal tool-call ledger.
-const APPROVAL_CHECKPOINT_VERSION: u32 = 7;
-/// Ordinary turn checkpoints include the durable first-terminal tool-call ledger.
-const TURN_CHECKPOINT_VERSION: u32 = 6;
+/// Approval checkpoints carry transcript, occurrence and approval facts only.
+const APPROVAL_CHECKPOINT_VERSION: u32 = 8;
+/// Ordinary turn checkpoints carry transcript and pending-call facts only.
+const TURN_CHECKPOINT_VERSION: u32 = 7;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise private checklist; update it when evidence or failure changes the approach, and complete the requested work before the final answer. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -245,28 +234,7 @@ const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
 const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
 const MODEL_RESPONSE_VALIDATION_ERROR: &str = "model response validation failed";
-const POST_MUTATION_VERIFICATION_REQUIRED: &str =
-    "completion gate rejected final answer: verification required after workspace mutation";
-const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
-    "invalid_tool_arguments",
-    "invalid_tool_input",
-    "expected_content_missing",
-    "tool_read_failed",
-    "binary_pattern",
-    "command_exit_nonzero",
-    "command_tests_failed",
-    "command_build_failed",
-];
-const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
-const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
-const MAX_REPAIR_ATTEMPTS: u32 = 3;
-const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
-const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
 const MAX_BOUNDED_TEXT_CHARS: usize = 512;
-const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPAIR_STATE_INSTRUCTIONS: &str = "Follow the bounded repair guidance. Use the latest typed tool result and trusted workspace revision evidence to choose the next valid action. When a repair strategy change is required, make a materially different workspace mutation that addresses the reported failure before retrying verification. Do not claim success without new verification evidence.";
-const COMPLETION_REPAIR_SIGNATURE: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const EVENT_SINK_FAILURE_ERROR: &str = "agent event sink failed";
 
 /// 一次 `AgentLoop` 运行的外部可观察生命周期状态。
@@ -312,47 +280,15 @@ impl From<&str> for AgentStatus {
     }
 }
 
-/// 工作区变更或必要检查后由完成门禁收集的证据。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-pub struct AgentVerification {
-    pub required: bool,
-    pub passed: bool,
-    pub successful_command_count: u32,
-    pub required_command_count: u32,
-    pub satisfied_command_count: u32,
-    pub unresolved_failures: Vec<String>,
-}
-
-/// Why a bounded repair was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentRepairReason {
-    VerificationFailed,
-    ToolFailure,
-    RevisionConflict,
-}
-
-/// 无效调用、修复尝试和被拒绝完成尝试的计数器。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AgentRecoveryMetrics {
-    pub invalid_tool_call_count: u32,
-    pub repeated_tool_call_count: u32,
-    pub repair_attempt_count: u32,
-    pub completion_rejection_count: u32,
-}
-
 /// 从 loop 派生的公开运行状态，包括门禁证据和安全诊断信息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
-    pub completed: bool,
     pub final_answer: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
     pub approval_count: u32,
     pub audit_events: Vec<Value>,
-    pub verification: AgentVerification,
-    pub recovery_metrics: AgentRecoveryMetrics,
     pub model_usage: ModelUsage,
     pub provider_attempts: ProviderAttemptMetadata,
     pub error: Option<String>,
@@ -389,14 +325,11 @@ impl AgentRunStatus {
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             status: AgentStatus::Failed,
-            completed: false,
             final_answer: None,
             model_turns: 0,
             tool_calls: 0,
             approval_count: 0,
             audit_events: Vec::new(),
-            verification: AgentVerification::default(),
-            recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
             error: Some(message.into()),
@@ -421,7 +354,6 @@ impl AgentRunStatus {
 
     /// 更新状态并保留已有诊断字段。
     pub fn with_status(mut self, status: AgentStatus) -> Self {
-        self.completed = status == AgentStatus::Completed;
         self.status = status;
         self
     }
@@ -578,19 +510,9 @@ impl AgentLoopInput {
 /// `"type"` 键位于对象中部，前缀匹配对真实格式恒不成立。
 const COMPACTION_SUMMARY_MARKER: &str = "\"type\":\"agent_context_compaction\"";
 
-/// completion feedback Developer 消息的固定前缀（见 `CompletionTracker::feedback`）。
-const COMPLETION_FEEDBACK_PREFIX: &str = "Do not finalize yet.";
-
-/// repair 预算耗尽提示（防御性剔除；正常不出现于 completed turn）。
-const REPAIR_BUDGET_EXHAUSTED_INSTRUCTION: &str =
-    "repair budget exhausted; refusing another repair attempt";
-
 /// 从跨轮 seed 组装新 Turn 的初始模型消息。
 ///
-/// 规则：删除开头连续的旧 leading Developer；剔除 repair/repeated-failure/budget/
-/// completion 瞬态 Developer（全部为固定常量匹配，不按自由文本猜测）；保留
-/// compaction summary（固定 JSON 前缀）；插入当前唯一 leading block；末尾追加
-/// 当前 user 输入。
+/// Replace the historical leading developer block while preserving compaction summaries.
 fn prepare_seed_messages(
     seed: &HistoricalModelContext,
     input: &AgentLoopInput,
@@ -608,18 +530,7 @@ fn prepare_seed_messages(
             break;
         }
     }
-    for message in seed_messages {
-        if message.role == ModelRole::Developer
-            && !message.content.contains(COMPACTION_SUMMARY_MARKER)
-            && (message.content.starts_with(REPAIR_STATE_INSTRUCTIONS)
-                || message.content == REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
-                || message.content == REPAIR_BUDGET_EXHAUSTED_INSTRUCTION
-                || message.content.starts_with(COMPLETION_FEEDBACK_PREFIX))
-        {
-            continue;
-        }
-        messages.push(message);
-    }
+    messages.extend(seed_messages);
     messages.insert(
         0,
         ModelMessage::text(
@@ -756,7 +667,6 @@ impl ApprovalGrant {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
-    pub completed: bool,
     pub final_answer: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
@@ -770,8 +680,6 @@ pub struct AgentLoopResult {
     pub pending_approvals: Vec<PendingApprovalOccurrence>,
     /// Public projection of the ordered internal tool-result occurrences.
     pub tool_results: Vec<ToolResult>,
-    pub verification: AgentVerification,
-    pub recovery_metrics: AgentRecoveryMetrics,
     pub model_usage: ModelUsage,
     pub provider_attempts: ProviderAttemptMetadata,
     pub error: Option<String>,
@@ -821,14 +729,11 @@ impl AgentLoopResult {
     pub fn to_run_status(&self) -> AgentRunStatus {
         AgentRunStatus {
             status: self.status.clone(),
-            completed: self.completed,
             final_answer: self.final_answer.clone(),
             model_turns: self.model_turns,
             tool_calls: self.tool_calls,
             approval_count: self.approval_count,
             audit_events: audit_events_from_tool_results(&self.tool_results),
-            verification: self.verification.clone(),
-            recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
             provider_attempts: self.provider_attempts.clone(),
             error: self.error.clone(),
@@ -850,14 +755,7 @@ struct AgentLoopState {
     pending_approvals: Vec<PendingApprovalOccurrence>,
     used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
-    completion: CompletionTracker,
-    repair_state: Option<RepairState>,
-    /// Monotonic repair-attempt ledger for the current episode. The active state may be cleared
-    /// after real progress, but this counter survives that transition and approval checkpoints.
-    repair_attempts: u32,
-    repair_cycles: Vec<RepairCycleRecord>,
-    last_completion_error: Option<String>,
-    recovery_metrics: AgentRecoveryMetrics,
+    execution_facts: ExecutionFacts,
     model_usage: ModelUsage,
     provider_attempts: ProviderAttemptMetadata,
     seen_tool_call_fingerprints: BTreeSet<String>,
@@ -867,35 +765,29 @@ struct AgentLoopState {
     /// Claims made by the current in-flight batch; unlike the completed ledger, this is not
     /// persisted because suspended approval has not reached a terminal outcome.
     first_attempt_claims: BTreeSet<String>,
-    last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
     provider_protocol_contract: Option<ProviderProtocolContract>,
     provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
-/// Internal repair state. The signature is a hash-only identity used to bound repeated repair;
-/// raw failure text and tool arguments never cross the checkpoint or trace projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RepairState {
-    reason: AgentRepairReason,
-    attempt: u32,
-    max_attempts: u32,
-    required_revision: Option<WorkspaceRevision>,
-    signature: String,
-    /// The tool whose legal success can close a tool-failure episode.  Other repair reasons
-    /// require mutation or required verification progress instead.
-    failed_tool_name: Option<String>,
+/// Execution facts retained across tool calls and checkpoint restore.
+///
+/// Carries the latest trusted workspace revision so a resumed workspace executor can reject stale
+/// mutations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExecutionFacts {
+    workspace_revision: Option<WorkspaceRevision>,
 }
 
-/// Producer-owned evidence for one committed repair decision and its revision-bound verification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RepairCycleRecord {
-    attempt: u32,
-    revision: WorkspaceRevision,
-    command_scope_digest: String,
-    verification_passed: bool,
+impl ExecutionFacts {
+    fn observe(&mut self, result: &ToolResult) {
+        if let Some(observation) = result.workspace_observation()
+            && let Some(revision) = observation.revision()
+        {
+            self.workspace_revision = Some(revision);
+        }
+    }
 }
 
 impl AgentLoopState {
@@ -911,18 +803,12 @@ impl AgentLoopState {
             pending_approvals: Vec::new(),
             used_approval_grants: BTreeSet::new(),
             prior_approval_count: 0,
-            completion: CompletionTracker::default(),
-            repair_state: None,
-            repair_attempts: 0,
-            repair_cycles: Vec::new(),
-            last_completion_error: None,
-            recovery_metrics: AgentRecoveryMetrics::default(),
+            execution_facts: ExecutionFacts::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             completed_tool_call_fingerprints: BTreeSet::new(),
             first_attempt_claims: BTreeSet::new(),
-            last_repair_failure: None,
             model_turn_limit,
             context_trace,
             provider_protocol_contract: None,
@@ -933,18 +819,18 @@ impl AgentLoopState {
     fn finish(
         self,
         status: AgentStatus,
-        completed: bool,
+        _completed: bool,
         final_answer: Option<String>,
         model_turns: u32,
         error: Option<String>,
     ) -> AgentLoopResult {
-        self.finish_with_model_error(status, completed, final_answer, model_turns, error, None)
+        self.finish_with_model_error(status, _completed, final_answer, model_turns, error, None)
     }
 
     fn finish_with_model_error(
         self,
         status: AgentStatus,
-        completed: bool,
+        _completed: bool,
         final_answer: Option<String>,
         model_turns: u32,
         error: Option<String>,
@@ -958,18 +844,14 @@ impl AgentLoopState {
             .into_iter()
             .map(ToolResultOccurrence::into_result)
             .collect::<Vec<_>>();
-        let verification = self.completion.summary();
         AgentLoopResult {
             status,
-            completed,
             final_answer,
             model_turns,
             tool_calls: tool_results.len() as u32,
             approval_count,
             pending_approvals: self.pending_approvals,
             tool_results,
-            verification,
-            recovery_metrics: self.recovery_metrics,
             model_usage: self.model_usage,
             provider_attempts: self.provider_attempts,
             error,
@@ -1194,12 +1076,6 @@ impl AgentLoopState {
             },
             model_turns,
             resume_attempt: input.resume_attempt,
-            completion: self.completion.clone(),
-            repair_state: self.repair_state.clone(),
-            repair_attempts: self.repair_attempts,
-            repair_cycles: self.repair_cycles.clone(),
-            last_completion_error: self.last_completion_error.clone(),
-            recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
             provider_attempts,
             context_trace: self.context_trace.clone(),
@@ -1209,270 +1085,6 @@ impl AgentLoopState {
                 .iter()
                 .cloned()
                 .collect(),
-            last_repair_failure: self.last_repair_failure.clone(),
-        }
-    }
-
-    fn completion_ready(&self) -> bool {
-        // The runtime completion gate is the sole authority for a terminal response.
-        self.completion.allows_final()
-    }
-
-    fn repair_feedback_with_failure(&self, failure: Option<&ToolResult>) -> String {
-        let Some(state) = self.repair_state.as_ref() else {
-            return REPAIR_STATE_INSTRUCTIONS.to_string();
-        };
-        let reason = state.reason;
-        let context = self.build_repair_context(reason, failure);
-        let context = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
-        let context = if context.chars().count() <= MAX_REPAIR_CONTEXT_SERIALIZED_CHARS {
-            context
-        } else {
-            // Preserve the required shape without admitting an unbounded model message if a
-            // future producer weakens one of the field-level limits.
-            json!({
-                "failed_requirement": "bounded repair context exceeded its safe limit",
-                "evidence": "bounded repair evidence unavailable",
-                "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
-                "previous_action": "bounded repair action unavailable",
-                "previous_result": "bounded repair result unavailable",
-            })
-            .to_string()
-        };
-        format!("{REPAIR_STATE_INSTRUCTIONS} repair_context={context}")
-    }
-
-    fn schedule_repair(
-        &mut self,
-        reason: AgentRepairReason,
-        signature: impl Into<String>,
-        failed_tool_name: Option<&str>,
-    ) -> Result<RepairState, RepairState> {
-        let signature = signature.into();
-        // A prospective repair decision does not own the already-failing revision. Only a later
-        // mutation can bind the decision to a revision and make its verification cycle consume
-        // one repair attempt.
-        let required_revision = None;
-        if let Some(active) = self.repair_state.as_mut() {
-            if self.repair_attempts >= MAX_REPAIR_ATTEMPTS && active.required_revision.is_none() {
-                active.reason = reason;
-                active.attempt = MAX_REPAIR_ATTEMPTS.saturating_add(1);
-                active.max_attempts = MAX_REPAIR_ATTEMPTS;
-                active.required_revision = required_revision;
-                active.signature = signature;
-                active.failed_tool_name = failed_tool_name.map(str::to_string);
-                return Err(active.clone());
-            }
-            // A repeated failure, read, or approval resume does not replace the
-            // repair decision or create another prospective attempt. A real verification failure
-            // on the bound mutation may upgrade the causal reason without consuming an attempt.
-            let terminal_cycle_revision = active
-                .required_revision
-                .filter(|revision| Some(*revision) == self.completion.workspace_revision);
-            active.required_revision = terminal_cycle_revision;
-            if reason == AgentRepairReason::VerificationFailed && terminal_cycle_revision.is_some()
-            {
-                active.reason = reason;
-                active.signature = signature;
-                active.failed_tool_name = None;
-            } else if active.reason == AgentRepairReason::ToolFailure
-                && reason == AgentRepairReason::ToolFailure
-                && active.failed_tool_name.as_deref() == failed_tool_name
-            {
-                // A generic completion rejection or a different failed tool cannot replace the
-                // concrete call that must be corrected. Otherwise a later successful call to the
-                // original tool cannot close its repair decision.
-                active.signature = signature;
-                active.failed_tool_name = failed_tool_name.map(str::to_string);
-            }
-            return Ok(active.clone());
-        }
-
-        let attempt = self.repair_attempts.saturating_add(1);
-        let state = RepairState {
-            reason,
-            attempt,
-            max_attempts: MAX_REPAIR_ATTEMPTS,
-            required_revision,
-            signature,
-            failed_tool_name: failed_tool_name.map(str::to_string),
-        };
-        let exhausted = attempt > MAX_REPAIR_ATTEMPTS;
-        self.repair_state = Some(state.clone());
-        if exhausted { Err(state) } else { Ok(state) }
-    }
-
-    fn build_repair_context(
-        &self,
-        reason: AgentRepairReason,
-        failure: Option<&ToolResult>,
-    ) -> Value {
-        let summary = self.completion.summary();
-        let latest_result = failure.or_else(|| {
-            self.tool_result_occurrences
-                .last()
-                .map(ToolResultOccurrence::result)
-        });
-        let requires_strategy_change = self.repair_state.as_ref().is_some_and(|active| {
-            active.required_revision.is_none()
-                && matches!(reason, AgentRepairReason::RevisionConflict)
-        });
-        let active_tool_failure = (reason == AgentRepairReason::ToolFailure)
-            .then(|| {
-                let failed_tool_name = self
-                    .repair_state
-                    .as_ref()
-                    .and_then(|active| active.failed_tool_name.as_deref());
-                self.tool_result_occurrences
-                    .iter()
-                    .rev()
-                    .map(ToolResultOccurrence::result)
-                    .find(|result| {
-                        !result.ok
-                            && is_repairable_tool_result(result)
-                            && failed_tool_name.is_none_or(|name| result.tool_name == name)
-                    })
-            })
-            .flatten();
-        // A later diagnostic command is useful transcript evidence, but it must not replace the
-        // failure that owns the active repair decision.
-        let evidence_result = failure
-            .filter(|result| !result.ok)
-            .or(active_tool_failure)
-            .or_else(|| {
-                (!requires_strategy_change)
-                    .then_some(latest_result)
-                    .flatten()
-            });
-        let failed_requirement = requires_strategy_change
-            .then(|| self.last_completion_error.clone())
-            .flatten()
-            .or_else(|| summary.unresolved_failures.first().cloned())
-            .or_else(|| self.last_completion_error.clone())
-            .unwrap_or_else(|| repair_reason_text(reason).to_string());
-        // Mutation scope and digests remain in the trusted tool history. They are intentionally not
-        // copied into a latest-only repair state or compared against a later model response.
-        let previous_result = requires_strategy_change
-            .then(|| {
-                self.last_completion_error
-                    .as_deref()
-                    .map(|error| json!(bounded_repair_text(error)))
-            })
-            .flatten()
-            .or_else(|| latest_result.map(|result| json!(safe_tool_result_evidence(result))))
-            .or_else(|| {
-                self.tool_result_occurrences
-                    .last()
-                    .map(|occurrence| json!(safe_tool_result_evidence(occurrence.result())))
-            })
-            .or_else(|| {
-                self.last_completion_error
-                    .as_deref()
-                    .map(|error| json!(bounded_repair_text(error)))
-            })
-            .unwrap_or_else(|| json!("repair decision pending execution"));
-        // Keep the repair context tied to the latest typed result without duplicating mutation
-        // scope or digest state outside the complete tool history.
-        let previous_action = self
-            .tool_result_occurrences
-            .last()
-            .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
-            .or_else(|| failure.map(|result| json!(safe_repair_tool_name(result))))
-            .unwrap_or_else(|| json!(repair_reason_text(reason)));
-        json!({
-            "failed_requirement": bounded_repair_text(&failed_requirement),
-            "evidence": evidence_result
-                .map(safe_tool_result_evidence)
-                .unwrap_or_else(|| {
-                    previous_result
-                        .as_str()
-                        .map(bounded_repair_text)
-                        .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string()))
-                }),
-            "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
-            "previous_action": previous_action,
-            "previous_result": previous_result,
-            "repair_strategy_change_required": requires_strategy_change,
-        })
-    }
-
-    fn note_repair_mutation(&mut self, revision: WorkspaceRevision) {
-        let Some(active) = self.repair_state.as_mut() else {
-            return;
-        };
-        active.attempt = self.repair_attempts.saturating_add(1);
-        active.required_revision = Some(revision);
-    }
-
-    /// Commit exactly one repair attempt for a new mutation revision followed by its terminal
-    /// command observation.  A failed command remains visible as a consumed cycle and opens the
-    /// next prospective attempt; the third failed cycle terminates before another mutation can
-    /// be requested.
-    fn consume_repair_cycle_if_complete(
-        &mut self,
-        tool_name: &str,
-        result: &ToolResult,
-    ) -> Option<RepairCycleCommit> {
-        if tool_name != TOOL_COMMAND || result.tool_name != TOOL_COMMAND {
-            return None;
-        }
-        if !result.ok && !is_repairable_tool_result(result) {
-            return None;
-        }
-        let observation = result.workspace_observation()?;
-        if observation.mutation() != singularity_tools::WorkspaceMutation::Unchanged {
-            return None;
-        }
-        let revision = observation.revision()?;
-        if self.completion.workspace_revision != Some(revision) {
-            return None;
-        }
-        let command_scope_digest = tool_result_command_scope_digest(result)?;
-        // A successful command only closes the cycle after every required command for this
-        // revision has been observed.  A matching failure closes the failed cycle immediately.
-        if result.ok && !self.completion.verification_satisfied() {
-            return None;
-        }
-        let active = self.repair_state.as_mut()?;
-        if active.required_revision != Some(revision) {
-            return None;
-        }
-        self.repair_attempts = self.repair_attempts.saturating_add(1);
-        self.recovery_metrics.repair_attempt_count = self.repair_attempts;
-        active.attempt = self.repair_attempts;
-        let committed_attempt = self.repair_attempts;
-        self.repair_cycles.push(RepairCycleRecord {
-            attempt: committed_attempt,
-            revision,
-            command_scope_digest: command_scope_digest.to_string(),
-            verification_passed: result.ok,
-        });
-        if result.ok {
-            self.repair_state = None;
-            self.last_repair_failure = None;
-            return Some(RepairCycleCommit {
-                attempt: committed_attempt,
-                exhausted: false,
-            });
-        }
-        if committed_attempt >= MAX_REPAIR_ATTEMPTS {
-            // Keep an internal terminal marker so the current tool batch fails immediately.  The
-            // event projection below uses the committed attempt (3), never this sentinel (4).
-            active.attempt = MAX_REPAIR_ATTEMPTS.saturating_add(1);
-            active.required_revision = None;
-            Some(RepairCycleCommit {
-                attempt: committed_attempt,
-                exhausted: true,
-            })
-        } else {
-            // The failed verification is committed, but the next prospective attempt remains
-            // uncommitted until a new mutation revision is observed.
-            active.required_revision = None;
-            active.attempt = self.repair_attempts.saturating_add(1);
-            Some(RepairCycleCommit {
-                attempt: committed_attempt,
-                exhausted: false,
-            })
         }
     }
 
@@ -1482,24 +1094,14 @@ impl AgentLoopState {
         allowed_tool_names: &[String],
     ) -> (String, bool, bool) {
         let fingerprint = tool_call_fingerprint(call);
-        if !self.seen_tool_call_fingerprints.insert(fingerprint.clone()) {
-            self.recovery_metrics.repeated_tool_call_count = self
-                .recovery_metrics
-                .repeated_tool_call_count
-                .saturating_add(1);
-        }
+        self.seen_tool_call_fingerprints.insert(fingerprint.clone());
         let invalid = call.parse_status != ModelToolParseStatus::Valid
             || !call.arguments.is_object()
             || call.tool_name.trim().is_empty()
             || !allowed_tool_names
                 .iter()
                 .any(|tool_name| tool_name == &call.tool_name);
-        if invalid {
-            self.recovery_metrics.invalid_tool_call_count = self
-                .recovery_metrics
-                .invalid_tool_call_count
-                .saturating_add(1);
-        }
+        let _ = invalid;
         let first_attempt = self.claim_first_attempt(&fingerprint);
         (fingerprint, invalid, first_attempt)
     }
@@ -1518,87 +1120,8 @@ impl AgentLoopState {
             .insert(fingerprint.to_string());
     }
 
-    fn observe_tool_result(
-        &mut self,
-        tool_result: &ToolResult,
-        tool_call_fingerprint: &str,
-    ) -> Option<String> {
-        self.completion.observe(tool_result);
-        if tool_result.ok {
-            let tool_failure_resolved = self.repair_state.as_ref().is_some_and(|state| {
-                if state.reason != AgentRepairReason::ToolFailure
-                    || state.required_revision.is_some()
-                {
-                    return false;
-                }
-                match state.failed_tool_name.as_deref() {
-                    Some(failed_tool_name) => failed_tool_name == tool_result.tool_name,
-                    None => true,
-                }
-            });
-            if tool_failure_resolved {
-                // Mutation and verification failures require the same tool to succeed. A
-                // read-only or visibility failure may be superseded by any successful action
-                // because its typed result remains in the model-visible transcript.
-                self.repair_state = None;
-            }
-            self.last_repair_failure = None;
-            return None;
-        }
-        if !is_repairable_tool_result(tool_result) {
-            self.last_repair_failure = None;
-            return None;
-        }
-        let error_code = tool_result
-            .error_code
-            .as_deref()
-            .unwrap_or("tool_execution_failed");
-        // The public command error is intentionally coarse; the validated audit code retains the
-        // causal distinction needed to avoid treating different input repairs as one failure.
-        let repair_error_code = tool_result
-            .audit_metadata()
-            .and_then(Value::as_object)
-            .and_then(|audit| audit.get("argument_validation_code"))
-            .and_then(Value::as_str)
-            .unwrap_or(error_code);
-        let signature = repair_failure_signature(tool_call_fingerprint, repair_error_code);
-        let consecutive_count = if self
-            .last_repair_failure
-            .as_ref()
-            .is_some_and(|failure| failure.signature == signature)
-        {
-            self.last_repair_failure
-                .as_ref()
-                .map_or(1, |failure| failure.consecutive_count.saturating_add(1))
-        } else {
-            1
-        };
-        self.last_repair_failure = Some(RepairFailureState {
-            signature,
-            consecutive_count,
-        });
-        let repair_signature = self
-            .last_repair_failure
-            .as_ref()
-            .map(|failure| failure.signature.clone())
-            .unwrap_or_default();
-        let repair_reason = AgentRepairReason::ToolFailure;
-        let failed_tool_name = matches!(tool_result.tool_name.as_str(), TOOL_PATCH | TOOL_COMMAND)
-            .then_some(tool_result.tool_name.as_str());
-        if let Err(exhausted) =
-            self.schedule_repair(repair_reason, repair_signature, failed_tool_name)
-        {
-            self.repair_state = Some(RepairState {
-                reason: exhausted.reason,
-                attempt: exhausted.attempt,
-                max_attempts: exhausted.max_attempts,
-                required_revision: exhausted.required_revision,
-                signature: String::new(),
-                failed_tool_name: failed_tool_name.map(str::to_string),
-            });
-            return Some("repair budget exhausted; refusing another repair attempt".to_string());
-        }
-        (consecutive_count >= 2).then(|| REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
+    fn observe_tool_result(&mut self, tool_result: &ToolResult, _tool_call_fingerprint: &str) {
+        self.execution_facts.observe(tool_result);
     }
 
     fn append_visible_tool_result(&mut self, tool_result: ToolResult) {
@@ -1769,16 +1292,49 @@ enum ToolBatchControl {
     Cancelled,
 }
 
-/// Result of committing a revision-bound repair cycle.  The committed attempt is kept separate
-/// from the active repair state's prospective attempt so exhaustion never leaks an attempt four event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RepairCycleCommit {
-    attempt: u32,
-    exhausted: bool,
+/// Callbacks projected at typed runtime and durable checkpoint boundaries.
+///
+/// The event callback receives only bounded `AgentLoopEvent` values. The checkpoint callback is
+/// invoked after a checkpoint has been assembled and before the loop crosses that boundary.
+pub struct AgentLoopCallbacks<'a> {
+    pub on_event: Option<&'a mut AgentLoopEventCallback<'a>>,
+    pub on_checkpoint: Option<&'a mut AgentLoopCheckpointCallback<'a>>,
 }
 
-/// 调用方消费最终化 assistant 文本 delta 的窄 callback 类型。
-pub type AgentTextDeltaCallback<'a> = dyn FnMut(&str) + 'a;
+impl<'a> AgentLoopCallbacks<'a> {
+    /// Construct callbacks for a caller that only consumes runtime events.
+    pub fn events(on_event: &'a mut AgentLoopEventCallback<'a>) -> Self {
+        Self {
+            on_event: Some(on_event),
+            on_checkpoint: None,
+        }
+    }
+
+    /// Construct callbacks for callers that persist every durable boundary.
+    pub fn events_and_checkpoints(
+        on_event: &'a mut AgentLoopEventCallback<'a>,
+        on_checkpoint: &'a mut AgentLoopCheckpointCallback<'a>,
+    ) -> Self {
+        Self {
+            on_event: Some(on_event),
+            on_checkpoint: Some(on_checkpoint),
+        }
+    }
+
+    /// Construct a callback set with no external projections.
+    pub const fn none() -> Self {
+        Self {
+            on_event: None,
+            on_checkpoint: None,
+        }
+    }
+}
+
+/// The durable continuation source used by the single resume entry point.
+pub enum AgentContinuation<'a> {
+    Turn(&'a TurnCheckpoint),
+    Approval(&'a PendingApprovalOccurrence),
+}
 
 /// 编排模型提供方 turn、策略决策、沙箱 tool、approval 和最终答复阶段。
 pub struct AgentLoop<P> {
@@ -1816,45 +1372,17 @@ where
         self
     }
 
-    /// 运行一个新 turn，直到完成、因 approval 阻塞、被取消或拒绝继续执行。
-    pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
-        self.run_internal(input, None)
-    }
-
-    /// 运行一个新 turn，并在真实边界向调用方投影有序 typed 事件。
-    pub fn run_with_events(
+    /// Run a new turn until completion, approval pause, cancellation, or a typed failure.
+    pub fn run(
         &self,
         input: &AgentLoopInput,
-        on_event: &mut AgentLoopEventCallback<'_>,
+        callbacks: AgentLoopCallbacks<'_>,
     ) -> AgentLoopResult {
-        self.run_internal(input, Some(on_event))
-    }
-
-    /// Run while notifying the owner at durable input/tool-result boundaries.
-    pub fn run_with_events_and_checkpoints(
-        &self,
-        input: &AgentLoopInput,
-        on_event: &mut AgentLoopEventCallback<'_>,
-        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
-    ) -> AgentLoopResult {
-        self.run_internal_with_checkpoints(input, Some(on_event), Some(on_checkpoint))
-    }
-
-    /// 运行一个新 turn，并只向调用方投影最终化 assistant 回合的有序文本 delta。
-    pub fn run_with_text_deltas(
-        &self,
-        input: &AgentLoopInput,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
-    ) -> AgentLoopResult {
-        self.run_internal(
-            input,
-            Some(&mut |event| {
-                if let AgentLoopEvent::FinalTextDelta { delta } = event {
-                    on_text_delta(&delta);
-                }
-                Ok(())
-            }),
-        )
+        let AgentLoopCallbacks {
+            on_event,
+            on_checkpoint,
+        } = callbacks;
+        self.run_internal_with_checkpoints(input, on_event, on_checkpoint)
     }
 
     /// Build the first durable boundary for a turn before any model request or tool side effect.
@@ -1890,35 +1418,25 @@ where
             .map_err(|error| format!("initial turn checkpoint invalid: {error}"))
     }
 
-    /// Resume a non-approval turn from a validated durable boundary. No tool call is replayed;
-    /// the next provider request is built from the checkpoint's exact message/state snapshot.
-    pub fn resume_turn(
+    /// Resume one validated durable continuation without replaying a completed tool call.
+    pub fn resume(
         &self,
         input: &AgentLoopInput,
-        checkpoint: &TurnCheckpoint,
+        continuation: AgentContinuation<'_>,
+        callbacks: AgentLoopCallbacks<'_>,
     ) -> AgentLoopResult {
-        self.resume_turn_internal(input, checkpoint, None, None)
-    }
-
-    /// Resume a non-approval turn and project the same observable events as a fresh run.
-    pub fn resume_turn_with_events(
-        &self,
-        input: &AgentLoopInput,
-        checkpoint: &TurnCheckpoint,
-        on_event: &mut AgentLoopEventCallback<'_>,
-    ) -> AgentLoopResult {
-        self.resume_turn_internal(input, checkpoint, Some(on_event), None)
-    }
-
-    /// Resume a non-approval turn while notifying the owner at durable tool boundaries.
-    pub fn resume_turn_with_events_and_checkpoints(
-        &self,
-        input: &AgentLoopInput,
-        checkpoint: &TurnCheckpoint,
-        on_event: &mut AgentLoopEventCallback<'_>,
-        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
-    ) -> AgentLoopResult {
-        self.resume_turn_internal(input, checkpoint, Some(on_event), Some(on_checkpoint))
+        let AgentLoopCallbacks {
+            on_event,
+            on_checkpoint,
+        } = callbacks;
+        match continuation {
+            AgentContinuation::Turn(checkpoint) => {
+                self.resume_turn_internal(input, checkpoint, on_event, on_checkpoint)
+            }
+            AgentContinuation::Approval(pending) => {
+                self.resume_pending_approval_internal(input, pending, on_event, on_checkpoint)
+            }
+        }
     }
 
     fn resume_turn_internal(
@@ -1937,7 +1455,7 @@ where
         }
         if let Some(workspace_tools) = &self.workspace_tools
             && let Err(error) = workspace_tools
-                .bind_checkpoint_workspace_revision(state.completion.workspace_revision)
+                .bind_checkpoint_workspace_revision(state.execution_facts.workspace_revision)
         {
             return state.finish(
                 AgentStatus::Failed,
@@ -2056,14 +1574,6 @@ where
         )
     }
 
-    fn run_internal(
-        &self,
-        input: &AgentLoopInput,
-        on_event: Option<&mut AgentLoopEventCallback<'_>>,
-    ) -> AgentLoopResult {
-        self.run_internal_with_checkpoints(input, on_event, None)
-    }
-
     fn run_internal_with_checkpoints(
         &self,
         input: &AgentLoopInput,
@@ -2172,9 +1682,7 @@ where
         on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
-        if model_turn_offset > max_turns
-            || (model_turn_offset == max_turns && !state.completion_ready())
-        {
+        if model_turn_offset >= max_turns {
             let model_turns = model_turn_offset.max(max_turns);
             return state.finish(
                 AgentStatus::Failed,
@@ -2187,26 +1695,7 @@ where
         let mut on_event = on_event;
         let mut on_checkpoint = on_checkpoint;
         let mut actual_model_turns = model_turn_offset;
-        // The inclusive endpoint is reserved for one terminal response only when the runtime
-        // completion gate became ready on the last ordinary work turn.
-        for turn_index in model_turn_offset..=max_turns {
-            if state
-                .repair_state
-                .as_ref()
-                .is_some_and(|state| state.attempt > state.max_attempts)
-            {
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    actual_model_turns,
-                    Some("repair budget exhausted".to_string()),
-                );
-            }
-            let finalization_only = turn_index == max_turns && state.completion_ready();
-            if turn_index == max_turns && !finalization_only {
-                break;
-            }
+        for turn_index in model_turn_offset..max_turns {
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
@@ -2214,7 +1703,7 @@ where
                 self.emit_checkpoint_event(
                     input,
                     &state,
-                    TurnCheckpointPhase::BeforeModelRequest { finalization_only },
+                    TurnCheckpointPhase::BeforeModelRequest,
                     turn_index,
                     &mut on_checkpoint,
                 ),
@@ -2227,45 +1716,6 @@ where
                     turn_index,
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
-            }
-            if finalization_only {
-                let gate_timer = OccurrenceTimer::start();
-                let gate_identity = occurrence_identity(
-                    input,
-                    "verification_gate",
-                    turn_index,
-                    state.recovery_metrics.completion_rejection_count,
-                    None,
-                );
-                let summary = state.completion.summary();
-                for lifecycle in [
-                    gate_timer.started(),
-                    gate_timer.finished(VerificationStatus::GatePassed),
-                ] {
-                    if emit_event(
-                        &mut on_event,
-                        AgentLoopEvent::Observation(AgentObservation::Verification(
-                            VerificationObservation {
-                                identity: gate_identity.clone(),
-                                lifecycle,
-                                required_command_count: summary.required_command_count,
-                                satisfied_command_count: summary.satisfied_command_count,
-                                occurrence_count: state.recovery_metrics.completion_rejection_count,
-                                command_duration_ms: None,
-                            },
-                        )),
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            turn_index,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
-                }
             }
             let prompt_identity =
                 occurrence_identity(input, "prompt_assembly", turn_index, 0, None);
@@ -2282,7 +1732,6 @@ where
                         request_token_count: 0,
                         request_digest: String::new(),
                         compacted: false,
-                        finalization_only,
                     },
                 )),
             )
@@ -2300,43 +1749,32 @@ where
                 turn_index,
                 &prompt_identity.occurrence_id,
             );
-            let tool_view = if finalization_only {
-                ModelToolView::finalization()
-            } else {
-                match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
-                    Ok(tool_view) => tool_view,
-                    Err(error) => {
-                        if emit_prompt_assembly_finished(
-                            &mut on_event,
-                            prompt_identity,
-                            &prompt_timer,
-                            turn_index,
-                            0,
-                            0,
-                            0,
-                            String::new(),
-                            false,
-                            finalization_only,
-                            PromptAssemblyStatus::ToolViewRejected,
-                        )
-                        .is_err()
-                        {
-                            return state.finish(
-                                AgentStatus::Failed,
-                                false,
-                                None,
-                                turn_index,
-                                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                            );
-                        }
+            let tool_view = match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
+                Ok(tool_view) => tool_view,
+                Err(error) => {
+                    if emit_prompt_assembly_finished(
+                        &mut on_event,
+                        prompt_identity,
+                        &prompt_timer,
+                        turn_index,
+                        0,
+                        0,
+                        0,
+                        String::new(),
+                        false,
+                        PromptAssemblyStatus::ToolViewRejected,
+                    )
+                    .is_err()
+                    {
                         return state.finish(
                             AgentStatus::Failed,
                             false,
                             None,
                             turn_index,
-                            Some(error),
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                         );
                     }
+                    return state.finish(AgentStatus::Failed, false, None, turn_index, Some(error));
                 }
             };
             let mut compacted = false;
@@ -2368,7 +1806,6 @@ where
                         request_token_count,
                         String::new(),
                         false,
-                        finalization_only,
                         PromptAssemblyStatus::ContextOverflow,
                     )
                     .is_err()
@@ -2399,15 +1836,8 @@ where
                     .provider_reasoning_history
                     .retain(|replay| replay.is_bound_to_messages(&state.messages));
             }
-            let request = model_turn_request(
-                input,
-                budget,
-                turn_index,
-                &state,
-                tool_view,
-                capabilities,
-                finalization_only,
-            );
+            let request =
+                model_turn_request(input, budget, turn_index, &state, tool_view, capabilities);
             // The projection is request-scoped. Tool-result and later checkpoints must derive the
             // next action from trusted state instead of persisting a now-stale command instruction.
             let request_validation =
@@ -2433,7 +1863,6 @@ where
                     request_token_count,
                     request_digest,
                     compacted,
-                    finalization_only,
                     PromptAssemblyStatus::ValidationFailed,
                 )
                 .is_err()
@@ -2477,7 +1906,6 @@ where
                 request_token_count,
                 request_digest,
                 compacted,
-                finalization_only,
                 PromptAssemblyStatus::Ready,
             )
             .is_err()
@@ -2611,8 +2039,8 @@ where
                 &provider_tool_names,
                 Some(capabilities),
             );
-            let recoverable_tool_validation = !finalization_only
-                && recoverable_tool_response_validation(&response, &validation.errors);
+            let recoverable_tool_validation =
+                recoverable_tool_response_validation(&response, &validation.errors);
             if !validation.valid && !recoverable_tool_validation {
                 let first_attempts = response
                     .tool_calls
@@ -2720,30 +2148,6 @@ where
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
-                    state.recovery_metrics.completion_rejection_count = state
-                        .recovery_metrics
-                        .completion_rejection_count
-                        .saturating_add(1);
-                    let rejection_count = state.recovery_metrics.completion_rejection_count;
-                    if emit_verification_occurrence(
-                        &mut on_event,
-                        input,
-                        turn_index,
-                        rejection_count,
-                        "verification_gate_rejected",
-                        VerificationStatus::GateRejected,
-                        &state.completion.summary(),
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
                     return state.finish(
                         AgentStatus::Failed,
                         false,
@@ -2752,27 +2156,7 @@ where
                         Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
                     );
                 }
-                if state.completion_ready() {
-                    if !finalization_only
-                        && emit_verification_occurrence(
-                            &mut on_event,
-                            input,
-                            turn_index,
-                            state.recovery_metrics.completion_rejection_count,
-                            "verification_gate",
-                            VerificationStatus::GatePassed,
-                            &state.completion.summary(),
-                        )
-                        .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
+                {
                     for delta in buffered_text_deltas {
                         if emit_event(&mut on_event, AgentLoopEvent::FinalTextDelta { delta })
                             .is_err()
@@ -2786,9 +2170,6 @@ where
                             );
                         }
                     }
-                    state.repair_state = None;
-                    state.last_repair_failure = None;
-                    state.last_completion_error = None;
                     state.messages.push(ModelMessage::text(
                         ModelRole::Assistant,
                         final_answer.clone(),
@@ -2819,81 +2200,6 @@ where
                         None,
                     );
                 }
-                let repair_requested = if state.completion.allows_final() {
-                    false
-                } else {
-                    match state.schedule_repair(
-                        AgentRepairReason::VerificationFailed,
-                        COMPLETION_REPAIR_SIGNATURE,
-                        None,
-                    ) {
-                        Ok(_state) => true,
-                        Err(exhausted) => {
-                            state.repair_state = Some(RepairState {
-                                reason: exhausted.reason,
-                                attempt: exhausted.attempt,
-                                max_attempts: exhausted.max_attempts,
-                                required_revision: exhausted.required_revision,
-                                signature: COMPLETION_REPAIR_SIGNATURE.to_string(),
-                                failed_tool_name: None,
-                            });
-                            false
-                        }
-                    }
-                };
-                state.recovery_metrics.completion_rejection_count = state
-                    .recovery_metrics
-                    .completion_rejection_count
-                    .saturating_add(1);
-                let rejection_count = state.recovery_metrics.completion_rejection_count;
-                let verification = state.completion.summary();
-                let verification_statuses = if repair_requested {
-                    [
-                        VerificationStatus::GateRejected,
-                        VerificationStatus::RepairRequested,
-                    ]
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                } else {
-                    vec![VerificationStatus::GateRejected]
-                };
-                for status in verification_statuses {
-                    let kind = match status {
-                        VerificationStatus::GateRejected => "verification_gate_rejected",
-                        VerificationStatus::RepairRequested => "verification_repair_requested",
-                        _ => "verification_gate_rejected",
-                    };
-                    if emit_verification_occurrence(
-                        &mut on_event,
-                        input,
-                        turn_index,
-                        rejection_count,
-                        kind,
-                        status,
-                        &verification,
-                    )
-                    .is_err()
-                    {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            actual_model_turns,
-                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                        );
-                    }
-                }
-                state.last_completion_error = Some(state.completion.rejection_reason());
-                state.messages.push(
-                    response
-                        .assistant_message
-                        .unwrap_or_else(|| ModelMessage::text(ModelRole::Assistant, final_answer)),
-                );
-                state.messages.push(ModelMessage::text(
-                    ModelRole::Developer,
-                    state.completion.feedback(),
-                ));
-                continue;
             }
             let execution_tool_calls =
                 resolve_model_tool_calls(&response.tool_calls, &provider_tool_names);
@@ -2978,66 +2284,12 @@ where
                 }
             }
         }
-        let error = state
-            .last_completion_error
-            .take()
-            .unwrap_or_else(|| "max turns exceeded".to_string());
         state.finish(
             AgentStatus::Failed,
             false,
             None,
             actual_model_turns,
-            Some(error),
-        )
-    }
-
-    /// 恢复一个已校验的 typed approval occurrence，执行已批准调用并继续运行。
-    pub fn resume_pending_approval(
-        &self,
-        input: &AgentLoopInput,
-        pending: &PendingApprovalOccurrence,
-    ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, None, None)
-    }
-
-    /// 恢复 approval，并在真实边界向调用方投影有序 typed 事件。
-    pub fn resume_pending_approval_with_events(
-        &self,
-        input: &AgentLoopInput,
-        pending: &PendingApprovalOccurrence,
-        on_event: &mut AgentLoopEventCallback<'_>,
-    ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, Some(on_event), None)
-    }
-
-    /// Resume an approved tool call while notifying the owner at durable tool-result boundaries.
-    pub fn resume_pending_approval_with_events_and_checkpoints(
-        &self,
-        input: &AgentLoopInput,
-        pending: &PendingApprovalOccurrence,
-        on_event: &mut AgentLoopEventCallback<'_>,
-        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
-    ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, Some(on_event), Some(on_checkpoint))
-    }
-
-    /// 恢复 approval，并只向调用方投影恢复后最终化 assistant 回合的有序文本 delta。
-    pub fn resume_pending_approval_with_text_deltas(
-        &self,
-        input: &AgentLoopInput,
-        pending: &PendingApprovalOccurrence,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
-    ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(
-            input,
-            pending,
-            Some(&mut |event| {
-                if let AgentLoopEvent::FinalTextDelta { delta } = event {
-                    on_text_delta(&delta);
-                }
-                Ok(())
-            }),
-            None,
+            Some("max turns exceeded".to_string()),
         )
     }
 
@@ -3096,7 +2348,7 @@ where
         }
         if let Some(workspace_tools) = &self.workspace_tools
             && let Err(error) = workspace_tools
-                .bind_checkpoint_workspace_revision(state.completion.workspace_revision)
+                .bind_checkpoint_workspace_revision(state.execution_facts.workspace_revision)
         {
             return state.finish(
                 AgentStatus::Failed,
@@ -3889,16 +3141,10 @@ where
         &self,
         execution_call: &ModelToolCall,
         fingerprint: &str,
-        invalid_was_observed: bool,
-        state: &mut AgentLoopState,
+        _invalid_was_observed: bool,
+        _state: &mut AgentLoopState,
     ) -> PreparedToolCall {
         if execution_call.parse_status != ModelToolParseStatus::Valid {
-            if !invalid_was_observed {
-                state.recovery_metrics.invalid_tool_call_count = state
-                    .recovery_metrics
-                    .invalid_tool_call_count
-                    .saturating_add(1);
-            }
             let validation_code = match execution_call.parse_status {
                 ModelToolParseStatus::InvalidJson => "invalid_json_arguments",
                 ModelToolParseStatus::SchemaMismatch => "tool_schema_mismatch",
@@ -3923,12 +3169,6 @@ where
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                if !invalid_was_observed {
-                    state.recovery_metrics.invalid_tool_call_count = state
-                        .recovery_metrics
-                        .invalid_tool_call_count
-                        .saturating_add(1);
-                }
                 return PreparedToolCall {
                     call: execution_call.clone(),
                     fingerprint: fingerprint.to_string(),
@@ -3971,12 +3211,6 @@ where
             .tool_broker
             .validate_execution_input(&bound_call.tool_name, &bound_call.arguments)
         {
-            if !invalid_was_observed {
-                state.recovery_metrics.invalid_tool_call_count = state
-                    .recovery_metrics
-                    .invalid_tool_call_count
-                    .saturating_add(1);
-            }
             return PreparedToolCall {
                 call: bound_call,
                 fingerprint: fingerprint.to_string(),
@@ -4144,7 +3378,7 @@ where
             .collect()
     }
 
-    /// 将 tool 结果送入完成和修复状态，同时保留失败类别。
+    /// Commit typed tool results and decide whether the next model turn is safe.
     fn record_tool_results(
         &self,
         input: &AgentLoopInput,
@@ -4155,8 +3389,7 @@ where
         on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     ) -> ToolBatchControl {
         debug_assert_eq!(results.len(), occurrences.len());
-        let mut failure = None;
-        let mut repairable_failure = None;
+        let mut fatal_error = None;
         for ((prepared, runtime), occurrence) in results.into_iter().zip(occurrences) {
             if runtime.event_sink_failed {
                 return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
@@ -4170,45 +3403,36 @@ where
             } else {
                 result
             };
-            let recoverable = is_repairable_tool_result(&result)
-                || (batch_rejected && result.failure_kind == Some(ToolFailureKind::Approval));
-            let non_repairable_error = (!result.ok && !recoverable).then(|| {
-                result
-                    .error_code
-                    .clone()
-                    .unwrap_or_else(|| "tool_execution_failed".to_string())
-            });
-            let verification_occurrence = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
-                let summary = state.completion.summary();
-                (
-                    child_occurrence_identity(&occurrence.context.identity, "verification", 0),
-                    summary.required_command_count,
-                    occurrence.context.tool_call_ordinal.saturating_add(1),
+            let feedback_safe = matches!(
+                result.failure_kind,
+                Some(
+                    ToolFailureKind::Input
+                        | ToolFailureKind::Visibility
+                        | ToolFailureKind::Capability
+                        | ToolFailureKind::Policy
+                        | ToolFailureKind::PermissionProfile
+                        | ToolFailureKind::WorkspaceBoundary
+                        | ToolFailureKind::ProtectedPath
+                        | ToolFailureKind::Approval
+                        | ToolFailureKind::Execution
                 )
-            });
-            if let Some((identity, required_command_count, occurrence_count)) =
-                &verification_occurrence
-            {
-                let summary = state.completion.summary();
-                if emit_event(
-                    on_event,
-                    AgentLoopEvent::Observation(AgentObservation::Verification(
-                        VerificationObservation {
-                            identity: identity.clone(),
-                            lifecycle: occurrence.context.timer.started(),
-                            required_command_count: *required_command_count,
-                            satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count: *occurrence_count,
-                            command_duration_ms: Some(tool_duration_ms),
-                        },
-                    )),
-                )
-                .is_err()
-                {
-                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-                }
+            ) || (batch_rejected
+                && result.failure_kind == Some(ToolFailureKind::Approval));
+            if !result.ok && !feedback_safe && fatal_error.is_none() {
+                fatal_error = Some(
+                    result
+                        .error_code
+                        .clone()
+                        .unwrap_or_else(|| "tool_execution_failed".to_string()),
+                );
             }
-            let recovery_feedback = state.observe_tool_result(&result, &prepared.fingerprint);
+            if result.workspace_observation().is_some_and(|observation| {
+                observation.mutation() == singularity_tools::WorkspaceMutation::Unknown
+            }) && fatal_error.is_none()
+            {
+                fatal_error = Some("workspace_observation_unknown".to_string());
+            }
+            state.observe_tool_result(&result, &prepared.fingerprint);
             let changed = result.workspace_observation().is_some_and(|observation| {
                 observation.mutation() == singularity_tools::WorkspaceMutation::Changed
             });
@@ -4217,9 +3441,6 @@ where
                     .workspace_observation()
                     .and_then(|observation| observation.revision())
                 else {
-                    state
-                        .completion
-                        .mark_workspace_revision_invalid("mutation_revision_missing");
                     return ToolBatchControl::Failed(
                         "workspace mutation revision is missing".to_string(),
                     );
@@ -4227,58 +3448,11 @@ where
                 match validate_workspace_change_summary(&prepared.call, &result) {
                     Ok(()) => {}
                     Err(error) => {
-                        state
-                            .completion
-                            .mark_workspace_revision_invalid("mutation_diff_summary_invalid");
                         return ToolBatchControl::Failed(error);
                     }
                 }
-                state.note_repair_mutation(revision);
+                state.execution_facts.workspace_revision = Some(revision);
             }
-            let repair_cycle =
-                state.consume_repair_cycle_if_complete(&prepared.call.tool_name, &result);
-            let _ = repair_cycle;
-            if let Some((identity, required_command_count, occurrence_count)) =
-                verification_occurrence
-            {
-                let summary = state.completion.summary();
-                let status = if result.ok {
-                    VerificationStatus::CommandPassed
-                } else {
-                    VerificationStatus::CommandFailed
-                };
-                if emit_event(
-                    on_event,
-                    AgentLoopEvent::Observation(AgentObservation::Verification(
-                        VerificationObservation {
-                            identity,
-                            lifecycle: occurrence
-                                .context
-                                .timer
-                                .finished_with_duration(tool_duration_ms, status),
-                            required_command_count,
-                            satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count,
-                            command_duration_ms: Some(tool_duration_ms),
-                        },
-                    )),
-                )
-                .is_err()
-                {
-                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-                }
-            }
-            if !result.ok && is_repairable_tool_result(&result) {
-                repairable_failure = state.last_repair_failure.clone();
-            }
-            // Repair instructions describe current state, so replace their prior projection while
-            // retaining the immutable Assistant ToolCall and ToolResult transcript.
-            state.messages.retain(|message| {
-                message.role != ModelRole::Developer
-                    || (message.content != REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
-                        && !message.content.starts_with(REPAIR_STATE_INSTRUCTIONS))
-            });
-            // Append before projecting repair context so the current typed failure is included.
             state.append_visible_tool_result(result.clone());
             let recorded = state
                 .tool_result_occurrences
@@ -4292,23 +3466,6 @@ where
             .is_err()
             {
                 return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
-            }
-            let repair_feedback = state
-                .repair_state
-                .is_some()
-                .then(|| state.repair_feedback_with_failure(Some(&result)));
-            if let Some(feedback) = recovery_feedback {
-                state
-                    .messages
-                    .push(ModelMessage::text(ModelRole::Developer, feedback));
-            }
-            if let Some(repair_feedback) = repair_feedback {
-                state
-                    .messages
-                    .push(ModelMessage::text(ModelRole::Developer, repair_feedback));
-            }
-            if failure.is_none() {
-                failure = non_repairable_error;
             }
             state.record_terminal_tool_call(&prepared.fingerprint);
             if emit_event(
@@ -4326,18 +3483,9 @@ where
                 return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
             }
         }
-        if let Some(repairable_failure) = repairable_failure {
-            state.last_repair_failure = Some(repairable_failure);
-        }
         if self.is_cancelled(input) {
             ToolBatchControl::Cancelled
-        } else if state
-            .repair_state
-            .as_ref()
-            .is_some_and(|state| state.attempt > state.max_attempts)
-        {
-            ToolBatchControl::Failed("repair budget exhausted".to_string())
-        } else if let Some(error_code) = failure {
+        } else if let Some(error_code) = fatal_error {
             ToolBatchControl::Failed(format!("tool execution failed: {error_code}"))
         } else {
             ToolBatchControl::Continue
@@ -5162,8 +4310,6 @@ fn compacted_tool_result_message(
 }
 
 fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> String {
-    let verification = state.completion.summary();
-    let active_control_instructions = compaction_control_instructions(state);
     let failed_tool_result_count = state
         .tool_result_occurrences
         .iter()
@@ -5175,32 +4321,8 @@ fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> S
         "compacted_message_count": compacted_message_count,
         "tool_result_count": state.tool_result_occurrences.len(),
         "failed_tool_result_count": failed_tool_result_count,
-        "verification": {
-            "required": verification.required,
-            "passed": verification.passed,
-            "required_command_count": verification.required_command_count,
-            "satisfied_command_count": verification.satisfied_command_count,
-            "unresolved_failures": verification.unresolved_failures.into_iter().take(8).collect::<Vec<_>>(),
-        },
-        "recovery": &state.recovery_metrics,
-        "active_control_instructions": active_control_instructions,
     })
     .to_string()
-}
-
-fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
-    let mut instructions = Vec::new();
-    if !state.completion.allows_final() {
-        instructions.push(state.completion.feedback());
-    }
-    if state
-        .last_repair_failure
-        .as_ref()
-        .is_some_and(|failure| failure.consecutive_count >= 2)
-    {
-        instructions.push(REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string());
-    }
-    instructions
 }
 
 /// 在已批准调用执行前恢复并重新规范化检查点。
@@ -5296,15 +4418,6 @@ fn restore_checkpoint(
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let derived_completion = restore_completion_from_history_with_provider(
-        checkpoint_history_messages,
-        &tool_result_occurrences,
-        &checkpoint_state.completion,
-        &checkpoint_state.provider_reasoning_history,
-    )?;
-    if derived_completion != checkpoint_state.completion {
-        return Err("approval checkpoint completion state mismatch".to_string());
-    }
     let seen_tool_call_fingerprints = checkpoint_state
         .seen_tool_call_fingerprints
         .iter()
@@ -5315,12 +4428,6 @@ fn restore_checkpoint(
     state.tool_result_occurrences = tool_result_occurrences;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint_state.approval_count;
-    state.completion = derived_completion;
-    state.repair_state = checkpoint_state.repair_state;
-    state.repair_attempts = checkpoint_state.repair_attempts;
-    state.repair_cycles = checkpoint_state.repair_cycles;
-    state.last_completion_error = checkpoint_state.last_completion_error;
-    state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
     state.provider_attempts = checkpoint_state.provider_attempts;
     state.context_trace = checkpoint_state.context_trace;
@@ -5329,103 +4436,12 @@ fn restore_checkpoint(
         .completed_tool_call_fingerprints
         .into_iter()
         .collect();
-    state.last_repair_failure = checkpoint_state.last_repair_failure;
-    Ok((state, checkpoint_state.model_turns))
-}
-
-/// Rebuild completion from checkpoint occurrences while preserving the post-input invalidation
-/// boundary. Omitted occurrences still prove workspace revision, but cannot prove terminal
-/// verification after a newer user input unless a later visible/compacted assistant call binds it.
-#[cfg(test)]
-fn restore_completion_from_history(
-    messages: &[ModelMessage],
-    tool_result_occurrences: &[ToolResultOccurrence],
-    checkpoint_completion: &CompletionTracker,
-) -> Result<CompletionTracker, String> {
-    restore_completion_from_history_with_provider(
-        messages,
-        tool_result_occurrences,
-        checkpoint_completion,
-        &[],
-    )
-}
-
-fn restore_completion_from_history_with_provider(
-    messages: &[ModelMessage],
-    tool_result_occurrences: &[ToolResultOccurrence],
-    checkpoint_completion: &CompletionTracker,
-    provider_reasoning_history: &[ProviderReasoningReplay],
-) -> Result<CompletionTracker, String> {
-    let private_call_ids = provider_reasoning_tool_call_ids(provider_reasoning_history, messages);
-    let occurrences = tool_result_message_occurrences_with_private_call_ids(
-        messages,
-        tool_result_occurrences,
-        &private_call_ids,
-    )
-    .ok_or_else(|| "turn checkpoint tool result occurrence bindings are invalid".to_string())?;
-    let mut derived = CompletionTracker::default();
-    for occurrence in tool_result_occurrences {
-        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
-            derived.observe(occurrence.result());
-        }
-    }
-    if !derived.is_consistent() {
-        return Err("turn checkpoint derived workspace revision state is invalid".to_string());
-    }
-
-    let user_indices = messages
+    state.execution_facts.workspace_revision = state
+        .tool_result_occurrences
         .iter()
-        .enumerate()
-        .filter_map(|(index, message)| (message.role == ModelRole::User).then_some(index))
-        .collect::<Vec<_>>();
-    if user_indices.len() > 1 {
-        let latest_user_index = *user_indices.last().expect("user count checked");
-        let has_post_input_occurrence = occurrences
-            .iter()
-            .any(|occurrence| occurrence.assistant_index > latest_user_index);
-        if has_post_input_occurrence {
-            derived.invalidate_after_user_input();
-            for occurrence in occurrences
-                .iter()
-                .filter(|occurrence| occurrence.assistant_index > latest_user_index)
-            {
-                let result = tool_result_occurrences
-                    .get(occurrence.result_index)
-                    .ok_or_else(|| {
-                        "turn checkpoint tool result occurrence index is invalid".to_string()
-                    })?
-                    .result();
-                if result.error_code.as_deref() == Some("not_executed_due_to_user_input") {
-                    continue;
-                }
-                if result.tool_name == TOOL_COMMAND
-                    && result.ok
-                    && let Some(observation) = result.workspace_observation()
-                    && observation.mutation() == WorkspaceMutation::Unchanged
-                    && let Some(revision) = observation.revision()
-                {
-                    derived.record_terminal_command_observation(
-                        successful_command_scope_digest(result),
-                        revision,
-                        1,
-                    );
-                }
-            }
-        } else if checkpoint_completion.requires_post_input_verification() {
-            // Context compaction may omit the post-input assistant/tool messages. The persisted
-            // reducer bit is then the only remaining proof; retain its fail-closed state.
-            derived.invalidate_after_user_input();
-        }
-    } else if checkpoint_completion.requires_post_input_verification() {
-        // Context compaction may retain only the newest user message. The persisted reducer bit
-        // still proves that this message superseded the previous terminal evidence.
-        derived.invalidate_after_user_input();
-    }
-
-    if !derived.is_consistent() || derived != *checkpoint_completion {
-        return Err("turn checkpoint completion state mismatch".to_string());
-    }
-    Ok(derived)
+        .filter_map(|occurrence| occurrence.result().workspace_observation()?.revision())
+        .max_by_key(|revision| revision.value());
+    Ok((state, checkpoint_state.model_turns))
 }
 
 /// Restore the shared state of an ordinary turn checkpoint. Unlike approval restore, this path
@@ -5465,12 +4481,6 @@ fn restore_turn_checkpoint(
     {
         return Err("turn checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let derived_completion = restore_completion_from_history_with_provider(
-        &checkpoint_state.messages,
-        &checkpoint_state.tool_result_occurrences,
-        &checkpoint_state.completion,
-        &checkpoint_state.provider_reasoning_history,
-    )?;
     let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
     // Provider-private reasoning replay is part of the durable turn snapshot. Restore it before
     // the next model request so a process restart cannot silently drop opaque provider state.
@@ -5478,12 +4488,6 @@ fn restore_turn_checkpoint(
     state.tool_result_occurrences = checkpoint_state.tool_result_occurrences;
     state.used_approval_grants = checkpoint_state.used_approval_grants.into_iter().collect();
     state.prior_approval_count = checkpoint_state.approval_count;
-    state.completion = derived_completion;
-    state.repair_state = checkpoint_state.repair_state;
-    state.repair_attempts = checkpoint_state.repair_attempts;
-    state.repair_cycles = checkpoint_state.repair_cycles;
-    state.last_completion_error = checkpoint_state.last_completion_error;
-    state.recovery_metrics = checkpoint_state.recovery_metrics;
     state.model_usage = checkpoint_state.model_usage;
     state.provider_attempts = checkpoint_state.provider_attempts;
     state.context_trace = checkpoint_state.context_trace;
@@ -5495,7 +4499,11 @@ fn restore_turn_checkpoint(
         .completed_tool_call_fingerprints
         .into_iter()
         .collect();
-    state.last_repair_failure = checkpoint_state.last_repair_failure;
+    state.execution_facts.workspace_revision = state
+        .tool_result_occurrences
+        .iter()
+        .filter_map(|occurrence| occurrence.result().workspace_observation()?.revision())
+        .max_by_key(|revision| revision.value());
     Ok((state, checkpoint_state.model_turns))
 }
 
@@ -5540,15 +4548,12 @@ fn has_duplicate_tool_call_ids(calls: &[ModelToolCall]) -> bool {
 fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     AgentLoopResult {
         status: AgentStatus::Failed,
-        completed: false,
         final_answer: None,
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
         pending_approvals: Vec::new(),
         tool_results: Vec::new(),
-        verification: AgentVerification::default(),
-        recovery_metrics: AgentRecoveryMetrics::default(),
         model_usage: ModelUsage::default(),
         provider_attempts: ProviderAttemptMetadata::default(),
         error: Some(error.into()),
@@ -5937,25 +4942,6 @@ fn command_audit_metadata(
     audit
 }
 
-fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
-    match tool_result.failure_kind.as_ref() {
-        Some(
-            ToolFailureKind::Input
-            | ToolFailureKind::Visibility
-            | ToolFailureKind::Capability
-            | ToolFailureKind::Policy
-            | ToolFailureKind::PermissionProfile
-            | ToolFailureKind::WorkspaceBoundary
-            | ToolFailureKind::ProtectedPath,
-        ) => true,
-        Some(ToolFailureKind::Execution) => tool_result
-            .error_code
-            .as_deref()
-            .is_some_and(|error_code| REPAIRABLE_TOOL_ERROR_CODES.contains(&error_code)),
-        _ => false,
-    }
-}
-
 /// Binding may materialize absent optional object fields as `null`; those two JSON forms have the
 /// same executable meaning, while every non-null value and every array position remains exact.
 fn checkpoint_arguments_equivalent(model: &Value, pending: &Value) -> bool {
@@ -6071,62 +5057,6 @@ fn tool_call_fingerprint(call: &ModelToolCall) -> String {
     let encoded = serde_json::to_vec(&(call.tool_name.as_str(), canonical_arguments))
         .expect("tool call fingerprint payload serializes");
     format!("sha256:{:x}", Sha256::digest(encoded))
-}
-
-fn repair_failure_signature(tool_call_fingerprint: &str, error_code: &str) -> String {
-    let encoded = format!("{tool_call_fingerprint}\0{error_code}");
-    format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()))
-}
-
-fn repair_reason_text(reason: AgentRepairReason) -> &'static str {
-    match reason {
-        AgentRepairReason::VerificationFailed => "revision-bound verification failed",
-        AgentRepairReason::ToolFailure => "repairable tool failure",
-        AgentRepairReason::RevisionConflict => "workspace revision conflict",
-    }
-}
-
-fn bounded_repair_text(value: &str) -> String {
-    value.chars().take(MAX_REPAIR_CONTEXT_CHARS).collect()
-}
-
-/// Project only the already-redacted public tool result payload into bounded repair evidence.
-fn safe_tool_result_evidence(result: &ToolResult) -> String {
-    let payload = result.to_message_payload();
-    let value = payload
-        .get("preview")
-        .or_else(|| payload.get("content"))
-        .or_else(|| payload.get("error_code"));
-    let evidence = value
-        .and_then(|value| serde_json::to_string(value).ok())
-        .unwrap_or_else(|| if result.ok { "ok" } else { "failed" }.to_string());
-    bounded_repair_text(&evidence)
-}
-
-fn safe_repair_tool_name(result: &ToolResult) -> String {
-    if is_provider_history_validation_rejection(result) {
-        return bounded_repair_text(&result.tool_name);
-    }
-    result
-        .to_message_payload()
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .map(bounded_repair_text)
-        .unwrap_or_else(|| "tool".to_string())
-}
-
-fn tool_result_command_scope_digest(result: &ToolResult) -> Option<&str> {
-    result
-        .result_id
-        .as_deref()
-        .filter(|digest| is_sha256_fingerprint(digest))
-        .or_else(|| {
-            result
-                .audit_metadata()
-                .and_then(|metadata| metadata.get("command_scope_digest"))
-                .and_then(Value::as_str)
-                .filter(|digest| is_sha256_fingerprint(digest))
-        })
 }
 
 fn is_sha256_fingerprint(value: &str) -> bool {
@@ -6771,118 +5701,6 @@ mod audit_projection_tests {
             vec![digest.to_string()]
         );
     }
-
-    #[test]
-    fn completion_gate_requires_exact_successful_command_observation_after_mutation() {
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut tracker = CompletionTracker::default();
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        tracker.observe(
-            &ToolResult::summary("patch", TOOL_PATCH, true, "changed")
-                .with_workspace_observation(WorkspaceObservation::changed(revision)),
-        );
-
-        let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
-        failed.result_id = Some(digest.to_string());
-        failed = failed.with_workspace_observation(WorkspaceObservation::unchanged(revision));
-        tracker.observe(&failed);
-        assert!(!tracker.verification_satisfied());
-
-        let mut malformed = ToolResult::summary("malformed", TOOL_COMMAND, true, "ok");
-        malformed.result_id = Some("sha256:not-a-digest".to_string());
-        malformed = malformed.with_workspace_observation(WorkspaceObservation::unchanged(revision));
-        tracker.observe(&malformed);
-        assert!(!tracker.verification_satisfied());
-
-        let mut successful = ToolResult::summary("successful", TOOL_COMMAND, true, "ok");
-        successful.result_id = Some(digest.to_string());
-        successful =
-            successful.with_workspace_observation(WorkspaceObservation::unchanged(revision));
-        tracker.observe(&successful);
-        assert!(tracker.verification_satisfied());
-    }
-
-    #[test]
-    fn follow_up_invalidates_terminal_evidence_across_restore_and_compaction() {
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let revision = WorkspaceRevision::initial().next().expect("revision");
-        let patch = ToolResult::summary("patch", TOOL_PATCH, true, "changed")
-            .with_workspace_observation(WorkspaceObservation::changed(revision));
-        let mut command = ToolResult::summary("command", TOOL_COMMAND, true, "verified");
-        command.result_id = Some(digest.to_string());
-        command = command.with_workspace_observation(WorkspaceObservation::unchanged(revision));
-        let occurrences = vec![
-            ToolResultOccurrence::new(patch.clone(), ToolResultVisibility::Visible),
-            ToolResultOccurrence::new(command.clone(), ToolResultVisibility::Visible),
-        ];
-        let mut messages = vec![
-            ModelMessage::text(ModelRole::User, "initial task"),
-            assistant_tool_message_for("patch", TOOL_PATCH),
-            tool_message("patch", "changed"),
-            assistant_tool_message_for("command", TOOL_COMMAND),
-            tool_message("command", "verified"),
-        ];
-        messages.push(ModelMessage::text(ModelRole::User, "follow-up task"));
-
-        let mut expected = CompletionTracker::default();
-        expected.observe(&patch);
-        expected.observe(&command);
-        expected.invalidate_after_user_input();
-        assert!(!expected.verification_satisfied());
-        let restored = restore_completion_from_history(&messages, &occurrences, &expected)
-            .expect("follow-up restore");
-        assert_eq!(restored, expected);
-        assert!(!restored.verification_satisfied());
-
-        messages.push(assistant_tool_message_for("command-2", TOOL_COMMAND));
-        messages.push(tool_message("command-2", "verified again"));
-        let mut command_after_follow_up = command.clone();
-        command_after_follow_up.tool_call_id = "command-2".to_string();
-        let mut occurrences_after_follow_up = occurrences.clone();
-        occurrences_after_follow_up.push(ToolResultOccurrence::new(
-            command_after_follow_up.clone(),
-            ToolResultVisibility::Visible,
-        ));
-        let mut expected_after_follow_up = expected.clone();
-        expected_after_follow_up.observe(&command_after_follow_up);
-        let restored_after_follow_up = restore_completion_from_history(
-            &messages,
-            &occurrences_after_follow_up,
-            &expected_after_follow_up,
-        )
-        .expect("post-follow-up restore");
-        assert!(restored_after_follow_up.verification_satisfied());
-
-        let compacted_messages = vec![ModelMessage::text(ModelRole::User, "follow-up task")];
-        let compacted_occurrences = occurrences
-            .into_iter()
-            .map(|occurrence| {
-                ToolResultOccurrence::new(occurrence.into_result(), ToolResultVisibility::Omitted)
-            })
-            .collect::<Vec<_>>();
-        let compacted =
-            restore_completion_from_history(&compacted_messages, &compacted_occurrences, &expected)
-                .expect("compacted follow-up restore");
-        assert_eq!(compacted, expected);
-        assert!(!compacted.verification_satisfied());
-    }
-
-    fn assistant_tool_message_for(tool_call_id: &str, tool_name: &str) -> ModelMessage {
-        ModelMessage::assistant_tool_calls(vec![ModelToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            arguments: json!({}),
-            raw_arguments: "{}".to_string(),
-            parse_status: ModelToolParseStatus::Valid,
-            validation_errors: Vec::new(),
-        }])
-    }
-
-    fn tool_message(tool_call_id: &str, content: &str) -> ModelMessage {
-        let mut message = ModelMessage::text(ModelRole::Tool, content);
-        message.tool_call_id = Some(tool_call_id.to_string());
-        message
-    }
 }
 
 #[cfg(test)]
@@ -6982,18 +5800,9 @@ mod cancellation_tests {
             .to_string(),
         );
         let old_leading = ModelMessage::text(ModelRole::Developer, "old leading instructions");
-        let repair = ModelMessage::text(
-            ModelRole::Developer,
-            format!("{REPAIR_STATE_INSTRUCTIONS} repair_context=..."),
-        );
         let history_user = ModelMessage::text(ModelRole::User, "history user");
         let seed = HistoricalModelContext {
-            messages: vec![
-                old_leading.clone(),
-                summary.clone(),
-                repair.clone(),
-                history_user.clone(),
-            ],
+            messages: vec![old_leading.clone(), summary.clone(), history_user.clone()],
             provider_reasoning_history: Vec::new(),
             tool_result_occurrences: Vec::new(),
             context_trace: None,
@@ -7001,7 +5810,7 @@ mod cancellation_tests {
         let input = AgentLoopInput::new("thread_1", "turn_2", "current user");
         let messages = prepare_seed_messages(&seed, &input, 1, "current user");
 
-        // 唯一 leading 为新的 developer 指令；compaction summary 保留；repair 剔除。
+        // The current leading developer block and compaction summary are preserved.
         assert_eq!(
             messages[0].role,
             ModelRole::Developer,
@@ -7014,12 +5823,6 @@ mod cancellation_tests {
                 .iter()
                 .any(|message| message.content == old_leading.content),
             "old leading replaced"
-        );
-        assert!(
-            !messages
-                .iter()
-                .any(|message| message.content.starts_with(REPAIR_STATE_INSTRUCTIONS)),
-            "repair feedback dropped"
         );
         assert!(
             messages.iter().any(|message| {

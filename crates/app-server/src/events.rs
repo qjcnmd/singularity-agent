@@ -244,7 +244,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// 把 finalization-only delta 投影到同一预分配 item，并记录过滤器实际生成的部分。
+    /// 把 assistant response 的 delta 投影到同一预分配 item，并记录过滤器实际生成的部分。
     pub(super) fn project_assistant_delta(
         &self,
         assistant_events: &mut AssistantItemEventState,

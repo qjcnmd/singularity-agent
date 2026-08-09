@@ -2,7 +2,7 @@
 
 use super::*;
 #[cfg(test)]
-use singularity_agent::AgentTextDeltaCallback;
+type AgentTextDeltaCallback<'a> = dyn FnMut(&str) + 'a;
 
 fn turn_tool_execution_id(turn_id: &str, tool_call_id: &str) -> String {
     format!("turn:{turn_id}:tool:{tool_call_id}")
@@ -23,7 +23,7 @@ impl AppServer {
             initialized_acknowledged: false,
             event_filter: Arc::new(Mutex::new(EventSubscriptionState::default())),
             shutdown_requested: false,
-            sandbox_backend: Arc::new(PlatformSandboxBackend::new()),
+            sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
@@ -538,7 +538,7 @@ impl AppServer {
         };
         match &event.phase {
             TurnCheckpointPhase::Initial
-            | TurnCheckpointPhase::BeforeModelRequest { .. }
+            | TurnCheckpointPhase::BeforeModelRequest
             | TurnCheckpointPhase::ModelResponseCommitted => self
                 .store
                 .save_turn_checkpoint(turn_id, thread_id, &checkpoint, checkpoint_version)
@@ -561,12 +561,7 @@ impl AppServer {
             }
         }
 
-        let include_follow_up = matches!(
-            &event.phase,
-            TurnCheckpointPhase::BeforeModelRequest {
-                finalization_only: true
-            } | TurnCheckpointPhase::ModelResponseCommitted
-        );
+        let include_follow_up = matches!(&event.phase, TurnCheckpointPhase::ModelResponseCommitted);
         let boundary = self
             .store
             .turn_boundary_state(turn_id, include_follow_up)
@@ -1467,11 +1462,10 @@ impl AppServer {
             AgentLoop::new(provider.clone(), ToolBroker::new(registry), policy)
                 .with_workspace_tools(workspace_tools)
                 .with_cancellation_token(context.cancellation.clone())
-                .resume_pending_approval_with_events_and_checkpoints(
+                .resume(
                     &loop_input,
-                    &pending_approval,
-                    &mut callback,
-                    &mut on_checkpoint,
+                    AgentContinuation::Approval(&pending_approval),
+                    AgentLoopCallbacks::events_and_checkpoints(&mut callback, &mut on_checkpoint),
                 )
         };
         if let Some(error) = callback_error.into_inner() {
@@ -1690,10 +1684,9 @@ impl AppServer {
                     }
                 }
             };
-            agent_loop.run_with_events_and_checkpoints(
+            agent_loop.run(
                 &loop_input,
-                &mut callback,
-                &mut on_checkpoint,
+                AgentLoopCallbacks::events_and_checkpoints(&mut callback, &mut on_checkpoint),
             )
         };
         if let Some(error) = callback_error.into_inner() {
@@ -1851,11 +1844,10 @@ impl AppServer {
                     }
                 }
             };
-            agent_loop.resume_turn_with_events_and_checkpoints(
+            agent_loop.resume(
                 &loop_input,
-                checkpoint,
-                &mut callback,
-                &mut on_checkpoint,
+                AgentContinuation::Turn(checkpoint),
+                AgentLoopCallbacks::events_and_checkpoints(&mut callback, &mut on_checkpoint),
             )
         };
         if let Some(error) = callback_error.into_inner() {

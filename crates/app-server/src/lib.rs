@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
-    AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
-    project_audit_event,
+    AgentContextItem, AgentContinuation, AgentLoop, AgentLoopCallbacks, AgentLoopCapability,
+    AgentLoopEvent, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRunStatus,
+    AgentStatus, ApprovalGrant, PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent,
+    TurnCheckpointPhase, project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -50,7 +50,7 @@ use singularity_protocol::{
     TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputParams, TurnInterruptResult,
     TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
-use singularity_sandbox::{PlatformSandboxBackend, SandboxBackend, SandboxBackendEnforcement};
+use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
 use singularity_store::{
     AllocatedAssistantItemId, CheckpointFailureClaim, CommitTurnOutcomeParams,
     CommittedTurnOutcome, CreateStartedTurnParams, SessionStore, StoreError, ToolExecution,
@@ -1336,7 +1336,6 @@ fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
 
 fn mark_run_cancelled(status: &mut AgentRunStatus) {
     status.status = AgentStatus::Cancelled;
-    status.completed = false;
     status.final_answer = None;
     status.error = None;
     status.error_category = None;
@@ -1380,7 +1379,6 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
         })),
         "tool_calls": status.tool_calls,
         "approval_count": status.approval_count,
-        "recovery_metrics": &status.recovery_metrics,
         "model_usage": &status.model_usage,
         "provider_attempts": &status.provider_attempts,
         "provider_protocol": {
@@ -1388,7 +1386,6 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
             "capability_metadata": &status.provider_capability_metadata,
         },
         "audit_events": &status.audit_events,
-        "verification": &status.verification,
         "error": status
             .error
             .as_deref()

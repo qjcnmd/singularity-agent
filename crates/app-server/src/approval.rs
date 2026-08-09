@@ -873,7 +873,6 @@ impl AppServer {
             run_status.approval_count = prior_status.approval_count;
         }
         run_status.status = AgentStatus::Failed;
-        run_status.completed = false;
         run_status.final_answer = None;
         run_status.error = Some(failure_message);
         if cancellation.is_cancelled()

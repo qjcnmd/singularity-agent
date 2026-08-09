@@ -18,16 +18,15 @@ use singularity_tools::{
     ToolFailureKind, ToolOutput, ToolResult, WorkspaceToolExecutor,
 };
 
-use super::completion::ToolResultOccurrence;
 use super::observation::OccurrenceTimer;
+use super::occurrence::ToolResultOccurrence;
 use super::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentLoopInput,
-    AgentObservation, AgentVerification, OccurrenceIdentity, OccurrenceLifecycle,
-    PolicyDecisionCause, PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation,
-    PromptAssemblyStatus, ProviderAttemptObservation, ProviderAttemptStatus,
-    ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
-    ToolCallObservation, ToolCallStatus, ToolResultObservation, VerificationObservation,
-    VerificationStatus,
+    AgentObservation, OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause,
+    PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation, PromptAssemblyStatus,
+    ProviderAttemptObservation, ProviderAttemptStatus, ProviderAttemptUsageObservation,
+    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
+    ToolResultObservation,
 };
 
 pub(super) struct ToolOccurrenceContext {
@@ -92,7 +91,6 @@ pub(super) fn emit_prompt_assembly_finished(
     request_token_count: u32,
     request_digest: String,
     compacted: bool,
-    finalization_only: bool,
     status: PromptAssemblyStatus,
 ) -> Result<(), AgentLoopEventSinkError> {
     emit_event(
@@ -107,7 +105,6 @@ pub(super) fn emit_prompt_assembly_finished(
                 request_token_count,
                 request_digest,
                 compacted,
-                finalization_only,
             },
         )),
     )
@@ -311,33 +308,6 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
         self.next_attempt_ordinal = self.next_attempt_ordinal.saturating_add(1);
         Ok(())
     }
-}
-
-pub(super) fn emit_verification_occurrence(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    input: &AgentLoopInput,
-    model_turn_ordinal: u32,
-    occurrence_ordinal: u32,
-    kind: &str,
-    status: VerificationStatus,
-    summary: &AgentVerification,
-) -> Result<(), AgentLoopEventSinkError> {
-    let timer = OccurrenceTimer::start();
-    let identity = occurrence_identity(input, kind, model_turn_ordinal, occurrence_ordinal, None);
-    for lifecycle in [timer.started(), timer.finished(status)] {
-        emit_event(
-            on_event,
-            AgentLoopEvent::Observation(AgentObservation::Verification(VerificationObservation {
-                identity: identity.clone(),
-                lifecycle,
-                required_command_count: summary.required_command_count,
-                satisfied_command_count: summary.satisfied_command_count,
-                occurrence_count: occurrence_ordinal,
-                command_duration_ms: None,
-            })),
-        )?;
-    }
-    Ok(())
 }
 
 pub(super) fn occurrence_identity(

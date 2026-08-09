@@ -7,7 +7,7 @@ use singularity_agent::{
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus, PromptAssemblyStatus,
     ProviderAttemptObservation, ProviderAttemptStatus as AgentProviderAttemptStatus,
     ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
-    ToolCallStatus, ToolResultObservation, VerificationStatus,
+    ToolCallStatus, ToolResultObservation,
 };
 use singularity_core::{Timestamp, bounded_stable_code};
 use singularity_model::{
@@ -19,8 +19,7 @@ use singularity_protocol::{
     TraceMetricSampleKind, TracePolicyCause, TracePolicyDecision, TracePolicyProjection,
     TraceProviderOperationPhase, TraceProviderProtocol, TraceSandboxEnforcement,
     TraceSandboxProjection, TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
-    TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
-    TraceVerificationStatus, TraceWorkspaceMutation,
+    TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceWorkspaceMutation,
 };
 use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{SandboxBackendEnforcement, WorkspaceMutation};
@@ -163,7 +162,6 @@ impl<'a> TraceProjector<'a> {
             AgentObservation::PromptAssembly(observation) => {
                 let identity = observation.identity.clone();
                 let start_projection = TraceSpanProjection {
-                    finalization_only: Some(observation.finalization_only),
                     model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
                     ..TraceSpanProjection::default()
                 };
@@ -174,7 +172,6 @@ impl<'a> TraceProjector<'a> {
                     request_token_count: Some(u64::from(observation.request_token_count)),
                     request_digest: non_empty(observation.request_digest.clone()),
                     compacted: Some(observation.compacted),
-                    finalization_only: Some(observation.finalization_only),
                     model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
                     ..TraceSpanProjection::default()
                 };
@@ -256,36 +253,6 @@ impl<'a> TraceProjector<'a> {
                 )
             }
             AgentObservation::SandboxExecution(observation) => self.project_sandbox(observation),
-            AgentObservation::Verification(observation) => {
-                let start = TraceVerificationProjection {
-                    required_command_count: Some(u64::from(observation.required_command_count)),
-                    satisfied_command_count: Some(u64::from(observation.satisfied_command_count)),
-                    occurrence_count: Some(u64::from(observation.occurrence_count)),
-                    ..TraceVerificationProjection::default()
-                };
-                self.append_lifecycle(
-                    self.observation_span(
-                        &observation.identity,
-                        TraceSpanKind::Verification,
-                        "verification",
-                    ),
-                    &observation.lifecycle,
-                    TraceSpanProjection {
-                        verification: Some(start.clone()),
-                        ..TraceSpanProjection::default()
-                    },
-                    |status| TraceSpanProjection {
-                        verification: Some(TraceVerificationProjection {
-                            status: Some(verification_status(*status)),
-                            command_duration_ms: observation.command_duration_ms,
-                            ..start.clone()
-                        }),
-                        ..TraceSpanProjection::default()
-                    },
-                    verification_span_status,
-                    verification_metric_samples,
-                )
-            }
         }
     }
 
@@ -634,39 +601,6 @@ fn policy_span_status(status: &PolicyDecisionStatus) -> TraceSpanStatus {
     match status {
         PolicyDecisionStatus::Deny => TraceSpanStatus::Error,
         PolicyDecisionStatus::Allow | PolicyDecisionStatus::Ask => TraceSpanStatus::Ok,
-    }
-}
-
-fn verification_status(status: VerificationStatus) -> TraceVerificationStatus {
-    match status {
-        VerificationStatus::CommandPassed => TraceVerificationStatus::CommandPassed,
-        VerificationStatus::CommandFailed => TraceVerificationStatus::CommandFailed,
-        VerificationStatus::GatePassed => TraceVerificationStatus::GatePassed,
-        VerificationStatus::GateRejected => TraceVerificationStatus::GateRejected,
-        VerificationStatus::RepairRequested => TraceVerificationStatus::RepairRequested,
-    }
-}
-
-fn verification_span_status(status: &VerificationStatus) -> TraceSpanStatus {
-    match status {
-        VerificationStatus::CommandPassed | VerificationStatus::GatePassed => TraceSpanStatus::Ok,
-        VerificationStatus::CommandFailed
-        | VerificationStatus::GateRejected
-        | VerificationStatus::RepairRequested => TraceSpanStatus::Error,
-    }
-}
-
-fn verification_metric_samples(status: &VerificationStatus) -> Vec<TraceMetricSample> {
-    match status {
-        VerificationStatus::GateRejected => vec![TraceMetricSample {
-            kind: TraceMetricSampleKind::CompletionRejection,
-            count: 1,
-        }],
-        VerificationStatus::RepairRequested => vec![TraceMetricSample {
-            kind: TraceMetricSampleKind::CompletionRepair,
-            count: 1,
-        }],
-        _ => Vec::new(),
     }
 }
 

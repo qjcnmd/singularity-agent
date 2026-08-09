@@ -1,7 +1,7 @@
 //! Typed approval checkpoint codec.
 //!
 //! This module owns the persistence boundary and validates request, tool-call, occurrence,
-//! completion, and history bindings before a checkpoint can be resumed.
+//! transcript, execution occurrence, and history bindings before a checkpoint can be resumed.
 
 use std::collections::BTreeSet;
 
@@ -15,13 +15,10 @@ use singularity_model::{
 use singularity_policy::{ApprovalRequest, PermissionResource, ToolId};
 use singularity_tools::BoundToolCall;
 
-use super::completion::{
-    CompletionTracker, RepairFailureState, ToolResultOccurrence, ToolResultVisibility,
-};
 use super::context::AgentContextTrace;
+use super::occurrence::{ToolResultOccurrence, ToolResultVisibility};
 use super::{
-    APPROVAL_CHECKPOINT_VERSION, AgentLoopInput, AgentRecoveryMetrics, approval_request_id,
-    is_sha256_fingerprint,
+    APPROVAL_CHECKPOINT_VERSION, AgentLoopInput, approval_request_id, is_sha256_fingerprint,
 };
 
 /// approval 暂停运行期间保留的规范化可执行 tool call 数据。
@@ -194,20 +191,11 @@ pub(super) struct CheckpointState {
     pub(super) model_turns: u32,
     #[serde(default)]
     pub(super) resume_attempt: u32,
-    pub(super) completion: CompletionTracker,
-    #[serde(default)]
-    pub(super) repair_state: Option<super::RepairState>,
-    pub(super) repair_attempts: u32,
-    #[serde(default)]
-    pub(super) repair_cycles: Vec<super::RepairCycleRecord>,
-    pub(super) last_completion_error: Option<String>,
-    pub(super) recovery_metrics: AgentRecoveryMetrics,
     pub(super) model_usage: ModelUsage,
     pub(super) provider_attempts: ProviderAttemptMetadata,
     pub(super) context_trace: Option<AgentContextTrace>,
     pub(super) seen_tool_call_fingerprints: Vec<String>,
     pub(super) completed_tool_call_fingerprints: Vec<String>,
-    pub(super) last_repair_failure: Option<RepairFailureState>,
 }
 
 /// A durable boundary for a non-approval turn and its next safe action.
@@ -250,9 +238,7 @@ impl HistoricalModelContext {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnCheckpointPhase {
     Initial,
-    BeforeModelRequest {
-        finalization_only: bool,
-    },
+    BeforeModelRequest,
     ToolCallsReady {
         pending_tool_calls: Vec<PendingToolCall>,
     },
@@ -428,7 +414,10 @@ fn migrate_v6_approval_checkpoint(payload: &Value) -> Result<Value, String> {
     insert_completed(provisional, completed, "approval")
 }
 
-/// Add only the current version and an empty ledger before strict typed parsing.
+/// Upgrade the historical payload at the migration seam.
+///
+/// Runtime checkpoints never carry quality policy.  Legacy completion/repair fields are removed
+/// here, while the terminal-call ledger is derived from the validated historical `seen` set.
 fn migrate_payload_shape(
     payload: &Value,
     current_version: u32,
@@ -450,6 +439,17 @@ fn migrate_payload_shape(
         "checkpoint_version".to_string(),
         Value::from(current_version),
     );
+    for key in [
+        "completion",
+        "repair_state",
+        "repair_attempts",
+        "repair_cycles",
+        "last_completion_error",
+        "recovery_metrics",
+        "last_repair_failure",
+    ] {
+        object.remove(key);
+    }
     object.insert(
         "completed_tool_call_fingerprints".to_string(),
         Value::Array(Vec::new()),
@@ -639,11 +639,6 @@ impl CheckpointState {
                 "approval checkpoint completed tool-call fingerprint state is invalid".to_string(),
             );
         }
-        if self.last_repair_failure.as_ref().is_some_and(|failure| {
-            failure.consecutive_count == 0 || !is_sha256_fingerprint(&failure.signature)
-        }) {
-            return Err("approval checkpoint repair state is invalid".to_string());
-        }
         if self.provider_attempts.retry_count > self.provider_attempts.attempt_count {
             return Err("approval checkpoint provider attempt state is invalid".to_string());
         }
@@ -660,9 +655,6 @@ impl CheckpointState {
         }) {
             return Err("approval checkpoint context compaction state is invalid".to_string());
         }
-        if !self.completion.is_consistent() {
-            return Err("approval checkpoint workspace revision state is invalid".to_string());
-        }
         for occurrence in &self.tool_result_occurrences {
             let result = occurrence.result();
             if result.workspace_observation().is_some_and(|observation| {
@@ -675,67 +667,6 @@ impl CheckpointState {
                     format!("approval checkpoint mutation change summary is invalid: {error}")
                 })?;
             }
-        }
-        if let Some(repair) = &self.repair_state {
-            if repair.attempt == 0 || repair.attempt > repair.max_attempts.saturating_add(1) {
-                return Err("approval checkpoint repair state budget is invalid".to_string());
-            }
-            if repair.max_attempts == 0 || repair.max_attempts > super::MAX_REPAIR_ATTEMPTS {
-                return Err("approval checkpoint repair state bound is invalid".to_string());
-            }
-            if !repair.signature.is_empty() && !is_sha256_fingerprint(&repair.signature) {
-                return Err("approval checkpoint repair state signature is invalid".to_string());
-            }
-            if repair
-                .required_revision
-                .is_some_and(|revision| Some(revision) != self.completion.workspace_revision)
-            {
-                return Err("approval checkpoint repair state binding is invalid".to_string());
-            }
-        }
-        if self.repair_attempts > super::MAX_REPAIR_ATTEMPTS {
-            return Err("approval checkpoint repair attempt ledger is invalid".to_string());
-        }
-        if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
-            return Err("approval checkpoint repair attempt metrics are inconsistent".to_string());
-        }
-        if self.repair_cycles.len() != usize::try_from(self.repair_attempts).unwrap_or(usize::MAX) {
-            return Err("approval checkpoint repair cycle ledger is inconsistent".to_string());
-        }
-        for (index, cycle) in self.repair_cycles.iter().enumerate() {
-            let expected_attempt = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            if cycle.attempt != expected_attempt
-                || !super::is_sha256_fingerprint(&cycle.command_scope_digest)
-                || self.repair_cycles[..index]
-                    .iter()
-                    .any(|previous| previous.revision.value() >= cycle.revision.value())
-                || !self.tool_result_occurrences.iter().any(|occurrence| {
-                    let result = occurrence.result();
-                    result.tool_name == super::TOOL_COMMAND
-                        && result.ok == cycle.verification_passed
-                        && super::tool_result_command_scope_digest(result)
-                            == Some(cycle.command_scope_digest.as_str())
-                        && result.workspace_observation().is_some_and(|observation| {
-                            observation.mutation()
-                                == singularity_tools::WorkspaceMutation::Unchanged
-                                && observation.revision() == Some(cycle.revision)
-                        })
-                })
-            {
-                return Err("approval checkpoint repair cycle evidence is invalid".to_string());
-            }
-        }
-        if self
-            .repair_state
-            .as_ref()
-            .is_some_and(|repair| repair.attempt != self.repair_attempts.saturating_add(1))
-        {
-            return Err("approval checkpoint repair attempt ledger is not monotonic".to_string());
-        }
-        if self.repair_state.is_none() && self.completion.has_unresolved_failures() {
-            return Err(
-                "approval checkpoint repair state is missing for unresolved failure".to_string(),
-            );
         }
         for occurrence in &self.tool_result_occurrences {
             occurrence.validate()?;

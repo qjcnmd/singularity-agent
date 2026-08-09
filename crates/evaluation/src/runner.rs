@@ -28,7 +28,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentRecoveryMetrics, AgentStatus,
+    AgentLoop, AgentLoopCallbacks, AgentLoopEventSinkError, AgentLoopInput, AgentStatus,
     ToolResultOccurrence,
 };
 use singularity_app_server::TraceProjector;
@@ -371,7 +371,7 @@ struct AgentStageExecution {
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
-    recovery_metrics: AgentRecoveryMetrics,
+    recovery_metrics: LegacyRecoveryMetrics,
     compaction_count: u32,
     verification_required_command_count: u32,
     verification_satisfied_command_count: u32,
@@ -387,6 +387,14 @@ struct AgentStageExecution {
     tool_schema_fingerprint: Option<String>,
     provider_evidence: Option<EvaluationProviderEvidence>,
     verification_bypass_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LegacyRecoveryMetrics {
+    invalid_tool_call_count: u32,
+    repeated_tool_call_count: u32,
+    repair_attempt_count: u32,
+    completion_rejection_count: u32,
 }
 
 struct TaskExecution {
@@ -4117,7 +4125,7 @@ fn run_recovery_agent_stage(
                 model_turns,
                 tool_calls,
                 approval_count: 0,
-                recovery_metrics: AgentRecoveryMetrics::default(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: 0,
                 verification_required_command_count,
                 verification_satisfied_command_count,
@@ -4160,7 +4168,7 @@ fn run_recovery_agent_stage(
             model_turns,
             tool_calls,
             approval_count: 0,
-            recovery_metrics: AgentRecoveryMetrics::default(),
+            recovery_metrics: LegacyRecoveryMetrics::default(),
             compaction_count: 0,
             verification_required_command_count,
             verification_satisfied_command_count,
@@ -4206,7 +4214,7 @@ fn run_recovery_agent_stage(
         model_turns,
         tool_calls,
         approval_count: 0,
-        recovery_metrics: AgentRecoveryMetrics::default(),
+        recovery_metrics: LegacyRecoveryMetrics::default(),
         compaction_count: 0,
         verification_required_command_count,
         verification_satisfied_command_count,
@@ -4825,7 +4833,7 @@ fn run_agent_stage(
     let result = AgentLoop::new(provider, ToolBroker::new(resolved_tools.registry), policy)
         .with_workspace_tools(workspace_tools)
         .with_cancellation_token(prepared.cancellation.clone())
-        .run_with_events(&input, &mut on_event);
+        .run(&input, AgentLoopCallbacks::events(&mut on_event));
     let verification_bypass_count = integrity_paths
         .as_ref()
         .and_then(|paths| verification_bypass_count_for_results(&result.tool_results, paths));
@@ -4913,13 +4921,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -4951,13 +4959,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -4990,13 +4998,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -5031,13 +5039,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -5069,13 +5077,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -5111,13 +5119,13 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
-                recovery_metrics: result.recovery_metrics.clone(),
+                recovery_metrics: LegacyRecoveryMetrics::default(),
                 compaction_count: result
                     .context_trace
                     .as_ref()
                     .map_or(0, |trace| trace.compaction_count),
-                verification_required_command_count: result.verification.required_command_count,
-                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                verification_required_command_count: 0,
+                verification_satisfied_command_count: 0,
                 model_usage: result.model_usage.clone(),
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
@@ -5133,7 +5141,7 @@ fn run_agent_stage(
             };
         }
     };
-    let loop_completed = result.completed && result.status == AgentStatus::Completed;
+    let loop_completed = result.status == AgentStatus::Completed;
     let error = result.error.clone().map(safe_text);
     let sandbox_blocker = agent_sandbox_blocker(&agent_command_projection);
     let stage = if let Some(blocker) = sandbox_blocker {
@@ -5186,13 +5194,13 @@ fn run_agent_stage(
         model_turns: result.model_turns,
         tool_calls: result.tool_calls,
         approval_count: result.approval_count,
-        recovery_metrics: result.recovery_metrics.clone(),
+        recovery_metrics: LegacyRecoveryMetrics::default(),
         compaction_count: result
             .context_trace
             .as_ref()
             .map_or(0, |trace| trace.compaction_count),
-        verification_required_command_count: result.verification.required_command_count,
-        verification_satisfied_command_count: result.verification.satisfied_command_count,
+        verification_required_command_count: 0,
+        verification_satisfied_command_count: 0,
         model_usage: result.model_usage.clone(),
         provider_attempts: result.provider_attempts.clone(),
         agent_duration_ms,
@@ -5590,7 +5598,7 @@ fn blocked_agent_stage(
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
-        recovery_metrics: AgentRecoveryMetrics::default(),
+        recovery_metrics: LegacyRecoveryMetrics::default(),
         compaction_count: 0,
         verification_required_command_count: 0,
         verification_satisfied_command_count: 0,

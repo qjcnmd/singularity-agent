@@ -2,9 +2,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::{
-    AgentLoop, AgentLoopEvent, AgentLoopInput, AgentObservation, AgentRecoveryMetrics,
-    AgentRunStatus, OccurrenceIdentity, OccurrenceLifecycle, PendingToolCall,
-    ProviderAttemptObservation, ProviderAttemptStatus, TurnCheckpointPhase,
+    AgentLoop, AgentLoopEvent, AgentLoopInput, AgentObservation, AgentRunStatus,
+    OccurrenceIdentity, OccurrenceLifecycle, PendingToolCall, ProviderAttemptObservation,
+    ProviderAttemptStatus, TurnCheckpointPhase,
 };
 use singularity_model::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
@@ -12,11 +12,11 @@ use singularity_model::{
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOperationPhase,
     ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
     ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ProviderReasoningReplay, ProviderStreamEvent,
+    ProviderProtocolNegotiation, ProviderReasoningReplay,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
 use singularity_protocol::{ItemKind, TurnInputDelivery};
-use singularity_sandbox::{CommandScriptRequest, WorkspaceChangeSummary, WorkspaceMutation};
+use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
 use singularity_tools::{CommandRequest, CommandResult, PATCH_TOOL as TOOL_PATCH};
 
 use super::*;
@@ -62,7 +62,7 @@ fn pending_approval_for_test(
         "tool_name": &request.action,
         "raw_arguments": &raw_arguments,
         "resources": &request.resources,
-        "checkpoint_version": 7,
+        "checkpoint_version": 8,
         "project_instructions_digest": null,
         "messages": [{
             "role": "assistant",
@@ -80,24 +80,11 @@ fn pending_approval_for_test(
         "used_approval_grants": [],
         "approval_count": 1,
         "model_turns": 1,
-        "completion": {
-            "workspace_mutated": false,
-            "workspace_revision": null,
-            "successful_command_count": 0,
-            "required_command_counts": {},
-            "terminal_command_scope_digests": [],
-            "terminal_command_revisions": [],
-            "unresolved_failures": []
-        },
-        "repair_attempts": 0,
-        "last_completion_error": null,
-        "recovery_metrics": AgentRecoveryMetrics::default(),
         "model_usage": ModelUsage::default(),
         "provider_attempts": ProviderAttemptMetadata::default(),
         "context_trace": null,
         "seen_tool_call_fingerprints": [],
-        "completed_tool_call_fingerprints": [],
-        "last_repair_failure": null
+        "completed_tool_call_fingerprints": []
     });
     decode_pending_approval(request, Some(&payload))
         .expect("pending approval")
@@ -1227,47 +1214,6 @@ struct StaticProvider {
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 }
 
-#[derive(Clone)]
-struct StreamingProvider {
-    responses: Vec<(Vec<ProviderStreamEvent>, ModelTurnResponse)>,
-    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
-}
-
-impl Provider for StreamingProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
-        let response_index = seen_requests.len();
-        seen_requests.push(request.clone());
-        let (events, response) = self
-            .responses
-            .get(response_index)
-            .unwrap_or_else(|| self.responses.last().expect("streaming response"));
-        let mut response = response.clone();
-        response.request_id = request.request_id.clone();
-        for event in events {
-            on_event(event.clone());
-        }
-        Ok(response)
-    }
-
-    fn complete(
-        &self,
-        _request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        panic!("streaming provider must use complete_stream")
-    }
-}
-
 impl Provider for StaticProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract::default()
@@ -1717,15 +1663,14 @@ fn null_model_thread_preflights_chat_replay_against_resolved_responses_selector(
             .with_shared_sandbox_backend(Arc::new(CompletedSandboxBackend)),
     );
     let mut checkpoint = None;
-    let fixture_status = fixture_loop.run_with_events_and_checkpoints(
+    let fixture_status = fixture_loop.run(
         &AgentLoopInput::new(&thread.thread_id, &prior.turn_id, "prior user").with_max_turns(2),
-        &mut |_event| Ok(()),
-        &mut |event| {
+        AgentLoopCallbacks::events_and_checkpoints(&mut |_event| Ok(()), &mut |event| {
             if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
                 checkpoint = Some(event.checkpoint.clone());
             }
             Ok(())
-        },
+        }),
     );
     assert_eq!(fixture_status.status, AgentStatus::Completed);
     let checkpoint = checkpoint.expect("completed checkpoint");
@@ -2250,7 +2195,7 @@ fn approval_resume_uses_stored_policy_snapshot_instead_of_defaults() {
         .expect("resume")
         .expect("terminal status");
 
-    assert_eq!(resumed.1.status, AgentStatus::Failed);
+    assert_eq!(resumed.1.status, AgentStatus::Completed);
     assert_eq!(
         std::fs::read_to_string(&file_path).expect("read readme"),
         "after"
@@ -2995,52 +2940,6 @@ fn agent_loop_approval_resume_fails_closed_when_project_instructions_change() {
 
 struct CompletedSandboxBackend;
 
-struct MutatingCommandSandboxBackend {
-    calls: AtomicUsize,
-}
-
-impl SandboxBackend for MutatingCommandSandboxBackend {
-    fn name(&self) -> &'static str {
-        "mutating_command_test"
-    }
-
-    fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
-        singularity_tools::SandboxCapabilities::strict().with_change_detection()
-    }
-
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        self.result(&request.command_id)
-    }
-
-    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        self.result(&request.command_id)
-    }
-}
-
-impl MutatingCommandSandboxBackend {
-    fn result(&self, command_id: &str) -> CommandResult {
-        let changed = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
-        let result = CommandResult::completed(command_id, "command ok")
-            .with_workspace_mutation(if changed {
-                WorkspaceMutation::Changed
-            } else {
-                WorkspaceMutation::Unchanged
-            })
-            .with_sandbox_execution(
-                self.name(),
-                singularity_tools::SandboxBackendEnforcement::Strict,
-            );
-        if changed {
-            result.with_workspace_change_summary(WorkspaceChangeSummary::new(
-                vec![".".to_string()],
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            ))
-        } else {
-            result
-        }
-    }
-}
-
 impl SandboxBackend for CompletedSandboxBackend {
     fn name(&self) -> &'static str {
         "completed_test"
@@ -3168,189 +3067,6 @@ fn agent_loop_command_uses_bound_sandbox_backend_without_approval() {
 }
 
 #[test]
-fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
-    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "say hello"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "say hello".to_string(),
-        }],
-    };
-    let server = app_server(store).with_sandbox_backend(MutatingCommandSandboxBackend {
-        calls: AtomicUsize::new(0),
-    });
-    server
-        .event_filter
-        .lock()
-        .expect("event filter")
-        .event_types = Some(vec![
-        "item/started".to_string(),
-        "item/agentMessage/delta".to_string(),
-        "item/completed".to_string(),
-        "turn/completed".to_string(),
-    ]);
-    let mut assistant_events =
-        AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-    let mut events = Vec::new();
-    let mut mutation_response =
-        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "mutating");
-    mutation_response.tool_calls.push(ModelToolCall {
-        tool_call_id: "call_mutate".to_string(),
-        tool_name: "command".to_string(),
-        arguments: json!({
-            "command": "test-program mutate",
-            "timeout_seconds": 5
-        }),
-        raw_arguments: json!({
-            "command": "test-program mutate",
-            "timeout_seconds": 5
-        })
-        .to_string(),
-        parse_status: ModelToolParseStatus::Valid,
-        validation_errors: Vec::new(),
-    });
-    let mut verification_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "verifying");
-    verification_response.tool_calls.push(ModelToolCall {
-        tool_call_id: "call_verify".to_string(),
-        tool_name: "command".to_string(),
-        arguments: json!({
-            "command": "test-program verify",
-            "cwd": ".",
-            "timeout_seconds": 5
-        }),
-        raw_arguments: json!({
-            "command": "test-program verify",
-            "cwd": ".",
-            "timeout_seconds": 5
-        })
-        .to_string(),
-        parse_status: ModelToolParseStatus::Valid,
-        validation_errors: Vec::new(),
-    });
-    let status = server
-        .run_agent_loop_with_provider_and_text_deltas(
-            StreamingProvider {
-                responses: vec![
-                    (
-                        vec![ProviderStreamEvent::OutputTextDelta {
-                            delta: "mutating".to_string(),
-                        }],
-                        mutation_response,
-                    ),
-                    (
-                        vec![ProviderStreamEvent::OutputTextDelta {
-                            delta: "verifying".to_string(),
-                        }],
-                        verification_response,
-                    ),
-                    (
-                        vec![
-                            ProviderStreamEvent::OutputTextDelta {
-                                delta: "do".to_string(),
-                            },
-                            ProviderStreamEvent::OutputTextDelta {
-                                delta: "ne".to_string(),
-                            },
-                        ],
-                        ModelTurnResponse::completed(
-                            "model_request_turn_1_2",
-                            "response_3",
-                            "done",
-                        ),
-                    ),
-                ],
-                seen_requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
-            &mut |delta| {
-                events.extend(
-                    server
-                        .project_assistant_delta(&mut assistant_events, delta)
-                        .expect("project delta"),
-                );
-            },
-        )
-        .expect("agent loop");
-    assert_eq!(status.status, AgentStatus::Completed);
-    assert_eq!(status.final_answer.as_deref(), Some("done"));
-    assert!(status.verification.required);
-    assert!(status.verification.passed);
-
-    let committed = server
-        .commit_turn_run_status(
-            turn,
-            &status,
-            Some(&assistant_events.item_id),
-            &CancellationToken::new(),
-            None,
-        )
-        .expect("commit terminal outcome");
-    events.extend(
-        server
-            .committed_turn_events(&committed, Some(&assistant_events))
-            .expect("terminal events"),
-    );
-
-    let methods = events
-        .iter()
-        .map(|event| event["method"].as_str().expect("event method"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        methods,
-        vec![
-            "item/started",
-            "item/agentMessage/delta",
-            "item/agentMessage/delta",
-            "item/completed",
-            "turn/completed",
-        ]
-    );
-    assert_eq!(events[1]["params"]["delta"], "do");
-    assert_eq!(events[2]["params"]["delta"], "ne");
-    let item_id = assistant_events.item_id.as_str();
-    assert!(
-        events[..3]
-            .iter()
-            .all(|event| event["params"]["item"]["item_id"] == item_id)
-    );
-    assert_eq!(events[3]["params"]["item"]["item_id"], item_id);
-    assert_eq!(
-        committed
-            .assistant_item
-            .as_ref()
-            .map(|item| item.item_id.as_str()),
-        Some(item_id)
-    );
-    assert_eq!(
-        committed
-            .assistant_item
-            .as_ref()
-            .and_then(|item| item.payload["delta"].as_str()),
-        Some("done")
-    );
-}
-
-#[test]
 fn unsequenced_turn_outputs_carry_one_explicit_transport_trace_binding() {
     let store = SessionStore::open(":memory:").expect("store");
     let mut server = app_server(store);
@@ -3368,103 +3084,6 @@ fn unsequenced_turn_outputs_carry_one_explicit_transport_trace_binding() {
         .expect("sequence unbound output");
     assert!(unbound[0].trace_binding.is_none());
     server.output_order.complete(unbound[0].reservation.order);
-}
-
-/// Verification Span 按 occurrence_id 分组，每个 ID 恰好一个 Start 和一个 End。
-#[test]
-fn verification_spans_are_paired_by_occurrence_id() {
-    use singularity_agent::{
-        AgentLoopEvent, AgentObservation, OccurrenceIdentity, OccurrenceLifecycle,
-        VerificationObservation, VerificationStatus,
-    };
-    use singularity_protocol::{TraceSpanKind, TraceSpanPhase};
-    use std::collections::BTreeMap;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "verify"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-
-    let mut projector =
-        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
-            .expect("projector");
-
-    // 投影三个不同 occurrence_id 的 verification observation
-    for ordinal in 0..3u32 {
-        // 每个 ordinal 使用不同的 occurrence_id
-        let identity = OccurrenceIdentity {
-            occurrence_id: format!("sha256:{}{:02x}", "cd".repeat(31), ordinal),
-            parent_occurrence_id: None,
-            ordinal,
-        };
-        let started = VerificationObservation {
-            identity: identity.clone(),
-            lifecycle: OccurrenceLifecycle::Started {
-                queued_at_unix_ms: 100 + u64::from(ordinal),
-                started_at_unix_ms: 101 + u64::from(ordinal),
-            },
-            required_command_count: 1,
-            satisfied_command_count: 0,
-            occurrence_count: ordinal + 1,
-            command_duration_ms: None,
-        };
-        projector
-            .project_event(AgentLoopEvent::Observation(AgentObservation::Verification(
-                started,
-            )))
-            .expect("project start");
-
-        let finished = VerificationObservation {
-            identity,
-            lifecycle: OccurrenceLifecycle::Finished {
-                queued_at_unix_ms: 100 + u64::from(ordinal),
-                started_at_unix_ms: 101 + u64::from(ordinal),
-                ended_at_unix_ms: 200 + u64::from(ordinal),
-                duration_ms: 99,
-                status: VerificationStatus::CommandPassed,
-            },
-            required_command_count: 1,
-            satisfied_command_count: 1,
-            occurrence_count: ordinal + 1,
-            command_duration_ms: Some(50),
-        };
-        projector
-            .project_event(AgentLoopEvent::Observation(AgentObservation::Verification(
-                finished,
-            )))
-            .expect("project end");
-    }
-
-    // 读取 trace 并按 span_id 分组
-    let trace = store.list_trace(&thread.thread_id).expect("trace");
-    let mut spans: BTreeMap<String, Vec<TraceSpanPhase>> = BTreeMap::new();
-    for event in &trace {
-        if event.span_kind == Some(TraceSpanKind::Verification)
-            && let (Some(span_id), Some(phase)) = (&event.span_id, event.span_phase)
-        {
-            spans.entry(span_id.clone()).or_default().push(phase);
-        }
-    }
-
-    // 每个 occurrence_id 恰好一个 Start 和一个 End
-    assert_eq!(spans.len(), 3, "three distinct verification span ids");
-    for (span_id, phases) in &spans {
-        let starts = phases
-            .iter()
-            .filter(|p| **p == TraceSpanPhase::Start)
-            .count();
-        let ends = phases.iter().filter(|p| **p == TraceSpanPhase::End).count();
-        assert_eq!(starts, 1, "span {span_id} must have exactly one Start");
-        assert_eq!(ends, 1, "span {span_id} must have exactly one End");
-    }
 }
 
 #[test]
