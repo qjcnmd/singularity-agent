@@ -713,16 +713,13 @@ fn run_task_workers(
     prepared_sources: &[PreparedTaskSource],
     trials_per_task: u32,
     max_workers: usize,
-    selected_trial: Option<u32>,
     recovery_every: Option<NonZeroUsize>,
     activity: &TrialActivityTracker,
 ) -> Result<Vec<TaskEvaluation>, TrialWorkerError> {
     if context.cancellation.is_cancelled() {
         return Err(TrialWorkerError::Cancelled(Vec::new()));
     }
-    let trial_ordinals = selected_trial
-        .map(|trial| vec![trial])
-        .unwrap_or_else(|| (1..=trials_per_task).collect::<Vec<_>>());
+    let trial_ordinals = (1..=trials_per_task).collect::<Vec<_>>();
     let trial_count = trial_ordinals.len();
     let task_traces = plans
         .iter()
@@ -1433,7 +1430,6 @@ pub fn run_evaluation_with_mode(
         &prepared_sources,
         trials_per_task,
         params.max_workers,
-        None,
         params.recovery_every,
         &trial_activity,
     );
