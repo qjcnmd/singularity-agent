@@ -1234,20 +1234,14 @@ fn approval_decision_after_process_kill_executes_approved_tool_once() {
             }
         }),
     );
+    let completed = second_output.recv_method("turn/completed", Duration::from_secs(20));
+    assert_eq!(completed["params"]["turn"]["turn_id"], turn_id);
+    assert_eq!(completed["params"]["turn"]["status"], "completed");
     let decision = second_output.recv_id(4, Duration::from_secs(5));
     assert_eq!(
         decision["result"]["decision"]["request_id"], approval_request_id,
         "approval decision must be recorded: {decision}"
     );
-
-    let completed = loop {
-        let message = second_output.recv_next_event(Duration::from_secs(20));
-        if message["method"] == "turn/completed" {
-            break message;
-        }
-    };
-    assert_eq!(completed["params"]["turn"]["turn_id"], turn_id);
-    assert_eq!(completed["params"]["turn"]["status"], "completed");
     assert_eq!(
         provider.production_requests.load(Ordering::SeqCst),
         3,
