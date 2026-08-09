@@ -936,10 +936,14 @@ fn write_json_response(stream: &mut TcpStream, body: &Value) {
 }
 
 fn write_stream_response(stream: &mut TcpStream, response: Value) {
+    let body = format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({"type": "response.completed", "response": response})
+    );
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: response.completed\ndata: {}\n\n",
-        json!({"type": "response.completed", "response": response})
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
     )
     .expect("write provider stream response");
     stream.flush().expect("flush provider stream response");
@@ -947,11 +951,15 @@ fn write_stream_response(stream: &mut TcpStream, response: Value) {
 
 fn write_final_stream_response(stream: &mut TcpStream, response: Value) {
     let final_text = "resumed and completed";
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+    let body = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
         json!({"type": "response.output_text.delta", "delta": final_text}),
         json!({"type": "response.completed", "response": response})
+    );
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
     )
     .expect("write final provider stream response");
     stream
