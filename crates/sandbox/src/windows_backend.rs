@@ -2420,67 +2420,61 @@ fn child_environment_from(
             )
         };
 
-    if let (Some(_), Some(_), Some(_), Some((host_temp, workspace, isolated_parent, temp_root))) = (
+    if let (
+        Some(cache),
+        Some(digest),
+        Some(_),
+        Some((host_temp, workspace, isolated_parent, temp_root)),
+    ) = (
         cache.as_deref(),
         cache_digest.as_deref(),
         isolated_cargo_target.as_deref(),
         isolated_temp.as_ref(),
     ) {
-        match std::fs::create_dir(isolated_parent) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed to create isolated TEMP parent directory {}: {error}",
-                    isolated_parent.display()
-                ));
-            }
-        }
-        let canonical_isolated_parent = dunce::canonicalize(isolated_parent).map_err(|error| {
-            format!(
-                "isolated TEMP parent is unavailable after creation {}: {error}",
-                isolated_parent.display()
-            )
-        })?;
-        if !canonical_isolated_parent.is_absolute()
-            || !canonical_isolated_parent.is_dir()
-            || !canonical_isolated_parent.starts_with(host_temp)
-            || canonical_isolated_parent == *host_temp
-            || canonical_isolated_parent.starts_with(workspace)
-            || canonical_isolated_parent != *isolated_parent
-        {
-            return Err(
-                "isolated TEMP parent is not a distinct directory under the canonical host TEMP"
-                    .to_string(),
-            );
-        }
-        match std::fs::create_dir(temp_root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed to create isolated TEMP directory {}: {error}",
-                    temp_root.display()
-                ));
-            }
-        }
-        let canonical_temp_root = dunce::canonicalize(temp_root).map_err(|error| {
-            format!(
-                "isolated TEMP root is unavailable after creation {}: {error}",
-                temp_root.display()
-            )
-        })?;
-        if !canonical_temp_root.is_absolute()
-            || !canonical_temp_root.is_dir()
-            || !canonical_temp_root.starts_with(host_temp)
-            || canonical_temp_root == *host_temp
-            || canonical_temp_root.starts_with(workspace)
-            || canonical_temp_root != *temp_root
-        {
-            return Err(
-                "isolated TEMP root is not a distinct directory under the canonical host TEMP"
-                    .to_string(),
-            );
+        let canonical_isolated_parent = create_and_validate_isolated_directory(
+            isolated_parent,
+            "TEMP parent directory",
+            host_temp,
+            workspace,
+            host_temp,
+        )?;
+        let canonical_temp_root = create_and_validate_isolated_directory(
+            temp_root,
+            "TEMP root directory",
+            host_temp,
+            workspace,
+            &canonical_isolated_parent,
+        )?;
+        let canonical_cache = create_and_validate_isolated_directory(
+            cache,
+            "tool cache root directory",
+            host_temp,
+            workspace,
+            &canonical_temp_root,
+        )?;
+        for (label, tool) in [
+            ("pip cache", "pip"),
+            ("npm cache", "npm"),
+            ("python cache", "python"),
+            ("pytest cache", "pytest"),
+            ("Cargo target", "cargo"),
+        ] {
+            let tool_root = cache.join(tool);
+            let canonical_tool_root = create_and_validate_isolated_directory(
+                &tool_root,
+                &format!("{label} root directory"),
+                host_temp,
+                workspace,
+                &canonical_cache,
+            )?;
+            let leaf = tool_root.join(digest);
+            create_and_validate_isolated_directory(
+                &leaf,
+                &format!("{label} directory"),
+                host_temp,
+                workspace,
+                &canonical_tool_root,
+            )?;
         }
         set_environment_value(&mut env_map, "TEMP", &canonical_temp_root.to_string_lossy());
         set_environment_value(&mut env_map, "TMP", &canonical_temp_root.to_string_lossy());
@@ -2518,6 +2512,45 @@ fn child_environment_from(
         set_environment_value(&mut env_map, "CARGO_TARGET_DIR", &target.to_string_lossy());
     }
     Ok(env_map)
+}
+
+/// Create one isolated directory and reject reparse or out-of-bound targets.
+fn create_and_validate_isolated_directory(
+    path: &Path,
+    label: &str,
+    host_temp: &Path,
+    workspace: &Path,
+    required_parent: &Path,
+) -> Result<PathBuf, String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to create isolated {label} {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let canonical = dunce::canonicalize(path).map_err(|error| {
+        format!(
+            "isolated {label} is unavailable after creation {}: {error}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_absolute()
+        || !canonical.is_dir()
+        || !canonical.starts_with(required_parent)
+        || !canonical.starts_with(host_temp)
+        || canonical.starts_with(workspace)
+        || canonical != path
+    {
+        return Err(format!(
+            "isolated {label} is not a distinct directory under the verified TEMP root: {}",
+            path.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 fn set_environment_value(env_map: &mut HashMap<String, String>, name: &str, value: &str) {
@@ -3372,7 +3405,12 @@ mod tests {
                             &dunce::canonicalize(workspace.path()).expect("canonical workspace")
                         ))
                 );
-                assert!(!expected_cache.exists());
+                for tool in ["pip", "npm", "python", "pytest", "cargo"] {
+                    assert!(
+                        expected_cache.join(tool).join(&digest).is_dir(),
+                        "isolated {tool} cache directory missing"
+                    );
+                }
                 assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
             } else {
                 assert_eq!(
@@ -3438,6 +3476,9 @@ mod tests {
         let second_temp = canonical_temp
             .join("singularity-isolated")
             .join(&second_digest);
+        let first_again_temp = PathBuf::from(
+            env_value(&first_again, "TEMP").expect("repeat isolated TEMP environment value"),
+        );
         assert_eq!(
             env_value(&first, "TEMP"),
             Some(first_temp.to_string_lossy().as_ref())
@@ -3484,6 +3525,36 @@ mod tests {
         assert!(
             env_value(&first, "PYTEST_ADDOPTS")
                 .is_some_and(|value| value.contains(&format!("cache_dir={first_pytest}")))
+        );
+        for tool in ["pip", "npm", "python", "pytest", "cargo"] {
+            let first_leaf = first_temp
+                .join("singularity-tool-cache")
+                .join(tool)
+                .join(&first_digest);
+            let second_leaf = second_temp
+                .join("singularity-tool-cache")
+                .join(tool)
+                .join(&second_digest);
+            let first_again_leaf = first_again_temp
+                .join("singularity-tool-cache")
+                .join(tool)
+                .join(&first_digest);
+            assert!(first_leaf.is_dir(), "first {tool} cache directory missing");
+            assert!(
+                second_leaf.is_dir(),
+                "second {tool} cache directory missing"
+            );
+            assert_ne!(first_leaf, second_leaf);
+            assert_eq!(first_leaf, first_again_leaf);
+            assert!(first_again_leaf.is_dir());
+        }
+        assert_eq!(
+            env_value(&first, "PYTEST_ADDOPTS"),
+            env_value(&first_again, "PYTEST_ADDOPTS")
+        );
+        assert_eq!(
+            env_value(&first, "CARGO_TARGET_DIR"),
+            env_value(&first_again, "CARGO_TARGET_DIR")
         );
         assert_ne!(
             env_value(&first, "PIP_CACHE_DIR"),
@@ -3544,6 +3615,60 @@ mod tests {
         assert!(
             !external_isolated.join(&digest).exists(),
             "isolated preparation must not materialize a digest through an outer junction"
+        );
+
+        fs::remove_dir(&alias).expect("remove junction fixture");
+    }
+
+    #[test]
+    fn isolated_environment_rejects_preexisting_tool_cache_junction() {
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external target");
+        let canonical_temp = dunce::canonicalize(temp_root.path()).expect("canonical temp root");
+        let canonical_workspace =
+            dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let digest = super::super::workspace_tool_cache_digest(&canonical_workspace);
+        let isolated_parent = canonical_temp.join("singularity-isolated");
+        let temp_root = isolated_parent.join(&digest);
+        let cache = temp_root.join("singularity-tool-cache");
+        fs::create_dir(&isolated_parent).expect("create isolated parent");
+        fs::create_dir(&temp_root).expect("create isolated temp root");
+        fs::create_dir(&cache).expect("create tool cache root");
+
+        let alias = cache.join("pip");
+        let external_pip = external.path().join("pip-target");
+        fs::create_dir(&external_pip).expect("create external pip target");
+        let alias_quoted = format!("\"{}\"", alias.display());
+        let target_quoted = format!("\"{}\"", external_pip.display());
+        let junction_created = std::process::Command::new("cmd.exe")
+            .raw_arg("/c")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&alias_quoted)
+            .raw_arg(&target_quoted)
+            .output()
+            .is_ok_and(|output| output.status.success() && alias.exists());
+        if !junction_created {
+            return;
+        }
+
+        let error = child_environment_from(
+            [(
+                "TEMP".to_string(),
+                canonical_temp.to_string_lossy().into_owned(),
+            )],
+            &CommandEnvironmentPolicy::Isolated,
+            workspace.path(),
+        )
+        .expect_err("tool cache junction must fail closed");
+        assert!(
+            error.contains("pip cache"),
+            "unexpected tool cache error: {error}"
+        );
+        assert!(
+            !external_pip.join(&digest).exists(),
+            "isolated preparation must not materialize a digest through an inner junction"
         );
 
         fs::remove_dir(&alias).expect("remove junction fixture");

@@ -466,6 +466,8 @@ Agent workspace 的 before/after 快照保留完整 materialized tree；仅在�
 
 Windows elevated setup 对 sandbox group 与 writable-root capability SID 使用同一目标 DACL 快照；继承的 `FILE_DELETE_CHILD` 不触发无法收敛的显式 ACL 刷新，runner 启动不加载用户 profile 并以 5 ms 间隔轮询就绪。
 
+Windows isolated child 启动前，controller 逐层物化并 canonical 验证按 workspace digest 分区的 pip、npm、python、pytest、cargo 五个工具缓存 leaf，使 ACL 解析覆盖 child 的实际可写目录；任一 reparse 或边界不一致均 fail closed。
+
 完整收口至少运行：
 
 ```text
