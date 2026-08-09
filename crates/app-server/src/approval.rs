@@ -203,6 +203,19 @@ impl AppServer {
                 match decode_pending_approval(&pending_request, pending_payload.as_ref()) {
                     Ok(pending) => pending,
                     Err(_) => {
+                        let expected_approval = is_tool_continuation.then_some((
+                            pending_request.request_id.as_str(),
+                            CheckpointFailureClaim::Pending,
+                        ));
+                        self.store
+                            .terminalize_checkpoint_failure(
+                                &pending_request.thread_id,
+                                &pending_request.turn_id,
+                                TurnStatus::Blocked,
+                                AgentStatus::Blocked.as_str(),
+                                expected_approval,
+                            )
+                            .map_err(AppServerError::Store)?;
                         emit_messages(
                             &mut emit,
                             invalid_state_response(
@@ -383,6 +396,21 @@ impl AppServer {
             ) {
                 Ok(pending_approval) => pending_approval,
                 Err(_) => {
+                    let current_turn = self.store.get_turn(&recorded.turn.turn_id)?;
+                    let expected_approval = (handoff_checkpoint.is_none() && is_tool_continuation)
+                        .then_some((
+                            recorded.request.request_id.as_str(),
+                            CheckpointFailureClaim::Executing,
+                        ));
+                    self.store
+                        .terminalize_checkpoint_failure(
+                            &recorded.request.thread_id,
+                            &recorded.turn.turn_id,
+                            current_turn.status.clone(),
+                            &current_turn.agent_loop_status,
+                            expected_approval,
+                        )
+                        .map_err(AppServerError::Store)?;
                     emit_messages(
                         &mut emit,
                         invalid_state_response(

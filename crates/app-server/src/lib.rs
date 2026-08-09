@@ -52,9 +52,9 @@ use singularity_protocol::{
 };
 use singularity_sandbox::{PlatformSandboxBackend, SandboxBackend, SandboxBackendEnforcement};
 use singularity_store::{
-    AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
-    CreateStartedTurnParams, SessionStore, StoreError, ToolExecution, ToolExecutionState,
-    TurnOutcomeAuthority,
+    AllocatedAssistantItemId, CheckpointFailureClaim, CommitTurnOutcomeParams,
+    CommittedTurnOutcome, CreateStartedTurnParams, SessionStore, StoreError, ToolExecution,
+    ToolExecutionState, TurnOutcomeAuthority,
 };
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, ToolBroker, ToolRegistry, WorkspaceTools, workspace_tool_entries,

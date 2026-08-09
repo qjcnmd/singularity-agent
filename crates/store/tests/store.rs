@@ -4855,11 +4855,21 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
 #[test]
 fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
+    let (turn, item, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "blocked",
+            serde_json::json!([{"type": "text", "text": "delete me"}]),
+            "test",
+            "turn started",
+        )
         .expect("turn");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
+        .expect("blocked turn");
     let request = ApprovalRequest::new(
         "approval_turn_call_1",
         thread.thread_id.clone(),
@@ -4920,6 +4930,49 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         Some(turn.turn_id.as_str())
     );
 
+    // Populate every recovery table with a real bound row before deletion.
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "insert into turn_inputs(input_id, turn_id, item_id, delivery, delivery_state, consumed_at)
+             values(?1, ?2, ?3, 'steer', 'consumed', current_timestamp)",
+            rusqlite::params!["input_delete", turn.turn_id, item.item_id],
+        )
+        .expect("turn input");
+    connection
+        .execute(
+            "insert into tool_executions(execution_id, thread_id, turn_id, tool_call_id, execution_state, payload)
+             values(?1, ?2, ?3, 'call_delete', 'unknown', '{}')",
+            rusqlite::params![
+                "execution_delete",
+                thread.thread_id,
+                turn.turn_id
+            ],
+        )
+        .expect("tool execution");
+    connection
+        .execute(
+            "insert into turn_checkpoints(turn_id, thread_id, payload, checkpoint_version)
+             values(?1, ?2, '{\"checkpoint_version\":1}', 1)",
+            rusqlite::params![turn.turn_id, thread.thread_id],
+        )
+        .expect("turn checkpoint");
+    for (table, count) in [
+        ("turn_inputs", 1_i64),
+        ("tool_executions", 1_i64),
+        ("turn_checkpoints", 1_i64),
+    ] {
+        let actual: i64 = connection
+            .query_row(
+                &format!("select count(*) from {table} where turn_id = ?1"),
+                [&turn.turn_id],
+                |row| row.get(0),
+            )
+            .expect("recovery row count");
+        assert_eq!(actual, count, "{table} fixture");
+    }
+    drop(connection);
+
     store
         .delete_thread(&thread.thread_id)
         .expect("delete thread");
@@ -4932,6 +4985,107 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     assert!(matches!(
         store.list_trace(&thread.thread_id),
         Err(StoreError::NotFound(message)) if message == format!("trace run {}", thread.thread_id)
+    ));
+
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
+    for table in [
+        "approval_decisions",
+        "pending_tool_calls",
+        "turn_inputs",
+        "tool_executions",
+        "turn_checkpoints",
+        "approvals",
+        "items",
+        "trace_events",
+        "artifact_refs",
+        "turns",
+        "threads",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("select count(*) from {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("deleted table count");
+        assert_eq!(count, 0, "{table} rows remain after thread deletion");
+    }
+}
+
+#[test]
+fn malformed_checkpoint_terminalization_marks_unknown_and_never_replays() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "recover safely"}]),
+            "test",
+            "turn started",
+        )
+        .expect("turn");
+    let checkpoint = serde_json::json!({"checkpoint_version": 1, "pending": "opaque"});
+    store
+        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 1)
+        .expect("checkpoint");
+    let execution = ToolExecution {
+        execution_id: format!("turn:{}:tool:call_recovery", turn.turn_id),
+        thread_id: thread.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        tool_call_id: "call_recovery".to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "command"}),
+    };
+    assert!(
+        store
+            .begin_tool_executions_at_checkpoint(std::slice::from_ref(&execution), &checkpoint, 1)
+            .expect("claim execution")
+    );
+
+    let failed = store
+        .terminalize_checkpoint_failure(
+            &thread.thread_id,
+            &turn.turn_id,
+            TurnStatus::Running,
+            "running",
+            None,
+        )
+        .expect("terminalize malformed checkpoint");
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(failed.agent_loop_status, "failed");
+    assert_eq!(
+        store
+            .get_tool_execution(&execution.execution_id)
+            .expect("execution lookup")
+            .expect("execution retained")
+            .state,
+        ToolExecutionState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint lookup"),
+        Some(checkpoint)
+    );
+    let trace = store
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .find(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
+        .expect("typed checkpoint failure trace");
+    assert_eq!(trace.payload["tool_replayed"], false);
+
+    assert!(matches!(
+        store.terminalize_checkpoint_failure(
+            &thread.thread_id,
+            &turn.turn_id,
+            TurnStatus::Running,
+            "running",
+            None,
+        ),
+        Err(StoreError::InvalidState(message))
+            if message.contains("owner/status changed")
     ));
 }
 

@@ -179,8 +179,7 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
-        // 先收集所有显式或 checkpoint 绑定的 approval request。
-        let mut approval_request_ids = BTreeSet::new();
+        // 先校验所有显式 approval 的 thread/turn 投影。
         {
             let mut statement = transaction.prepare(
                 "select request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
@@ -212,51 +211,189 @@ impl SessionStore {
                         "approval thread projection is inconsistent during deletion".to_string(),
                     ));
                 }
-                approval_request_ids.insert(request_id);
             }
         }
-        {
+
+        // 按 child-first 顺序删除所有恢复/approval 子表。每次删除都核对
+        // 事务快照中的行数，避免关系投影不完整时静默留下孤儿数据。
+        let expected_approval_decisions: i64 = transaction.query_row(
+            "select count(*) from approval_decisions where request_id in
+                 (select request_id from approvals where thread_id = ?1
+                  union select request_id from pending_tool_calls
+                  where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1))",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_approval_decisions = transaction.execute(
+            "delete from approval_decisions where request_id in
+                 (select request_id from approvals where thread_id = ?1
+                  union select request_id from pending_tool_calls
+                  where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1))",
+            params![thread_id],
+        )? as i64;
+        if deleted_approval_decisions != expected_approval_decisions {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed approval decision rows".to_string(),
+            ));
+        }
+
+        let expected_pending_tool_calls: i64 = transaction.query_row(
+            "select count(*) from pending_tool_calls where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_pending_tool_calls = transaction.execute(
+            "delete from pending_tool_calls where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_pending_tool_calls != expected_pending_tool_calls {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed pending tool call rows".to_string(),
+            ));
+        }
+
+        let expected_turn_inputs: i64 = transaction.query_row(
+            "select count(*) from turn_inputs where turn_id in
+                 (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_turn_inputs = transaction.execute(
+            "delete from turn_inputs where turn_id in
+                 (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_turn_inputs != expected_turn_inputs {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed turn input rows".to_string(),
+            ));
+        }
+
+        let expected_tool_executions: i64 = transaction.query_row(
+            "select count(*) from tool_executions where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_tool_executions = transaction.execute(
+            "delete from tool_executions where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_tool_executions != expected_tool_executions {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed tool execution rows".to_string(),
+            ));
+        }
+
+        let expected_turn_checkpoints: i64 = transaction.query_row(
+            "select count(*) from turn_checkpoints where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_turn_checkpoints = transaction.execute(
+            "delete from turn_checkpoints where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_turn_checkpoints != expected_turn_checkpoints {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed turn checkpoint rows".to_string(),
+            ));
+        }
+
+        let expected_approvals: i64 = transaction.query_row(
+            "select count(*) from approvals where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_approvals = transaction.execute(
+            "delete from approvals where thread_id = ?1
+             or turn_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_approvals != expected_approvals {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed approval rows".to_string(),
+            ));
+        }
+
+        let artifact_ids = {
             let mut statement = transaction.prepare(
-                "select request_id from pending_tool_calls where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1)",
+                "select artifact_id from artifact_refs where run_id = ?1
+                 or item_id in (select item_id from items where turn_id in
+                     (select turn_id from turns where thread_id = ?1))",
             )?;
-            let rows = statement.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                approval_request_ids.insert(row?);
-            }
+            statement
+                .query_map(params![thread_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let expected_items: i64 = transaction.query_row(
+            "select count(*) from items where turn_id in
+                 (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_items = transaction.execute(
+            "delete from items where turn_id in
+                 (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_items != expected_items {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed item rows".to_string(),
+            ));
         }
-        // 再按依赖顺序删除 decision history、checkpoint 和 approval。
-        for request_id in approval_request_ids {
-            transaction.execute(
-                "delete from approval_decisions where request_id = ?1",
-                params![request_id],
-            )?;
-            transaction.execute(
-                "delete from pending_tool_calls where request_id = ?1",
-                params![request_id],
-            )?;
-            transaction.execute(
-                "delete from approvals where request_id = ?1",
-                params![request_id],
-            )?;
+
+        let expected_trace_events: i64 = transaction.query_row(
+            "select count(*) from trace_events where run_id = ?1
+             or session_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        let deleted_trace_events = transaction.execute(
+            "delete from trace_events where run_id = ?1
+             or session_id in (select turn_id from turns where thread_id = ?1)",
+            params![thread_id],
+        )? as i64;
+        if deleted_trace_events != expected_trace_events {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed trace rows".to_string(),
+            ));
         }
-        // 最后清理 thread 的 turn、item、trace、artifact 和自身记录。
-        transaction.execute(
-            "delete from pending_tool_calls where turn_id in (select turn_id from turns where thread_id = ?1)",
+
+        let expected_artifact_refs = artifact_ids.len() as i64;
+        let mut deleted_artifact_refs = 0_i64;
+        for artifact_id in &artifact_ids {
+            deleted_artifact_refs += transaction.execute(
+                "delete from artifact_refs where artifact_id = ?1",
+                params![artifact_id],
+            )? as i64;
+        }
+        if deleted_artifact_refs != expected_artifact_refs {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed artifact rows".to_string(),
+            ));
+        }
+
+        let expected_turns: i64 = transaction.query_row(
+            "select count(*) from turns where thread_id = ?1",
             params![thread_id],
+            |row| row.get(0),
         )?;
-        transaction.execute(
-            "delete from items where turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )?;
-        transaction.execute("delete from turns where thread_id = ?1", params![thread_id])?;
-        transaction.execute(
-            "delete from trace_events where run_id = ?1 or session_id = ?1",
-            params![thread_id],
-        )?;
-        transaction.execute(
-            "delete from artifact_refs where run_id = ?1",
-            params![thread_id],
-        )?;
+        let deleted_turns = transaction
+            .execute("delete from turns where thread_id = ?1", params![thread_id])?
+            as i64;
+        if deleted_turns != expected_turns {
+            return Err(StoreError::InvalidState(
+                "thread deletion changed turn rows".to_string(),
+            ));
+        }
         let changed = transaction.execute(
             "delete from threads where thread_id = ?1",
             params![thread_id],

@@ -15,7 +15,7 @@ use singularity_model::{
     ProviderProtocolNegotiation, ProviderReasoningReplay, ProviderStreamEvent,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
-use singularity_protocol::ItemKind;
+use singularity_protocol::{ItemKind, TurnInputDelivery};
 use singularity_sandbox::{CommandScriptRequest, WorkspaceChangeSummary, WorkspaceMutation};
 use singularity_tools::{CommandRequest, CommandResult, PATCH_TOOL as TOOL_PATCH};
 
@@ -2652,6 +2652,160 @@ fn agent_loop_approval_resume_rejects_untyped_checkpoint_payloads() {
         invalid_args_error,
         AppServerError::Store(StoreError::InvalidState(_))
     ));
+}
+
+#[test]
+fn turn_resume_malformed_checkpoint_terminalizes_without_provider_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            AgentStatus::Running.as_str(),
+            json!([{"type": "text", "text": "resume malformed"}]),
+            "test",
+            "turn started",
+        )
+        .expect("turn");
+    store
+        .save_turn_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &json!({"checkpoint_version": 1, "malformed": true}),
+            1,
+        )
+        .expect("checkpoint");
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "resume-pause",
+            TurnInputDelivery::Steer,
+            &json!([{"type": "text", "text": "pause before resume"}]),
+        )
+        .expect("pause input");
+    store
+        .request_turn_pause(&turn.turn_id)
+        .expect("pause request");
+    store
+        .consume_turn_inputs_with_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &["resume-pause".to_string()],
+            &json!({"checkpoint_version": 1, "malformed": true}),
+            1,
+            true,
+        )
+        .expect("pause checkpoint");
+
+    let mut server = app_server(store);
+    let responses = server
+        .turn_resume(
+            JsonRpcMessage::request(Method::TurnResume, 1, json!({"turnId": turn.turn_id}))
+                .expect("resume request"),
+        )
+        .expect("resume response");
+    assert!(!responses.is_empty());
+    let failed = server.store.get_turn(&turn.turn_id).expect("failed turn");
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(failed.agent_loop_status, AgentStatus::Failed.as_str());
+    assert_eq!(
+        server
+            .store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint remains")
+            .expect("checkpoint row")
+            .get("malformed")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        server
+            .store
+            .list_trace(&thread.thread_id)
+            .expect("trace list")
+            .iter()
+            .any(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
+    );
+}
+
+#[test]
+fn approval_malformed_checkpoint_terminalizes_before_claim_without_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let store = SessionStore::open(&db_path).expect("store");
+    let thread = store
+        .create_thread(None, Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            AgentStatus::Running.as_str(),
+            json!([{"type": "text", "text": "approval malformed"}]),
+            "test",
+            "turn started",
+        )
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_malformed_before_claim",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id(TOOL_PATCH),
+    )
+    .with_tool_call_id("call_malformed");
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(json!({"malformed": true})),
+            "approval",
+            "approval requested",
+        )
+        .expect("malformed approval");
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "approved",
+    );
+
+    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let responses = server
+        .approval_decision(
+            JsonRpcMessage::request(
+                Method::ApprovalDecision,
+                1,
+                serde_json::to_value(&decision).expect("decision params"),
+            )
+            .expect("approval request"),
+        )
+        .expect("approval response");
+    assert!(!responses.is_empty());
+    let failed = server.store.get_turn(&turn.turn_id).expect("failed turn");
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(failed.agent_loop_status, AgentStatus::Failed.as_str());
+    assert!(
+        !server
+            .store
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending call lookup")
+    );
+    assert!(
+        server
+            .store
+            .list_pending_approvals()
+            .expect("pending approvals")
+            .is_empty()
+    );
+    assert!(
+        server
+            .store
+            .list_trace(&thread.thread_id)
+            .expect("trace list")
+            .iter()
+            .any(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
+    );
 }
 
 #[test]

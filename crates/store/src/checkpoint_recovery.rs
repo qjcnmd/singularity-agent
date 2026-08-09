@@ -31,6 +31,24 @@ impl ToolExecutionState {
     }
 }
 
+/// Approval ownership observed while terminalizing a malformed checkpoint.
+/// A pending approval has not started its external side effect; an executing
+/// approval has crossed the Store claim boundary and must not be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointFailureClaim {
+    Pending,
+    Executing,
+}
+
+impl CheckpointFailureClaim {
+    const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Executing => "executing",
+        }
+    }
+}
+
 /// Opaque persisted metadata for one tool execution. Raw tool output is never stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolExecution {
@@ -125,6 +143,255 @@ impl SessionStore {
             .map(|payload| serde_json::from_str(&payload))
             .transpose()
             .map_err(StoreError::from)
+    }
+
+    /// Atomically fail a turn whose opaque checkpoint cannot be decoded.
+    ///
+    /// The expected turn owner/status and, for approval resumes, the exact
+    /// pending-call state form the CAS boundary. Running tool executions are
+    /// retained as `Unknown`; no external operation is started or replayed.
+    /// The durable turn checkpoint remains available for audit while unresolved
+    /// approvals are removed and a typed failure trace is appended.
+    pub fn terminalize_checkpoint_failure(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expected_status: TurnStatus,
+        expected_agent_loop_status: &str,
+        expected_approval: Option<(&str, CheckpointFailureClaim)>,
+    ) -> StoreResult<Turn> {
+        if thread_id.trim().is_empty()
+            || turn_id.trim().is_empty()
+            || expected_agent_loop_status.trim().is_empty()
+        {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure terminalization identity is invalid".to_string(),
+            ));
+        }
+        if matches!(
+            expected_status,
+            TurnStatus::Completed | TurnStatus::Interrupted
+        ) {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure cannot overwrite a terminal turn".to_string(),
+            ));
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let current = self.turn_in_transaction(&transaction, turn_id)?;
+        if current.thread_id != thread_id {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure turn/thread binding mismatch".to_string(),
+            ));
+        }
+        if current.status != expected_status
+            || current.agent_loop_status != expected_agent_loop_status
+        {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure owner/status changed before terminalization".to_string(),
+            ));
+        }
+
+        // A concurrent owner may have already committed the same failed
+        // terminal state. Treat that exact state as an idempotent success, but
+        // never overwrite another terminal outcome.
+        if current.status == TurnStatus::Failed && current.agent_loop_status == "failed" {
+            transaction.commit()?;
+            return Ok(current);
+        }
+
+        let mut pending_statement = transaction.prepare(
+            "select request_id, thread_id, execution_state from pending_tool_calls
+             where turn_id = ?1 order by rowid",
+        )?;
+        let pending_rows = pending_statement
+            .query_map(params![turn_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(pending_statement);
+
+        if pending_rows
+            .iter()
+            .any(|(_, stored_thread_id, _)| stored_thread_id != thread_id)
+        {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure approval thread binding mismatch".to_string(),
+            ));
+        }
+
+        let executing_count = pending_rows
+            .iter()
+            .filter(|(_, _, state)| state == "executing")
+            .count();
+        match expected_approval {
+            Some((request_id, expected_claim)) => {
+                let Some((stored_request_id, _, stored_state)) = pending_rows
+                    .iter()
+                    .find(|(stored_request_id, _, _)| stored_request_id == request_id)
+                else {
+                    return Err(StoreError::InvalidState(format!(
+                        "checkpoint failure approval {request_id} is not present"
+                    )));
+                };
+                if stored_state != expected_claim.as_storage_text() {
+                    return Err(StoreError::InvalidState(format!(
+                        "checkpoint failure approval {stored_request_id} state changed"
+                    )));
+                }
+                if expected_claim == CheckpointFailureClaim::Pending && executing_count != 0 {
+                    return Err(StoreError::InvalidState(
+                        "checkpoint failure has another executing approval owner".to_string(),
+                    ));
+                }
+                if expected_claim == CheckpointFailureClaim::Executing && executing_count != 1 {
+                    return Err(StoreError::InvalidState(
+                        "checkpoint failure approval execution owner is ambiguous".to_string(),
+                    ));
+                }
+            }
+            None if executing_count != 0 => {
+                return Err(StoreError::InvalidState(
+                    "checkpoint failure approval execution owner is missing".to_string(),
+                ));
+            }
+            None => {}
+        }
+
+        let running_execution_count: i64 = transaction.query_row(
+            "select count(*) from tool_executions
+             where thread_id = ?1 and turn_id = ?2 and execution_state = 'running'",
+            params![thread_id, turn_id],
+            |row| row.get(0),
+        )?;
+        let mismatched_execution_binding: bool = transaction.query_row(
+            "select exists(select 1 from tool_executions
+             where turn_id = ?1 and thread_id <> ?2)",
+            params![turn_id, thread_id],
+            |row| row.get(0),
+        )?;
+        if mismatched_execution_binding {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure execution thread binding mismatch".to_string(),
+            ));
+        }
+        let marked_unknown = transaction.execute(
+            "update tool_executions set execution_state = 'unknown'
+             where thread_id = ?1 and turn_id = ?2 and execution_state = 'running'",
+            params![thread_id, turn_id],
+        )? as i64;
+        if marked_unknown != running_execution_count {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure changed an unexpected tool execution count".to_string(),
+            ));
+        }
+
+        if let Some((request_id, CheckpointFailureClaim::Executing)) = expected_approval {
+            let deleted = transaction.execute(
+                "delete from pending_tool_calls
+                 where request_id = ?1 and thread_id = ?2 and turn_id = ?3 and execution_state = 'executing'",
+                params![request_id, thread_id, turn_id],
+            )?;
+            if deleted != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "checkpoint failure approval {request_id} was not resolved"
+                )));
+            }
+        }
+        if let Some((request_id, CheckpointFailureClaim::Pending)) = expected_approval {
+            let deleted = transaction.execute(
+                "delete from pending_tool_calls
+                 where request_id = ?1 and thread_id = ?2 and turn_id = ?3 and execution_state = 'pending'",
+                params![request_id, thread_id, turn_id],
+            )?;
+            if deleted != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "checkpoint failure approval {request_id} was not resolved"
+                )));
+            }
+        }
+
+        let pending_count_before_cleanup: i64 = transaction.query_row(
+            "select count(*) from pending_tool_calls where thread_id = ?1 and turn_id = ?2 and execution_state = 'pending'",
+            params![thread_id, turn_id],
+            |row| row.get(0),
+        )?;
+        let cleaned_pending = Self::delete_unresolved_pending_approvals(&transaction, turn_id)?;
+        if cleaned_pending as i64 != pending_count_before_cleanup {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure changed an unexpected pending approval count".to_string(),
+            ));
+        }
+        let unresolved_approval_count: i64 = transaction.query_row(
+            "select count(*) from approvals where thread_id = ?1 and turn_id = ?2 and decision_outcome is null",
+            params![thread_id, turn_id],
+            |row| row.get(0),
+        )?;
+        let deleted_unresolved_approvals = transaction.execute(
+            "delete from approvals where thread_id = ?1 and turn_id = ?2 and decision_outcome is null",
+            params![thread_id, turn_id],
+        )? as i64;
+        if deleted_unresolved_approvals != unresolved_approval_count {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure changed an unexpected unresolved approval count".to_string(),
+            ));
+        }
+
+        let mut trace = TraceEvent::for_turn(
+            format!(
+                "trace_{turn_id}_checkpoint_decode_failed_{}",
+                Uuid::new_v4()
+            ),
+            thread_id,
+            turn_id,
+            "app_server",
+            "turn failed because its checkpoint could not be decoded",
+        );
+        trace.payload = serde_json::json!({
+            "failure_kind": "checkpoint_decode_failed",
+            "recovery_reason": "checkpoint_decode_failed",
+            "previous_status": current.status.clone(),
+            "previous_agent_loop_status": current.agent_loop_status.clone(),
+            "running_executions_marked_unknown": marked_unknown,
+            "pending_approvals_cleared": cleaned_pending as i64 + deleted_unresolved_approvals,
+            "tool_replayed": false,
+        });
+        let trace = if find_trace_span_start(&transaction, thread_id, turn_id, TraceSpanKind::Turn)?
+            .is_some()
+        {
+            typed_turn_end_trace(&transaction, &trace, &current, &TurnStatus::Failed)?
+        } else {
+            trace
+        };
+
+        let changed = transaction.execute(
+            "update turns set status = ?1, agent_loop_status = ?2
+             where turn_id = ?3 and thread_id = ?4 and status = ?5 and agent_loop_status = ?6",
+            params![
+                TurnStatus::Failed.to_db_text(),
+                "failed",
+                turn_id,
+                thread_id,
+                expected_status.to_db_text(),
+                expected_agent_loop_status,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "checkpoint failure owner/status changed before terminal commit".to_string(),
+            ));
+        }
+        Self::insert_turn_trace(&transaction, &trace, thread_id, turn_id)?;
+        transaction.commit()?;
+        Ok(Turn {
+            status: TurnStatus::Failed,
+            agent_loop_status: "failed".to_string(),
+            ..current
+        })
     }
 
     /// Publish the pending-action checkpoint and claim every tool execution unless a steer or

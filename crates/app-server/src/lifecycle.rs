@@ -317,11 +317,15 @@ impl AppServer {
         let checkpoint = match TurnCheckpoint::decode(&checkpoint_payload) {
             Ok(checkpoint) => checkpoint,
             Err(_) => {
-                let _ = self.store.update_turn_state(
-                    &turn.turn_id,
-                    TurnStatus::Failed,
-                    AgentStatus::Failed.as_str(),
-                );
+                self.store
+                    .terminalize_checkpoint_failure(
+                        &thread.thread_id,
+                        &turn.turn_id,
+                        TurnStatus::Running,
+                        AgentStatus::Running.as_str(),
+                        None,
+                    )
+                    .map_err(AppServerError::Store)?;
                 emit_messages(
                     &mut emit,
                     invalid_state_response(message.required_id(), "turn checkpoint unavailable")?,
@@ -1902,11 +1906,24 @@ impl AppServer {
                     "turn boundary is pending without a durable checkpoint".to_string(),
                 )
             })?;
-        let checkpoint =
-            TurnCheckpoint::decode(&payload).map_err(|_| AppServerError::TurnExecution {
-                stage: TurnFailureStage::ApprovalCheckpoint,
-                cause: TurnFailureCause::Serialization,
-            })?;
+        let checkpoint = match TurnCheckpoint::decode(&payload) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                self.store
+                    .terminalize_checkpoint_failure(
+                        &invocation.thread.thread_id,
+                        invocation.turn_id,
+                        TurnStatus::Running,
+                        AgentStatus::Running.as_str(),
+                        None,
+                    )
+                    .map_err(AppServerError::Store)?;
+                return Err(AppServerError::TurnExecution {
+                    stage: TurnFailureStage::ApprovalCheckpoint,
+                    cause: TurnFailureCause::Serialization,
+                });
+            }
+        };
         let checkpoint = match self.persist_turn_checkpoint_event(
             &invocation.thread.thread_id,
             invocation.turn_id,

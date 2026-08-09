@@ -103,7 +103,7 @@ mod trace_artifact;
 mod turn_input;
 
 pub use approval::RecordedApprovalDecision;
-pub use checkpoint_recovery::{ToolExecution, ToolExecutionState};
+pub use checkpoint_recovery::{CheckpointFailureClaim, ToolExecution, ToolExecutionState};
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
 pub(crate) use thread_turn::typed_turn_end_trace;
