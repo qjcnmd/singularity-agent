@@ -525,6 +525,11 @@ impl ApprovalCheckpoint {
         self.pending_tool_call.validate()?;
         self.state
             .validate_serialized(APPROVAL_CHECKPOINT_VERSION, true)?;
+        reject_pending_completed_overlap(
+            &self.state,
+            std::slice::from_ref(&self.pending_tool_call),
+            "approval",
+        )?;
         validate_provider_replay_bindings(&self.state)
     }
 }
@@ -539,11 +544,19 @@ impl TurnCheckpoint {
             .validate_serialized(super::TURN_CHECKPOINT_VERSION, false)?;
         validate_provider_replay_bindings(&self.state)?;
         let mut ids = BTreeSet::new();
+        let mut pending_fingerprints = BTreeSet::new();
         for pending in &self.pending_tool_calls {
             pending.validate()?;
             if pending.request_id.is_empty() || !ids.insert(&pending.tool_call_id) {
                 return Err("turn checkpoint contains duplicate pending tool calls".to_string());
             }
+            let fingerprint = pending
+                .to_model_tool_call()
+                .map(|call| super::tool_call_fingerprint(&call))
+                .map_err(|error| {
+                    format!("turn checkpoint pending tool-call fingerprint is invalid: {error}")
+                })?;
+            pending_fingerprints.insert(fingerprint);
             let bound = self.state.messages.iter().rev().any(|message| {
                 message.tool_calls.iter().any(|call| {
                     call.tool_call_id == pending.tool_call_id
@@ -554,8 +567,44 @@ impl TurnCheckpoint {
                 return Err("turn checkpoint pending tool call binding is invalid".to_string());
             }
         }
+        if pending_fingerprints.iter().any(|fingerprint| {
+            self.state
+                .completed_tool_call_fingerprints
+                .contains(fingerprint)
+        }) {
+            return Err(
+                "turn checkpoint pending tool call overlaps completed fingerprint state"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
+}
+
+fn reject_pending_completed_overlap(
+    state: &CheckpointState,
+    pending_tool_calls: &[PendingToolCall],
+    kind: &str,
+) -> Result<(), String> {
+    let mut pending_fingerprints = BTreeSet::new();
+    for pending in pending_tool_calls {
+        let fingerprint = pending
+            .to_model_tool_call()
+            .map(|call| super::tool_call_fingerprint(&call))
+            .map_err(|error| {
+                format!("{kind} checkpoint pending tool-call fingerprint is invalid: {error}")
+            })?;
+        pending_fingerprints.insert(fingerprint);
+    }
+    if pending_fingerprints
+        .iter()
+        .any(|fingerprint| state.completed_tool_call_fingerprints.contains(fingerprint))
+    {
+        return Err(format!(
+            "{kind} checkpoint pending tool call overlaps completed fingerprint state"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_provider_replay_bindings(state: &CheckpointState) -> Result<(), String> {

@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use singularity_agent::{
     AgentContinuation, AgentLoop, AgentLoopCallbacks, AgentLoopEvent, AgentLoopEventSinkError,
-    AgentLoopInput, AgentStatus, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
+    AgentLoopInput, AgentStatus, PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent,
+    TurnCheckpointPhase,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderProtocolContract, ProviderStreamEvent,
+    ModelErrorCategory, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+    Provider, ProviderProtocolContract, ProviderStreamEvent,
 };
 use singularity_policy::{
     PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,
@@ -123,14 +124,27 @@ fn assistant_response(text: &str) -> ModelTurnResponse {
 
 fn read_tool_response(path: &str) -> ModelTurnResponse {
     let mut response = assistant_response("reading");
-    response.tool_calls.push(ModelToolCall {
+    let arguments = json!({
+        "path": path,
+        "max_chars": null,
+        "line_start": null,
+        "line_end": null,
+    });
+    let call = ModelToolCall {
         tool_call_id: "read_call".to_string(),
         tool_name: singularity_tools::READ_TOOL.to_string(),
-        arguments: json!({"path": path}),
-        raw_arguments: json!({"path": path}).to_string(),
+        arguments: arguments.clone(),
+        raw_arguments: arguments.to_string(),
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
-    });
+    };
+    response.tool_calls.push(call.clone());
+    response
+        .assistant_message
+        .as_mut()
+        .expect("assistant message")
+        .tool_calls
+        .push(call);
     response
 }
 
@@ -176,6 +190,48 @@ fn natural_stop_commits_one_streamed_assistant_response() {
             .iter()
             .any(|event| event.phase == TurnCheckpointPhase::ModelResponseCommitted)
     );
+}
+
+#[test]
+fn mismatched_assistant_tool_calls_fail_before_any_tool_execution() {
+    let mut malformed = read_tool_response("README.md");
+    malformed
+        .assistant_message
+        .as_mut()
+        .expect("assistant message")
+        .tool_calls
+        .clear();
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_ = loop_with(
+        vec![malformed],
+        Arc::clone(&seen_requests),
+        read_policy(),
+        CancellationToken::new(),
+        false,
+    );
+
+    let result = loop_.run(
+        &AgentLoopInput::new("thread_mismatch", "turn_mismatch", "inspect"),
+        AgentLoopCallbacks::none(),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("assistant_tool_calls_mismatch"))
+    );
+    assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref()),
+        Some("provider_response_invalid")
+    );
+    assert!(result.tool_results.is_empty());
+    assert_eq!(seen_requests.lock().expect("requests").len(), 1);
 }
 
 #[test]
@@ -329,6 +385,80 @@ fn response_checkpoint_roundtrip_keeps_occurrences_and_has_no_quality_gate_state
     assert_eq!(decoded.checkpoint_version(), 7);
     assert_eq!(decoded.model_turns(), 1);
     assert!(decoded.pending_tool_calls().is_empty());
+}
+
+#[test]
+fn v7_and_v8_checkpoints_reject_pending_completed_fingerprint_overlap() {
+    let ordinary_seen = Arc::new(Mutex::new(Vec::new()));
+    let ordinary_loop = loop_with(
+        vec![
+            read_tool_response("missing-file-for-checkpoint-test"),
+            assistant_response("done"),
+        ],
+        Arc::clone(&ordinary_seen),
+        read_policy(),
+        CancellationToken::new(),
+        false,
+    );
+    let mut ready_checkpoint = None;
+    let mut on_checkpoint = |event: TurnCheckpointEvent| -> Result<(), AgentLoopEventSinkError> {
+        if matches!(event.phase, TurnCheckpointPhase::ToolCallsReady { .. }) {
+            ready_checkpoint = Some(event.checkpoint);
+        }
+        Ok(())
+    };
+    let result = ordinary_loop.run(
+        &AgentLoopInput::new("thread_overlap", "turn_overlap", "inspect"),
+        AgentLoopCallbacks {
+            on_event: None,
+            on_checkpoint: Some(&mut on_checkpoint),
+        },
+    );
+    assert_eq!(result.status, AgentStatus::Completed);
+    let mut ordinary_payload = ready_checkpoint
+        .expect("ordinary tool-call checkpoint")
+        .encode()
+        .expect("encode ordinary checkpoint");
+    let ordinary_fingerprint = ordinary_payload["seen_tool_call_fingerprints"][0].clone();
+    ordinary_payload["completed_tool_call_fingerprints"] = json!([ordinary_fingerprint]);
+    let ordinary_error = TurnCheckpoint::decode(&ordinary_payload)
+        .expect_err("ordinary checkpoint overlap must fail closed");
+    assert!(ordinary_error.contains("overlaps completed fingerprint state"));
+
+    let approval_seen = Arc::new(Mutex::new(Vec::new()));
+    let approval_loop = loop_with(
+        vec![read_tool_response("README.md")],
+        Arc::clone(&approval_seen),
+        approval_policy(),
+        CancellationToken::new(),
+        false,
+    );
+    let approval_result = approval_loop.run(
+        &AgentLoopInput::new(
+            "thread_overlap_approval",
+            "turn_overlap_approval",
+            "inspect",
+        ),
+        AgentLoopCallbacks::none(),
+    );
+    assert_eq!(approval_result.status, AgentStatus::Blocked);
+    let pending = approval_result
+        .pending_approvals
+        .first()
+        .expect("approval occurrence");
+    let mut approval_payload = pending
+        .encode_checkpoint()
+        .expect("encode approval checkpoint");
+    let approval_fingerprint = approval_payload["seen_tool_call_fingerprints"][0].clone();
+    approval_payload["completed_tool_call_fingerprints"] = json!([approval_fingerprint]);
+    let approval_error = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &approval_payload,
+    )
+    .expect_err("approval checkpoint overlap must fail closed");
+    assert!(approval_error.contains("overlaps completed fingerprint state"));
+    assert_eq!(ordinary_seen.lock().expect("ordinary requests").len(), 2);
+    assert_eq!(approval_seen.lock().expect("approval requests").len(), 1);
 }
 
 #[test]

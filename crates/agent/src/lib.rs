@@ -2033,6 +2033,41 @@ where
                 .iter()
                 .map(|tool| tool.name.clone())
                 .collect::<Vec<_>>();
+            if !assistant_tool_calls_match_response(&response) {
+                let first_attempts = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| state.observe_model_tool_call(call, &provider_tool_names).2)
+                    .collect::<Vec<_>>();
+                if emit_rejected_tool_calls(
+                    &mut on_event,
+                    input,
+                    &response.tool_calls,
+                    turn_index,
+                    &first_attempts,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
+                let model_error = model_response_validation_error(vec![
+                    "assistant_tool_calls_mismatch".to_string(),
+                ]);
+                return state.finish_with_model_error(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    actual_model_turns,
+                    Some(model_error.message.clone()),
+                    Some(&model_error),
+                );
+            }
             let validation = validate_model_turn_response(
                 &request,
                 &response,
@@ -2065,43 +2100,6 @@ where
                     );
                 }
                 let model_error = model_response_validation_error(validation.errors);
-                return state.finish_with_model_error(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    actual_model_turns,
-                    Some(model_error.message.clone()),
-                    Some(&model_error),
-                );
-            }
-            if response.assistant_message.as_ref().is_some_and(|message| {
-                !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
-            }) {
-                let first_attempts = response
-                    .tool_calls
-                    .iter()
-                    .map(|call| state.observe_model_tool_call(call, &provider_tool_names).2)
-                    .collect::<Vec<_>>();
-                if emit_rejected_tool_calls(
-                    &mut on_event,
-                    input,
-                    &response.tool_calls,
-                    turn_index,
-                    &first_attempts,
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        actual_model_turns,
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
-                let model_error = model_response_validation_error(vec![
-                    "assistant_tool_calls_mismatch".to_string(),
-                ]);
                 return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
@@ -5248,6 +5246,13 @@ fn recoverable_tool_response_validation(
             .tool_calls
             .iter()
             .all(|call| !call.tool_call_id.trim().is_empty() && !call.tool_name.trim().is_empty())
+}
+
+fn assistant_tool_calls_match_response(response: &ModelTurnResponse) -> bool {
+    response
+        .assistant_message
+        .as_ref()
+        .is_some_and(|message| message.tool_calls == response.tool_calls)
 }
 
 fn cancelled_tool_result(call: &ModelToolCall) -> ToolResult {
