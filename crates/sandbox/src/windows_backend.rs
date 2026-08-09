@@ -2457,6 +2457,7 @@ fn child_environment_from(
             ("npm cache", "npm"),
             ("python cache", "python"),
             ("pytest cache", "pytest"),
+            ("DeepEval cache", "deepeval"),
             ("Cargo target", "cargo"),
         ] {
             let tool_root = cache.join(tool);
@@ -2485,6 +2486,7 @@ fn child_environment_from(
             ("PIP_CACHE_DIR", "pip"),
             ("NPM_CONFIG_CACHE", "npm"),
             ("PYTHONPYCACHEPREFIX", "python"),
+            ("DEEPEVAL_CACHE_FOLDER", "deepeval"),
         ] {
             let path = cache.join(tool);
             let path = match cache_digest.as_deref() {
@@ -3322,6 +3324,7 @@ mod tests {
         let shared_pip_cache = cache_root.join("pip").to_string_lossy().into_owned();
         let shared_npm_cache = cache_root.join("npm").to_string_lossy().into_owned();
         let shared_python_cache = cache_root.join("python").to_string_lossy().into_owned();
+        let shared_deepeval_cache = cache_root.join("deepeval").to_string_lossy().into_owned();
         let shared_pytest_cache = cache_root
             .join("pytest")
             .to_string_lossy()
@@ -3391,6 +3394,16 @@ mod tests {
                     env_value(&values, "PYTEST_ADDOPTS"),
                     Some(expected_pytest.as_str())
                 );
+                assert_eq!(
+                    env_value(&values, "DEEPEVAL_CACHE_FOLDER"),
+                    Some(
+                        expected_cache
+                            .join("deepeval")
+                            .join(&digest)
+                            .to_string_lossy()
+                            .as_ref()
+                    )
+                );
                 let target = PathBuf::from(
                     env_value(&values, "CARGO_TARGET_DIR").expect("isolated Cargo target"),
                 );
@@ -3405,7 +3418,7 @@ mod tests {
                             &dunce::canonicalize(workspace.path()).expect("canonical workspace")
                         ))
                 );
-                for tool in ["pip", "npm", "python", "pytest", "cargo"] {
+                for tool in ["pip", "npm", "python", "pytest", "deepeval", "cargo"] {
                     assert!(
                         expected_cache.join(tool).join(&digest).is_dir(),
                         "isolated {tool} cache directory missing"
@@ -3432,6 +3445,10 @@ mod tests {
                 assert_eq!(
                     env_value(&values, "PYTEST_ADDOPTS"),
                     Some(expected_shared_pytest.as_str())
+                );
+                assert_eq!(
+                    env_value(&values, "DEEPEVAL_CACHE_FOLDER"),
+                    Some(shared_deepeval_cache.as_str())
                 );
                 assert_eq!(env_value(&values, "SINGULARITY_MODEL"), Some("host-model"));
             }
@@ -3526,7 +3543,27 @@ mod tests {
             env_value(&first, "PYTEST_ADDOPTS")
                 .is_some_and(|value| value.contains(&format!("cache_dir={first_pytest}")))
         );
-        for tool in ["pip", "npm", "python", "pytest", "cargo"] {
+        let first_deepeval = first_temp
+            .join("singularity-tool-cache")
+            .join("deepeval")
+            .join(&first_digest);
+        let second_deepeval = second_temp
+            .join("singularity-tool-cache")
+            .join("deepeval")
+            .join(&second_digest);
+        assert_eq!(
+            env_value(&first, "DEEPEVAL_CACHE_FOLDER"),
+            Some(first_deepeval.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_value(&second, "DEEPEVAL_CACHE_FOLDER"),
+            Some(second_deepeval.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_value(&first_again, "DEEPEVAL_CACHE_FOLDER"),
+            Some(first_deepeval.to_string_lossy().as_ref())
+        );
+        for tool in ["pip", "npm", "python", "pytest", "deepeval", "cargo"] {
             let first_leaf = first_temp
                 .join("singularity-tool-cache")
                 .join(tool)
