@@ -20,7 +20,7 @@
 
 主代理与委派的子代理理解仓库结构、查找符号、调用关系和影响范围时，都优先使用 `codebase-memory-mcp` 缩小检索范围（如 `search_graph`、`search_code`、`trace_path`、`get_code_snippet`），查询不足或结果可能过期时再用 `rg`、Git 和当前源文件验证。代码图不是代码事实的唯一来源，且只查询当前任务需要的局部信息，不无条件输出完整仓库地图。
 
-每次成功创建 Git 提交后——包括主代理在集成候选中的提交和子代理在独立 worktree 中的阶段提交——必须调用 `codebase-memory-mcp` 的 `index_repository`，使用该提交所在工作树根目录的绝对路径刷新代码图。索引失败不撤销已经创建的提交，但必须明确报告失败原因和当前索引状态。无法访问 `codebase-memory-mcp` 的环境（未配置该 MCP 的其他 agent）跳过本节的索引要求，直接使用 `rg` 和 Git 检索，并在最终回复中说明索引未刷新。
+主代理每次成功创建 Git 提交后，必须调用 `codebase-memory-mcp` 的 `index_repository`，使用当前工作树根目录的绝对路径刷新代码图；子代理在独立 worktree 中的阶段提交不刷新，由主代理集成提交时统一刷新覆盖。索引失败不撤销已经创建的提交，但必须明确报告失败原因和当前索引状态。无法访问 `codebase-memory-mcp` 的环境（未配置该 MCP 的其他 agent）跳过本节的索引要求，直接使用 `rg` 和 Git 检索，并在最终回复中说明索引未刷新。
 
 不要开启 `auto_watch`，直到已验证的上游版本修复 dirty worktree 下的重复索引问题（2026-07 记录；确认上游修复后删除本条）。
 
