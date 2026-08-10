@@ -53,10 +53,13 @@
 
 - 模型可见产品工具由单一注册事实源产生；功能任务不通过 Evaluation task、required capability 或内部阶段维护第二套工具表面。工具选择自由与权限控制分离，副作用由 Policy、Approval 和 OS sandbox 约束。
 - Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 在任何完成请求前固定 `provider_id`、`model_id`、已选 API protocol 和相关模型参数；能力协商可依据声明或协议证据在完成请求前确定单一 protocol，但完成请求中不自动路由、轮换或 fallback。
+- 本仓库的计划内真实产品测试与 Evaluation 已获长期授权：可直接使用当前用户配置中的 `opencode-go/deepseek-v4-flash` 和 `longcat/LongCat-2.0`，消耗已购测试额度，并执行对应模型的一次显式 capability probe 及其原子配置更新；固定 candidate、selector 和 protocol，保留首次结果并脱敏，不逐次请求授权。其他 Provider/模型、计划外完整 Evaluation、push、发布和 GitHub 写入不在此授权内。
+- 真实模型调用默认使用显式 config、catalog 或 capability probe 已证明支持的最高 reasoning variant；当前 `opencode-go/deepseek-v4-flash` 使用 `#max`，`longcat/LongCat-2.0` 使用 `#high`。能力未证明时先执行一次显式 probe，不从模型名称推断；只有任务明确测试较低档位或模型没有 reasoning variant 时才使用其他模式。
 - Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
 - 失败归因顺序：只有充分排除 Harness、AgentLoop、Store、checkpoint、completion gate、verification tracker、Evaluation runner、并发调度和测试环境问题后，才能把剩余失败归因于模型能力；除模型能力之外的任何问题都必须继续调查并修复，不得以“可能是模型问题”“artifact 被 redacted”“Evaluation 提前结束”为理由停止。每个失败明确分类：已确认 Harness/Evaluation 缺陷（修复）、已确认模型能力问题（保留原始证据并报告）、仍未确定（继续调查，不得作为最终 blocker）。
 - Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
 - `functional_task_success`、`agent_protocol_success` 与 `sandbox_security_success` 分别计算、发布和归因；外部门禁可以同时要求三者，但不得合并成无法定位责任层的单一失败。Evaluator 保护自身 patch、tests、`.git` 和依赖/系统路径，并审计异常改动，不用路径白名单向模型泄露答案位置或阻止合理跨文件修复。
+- 计划内严格 Windows Sandbox 产品验收已获长期授权：可触发 UAC，并创建或修复 Singularity 自有 sandbox 账户、ACL、WFP、Job Object 和 setup 状态；按冻结 candidate 与受控 scratch 执行，不逐次请求授权。该授权不扩展到 Singularity 之外的账户、网络策略或系统配置。
 
 ## 工程原则
 
