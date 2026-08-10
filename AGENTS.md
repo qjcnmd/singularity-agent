@@ -56,7 +56,7 @@
 - 本仓库的计划内真实产品测试与 Evaluation 已获长期授权：task、trial、Evaluation 和其他模型驱动验收必须以 `opencode-go/deepseek-v4-flash#max` 为主模型；`longcat/LongCat-2.0#high` 可自由用于细粒度小测试、补充覆盖和跨模型对照。允许消耗两者的已购测试额度，并执行对应模型的一次显式 capability probe 及其原子配置更新；固定 candidate、selector 和 protocol，保留首次结果并脱敏，不逐次请求授权。其他 Provider/模型、计划外完整 Evaluation、push、发布和 GitHub 写入不在此授权内。
 - 真实模型调用默认使用显式 config、catalog 或 capability probe 已证明支持的最高 reasoning variant；当前 `opencode-go/deepseek-v4-flash` 使用 `#max`，`longcat/LongCat-2.0` 使用 `#high`。能力未证明时先执行一次显式 probe，不从模型名称推断；只有任务明确测试较低档位或模型没有 reasoning variant 时才使用其他模式。
 - 模型交互行为按单一不变量拆成细粒度真实产品调用：自然停止、工具选择与结果消费、多轮修复、approval/resume、上下文续接和模型可见错误恢复优先直接调用主模型，并可用 LongCat 对照定位模型差异；不必等到完整 trial 才调用模型。wire/schema 解析、事务、权限、安全失败关闭和 no-replay 等要求确定性与故障注入的边界继续使用隔离测试，但 mock 结果不能替代真实模型产品链证据。
-- 可由真实模型产品调用完整覆盖的行为不保留 mock、fake 或模拟测试副本；真实调用建立等价或更强证据后，删除对应测试及其专用 fixture、helper 和分支。若覆盖测试 B 的同环境实测耗时不超过 3 分钟，即使它慢于 A+C+D 的总和也删除 A、C、D；仅当 B 超过 3 分钟且拆分测试更快时才保留拆分。只有外部模型无法可靠构造的畸形 wire、精确错误码、事务故障、权限拒绝、取消竞态、崩溃恢复和 no-replay 等确定性边界才保留 test double，并在测试语义中明确其不可替代的不变量。
+- 可由真实模型产品调用完整覆盖的行为不保留 mock、fake 或模拟测试副本；真实调用建立等价或更强证据后，按测试数量、日常总耗时、稳定性与外部依赖权衡删除对应测试及其专用 fixture、helper 和分支。若覆盖测试 B 的同环境实测耗时不超过 3 分钟，即使它慢于 A+C+D 的总和也可删除 A、C、D；仅当 B 超过 3 分钟且拆分测试更快时才应保留拆分。优先删除重复的模型行为副本，保留能低成本保护协议、安全、事务、权限、取消、恢复和 no-replay 的确定性边界；只有外部模型无法可靠构造的畸形 wire、精确错误码、事务故障、权限拒绝、取消竞态、崩溃恢复和 no-replay 等确定性边界才保留 test double，并在测试语义中明确其不可替代的不变量。
 - Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
 - 失败归因顺序：只有充分排除 Harness、AgentLoop、Store、checkpoint、completion gate、verification tracker、Evaluation runner、并发调度和测试环境问题后，才能把剩余失败归因于模型能力；除模型能力之外的任何问题都必须继续调查并修复，不得以“可能是模型问题”“artifact 被 redacted”“Evaluation 提前结束”为理由停止。每个失败明确分类：已确认 Harness/Evaluation 缺陷（修复）、已确认模型能力问题（保留原始证据并报告）、仍未确定（继续调查，不得作为最终 blocker）。
 - Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
@@ -114,7 +114,7 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 - 本地测试默认使用显式 mock 配置（Provider、模型、地址、测试 key），不得读取真实用户级配置、凭据或外部服务；隔离后的测试失败才按产品缺陷处理。
 - 完整构建、全仓测试、跨平台验证和完整 Evaluation 只有在实际影响范围无法由更窄证据证明时运行。完整 Evaluation 不是模型调用链改动后的首次真实测试。
 - 不新增或操纵 Trial 重采样、预算、timeout、门禁、task、工具权限或隐藏答案来赌分。真实 Provider Task 首次正确完成即为有效证据；失败保留首个错误、阶段和耗时，只修通用根因。
-- 测试集合按行为证明关系保持最小：若测试 B 的可观察行为与断言完整证明测试 A、C、D 的全部不变量，且 B 的同环境实测耗时不超过 3 分钟，删除 A、C、D 及其专用 fixture/helper；只有 B 超过 3 分钟且拆分测试更快时才保留较快的拆分测试。覆盖关系和耗时必须来自当前源码与实际运行，不从测试名称或历史结果推断。
+- 测试集合按行为证明关系保持最小：若测试 B 的可观察行为与断言完整证明测试 A、C、D 的全部不变量，且 B 的同环境实测耗时不超过 3 分钟，结合数量收益与日常时间/稳定性成本决定删除 A、C、D 及其专用 fixture/helper；只有 B 超过 3 分钟且拆分测试更快时才保留较快的拆分测试。覆盖关系和耗时必须来自当前源码与实际运行，不从测试名称或历史结果推断。
 - Issue 或任务文档逐条列出的真实链路要求（如同一用户轮次内多次模型与工具交互、中断后恢复、上下文压缩后续接、Provider/model/protocol 变化等），每条必须映射到可指认的真实模型调用证据，或显式标注“由确定性测试覆盖（不涉真实执行链路）”；仅 mock 或确定性测试不得作为此类要求的完成证据。
 - 默认不运行 Codex Security 扫描；只有用户明确要求使用时才运行。
 - 最终回复列出实际运行的检查、精确结果和未验证范围，不把局部证据描述为全量通过。
