@@ -48,6 +48,120 @@ function Set-WorkflowOutput {
     }
 }
 
+function Set-IsolatedWorkspaceMembers {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$MemberPaths
+    )
+
+    $lines = @(Get-Content -LiteralPath $ManifestPath)
+    $membersStart = -1
+    $membersEnd = -1
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index].Trim() -eq "members = [") {
+            if ($membersStart -ne -1) {
+                throw "workspace manifest has multiple members arrays: $ManifestPath"
+            }
+            $membersStart = $index
+            for ($end = $index + 1; $end -lt $lines.Count; $end++) {
+                if ($lines[$end].Trim() -eq "]") {
+                    $membersEnd = $end
+                    break
+                }
+            }
+            break
+        }
+    }
+    if ($membersStart -eq -1 -or $membersEnd -eq -1) {
+        throw "workspace manifest members array was not found: $ManifestPath"
+    }
+
+    $replacement = New-Object System.Collections.Generic.List[string]
+    $replacement.Add("members = [")
+    foreach ($memberPath in $MemberPaths) {
+        $replacement.Add(('    "{0}",' -f $memberPath.Replace("\", "/")))
+    }
+    $replacement.Add("]")
+
+    $rewritten = New-Object System.Collections.Generic.List[string]
+    for ($index = 0; $index -lt $membersStart; $index++) {
+        $rewritten.Add($lines[$index])
+    }
+    foreach ($line in $replacement) {
+        $rewritten.Add($line)
+    }
+    for ($index = $membersEnd + 1; $index -lt $lines.Count; $index++) {
+        $rewritten.Add($lines[$index])
+    }
+    Set-Content -LiteralPath $ManifestPath -Value $rewritten -Encoding utf8
+}
+
+function Rewrite-IsolatedManifestPathDependencies {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OriginalPackageDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OriginalCratesRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DependencyRoot
+    )
+
+    $lines = @(Get-Content -LiteralPath $ManifestPath)
+    $rewritten = foreach ($line in $lines) {
+        if ($line -match 'path\s*=\s*"(?<relative>\.\./[^"]+)"') {
+            $relative = $Matches.relative
+            $originalDependency = [IO.Path]::GetFullPath((Join-Path $OriginalPackageDirectory $relative))
+            $cratesPrefix = "$([IO.Path]::GetFullPath($OriginalCratesRoot))$([IO.Path]::DirectorySeparatorChar)"
+            if (-not $originalDependency.StartsWith($cratesPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "path dependency escapes the workspace crates directory: $ManifestPath"
+            }
+            $dependencyRelative = [IO.Path]::GetRelativePath(
+                [IO.Path]::GetFullPath($OriginalCratesRoot),
+                $originalDependency
+            )
+            $dependency = Join-Path $DependencyRoot $dependencyRelative
+            if (-not (Test-Path -LiteralPath (Join-Path $dependency "Cargo.toml") -PathType Leaf)) {
+                throw "path dependency manifest is missing: $dependency"
+            }
+            $newRelative = [IO.Path]::GetRelativePath(
+                (Split-Path -Parent $ManifestPath),
+                $dependency
+            ).Replace("\", "/")
+            $line.Replace($relative, $newRelative)
+        } else {
+            $line
+        }
+    }
+    Set-Content -LiteralPath $ManifestPath -Value $rewritten -Encoding utf8
+}
+
+function Remove-TaskStagingDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $tempRoot = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path
+    $leaf = Split-Path -Leaf $resolved
+    if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $leaf -notmatch '^singularity-release-sbom-[0-9]+-[0-9a-f]{32}$') {
+        throw "refusing to remove unexpected SBOM staging path: $resolved"
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+}
+
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 if ($IsFormalRelease) {
     if ($RefName -notmatch '^v') {
@@ -143,6 +257,7 @@ $sbomRequests = @(
 )
 $generatedBomFiles = @()
 $validatedBoms = @()
+$stagingParent = Join-Path ([IO.Path]::GetTempPath()) ("singularity-release-sbom-{0}-{1}" -f $PID, [Guid]::NewGuid().ToString("N"))
 
 try {
     foreach ($request in $sbomRequests) {
@@ -150,7 +265,43 @@ try {
         if ($existing.Count -ne 0) {
             throw "unexpected pre-existing CycloneDX files in $($request.Directory)"
         }
+    }
 
+    # cargo-cyclonedx 0.5.9 emits binaries for every workspace member, so each
+    # release crate is described from a temporary single-member workspace.
+    $stagedWorkspaceRoot = Join-Path $stagingParent "workspaces"
+    New-Item -ItemType Directory -Force -Path $stagedWorkspaceRoot | Out-Null
+
+    $stagedSbomRequests = @()
+    foreach ($request in $sbomRequests) {
+        $packageDirectoryName = Split-Path -Leaf $request.Directory
+        $workspaceDirectory = Join-Path $stagedWorkspaceRoot $packageDirectoryName
+        $stagedPackageDirectory = Join-Path $workspaceDirectory "packages/$packageDirectoryName"
+        New-Item -ItemType Directory -Force -Path $workspaceDirectory, (Join-Path $workspaceDirectory "packages") | Out-Null
+        Copy-Item -LiteralPath @(
+            (Join-Path $WorkspaceRoot "Cargo.toml")
+            (Join-Path $WorkspaceRoot "Cargo.lock")
+        ) -Destination $workspaceDirectory
+        Copy-Item -LiteralPath $request.Directory -Destination $stagedPackageDirectory -Recurse
+
+        $stagedWorkspaceManifest = Join-Path $workspaceDirectory "Cargo.toml"
+        Set-IsolatedWorkspaceMembers -ManifestPath $stagedWorkspaceManifest -MemberPaths @(
+            "packages/$packageDirectoryName"
+        )
+        Rewrite-IsolatedManifestPathDependencies `
+            -ManifestPath (Join-Path $stagedPackageDirectory "Cargo.toml") `
+            -OriginalPackageDirectory $request.Directory `
+            -OriginalCratesRoot (Join-Path $WorkspaceRoot "crates") `
+            -DependencyRoot (Join-Path $WorkspaceRoot "crates")
+
+        $stagedSbomRequests += [ordered]@{
+            Manifest = $stagedWorkspaceManifest
+            Directory = $stagedPackageDirectory
+            ExpectedNames = $request.ExpectedNames
+        }
+    }
+
+    foreach ($request in $stagedSbomRequests) {
         $sbomArguments = @(
             "cyclonedx"
             "--manifest-path"
@@ -196,7 +347,7 @@ try {
         if ([string]$bom.metadata.component.type -ne "application" -or $stableSbomPaths.Keys -notcontains $binaryName) {
             throw "metadata component does not identify a release binary: $($bomFile.FullName)"
         }
-        $request = @($sbomRequests | Where-Object { $_.Directory -eq $bomFile.DirectoryName })
+        $request = @($stagedSbomRequests | Where-Object { $_.Directory -eq $bomFile.DirectoryName })
         if ($request.Count -ne 1 -or $request[0].ExpectedNames -notcontains $binaryName) {
             throw "metadata binary does not match its manifest: $($bomFile.FullName)"
         }
@@ -227,13 +378,26 @@ try {
     $generatedBomFiles | Remove-Item -Force -ErrorAction Stop
     $generatedBomFiles = @()
 } finally {
+    $cleanupFailure = $null
     if (@($generatedBomFiles).Count -gt 0) {
         try {
             $generatedBomFiles | Remove-Item -Force -ErrorAction Stop
             $generatedBomFiles = @()
         } catch {
-            throw "SBOM temporary-file cleanup failed."
+            $cleanupFailure = "SBOM temporary-file cleanup failed."
         }
+    }
+    try {
+        Remove-TaskStagingDirectory -Path $stagingParent
+    } catch {
+        if ($null -eq $cleanupFailure) {
+            $cleanupFailure = "SBOM temporary workspace cleanup failed."
+        } else {
+            $cleanupFailure = "$cleanupFailure SBOM temporary workspace cleanup failed."
+        }
+    }
+    if ($null -ne $cleanupFailure) {
+        throw $cleanupFailure
     }
 }
 
