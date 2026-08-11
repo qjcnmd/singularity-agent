@@ -1,5 +1,7 @@
 #![cfg(windows)]
 
+mod support;
+
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::app_server_bin;
 
 const ORIGINAL_TASK: &str = "Inspect the workspace and then finish this same turn";
 const LIST_CALL_ID: &str = "durable_list_call";
@@ -965,21 +968,6 @@ fn write_final_stream_response(stream: &mut TcpStream, response: Value) {
     stream
         .flush()
         .expect("flush final provider stream response");
-}
-
-fn app_server_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
-        let mut path = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-        path.pop();
-        path.pop();
-        path.push("target");
-        path.push("debug");
-        path.push(format!(
-            "singularity_app_server{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        path.to_string_lossy().to_string()
-    })
 }
 
 // Issue #24 批次 A（场景 2）：completed turn -> 干净退出 -> 新 App Server -> 同 Thread

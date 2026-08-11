@@ -61,7 +61,7 @@ CLI 不直接依赖 agent、model、tools 或 store。公共协议对象只在 `
 
 stdio 的每一行是一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。所有 envelope 都必须带 `jsonrpc: "2.0"`，并由互斥的 request、notification、success 或 error 类型表示。request id 只接受字符串或可精确表示的 JSON 整数；`null` 仅用于服务端无法关联合法请求时的 response/error id，带小数的 number 与 request `id: null` 都按 Invalid Request 处理。响应按解析后的合法 id 原样关联，error envelope 不允许省略 `id`。`METHOD_REGISTRY` 是 method 名、调用类型、params schema 和 result schema 的唯一事实源；dispatcher 与 CLI 都从该 registry 查找并校验合同。
 
-单请求、空 batch 和 mixed batch 都受支持。batch 按输入顺序串行分发，不并行执行有副作用项；notification 项即使 method 未知或 params 非法也不产生响应，全 notification batch 不输出任何行。batch response 保持请求项的输入顺序。解析失败、无效请求、未知方法、无效参数和内部错误分别使用 `-32700`、`-32600`、`-32601`、`-32602` 和 `-32603`；合法调用触发的 runtime 状态冲突使用项目错误 `-32005`，请求工作线程容量已满使用 `-32006`，两者都不占用标准错误码。标准错误不回显原始输入或内部诊断，`data` 仅允许显式脱敏内容。
+单请求、空 batch 和 mixed batch 都受支持。batch 按输入顺序串行分发，不并行执行有副作用项；notification 项即使 method 未知或 params 非法也不产生响应，全 notification batch 不输出任何行。batch response 保持请求项的输入顺序；`turn/start`、`turn/resume` 和 `approval/decision` 等长 worker 方法不在 batch 中执行，请求项返回标准 `-32600` Invalid Request，notification 项按 notification 合同不产生响应，其余 batch 项继续按原合同处理。解析失败、无效请求、未知方法、无效参数和内部错误分别使用 `-32700`、`-32600`、`-32601`、`-32602` 和 `-32603`；合法调用触发的 runtime 状态冲突使用项目错误 `-32005`，请求工作线程容量已满使用 `-32006`，两者都不占用标准错误码。标准错误不回显原始输入或内部诊断，`data` 仅允许显式脱敏内容。
 
 ## 3. 主调用链
 

@@ -1,5 +1,7 @@
 #![cfg(windows)]
 
+mod support;
+
 use serde_json::{Value, json};
 use singularity_protocol::TurnStatus;
 use singularity_store::SessionStore;
@@ -13,6 +15,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::app_server_bin;
 
 const ORIGINAL_INPUT: &str = "Complete this turn interactively";
 const FIRST_FOLLOW_UP: &str = "First follow-up";
@@ -944,21 +947,6 @@ impl JsonOutput {
             self.buffered.push_back(message);
         }
     }
-}
-
-fn app_server_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
-        let mut path = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-        path.pop();
-        path.pop();
-        path.push("target");
-        path.push("debug");
-        path.push(format!(
-            "singularity_app_server{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        path.to_string_lossy().to_string()
-    })
 }
 
 // Issue #24 批次 A（A3）：thread/start 未显式指定 model 时，Thread.model 冻结为

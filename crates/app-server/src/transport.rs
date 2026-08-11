@@ -525,9 +525,15 @@ async fn send_output_async(
 }
 
 fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
-    if message.is_notification() {
-        return false;
-    }
+    !message.is_notification() && is_long_worker_method(message)
+}
+
+/// Methods whose execution can outlive a normal JSON-RPC dispatch turn.
+///
+/// Batch dispatch has no streaming worker path, so these methods must be
+/// admitted only as single requests. Notifications are included here because
+/// their lack of an id does not make the underlying execution short-lived.
+fn is_long_worker_method(message: &JsonRpcMessage) -> bool {
     matches!(
         message.method_name(),
         Some(method)
@@ -569,6 +575,12 @@ fn dispatch_batch(
             JsonRpcBatchItem::Message(message) => {
                 let notification = message.is_notification();
                 let request_id = message.id().cloned();
+                if is_long_worker_method(&message) {
+                    if !notification {
+                        responses.push(JsonRpcMessage::invalid_request(request_id).to_wire_value());
+                    }
+                    continue;
+                }
                 match server.handle_with_output(message) {
                     Ok(messages) => {
                         for output in messages {
@@ -631,15 +643,8 @@ fn run_request_worker(
 ) -> Result<(), String> {
     let request_id = message.id().cloned();
     let mut output_error = None;
-    let streaming_method = message.method_name();
     let result =
-        if matches!(
-            streaming_method,
-            Some(method)
-                if method == Method::TurnStart.as_str()
-                    || method == Method::TurnResume.as_str()
-                    || method == Method::ApprovalDecision.as_str()
-        ) {
+        if is_long_worker_method(&message) {
             let mut send_streaming_output = |output: AppServerOutput| {
                 if output_error.is_none()
                     && let Err(error) = send_reserved_output(
@@ -655,7 +660,7 @@ fn run_request_worker(
                     outputs.order_state.complete(output.reservation.order);
                 }
             };
-            match streaming_method {
+            match message.method_name() {
                 Some(method) if method == Method::TurnStart.as_str() => worker
                     .handle_turn_start_streaming_with_output(message, &mut send_streaming_output),
                 Some(method) if method == Method::TurnResume.as_str() => worker
@@ -2369,6 +2374,47 @@ mod tests {
                 .iter()
                 .all(|response| response["jsonrpc"] == "2.0")
         );
+    }
+
+    #[test]
+    fn batch_rejects_long_worker_methods_and_continues_with_short_items() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
+        let cancellation = server.cancellation_handle();
+        let (outputs, mut receiver, _event_receiver) = test_output_channels(16, 8);
+        let payload = parse_json_rpc_payload(
+            r#"[
+                {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
+                {"jsonrpc":"2.0","method":"initialized","params":{}},
+                {"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}},
+                {"jsonrpc":"2.0","method":"turn/start","id":3,"params":{}},
+                {"jsonrpc":"2.0","method":"turn/resume","id":4,"params":{}},
+                {"jsonrpc":"2.0","method":"approval/decision","id":5,"params":{}},
+                {"jsonrpc":"2.0","method":"turn/start","params":{}},
+                {"jsonrpc":"2.0","method":"server/capabilities","id":6,"params":{}}
+            ]"#,
+        )
+        .expect("batch parses");
+
+        dispatch_batch(&mut server, payload, &outputs, &cancellation).expect("dispatch batch");
+
+        let response = receiver.try_recv().expect("batch response").message;
+        let responses = response.as_array().expect("batch response array");
+        assert_eq!(responses.len(), 6);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(
+            responses[1]["result"]["transports"][0]["transport"],
+            "stdio"
+        );
+        for (response, id) in responses.iter().skip(2).zip([3, 4, 5]) {
+            assert_eq!(response["id"], id);
+            assert_eq!(response["error"]["code"], -32600);
+            assert_eq!(response["error"]["message"], "Invalid Request");
+        }
+        assert_eq!(responses[5]["id"], 6);
+        assert!(responses[5]["result"]["transports"].is_array());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
