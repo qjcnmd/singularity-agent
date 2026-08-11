@@ -1942,7 +1942,7 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
 }
 
 #[test]
-fn openai_responses_stream_aggregates_deltas_and_requires_completed_envelope() {
+fn openai_responses_stream_aggregates_deltas_and_ignores_ping_after_completion() {
     let delta_one = serde_json::json!({
         "type": "response.output_text.delta",
         "delta": "hel"
@@ -1966,7 +1966,7 @@ fn openai_responses_stream_aggregates_deltas_and_requires_completed_envelope() {
         }
     });
     let body = format!(
-        "event: response.output_text.delta\r\ndata: {delta_one}\r\n\r\nevent: response.output_text.delta\r\ndata: {delta_two}\r\n\r\nevent: response.completed\r\ndata: {completed}\r\n\r\n"
+        "event: response.output_text.delta\r\ndata: {delta_one}\r\n\r\nevent: response.output_text.delta\r\ndata: {delta_two}\r\n\r\nevent: response.completed\r\ndata: {completed}\r\n\r\nevent: ping\r\ndata: {{\"type\":\"ping\"}}\r\n\r\n"
     );
     let chunks = body
         .as_bytes()
@@ -2073,6 +2073,11 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
         (
             "malformed",
             "event: response.output_text.delta\ndata: {not-json}\n\n",
+            "responses_stream_malformed",
+        ),
+        (
+            "business_event_after_terminal",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n",
             "responses_stream_malformed",
         ),
     ];

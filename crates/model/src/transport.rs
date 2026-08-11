@@ -1674,6 +1674,9 @@ impl<'a> ResponsesSseDecoder<'a> {
             ));
         }
         self.event_name = None;
+        if payload_type == "ping" {
+            return Ok(());
+        }
         if self.terminal_response.is_some() {
             return Err(provider_responses_stream_malformed_error(
                 "event_after_terminal",
