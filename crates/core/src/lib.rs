@@ -36,6 +36,8 @@ pub const APP_ERROR_NOT_INITIALIZED: i64 = -32002;
 pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
 /// 请求的持久化对象不存在。
 pub const APP_ERROR_NOT_FOUND: i64 = -32004;
+/// AppServer 请求工作线程容量已满。
+pub const APP_ERROR_REQUEST_CAPACITY_EXCEEDED: i64 = -32006;
 const TOKEN_VALUE_MIN_BODY_CHARS: usize = 8;
 const SECRET_ASSIGNMENT_MIN_VALUE_CHARS: usize = 1;
 const AWS_ACCESS_KEY_ID_BODY_CHARS: usize = 16;
@@ -306,6 +308,14 @@ impl ErrorCode {
     /// 构造资源不存在错误。
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(APP_ERROR_NOT_FOUND, message)
+    }
+
+    /// 构造请求容量已满错误。
+    pub fn request_capacity_exceeded() -> Self {
+        Self::new(
+            APP_ERROR_REQUEST_CAPACITY_EXCEEDED,
+            "Request capacity exceeded",
+        )
     }
 
     /// 返回错误消息。

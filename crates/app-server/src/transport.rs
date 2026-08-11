@@ -31,7 +31,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_REQUEST_WORKERS: usize = 16;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 256;
-const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 const FILE_BACKED_STORE_REQUIRED: &str =
     "app-server requires a file-backed SINGULARITY_APP_SERVER_DB";
 const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
@@ -294,7 +293,7 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
                         if let Err(error) = send_output_async(
                             outputs.clone(),
                             cancellation.clone(),
-                            internal_error_value(request_id, REQUEST_CAPACITY_EXCEEDED),
+                            request_capacity_error_value(request_id),
                         )
                         .await
                         {
@@ -1217,6 +1216,10 @@ fn request_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
         }
         error => transport_error_value(id, error),
     }
+}
+
+fn request_capacity_error_value(id: Option<JsonRpcId>) -> Value {
+    JsonRpcMessage::error(id, ErrorCode::request_capacity_exceeded()).to_wire_value()
 }
 
 fn internal_error_value(id: Option<JsonRpcId>, _diagnostic: impl Into<String>) -> Value {
@@ -2486,6 +2489,16 @@ mod tests {
         assert_eq!(response["error"]["code"], -32602);
         assert_eq!(response["error"]["message"], "Invalid params");
         assert!(!response.to_string().contains("secret-shaped"));
+    }
+
+    #[test]
+    fn request_capacity_exceeded_has_a_stable_typed_response() {
+        let response = request_capacity_error_value(Some(JsonRpcId::String("request-7".into())));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "request-7");
+        assert_eq!(response["error"]["code"], -32006);
+        assert_eq!(response["error"]["message"], "Request capacity exceeded");
     }
 
     #[test]
