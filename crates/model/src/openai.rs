@@ -785,8 +785,30 @@ pub(super) fn parse_openai_response(
         ));
     }
     let choice = &choices[0];
-    let message = choice.get("message").unwrap_or(&Value::Null);
-    let content = parse_openai_content(message.get("content"));
+    validate_openai_chat_response_wire(choice).map_err(|validation_error| {
+        provider_response_validation_error(
+            config,
+            model_name,
+            "provider Chat response failed wire validation",
+            vec![validation_error.to_string()],
+        )
+    })?;
+    let message = choice.get("message").ok_or_else(|| {
+        provider_response_validation_error(
+            config,
+            model_name,
+            "provider Chat response message was missing",
+            vec!["chat_message_invalid".to_string()],
+        )
+    })?;
+    let content = parse_openai_content(message.get("content")).map_err(|validation_error| {
+        provider_response_validation_error(
+            config,
+            model_name,
+            "provider Chat response content was invalid",
+            vec![validation_error.to_string()],
+        )
+    })?;
     let tool_calls = parse_openai_tool_calls(message);
     let assistant_message = Some(ModelMessage {
         tool_calls: tool_calls.clone(),
@@ -917,6 +939,63 @@ pub(super) fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
         .unwrap_or_default()
 }
 
+/// Validate the Chat wire discriminators before any response normalization.
+///
+/// OpenAI-compatible providers are external inputs: silently dropping an
+/// unknown role, tool-call variant, content part, or incomplete terminal
+/// reason could turn malformed output into an executable assistant turn.
+fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str> {
+    let choice = choice.as_object().ok_or("chat_message_invalid")?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or("chat_message_invalid")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err("chat_message_role_invalid");
+    }
+
+    if let Some(content) = message.get("content") {
+        match content {
+            Value::String(_) | Value::Null => {}
+            Value::Array(parts) => {
+                for part in parts {
+                    let part = part.as_object().ok_or("chat_content_part_type_invalid")?;
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") if part.get("text").and_then(Value::as_str).is_some() => {}
+                        Some("refusal")
+                            if part.get("refusal").and_then(Value::as_str).is_some() => {}
+                        _ => return Err("chat_content_part_type_invalid"),
+                    }
+                }
+            }
+            _ => return Err("chat_content_part_type_invalid"),
+        }
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls") {
+        match tool_calls {
+            Value::Null => {}
+            Value::Array(calls) => {
+                for call in calls {
+                    let call = call.as_object().ok_or("chat_tool_call_type_invalid")?;
+                    if call.get("type").and_then(Value::as_str) != Some("function") {
+                        return Err("chat_tool_call_type_invalid");
+                    }
+                }
+            }
+            _ => return Err("chat_tool_call_type_invalid"),
+        }
+    }
+
+    if matches!(
+        choice.get("finish_reason").and_then(Value::as_str),
+        Some("length" | "content_filter")
+    ) {
+        return Err("chat_completion_incomplete");
+    }
+    Ok(())
+}
+
 pub(super) fn parse_openai_tool_call(_index: usize, call: &Value) -> ModelToolCall {
     let function = call.get("function").unwrap_or(&Value::Null);
     let arguments_value = function.get("arguments").unwrap_or(&Value::Null);
@@ -969,20 +1048,31 @@ pub(super) fn parse_tool_arguments(
     }
 }
 
-pub(super) fn parse_openai_content(content: Option<&Value>) -> String {
+pub(super) fn parse_openai_content(content: Option<&Value>) -> Result<String, &'static str> {
     match content {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| {
-                (part.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| part.get("text").and_then(Value::as_str))
-                    .flatten()
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        Some(_) => String::new(),
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut content = String::new();
+            for part in parts {
+                let part = part.as_object().ok_or("chat_content_part_type_invalid")?;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => content.push_str(
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("chat_content_part_type_invalid")?,
+                    ),
+                    Some("refusal") => content.push_str(
+                        part.get("refusal")
+                            .and_then(Value::as_str)
+                            .ok_or("chat_content_part_type_invalid")?,
+                    ),
+                    _ => return Err("chat_content_part_type_invalid"),
+                }
+            }
+            Ok(content)
+        }
+        Some(_) => Err("chat_content_part_type_invalid"),
     }
 }
 

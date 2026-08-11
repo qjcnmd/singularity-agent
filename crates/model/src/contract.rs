@@ -326,6 +326,12 @@ pub fn validate_model_turn_response(
             .errors
             .push("response_output_tokens_exceed_provider_limit".to_string());
     }
+    if matches!(
+        response.finish_reason.as_deref(),
+        Some("length" | "content_filter")
+    ) {
+        result.errors.push("chat_completion_incomplete".to_string());
+    }
     result.errors.sort();
     result.errors.dedup();
     result.valid = result.errors.is_empty();

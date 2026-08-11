@@ -4741,6 +4741,173 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
 }
 
 #[test]
+fn openai_chat_response_wire_discriminators_fail_closed_before_normalization() {
+    let cases = [
+        (
+            "role",
+            r#"{
+                "id": "chat_invalid_role",
+                "choices": [{
+                    "message": {
+                        "role": "user",
+                        "content": "ignored",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+            "chat_message_role_invalid",
+            true,
+        ),
+        (
+            "tool type",
+            r#"{
+                "id": "chat_invalid_tool_type",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "custom",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+            "chat_tool_call_type_invalid",
+            true,
+        ),
+        (
+            "content part",
+            r#"{
+                "id": "chat_invalid_content_part",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid"}}],
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+            "chat_content_part_type_invalid",
+            true,
+        ),
+        (
+            "length",
+            r#"{
+                "id": "chat_length_with_tool_call",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        }]
+                    },
+                    "finish_reason": "length"
+                }]
+            }"#,
+            "chat_completion_incomplete",
+            true,
+        ),
+        (
+            "content filter",
+            r#"{
+                "id": "chat_filter_with_tool_call",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        }]
+                    },
+                    "finish_reason": "content_filter"
+                }]
+            }"#,
+            "chat_completion_incomplete",
+            true,
+        ),
+        (
+            "length without tools",
+            r#"{
+                "id": "chat_incomplete_text",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "partial"},
+                    "finish_reason": "length"
+                }]
+            }"#,
+            "chat_completion_incomplete",
+            false,
+        ),
+        (
+            "content filter without tools",
+            r#"{
+                "id": "chat_incomplete_text",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "partial"},
+                    "finish_reason": "content_filter"
+                }]
+            }"#,
+            "chat_completion_incomplete",
+            false,
+        ),
+    ];
+
+    for (case_name, body, expected_code, with_tools) in cases {
+        let base_url = single_response_server("HTTP/1.1 200 OK", body);
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let request = if with_tools {
+            capability_test_request(None, false, 1)
+        } else {
+            ModelTurnRequest::new(
+                "chat_incomplete_text",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            )
+        };
+        let error = provider
+            .complete(&request, &singularity_core::CancellationToken::new())
+            .expect_err("malformed Chat response must fail closed");
+
+        assert_eq!(
+            error.error.kind,
+            ModelErrorKind::JsonSchemaViolation,
+            "{case_name}"
+        );
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_response_invalid"),
+            "{case_name}"
+        );
+        assert_eq!(
+            error.error.stage,
+            Some(ProviderErrorStage::ResponseValidation),
+            "{case_name}"
+        );
+        assert_eq!(
+            error.error.validation_errors,
+            vec![expected_code.to_string()],
+            "{case_name}"
+        );
+    }
+}
+
+#[test]
 fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
     let success_body = r#"{
         "id": "resp_retry",
