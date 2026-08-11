@@ -5751,17 +5751,77 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
 }
 
 #[test]
-fn openai_provider_validation_rejects_non_object_tool_arguments() {
+fn openai_provider_recovers_native_argument_parse_errors_for_agent_repair() {
+    for (case_name, arguments, expected_errors) in [
+        ("invalid_json", "{\"path\":", vec!["invalid_json"]),
+        (
+            "non_object",
+            "\"README.md\"",
+            vec!["schema_mismatch", "tool_call_arguments_must_be_object"],
+        ),
+    ] {
+        let body = serde_json::json!({
+            "id": format!("resp_{case_name}"),
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": format!("call_{case_name}"),
+                        "type": "function",
+                        "function": {"name": "read", "arguments": arguments},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        })
+        .to_string();
+        let base_url = single_response_server("HTTP/1.1 200 OK", Box::leak(body.into_boxed_str()));
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let mut request = ModelTurnRequest::new(
+            format!("request_{case_name}"),
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.tools.push(ModelToolSchema {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        });
+
+        let response = provider
+            .complete(&request, &singularity_core::CancellationToken::new())
+            .expect("provider response");
+
+        assert_eq!(response.status, ModelTurnStatus::Success, "{case_name}");
+        assert!(response.error.is_none(), "{case_name}");
+        assert_eq!(
+            response.validation.as_ref().expect("validation").errors,
+            expected_errors
+                .iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>(),
+            "{case_name}"
+        );
+        assert_eq!(response.tool_calls.len(), 1, "{case_name}");
+        assert_eq!(
+            response.tool_calls[0].tool_call_id,
+            format!("call_{case_name}")
+        );
+    }
+}
+
+#[test]
+fn openai_provider_rejects_unknown_native_tool_even_when_arguments_are_repairable() {
     let body = r#"{
-        "id": "resp_1",
+        "id": "resp_unknown_tool",
         "choices": [{
             "message": {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [{
-                    "id": "call_1",
+                    "id": "call_unknown",
                     "type": "function",
-                    "function": {"name": "read", "arguments": "\"README.md\""}
+                    "function": {"name": "unknown", "arguments": "{\"path\":"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -5770,7 +5830,7 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
     let base_url = single_response_server("HTTP/1.1 200 OK", body);
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
-        "request_1",
+        "request_unknown_tool",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
@@ -5784,14 +5844,72 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
         .expect("provider response");
 
     assert_eq!(response.status, ModelTurnStatus::Invalid);
-    assert_eq!(
-        response.validation.as_ref().expect("validation").errors,
-        vec!["schema_mismatch", "tool_call_arguments_must_be_object"]
+    assert!(
+        response
+            .validation
+            .as_ref()
+            .expect("validation")
+            .errors
+            .contains(&"unknown_tool".to_string())
     );
     assert_eq!(
         response.error.as_ref().expect("validation error").kind,
         ModelErrorKind::JsonSchemaViolation
     );
+}
+
+#[test]
+fn openai_provider_rejects_missing_or_non_string_chat_argument_fields() {
+    for (case_name, arguments) in [("missing", None), ("number", Some(serde_json::json!(7)))] {
+        let mut function = serde_json::json!({"name": "read"});
+        if let Some(arguments) = arguments {
+            function["arguments"] = arguments;
+        }
+        let body = serde_json::json!({
+            "id": format!("resp_{case_name}_arguments"),
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": format!("call_{case_name}_arguments"),
+                        "type": "function",
+                        "function": function,
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        })
+        .to_string();
+        let base_url = single_response_server("HTTP/1.1 200 OK", Box::leak(body.into_boxed_str()));
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let mut request = ModelTurnRequest::new(
+            format!("request_{case_name}_arguments"),
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.tools.push(ModelToolSchema {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        });
+
+        let response = provider
+            .complete(&request, &singularity_core::CancellationToken::new())
+            .expect("provider response");
+
+        assert_eq!(response.status, ModelTurnStatus::Invalid, "{case_name}");
+        assert!(response.error.is_some(), "{case_name}");
+        assert!(
+            response
+                .validation
+                .as_ref()
+                .expect("validation")
+                .errors
+                .iter()
+                .any(|error| error == "schema_mismatch"),
+            "{case_name}"
+        );
+    }
 }
 
 #[test]

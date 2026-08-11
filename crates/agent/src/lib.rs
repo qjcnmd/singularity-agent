@@ -5242,10 +5242,24 @@ fn recoverable_tool_response_validation(
                 "invalid_json" | "schema_mismatch" | "tool_call_arguments_must_be_object"
             )
         })
-        && response
-            .tool_calls
-            .iter()
-            .all(|call| !call.tool_call_id.trim().is_empty() && !call.tool_name.trim().is_empty())
+        && response.tool_calls.iter().all(|call| {
+            !call.tool_call_id.trim().is_empty()
+                && !call.tool_name.trim().is_empty()
+                && match call.parse_status {
+                    ModelToolParseStatus::Valid => call.validation_errors.is_empty(),
+                    ModelToolParseStatus::InvalidJson | ModelToolParseStatus::SchemaMismatch => {
+                        call.validation_errors.iter().all(|error| {
+                            matches!(
+                                error.as_str(),
+                                "invalid_json"
+                                    | "schema_mismatch"
+                                    | "tool_call_arguments_must_be_object"
+                            )
+                        })
+                    }
+                    ModelToolParseStatus::UnknownTool => false,
+                }
+        })
 }
 
 fn assistant_tool_calls_match_response(response: &ModelTurnResponse) -> bool {

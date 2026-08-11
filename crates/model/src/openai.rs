@@ -682,21 +682,8 @@ pub(super) fn parse_openai_responses_message(message: &Value) -> Result<String, 
 }
 
 pub(super) fn parse_openai_responses_tool_call(_index: usize, call: &Value) -> ModelToolCall {
-    let arguments_value = call.get("arguments").unwrap_or(&Value::Null);
-    let raw_arguments = match arguments_value {
-        Value::String(raw) => raw.clone(),
-        Value::Object(_) => serde_json::to_string(arguments_value).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let (arguments, parse_status, validation_errors) = if arguments_value.is_object() {
-        (
-            arguments_value.clone(),
-            ModelToolParseStatus::Valid,
-            Vec::new(),
-        )
-    } else {
-        parse_tool_arguments(&raw_arguments)
-    };
+    let (arguments, raw_arguments, parse_status, validation_errors) =
+        parse_tool_call_arguments(call.get("arguments"));
     ModelToolCall {
         tool_call_id: call
             .get("call_id")
@@ -892,7 +879,38 @@ pub(super) fn finalize_provider_response(
         &available_tool_names,
         Some(capabilities),
     );
-    if !validation.valid {
+    let mut validation = validation;
+    // Unknown names are warnings in the generic model contract so callers can
+    // report them without losing the rest of the response.  The OpenAI adapter
+    // is the native tool trust boundary, however: an unregistered name (or a
+    // missing call identity) must never enter AgentLoop's argument-repair path.
+    let unknown_tool = response.tool_calls.iter().any(|call| {
+        call.parse_status == ModelToolParseStatus::UnknownTool
+            || (!call.tool_name.trim().is_empty()
+                && !available_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == &call.tool_name))
+    });
+    let invalid_tool_identity = response
+        .tool_calls
+        .iter()
+        .any(|call| call.tool_call_id.trim().is_empty() || call.tool_name.trim().is_empty());
+    if unknown_tool
+        && !validation
+            .errors
+            .iter()
+            .any(|error| error == "unknown_tool")
+    {
+        validation.errors.push("unknown_tool".to_string());
+        validation.errors.sort();
+        validation.errors.dedup();
+        validation.valid = false;
+    }
+    let invalid_tool_call = unknown_tool || invalid_tool_identity;
+    if invalid_tool_call && validation.valid {
+        validation.valid = false;
+    }
+    if !validation.valid && !recoverable_tool_argument_validation(&response, &validation.errors) {
         response.status = ModelTurnStatus::Invalid;
         let provider_rejected_parallelism = validation
             .errors
@@ -923,6 +941,36 @@ pub(super) fn finalize_provider_response(
     }
     response.validation = Some(validation);
     Ok(response)
+}
+
+/// Only malformed arguments for a registered, fully identified native call may
+/// continue to `AgentLoop` for a typed validation result.  Every other response
+/// validation error remains a provider failure at this boundary.
+fn recoverable_tool_argument_validation(
+    response: &ModelTurnResponse,
+    validation_errors: &[String],
+) -> bool {
+    !response.tool_calls.is_empty()
+        && !validation_errors.is_empty()
+        && validation_errors
+            .iter()
+            .all(|error| is_recoverable_tool_argument_error(error))
+        && response.tool_calls.iter().all(|call| {
+            !call.tool_call_id.trim().is_empty()
+                && !call.tool_name.trim().is_empty()
+                && call.parse_status != ModelToolParseStatus::UnknownTool
+                && call
+                    .validation_errors
+                    .iter()
+                    .all(|error| is_recoverable_tool_argument_error(error))
+        })
+}
+
+fn is_recoverable_tool_argument_error(error: &str) -> bool {
+    matches!(
+        error,
+        "invalid_json" | "schema_mismatch" | "tool_call_arguments_must_be_object"
+    )
 }
 
 pub(super) fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
@@ -998,21 +1046,8 @@ fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str
 
 pub(super) fn parse_openai_tool_call(_index: usize, call: &Value) -> ModelToolCall {
     let function = call.get("function").unwrap_or(&Value::Null);
-    let arguments_value = function.get("arguments").unwrap_or(&Value::Null);
-    let raw_arguments = match arguments_value {
-        Value::String(raw) => raw.clone(),
-        Value::Object(_) => serde_json::to_string(arguments_value).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let (arguments, parse_status, validation_errors) = if arguments_value.is_object() {
-        (
-            arguments_value.clone(),
-            ModelToolParseStatus::Valid,
-            Vec::new(),
-        )
-    } else {
-        parse_tool_arguments(&raw_arguments)
-    };
+    let (arguments, raw_arguments, parse_status, validation_errors) =
+        parse_tool_call_arguments(function.get("arguments"));
     let wire_tool_name = function.get("name").and_then(Value::as_str).unwrap_or("");
     ModelToolCall {
         tool_call_id: call
@@ -1025,6 +1060,42 @@ pub(super) fn parse_openai_tool_call(_index: usize, call: &Value) -> ModelToolCa
         raw_arguments,
         parse_status,
         validation_errors,
+    }
+}
+
+fn parse_tool_call_arguments(
+    arguments_value: Option<&Value>,
+) -> (Value, String, ModelToolParseStatus, Vec<String>) {
+    let Some(arguments_value) = arguments_value else {
+        return (
+            json!({}),
+            String::new(),
+            ModelToolParseStatus::SchemaMismatch,
+            vec!["tool_call_arguments_missing".to_string()],
+        );
+    };
+    match arguments_value {
+        Value::String(raw_arguments) => {
+            let (arguments, parse_status, validation_errors) = parse_tool_arguments(raw_arguments);
+            (
+                arguments,
+                raw_arguments.clone(),
+                parse_status,
+                validation_errors,
+            )
+        }
+        Value::Object(_) => (
+            arguments_value.clone(),
+            serde_json::to_string(arguments_value).unwrap_or_default(),
+            ModelToolParseStatus::Valid,
+            Vec::new(),
+        ),
+        _ => (
+            json!({}),
+            String::new(),
+            ModelToolParseStatus::SchemaMismatch,
+            vec!["tool_call_arguments_type_invalid".to_string()],
+        ),
     }
 }
 

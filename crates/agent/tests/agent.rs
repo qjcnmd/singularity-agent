@@ -1,6 +1,9 @@
 //! AgentLoop public behavior regressions.
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use serde_json::json;
 use singularity_agent::{
@@ -10,8 +13,10 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelErrorCategory, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    Provider, ProviderProtocolContract, ProviderStreamEvent,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelErrorCategory, ModelToolCall,
+    ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, OpenAiProvider,
+    OpenAiProviderConfig, Provider, ProviderCapabilityDeclaration, ProviderConfigSource,
+    ProviderProtocolContract, ProviderStreamEvent,
 };
 use singularity_policy::{
     PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,
@@ -25,6 +30,43 @@ use singularity_tools::{
 struct FixtureProvider {
     responses: Vec<ModelTurnResponse>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+}
+
+/// Use the real OpenAI adapter while keeping this regression deterministic and non-streaming.
+/// The adapter still owns response parsing/validation; the wrapper only exposes the requests the
+/// AgentLoop sees and lets the default stream fallback call `complete`.
+#[derive(Clone)]
+struct AdapterFixtureProvider {
+    provider: OpenAiProvider,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+}
+
+impl Provider for AdapterFixtureProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.provider.protocol_contract()
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        model_preferences: &singularity_model::ModelPreferences,
+        cancellation: &CancellationToken,
+    ) -> Result<singularity_model::ProviderProtocolNegotiation, singularity_model::ProviderError>
+    {
+        self.provider
+            .negotiate_tool_capabilities(model_preferences, cancellation)
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, singularity_model::ProviderError> {
+        self.seen_requests
+            .lock()
+            .expect("adapter requests lock")
+            .push(request.clone());
+        self.provider.complete(request, cancellation)
+    }
 }
 
 impl Provider for FixtureProvider {
@@ -116,6 +158,114 @@ fn loop_with(
         WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")).expect("fixture workspace tools"),
     )
     .with_cancellation_token(cancellation)
+}
+
+fn adapter_test_config(base_url: String) -> OpenAiProviderConfig {
+    OpenAiProviderConfig {
+        provider_name: "openai_compatible".to_string(),
+        model_name: "gpt-test".to_string(),
+        base_url,
+        api_key: "sk-test".to_string(),
+        source: ProviderConfigSource::ProcessEnvironment,
+        max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        capabilities: ProviderCapabilityDeclaration {
+            supports_tools: Some(true),
+            supports_parallel_tool_calls: Some(false),
+            supports_required_tool_choice: Some(false),
+            supports_strict_tool_schema: Some(true),
+            supports_json_mode: Some(false),
+            supports_system_message: Some(true),
+            supports_developer_message: Some(true),
+            supports_reasoning: Some(false),
+            max_tools_per_request: Some(8),
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+            max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        },
+    }
+}
+
+fn adapter_response_server(
+    endpoint: &'static str,
+    responses: Vec<String>,
+) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind adapter fixture provider");
+    let address = listener
+        .local_addr()
+        .expect("adapter fixture provider address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let handle = thread::spawn(move || {
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept adapter request");
+            let request = read_http_request(&mut stream);
+            assert!(
+                request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains(endpoint)),
+                "unexpected adapter endpoint: {request}"
+            );
+            captured.lock().expect("adapter request lock").push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write adapter response");
+        }
+    });
+    (format!("http://{address}"), requests, handle)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let read = stream.read(&mut chunk).expect("read adapter request");
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let header = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or_default();
+        if bytes.len() >= header_end.saturating_add(content_length) {
+            break;
+        }
+    }
+    String::from_utf8(bytes).expect("adapter request utf8")
+}
+
+fn adapter_loop_with(
+    base_url: String,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+) -> AgentLoop<AdapterFixtureProvider> {
+    let provider = OpenAiProvider::new(adapter_test_config(base_url)).expect("adapter provider");
+    AgentLoop::new(
+        AdapterFixtureProvider {
+            provider,
+            seen_requests,
+        },
+        tool_broker(),
+        Some(read_policy()),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")).expect("fixture workspace tools"),
+    )
 }
 
 fn assistant_response(text: &str) -> ModelTurnResponse {
@@ -268,6 +418,158 @@ fn recoverable_typed_tool_failure_reaches_the_next_model_turn() {
             | Some(ToolFailureKind::WorkspaceBoundary)
             | Some(ToolFailureKind::Input)
     ));
+}
+
+#[test]
+fn chat_adapter_argument_parse_failure_reaches_typed_repair_without_execution() {
+    let first = json!({
+        "id": "chat_invalid_arguments",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_chat_invalid",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    let second = json!({
+        "id": "chat_repaired",
+        "choices": [{
+            "message": {"role": "assistant", "content": "recovered"},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, network_requests, server) =
+        adapter_response_server("/v1/chat/completions", vec![first, second]);
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_ = adapter_loop_with(format!("{base_url}/v1"), Arc::clone(&seen_requests));
+    let result = loop_.run(
+        &AgentLoopInput::new("thread_chat_repair", "turn_chat_repair", "inspect"),
+        AgentLoopCallbacks::none(),
+    );
+    server.join().expect("chat adapter server");
+
+    assert_eq!(result.status, AgentStatus::Completed, "{:?}", result.error);
+    assert_eq!(result.final_answer.as_deref(), Some("recovered"));
+    assert_eq!(network_requests.lock().expect("network requests").len(), 2);
+    assert_eq!(seen_requests.lock().expect("agent requests").len(), 2);
+    let failure = result
+        .tool_results
+        .first()
+        .expect("typed invalid arguments");
+    assert_eq!(
+        failure.error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    assert_eq!(
+        failure
+            .audit_metadata()
+            .and_then(|audit| audit.get("executor_started"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    let requests = seen_requests.lock().expect("agent requests");
+    let second_request = &requests[1];
+    let assistant_call = second_request
+        .messages
+        .iter()
+        .find(|message| message.role == singularity_model::ModelRole::Assistant)
+        .and_then(|message| message.tool_calls.first())
+        .expect("canonical rejected assistant call");
+    assert_eq!(assistant_call.tool_call_id, "call_chat_invalid");
+    assert_eq!(assistant_call.tool_name, "read");
+    assert_eq!(assistant_call.arguments, json!({}));
+    assert_eq!(assistant_call.raw_arguments, "{}");
+    assert!(second_request.messages.iter().any(|message| {
+        message.role == singularity_model::ModelRole::Tool
+            && message.content.contains("invalid_tool_arguments")
+    }));
+}
+
+#[test]
+fn responses_adapter_schema_failure_reaches_typed_repair_without_execution() {
+    let first = json!({
+        "id": "responses_schema_mismatch",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_responses_invalid",
+            "name": "read",
+            "arguments": {}
+        }]
+    })
+    .to_string();
+    let second = json!({
+        "id": "responses_repaired",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "recovered"}]
+        }]
+    })
+    .to_string();
+    let (base_url, network_requests, server) =
+        adapter_response_server("/v1/responses", vec![first, second]);
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_ = adapter_loop_with(
+        format!("{base_url}/v1/responses"),
+        Arc::clone(&seen_requests),
+    );
+    let result = loop_.run(
+        &AgentLoopInput::new(
+            "thread_responses_repair",
+            "turn_responses_repair",
+            "inspect",
+        ),
+        AgentLoopCallbacks::none(),
+    );
+    server.join().expect("Responses adapter server");
+
+    assert_eq!(result.status, AgentStatus::Completed, "{:?}", result.error);
+    assert_eq!(result.final_answer.as_deref(), Some("recovered"));
+    assert_eq!(network_requests.lock().expect("network requests").len(), 2);
+    assert_eq!(seen_requests.lock().expect("agent requests").len(), 2);
+    let failure = result
+        .tool_results
+        .first()
+        .expect("typed invalid arguments");
+    assert_eq!(
+        failure.error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    assert_eq!(
+        failure
+            .audit_metadata()
+            .and_then(|audit| audit.get("executor_started"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    let requests = seen_requests.lock().expect("agent requests");
+    let second_request = &requests[1];
+    let assistant_call = second_request
+        .messages
+        .iter()
+        .find(|message| message.role == singularity_model::ModelRole::Assistant)
+        .and_then(|message| message.tool_calls.first())
+        .expect("canonical rejected assistant call");
+    assert_eq!(assistant_call.tool_call_id, "call_responses_invalid");
+    assert_eq!(assistant_call.tool_name, "read");
+    assert_eq!(assistant_call.arguments, json!({}));
+    assert_eq!(assistant_call.raw_arguments, "{}");
+    assert!(second_request.messages.iter().any(|message| {
+        message.role == singularity_model::ModelRole::Tool
+            && message.content.contains("invalid_tool_arguments")
+    }));
 }
 
 #[test]
