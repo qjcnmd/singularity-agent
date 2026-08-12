@@ -3087,14 +3087,37 @@ fn capability_probe_unsupported_error(mut error: ModelError) -> ProviderError {
 
 fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderError {
     let mut error = response.error.as_ref().cloned().unwrap_or_else(|| {
-        ModelError::new(
-            ModelErrorKind::UnsupportedCapability,
-            "provider capability probe did not return native structured tool calls",
-        )
-        .with_provider_diagnostic(
-            "provider_native_structured_tool_calls_unsupported",
-            ProviderErrorStage::ResponseValidation,
-        )
+        // AgentLoop may keep a response with recoverable argument errors at
+        // Success for its repair path, but the probe has no such path: any
+        // validation evidence must fail closed with its typed cause instead of
+        // being conflated into a generic capability rejection.
+        let validation_errors = response
+            .validation
+            .as_ref()
+            .map(|validation| validation.errors.clone())
+            .unwrap_or_default();
+        if !validation_errors.is_empty() {
+            ModelError::new(
+                ModelErrorKind::JsonSchemaViolation,
+                format!(
+                    "provider_response_invalid: {}",
+                    validation_errors.join(",")
+                ),
+            )
+            .with_provider_diagnostic(
+                "provider_response_invalid",
+                ProviderErrorStage::ResponseValidation,
+            )
+        } else {
+            ModelError::new(
+                ModelErrorKind::UnsupportedCapability,
+                "provider capability probe did not return native structured tool calls",
+            )
+            .with_provider_diagnostic(
+                "provider_native_structured_tool_calls_unsupported",
+                ProviderErrorStage::ResponseValidation,
+            )
+        }
     });
     if let Some(validation) = &response.validation {
         error.validation_errors = validation.errors.clone();

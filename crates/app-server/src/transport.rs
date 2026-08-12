@@ -2379,7 +2379,10 @@ mod tests {
     #[test]
     fn batch_rejects_long_worker_methods_and_continues_with_short_items() {
         let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
+        let mut server = AppServer::new(
+            store,
+            ProviderConfigSnapshot::capture(|_| None, None, None),
+        );
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(16, 8);
         let payload = parse_json_rpc_payload(

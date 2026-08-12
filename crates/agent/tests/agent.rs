@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde_json::json;
 use singularity_agent::{
@@ -15,8 +16,7 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelErrorCategory, ModelToolCall,
     ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, OpenAiProvider,
-    OpenAiProviderConfig, Provider, ProviderCapabilityDeclaration, ProviderConfigSource,
-    ProviderProtocolContract, ProviderStreamEvent,
+    OpenAiProviderConfig, Provider, ProviderConfigSource, ProviderProtocolContract, ProviderStreamEvent,
 };
 use singularity_policy::{
     PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,
@@ -169,19 +169,6 @@ fn adapter_test_config(base_url: String) -> OpenAiProviderConfig {
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-        capabilities: ProviderCapabilityDeclaration {
-            supports_tools: Some(true),
-            supports_parallel_tool_calls: Some(false),
-            supports_required_tool_choice: Some(false),
-            supports_strict_tool_schema: Some(true),
-            supports_json_mode: Some(false),
-            supports_system_message: Some(true),
-            supports_developer_message: Some(true),
-            supports_reasoning: Some(false),
-            max_tools_per_request: Some(8),
-            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
-            max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
-        },
     }
 }
 
@@ -190,15 +177,53 @@ fn adapter_response_server(
     responses: Vec<String>,
 ) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind adapter fixture provider");
+    listener
+        .set_nonblocking(true)
+        .expect("adapter listener nonblocking");
     let address = listener
         .local_addr()
         .expect("adapter fixture provider address");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);
     let handle = thread::spawn(move || {
-        for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept adapter request");
+        // The provider runs its fixed capability probe before the adapter requests;
+        // probe and continuation requests are served out of band and are not part
+        // of the queued adapter exchange recorded for assertions.  The loop ends
+        // once the queued adapter responses are exhausted and no new connection
+        // arrives, so the test can join the server thread deterministically.
+        let mut responses = responses.into_iter();
+        let mut idle_rounds = 0_u32;
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if responses.len() == 0 {
+                        idle_rounds += 1;
+                        if idle_rounds >= 100 {
+                            break;
+                        }
+                    } else {
+                        idle_rounds = 0;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("adapter listener accept failed: {error}"),
+            };
             let request = read_http_request(&mut stream);
+            let request_body = request
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            if request_body.contains("singularity_capability_probe") {
+                let body = adapter_capability_probe_response(request_body);
+                write_adapter_http_response(&mut stream, &body);
+                continue;
+            }
+            let Some(body) = responses.next() else {
+                break;
+            };
             assert!(
                 request
                     .lines()
@@ -207,17 +232,86 @@ fn adapter_response_server(
                 "unexpected adapter endpoint: {request}"
             );
             captured.lock().expect("adapter request lock").push(request);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write adapter response");
+            write_adapter_http_response(&mut stream, &body);
         }
     });
     (format!("http://{address}"), requests, handle)
+}
+
+fn write_adapter_http_response(stream: &mut TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("write adapter response");
+}
+
+/// 用最小 probe 完成响应应答 capability probe 请求（含多轮 continuation）。
+fn adapter_capability_probe_response(request_body: String) -> String {
+    let request: serde_json::Value = serde_json::from_str(&request_body).expect("probe request");
+    // Chat probe requests carry nested function schemas; Responses requests use
+    // flat tool entries.  Detect the wire shape and reply in the same protocol.
+    let chat_wire = request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+    let responses_wire = request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        });
+    let continuation = chat_wire || responses_wire;
+    let call_id = if continuation {
+        "probe_call_continuation"
+    } else {
+        "probe_call_a"
+    };
+    if chat_wire || request.get("messages").is_some() {
+        serde_json::json!({
+            "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        })
+        .to_string()
+    } else {
+        let calls = vec![serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "singularity_capability_probe_a",
+            "arguments": "{}",
+        })];
+        serde_json::json!({
+            "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
+            "object": "response",
+            "status": "completed",
+            "output": calls,
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0}
+            }
+        })
+        .to_string()
+    }
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -237,10 +331,13 @@ fn read_http_request(stream: &mut TcpStream) -> String {
         let content_length = header
             .lines()
             .find_map(|line| {
-                line.strip_prefix("Content-Length:")?
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
+                let (name, value) = line
+                    .split_once(':')
+                    .map(|(name, value)| (name.trim(), value.trim()))
+                    .unwrap_or((line.trim(), ""));
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.parse::<usize>().ok())
+                    .flatten()
             })
             .unwrap_or_default();
         if bytes.len() >= header_end.saturating_add(content_length) {
@@ -261,7 +358,7 @@ fn adapter_loop_with(
             seen_requests,
         },
         tool_broker(),
-        Some(read_policy()),
+        read_policy(),
     )
     .with_workspace_tools(
         WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")).expect("fixture workspace tools"),
@@ -449,7 +546,10 @@ fn chat_adapter_argument_parse_failure_reaches_typed_repair_without_execution() 
     let (base_url, network_requests, server) =
         adapter_response_server("/v1/chat/completions", vec![first, second]);
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let loop_ = adapter_loop_with(format!("{base_url}/v1"), Arc::clone(&seen_requests));
+    let loop_ = adapter_loop_with(
+        format!("{base_url}/v1/chat/completions"),
+        Arc::clone(&seen_requests),
+    );
     let result = loop_.run(
         &AgentLoopInput::new("thread_chat_repair", "turn_chat_repair", "inspect"),
         AgentLoopCallbacks::none(),
