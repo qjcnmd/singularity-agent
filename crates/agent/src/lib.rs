@@ -42,9 +42,11 @@ use thiserror::Error;
 
 mod checkpoint;
 mod context;
+pub mod message;
 mod model_turn;
 mod observation;
 mod occurrence;
+pub mod session;
 mod tool_occurrence;
 
 use checkpoint::HistoricalModelContext;
