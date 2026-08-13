@@ -32,3 +32,7 @@ nul
 
 # Evaluation run artifacts (evidence kept locally).
 evaluations/output/
+
+# Python bytecode caches (test runs inside task workspaces).
+__pycache__/
+*.pyc
