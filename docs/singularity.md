@@ -319,7 +319,7 @@ flowchart LR
 | trace 体系（TraceEvent / typed span / TransportTraceSink、trace/list\|show\|tail\|metrics 方法） | 6 | 删除；会话文件即完整记录，事件流为实时输出 |
 | 16-worker 请求池、控制/事件双队列、cursor/gap、输出全局排序 | 4 | 单 worker 顺序处理 |
 | Approval / Policy 链（PolicyEngine、PermissionProfile、approval/decision 等） | 3/5/7 | 删除；trust 决策替代 |
-| Sandbox（sandbox / windows-sandbox crate：restricted-token、Job Object、namespace/seccomp/Landlock、elevated setup；command-runner / setup 二进制） | 5 | 命令进程内执行；二进制 Phase 7 退役 |
+| Sandbox（sandbox / windows-sandbox crate：restricted-token、Job Object、namespace/seccomp/Landlock、elevated setup；command-runner / setup 二进制） | 5 | 命令进程内执行；crate 与二进制已随 3b 删除（`2f7189f1`） |
 | capability probe 体系（约 3236 行 negotiation + 持久化缓存） | 8 | 静态能力声明 |
 | 旧 Evaluation（task_set v6 / result v9 / evidence v4、三维 gate、sandbox preflight、source-template cache、publication） | 2 | 轻量回归工具（第 8 节） |
 | 旧工具面 read/list/grep/patch/command 及 patch 原子发布 / WorkspaceContentRevision | 3 | Pi 工具面 read/bash/edit/write（+可选只读集） |
@@ -337,8 +337,8 @@ flowchart LR
 | --- | --- | --- |
 | 1 | 剥离死表面（evaluator_only、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | **完成**（提交 `8c44439b`） |
 | 2 | 新建 JSONL SessionManager + Pi 式 Agent 循环 + Compaction + 事件流（新模块，与旧机制并存不切换） | **完成**（提交 `5213e604` / `602303d` / `d2e79e0` / `da6c689`：message/session/compaction/tools/loop + 真实模型端到端） |
-| 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | **部分完成**：3a 已切换 app-server turn 执行到新核心（提交 `2df1d7fa`）；3b（删三 crate + 旧 AgentLoop）调查中 |
+| 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | **完成**：3a 切换 turn 执行到新核心（`2df1d7fa`）；3b 删除旧 AgentLoop 链（`2a8cb079`）、approval/trace/policy 产品面（`5ba5bcbc`）、tools/policy/sandbox/windows-sandbox crate（`2f7189f1`） |
 | 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | 未开始（与 3b 联动，依赖面盘点中） |
 | 5 | Provider 简化：删 capability probe 全链，静态声明 + 用户覆盖；保留双协议 adapter / 重试 / usage 记账 | 未开始 |
 | 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局 config.toml | 未开始 |
-| 7 | 清理与文档：退役 command-runner / setup 二进制、删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | 未开始 |
+| 7 | 清理与文档：删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | 未开始（command-runner / setup 二进制已随 3b 删除） |
