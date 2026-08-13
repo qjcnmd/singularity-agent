@@ -41,12 +41,14 @@ use singularity_tools::{
 use thiserror::Error;
 
 mod checkpoint;
+pub mod compaction;
 mod context;
 pub mod message;
 mod model_turn;
 mod observation;
 mod occurrence;
 pub mod session;
+pub mod tools;
 mod tool_occurrence;
 
 use checkpoint::HistoricalModelContext;
