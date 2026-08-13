@@ -1,118 +1,81 @@
-//! 验证 SessionStore 的 schema、绑定、恢复、历史、trace 与事务不变量。
+//! 验证 SessionStore 的 schema、绑定、恢复、历史与事务不变量。
 
 use schemars::schema_for;
-use serde_json::Value;
-use singularity_protocol::{
-    ItemKind, ThreadStatus, TraceApprovalOutcome, TraceApprovalProjection, TraceBindingError,
-    TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
-    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceMetricAvailability, TraceMetricSample,
-    TraceMetricSampleKind, TracePolicyCause, TracePolicyDecision, TracePolicyProjection,
-    TraceProviderOperationPhase, TraceProviderProtocol, TraceSandboxEnforcement,
-    TraceSandboxProjection, TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
-    TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
-    TraceVerificationStatus, TraceWorkspaceMutation, TurnInputDelivery, TurnStatus,
-};
+use singularity_protocol::{ItemKind, ThreadStatus, TurnInputDelivery, TurnStatus};
 use singularity_store::{
-    CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
-    SessionStoreDescriptor, StoreError, ToolExecution, ToolExecutionState, TurnOutcomeAuthority,
+    CommitTurnOutcomeParams, ConversationRole, SessionStore, SessionStoreDescriptor, StoreError,
+    TurnOutcomeAuthority,
 };
 use std::sync::{Arc, Barrier};
 
+// 原子 start：turn 与 user input 在同一事务创建；重复 start 在已有非终态 turn 时被拒绝。
 #[test]
-fn typed_turn_start_is_atomic_and_duplicate_start_is_idempotent() {
+fn turn_start_with_input_is_atomic_and_single_owner() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let started = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "hello"}]),
-            "app_server",
-            "turn started",
-        )
+    let input = serde_json::json!([{"type": "text", "text": "hello"}]);
+    let (turn, item) = store
+        .create_turn_with_input(&thread.thread_id, "running", input.clone())
         .expect("started turn");
 
-    assert_eq!(started.2.span_kind, Some(TraceSpanKind::Turn));
-    assert_eq!(started.2.span_phase, Some(TraceSpanPhase::Start));
-    assert!(started.2.timestamp.is_some());
+    assert_eq!(turn.status, TurnStatus::Running);
+    assert_eq!(item.kind, ItemKind::UserMessage);
     assert_eq!(
         store
-            .append_trace_idempotent(&started.2)
-            .expect("duplicate start is idempotent"),
-        started.2
+            .get_turn_user_input(&turn.turn_id)
+            .expect("user input"),
+        input
     );
-    let mut resumed_start = started.2.clone();
-    resumed_start.timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    // 同一 thread 已有非终态 turn：重复 start 必须拒绝，而不是幂等覆盖。
+    assert!(matches!(
+        store.create_turn_with_input(&thread.thread_id, "running", input),
+        Err(StoreError::WorkspaceHasNonterminalTurn { .. })
+    ));
     assert_eq!(
-        store
-            .append_trace_idempotent(&resumed_start)
-            .expect("same occurrence start is idempotent across resume"),
-        started.2
-    );
-    assert_eq!(
-        store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .iter()
-            .filter(|event| event.span_kind == Some(TraceSpanKind::Turn))
-            .count(),
-        1
+        store.get_turn(&turn.turn_id).expect("turn").status,
+        TurnStatus::Running
     );
 }
 
+// 终态提交在 SQLite 重开后仍然持久化。
 #[test]
-fn typed_turn_end_recovers_persisted_start_after_sqlite_reopen() {
+fn turn_outcome_persists_across_store_reopen() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, start) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "hello"}]),
-            "app_server",
-            "turn started",
         )
         .expect("started turn");
     drop(store);
 
     let store = SessionStore::open(&db_path).expect("reopen store");
-    let terminal = TraceEvent::for_turn(
-        "trace_terminal_failure",
-        &thread.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "terminal failure",
-    );
-    store
+    let committed = store
         .commit_turn_outcome(
             &turn.turn_id,
             CommitTurnOutcomeParams {
-                status: TurnStatus::Failed,
-                agent_loop_status: "failed",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &terminal,
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
+                assistant_delta: Some("done"),
             },
         )
         .expect("terminal outcome");
-
-    let trace = store.list_trace(&thread.thread_id).expect("trace list");
-    let end = trace
-        .iter()
-        .find(|event| {
-            event.span_kind == Some(TraceSpanKind::Turn)
-                && event.span_phase == Some(TraceSpanPhase::End)
-        })
-        .expect("typed turn end");
-    assert_eq!(end.span_id, start.span_id);
-    assert_eq!(end.span_status, Some(TraceSpanStatus::Error));
-    assert!(end.timestamp.is_some());
-    assert!(end.duration_ms.is_some());
+    assert_eq!(committed.turn.status, TurnStatus::Completed);
+    let history = store
+        .read_thread_history(&thread.thread_id, None, 10)
+        .expect("history");
+    assert_eq!(history.messages.len(), 2);
+    assert_eq!(history.messages[0].content, "hello");
+    assert_eq!(history.messages[1].content, "done");
 }
+
 #[test]
-fn sqlite_store_persists_threads_turns_items_and_trace() {
+fn sqlite_store_persists_threads_turns_and_items() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let descriptor = store.descriptor();
@@ -159,14 +122,6 @@ fn sqlite_store_persists_threads_turns_items_and_trace() {
             serde_json::json!([{"type": "text", "text": "hello"}]),
         )
         .expect("item");
-    let trace = TraceEvent::new(
-        "trace_1",
-        "run_1",
-        "session_1",
-        "app_server",
-        "thread started",
-    );
-    store.append_trace(&trace).expect("trace");
 
     let connection =
         rusqlite::Connection::open(dir.path().join("sessions.sqlite3")).expect("open sqlite");
@@ -187,12 +142,6 @@ fn sqlite_store_persists_threads_turns_items_and_trace() {
     );
 
     assert_eq!(item.kind, ItemKind::UserMessage);
-    assert_eq!(store.list_trace("run_1").expect("trace list").len(), 1);
-    assert_eq!(
-        store.show_trace("trace_1").expect("trace show").summary,
-        "thread started"
-    );
-    assert!(store.show_trace("missing").is_err());
 }
 
 // 验证 schema 元数据和 SQLite WAL pragma 在新库中正确写入。
@@ -243,10 +192,10 @@ fn sqlite_store_rejects_future_schema_version() {
     ));
 }
 
-// v12 降级脚本重建 released v12 形状（含 approval 三表与 threads policy 列），
-// 迁移必须保留 thread/turn/trace 行并加入恢复表。
+// 重建 released v12 形状（含 approval 三表、threads policy 列、typed trace 表与
+// trace 索引/触发器），迁移必须保留 thread/turn/item 行并丢弃旧 trace/approval/checkpoint 表。
 #[test]
-fn v12_to_v13_migration_adds_recovery_tables_and_preserves_rows() {
+fn v12_to_v13_migration_drops_legacy_tables_and_preserves_rows() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("v12.sqlite3");
     let store = SessionStore::open(&db_path).expect("open v13 store");
@@ -254,14 +203,13 @@ fn v12_to_v13_migration_adds_recovery_tables_and_preserves_rows() {
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("turn");
-    let trace = TraceEvent::for_turn(
-        "v12_preserved_trace",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        "test",
-        "preserved",
-    );
-    store.append_trace(&trace).expect("trace");
+    store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::UserMessage,
+            serde_json::json!([{"type": "text", "text": "preserved"}]),
+        )
+        .expect("item");
     drop(store);
 
     let connection = rusqlite::Connection::open(&db_path).expect("open v13 sqlite");
@@ -270,12 +218,42 @@ fn v12_to_v13_migration_adds_recovery_tables_and_preserves_rows() {
             r#"
 pragma foreign_keys = off;
 drop table turn_inputs;
-drop table turn_checkpoints;
-drop table tool_executions;
 alter table threads add column sandbox_mode text not null default 'workspace-write'
     check(sandbox_mode in ('read-only', 'workspace-write'));
 alter table threads add column approval_policy text not null default 'on-request'
     check(approval_policy in ('on-request', 'never'));
+create table trace_events(
+    event_id text primary key,
+    run_id text not null,
+    session_id text not null default '',
+    payload text not null,
+    span_id text check(span_id is null or length(trim(span_id)) > 0),
+    parent_span_id text check(parent_span_id is null or length(trim(parent_span_id)) > 0),
+    span_kind text
+        check(span_kind in ('task', 'turn', 'prompt_assembly', 'provider_attempt', 'tool_call',
+                            'policy_decision', 'approval_wait', 'sandbox_execution',
+                            'verification', 'final_review') or span_kind is null),
+    span_phase text check(span_phase in ('start', 'end') or span_phase is null),
+    span_status text check(span_status in ('unset', 'ok', 'error', 'cancelled') or span_status is null),
+    duration_ms integer check(duration_ms >= 0 or duration_ms is null),
+    time_to_first_token_ms integer
+        check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),
+    span_projection text check(span_projection is null or json_valid(span_projection)),
+    metric_samples text not null default '[]'
+        check(json_valid(metric_samples) and json_type(metric_samples) = 'array'),
+    check((span_id is null and parent_span_id is null and span_kind is null
+           and span_phase is null and span_status is null and duration_ms is null
+           and time_to_first_token_ms is null and span_projection is null)
+          or (span_id is not null and span_kind is not null and span_phase is not null)),
+    check((span_phase = 'start' and span_status is null and duration_ms is null
+           and time_to_first_token_ms is null and metric_samples = '[]')
+          or (span_phase = 'end' and span_status is not null and duration_ms is not null)
+          or span_phase is null),
+    check(time_to_first_token_ms is null or span_kind = 'provider_attempt'),
+    check(time_to_first_token_ms is null or duration_ms is null
+          or time_to_first_token_ms <= duration_ms),
+    check(parent_span_id is null or parent_span_id <> span_id)
+);
 create table approvals(
     request_id text primary key,
     thread_id text not null,
@@ -295,6 +273,17 @@ create table approval_decisions(
     payload text not null,
     foreign key(request_id) references approvals(request_id)
 );
+create table artifact_refs(
+    artifact_id text primary key,
+    run_id text not null,
+    item_id text,
+    kind text not null,
+    uri text not null,
+    content_digest text not null,
+    summary text not null,
+    metadata text not null,
+    redacted integer not null check(redacted in (0, 1))
+);
 create table pending_tool_calls(
     request_id text primary key,
     thread_id text not null,
@@ -307,11 +296,76 @@ create table pending_tool_calls(
     foreign key(thread_id) references threads(thread_id),
     foreign key(turn_id) references turns(turn_id)
 );
+insert into trace_events(event_id, run_id, session_id, payload)
+values('v12_legacy_trace', 'v12_thread', 'v12_turn', '{"safe":"legacy trace"}');
 create unique index approval_decisions_request_unique on approval_decisions(request_id);
+create index trace_run_lookup on trace_events(run_id, event_id);
 create index approvals_pending_lookup on approvals(decision_outcome, request_id);
 create index approvals_thread_lookup on approvals(thread_id, decision_outcome, request_id);
 create index approvals_turn_lookup on approvals(turn_id, decision_outcome, request_id);
 create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
+create unique index trace_span_phase_unique
+    on trace_events(run_id, span_id, span_phase)
+    where span_id is not null;
+create index trace_span_parent_lookup
+    on trace_events(run_id, parent_span_id, span_id)
+    where parent_span_id is not null;
+create trigger trace_span_lifecycle_insert
+before insert on trace_events
+when json_extract(new.payload, '$.span_id') is not null
+ and (
+     (json_extract(new.payload, '$.parent_span_id') is not null and not exists(
+         select 1 from trace_events
+         where run_id = new.run_id
+           and span_id = json_extract(new.payload, '$.parent_span_id')
+     ))
+     or (json_extract(new.payload, '$.span_phase') = 'start' and exists(
+         select 1 from trace_events
+         where run_id = new.run_id
+           and span_id = json_extract(new.payload, '$.span_id')
+           and span_phase = 'start'
+     ))
+     or (json_extract(new.payload, '$.span_phase') = 'end' and (
+         not exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'start'
+         )
+         or exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'end'
+         )
+         or exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'start'
+               and (parent_span_id is not json_extract(new.payload, '$.parent_span_id')
+                    or span_kind is not json_extract(new.payload, '$.span_kind'))
+         )
+     ))
+ )
+begin
+    select raise(abort, 'invalid trace span lifecycle');
+end;
+create trigger trace_span_projection_insert
+after insert on trace_events
+begin
+    update trace_events
+       set span_id = json_extract(new.payload, '$.span_id'),
+           parent_span_id = json_extract(new.payload, '$.parent_span_id'),
+           span_kind = json_extract(new.payload, '$.span_kind'),
+           span_phase = json_extract(new.payload, '$.span_phase'),
+           span_status = json_extract(new.payload, '$.span_status'),
+           duration_ms = json_extract(new.payload, '$.duration_ms'),
+           time_to_first_token_ms = json_extract(new.payload, '$.time_to_first_token_ms'),
+           span_projection = json_extract(new.payload, '$.span_projection'),
+           metric_samples = coalesce(json_extract(new.payload, '$.metric_samples'), '[]')
+     where event_id = new.event_id;
+end;
 create table turns_v12(
     turn_id text primary key,
     thread_id text not null,
@@ -353,37 +407,66 @@ pragma foreign_keys = on;
         migrated.get_turn(&turn.turn_id).expect("turn").status,
         TurnStatus::Running
     );
-    assert!(
-        migrated
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .iter()
-            .any(|event| event.event_id == trace.event_id)
-    );
     let connection = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
-    for table in ["turn_checkpoints", "tool_executions"] {
+    let item_payload: String = connection
+        .query_row(
+            "select payload from items where turn_id = ?1",
+            [&turn.turn_id],
+            |row| row.get(0),
+        )
+        .expect("preserved item");
+    assert!(item_payload.contains("preserved"));
+    for table in [
+        "trace_events",
+        "artifact_refs",
+        "approvals",
+        "approval_decisions",
+        "pending_tool_calls",
+        "turn_checkpoints",
+        "tool_executions",
+    ] {
         let exists: bool = connection
             .query_row(
                 "select exists(select 1 from sqlite_schema where type = 'table' and name = ?1)",
                 [table],
                 |row| row.get(0),
             )
-            .expect("recovery table lookup");
-        assert!(exists, "missing migrated table {table}");
+            .expect("legacy table lookup");
+        assert!(!exists, "legacy table {table} must be dropped by migration");
     }
+    let turn_inputs: bool = connection
+        .query_row(
+            "select exists(select 1 from sqlite_schema where type = 'table' and name = 'turn_inputs')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("turn_inputs lookup");
+    assert!(turn_inputs, "turn_inputs must exist in migrated schema");
+    let has_pause_requested: bool = connection
+        .query_row(
+            "select exists(
+                 select 1 from pragma_table_xinfo('turns')
+                 where name = 'pause_requested'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pause_requested lookup");
+    assert!(
+        has_pause_requested,
+        "migrated turns must keep pause_requested"
+    );
 }
 
 #[test]
 fn turn_input_is_idempotent_ordered_at_boundaries() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "original"}]),
-            "app_server",
-            "turn started",
         )
         .expect("started turn");
     let first = serde_json::json!([{"type": "text", "text": "first"}]);
@@ -452,13 +535,11 @@ fn accepted_turn_input_blocks_terminal_commit_and_stays_idempotent() {
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "original"}]),
-            "app_server",
-            "turn started",
         )
         .expect("started turn");
     let input = serde_json::json!([{"type": "text", "text": "accepted"}]);
@@ -478,13 +559,6 @@ fn accepted_turn_input_blocks_terminal_commit_and_stays_idempotent() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
                 assistant_delta: Some("done"),
-                trace: &TraceEvent::for_turn(
-                    "trace_terminal_after_accepted_input",
-                    &thread.thread_id,
-                    &turn.turn_id,
-                    "agent_loop",
-                    "terminal result",
-                ),
             },
         ),
         Err(StoreError::TurnBoundaryPending { .. })
@@ -554,13 +628,11 @@ fn accepted_turn_input_blocks_terminal_commit_and_stays_idempotent() {
 fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "original"}]),
-            "app_server",
-            "turn started",
         )
         .expect("started turn");
     store
@@ -571,13 +643,6 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
             &serde_json::json!([{"type": "text", "text": "more work"}]),
         )
         .expect("follow-up");
-    let terminal = TraceEvent::for_turn(
-        "trace_terminal_with_pending_input",
-        &thread.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "terminal result",
-    );
     assert!(matches!(
         store.commit_turn_outcome(
             &turn.turn_id,
@@ -586,7 +651,6 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
                 agent_loop_status: "failed",
                 assistant_item_id: None,
                 assistant_delta: None,
-                trace: &terminal,
             },
         ),
         Err(StoreError::TurnBoundaryPending { .. })
@@ -619,144 +683,8 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
             .is_ok()
     );
 }
-fn create_v10_database(path: &std::path::Path) {
-    let connection = rusqlite::Connection::open(path).expect("open v10 sqlite");
-    connection
-        .execute_batch(
-            r#"
-create table schema_meta(
-schema_version integer not null check(schema_version = 10)
-);
-create table schema_migrations(
-    migration_id text primary key,
-    applied_at text not null default current_timestamp
-);
-create table threads(
-    thread_id text primary key,
-    model text,
-    cwd text,
-    status text not null default 'active'
-        check(status in ('active', 'archived')),
-    sandbox_mode text not null default 'workspace-write'
-        check(sandbox_mode in ('read-only', 'workspace-write')),
-    approval_policy text not null default 'on-request'
-        check(approval_policy in ('on-request', 'never'))
-);
-create table turns(
-    turn_id text primary key,
-    thread_id text not null,
-    turn_sequence integer not null check(turn_sequence > 0),
-    status text not null
-        check(status in ('running', 'completed', 'blocked', 'failed', 'interrupted')),
-    agent_loop_status text not null,
-    foreign key(thread_id) references threads(thread_id)
-);
-create table items(
-    item_id text primary key,
-    turn_id text not null,
-    item_sequence integer not null check(item_sequence > 0),
-    kind text not null
-        check(kind in ('userMessage', 'agentMessage', 'reasoning', 'commandExecution', 'fileChange')),
-    payload text not null,
-    status text not null check(status in ('started', 'completed')),
-    redacted integer not null check(redacted in (0, 1)),
-    foreign key(turn_id) references turns(turn_id)
-);
-create table trace_events(
-    event_id text primary key,
-    run_id text not null,
-    session_id text not null default '',
-    payload text not null
-);
-create table approvals(
-    request_id text primary key,
-    thread_id text not null,
-    turn_id text not null,
-    payload text not null,
-    decision_outcome text check(decision_outcome in ('allow', 'deny') or decision_outcome is null),
-    decision_reason text,
-    foreign key(thread_id) references threads(thread_id),
-    foreign key(turn_id) references turns(turn_id)
-);
-create table approval_decisions(
-    decision_id text primary key,
-    request_id text not null,
-    outcome text not null check(outcome in ('allow', 'deny')),
-    reason text not null,
-    payload text not null,
-    foreign key(request_id) references approvals(request_id)
-);
-create table artifact_refs(
-    artifact_id text primary key,
-    run_id text not null,
-    item_id text,
-    kind text not null,
-    uri text not null,
-    content_digest text not null,
-    summary text not null,
-    metadata text not null,
-    redacted integer not null check(redacted in (0, 1))
-);
-create table pending_tool_calls(
-    request_id text primary key,
-    thread_id text not null,
-    turn_id text not null,
-    tool_call_id text not null,
-    payload text not null,
-    execution_state text not null default 'pending'
-        check(execution_state in ('pending', 'executing')),
-    foreign key(request_id) references approvals(request_id),
-    foreign key(thread_id) references threads(thread_id),
-    foreign key(turn_id) references turns(turn_id)
-);
-create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
-create unique index items_turn_sequence_unique on items(turn_id, item_sequence);
-create index turns_history_lookup on turns(thread_id, status, turn_sequence);
-create index items_history_lookup on items(turn_id, status, kind, item_sequence);
-create unique index approval_decisions_request_unique on approval_decisions(request_id);
-create index trace_run_lookup on trace_events(run_id, event_id);
-create index approvals_pending_lookup on approvals(decision_outcome, request_id);
-create index approvals_thread_lookup on approvals(thread_id, decision_outcome, request_id);
-create index approvals_turn_lookup on approvals(turn_id, decision_outcome, request_id);
-create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
-insert into schema_meta(schema_version) values(10);
-insert into schema_migrations(migration_id) values
-    ('0001_initial_session_store'),
-    ('0002_durable_ledger'),
-    ('0004_pending_tool_calls'),
-    ('0005_store_hardening'),
-    ('0006_conversation_history'),
-    ('0007_pending_execution_state'),
-    ('0008_approval_execution_recovery'),
-    ('0009_thread_policy_snapshot'),
-    ('0010_stable_enum_text');
-insert into threads(thread_id, model, cwd, status, sandbox_mode, approval_policy)
-values('thread_v10', null, null, 'active', 'workspace-write', 'on-request');
-insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status)
-values('turn_v10', 'thread_v10', 1, 'running', 'running');
-"#,
-        )
-        .expect("create v10 database");
-}
-
-fn create_v11_database(path: &std::path::Path) {
-    create_v10_database(path);
-    let connection = rusqlite::Connection::open(path).expect("open v11 sqlite");
-    connection
-        .execute_batch(
-            "create table schema_meta_v11(
-                 schema_version integer not null check(schema_version = 11)
-             );
-             insert into schema_meta_v11(schema_version) values(11);
-             drop table schema_meta;
-             alter table schema_meta_v11 rename to schema_meta;
-             insert into schema_migrations(migration_id)
-             values('0011_typed_permission_resources');",
-        )
-        .expect("upgrade v10 schema metadata to v11");
-}
 #[test]
-fn every_supported_legacy_schema_migrates_with_trace_data() {
+fn every_supported_legacy_schema_migrates() {
     for schema_version in 1..=9 {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("sessions.sqlite3");
@@ -799,12 +727,22 @@ fn every_supported_legacy_schema_migrates_with_trace_data() {
             )
             .expect("item kind");
         assert_eq!(item_kind, ItemKind::UserMessage.as_storage_text());
-        let repaired = store
-            .show_trace("trace_legacy_turn_repair")
-            .expect("repaired turn trace");
-        assert_eq!(repaired.run_id, "thread_legacy");
-        assert_eq!(repaired.session_id, "turn_legacy");
-        assert_eq!(repaired.task_id.as_deref(), Some("turn_legacy"));
+        for table in [
+            "trace_events",
+            "approvals",
+            "approval_decisions",
+            "artifact_refs",
+            "pending_tool_calls",
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("legacy table lookup");
+            assert!(!exists, "legacy table {table} must be dropped by migration");
+        }
         assert!(!connection
             .query_row(
                 "select exists(select 1 from sqlite_master where type = 'table' and name = 'active_sidecar_runs')",
@@ -944,7 +882,8 @@ fn invalid_legacy_enum_is_rejected_without_mutating_any_supported_version() {
                 "update threads set status = ?1 where thread_id = 'thread_legacy'",
                 [r#""unknown""#],
             )
-            .expect("inject unknown enum");
+            .expect("inject
+ unknown enum");
         drop(connection);
         let before_invalid = sqlite_snapshot(&db_path);
 
@@ -995,88 +934,6 @@ fn unexpected_legacy_object_is_rejected_without_mutation() {
         .expect("unexpected table row");
     assert_eq!(value, "must survive rollback");
 }
-
-// 验证现行 v11 每次 open 都拒绝 trace 列与 payload 的身份分裂。
-#[test]
-fn v11_trace_column_payload_mismatch_fails_closed_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let trace = TraceEvent {
-        task_id: Some(turn.turn_id.clone()),
-        ..TraceEvent::for_turn(
-            "trace_v11_column_mismatch",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "test",
-            "trace",
-        )
-    };
-    store.append_trace(&trace).expect("trace");
-    drop(store);
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "update trace_events set session_id = 'wrong_turn'
-             where event_id = 'trace_v11_column_mismatch'",
-            [],
-        )
-        .expect("tamper trace column");
-    drop(connection);
-    let before = sqlite_snapshot(&db_path);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message))
-            if message.contains("session_id column does not match payload")
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-}
-
-// trusted reopen 只验证结构；实际 trace 行仍必须在读取边界拒绝列/payload 分裂。
-#[test]
-fn trusted_reopen_defers_trace_row_validation_until_read() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let trace = TraceEvent {
-        task_id: Some(turn.turn_id.clone()),
-        ..TraceEvent::for_turn(
-            "trace_trusted_reopen",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "test",
-            "trace",
-        )
-    };
-    store.append_trace(&trace).expect("trace");
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "update trace_events set session_id = 'wrong_turn'
-             where event_id = 'trace_trusted_reopen'",
-            [],
-        )
-        .expect("tamper trace column");
-    drop(connection);
-
-    let reopened = store.trusted_reopen().expect("trusted reopen");
-    assert!(matches!(
-        reopened.show_trace("trace_trusted_reopen"),
-        Err(StoreError::InvalidState(message))
-            if message.contains("columns do not match payload")
-    ));
-}
-
 // trusted reopen 仍拒绝已初始化数据库的 marker/结构分裂。
 #[test]
 fn trusted_reopen_validates_v11_markers_before_serving_rows() {
@@ -1197,76 +1054,6 @@ fn store_open_rejects_parent_reparse_point_when_creation_is_available() {
         Err(StoreError::InvalidState(message)) if message.contains("without following links")
     ));
 }
-
-// trusted reopen 不扫描 checkpoint 全表，但每个读取事务仍 fail closed。
-#[test]
-fn trusted_reopen_defers_checkpoint_validation_until_use() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    store
-        .save_turn_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &serde_json::json!({"version": 1, "state": "safe-boundary"}),
-            1,
-        )
-        .expect("checkpoint");
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "update turn_checkpoints set payload = '{\"version\":99,\"state\":\"tampered\"}' where turn_id = ?1",
-            [&turn.turn_id],
-        )
-        .expect("tamper checkpoint payload");
-    drop(connection);
-
-    let trusted = store.trusted_reopen().expect("trusted reopen");
-    assert_eq!(
-        trusted
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint read after reopen"),
-        Some(serde_json::json!({"version": 99, "state": "tampered"}))
-    );
-}
-
-// 验证历史 turn-shaped trace 不能在关联不唯一时被猜测修复。
-#[test]
-fn ambiguous_legacy_turn_trace_is_rejected_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    create_legacy_enum_database(&db_path, 9);
-    remove_legacy_pending_approval(&db_path, 9);
-    let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
-    let payload = legacy_trace_payload(
-        "trace_legacy_turn_repair",
-        "thread_legacy",
-        "turn_pending",
-        Some("turn_legacy"),
-    );
-    connection
-        .execute(
-            "update trace_events set session_id = ?1, payload = ?2
-             where event_id = 'trace_legacy_turn_repair'",
-            rusqlite::params!["turn_pending", payload],
-        )
-        .expect("inject ambiguous trace");
-    drop(connection);
-    let before = sqlite_snapshot(&db_path);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message)) if message.contains("ambiguous turn binding")
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-    assert!(!has_v11_temporary_tables(&db_path));
-}
-
 // 验证已标记 v11 库缺少 migration marker 时不能被认领。
 #[test]
 fn v11_missing_migration_marker_fails_closed() {
@@ -1358,7 +1145,7 @@ fn v11_structure_rejects_weak_check_index_and_trigger_without_mutation() {
     }
 }
 
-// 验证已经标记完成的 schema 也不会接受未知或伪造的持久化 policy 值。
+// 验证迁移重建的 schema 保留外键绑定与状态检查。
 #[test]
 fn migrated_schema_rebuilds_foreign_key_tables() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1391,9 +1178,9 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
         .is_err());
 }
 
-// 验证新 schema 拒绝孤儿 turn 与 artifact。
+// 验证新 schema 拒绝孤儿 thread/turn。
 #[test]
-fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
+fn missing_thread_and_turn_fail_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
 
@@ -1405,17 +1192,9 @@ fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
         store.append_item("missing_turn", ItemKind::UserMessage, serde_json::json!({})),
         Err(StoreError::NotFound(message)) if message == "turn missing_turn"
     ));
-    assert!(matches!(
-        store.list_trace("missing_run"),
-        Err(StoreError::NotFound(message)) if message == "trace run missing_run"
-    ));
-    assert!(matches!(
-        store.get_artifact_ref("missing_artifact"),
-        Err(StoreError::NotFound(message)) if message == "artifact missing_artifact"
-    ));
 }
 
-// 验证 pending tool call 的 request_id 必须绑定 approval。
+// 验证终态 turn 状态与 agent_loop_status 不可被后续更新覆盖。
 #[test]
 fn terminal_turn_status_is_not_overwritten_by_later_updates() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1448,7 +1227,6 @@ fn terminal_turn_status_is_not_overwritten_by_later_updates() {
         "completed"
     );
 }
-
 // 验证取消请求与晚到 completion 之间保持原子边界。
 #[test]
 fn cancellation_request_is_atomic_and_rejects_late_completion() {
@@ -1458,16 +1236,9 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("turn");
-    let trace = TraceEvent::for_turn(
-        "trace_cancel_requested",
-        &thread.thread_id,
-        &turn.turn_id,
-        "app_server",
-        "turn interrupt requested",
-    );
 
     let cancel_requested = store
-        .request_turn_cancellation(&turn.turn_id, &trace)
+        .request_turn_cancellation(&turn.turn_id)
         .expect("request cancellation");
 
     assert_eq!(cancel_requested.status, TurnStatus::Running);
@@ -1480,13 +1251,6 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
                 assistant_delta: Some("too late"),
-                trace: &TraceEvent::for_turn(
-                    "trace_too_late",
-                    &thread.thread_id,
-                    &turn.turn_id,
-                    "agent_loop",
-                    "late completion",
-                ),
             },
         ),
         Err(StoreError::InvalidState(message))
@@ -1500,31 +1264,13 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "cancelled",
                 assistant_item_id: None,
                 assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_cancelled",
-                    &thread.thread_id,
-                    &turn.turn_id,
-                    "agent_loop",
-                    "turn cancelled",
-                ),
             },
         )
         .expect("finalize cancellation");
     assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
-    let trace_ids = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .filter(|trace| {
-            !(trace.span_kind == Some(TraceSpanKind::Turn)
-                && trace.span_phase == Some(TraceSpanPhase::Start))
-        })
-        .map(|trace| trace.event_id)
-        .collect::<Vec<_>>();
-    assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
 }
 
-// 验证 monitor 基础设施故障优先于 cancel_requested，并原子清理 executing checkpoint。
+// 验证 monitor 基础设施故障优先于 cancel_requested。
 #[test]
 fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
     for (status, agent_loop_status) in [
@@ -1539,16 +1285,7 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
             .create_turn(&thread.thread_id, "running")
             .expect("turn");
         store
-            .request_turn_cancellation(
-                &turn.turn_id,
-                &TraceEvent::for_turn(
-                    format!("trace_infrastructure_authority_{}", agent_loop_status),
-                    thread.thread_id.clone(),
-                    turn.turn_id.clone(),
-                    "test",
-                    "cancel requested",
-                ),
-            )
+            .request_turn_cancellation(&turn.turn_id)
             .expect("cancel request");
 
         let assistant_item_id = SessionStore::allocate_assistant_item_id();
@@ -1559,16 +1296,6 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
                 agent_loop_status,
                 assistant_item_id: is_completed.then_some(&assistant_item_id),
                 assistant_delta: is_completed.then_some("late result"),
-                trace: &TraceEvent::for_turn(
-                    format!(
-                        "trace_infrastructure_authority_result_{}",
-                        agent_loop_status
-                    ),
-                    thread.thread_id.clone(),
-                    turn.turn_id.clone(),
-                    "test",
-                    "infrastructure result",
-                ),
             },
             TurnOutcomeAuthority::InfrastructureFailure,
         );
@@ -1583,7 +1310,7 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
     }
 }
 
-// 验证 approval 决定只写入一次且保留在 decision history。
+// 验证 paused/suspended 无 owner turn 被 interrupt 时当场终态化。
 #[test]
 fn paused_and_suspended_interrupt_terminalizes_without_restart() {
     for (status, agent_loop_status) in [
@@ -1598,25 +1325,10 @@ fn paused_and_suspended_interrupt_terminalizes_without_restart() {
             .create_turn(&thread.thread_id, "running")
             .expect("turn");
         store
-            .save_turn_checkpoint(
-                &turn.turn_id,
-                &thread.thread_id,
-                &serde_json::json!({"checkpoint_version": 1, "boundary": "initial"}),
-                1,
-            )
-            .expect("checkpoint");
-        store
             .update_turn_state(&turn.turn_id, status, agent_loop_status)
             .expect("ownerless state");
-        let trace = TraceEvent::for_turn(
-            "trace_interrupt_ownerless",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "app_server",
-            "turn interrupt requested",
-        );
         let interrupted = store
-            .request_turn_cancellation(&turn.turn_id, &trace)
+            .request_turn_cancellation(&turn.turn_id)
             .expect("interrupt");
         assert_eq!(interrupted.status, TurnStatus::Interrupted);
         assert_eq!(interrupted.agent_loop_status, "cancelled");
@@ -1624,749 +1336,20 @@ fn paused_and_suspended_interrupt_terminalizes_without_restart() {
         let persisted = store.get_turn(&turn.turn_id).expect("turn");
         assert_eq!(persisted.status, TurnStatus::Interrupted);
         assert_eq!(persisted.agent_loop_status, "cancelled");
-        // checkpoint 保留为审计证据。
-        assert!(
-            store
-                .get_turn_checkpoint(&turn.turn_id)
-                .expect("checkpoint lookup")
-                .is_some()
-        );
-        let recovery_trace = store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .into_iter()
-            .find(|trace| trace.event_id == "trace_interrupt_ownerless")
-            .expect("interrupt trace");
-        assert_eq!(recovery_trace.payload["tool_replayed"], false);
-        assert_eq!(
-            recovery_trace.payload["recovery_reason"],
-            "execution_owner_lost"
-        );
-        assert_eq!(recovery_trace.payload["previous_status"], agent_loop_status);
     }
 }
-
-// B2：启动恢复将可归属不一致的 ownerless turn 终态化（Interrupted/interrupted），
-// 保留审计证据、清理未解决 pending approval，且不阻断健康 sibling。
+// 验证 delete_thread 级联删除绑定行（turn_inputs/items/turns/threads）。
 #[test]
-fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("store");
-
-    // 场景 1：suspended 缺 checkpoint（附 unknown execution 验证保留）。
-    let thread_1 = store.create_thread(None, None).expect("thread 1");
-    let turn_1 = store
-        .create_turn(&thread_1.thread_id, "running")
-        .expect("turn 1");
-    store
-        .update_turn_state(&turn_1.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend 1");
-    let execution_1 = format!("exec:unknown:{}", turn_1.turn_id);
-    let connection = rusqlite::Connection::open(&db_path).expect("sqlite");
-    connection
-        .execute(
-            "insert into tool_executions(
-                execution_id, thread_id, turn_id, tool_call_id, execution_state, payload
-             ) values(?1, ?2, ?3, ?4, 'unknown', ?5)",
-            rusqlite::params![
-                execution_1,
-                thread_1.thread_id,
-                turn_1.turn_id,
-                "call_1",
-                serde_json::to_string(
-                    &serde_json::json!({"kind": "tool_call", "tool_name": "read"})
-                )
-                .expect("execution payload")
-            ],
-        )
-        .expect("insert unknown execution");
-    drop(connection);
-
-    // 场景 2：paused 缺 checkpoint。
-    let thread_2 = store.create_thread(None, None).expect("thread 2");
-    let turn_2 = store
-        .create_turn(&thread_2.thread_id, "running")
-        .expect("turn 2");
-    store
-        .update_turn_state(&turn_2.turn_id, TurnStatus::Paused, "paused")
-        .expect("pause 2");
-
-    // 健康 sibling：suspended 有 checkpoint（正常可恢复）。
-    let thread_5 = store.create_thread(None, None).expect("thread 5");
-    let turn_5 = store
-        .create_turn(&thread_5.thread_id, "running")
-        .expect("turn 5");
-    store
-        .save_turn_checkpoint(
-            &turn_5.turn_id,
-            &thread_5.thread_id,
-            &serde_json::json!({"checkpoint_version": 1, "boundary": "initial"}),
-            1,
-        )
-        .expect("checkpoint 5");
-    store
-        .update_turn_state(&turn_5.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend 5");
-
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("recover inconsistent ownerless turns");
-
-    // 两个坏 turn 全部收敛为 Interrupted/interrupted。
-    for turn in [&turn_1, &turn_2] {
-        let recovered = reopened.get_turn(&turn.turn_id).expect("recovered turn");
-        assert_eq!(recovered.status, TurnStatus::Interrupted);
-        assert_eq!(recovered.agent_loop_status, "interrupted");
-    }
-    // unknown execution 保留为审计证据（不删除、不重放）。
-    assert_eq!(
-        reopened
-            .get_tool_execution(&execution_1)
-            .expect("execution lookup")
-            .expect("unknown execution")
-            .state,
-        ToolExecutionState::Unknown
-    );
-    // typed trace 记录收敛原因与 previous 状态。
-    let recovery_trace = reopened
-        .list_trace(&thread_1.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|trace| {
-            trace
-                .payload
-                .get("recovery_reason")
-                .and_then(|value| value.as_str())
-                == Some("inconsistent_turn_state")
-        })
-        .expect("recovery trace");
-    assert_eq!(recovery_trace.payload["tool_replayed"], false);
-    assert_eq!(recovery_trace.payload["previous_status"], "suspended");
-    assert_eq!(
-        recovery_trace.payload["previous_agent_loop_status"],
-        "suspended"
-    );
-    // 健康 sibling 不受影响。
-    let healthy_5 = reopened.get_turn(&turn_5.turn_id).expect("turn 5");
-    assert_eq!(healthy_5.status, TurnStatus::Suspended);
-    assert_eq!(healthy_5.agent_loop_status, "suspended");
-}
-
-#[test]
-fn parallel_tool_result_checkpoint_clears_the_complete_batch_before_owner_recovery() {
+fn thread_delete_removes_bound_turn_inputs_items_and_turns() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let pending_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "tool_calls_ready"
-    });
-    let executions = ["call_first", "call_second"].map(|tool_call_id| ToolExecution {
-        execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
-        thread_id: thread.thread_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        tool_call_id: tool_call_id.to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
-    });
-    assert!(
-        store
-            .begin_tool_executions_at_checkpoint(&executions, &pending_checkpoint, 1)
-            .expect("begin parallel read executions")
-    );
-
-    let committed_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "parallel_tool_results_committed",
-        "tool_call_ids": ["call_first", "call_second"]
-    });
-    store
-        .commit_tool_results_checkpoint(
-            &executions
-                .iter()
-                .map(|execution| execution.execution_id.clone())
-                .collect::<Vec<_>>(),
-            &turn.turn_id,
-            &thread.thread_id,
-            &committed_checkpoint,
-            1,
-        )
-        .expect("commit complete parallel result checkpoint");
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("recover owner loss after complete batch");
-    for execution in &executions {
-        assert!(
-            reopened
-                .get_tool_execution(&execution.execution_id)
-                .expect("execution lookup")
-                .is_none(),
-            "a checkpoint containing the complete batch must clear every execution owner"
-        );
-    }
-    let (claimed, checkpoint) = reopened
-        .claim_suspended_turn(&turn.turn_id)
-        .expect("complete batch checkpoint remains resumable");
-    assert_eq!(claimed.status, TurnStatus::Running);
-    assert_eq!(checkpoint, committed_checkpoint);
-}
-
-#[test]
-fn tool_result_checkpoint_rejects_an_incomplete_or_invalid_batch_without_writes() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let pending_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "tool_calls_ready"
-    });
-    let executions = ["call_first", "call_second"].map(|tool_call_id| ToolExecution {
-        execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
-        thread_id: thread.thread_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        tool_call_id: tool_call_id.to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
-    });
-    assert!(
-        store
-            .begin_tool_executions_at_checkpoint(&executions, &pending_checkpoint, 1)
-            .expect("begin parallel read executions")
-    );
-    let committed_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "parallel_tool_results_committed"
-    });
-    let invalid_batches = [
-        vec![executions[0].execution_id.clone()],
-        vec![
-            executions[0].execution_id.clone(),
-            executions[0].execution_id.clone(),
-        ],
-        vec![
-            executions[0].execution_id.clone(),
-            "turn:unknown:tool:call_unknown".to_string(),
-        ],
-    ];
-
-    for invalid_batch in invalid_batches {
-        assert!(matches!(
-            store.commit_tool_results_checkpoint(
-                &invalid_batch,
-                &turn.turn_id,
-                &thread.thread_id,
-                &committed_checkpoint,
-                1,
-            ),
-            Err(StoreError::InvalidState(_))
-        ));
-        assert_eq!(
-            store
-                .get_turn_checkpoint(&turn.turn_id)
-                .expect("checkpoint lookup")
-                .expect("pending checkpoint"),
-            pending_checkpoint
-        );
-        for execution in &executions {
-            assert_eq!(
-                store
-                    .get_tool_execution(&execution.execution_id)
-                    .expect("execution lookup")
-                    .expect("running execution")
-                    .state,
-                ToolExecutionState::Running
-            );
-        }
-    }
-}
-
-#[test]
-fn terminal_turn_rejects_late_tool_execution_begin_without_writes() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let terminal_statuses = [
-        (TurnStatus::Completed, "completed"),
-        (TurnStatus::Failed, "failed"),
-        (TurnStatus::Interrupted, "interrupted"),
-        (TurnStatus::Paused, "paused"),
-        (TurnStatus::Suspended, "suspended"),
-    ];
-
-    for (status, agent_loop_status) in terminal_statuses {
-        let thread = store.create_thread(None, None).expect("thread");
-        let turn = store
-            .create_turn(&thread.thread_id, "running")
-            .expect("turn");
-        store
-            .update_turn_state(&turn.turn_id, status.clone(), agent_loop_status)
-            .expect("terminalize turn");
-        let checkpoint = serde_json::json!({
-            "checkpoint_version": 1,
-            "boundary": "tool_calls_ready"
-        });
-        let execution = ToolExecution {
-            execution_id: format!("turn:{}:tool:late", turn.turn_id),
-            thread_id: thread.thread_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            tool_call_id: "call_late".to_string(),
-            state: ToolExecutionState::Running,
-            payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
-        };
-
-        assert!(matches!(
-            store.begin_tool_executions_at_checkpoint(
-                std::slice::from_ref(&execution),
-                &checkpoint,
-                1,
-            ),
-            Err(StoreError::InvalidState(_))
-        ));
-        assert!(
-            store
-                .get_turn_checkpoint(&turn.turn_id)
-                .expect("checkpoint lookup")
-                .is_none()
-        );
-        assert!(
-            store
-                .get_tool_execution(&execution.execution_id)
-                .expect("execution lookup")
-                .is_none()
-        );
-        assert_eq!(
-            store.get_turn(&turn.turn_id).expect("turn lookup").status,
-            status
-        );
-    }
-}
-
-#[test]
-fn terminal_outcomes_reconcile_running_tool_executions() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let prepare = |tool_call_id: &str| {
-        let (turn, _, _) = store
-            .create_turn_with_input_and_trace(
-                &thread.thread_id,
-                "running",
-                serde_json::json!([{"type": "text", "text": "run"}]),
-                "app_server",
-                "turn started",
-            )
-            .expect("started turn");
-        let checkpoint = serde_json::json!({
-            "checkpoint_version": 1,
-            "boundary": "tool_calls_ready",
-            "pending_tool_calls": [{"tool_call_id": tool_call_id}]
-        });
-        let execution = ToolExecution {
-            execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
-            thread_id: thread.thread_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            tool_call_id: tool_call_id.to_string(),
-            state: ToolExecutionState::Running,
-            payload: serde_json::json!({"kind": "tool_call", "tool_name": "command"}),
-        };
-        assert!(
-            store
-                .begin_tool_executions_at_checkpoint(
-                    std::slice::from_ref(&execution),
-                    &checkpoint,
-                    1,
-                )
-                .expect("running execution")
-        );
-        (turn, execution, checkpoint)
-    };
-
-    let (failed_turn, failed_execution, failed_checkpoint) = prepare("call_failed");
-    let failed = store
-        .commit_turn_outcome(
-            &failed_turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Failed,
-                agent_loop_status: "failed",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_failed_with_execution",
-                    &thread.thread_id,
-                    &failed_turn.turn_id,
-                    "agent_loop",
-                    "tool execution failed",
-                ),
-            },
-        )
-        .expect("failed outcome");
-    assert_eq!(failed.turn.status, TurnStatus::Failed);
-    assert_eq!(
-        store
-            .get_tool_execution(&failed_execution.execution_id)
-            .expect("failed execution lookup")
-            .expect("failed execution")
-            .state,
-        ToolExecutionState::Unknown
-    );
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&failed_turn.turn_id)
-            .expect("failed checkpoint lookup")
-            .expect("failed checkpoint"),
-        failed_checkpoint
-    );
-
-    let (interrupted_turn, interrupted_execution, interrupted_checkpoint) =
-        prepare("call_cancelled");
-    let interrupted = store
-        .commit_turn_outcome(
-            &interrupted_turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Interrupted,
-                agent_loop_status: "cancelled",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_interrupted_with_execution",
-                    &thread.thread_id,
-                    &interrupted_turn.turn_id,
-                    "agent_loop",
-                    "tool execution cancelled",
-                ),
-            },
-        )
-        .expect("interrupted outcome");
-    assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
-    assert_eq!(
-        store
-            .get_tool_execution(&interrupted_execution.execution_id)
-            .expect("interrupted execution lookup")
-            .expect("interrupted execution")
-            .state,
-        ToolExecutionState::Unknown
-    );
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&interrupted_turn.turn_id)
-            .expect("interrupted checkpoint lookup")
-            .expect("interrupted checkpoint"),
-        interrupted_checkpoint
-    );
-
-    let (completed_turn, completed_execution, completed_checkpoint) = prepare("call_completed");
-    let assistant_item_id = SessionStore::allocate_assistant_item_id();
-    assert!(matches!(
-        store.commit_turn_outcome(
-            &completed_turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Completed,
-                agent_loop_status: "completed",
-                assistant_item_id: Some(&assistant_item_id),
-                assistant_delta: Some("done"),
-                trace: &TraceEvent::for_turn(
-                    "trace_completed_with_execution",
-                    &thread.thread_id,
-                    &completed_turn.turn_id,
-                    "agent_loop",
-                    "completion attempted",
-                ),
-            },
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "completed turn outcome cannot commit with running tool execution"
-    ));
-    assert_eq!(
-        store
-            .get_turn(&completed_turn.turn_id)
-            .expect("completed turn lookup")
-            .status,
-        TurnStatus::Running
-    );
-    assert_eq!(
-        store
-            .get_tool_execution(&completed_execution.execution_id)
-            .expect("completed execution lookup")
-            .expect("completed execution")
-            .state,
-        ToolExecutionState::Running
-    );
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&completed_turn.turn_id)
-            .expect("completed checkpoint lookup")
-            .expect("completed checkpoint"),
-        completed_checkpoint
-    );
-}
-
-#[test]
-fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let initial_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "initial"
-    });
-    store
-        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &initial_checkpoint, 1)
-        .expect("initial checkpoint");
-    let execution_id = format!("turn:{}:tool:call_completed", turn.turn_id);
-    let execution = ToolExecution {
-        execution_id: execution_id.clone(),
-        thread_id: thread.thread_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        tool_call_id: "call_completed".to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "tool_call", "tool_name": "update_plan"}),
-    };
-    assert!(
-        store
-            .begin_tool_executions_at_checkpoint(
-                std::slice::from_ref(&execution),
-                &initial_checkpoint,
-                1,
-            )
-            .expect("running execution")
-    );
-    let committed_checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "tool_result_committed"
-    });
-    store
-        .commit_tool_results_checkpoint(
-            std::slice::from_ref(&execution_id),
-            &turn.turn_id,
-            &thread.thread_id,
-            &committed_checkpoint,
-            1,
-        )
-        .expect("atomic tool result checkpoint");
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint")
-            .expect("checkpoint row"),
-        committed_checkpoint
-    );
-    assert!(
-        store
-            .get_tool_execution(&execution_id)
-            .expect("execution lookup")
-            .is_none()
-    );
-
-    // A safe checkpoint with no active or unknown external execution is resumable and recovery is
-    // idempotent; it must not require a synthetic owner sentinel.
-    store
-        .recover_unowned_workspace_executions()
-        .expect("safe checkpoint recovery");
-    let suspended = store.get_turn(&turn.turn_id).expect("suspended turn");
-    assert_eq!(suspended.status, TurnStatus::Suspended);
-    assert_eq!(suspended.agent_loop_status, "suspended");
-    let (claimed, claimed_checkpoint) = store
-        .claim_suspended_turn(&turn.turn_id)
-        .expect("safe resume claim");
-    assert_eq!(claimed.status, TurnStatus::Running);
-    assert_eq!(claimed_checkpoint, committed_checkpoint);
-    let suspended_after_failure = store
-        .suspend_claimed_turn_after_failure(&turn.turn_id)
-        .expect("release failed resume claim");
-    assert_eq!(suspended_after_failure.status, TurnStatus::Suspended);
-    let (reclaimed, reclaimed_checkpoint) = store
-        .claim_suspended_turn(&turn.turn_id)
-        .expect("retry released resume claim");
-    assert_eq!(reclaimed.status, TurnStatus::Running);
-    assert_eq!(reclaimed_checkpoint, committed_checkpoint);
-
-    // An owner lost while a real tool is in flight remains terminally Unknown and cannot be
-    // retried by an explicit resume.
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Failed, "failed")
-        .expect("finish first turn");
-    let unknown_turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("unknown turn");
-    store
-        .save_turn_checkpoint(
-            &unknown_turn.turn_id,
-            &thread.thread_id,
-            &initial_checkpoint,
-            1,
-        )
-        .expect("unknown checkpoint");
-    let unknown_execution_id = format!("turn:{}:tool:call_unknown", unknown_turn.turn_id);
-    let unknown_execution = ToolExecution {
-        execution_id: unknown_execution_id.clone(),
-        thread_id: thread.thread_id.clone(),
-        turn_id: unknown_turn.turn_id.clone(),
-        tool_call_id: "call_unknown".to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
-    };
-    assert!(
-        store
-            .begin_tool_executions_at_checkpoint(
-                std::slice::from_ref(&unknown_execution),
-                &initial_checkpoint,
-                1,
-            )
-            .expect("unknown running execution")
-    );
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("unknown execution recovery");
-    assert_eq!(
-        reopened
-            .get_tool_execution(&unknown_execution_id)
-            .expect("unknown lookup")
-            .expect("unknown execution")
-            .state,
-        ToolExecutionState::Unknown
-    );
-    assert!(matches!(
-        reopened.claim_suspended_turn(&unknown_turn.turn_id),
-        Err(StoreError::InvalidState(message))
-            if message == "turn has unknown tool execution and cannot be resumed"
-    ));
-}
-
-#[test]
-fn turn_checkpoint_provider_reasoning_payload_survives_store_reopen_and_resume() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let checkpoint = serde_json::json!({
-        "checkpoint_version": 5,
-        "thread_id": thread.thread_id,
-        "turn_id": turn.turn_id,
-        "provider_reasoning_history": [{
-            "kind": "responses",
-            "provider_name": "deepseek",
-            "model_name": "deepseek-reasoner",
-            "reasoning_effort": "high",
-            "tool_call_ids": ["call_1"],
-            "item": {
-                "type": "reasoning",
-                "id": "rs_opaque",
-                "encrypted_content": "opaque-provider-state"
-            }
-        }]
-    });
-    store
-        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 5)
-        .expect("save checkpoint");
-    drop(store);
-
-    // Reopening the SQLite store models a process restart. The payload remains opaque to Store,
-    // but its exact bytes must be available to the typed Agent checkpoint decoder on resume.
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    assert_eq!(
-        reopened
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint lookup")
-            .expect("checkpoint row"),
-        checkpoint
-    );
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("suspend running turn after owner loss");
-    let (_claimed, resumed_checkpoint) = reopened
-        .claim_suspended_turn(&turn.turn_id)
-        .expect("claim resumable turn");
-    assert_eq!(resumed_checkpoint, checkpoint);
-}
-
-// 两个独立连接并发恢复同一安全 checkpoint 时，Store CAS 只能交给一个 owner。
-#[test]
-fn suspended_turn_claim_allows_only_one_owner() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "safe"
-    });
-    store
-        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 1)
-        .expect("checkpoint");
-    store
-        .recover_unowned_workspace_executions()
-        .expect("suspend turn");
-    assert_eq!(
-        store.get_turn(&turn.turn_id).expect("suspended").status,
-        TurnStatus::Suspended
-    );
-    drop(store);
-
-    let barrier = Arc::new(Barrier::new(2));
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let path = db_path.clone();
-        let turn_id = turn.turn_id.clone();
-        let barrier = Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            let store = SessionStore::open(path).expect("open concurrent store");
-            barrier.wait();
-            store.claim_suspended_turn(&turn_id)
-        }));
-    }
-
-    let outcomes = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("claim thread"))
-        .collect::<Vec<_>>();
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, Err(StoreError::InvalidState(_))))
-            .count(),
-        1
-    );
-}
-
-// 验证旧 handoff 半完成时恢复 pending successor 而不丢失执行上下文。
-#[test]
-fn thread_delete_removes_bound_recovery_rows_and_traces() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, item, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, item) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "delete me"}]),
-            "test",
-            "turn started",
         )
         .expect("turn");
     store
@@ -2377,25 +1360,11 @@ fn thread_delete_removes_bound_recovery_rows_and_traces() {
                 agent_loop_status: "interrupted",
                 assistant_item_id: None,
                 assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_terminal_before_delete",
-                    &thread.thread_id,
-                    &turn.turn_id,
-                    "test",
-                    "interrupted before deletion",
-                ),
             },
         )
         .expect("terminal turn");
-    assert!(
-        store
-            .list_trace(&thread.thread_id)
-            .expect("thread trace")
-            .iter()
-            .any(|event| event.event_id == format!("trace_{}", turn.turn_id))
-    );
 
-    // Populate every recovery table with a real bound row before deletion.
+    // 删除前放入一条真实绑定的 turn_input 行。
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute(
@@ -2404,60 +1373,22 @@ fn thread_delete_removes_bound_recovery_rows_and_traces() {
             rusqlite::params!["input_delete", turn.turn_id, item.item_id],
         )
         .expect("turn input");
-    connection
-        .execute(
-            "insert into tool_executions(execution_id, thread_id, turn_id, tool_call_id, execution_state, payload)
-             values(?1, ?2, ?3, 'call_delete', 'unknown', '{}')",
-            rusqlite::params![
-                "execution_delete",
-                thread.thread_id,
-                turn.turn_id
-            ],
+    let actual: i64 = connection
+        .query_row(
+            "select count(*) from turn_inputs where turn_id = ?1",
+            [&turn.turn_id],
+            |row| row.get(0),
         )
-        .expect("tool execution");
-    connection
-        .execute(
-            "insert into turn_checkpoints(turn_id, thread_id, payload, checkpoint_version)
-             values(?1, ?2, '{\"checkpoint_version\":1}', 1)",
-            rusqlite::params![turn.turn_id, thread.thread_id],
-        )
-        .expect("turn checkpoint");
-    for (table, count) in [
-        ("turn_inputs", 1_i64),
-        ("tool_executions", 1_i64),
-        ("turn_checkpoints", 1_i64),
-    ] {
-        let actual: i64 = connection
-            .query_row(
-                &format!("select count(*) from {table} where turn_id = ?1"),
-                [&turn.turn_id],
-                |row| row.get(0),
-            )
-            .expect("recovery row count");
-        assert_eq!(actual, count, "{table} fixture");
-    }
+        .expect("turn input fixture count");
+    assert_eq!(actual, 1, "turn_inputs fixture");
     drop(connection);
 
     store
         .delete_thread(&thread.thread_id)
         .expect("delete thread");
 
-    assert!(matches!(
-        store.list_trace(&thread.thread_id),
-        Err(StoreError::NotFound(message)) if message == format!("trace run {}", thread.thread_id)
-    ));
-
     let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
-    for table in [
-        "turn_inputs",
-        "tool_executions",
-        "turn_checkpoints",
-        "items",
-        "trace_events",
-        "artifact_refs",
-        "turns",
-        "threads",
-    ] {
+    for table in ["turn_inputs", "items", "turns", "threads"] {
         let count: i64 = connection
             .query_row(&format!("select count(*) from {table}"), [], |row| {
                 row.get(0)
@@ -2465,83 +1396,6 @@ fn thread_delete_removes_bound_recovery_rows_and_traces() {
             .expect("deleted table count");
         assert_eq!(count, 0, "{table} rows remain after thread deletion");
     }
-}
-
-#[test]
-fn malformed_checkpoint_terminalization_marks_unknown_and_never_replays() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "recover safely"}]),
-            "test",
-            "turn started",
-        )
-        .expect("turn");
-    let checkpoint = serde_json::json!({"checkpoint_version": 1, "pending": "opaque"});
-    store
-        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 1)
-        .expect("checkpoint");
-    let execution = ToolExecution {
-        execution_id: format!("turn:{}:tool:call_recovery", turn.turn_id),
-        thread_id: thread.thread_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        tool_call_id: "call_recovery".to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "command"}),
-    };
-    assert!(
-        store
-            .begin_tool_executions_at_checkpoint(std::slice::from_ref(&execution), &checkpoint, 1)
-            .expect("claim execution")
-    );
-
-    let failed = store
-        .terminalize_checkpoint_failure(
-            &thread.thread_id,
-            &turn.turn_id,
-            TurnStatus::Running,
-            "running",
-        )
-        .expect("terminalize malformed checkpoint");
-    assert_eq!(failed.status, TurnStatus::Failed);
-    assert_eq!(failed.agent_loop_status, "failed");
-    assert_eq!(
-        store
-            .get_tool_execution(&execution.execution_id)
-            .expect("execution lookup")
-            .expect("execution retained")
-            .state,
-        ToolExecutionState::Unknown
-    );
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint lookup"),
-        Some(checkpoint)
-    );
-    let trace = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
-        .expect("typed checkpoint failure trace");
-    assert_eq!(trace.payload["tool_replayed"], false);
-
-    assert!(matches!(
-        store.terminalize_checkpoint_failure(
-            &thread.thread_id,
-            &turn.turn_id,
-            TurnStatus::Running,
-            "running",
-        ),
-        Err(StoreError::InvalidState(message))
-            if message.contains("owner/status changed")
-    ));
 }
 
 // 读取指定表的外键父表名称，供迁移断言复用。
@@ -2555,21 +1409,15 @@ fn foreign_key_parents(connection: &rusqlite::Connection, table: &str) -> Vec<St
         .collect()
 }
 
-// 验证 turn user input 可供 approval resume 读取。
+// 验证 turn user input 可供 turn/resume 读取。
 #[test]
 fn turn_user_input_can_be_read_for_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
     let payload = serde_json::json!([{"type": "text", "text": "resume this turn"}]);
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "blocked",
-            payload.clone(),
-            "app_server",
-            "turn started",
-        )
+    let (turn, _) = store
+        .create_turn_with_input(&thread.thread_id, "blocked", payload.clone())
         .expect("turn");
 
     assert_eq!(
@@ -2584,71 +1432,19 @@ fn turn_user_input_can_be_read_for_resume() {
     ));
 }
 
-// 验证 turn start 在 trace insert 失败时回滚全部副作用。
+// 验证终态 turn 与 assistant item 在同一事务提交。
 #[test]
-fn transactional_turn_start_rolls_back_when_trace_insert_fails() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "
-            create trigger fail_turn_trace
-            before insert on trace_events
-            when new.payload like '%rollback trace%'
-            begin
-                select raise(abort, 'forced trace failure');
-            end;
-            ",
-        )
-        .expect("install trigger");
-
-    let failed = store.create_turn_with_input_and_trace(
-        &thread.thread_id,
-        "running",
-        serde_json::json!([{"type": "text", "text": "rollback"}]),
-        "test",
-        "rollback trace",
-    );
-
-    assert!(failed.is_err());
-    assert!(store.list_trace("missing_after_rollback").is_err());
-    let successful = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "ok"}]),
-            "test",
-            "turn trace",
-        )
-        .expect("successful turn");
-    assert!(store.get_turn(&successful.0.turn_id).is_ok());
-}
-
-// 验证终态 turn、assistant item 与 trace 在同一事务提交。
-#[test]
-fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
+fn terminal_turn_state_and_assistant_item_commit_atomically() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "user"}]),
-            "test",
-            "turn started",
         )
         .expect("turn");
-    let trace = TraceEvent::for_turn(
-        "trace_terminal_success",
-        &thread.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "terminal result",
-    );
     let assistant_item_id = SessionStore::allocate_assistant_item_id();
 
     let committed = store
@@ -2659,7 +1455,6 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&assistant_item_id),
                 assistant_delta: Some("assistant"),
-                trace: &trace,
             },
         )
         .expect("commit terminal outcome");
@@ -2679,7 +1474,6 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
             .and_then(|item| item.payload["delta"].as_str()),
         Some("assistant")
     );
-    assert_eq!(committed.trace.event_id, "trace_terminal_success");
     let history = store
         .read_thread_history(&thread.thread_id, None, 10)
         .expect("history");
@@ -2713,13 +1507,6 @@ fn terminal_assistant_item_id_and_delta_must_be_paired() {
                     agent_loop_status: "completed",
                     assistant_item_id: assistant_item_id.as_ref(),
                     assistant_delta,
-                    trace: &TraceEvent::for_turn(
-                        format!("trace_pairing_{}", turn.turn_id),
-                        &thread.thread_id,
-                        &turn.turn_id,
-                        "test",
-                        "terminal pairing",
-                    ),
                 },
             )
             .expect_err("unpaired assistant item must fail closed");
@@ -2748,7 +1535,7 @@ fn preallocated_assistant_item_id_cannot_be_reused() {
         .create_turn(&second_thread.thread_id, "running")
         .expect("second turn");
     let item_id = SessionStore::allocate_assistant_item_id();
-    let commit = |turn: &singularity_protocol::Turn, thread_id: &str, trace_id: &str| {
+    let commit = |turn: &singularity_protocol::Turn| {
         store.commit_turn_outcome(
             &turn.turn_id,
             CommitTurnOutcomeParams {
@@ -2756,20 +1543,12 @@ fn preallocated_assistant_item_id_cannot_be_reused() {
                 agent_loop_status: "completed",
                 assistant_item_id: Some(&item_id),
                 assistant_delta: Some("assistant"),
-                trace: &TraceEvent::for_turn(
-                    trace_id,
-                    thread_id,
-                    &turn.turn_id,
-                    "test",
-                    "terminal outcome",
-                ),
             },
         )
     };
 
-    commit(&first_turn, &first_thread.thread_id, "trace_first").expect("first commit");
-    let error = commit(&second_turn, &second_thread.thread_id, "trace_second")
-        .expect_err("duplicate item ID must fail closed");
+    commit(&first_turn).expect("first commit");
+    let error = commit(&second_turn).expect_err("duplicate item ID must fail closed");
 
     assert!(matches!(
         error,
@@ -2783,2577 +1562,6 @@ fn preallocated_assistant_item_id_cannot_be_reused() {
             .status,
         TurnStatus::Running
     );
-}
-
-// 验证终态提交的 trace 失败会回滚状态与 item。
-#[test]
-fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "user"}]),
-            "test",
-            "turn started",
-        )
-        .expect("turn");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "
-            create trigger fail_terminal_trace
-            before insert on trace_events
-            when new.payload like '%forced terminal failure%'
-            begin
-                select raise(abort, 'forced terminal trace failure');
-            end;
-            ",
-        )
-        .expect("install trigger");
-    drop(connection);
-    let trace = TraceEvent::for_turn(
-        "trace_terminal_failure",
-        &thread.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "forced terminal failure",
-    );
-
-    let result = store.commit_turn_outcome(
-        &turn.turn_id,
-        CommitTurnOutcomeParams {
-            status: TurnStatus::Completed,
-            agent_loop_status: "completed",
-            assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
-            assistant_delta: Some("assistant"),
-            trace: &trace,
-        },
-    );
-
-    assert!(result.is_err());
-    assert_eq!(
-        store
-            .get_turn(&turn.turn_id)
-            .expect("turn after rollback")
-            .status,
-        TurnStatus::Running
-    );
-    assert!(
-        store
-            .read_thread_history(&thread.thread_id, None, 10)
-            .expect("history")
-            .messages
-            .is_empty()
-    );
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    let assistant_count: u64 = connection
-        .query_row(
-            "select count(*) from items where turn_id = ?1 and kind = ?2",
-            rusqlite::params![turn.turn_id, ItemKind::AgentMessage.as_storage_text()],
-            |row| row.get(0),
-        )
-        .expect("assistant count");
-    assert_eq!(assistant_count, 0);
-}
-
-// 验证 runtime turn trace 绑定错误以 typed StoreError 传播，而不是退化为字符串状态。
-#[test]
-fn turn_trace_binding_error_remains_typed_at_store_boundary() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let trace = TraceEvent::for_turn(
-        "trace_wrong_turn_binding",
-        &thread.thread_id,
-        "wrong_turn",
-        "agent_loop",
-        "invalid turn binding",
-    );
-
-    let error = store
-        .commit_turn_outcome(
-            &turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Interrupted,
-                agent_loop_status: "interrupted",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &trace,
-            },
-        )
-        .expect_err("mismatched turn trace must be rejected");
-
-    assert!(matches!(
-        error,
-        StoreError::TraceBinding(TraceBindingError::SessionIdMismatch { expected, actual })
-            if expected == turn.turn_id && actual == "wrong_turn"
-    ));
-    assert_eq!(
-        store
-            .get_turn(&turn.turn_id)
-            .expect("turn after rejection")
-            .status,
-        TurnStatus::Running
-    );
-}
-
-#[test]
-fn missing_turn_trace_task_id_remains_typed_at_store_boundary() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let mut trace = TraceEvent::for_turn(
-        "trace_missing_task",
-        &thread.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "missing task",
-    );
-    trace.task_id = None;
-
-    assert!(matches!(
-        store.commit_turn_outcome(
-            &turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Interrupted,
-                agent_loop_status: "interrupted",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &trace,
-            },
-        ),
-        Err(StoreError::TraceBinding(TraceBindingError::TaskIdMismatch { expected, actual: None }))
-            if expected == turn.turn_id
-    ));
-}
-
-// append_trace 的绑定检查与插入必须和 delete_thread 共享同一个写事务，不能留下孤立 turn trace。
-#[test]
-fn append_and_delete_race_cannot_leave_an_orphan_turn_trace() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let setup = SessionStore::open(&db_path).expect("open store");
-    let thread = setup.create_thread(None, None).expect("thread");
-    let turn = setup
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    setup
-        .update_turn_state(&turn.turn_id, TurnStatus::Completed, "completed")
-        .expect("terminal turn");
-    drop(setup);
-
-    let append_store = SessionStore::open(&db_path).expect("append store");
-    let delete_store = SessionStore::open(&db_path).expect("delete store");
-    let trace = TraceEvent::for_turn(
-        "trace_append_delete_race",
-        &thread.thread_id,
-        &turn.turn_id,
-        "test",
-        "race",
-    );
-    let barrier = Arc::new(Barrier::new(3));
-    let append_barrier = Arc::clone(&barrier);
-    let append_handle = std::thread::spawn(move || {
-        append_barrier.wait();
-        append_store.append_trace(&trace)
-    });
-    let delete_barrier = Arc::clone(&barrier);
-    let thread_id = thread.thread_id.clone();
-    let delete_handle = std::thread::spawn(move || {
-        delete_barrier.wait();
-        delete_store.delete_thread(&thread_id)
-    });
-    barrier.wait();
-
-    let append_result = append_handle.join().expect("append worker");
-    let delete_result = delete_handle.join().expect("delete worker");
-    assert!(delete_result.is_ok(), "delete result: {delete_result:?}");
-    assert!(
-        append_result.is_ok()
-            || matches!(append_result, Err(StoreError::InvalidState(ref message)) if message.contains("existing turn")),
-        "append result: {append_result:?}"
-    );
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    assert!(matches!(
-        reopened.get_thread(&thread.thread_id),
-        Err(StoreError::NotFound(_))
-    ));
-    let connection = rusqlite::Connection::open(&db_path).expect("inspect store");
-    let trace_count: i64 = connection
-        .query_row(
-            "select count(*) from trace_events where event_id = 'trace_append_delete_race'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("trace count");
-    assert_eq!(trace_count, 0);
-}
-
-// 验证 trace 列表支持分页与尾部窗口读取。
-#[test]
-fn trace_list_supports_pagination_and_tail() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    for index in 0..3 {
-        store
-            .append_trace(&TraceEvent::new(
-                format!("trace_{index}"),
-                "run_1",
-                "session_1",
-                "test",
-                format!("event {index}"),
-            ))
-            .expect("trace");
-    }
-
-    let page = store
-        .list_trace_page("run_1", Some(1), Some(1))
-        .expect("page");
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].event_id, "trace_1");
-    assert!(
-        store
-            .list_trace_page("run_1", Some(1), Some(99))
-            .expect("empty page")
-            .is_empty()
-    );
-    assert_eq!(
-        store.tail_trace("run_1", 2, None).expect("tail")[0].event_id,
-        "trace_1"
-    );
-    assert_eq!(
-        store.tail_trace("run_1", 2, Some(1)).expect("offset tail")[0].event_id,
-        "trace_0"
-    );
-}
-
-// 验证 trace payload 递归脱敏并按 canonical JSON 计算 hash。
-#[test]
-fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut first = TraceEvent::new(
-        "trace_redacted_1",
-        "run_redacted",
-        "session_redacted",
-        "test",
-        "Authorization: Bearer sentinel-secret-value",
-    );
-    first.payload = serde_json::json!({
-        "z": 1,
-        "nested": {
-            "authorization": "Bearer sentinel-secret-value",
-            "safe": "ok"
-        }
-    });
-    let mut second = TraceEvent::new(
-        "trace_redacted_2",
-        "run_redacted",
-        "session_redacted",
-        "test",
-        "safe summary",
-    );
-    second.payload = serde_json::json!({
-        "nested": {
-            "safe": "ok",
-            "authorization": "different-secret-value"
-        },
-        "z": 1
-    });
-
-    store.append_trace(&first).expect("first trace");
-    store.append_trace(&second).expect("second trace");
-    let first = store.show_trace("trace_redacted_1").expect("stored first");
-    let second = store.show_trace("trace_redacted_2").expect("stored second");
-
-    assert_eq!(first.summary, "[redacted]");
-    assert_eq!(first.payload["nested"]["authorization"], "[redacted]");
-    assert_eq!(first.payload["nested"]["safe"], "ok");
-    assert!(first.redaction_applied);
-    assert!(first.payload_hash.starts_with("sha256:"));
-    assert_eq!(first.payload_hash.len(), "sha256:".len() + 64);
-    assert_ne!(first.payload_hash, second.payload_hash);
-    let serialized = serde_json::to_string(&first).expect("serialize trace");
-    assert!(!serialized.contains("sentinel-secret-value"));
-}
-
-#[test]
-fn trace_storage_preserves_stable_provider_codes_and_redacts_invalid_codes() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let identity = || TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiChatCompletions),
-        operation_phase: Some(TraceProviderOperationPhase::Completion),
-        attempt_index: Some(1),
-        retry_count: Some(0),
-        ..TraceSpanProjection::default()
-    };
-    let append_pair = |prefix: &str, code: &str| {
-        let mut start = provider_span(&format!("{prefix}_start"), TraceSpanPhase::Start);
-        start.span_id = Some(prefix.to_string());
-        start.span_projection = Some(identity());
-
-        let mut end = provider_span(&format!("{prefix}_end"), TraceSpanPhase::End);
-        end.span_id = Some(prefix.to_string());
-        end.span_status = Some(TraceSpanStatus::Error);
-        let mut projection = identity();
-        projection.error = Some(TraceErrorProjection {
-            category: TraceErrorCategory::JsonSchema,
-            stage: Some(TraceErrorStage::ResponseValidation),
-            code: Some(code.to_string()),
-        });
-        end.span_projection = Some(projection);
-
-        store.append_trace(&start).expect("provider span start");
-        store.append_trace(&end).expect("provider span end");
-    };
-
-    append_pair("stable_code", "provider_response_invalid");
-    append_pair("invalid_code", "provider response invalid");
-    append_pair("secret_code", "sk-abcdefgh");
-    append_pair(
-        "jwt_code",
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
-    );
-
-    let stable = store.show_trace("stable_code_end").expect("stable trace");
-    assert_eq!(
-        stable
-            .span_projection
-            .and_then(|projection| projection.error)
-            .and_then(|error| error.code)
-            .as_deref(),
-        Some("provider_response_invalid")
-    );
-
-    let invalid = store.show_trace("invalid_code_end").expect("invalid trace");
-    assert_eq!(
-        invalid
-            .span_projection
-            .and_then(|projection| projection.error)
-            .and_then(|error| error.code)
-            .as_deref(),
-        Some("[redacted]")
-    );
-
-    for event_id in ["secret_code_end", "jwt_code_end"] {
-        let redacted = store.show_trace(event_id).expect("secret trace");
-        assert_eq!(
-            redacted
-                .span_projection
-                .and_then(|projection| projection.error)
-                .and_then(|error| error.code)
-                .as_deref(),
-            Some("[redacted]"),
-            "{event_id} must not persist a credential-shaped code"
-        );
-    }
-}
-
-// 验证被篡改的 trace payload hash 会 fail closed。
-#[test]
-fn tampered_trace_payload_hash_fails_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut trace = TraceEvent::new(
-        "trace_tampered",
-        "run_tampered",
-        "session_tampered",
-        "test",
-        "safe",
-    );
-    trace.payload = serde_json::json!({"safe": "before"});
-    store.append_trace(&trace).expect("append trace");
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
-    let payload: String = connection
-        .query_row(
-            "select payload from trace_events where event_id = 'trace_tampered'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read payload");
-    let mut payload: serde_json::Value = serde_json::from_str(&payload).expect("parse payload");
-    payload["payload"]["safe"] = serde_json::json!("after");
-    connection
-        .execute(
-            "update trace_events set payload = ?1 where event_id = 'trace_tampered'",
-            [serde_json::to_string(&payload).expect("serialize tampered payload")],
-        )
-        .expect("tamper payload");
-
-    let error = store
-        .show_trace("trace_tampered")
-        .expect_err("tampered trace must fail closed");
-    assert!(error.to_string().contains("trace integrity"));
-}
-
-fn provider_span(event_id: &str, phase: TraceSpanPhase) -> TraceEvent {
-    let mut event = TraceEvent::new(event_id, "run_span", "session_span", "provider", "span");
-    event.span_id = Some("provider_span".to_string());
-    event.span_kind = Some(TraceSpanKind::ProviderAttempt);
-    event.span_phase = Some(phase);
-    if phase == TraceSpanPhase::End {
-        event.span_status = Some(TraceSpanStatus::Ok);
-        event.duration_ms = Some(20);
-        event.time_to_first_token_ms = Some(8);
-    }
-    event
-}
-
-#[test]
-fn typed_trace_span_lifecycle_rejects_duplicates_and_cross_run_parents() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    store
-        .append_trace(&provider_span("span_start", TraceSpanPhase::Start))
-        .expect("span start");
-    assert!(
-        store
-            .append_trace(&provider_span(
-                "span_start_duplicate",
-                TraceSpanPhase::Start
-            ))
-            .is_err()
-    );
-    store
-        .append_trace(&provider_span("span_end", TraceSpanPhase::End))
-        .expect("span end");
-    assert!(
-        store
-            .append_trace(&provider_span("span_end_duplicate", TraceSpanPhase::End))
-            .is_err()
-    );
-
-    let mut cross_run = TraceEvent::new(
-        "cross_run_parent",
-        "another_run",
-        "another_session",
-        "provider",
-        "cross run",
-    );
-    cross_run.span_id = Some("child".to_string());
-    cross_run.parent_span_id = Some("provider_span".to_string());
-    cross_run.span_kind = Some(TraceSpanKind::ProviderAttempt);
-    cross_run.span_phase = Some(TraceSpanPhase::Start);
-    assert!(store.append_trace(&cross_run).is_err());
-}
-
-#[test]
-fn prompt_assembly_start_end_contract_is_closed_and_fail_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let make_pair = |span_id: &str,
-                     start_projection: Option<TraceSpanProjection>,
-                     end_projection: TraceSpanProjection| {
-        let mut start = TraceEvent::new(
-            format!("{span_id}_start"),
-            "prompt_run",
-            "prompt_session",
-            "agent",
-            "prompt",
-        );
-        start.span_id = Some(span_id.to_string());
-        start.span_kind = Some(TraceSpanKind::PromptAssembly);
-        start.span_phase = Some(TraceSpanPhase::Start);
-        start.span_projection = start_projection;
-
-        let mut end = TraceEvent::new(
-            format!("{span_id}_end"),
-            "prompt_run",
-            "prompt_session",
-            "agent",
-            "prompt",
-        );
-        end.span_id = Some(span_id.to_string());
-        end.span_kind = Some(TraceSpanKind::PromptAssembly);
-        end.span_phase = Some(TraceSpanPhase::End);
-        end.span_status = Some(TraceSpanStatus::Ok);
-        end.duration_ms = Some(4);
-        end.span_projection = Some(end_projection);
-        (start, end)
-    };
-
-    let terminal_projection = || TraceSpanProjection {
-        message_count: Some(3),
-        tool_count: Some(1),
-        request_token_count: Some(8),
-        request_digest: Some(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ),
-        compacted: Some(true),
-        finalization_only: Some(false),
-        model_turn_ordinal: Some(2),
-        ..TraceSpanProjection::default()
-    };
-
-    let (unknown_start, real_end) = make_pair("unknown", None, terminal_projection());
-    store
-        .append_trace_batch(&[unknown_start, real_end])
-        .expect("unknown start and real end");
-
-    let (terminal_start, terminal_end) = make_pair(
-        "terminal_start",
-        Some(TraceSpanProjection {
-            message_count: Some(3),
-            ..TraceSpanProjection::default()
-        }),
-        terminal_projection(),
-    );
-    assert!(
-        store
-            .append_trace_batch(&[terminal_start, terminal_end])
-            .is_err()
-    );
-
-    let (empty_digest_start, mut empty_digest_end) =
-        make_pair("empty_digest", None, terminal_projection());
-    empty_digest_end
-        .span_projection
-        .as_mut()
-        .expect("end projection")
-        .request_digest = Some(String::new());
-    assert!(
-        store
-            .append_trace_batch(&[empty_digest_start, empty_digest_end])
-            .is_err()
-    );
-
-    let (stable_start, stable_end) = make_pair(
-        "stable_mismatch",
-        Some(TraceSpanProjection {
-            finalization_only: Some(false),
-            model_turn_ordinal: Some(1),
-            ..TraceSpanProjection::default()
-        }),
-        TraceSpanProjection {
-            finalization_only: Some(false),
-            model_turn_ordinal: Some(2),
-            ..TraceSpanProjection::default()
-        },
-    );
-    assert!(
-        store
-            .append_trace_batch(&[stable_start, stable_end])
-            .is_err()
-    );
-}
-
-#[test]
-fn typed_trace_span_identity_rejects_every_stable_mismatch_before_insert() {
-    let assert_rejected = |label: &str,
-                           kind: TraceSpanKind,
-                           start_projection: TraceSpanProjection,
-                           end_projection: TraceSpanProjection| {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let run_id = format!("identity_{label}");
-        let mut start = TraceEvent::new(
-            format!("{label}_start"),
-            run_id.clone(),
-            format!("{label}_session"),
-            "identity",
-            "start",
-        );
-        start.span_id = Some(format!("{label}_span"));
-        start.span_kind = Some(kind);
-        start.span_phase = Some(TraceSpanPhase::Start);
-        start.span_projection = Some(start_projection);
-
-        let mut end = TraceEvent::new(
-            format!("{label}_end"),
-            run_id.clone(),
-            format!("{label}_session"),
-            "identity",
-            "end",
-        );
-        end.span_id = Some(format!("{label}_span"));
-        end.span_kind = Some(kind);
-        end.span_phase = Some(TraceSpanPhase::End);
-        end.span_status = Some(TraceSpanStatus::Ok);
-        end.duration_ms = Some(1);
-        end.span_projection = Some(end_projection);
-
-        assert!(
-            store.append_trace_batch(&[start, end]).is_err(),
-            "accepted stable identity mismatch for {label}"
-        );
-        assert!(matches!(
-            store.list_trace(&run_id),
-            Err(StoreError::NotFound(message)) if message == format!("trace run {run_id}")
-        ));
-    };
-
-    let prompt = |model_turn_ordinal, finalization_only| TraceSpanProjection {
-        model_turn_ordinal: Some(model_turn_ordinal),
-        finalization_only: Some(finalization_only),
-        ..TraceSpanProjection::default()
-    };
-    assert_rejected(
-        "prompt_model_turn",
-        TraceSpanKind::PromptAssembly,
-        prompt(1, false),
-        prompt(2, false),
-    );
-    assert_rejected(
-        "prompt_finalization",
-        TraceSpanKind::PromptAssembly,
-        prompt(1, false),
-        prompt(1, true),
-    );
-
-    let provider = || TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        operation_phase: Some(TraceProviderOperationPhase::Completion),
-        attempt_index: Some(1),
-        retry_count: Some(0),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = provider();
-    end.provider_name = Some("other_provider".to_string());
-    assert_rejected(
-        "provider_name",
-        TraceSpanKind::ProviderAttempt,
-        provider(),
-        end,
-    );
-    let mut end = provider();
-    end.model_name = Some("other_model".to_string());
-    assert_rejected(
-        "model_name",
-        TraceSpanKind::ProviderAttempt,
-        provider(),
-        end,
-    );
-    let mut end = provider();
-    end.protocol = Some(TraceProviderProtocol::OpenAiChatCompletions);
-    assert_rejected("protocol", TraceSpanKind::ProviderAttempt, provider(), end);
-    let mut end = provider();
-    end.operation_phase = Some(TraceProviderOperationPhase::CapabilityProbe);
-    assert_rejected(
-        "operation_phase",
-        TraceSpanKind::ProviderAttempt,
-        provider(),
-        end,
-    );
-    let mut end = provider();
-    end.attempt_index = Some(2);
-    assert_rejected(
-        "attempt_index",
-        TraceSpanKind::ProviderAttempt,
-        provider(),
-        end,
-    );
-    let mut end = provider();
-    end.retry_count = Some(1);
-    assert_rejected(
-        "retry_count",
-        TraceSpanKind::ProviderAttempt,
-        provider(),
-        end,
-    );
-
-    let tool = || TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection {
-            tool_name: Some("command".to_string()),
-            tool_call_id_digest: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            ),
-            tool_call_ordinal: Some(1),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = tool();
-    end.model_turn_ordinal = Some(3);
-    assert_rejected("tool_model_turn", TraceSpanKind::ToolCall, tool(), end);
-    let mut end = tool();
-    end.tool.as_mut().expect("tool identity").tool_name = Some("edit".to_string());
-    assert_rejected("tool_name", TraceSpanKind::ToolCall, tool(), end);
-    let mut end = tool();
-    end.tool
-        .as_mut()
-        .expect("tool identity")
-        .tool_call_id_digest =
-        Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string());
-    assert_rejected("tool_call_id_digest", TraceSpanKind::ToolCall, tool(), end);
-    let mut end = tool();
-    end.tool.as_mut().expect("tool identity").tool_call_ordinal = Some(2);
-    assert_rejected("tool_call_ordinal", TraceSpanKind::ToolCall, tool(), end);
-
-    let policy = || TraceSpanProjection {
-        policy: Some(TracePolicyProjection {
-            operation_count: Some(1),
-            resource_count: Some(2),
-            ..TracePolicyProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = policy();
-    end.policy
-        .as_mut()
-        .expect("policy identity")
-        .operation_count = Some(2);
-    assert_rejected(
-        "policy_operation_count",
-        TraceSpanKind::PolicyDecision,
-        policy(),
-        end,
-    );
-    let mut end = policy();
-    end.policy.as_mut().expect("policy identity").resource_count = Some(3);
-    assert_rejected(
-        "policy_resource_count",
-        TraceSpanKind::PolicyDecision,
-        policy(),
-        end,
-    );
-
-    let approval = || TraceSpanProjection {
-        approval: Some(TraceApprovalProjection {
-            request_count: Some(1),
-            ..TraceApprovalProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = approval();
-    end.approval
-        .as_mut()
-        .expect("approval identity")
-        .request_count = Some(2);
-    assert_rejected(
-        "approval_request_count",
-        TraceSpanKind::ApprovalWait,
-        approval(),
-        end,
-    );
-
-    let sandbox = || TraceSpanProjection {
-        sandbox: Some(TraceSandboxProjection {
-            command_id_digest: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            ),
-            command_id_binding_valid: Some(true),
-            ..TraceSandboxProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = sandbox();
-    end.sandbox
-        .as_mut()
-        .expect("sandbox identity")
-        .command_id_digest =
-        Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string());
-    assert_rejected(
-        "sandbox_command_id_digest",
-        TraceSpanKind::SandboxExecution,
-        sandbox(),
-        end,
-    );
-    let mut end = sandbox();
-    end.sandbox
-        .as_mut()
-        .expect("sandbox identity")
-        .command_id_binding_valid = Some(false);
-    assert_rejected(
-        "sandbox_command_binding",
-        TraceSpanKind::SandboxExecution,
-        sandbox(),
-        end,
-    );
-
-    let verification = || TraceSpanProjection {
-        verification: Some(TraceVerificationProjection {
-            required_command_count: Some(1),
-            occurrence_count: Some(1),
-            ..TraceVerificationProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = verification();
-    end.verification
-        .as_mut()
-        .expect("verification identity")
-        .required_command_count = Some(2);
-    assert_rejected(
-        "verification_required_count",
-        TraceSpanKind::Verification,
-        verification(),
-        end,
-    );
-    let mut end = verification();
-    end.verification
-        .as_mut()
-        .expect("verification identity")
-        .occurrence_count = Some(2);
-    assert_rejected(
-        "verification_occurrence_count",
-        TraceSpanKind::Verification,
-        verification(),
-        end,
-    );
-
-    let final_review = || TraceSpanProjection {
-        final_review: Some(TraceFinalReviewProjection {
-            model_turn_ordinal: Some(2),
-            ..TraceFinalReviewProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    let mut end = final_review();
-    end.final_review
-        .as_mut()
-        .expect("review identity")
-        .model_turn_ordinal = Some(3);
-    assert_rejected(
-        "final_review_model_turn",
-        TraceSpanKind::FinalReview,
-        final_review(),
-        end,
-    );
-}
-
-#[test]
-fn prompt_identity_rejects_known_start_with_missing_end_before_insert() {
-    let assert_rejected = |label: &str, start_projection: TraceSpanProjection| {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let run_id = format!("prompt_identity_{label}");
-        let mut start = TraceEvent::new(
-            format!("{label}_start"),
-            run_id.clone(),
-            format!("{label}_session"),
-            "identity",
-            "start",
-        );
-        start.span_id = Some(format!("{label}_span"));
-        start.span_kind = Some(TraceSpanKind::PromptAssembly);
-        start.span_phase = Some(TraceSpanPhase::Start);
-        start.span_projection = Some(start_projection);
-
-        let mut end = TraceEvent::new(
-            format!("{label}_end"),
-            run_id.clone(),
-            format!("{label}_session"),
-            "identity",
-            "end",
-        );
-        end.span_id = Some(format!("{label}_span"));
-        end.span_kind = Some(TraceSpanKind::PromptAssembly);
-        end.span_phase = Some(TraceSpanPhase::End);
-        end.span_status = Some(TraceSpanStatus::Ok);
-        end.duration_ms = Some(1);
-        end.span_projection = Some(TraceSpanProjection::default());
-
-        assert!(store.append_trace_batch(&[start, end]).is_err());
-        assert!(matches!(
-            store.list_trace(&run_id),
-            Err(StoreError::NotFound(message)) if message == format!("trace run {run_id}")
-        ));
-    };
-
-    assert_rejected(
-        "model_turn_ordinal",
-        TraceSpanProjection {
-            model_turn_ordinal: Some(2),
-            ..TraceSpanProjection::default()
-        },
-    );
-    assert_rejected(
-        "finalization_only",
-        TraceSpanProjection {
-            finalization_only: Some(false),
-            ..TraceSpanProjection::default()
-        },
-    );
-}
-
-#[test]
-fn typed_trace_span_identity_ignores_terminal_results_and_allows_prompt_unknown_start() {
-    let assert_accepted = |label: &str,
-                           kind: TraceSpanKind,
-                           start_projection: Option<TraceSpanProjection>,
-                           end_projection: TraceSpanProjection| {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let run_id = format!("terminal_identity_{label}");
-        let mut start = TraceEvent::new(
-            format!("{label}_start"),
-            run_id.clone(),
-            format!("{label}_session"),
-            "identity",
-            "start",
-        );
-        start.span_id = Some(format!("{label}_span"));
-        start.span_kind = Some(kind);
-        start.span_phase = Some(TraceSpanPhase::Start);
-        start.span_projection = start_projection;
-
-        let mut end = TraceEvent::new(
-            format!("{label}_end"),
-            run_id,
-            format!("{label}_session"),
-            "identity",
-            "end",
-        );
-        end.span_id = Some(format!("{label}_span"));
-        end.span_kind = Some(kind);
-        end.span_phase = Some(TraceSpanPhase::End);
-        end.span_status = Some(TraceSpanStatus::Ok);
-        end.duration_ms = Some(1);
-        end.span_projection = Some(end_projection);
-        store
-            .append_trace_batch(&[start, end])
-            .unwrap_or_else(|error| panic!("terminal fields rejected for {label}: {error}"));
-    };
-
-    assert_accepted(
-        "prompt",
-        TraceSpanKind::PromptAssembly,
-        None,
-        TraceSpanProjection {
-            operation_count: Some(1),
-            message_count: Some(2),
-            tool_count: Some(1),
-            request_token_count: Some(3),
-            request_digest: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            ),
-            compacted: Some(true),
-            finalization_only: Some(false),
-            model_turn_ordinal: Some(2),
-            ..TraceSpanProjection::default()
-        },
-    );
-
-    let provider = || TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        operation_phase: Some(TraceProviderOperationPhase::Completion),
-        attempt_index: Some(1),
-        retry_count: Some(0),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "provider",
-        TraceSpanKind::ProviderAttempt,
-        Some(provider()),
-        TraceSpanProjection {
-            queue_duration_ms: Some(2),
-            request_send_to_headers_ms: Some(3),
-            retry_backoff_ms: Some(4),
-            usage: Some(TraceUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
-                cached_input_tokens: 1,
-                reasoning_tokens: 0,
-            }),
-            error: Some(TraceErrorProjection {
-                category: TraceErrorCategory::Network,
-                stage: Some(TraceErrorStage::ResponseStatus),
-                code: Some("provider_unavailable".to_string()),
-            }),
-            ..provider()
-        },
-    );
-
-    let tool = || TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection {
-            tool_name: Some("command".to_string()),
-            tool_call_id_digest: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            ),
-            tool_call_ordinal: Some(1),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "tool",
-        TraceSpanKind::ToolCall,
-        Some(tool()),
-        TraceSpanProjection {
-            tool: Some(TraceToolProjection {
-                status: Some(TraceToolStatus::Failed),
-                ..tool().tool.expect("tool identity")
-            }),
-            ..tool()
-        },
-    );
-
-    let policy = || TraceSpanProjection {
-        policy: Some(TracePolicyProjection {
-            operation_count: Some(1),
-            resource_count: Some(2),
-            ..TracePolicyProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "policy",
-        TraceSpanKind::PolicyDecision,
-        Some(policy()),
-        TraceSpanProjection {
-            policy: Some(TracePolicyProjection {
-                decision: Some(TracePolicyDecision::Deny),
-                cause: Some(TracePolicyCause::Explicit),
-                ..policy().policy.expect("policy identity")
-            }),
-            ..policy()
-        },
-    );
-
-    let approval = || TraceSpanProjection {
-        approval: Some(TraceApprovalProjection {
-            request_count: Some(1),
-            ..TraceApprovalProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "approval",
-        TraceSpanKind::ApprovalWait,
-        Some(approval()),
-        TraceSpanProjection {
-            approval: Some(TraceApprovalProjection {
-                outcome: Some(TraceApprovalOutcome::Deny),
-                ..approval().approval.expect("approval identity")
-            }),
-            ..approval()
-        },
-    );
-
-    let sandbox = || TraceSpanProjection {
-        sandbox: Some(TraceSandboxProjection {
-            command_id_digest: Some(
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            ),
-            command_id_binding_valid: Some(true),
-            ..TraceSandboxProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "sandbox",
-        TraceSpanKind::SandboxExecution,
-        Some(sandbox()),
-        TraceSpanProjection {
-            sandbox: Some(TraceSandboxProjection {
-                status: Some(TraceSandboxStatus::Error),
-                workspace_mutation: Some(TraceWorkspaceMutation::Changed),
-                enforcement: Some(TraceSandboxEnforcement::Strict),
-                ..sandbox().sandbox.expect("sandbox identity")
-            }),
-            ..sandbox()
-        },
-    );
-
-    let verification = || TraceSpanProjection {
-        verification: Some(TraceVerificationProjection {
-            required_command_count: Some(1),
-            satisfied_command_count: Some(0),
-            occurrence_count: Some(1),
-            ..TraceVerificationProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "verification",
-        TraceSpanKind::Verification,
-        Some(verification()),
-        TraceSpanProjection {
-            verification: Some(TraceVerificationProjection {
-                satisfied_command_count: Some(1),
-                status: Some(TraceVerificationStatus::CommandPassed),
-                command_duration_ms: Some(5),
-                ..verification().verification.expect("verification identity")
-            }),
-            ..verification()
-        },
-    );
-
-    let final_review = || TraceSpanProjection {
-        final_review: Some(TraceFinalReviewProjection {
-            model_turn_ordinal: Some(2),
-            ..TraceFinalReviewProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    };
-    assert_accepted(
-        "final_review",
-        TraceSpanKind::FinalReview,
-        Some(final_review()),
-        TraceSpanProjection {
-            final_review: Some(TraceFinalReviewProjection {
-                status: Some(TraceFinalReviewStatus::Failed),
-                ..final_review().final_review.expect("review identity")
-            }),
-            ..final_review()
-        },
-    );
-}
-
-#[test]
-fn append_trace_batch_validates_every_event_before_any_insert() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let valid_start = provider_span("batch_start", TraceSpanPhase::Start);
-    let valid_end = provider_span("batch_end", TraceSpanPhase::End);
-    let mut invalid = provider_span("batch_invalid", TraceSpanPhase::Start);
-    invalid.span_status = Some(TraceSpanStatus::Error);
-
-    assert!(
-        store
-            .append_trace_batch(&[valid_start, valid_end, invalid])
-            .is_err()
-    );
-    assert!(matches!(
-        store.list_trace("run_span"),
-        Err(StoreError::NotFound(message)) if message == "trace run run_span"
-    ));
-}
-
-#[test]
-fn append_trace_batch_rejects_overflow_before_persisting_any_event() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let start = provider_span("overflow_start", TraceSpanPhase::Start);
-    let mut end = provider_span("overflow_end", TraceSpanPhase::End);
-    end.duration_ms = Some(u64::MAX);
-    assert!(store.append_trace_batch(&[start, end]).is_err());
-    assert!(matches!(
-        store.list_trace("run_span"),
-        Err(StoreError::NotFound(message)) if message == "trace run run_span"
-    ));
-
-    let mut prompt = metric_span(
-        "overflow_prompt",
-        "overflow_prompt_span",
-        TraceSpanKind::PromptAssembly,
-        TraceSpanPhase::Start,
-        0,
-    );
-    prompt.span_projection = Some(TraceSpanProjection {
-        model_turn_ordinal: Some(u64::MAX),
-        ..TraceSpanProjection::default()
-    });
-    assert!(store.append_trace(&prompt).is_err());
-    assert!(matches!(
-        store.list_trace("metrics_run"),
-        Err(StoreError::NotFound(message)) if message == "trace run metrics_run"
-    ));
-}
-
-#[test]
-fn trace_metrics_report_incomplete_start_end_without_faking_duration_zero() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    store
-        .append_trace(&metric_span(
-            "incomplete_turn_start",
-            "incomplete_turn",
-            TraceSpanKind::Turn,
-            TraceSpanPhase::Start,
-            0,
-        ))
-        .expect("start-only span");
-    let metrics = store.trace_metrics("metrics_run").expect("metrics");
-    let metric = metrics.metric("turn_duration_ms").expect("turn metric");
-    assert!(matches!(
-        metric.availability,
-        TraceMetricAvailability::Unavailable {
-            reason: singularity_protocol::TraceMetricUnavailableReason::IncompleteStartEnd
-        }
-    ));
-    assert!(metric.distribution.is_none());
-}
-
-fn metric_span(
-    event_id: &str,
-    span_id: &str,
-    kind: TraceSpanKind,
-    phase: TraceSpanPhase,
-    duration_ms: u64,
-) -> TraceEvent {
-    let mut event = TraceEvent::new(
-        event_id,
-        "metrics_run",
-        "metrics_session",
-        "metrics",
-        "span",
-    );
-    event.span_id = Some(span_id.to_string());
-    event.span_kind = Some(kind);
-    event.span_phase = Some(phase);
-    if phase == TraceSpanPhase::End {
-        event.span_status = Some(TraceSpanStatus::Ok);
-        event.duration_ms = Some(duration_ms);
-    }
-    event
-}
-
-#[test]
-fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percentiles() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-
-    let mut provider_start = metric_span(
-        "provider_start_1",
-        "provider_1",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::Start,
-        0,
-    );
-    provider_start.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(1),
-        ..TraceSpanProjection::default()
-    });
-    let mut provider_end = metric_span(
-        "provider_end_1",
-        "provider_1",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::End,
-        10,
-    );
-    provider_end.time_to_first_token_ms = Some(4);
-    provider_end.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(1),
-        retry_count: Some(0),
-        request_send_to_headers_ms: Some(3),
-        queue_duration_ms: Some(1),
-        usage: Some(TraceUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            total_tokens: 15,
-            cached_input_tokens: 0,
-            reasoning_tokens: 0,
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut provider_start_2 = metric_span(
-        "provider_start_2",
-        "provider_2",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::Start,
-        0,
-    );
-    provider_start_2.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(2),
-        ..TraceSpanProjection::default()
-    });
-    let mut provider_end_2 = metric_span(
-        "provider_end_2",
-        "provider_2",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::End,
-        20,
-    );
-    provider_end_2.time_to_first_token_ms = Some(8);
-    provider_end_2.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(2),
-        retry_count: Some(1),
-        retry_backoff_ms: Some(6),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut tool_start = metric_span(
-        "tool_start",
-        "tool_1",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::Start,
-        0,
-    );
-    tool_start.span_projection = Some(TraceSpanProjection {
-        tool: Some(Default::default()),
-        ..TraceSpanProjection::default()
-    });
-    let mut tool_end = metric_span(
-        "tool_end",
-        "tool_1",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::End,
-        7,
-    );
-    tool_end.span_projection = Some(TraceSpanProjection {
-        tool: Some(TraceToolProjection {
-            status: Some(TraceToolStatus::Succeeded),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut samples = TraceEvent::new(
-        "metric_samples",
-        "metrics_run",
-        "metrics_session",
-        "metrics",
-        "samples",
-    );
-    samples.metric_samples = vec![
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::CompletionRejection,
-            count: 2,
-        },
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::CompletionRepair,
-            count: 1,
-        },
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::EventGap,
-            count: 3,
-        },
-    ];
-
-    store
-        .append_trace_batch(&[
-            provider_start,
-            provider_end,
-            provider_start_2,
-            provider_end_2,
-            tool_start,
-            tool_end,
-            samples,
-        ])
-        .expect("append metric events");
-
-    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
-    let provider_duration = metrics
-        .metric("provider_attempt_duration_ms")
-        .expect("provider duration metric");
-    let distribution = provider_duration
-        .distribution
-        .as_ref()
-        .expect("distribution");
-    assert_eq!(distribution.count, 2);
-    assert_eq!(distribution.sum, 30);
-    assert_eq!(distribution.p50, Some(10));
-    assert_eq!(distribution.p95, Some(20));
-    assert!(matches!(
-        metrics
-            .metric("provider_time_to_first_token_ms")
-            .expect("ttft")
-            .availability,
-        TraceMetricAvailability::Available
-    ));
-    assert_eq!(
-        metrics
-            .metric("completion_rejection_count")
-            .expect("rejection")
-            .distribution
-            .as_ref()
-            .expect("rejection distribution")
-            .count,
-        1
-    );
-    assert_eq!(
-        metrics
-            .metric("completion_rejection_count")
-            .expect("rejection")
-            .distribution
-            .as_ref()
-            .expect("rejection distribution")
-            .sum,
-        2
-    );
-}
-
-#[test]
-fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projections() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-
-    let prompt_start = metric_span(
-        "prompt_start",
-        "prompt",
-        TraceSpanKind::PromptAssembly,
-        TraceSpanPhase::Start,
-        0,
-    );
-    let mut prompt_end = metric_span(
-        "prompt_end",
-        "prompt",
-        TraceSpanKind::PromptAssembly,
-        TraceSpanPhase::End,
-        4,
-    );
-    prompt_end.span_projection = Some(TraceSpanProjection {
-        message_count: Some(3),
-        tool_count: Some(1),
-        request_token_count: Some(8),
-        request_digest: Some(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ),
-        compacted: Some(true),
-        finalization_only: Some(false),
-        model_turn_ordinal: Some(2),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut provider_start = metric_span(
-        "provider_start_cached",
-        "provider_cached",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::Start,
-        0,
-    );
-    provider_start.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(1),
-        ..TraceSpanProjection::default()
-    });
-    let mut provider_end = metric_span(
-        "provider_end_cached",
-        "provider_cached",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::End,
-        12,
-    );
-    provider_end.span_projection = Some(TraceSpanProjection {
-        provider_name: Some("provider".to_string()),
-        model_name: Some("model".to_string()),
-        protocol: Some(TraceProviderProtocol::OpenAiResponses),
-        attempt_index: Some(1),
-        usage: Some(TraceUsage {
-            input_tokens: 10,
-            output_tokens: 4,
-            total_tokens: 14,
-            cached_input_tokens: 7,
-            reasoning_tokens: 0,
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut tool_start = metric_span(
-        "tool_start_success",
-        "tool_success",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::Start,
-        0,
-    );
-    tool_start.span_projection = Some(TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection::default()),
-        ..TraceSpanProjection::default()
-    });
-    let mut tool_end = metric_span(
-        "tool_end_success",
-        "tool_success",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::End,
-        5,
-    );
-    tool_end.span_projection = Some(TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection {
-            status: Some(TraceToolStatus::Succeeded),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut tool_failed_start = metric_span(
-        "tool_start_failed",
-        "tool_failed",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::Start,
-        0,
-    );
-    tool_failed_start.span_projection = Some(TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection::default()),
-        ..TraceSpanProjection::default()
-    });
-    let mut tool_failed_end = metric_span(
-        "tool_end_failed",
-        "tool_failed",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::End,
-        6,
-    );
-    tool_failed_end.span_status = Some(TraceSpanStatus::Error);
-    tool_failed_end.span_projection = Some(TraceSpanProjection {
-        model_turn_ordinal: Some(2),
-        tool: Some(TraceToolProjection {
-            status: Some(TraceToolStatus::Failed),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut sandbox_start = metric_span(
-        "sandbox_start",
-        "sandbox",
-        TraceSpanKind::SandboxExecution,
-        TraceSpanPhase::Start,
-        0,
-    );
-    sandbox_start.span_projection = Some(TraceSpanProjection {
-        sandbox: Some(TraceSandboxProjection::default()),
-        ..TraceSpanProjection::default()
-    });
-    let mut sandbox_end = metric_span(
-        "sandbox_end",
-        "sandbox",
-        TraceSpanKind::SandboxExecution,
-        TraceSpanPhase::End,
-        9,
-    );
-    sandbox_end.span_projection = Some(TraceSpanProjection {
-        sandbox: Some(TraceSandboxProjection {
-            workspace_mutation: Some(TraceWorkspaceMutation::Changed),
-            enforcement: Some(TraceSandboxEnforcement::Strict),
-            ..TraceSandboxProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    });
-
-    let mut transport_sample = TraceEvent::new(
-        "transport_samples",
-        "metrics_run",
-        "metrics_session",
-        "transport",
-        "closed samples",
-    );
-    transport_sample.metric_samples = vec![
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
-            count: 2,
-        },
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::ProviderCapabilityCacheMiss,
-            count: 1,
-        },
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::EventGap,
-            count: 3,
-        },
-    ];
-
-    store
-        .append_trace_batch(&[
-            prompt_start,
-            prompt_end,
-            provider_start,
-            provider_end,
-            tool_start,
-            tool_end,
-            tool_failed_start,
-            tool_failed_end,
-            sandbox_start,
-            sandbox_end,
-            transport_sample,
-        ])
-        .expect("append observation projections");
-
-    let stored = store.list_trace("metrics_run").expect("list trace");
-    let stored_prompt = stored
-        .iter()
-        .find(|event| event.event_id == "prompt_end")
-        .expect("prompt end");
-    assert_eq!(
-        stored_prompt
-            .span_projection
-            .as_ref()
-            .and_then(|projection| projection.request_digest.as_deref()),
-        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")
-    );
-    let stored_sandbox = stored
-        .iter()
-        .find(|event| event.event_id == "sandbox_end")
-        .expect("sandbox end");
-    assert_eq!(
-        stored_sandbox
-            .span_projection
-            .as_ref()
-            .and_then(|projection| projection.sandbox.as_ref())
-            .and_then(|sandbox| sandbox.workspace_mutation),
-        Some(TraceWorkspaceMutation::Changed)
-    );
-
-    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
-    assert_eq!(
-        metrics
-            .metric("provider_cached_input_tokens")
-            .expect("cached input metric")
-            .distribution
-            .as_ref()
-            .expect("cached input distribution")
-            .min,
-        Some(7)
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_count")
-            .expect("cache hit count")
-            .distribution
-            .as_ref()
-            .expect("cache hit distribution")
-            .min,
-        Some(2)
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_count")
-            .expect("cache hit count")
-            .distribution
-            .as_ref()
-            .expect("cache hit distribution")
-            .sum,
-        2
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_rate_bps")
-            .expect("cache hit rate")
-            .distribution
-            .as_ref()
-            .expect("cache hit rate distribution")
-            .min,
-        Some(6666)
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_rate_bps")
-            .expect("cache hit rate")
-            .distribution
-            .as_ref()
-            .expect("cache hit rate distribution")
-            .sum,
-        6666
-    );
-    assert_eq!(
-        metrics
-            .metric("tool_success_rate_bps")
-            .expect("tool success rate")
-            .distribution
-            .as_ref()
-            .expect("tool success rate distribution")
-            .min,
-        Some(5000)
-    );
-    assert_eq!(
-        metrics
-            .metric("tool_success_rate_bps")
-            .expect("tool success rate")
-            .distribution
-            .as_ref()
-            .expect("tool success rate distribution")
-            .sum,
-        5000
-    );
-    assert_eq!(
-        metrics
-            .metric("event_gap_count")
-            .expect("event gap")
-            .distribution
-            .as_ref()
-            .expect("event gap distribution")
-            .min,
-        Some(3)
-    );
-    assert_eq!(
-        metrics
-            .metric("event_gap_count")
-            .expect("event gap")
-            .distribution
-            .as_ref()
-            .expect("event gap distribution")
-            .sum,
-        3
-    );
-}
-
-#[test]
-fn trace_metrics_expose_known_zero_counts_and_single_sided_cache_capabilities() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-
-    let provider_start = metric_span(
-        "provider_success_start",
-        "provider_success",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::Start,
-        0,
-    );
-    let provider_end = metric_span(
-        "provider_success_end",
-        "provider_success",
-        TraceSpanKind::ProviderAttempt,
-        TraceSpanPhase::End,
-        1,
-    );
-    let mut tool_start = metric_span(
-        "tool_failure_start",
-        "tool_failure",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::Start,
-        0,
-    );
-    tool_start.span_projection = Some(TraceSpanProjection {
-        tool: Some(TraceToolProjection::default()),
-        ..TraceSpanProjection::default()
-    });
-    let mut tool_end = metric_span(
-        "tool_failure_end",
-        "tool_failure",
-        TraceSpanKind::ToolCall,
-        TraceSpanPhase::End,
-        1,
-    );
-    tool_end.span_status = Some(TraceSpanStatus::Error);
-    tool_end.span_projection = Some(TraceSpanProjection {
-        tool: Some(TraceToolProjection {
-            status: Some(TraceToolStatus::Failed),
-            ..TraceToolProjection::default()
-        }),
-        ..TraceSpanProjection::default()
-    });
-    let mut hit_samples = TraceEvent::new(
-        "cache_hit_samples",
-        "metrics_run",
-        "metrics_session",
-        "transport",
-        "cache hits",
-    );
-    hit_samples.metric_samples = vec![
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
-            count: 2,
-        },
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
-            count: 3,
-        },
-    ];
-    store
-        .append_trace_batch(&[
-            provider_start,
-            provider_end,
-            tool_start,
-            tool_end,
-            hit_samples,
-        ])
-        .expect("append known zero metrics");
-
-    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
-    for name in ["provider_error_count", "tool_success_count"] {
-        let metric = metrics.metric(name).expect("count metric");
-        assert!(matches!(
-            metric.availability,
-            TraceMetricAvailability::Available
-        ));
-        assert_eq!(
-            metric
-                .distribution
-                .as_ref()
-                .expect("count distribution")
-                .sum,
-            0
-        );
-    }
-    assert_eq!(
-        metrics
-            .metric("tool_success_rate_bps")
-            .expect("tool success rate")
-            .distribution
-            .as_ref()
-            .expect("tool success rate distribution")
-            .sum,
-        0
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_count")
-            .expect("cache hit count")
-            .distribution
-            .as_ref()
-            .expect("cache hit distribution")
-            .sum,
-        5
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_miss_count")
-            .expect("cache miss count")
-            .distribution
-            .as_ref()
-            .expect("cache miss distribution")
-            .sum,
-        0
-    );
-    assert_eq!(
-        metrics
-            .metric("provider_capability_cache_hit_rate_bps")
-            .expect("cache hit rate")
-            .distribution
-            .as_ref()
-            .expect("cache hit rate distribution")
-            .sum,
-        10_000
-    );
-
-    let miss_dir = tempfile::tempdir().expect("miss temp dir");
-    let miss_store =
-        SessionStore::open(miss_dir.path().join("sessions.sqlite3")).expect("open miss store");
-    let mut miss_samples = TraceEvent::new(
-        "cache_miss_samples",
-        "metrics_run",
-        "metrics_session",
-        "transport",
-        "cache misses",
-    );
-    miss_samples.metric_samples = vec![TraceMetricSample {
-        kind: TraceMetricSampleKind::ProviderCapabilityCacheMiss,
-        count: 4,
-    }];
-    miss_store
-        .append_trace(&miss_samples)
-        .expect("append cache miss");
-    let miss_metrics = miss_store
-        .trace_metrics("metrics_run")
-        .expect("miss metrics");
-    assert_eq!(
-        miss_metrics
-            .metric("provider_capability_cache_hit_count")
-            .expect("cache hit count")
-            .distribution
-            .as_ref()
-            .expect("cache hit distribution")
-            .sum,
-        0
-    );
-    assert_eq!(
-        miss_metrics
-            .metric("provider_capability_cache_miss_count")
-            .expect("cache miss count")
-            .distribution
-            .as_ref()
-            .expect("cache miss distribution")
-            .sum,
-        4
-    );
-    assert_eq!(
-        miss_metrics
-            .metric("provider_capability_cache_hit_rate_bps")
-            .expect("cache hit rate")
-            .distribution
-            .as_ref()
-            .expect("cache hit rate distribution")
-            .sum,
-        0
-    );
-}
-
-#[test]
-fn trace_metrics_fail_closed_for_missing_or_conflicting_tool_terminal_status() {
-    for (span_status, tool_status) in [
-        (TraceSpanStatus::Ok, None),
-        (TraceSpanStatus::Ok, Some(TraceToolStatus::Failed)),
-        (TraceSpanStatus::Cancelled, Some(TraceToolStatus::Succeeded)),
-    ] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let mut start = metric_span(
-            "tool_terminal_start",
-            "tool_terminal",
-            TraceSpanKind::ToolCall,
-            TraceSpanPhase::Start,
-            0,
-        );
-        start.span_projection = Some(TraceSpanProjection {
-            tool: Some(TraceToolProjection::default()),
-            ..TraceSpanProjection::default()
-        });
-        let mut end = metric_span(
-            "tool_terminal_end",
-            "tool_terminal",
-            TraceSpanKind::ToolCall,
-            TraceSpanPhase::End,
-            1,
-        );
-        end.span_status = Some(span_status);
-        end.span_projection = Some(TraceSpanProjection {
-            tool: Some(TraceToolProjection {
-                status: tool_status,
-                ..TraceToolProjection::default()
-            }),
-            ..TraceSpanProjection::default()
-        });
-        store
-            .append_trace_batch(&[start, end])
-            .expect("append tool trace");
-        assert!(store.trace_metrics("metrics_run").is_err());
-    }
-}
-
-#[test]
-fn trace_metric_sample_sum_overflow_fails_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut event = TraceEvent::new(
-        "overflow_samples",
-        "metrics_run",
-        "metrics_session",
-        "transport",
-        "overflow samples",
-    );
-    event.metric_samples = vec![
-        TraceMetricSample {
-            kind: TraceMetricSampleKind::EventGap,
-            count: i64::MAX as u64,
-        };
-        3
-    ];
-    store.append_trace(&event).expect("append overflow samples");
-    assert!(matches!(
-        store.trace_metrics("metrics_run"),
-        Err(StoreError::InvalidState(message)) if message.contains("trace metric sum overflow")
-    ));
-}
-
-#[test]
-fn trace_metrics_expose_unavailable_reasons_instead_of_zero_placeholders() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    store
-        .append_trace(&TraceEvent::new(
-            "legacy_metric_event",
-            "legacy_metric_run",
-            "legacy_metric_session",
-            "legacy",
-            "legacy",
-        ))
-        .expect("legacy event");
-    let metrics = store
-        .trace_metrics("legacy_metric_run")
-        .expect("legacy metrics");
-    assert!(matches!(
-        metrics
-            .metric("provider_time_to_first_token_ms")
-            .expect("ttft")
-            .availability,
-        TraceMetricAvailability::Unavailable { .. }
-    ));
-    assert!(
-        metrics
-            .metric("provider_time_to_first_token_ms")
-            .expect("ttft")
-            .distribution
-            .is_none()
-    );
-    assert!(matches!(
-        metrics
-            .metric("provider_capability_cache_hit_rate_bps")
-            .expect("cache hit rate")
-            .availability,
-        TraceMetricAvailability::Unavailable {
-            reason: singularity_protocol::TraceMetricUnavailableReason::LegacyOnly
-        }
-    ));
-    assert!(matches!(
-        metrics
-            .metric("tool_success_rate_bps")
-            .expect("tool success rate")
-            .availability,
-        TraceMetricAvailability::Unavailable {
-            reason: singularity_protocol::TraceMetricUnavailableReason::LegacyOnly
-        }
-    ));
-}
-
-#[test]
-fn trace_envelope_and_projection_tampering_fail_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut event = TraceEvent::new(
-        "trace_envelope_tampered",
-        "run_envelope",
-        "session_envelope",
-        "test",
-        "safe summary",
-    );
-    event.timestamp = Some("2026-07-21T00:00:00Z".to_string());
-    store.append_trace(&event).expect("append envelope trace");
-    let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
-    let payload: String = connection
-        .query_row(
-            "select payload from trace_events where event_id = 'trace_envelope_tampered'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read envelope payload");
-    let mut payload: Value = serde_json::from_str(&payload).expect("parse envelope payload");
-    payload["timestamp"] = serde_json::json!("2026-07-21T00:00:01Z");
-    connection
-        .execute(
-            "update trace_events set payload = ?1 where event_id = 'trace_envelope_tampered'",
-            [serde_json::to_string(&payload).expect("serialize envelope payload")],
-        )
-        .expect("tamper envelope");
-    assert!(matches!(
-        store.show_trace("trace_envelope_tampered"),
-        Err(StoreError::TraceIntegrity(_))
-    ));
-    drop(connection);
-
-    let typed = provider_span("projection_tampered", TraceSpanPhase::Start);
-    store.append_trace(&typed).expect("append typed trace");
-    let connection = rusqlite::Connection::open(&db_path).expect("open projection connection");
-    connection
-        .execute(
-            "update trace_events set span_kind = 'turn' where event_id = 'projection_tampered'",
-            [],
-        )
-        .expect("tamper projection");
-    assert!(matches!(
-        store.show_trace("projection_tampered"),
-        Err(StoreError::InvalidState(message)) if message.contains("columns do not match")
-    ));
-}
-
-#[test]
-fn verification_projection_corruption_and_unknown_repair_reason_fail_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-
-    for (event_id, projection) in [
-        (
-            "projection_malformed",
-            r#"{"verification":{"bogus":true}}"#.to_string(),
-        ),
-        (
-            "projection_unknown_repair_reason",
-            r#"{"verification":{"repair_reason":"unknown"}}"#.to_string(),
-        ),
-    ] {
-        let db_path = dir.path().join(format!("{event_id}.sqlite3"));
-        let store = SessionStore::open(&db_path).expect("open store");
-        let mut event = TraceEvent::new(
-            event_id,
-            "run_projection_corruption",
-            "session_projection_corruption",
-            "test",
-            "projection",
-        );
-        event.span_id = Some(format!("{event_id}_span"));
-        event.span_kind = Some(TraceSpanKind::Verification);
-        event.span_phase = Some(TraceSpanPhase::Start);
-        event.span_projection = Some(TraceSpanProjection {
-            verification: Some(TraceVerificationProjection::default()),
-            ..TraceSpanProjection::default()
-        });
-        store.append_trace(&event).expect("append projection");
-
-        let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
-        connection
-            .execute(
-                "update trace_events set span_projection = ?1 where event_id = ?2",
-                rusqlite::params![projection, event_id],
-            )
-            .expect("tamper projection");
-        drop(connection);
-
-        assert!(matches!(
-            store.show_trace(event_id),
-            Err(StoreError::InvalidState(message))
-                if message.contains("trace span projection is invalid")
-        ));
-    }
-}
-
-#[test]
-fn v11_to_v13_migration_rehashes_legacy_trace_without_fabricating_spans() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("v11.sqlite3");
-    create_v11_database(&db_path);
-    let mut legacy = TraceEvent::new(
-        "v11_legacy_trace",
-        "thread_v10",
-        "thread_v10",
-        "legacy",
-        "legacy event",
-    );
-    legacy.payload = serde_json::json!({"safe": true});
-    let connection = rusqlite::Connection::open(&db_path).expect("open v11 connection");
-    connection
-        .execute(
-            "insert into trace_events(event_id, run_id, session_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                legacy.event_id,
-                legacy.run_id,
-                legacy.session_id,
-                serde_json::to_string(&legacy).expect("legacy trace")
-            ],
-        )
-        .expect("insert v11 trace");
-    drop(connection);
-
-    let migrated = SessionStore::open(&db_path).expect("migrate v11 store");
-    let stored = migrated
-        .show_trace("v11_legacy_trace")
-        .expect("read migrated trace");
-    assert_eq!(migrated.descriptor().schema_version, 13);
-    assert_eq!(stored.span_id, None);
-    assert_eq!(stored.parent_span_id, None);
-    assert_eq!(stored.span_kind, None);
-    assert_eq!(stored.span_phase, None);
-    assert_eq!(stored.span_status, None);
-    assert_eq!(stored.duration_ms, None);
-    assert_eq!(stored.time_to_first_token_ms, None);
-    let connection = rusqlite::Connection::open(&db_path).expect("inspect migrated trace");
-    let projection: (Option<String>, Option<String>, Option<String>, Option<i64>) = connection
-        .query_row(
-            "select span_id, span_kind, span_phase, duration_ms
-             from trace_events where event_id = 'v11_legacy_trace'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .expect("read migrated projection");
-    assert_eq!(projection, (None, None, None, None));
-}
-
-#[test]
-fn v9_empty_trace_payload_hash_migrates_as_pre_hash_legacy() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("v9-empty-trace-hash.sqlite3");
-    create_legacy_enum_database(&db_path, 9);
-    remove_legacy_pending_approval(&db_path, 9);
-
-    let mut legacy = TraceEvent::new(
-        "v9_empty_trace_hash",
-        "thread_legacy",
-        "thread_legacy",
-        "legacy",
-        "Authorization: Bearer v9-secret",
-    );
-    legacy.redaction_applied = true;
-    legacy.payload = serde_json::json!({"authorization": "Bearer v9-secret"});
-    legacy.payload_hash.clear();
-    let connection = rusqlite::Connection::open(&db_path).expect("open v9 connection");
-    connection
-        .execute(
-            "insert into trace_events(event_id, run_id, session_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                legacy.event_id,
-                legacy.run_id,
-                legacy.session_id,
-                serde_json::to_string(&legacy).expect("legacy trace")
-            ],
-        )
-        .expect("insert v9 trace");
-    drop(connection);
-
-    let migrated = SessionStore::open(&db_path).expect("migrate v9 store");
-    let stored = migrated
-        .show_trace("v9_empty_trace_hash")
-        .expect("read migrated trace");
-    assert_eq!(migrated.descriptor().schema_version, 13);
-    assert_eq!(stored.summary, "[redacted]");
-    assert_eq!(stored.payload["authorization"], "[redacted]");
-    assert!(stored.payload_hash.starts_with("sha256:"));
-}
-
-#[test]
-fn v9_nonempty_trace_payload_hash_mismatch_fails_closed_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("v9-bad-trace-hash.sqlite3");
-    create_legacy_enum_database(&db_path, 9);
-    remove_legacy_pending_approval(&db_path, 9);
-
-    let mut legacy = TraceEvent::new(
-        "v9_bad_trace_hash",
-        "thread_legacy",
-        "thread_legacy",
-        "legacy",
-        "legacy event",
-    );
-    legacy.redaction_applied = true;
-    legacy.payload = serde_json::json!({"safe": true});
-    legacy.payload_hash = format!("sha256:{}", "0".repeat(64));
-    let connection = rusqlite::Connection::open(&db_path).expect("open v9 connection");
-    connection
-        .execute(
-            "insert into trace_events(event_id, run_id, session_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                legacy.event_id,
-                legacy.run_id,
-                legacy.session_id,
-                serde_json::to_string(&legacy).expect("legacy trace")
-            ],
-        )
-        .expect("insert v9 trace");
-    drop(connection);
-    let before = sqlite_snapshot(&db_path);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::TraceIntegrity(message))
-            if message.contains("trace envelope hash mismatch")
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-}
-
-#[test]
-fn v10_empty_trace_payload_hash_fails_closed_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("v10-empty-trace-hash.sqlite3");
-    create_v10_database(&db_path);
-
-    let mut legacy = TraceEvent::new(
-        "v10_empty_trace_hash",
-        "thread_v10",
-        "thread_v10",
-        "legacy",
-        "legacy event",
-    );
-    legacy.redaction_applied = true;
-    legacy.payload = serde_json::json!({"safe": true});
-    legacy.payload_hash.clear();
-    let connection = rusqlite::Connection::open(&db_path).expect("open v10 connection");
-    connection
-        .execute(
-            "insert into trace_events(event_id, run_id, session_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                legacy.event_id,
-                legacy.run_id,
-                legacy.session_id,
-                serde_json::to_string(&legacy).expect("legacy trace")
-            ],
-        )
-        .expect("insert v10 trace");
-    drop(connection);
-    let before = sqlite_snapshot(&db_path);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::TraceIntegrity(message))
-            if message.contains("trace envelope hash mismatch")
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-}
-
-#[test]
-fn invalid_v11_span_data_rolls_back_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("invalid-v11.sqlite3");
-    create_v11_database(&db_path);
-    let mut invalid = provider_span("invalid_v11_span", TraceSpanPhase::Start);
-    invalid.span_status = Some(TraceSpanStatus::Ok);
-    let connection = rusqlite::Connection::open(&db_path).expect("open v11 connection");
-    connection
-        .execute(
-            "insert into trace_events(event_id, run_id, session_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                invalid.event_id,
-                invalid.run_id,
-                invalid.session_id,
-                serde_json::to_string(&invalid).expect("invalid trace")
-            ],
-        )
-        .expect("insert invalid v11 trace");
-    drop(connection);
-    let before = sqlite_snapshot(&db_path);
-    assert!(SessionStore::open(&db_path).is_err());
-    assert_eq!(sqlite_snapshot(&db_path), before);
-}
-
-// 验证 trace tail 返回有界且按时间正序排列的最新窗口。
-#[test]
-fn trace_tail_returns_the_bounded_latest_window_in_chronological_order() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    for index in 0..100 {
-        store
-            .append_trace(&TraceEvent::new(
-                format!("trace_window_{index}"),
-                "run_window",
-                "session_window",
-                "test",
-                format!("event {index}"),
-            ))
-            .expect("append trace");
-    }
-
-    let tail = store.tail_trace("run_window", 3, Some(2)).expect("tail");
-    assert_eq!(
-        tail.into_iter()
-            .map(|event| event.event_id)
-            .collect::<Vec<_>>(),
-        vec!["trace_window_95", "trace_window_96", "trace_window_97"]
-    );
-}
-
-// 验证 artifact ref 持久化并脱敏 secret-like metadata。
-#[test]
-fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let item = store
-        .append_item(
-            &turn.turn_id,
-            ItemKind::FileChange,
-            serde_json::json!({"changed_files": ["safe/result.txt"]}),
-        )
-        .expect("item");
-    let content_digest = format!("sha256:{}", "a".repeat(64));
-
-    let artifact = store
-        .register_artifact_ref(RegisterArtifactRefParams {
-            run_id: &thread.thread_id,
-            item_id: Some(&item.item_id),
-            kind: "file",
-            uri: "artifact://safe/result.txt",
-            content_digest: &content_digest,
-            summary: "contains token output",
-            metadata: serde_json::json!({
-                "path": "safe/result.txt",
-                "api_key": "abc123",
-                "nested": {"authorization": "Bearer abc123"}
-            }),
-        })
-        .expect("artifact");
-
-    assert!(artifact.redacted);
-    assert_eq!(artifact.summary, "[redacted]");
-    assert_eq!(artifact.metadata["api_key"], "[redacted]");
-    assert_eq!(artifact.metadata["nested"]["authorization"], "[redacted]");
-    let fetched = store
-        .get_artifact_ref(&artifact.artifact_id)
-        .expect("fetched");
-    assert_eq!(fetched, artifact);
-    assert_eq!(
-        store.list_artifact_refs(&thread.thread_id).expect("list")[0].artifact_id,
-        artifact.artifact_id
-    );
-
-    let connection =
-        rusqlite::Connection::open(dir.path().join("sessions.sqlite3")).expect("reopen sqlite");
-    connection
-        .execute(
-            "update artifact_refs set metadata = ?1 where artifact_id = ?2",
-            rusqlite::params![
-                serde_json::json!({"note": "token=raw"}).to_string(),
-                artifact.artifact_id
-            ],
-        )
-        .expect("tamper metadata");
-    let tampered = store.get_artifact_ref(&artifact.artifact_id);
-    assert!(matches!(
-        tampered,
-        Err(StoreError::InvalidState(message)) if message.contains("unredacted sensitive")
-    ));
-}
-
-// 验证 artifact registration 在同一事务内拒绝不存在、错绑和重复引用，并随 thread 删除。
-#[test]
-fn artifact_registration_enforces_thread_turn_item_binding_and_deletion() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let item = store
-        .append_item(
-            &turn.turn_id,
-            ItemKind::FileChange,
-            serde_json::json!({"changed_files": ["safe/result.txt"]}),
-        )
-        .expect("item");
-    let other_thread = store.create_thread(None, None).expect("other thread");
-    let other_turn = store
-        .create_turn(&other_thread.thread_id, "running")
-        .expect("other turn");
-    let other_item = store
-        .append_item(
-            &other_turn.turn_id,
-            ItemKind::FileChange,
-            serde_json::json!({"changed_files": ["other.txt"]}),
-        )
-        .expect("other item");
-    let content_digest = format!("sha256:{}", "b".repeat(64));
-    fn registration<'a>(
-        run_id: &'a str,
-        item_id: Option<&'a str>,
-        content_digest: &'a str,
-    ) -> RegisterArtifactRefParams<'a> {
-        RegisterArtifactRefParams {
-            run_id,
-            item_id,
-            kind: "file",
-            uri: "artifact://safe/result.txt",
-            content_digest,
-            summary: "safe result",
-            metadata: serde_json::json!({"path": "safe/result.txt"}),
-        }
-    }
-
-    assert!(matches!(
-        store.register_artifact_ref(registration(
-            "missing_thread",
-            None,
-            &content_digest
-        )),
-        Err(StoreError::NotFound(message)) if message == "artifact run missing_thread"
-    ));
-    assert!(matches!(
-        store.register_artifact_ref(registration(
-            &turn.turn_id,
-            Some(&item.item_id),
-            &content_digest
-        )),
-        Err(StoreError::InvalidState(message)) if message.contains("run_id must identify a thread")
-    ));
-    assert!(matches!(
-        store.register_artifact_ref(registration(
-            &thread.thread_id,
-            Some("missing_item"),
-            &content_digest
-        )),
-        Err(StoreError::NotFound(message)) if message == "artifact item missing_item"
-    ));
-    assert!(matches!(
-        store.register_artifact_ref(registration(
-            &thread.thread_id,
-            Some(&other_item.item_id),
-            &content_digest
-        )),
-        Err(StoreError::InvalidState(message)) if message.contains("item does not belong to run")
-    ));
-
-    let artifact = store
-        .register_artifact_ref(registration(
-            &thread.thread_id,
-            Some(&item.item_id),
-            &content_digest,
-        ))
-        .expect("valid artifact");
-    assert!(matches!(
-        store.register_artifact_ref(registration(
-            &thread.thread_id,
-            Some(&item.item_id),
-            &content_digest,
-        )),
-        Err(StoreError::AlreadyExists(message)) if message.contains("artifact")
-    ));
-
-    store
-        .update_turn_status(&turn.turn_id, TurnStatus::Completed)
-        .expect("complete turn");
-    store
-        .delete_thread(&thread.thread_id)
-        .expect("delete thread");
-    assert!(matches!(
-        store.get_artifact_ref(&artifact.artifact_id),
-        Err(StoreError::NotFound(message)) if message == format!("artifact {}", artifact.artifact_id)
-    ));
-}
-
-// 验证 artifact 的公共字段合同在任何写入前拒绝歧义或不可验证输入。
-#[test]
-fn artifact_registration_rejects_invalid_public_contract_fields() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let item = store
-        .append_item(
-            &turn.turn_id,
-            ItemKind::FileChange,
-            serde_json::json!({"changed_files": ["safe/result.txt"]}),
-        )
-        .expect("item");
-    let content_digest = format!("sha256:{}", "c".repeat(64));
-    let valid = || RegisterArtifactRefParams {
-        run_id: &thread.thread_id,
-        item_id: Some(&item.item_id),
-        kind: "file",
-        uri: "artifact://safe/result.txt",
-        content_digest: &content_digest,
-        summary: "safe result",
-        metadata: serde_json::json!({"path": "safe/result.txt"}),
-    };
-
-    let mut invalid_kind = valid();
-    invalid_kind.kind = "";
-    assert!(matches!(
-        store.register_artifact_ref(invalid_kind),
-        Err(StoreError::InvalidState(message)) if message.contains("artifact kind")
-    ));
-
-    let mut invalid_uri = valid();
-    invalid_uri.uri = "file://outside/result.txt";
-    assert!(matches!(
-        store.register_artifact_ref(invalid_uri),
-        Err(StoreError::InvalidState(message)) if message.contains("artifact uri")
-    ));
-
-    let mut invalid_digest = valid();
-    invalid_digest.content_digest = "sha256:short";
-    assert!(matches!(
-        store.register_artifact_ref(invalid_digest),
-        Err(StoreError::InvalidState(message)) if message.contains("artifact content digest")
-    ));
-
-    let mut invalid_metadata = valid();
-    invalid_metadata.metadata = serde_json::json!({
-        "artifact_ref": "artifact://unregistered",
-    });
-    assert!(matches!(
-        store.register_artifact_ref(invalid_metadata),
-        Err(StoreError::InvalidState(message)) if message.contains("artifact metadata")
-    ));
 }
 
 // 验证 v5 数据库重开时补齐稳定的 turn/item sequence。
@@ -5421,7 +1629,6 @@ fn v5_reopen_backfills_stable_explicit_turn_and_item_sequences() {
         }
     }
 }
-
 // 验证并发连接会串行化 v5 history migration。
 #[test]
 fn concurrent_connections_serialize_the_v5_history_migration() {
@@ -5465,13 +1672,11 @@ fn v11_missing_migration_marker_fails_closed_without_mutation() {
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (_, item, _) = store
-        .create_turn_with_input_and_trace(
+    let (_, item) = store
+        .create_turn_with_input(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "safe"}]),
-            "test",
-            "turn started",
         )
         .expect("turn");
     drop(store);
@@ -5500,7 +1705,6 @@ fn v11_missing_migration_marker_fails_closed_without_mutation() {
         .expect("read unchanged item");
     assert!(payload.contains("safe"));
 }
-
 // 验证已完成 history 可持久化、排序并按 turn 分页。
 #[test]
 fn completed_history_is_durable_ordered_and_paged_by_turn() {
@@ -5600,7 +1804,6 @@ fn completed_history_is_durable_ordered_and_paged_by_turn() {
         ]
     );
 }
-
 // 验证 history 排除非 completed turn 与非 conversation item。
 #[test]
 fn history_excludes_non_completed_turns_and_non_conversation_items() {
@@ -5617,12 +1820,10 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
         TurnStatus::Interrupted,
     ] {
         let started = store
-            .create_turn_with_input_trace_and_history(
+            .create_turn_with_input_and_history(
                 &thread.thread_id,
                 "running",
                 serde_json::json!([{"type": "text", "text": "must not replay"}]),
-                "test",
-                "turn started",
                 10,
             )
             .expect("start non-completed turn");
@@ -5648,12 +1849,10 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
     }
 
     let incomplete = store
-        .create_turn_with_input_trace_and_history(
+        .create_turn_with_input_and_history(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "incomplete completed turn"}]),
-            "test",
-            "turn started",
             10,
         )
         .expect("start incomplete turn");
@@ -5688,15 +1887,6 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
             serde_json::json!({"command": "secret tool metadata"}),
         )
         .expect("tool item");
-    store
-        .append_trace(&TraceEvent::new(
-            "history_trace",
-            &thread.thread_id,
-            &thread.thread_id,
-            "test",
-            "trace metadata",
-        ))
-        .expect("trace");
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute(
@@ -5709,18 +1899,6 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
         )
         .expect("started item");
     drop(connection);
-    store
-        .register_artifact_ref(RegisterArtifactRefParams {
-            run_id: &thread.thread_id,
-            item_id: None,
-            kind: "file",
-            uri: "artifact://history/result.txt",
-            content_digest:
-                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            summary: "artifact metadata",
-            metadata: serde_json::json!({"safe": true}),
-        })
-        .expect("artifact");
 
     let history = store
         .read_thread_history(&thread.thread_id, None, 20)
@@ -5730,9 +1908,7 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
     assert_eq!(history.messages[1].content, "safe assistant");
 }
 
-// Issue #24 批次 A（失败证据）：带追加输入（steer/follow-up）的 completed turn
-// 应完整进入下一轮历史。当前实现只收恰好 [User, Assistant] 两条消息的 turn，
-// 该 turn 会被整体排除，下一轮历史缺失追加输入前后的消息。
+// 带追加输入（steer/follow-up）的 completed turn 应完整进入下一轮历史。
 #[test]
 fn completed_turn_with_follow_up_messages_is_included_in_history() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5757,12 +1933,10 @@ fn completed_turn_with_follow_up_messages_is_included_in_history() {
         .expect("second assistant item");
 
     let started = store
-        .create_turn_with_input_trace_and_history(
+        .create_turn_with_input_and_history(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "current user"}]),
-            "test",
-            "turn started",
             10,
         )
         .expect("start next turn");
@@ -5783,7 +1957,6 @@ fn completed_turn_with_follow_up_messages_is_included_in_history() {
         ]
     );
 }
-
 #[test]
 fn history_decodes_all_selected_item_status_and_kind_values_before_projection() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5820,12 +1993,10 @@ fn item_storage_and_history_redact_sensitive_user_and_assistant_text() {
     let raw_assistant_secret = "Bearer abcdefghijklmnopqrstuvwxyz123456";
     let raw_tool_secret = "token=abcdefghijklmnopqrstuvwxyz123456";
     let started = store
-        .create_turn_with_input_trace_and_history(
+        .create_turn_with_input_and_history(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": raw_user_secret}]),
-            "test",
-            "turn started",
             10,
         )
         .expect("start turn");
@@ -5925,18 +2096,15 @@ fn archived_thread_cannot_start_a_turn() {
         Err(StoreError::InvalidState(_))
     ));
     assert!(matches!(
-        store.create_turn_with_input_trace_and_history(
+        store.create_turn_with_input_and_history(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "cannot start"}]),
-            "test",
-            "turn started",
             10,
         ),
         Err(StoreError::InvalidState(_))
     ));
 }
-
 // 验证 turn 与 item 的唯一 sequence 索引拒绝重复值。
 #[test]
 fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
@@ -6058,7 +2226,6 @@ fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
         (1..=u64::try_from(WORKERS).expect("worker count")).collect::<Vec<_>>()
     );
 }
-
 // 验证共享 workspace 的执行 guard 串行化并在 owner 丢失后释放。
 #[test]
 fn workspace_execution_guard_serializes_shared_workspace_and_releases_after_owner_loss() {
@@ -6127,12 +2294,10 @@ fn started_turn_returns_prior_history_from_the_same_atomic_start_boundary() {
         append_completed_conversation(&store, &thread.thread_id, "prior user", "prior assistant");
 
     let started = store
-        .create_turn_with_input_trace_and_history(
+        .create_turn_with_input_and_history(
             &thread.thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": "current user"}]),
-            "test",
-            "turn started",
             10,
         )
         .expect("start turn");
@@ -6146,8 +2311,6 @@ fn started_turn_returns_prior_history_from_the_same_atomic_start_boundary() {
             .all(|message| message.turn_id == prior_turn)
     );
     assert_eq!(started.item.turn_id, started.turn.turn_id);
-    assert_eq!(started.trace.run_id, thread.thread_id);
-    assert_eq!(started.trace.session_id, started.turn.turn_id);
 }
 
 // 追加一条 completed conversation，供 history 测试构造数据。
@@ -6157,13 +2320,11 @@ fn append_completed_conversation(
     user: &str,
     assistant: &str,
 ) -> String {
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             thread_id,
             "running",
             serde_json::json!([{"type": "text", "text": user}]),
-            "test",
-            "turn started",
         )
         .expect("start turn");
     store
@@ -6178,7 +2339,6 @@ fn append_completed_conversation(
         .expect("complete turn");
     turn.turn_id
 }
-
 // 创建用于 v5 migration 测试的历史数据库。
 fn create_v5_history_database(path: &std::path::Path) {
     let connection = rusqlite::Connection::open(path).expect("open v5 sqlite");
@@ -6292,7 +2452,6 @@ fn remove_legacy_pending_approval(path: &std::path::Path, schema_version: u32) {
         )
         .expect("remove legacy pending approval");
 }
-
 // 创建真实历史版本的最小数据库：v1/v2 仍没有 schema_meta，v3/v4
 // 还携带已删除的 active_sidecar_runs，v5 以后才使用 schema_meta；当前
 // v11 migration 会读取并丢弃这个已移除的运行时 sidecar，而不把它带入现行 schema。
@@ -6576,7 +2735,6 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
             }
         }
     }
-
     let active = serde_json::to_string(&ThreadStatus::Active).expect("thread status");
     let completed = serde_json::to_string(&TurnStatus::Completed).expect("turn status");
     let blocked = serde_json::to_string(&TurnStatus::Blocked).expect("turn status");
@@ -6681,7 +2839,6 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
                 .expect("insert legacy item");
         }
     }
-
     let thread_trace = legacy_trace_payload("trace_legacy_thread", thread_id, thread_id, None);
     let turn_trace = legacy_trace_payload(
         "trace_legacy_turn_repair",
@@ -6755,16 +2912,25 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
             .expect("insert legacy sidecar run");
     }
 }
-
-
+// 旧库 trace 行只需在迁移时被读取并丢弃；payload 以可解析 JSON 构造即可。
 fn legacy_trace_payload(
     event_id: &str,
     run_id: &str,
     session_id: &str,
     task_id: Option<&str>,
 ) -> String {
-    let mut event = TraceEvent::new(event_id, run_id, session_id, "legacy", "legacy trace");
-    event.task_id = task_id.map(str::to_string);
+    let mut event = serde_json::json!({
+        "event_id": event_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "source": "legacy",
+        "summary": "legacy trace",
+        "payload": {"safe": true},
+    });
+    if let Some(task_id) = task_id {
+        event["task_id"] = serde_json::json!(task_id);
+    }
     serde_json::to_string(&event).expect("serialize legacy trace")
 }
 
@@ -6854,4 +3020,82 @@ fn read_history_sequences(path: &std::path::Path) -> HistorySequences {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect items");
     (turns, items)
+}
+// 一次性探针（验证后删除）
+#[test]
+fn probe_resume_commit_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _) = store
+        .create_turn_with_input(
+            &thread.thread_id,
+            "paused",
+            serde_json::json!([{"type": "text", "text": "resume me"}]),
+        )
+        .expect("turn");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Paused, "paused")
+        .expect("paused turn");
+    let item_id = SessionStore::allocate_assistant_item_id();
+    let result = store.commit_turn_outcome_with_authority(
+        &turn.turn_id,
+        CommitTurnOutcomeParams {
+            status: TurnStatus::Completed,
+            agent_loop_status: "completed",
+            assistant_item_id: Some(&item_id),
+            assistant_delta: Some("resumed answer"),
+        },
+        TurnOutcomeAuthority::AgentLoop,
+    );
+    match result {
+        Ok(committed) => println!("PROBE commit ok: {}", committed.turn.status.as_storage_text()),
+        Err(e) => println!("PROBE commit err: {e:?}"),
+    }
+}
+
+// 验证 paused/suspended 无 owner turn 在 workspace 恢复时保持可恢复（turn/resume 依赖）。
+#[test]
+fn workspace_recovery_preserves_paused_and_suspended_turns() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let paused_workspace = dir.path().join("paused-workspace");
+    let suspended_workspace = dir.path().join("suspended-workspace");
+    std::fs::create_dir(&paused_workspace).expect("paused workspace");
+    std::fs::create_dir(&suspended_workspace).expect("suspended workspace");
+    let store = SessionStore::open(&db_path).expect("store");
+    let paused_thread = store
+        .create_thread(None, Some(&paused_workspace.to_string_lossy()))
+        .expect("paused thread");
+    let paused = store
+        .create_turn(&paused_thread.thread_id, "running")
+        .expect("paused turn");
+    store
+        .update_turn_state(&paused.turn_id, TurnStatus::Paused, "paused")
+        .expect("pause");
+    let suspended_thread = store
+        .create_thread(None, Some(&suspended_workspace.to_string_lossy()))
+        .expect("suspended thread");
+    let suspended = store
+        .create_turn(&suspended_thread.thread_id, "running")
+        .expect("suspended turn");
+    store
+        .update_turn_state(&suspended.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend");
+
+    store
+        .recover_unowned_workspace_executions()
+        .expect("recover");
+
+    assert_eq!(
+        store.get_turn(&paused.turn_id).expect("paused").status,
+        TurnStatus::Paused
+    );
+    assert_eq!(
+        store
+            .get_turn(&suspended.turn_id)
+            .expect("suspended")
+            .status,
+        TurnStatus::Suspended
+    );
 }

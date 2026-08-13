@@ -735,9 +735,9 @@ pub struct Turn {
 /// turn 的生命周期状态。
 pub enum TurnStatus {
     Running,
-    /// 用户显式暂停；保留 checkpoint、释放执行 owner，并可通过 turn/resume 继续。
+    /// 用户显式暂停；非终态，可通过显式 turn/resume 继续。
     Paused,
-    /// The owner exited while a safe checkpoint was available. This is resumable only through
+    /// The owner exited while the turn was not terminal. This is resumable only through
     /// an explicit turn/resume request and is not a terminal outcome.
     Suspended,
     Completed,

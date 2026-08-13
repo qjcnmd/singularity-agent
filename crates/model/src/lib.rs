@@ -245,7 +245,7 @@ pub enum ProviderToolReasoningMode {
 /// Provider-private reasoning state that is safe to replay at the adapter
 /// boundary but must never be displayed or projected into public conversation,
 /// trace, Evaluation, or error schemas. The Rust type is public only because
-/// Agent and app-server own the checkpoint/restore boundary.
+/// the harness owns the reasoning-replay boundary between turns.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderReasoningReplay {
@@ -1188,7 +1188,7 @@ pub struct ProviderAttemptMetadata {
     pub attempt_count: u32,
     pub retry_count: u32,
     pub latency_ms: u64,
-    /// 运行期 typed observation；不进入现有 checkpoint、trace JSON 或公共 schema。
+    /// 运行期 typed observation；不进入公共 schema。
     #[serde(skip)]
     #[schemars(skip)]
     pub occurrences: Vec<ProviderAttemptOccurrence>,

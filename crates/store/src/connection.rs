@@ -241,13 +241,15 @@ impl SessionStore {
     }
 
     // 将 thread 中遗留的非终态 turn 收敛为 Interrupted。
+    // Paused/Suspended 是刻意无 owner、可经 turn/resume 恢复的状态（resume 认领
+    // workspace guard 时不能把目标 turn 终态化），因此不参与 owner 丢失收敛。
     pub(crate) fn recover_abandoned_turns_for_thread(
         transaction: &Connection,
         thread_id: &str,
     ) -> StoreResult<Vec<String>> {
         let mut statement = transaction.prepare(
             "select turn_id from turns
-             where thread_id = ?1 and status not in (?2, ?3, ?4)
+             where thread_id = ?1 and status not in (?2, ?3, ?4, ?5, ?6)
              order by turn_sequence",
         )?;
         let turn_ids = statement
@@ -257,6 +259,8 @@ impl SessionStore {
                     TurnStatus::Completed.to_db_text(),
                     TurnStatus::Failed.to_db_text(),
                     TurnStatus::Interrupted.to_db_text(),
+                    TurnStatus::Paused.to_db_text(),
+                    TurnStatus::Suspended.to_db_text(),
                 ],
                 |row| row.get::<_, String>(0),
             )?

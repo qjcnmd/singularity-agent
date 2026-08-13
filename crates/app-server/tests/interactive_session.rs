@@ -367,56 +367,53 @@ fn thread_start_freezes_resolved_default_selector_when_model_is_omitted() {
     process.shutdown(3);
 }
 
-// 启动恢复 E2E：预置两个无 checkpoint 的非终态 turn（suspended），同一 App
-// Server 启动成功后全部收敛为 interrupted，且不阻断启动（新核心无 checkpoint
-// 语义，owner 丢失的非终态 turn 统一终态化）。
+// 启动恢复 E2E：预置一个 ownerless running turn 与一个 suspended turn，同一
+// App Server 启动成功后 running turn 收敛为 interrupted（owner 丢失），
+// suspended turn 保持可恢复（刻意无 owner，turn/resume 可继续），不阻断启动。
 #[test]
-fn app_server_startup_terminalizes_ownerless_nonterminal_turns() {
+fn app_server_startup_recovers_ownerless_running_turn_only() {
     let provider = ControlledProvider::start();
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = create_workspace(dir.path());
     let db_path = dir.path().join("sessions.sqlite3");
 
     let store = SessionStore::open(&db_path).expect("preload store");
-    let first_thread = store.create_thread(None, None).expect("first thread");
-    let first_turn = store
-        .create_turn(&first_thread.thread_id, "running")
-        .expect("first turn");
+    let running_thread = store.create_thread(None, None).expect("running thread");
+    let running_turn = store
+        .create_turn(&running_thread.thread_id, "running")
+        .expect("running turn");
+    let suspended_thread = store.create_thread(None, None).expect("suspended thread");
+    let suspended_turn = store
+        .create_turn(&suspended_thread.thread_id, "running")
+        .expect("suspended turn");
     store
-        .update_turn_state(&first_turn.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend first turn");
-    let second_thread = store.create_thread(None, None).expect("second thread");
-    let second_turn = store
-        .create_turn(&second_thread.thread_id, "running")
-        .expect("second turn");
-    store
-        .update_turn_state(&second_turn.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend second turn");
+        .update_turn_state(&suspended_turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend turn");
     drop(store);
 
     let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
     process.initialize();
 
-    process.send_request(2, "turn/status", json!({"turnId": first_turn.turn_id}));
-    let first_response = process.output.recv_id(2, Duration::from_secs(5));
+    process.send_request(2, "turn/status", json!({"turnId": running_turn.turn_id}));
+    let running_response = process.output.recv_id(2, Duration::from_secs(5));
     assert_eq!(
-        first_response["result"]["turn"]["status"], "interrupted",
-        "ownerless turn must be terminalized during startup: {first_response}"
+        running_response["result"]["turn"]["status"], "interrupted",
+        "ownerless running turn must be terminalized during startup: {running_response}"
     );
     assert_eq!(
-        first_response["result"]["turn"]["agent_loop_status"],
+        running_response["result"]["turn"]["agent_loop_status"],
         "interrupted"
     );
 
-    process.send_request(3, "turn/status", json!({"turnId": second_turn.turn_id}));
-    let second_response = process.output.recv_id(3, Duration::from_secs(5));
+    process.send_request(3, "turn/status", json!({"turnId": suspended_turn.turn_id}));
+    let suspended_response = process.output.recv_id(3, Duration::from_secs(5));
     assert_eq!(
-        second_response["result"]["turn"]["status"], "interrupted",
-        "all ownerless turns must be terminalized: {second_response}"
+        suspended_response["result"]["turn"]["status"], "suspended",
+        "suspended turn must remain resumable: {suspended_response}"
     );
     assert_eq!(
-        second_response["result"]["turn"]["agent_loop_status"],
-        "interrupted"
+        suspended_response["result"]["turn"]["agent_loop_status"],
+        "suspended"
     );
 
     process.shutdown(4);
@@ -424,8 +421,8 @@ fn app_server_startup_terminalizes_ownerless_nonterminal_turns() {
 
 // 非终态 turn 错误映射：thread/archive 与 turn/start 的 JSON-RPC error message
 // 携带已确认的 turn ID 与可操作提示（保留 error code，不新增协议字段）。
-// 启动恢复会终态化遗留非终态 turn，因此非终态 turn 在服务运行期间通过独立
-// store 连接创建。
+// suspended 是刻意无 owner 且可 resumable 的状态，启动恢复不会终态化它，
+// 因此可用来稳定触发 nonterminal-turn 错误。
 #[test]
 fn nonterminal_turn_errors_carry_turn_id_for_actionable_cli_hint() {
     let provider = ControlledProvider::start();
@@ -433,18 +430,20 @@ fn nonterminal_turn_errors_carry_turn_id_for_actionable_cli_hint() {
     let workspace = create_workspace(dir.path());
     let db_path = dir.path().join("sessions.sqlite3");
 
-    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
-    process.initialize();
-
-    // 服务启动恢复完成后，经独立 store 连接创建非终态 turn（running）。
-    let store = SessionStore::open(&db_path).expect("live store");
+    let store = SessionStore::open(&db_path).expect("preload store");
     let thread = store
         .create_thread(None, Some(&workspace.to_string_lossy()))
         .expect("thread");
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("running turn");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend turn");
     drop(store);
+
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
 
     // thread/archive 触发 ThreadHasNonterminalTurn：消息含 turn ID 与操作提示。
     process.send_request(2, "thread/archive", json!({ "threadId": thread.thread_id }));
