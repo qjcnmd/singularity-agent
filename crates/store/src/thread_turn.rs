@@ -100,23 +100,7 @@ pub struct CommitTurnOutcomeParams<'a> {
 
 impl SessionStore {
     pub fn create_thread(&self, model: Option<&str>, cwd: Option<&str>) -> StoreResult<Thread> {
-        self.create_thread_with_policy(
-            model,
-            cwd,
-            PermissionProfileName::WorkspaceWrite,
-            ApprovalPolicy::OnRequest,
-        )
-    }
-
-    /// 创建带有不可变 sandbox/approval 快照的 thread。
-    pub fn create_thread_with_policy(
-        &self,
-        model: Option<&str>,
-        cwd: Option<&str>,
-        sandbox_mode: PermissionProfileName,
-        approval_policy: ApprovalPolicy,
-    ) -> StoreResult<Thread> {
-        let thread = Self::new_thread(model, cwd, sandbox_mode, approval_policy);
+        let thread = Self::new_thread(model, cwd);
         Self::insert_thread(&self.connection, &thread)?;
         Ok(thread)
     }
@@ -124,7 +108,7 @@ impl SessionStore {
     /// 按持久化顺序列出所有 thread。
     pub fn list_threads(&self) -> StoreResult<Vec<Thread>> {
         let mut statement = self.connection.prepare(
-            "select thread_id, model, cwd, status, sandbox_mode, approval_policy
+            "select thread_id, model, cwd, status
                  from threads order by rowid",
         )?;
         let rows = statement.query_map([], |row| self.thread_from_row(row))?;
@@ -139,7 +123,7 @@ impl SessionStore {
     pub fn get_thread(&self, thread_id: &str) -> StoreResult<Thread> {
         self.connection
             .query_row(
-                "select thread_id, model, cwd, status, sandbox_mode, approval_policy
+                "select thread_id, model, cwd, status
                  from threads where thread_id = ?1",
                 params![thread_id],
                 |row| self.thread_from_row(row),
@@ -174,86 +158,14 @@ impl SessionStore {
         self.get_thread(thread_id)
     }
 
-    /// 删除 thread 及其绑定的 turn、item、trace、approval 和 artifact。
+    /// 删除 thread 及其绑定的 turn、item、trace 和 artifact。
     pub fn delete_thread(&self, thread_id: &str) -> StoreResult<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
-        // 先校验所有显式 approval 的 thread/turn 投影。
-        {
-            let mut statement = transaction.prepare(
-                "select request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-                 from approvals where thread_id = ?1",
-            )?;
-            let rows = statement.query_map(params![thread_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            })?;
-            for row in rows {
-                let (request_id, stored_thread_id, stored_turn_id, payload, outcome, reason) = row?;
-                let request = decode_stored_approval_request_row(
-                    &transaction,
-                    &request_id,
-                    &stored_thread_id,
-                    &stored_turn_id,
-                    &payload,
-                    outcome.as_deref(),
-                    reason.as_deref(),
-                )?;
-                if request.thread_id != thread_id {
-                    return Err(StoreError::InvalidState(
-                        "approval thread projection is inconsistent during deletion".to_string(),
-                    ));
-                }
-            }
-        }
 
-        // 按 child-first 顺序删除所有恢复/approval 子表。每次删除都核对
+        // 按 child-first 顺序删除所有恢复子表。每次删除都核对
         // 事务快照中的行数，避免关系投影不完整时静默留下孤儿数据。
-        let expected_approval_decisions: i64 = transaction.query_row(
-            "select count(*) from approval_decisions where request_id in
-                 (select request_id from approvals where thread_id = ?1
-                  union select request_id from pending_tool_calls
-                  where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1))",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_approval_decisions = transaction.execute(
-            "delete from approval_decisions where request_id in
-                 (select request_id from approvals where thread_id = ?1
-                  union select request_id from pending_tool_calls
-                  where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1))",
-            params![thread_id],
-        )? as i64;
-        if deleted_approval_decisions != expected_approval_decisions {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed approval decision rows".to_string(),
-            ));
-        }
-
-        let expected_pending_tool_calls: i64 = transaction.query_row(
-            "select count(*) from pending_tool_calls where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_pending_tool_calls = transaction.execute(
-            "delete from pending_tool_calls where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_pending_tool_calls != expected_pending_tool_calls {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed pending tool call rows".to_string(),
-            ));
-        }
-
         let expected_turn_inputs: i64 = transaction.query_row(
             "select count(*) from turn_inputs where turn_id in
                  (select turn_id from turns where thread_id = ?1)",
@@ -302,23 +214,6 @@ impl SessionStore {
         if deleted_turn_checkpoints != expected_turn_checkpoints {
             return Err(StoreError::InvalidState(
                 "thread deletion changed turn checkpoint rows".to_string(),
-            ));
-        }
-
-        let expected_approvals: i64 = transaction.query_row(
-            "select count(*) from approvals where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_approvals = transaction.execute(
-            "delete from approvals where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_approvals != expected_approvals {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed approval rows".to_string(),
             ));
         }
 
@@ -413,28 +308,8 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<(Thread, TraceEvent)> {
-        self.create_thread_with_trace_and_policy(
-            model,
-            cwd,
-            PermissionProfileName::WorkspaceWrite,
-            ApprovalPolicy::OnRequest,
-            component,
-            summary,
-        )
-    }
-
-    /// 原子创建带有 policy 快照的 thread 及其初始 trace。
-    pub fn create_thread_with_trace_and_policy(
-        &self,
-        model: Option<&str>,
-        cwd: Option<&str>,
-        sandbox_mode: PermissionProfileName,
-        approval_policy: ApprovalPolicy,
-        component: &str,
-        summary: &str,
-    ) -> StoreResult<(Thread, TraceEvent)> {
         let transaction = self.connection.unchecked_transaction()?;
-        let thread = Self::new_thread(model, cwd, sandbox_mode, approval_policy);
+        let thread = Self::new_thread(model, cwd);
         Self::insert_thread(&transaction, &thread)?;
         let trace = TraceEvent::new(
             format!("trace_{}", thread.thread_id),
@@ -789,9 +664,6 @@ impl SessionStore {
         } else {
             trace.clone()
         };
-        if status == TurnStatus::Interrupted {
-            Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
-        }
 
         transaction.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
@@ -828,7 +700,7 @@ impl SessionStore {
         })
     }
 
-    /// 记录取消，同时保留待处理 approval 与执行中工作之间的区别。
+    /// 记录取消；paused/suspended 当场终态化，running 置 cancel_requested。
     pub fn request_turn_cancellation(
         &self,
         turn_id: &str,
@@ -853,41 +725,6 @@ impl SessionStore {
             return Ok(turn);
         }
         validate_turn_trace_binding(trace, &turn.thread_id, &turn.turn_id)?;
-        let pending_count: i64 = transaction.query_row(
-            "select count(*) from pending_tool_calls
-             where turn_id = ?1 and execution_state = 'pending'",
-            params![turn_id],
-            |row| row.get(0),
-        )?;
-        let has_executing = Self::exists_in_transaction(
-            &transaction,
-            "select 1 from pending_tool_calls where turn_id = ?1 and execution_state = 'executing'",
-            turn_id,
-        )?;
-        if pending_count > 0 && !has_executing {
-            Self::delete_unresolved_pending_approvals(&transaction, turn_id)?;
-            transaction.execute(
-                "update turns set status = ?1, agent_loop_status = 'cancelled' where turn_id = ?2",
-                params![TurnStatus::Interrupted.to_db_text(), turn_id],
-            )?;
-            let mut terminal_trace = trace.clone();
-            terminal_trace.summary = "turn interrupted while approval pending".to_string();
-            terminal_trace.payload = serde_json::json!({
-                "turn_id": turn_id,
-                "agent_loop_status": "cancelled",
-                "pending_approval_cancelled": true,
-            });
-            Self::insert_turn_trace(
-                &transaction,
-                &terminal_trace,
-                &turn.thread_id,
-                &turn.turn_id,
-            )?;
-            turn.status = TurnStatus::Interrupted;
-            turn.agent_loop_status = "cancelled".to_string();
-            transaction.commit()?;
-            return Ok(turn);
-        }
         // paused/suspended 已无 active owner，不会再有 worker 收敛
         // cancel_requested；用户 interrupt 时当场终态化，避免卡死到重启。
         if turn.status == TurnStatus::Paused || turn.status == TurnStatus::Suspended {
@@ -918,38 +755,6 @@ impl SessionStore {
         Ok(turn)
     }
 
-    // 删除尚未开始外部执行的 pending approval 及其 checkpoint。
-    // B1（interrupt）与 B2（启动恢复）共用同一删除语义，防止 SQL 漂移。
-    pub(crate) fn delete_unresolved_pending_approvals(
-        transaction: &Connection,
-        turn_id: &str,
-    ) -> StoreResult<usize> {
-        let mut pending_statement = transaction.prepare(
-            "select request_id from pending_tool_calls
-             where turn_id = ?1 and execution_state = 'pending' order by rowid",
-        )?;
-        let pending_request_ids = pending_statement
-            .query_map(params![turn_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(pending_statement);
-        transaction.execute(
-            "delete from pending_tool_calls where turn_id = ?1 and execution_state = 'pending'",
-            params![turn_id],
-        )?;
-        for request_id in &pending_request_ids {
-            let deleted = transaction.execute(
-                "delete from approvals where request_id = ?1 and decision_outcome is null",
-                params![request_id],
-            )?;
-            if deleted != 1 {
-                return Err(StoreError::InvalidState(
-                    "pending turn cancellation requires an unresolved approval".to_string(),
-                ));
-            }
-        }
-        Ok(pending_request_ids.len())
-    }
-
     /// 清理 payload 后向 turn 追加一个 item。
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
         let transaction =
@@ -969,7 +774,7 @@ impl SessionStore {
         Ok(item)
     }
 
-    /// 读取 turn 的 user input payload，供 approval resume 重建上下文。
+    /// 读取 turn 的 user input payload，供 turn/resume 重建上下文。
     pub fn get_turn_user_input(&self, turn_id: &str) -> StoreResult<Value> {
         let payload: String = self
             .connection
@@ -1354,18 +1159,14 @@ impl SessionStore {
         )?;
         next_sequence(current, "item sequence")
     }
-    // 将包含安全策略快照的 threads 行解码为 protocol Thread。
+    // 将包含持久化列的 threads 行解码为 protocol Thread。
     pub(crate) fn thread_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         let status: String = row.get(3)?;
-        let sandbox_mode: String = row.get(4)?;
-        let approval_policy: String = row.get(5)?;
         Ok(Thread {
             thread_id: row.get(0)?,
             model: row.get(1)?,
             cwd: row.get(2)?,
             status: decode_db_enum(status, 3)?,
-            sandbox_mode: decode_db_enum(sandbox_mode, 4)?,
-            approval_policy: decode_db_enum(approval_policy, 5)?,
         })
     }
 
@@ -1416,20 +1217,13 @@ impl SessionStore {
         )
     }
 
-    // 构造带新 id、初始 active 状态和安全策略快照的 Thread。
-    pub(crate) fn new_thread(
-        model: Option<&str>,
-        cwd: Option<&str>,
-        sandbox_mode: PermissionProfileName,
-        approval_policy: ApprovalPolicy,
-    ) -> Thread {
+    // 构造带新 id、初始 active 状态的 Thread。
+    pub(crate) fn new_thread(model: Option<&str>, cwd: Option<&str>) -> Thread {
         Thread {
             thread_id: format!("thread_{}", short_id()),
             model: model.map(str::to_string),
             cwd: cwd.map(str::to_string),
             status: ThreadStatus::Active,
-            sandbox_mode,
-            approval_policy,
         }
     }
 
@@ -1482,15 +1276,13 @@ impl SessionStore {
     pub(crate) fn insert_thread(connection: &Connection, thread: &Thread) -> StoreResult<()> {
         connection.execute(
             "insert into threads(
-                thread_id, model, cwd, status, sandbox_mode, approval_policy
-            ) values(?1, ?2, ?3, ?4, ?5, ?6)",
+                thread_id, model, cwd, status
+            ) values(?1, ?2, ?3, ?4)",
             params![
                 thread.thread_id,
                 thread.model,
                 thread.cwd,
                 thread.status.to_db_text(),
-                thread.sandbox_mode.to_db_text(),
-                thread.approval_policy.to_db_text(),
             ],
         )?;
         Ok(())

@@ -12,13 +12,12 @@ use serde_json::{Value, json};
 use singularity_core::ClientInfo;
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
-    AgentCapabilityResult, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, EmptyParams,
+    AgentCapabilityResult, EmptyParams,
     EventClass, EventDelivery, EventGapReason, EventMetadata, EventRecoveryQuery,
     EventSubscribeParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId, JsonRpcMessage,
-    JsonRpcNotification, Method, PermissionProfileName, ProviderConfigurationStatus, RpcMethod,
-    Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams, TraceEvent, TraceMetric,
-    TraceMetricAvailability, TraceMetricUnavailableReason, TraceMetrics, TraceMetricsParams,
-    TraceShowParams, TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnInputDelivery,
+    JsonRpcNotification, Method, ProviderConfigurationStatus, RpcMethod,
+    Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams,
+    Turn, TurnEventParams, TurnIdParams, TurnInputDelivery,
     TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
@@ -28,7 +27,6 @@ const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity CLI";
 const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -37,7 +35,6 @@ const EVENT_TYPES: &[&str] = &[
     "thread/started",
     "turn/started",
     "turn/completed",
-    "approval/requested",
     "item/started",
     "item/completed",
     "item/failed",
@@ -62,10 +59,6 @@ enum Command {
         goal: String,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_enum)]
-        sandbox_mode: Option<SandboxModeArg>,
-        #[arg(long, value_enum)]
-        approval_policy: Option<ApprovalPolicyArg>,
         #[arg(long)]
         json: bool,
     },
@@ -81,18 +74,6 @@ enum Command {
     },
     /// List persisted threads through the app-server protocol.
     Threads,
-    /// Render trace events for a thread or run id.
-    Trace(TraceArgs),
-    /// Record an approval decision through the app-server protocol.
-    Approve {
-        request_id: String,
-        #[arg(long, value_enum)]
-        decision: ApprovalDecisionArg,
-        #[arg(long)]
-        reason: Option<String>,
-    },
-    /// List pending approvals through the app-server protocol.
-    Approvals,
     /// Configuration and runtime diagnostics.
     Config {
         #[command(subcommand)]
@@ -157,77 +138,6 @@ impl TurnDeliveryArg {
     }
 }
 
-#[derive(Debug, Parser)]
-// trace 查询参数；无子命令时按 run_id 读取尾部事件。
-struct TraceArgs {
-    #[command(subcommand)]
-    command: Option<TraceCommand>,
-    run_id: Option<String>,
-    #[arg(long)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Subcommand)]
-// trace 的子命令操作。
-enum TraceCommand {
-    /// Render server-derived metrics for one run.
-    Metrics { run_id: String },
-    /// Show one trace event by id.
-    Show { event_id: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-// approval 决定在 CLI 中的受控枚举表示。
-enum ApprovalDecisionArg {
-    Allow,
-    Deny,
-    Defer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-// thread/start 可选择的受控 sandbox 快照。
-enum SandboxModeArg {
-    ReadOnly,
-    WorkspaceWrite,
-}
-
-impl SandboxModeArg {
-    fn protocol_value(self) -> PermissionProfileName {
-        match self {
-            Self::ReadOnly => PermissionProfileName::ReadOnly,
-            Self::WorkspaceWrite => PermissionProfileName::WorkspaceWrite,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-// thread/start 可选择的受控 approval 快照。
-enum ApprovalPolicyArg {
-    OnRequest,
-    Never,
-}
-
-impl ApprovalPolicyArg {
-    fn protocol_value(self) -> ApprovalPolicy {
-        match self {
-            Self::OnRequest => ApprovalPolicy::OnRequest,
-            Self::Never => ApprovalPolicy::Never,
-        }
-    }
-}
-
-// approval CLI 枚举到协议 outcome 的转换边界。
-impl ApprovalDecisionArg {
-    // 将 CLI 枚举映射为 app-server 协议值。
-    fn protocol_value(self) -> ApprovalOutcome {
-        match self {
-            Self::Allow => ApprovalOutcome::Allow,
-            Self::Deny => ApprovalOutcome::Deny,
-            Self::Defer => ApprovalOutcome::Defer,
-        }
-    }
-}
-
 // 解析命令、驱动 app-server 客户端，并将错误转换为进程失败。
 fn main() {
     if let Err(error) = run_cli(Cli::parse()) {
@@ -242,23 +152,15 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Run {
             goal,
             model,
-            sandbox_mode,
-            approval_policy,
             json,
         } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             ensure_agent_loop_available(&mut client)?;
-            let (thread, thread_events) = client.thread_start(
-                model,
-                sandbox_mode.map(SandboxModeArg::protocol_value),
-                approval_policy.map(ApprovalPolicyArg::protocol_value),
-                !json,
-            )?;
+            let (thread, thread_events) = client.thread_start(model, !json)?;
             if !json {
                 println!("thread {}", thread.thread_id);
-                render_thread_policy(&thread)?;
             }
             let (turn, turn_events) = client.turn_start(&thread.thread_id, &goal, !json)?;
             if json {
@@ -284,9 +186,8 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             ensure_agent_loop_available(&mut client)?;
-            let thread = client.thread_resume(&thread_id)?;
+            let _thread = client.thread_resume(&thread_id)?;
             println!("thread {thread_id}");
-            render_thread_policy(&thread)?;
             let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
             fail_for_failed_turn(&turn)?;
             Ok(())
@@ -328,36 +229,6 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             client.thread_list()?;
-            Ok(())
-        }
-        Command::Trace(args) => {
-            let mut client = AppServerClient::spawn()?;
-            client.initialize()?;
-            match args.command {
-                Some(TraceCommand::Metrics { run_id }) => client.trace_metrics(&run_id),
-                Some(TraceCommand::Show { event_id }) => client.trace_show(&event_id),
-                None => {
-                    let run_id = args
-                        .run_id
-                        .ok_or_else(|| "trace requires a run id or subcommand".to_string())?;
-                    client.trace_tail(&run_id, args.limit.unwrap_or(DEFAULT_TRACE_TAIL_LIMIT))
-                }
-            }
-        }
-        Command::Approve {
-            request_id,
-            decision,
-            reason,
-        } => {
-            let mut client = AppServerClient::spawn()?;
-            client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
-            client.initialize()?;
-            client.approval_decision(&request_id, decision, reason.as_deref().unwrap_or(""))
-        }
-        Command::Approvals => {
-            let mut client = AppServerClient::spawn()?;
-            client.initialize()?;
-            client.approvals()?;
             Ok(())
         }
         Command::Config { command } => match command {
@@ -595,15 +466,11 @@ impl AppServerClient {
     fn thread_start(
         &mut self,
         model: Option<String>,
-        sandbox_mode: Option<PermissionProfileName>,
-        approval_policy: Option<ApprovalPolicy>,
         render: bool,
     ) -> Result<(Thread, Vec<JsonRpcNotification>), String> {
         let reply = self.request::<rpc_methods::ThreadStart>(&ThreadStartParams {
             model,
             cwd: Some(canonical_current_dir()?),
-            sandbox_mode,
-            approval_policy,
         })?;
         if render {
             render_messages(&reply.notifications, false);
@@ -739,7 +606,6 @@ impl AppServerClient {
         let reply = self.request::<rpc_methods::ThreadList>(&EmptyParams::default())?;
         for thread in &reply.result.threads {
             println!("{} {}", thread.thread_id, thread.status.as_storage_text());
-            render_thread_policy(thread)?;
         }
         Ok(())
     }
@@ -763,65 +629,6 @@ impl AppServerClient {
             reply.result.turn_id,
             reply.result.status,
             agent_loop_status_suffix(reply.result.agent_loop_status.as_deref())
-        );
-        Ok(())
-    }
-
-    // 请求并按顺序渲染 run 的 trace 尾部。
-    fn trace_tail(&mut self, run_id: &str, limit: usize) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::TraceTail>(&TraceTailParams {
-            run_id: run_id.to_string(),
-            limit: Some(limit),
-            offset: None,
-        })?;
-        for event in &reply.result.events {
-            render_trace_event(event);
-        }
-        Ok(())
-    }
-
-    // 请求并渲染指定 trace event。
-    fn trace_show(&mut self, event_id: &str) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::TraceShow>(&TraceShowParams {
-            event_id: event_id.to_string(),
-        })?;
-        render_trace_event(&reply.result.event);
-        Ok(())
-    }
-
-    // 请求并渲染 app-server 派生的 run metrics，不在 CLI 重新聚合 trace。
-    fn trace_metrics(&mut self, run_id: &str) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::TraceMetrics>(&TraceMetricsParams {
-            run_id: run_id.to_string(),
-        })?;
-        if reply.result.metrics.run_id != run_id {
-            return Err("trace metrics response run mismatch".to_string());
-        }
-        render_trace_metrics(&reply.result.metrics)
-    }
-
-    // 请求并打印当前 pending approval 列表。
-    fn approvals(&mut self) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::ApprovalList>(&EmptyParams::default())?;
-        for approval in &reply.result.approvals {
-            println!("{} {}", approval.request_id, approval.action.as_str());
-        }
-        Ok(())
-    }
-
-    // 提交 approval 决定并打印已记录的结果。
-    fn approval_decision(
-        &mut self,
-        request_id: &str,
-        decision: ApprovalDecisionArg,
-        reason: &str,
-    ) -> Result<(), String> {
-        let params = ApprovalDecision::new(request_id, decision.protocol_value(), reason);
-        let reply = self.request::<rpc_methods::ApprovalDecision>(&params)?;
-        println!(
-            "approval {} {}",
-            reply.result.decision.request_id,
-            reply.result.decision.outcome.as_storage_text()
         );
         Ok(())
     }
@@ -1126,17 +933,6 @@ fn validate_event_recovery(
                 ),
             }
         }
-        "approval/requested" => {
-            if metadata
-                .recovery_query
-                .as_ref()
-                .is_some_and(|query| matches!(query, EventRecoveryQuery::ApprovalList(_)))
-            {
-                Ok(())
-            } else {
-                Err("approval/requested event has no approval/list recovery query".to_string())
-            }
-        }
         _ if metadata.recovery_query.is_none() => Ok(()),
         _ => Err(format!(
             "event {} declares an unsupported recovery query",
@@ -1154,16 +950,6 @@ fn canonical_current_dir() -> Result<String, String> {
     cwd.to_str()
         .map(str::to_string)
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
-}
-
-// 渲染 thread 实际持久化的安全策略快照。
-fn render_thread_policy(thread: &Thread) -> Result<(), String> {
-    println!(
-        "thread_policy sandbox_mode={} approval_policy={}",
-        thread.sandbox_mode.as_storage_text(),
-        thread.approval_policy.as_storage_text()
-    );
-    Ok(())
 }
 
 // 过滤并脱敏可公开渲染的协议事件。
@@ -1282,117 +1068,6 @@ fn agent_loop_status_suffix(status: Option<&str>) -> String {
     status
         .map(|status| format!(" agent_loop_status={status}"))
         .unwrap_or_default()
-}
-
-// 渲染 trace event 的公开摘要字段。
-fn render_trace_event(event: &TraceEvent) {
-    println!(
-        "trace {} {} {}",
-        event.event_id, event.component, event.summary
-    );
-}
-
-// 先校验完整响应，再输出任何字段，避免畸形结果产生部分成功。
-fn render_trace_metrics(metrics: &TraceMetrics) -> Result<(), String> {
-    for metric in &metrics.metrics {
-        validate_trace_metric(metric)?;
-    }
-
-    println!("trace metrics {}", metrics.run_id);
-    for metric in &metrics.metrics {
-        match &metric.availability {
-            TraceMetricAvailability::Available => {
-                let distribution = metric
-                    .distribution
-                    .as_ref()
-                    .expect("validated available trace metric distribution");
-                println!(
-                    "metric {} available count={} sum={} min={} max={} mean={:.6} p50={} p95={}",
-                    metric.name.as_storage_text(),
-                    distribution.count,
-                    distribution.sum,
-                    distribution.min.expect("validated trace metric min"),
-                    distribution.max.expect("validated trace metric max"),
-                    distribution.mean.expect("validated trace metric mean"),
-                    distribution.p50.expect("validated trace metric p50"),
-                    distribution.p95.expect("validated trace metric p95"),
-                );
-            }
-            TraceMetricAvailability::Unavailable { reason } => {
-                println!(
-                    "metric {} unavailable reason={}",
-                    metric.name.as_storage_text(),
-                    trace_metric_unavailable_reason_text(*reason),
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-// 校验 availability 与 distribution 的公开一致性及可渲染聚合字段。
-fn validate_trace_metric(metric: &TraceMetric) -> Result<(), String> {
-    let name = metric.name.as_storage_text();
-    match (&metric.availability, metric.distribution.as_ref()) {
-        (TraceMetricAvailability::Available, None) => Err(format!(
-            "invalid trace metrics response: metric {name} is available without distribution"
-        )),
-        (TraceMetricAvailability::Unavailable { .. }, Some(_)) => Err(format!(
-            "invalid trace metrics response: metric {name} is unavailable with distribution"
-        )),
-        (TraceMetricAvailability::Available, Some(distribution)) => {
-            if distribution.count == 0 {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution has zero count"
-                ));
-            }
-            if distribution.min.is_none() {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution missing min"
-                ));
-            }
-            if distribution.max.is_none() {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution missing max"
-                ));
-            }
-            let Some(mean) = distribution.mean else {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution missing mean"
-                ));
-            };
-            if !mean.is_finite() {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution has invalid mean"
-                ));
-            }
-            if distribution.p50.is_none() {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution missing p50"
-                ));
-            }
-            if distribution.p95.is_none() {
-                return Err(format!(
-                    "invalid trace metrics response: metric {name} distribution missing p95"
-                ));
-            }
-            Ok(())
-        }
-        (TraceMetricAvailability::Unavailable { .. }, None) => Ok(()),
-    }
-}
-
-// 将闭集 typed reason 映射为稳定的 storage 文本，不暴露 Debug 或原始响应。
-fn trace_metric_unavailable_reason_text(reason: TraceMetricUnavailableReason) -> &'static str {
-    match reason {
-        TraceMetricUnavailableReason::NoProducer => "no_producer",
-        TraceMetricUnavailableReason::LegacyOnly => "legacy_only",
-        TraceMetricUnavailableReason::IncompleteStartEnd => "incomplete_start_end",
-        TraceMetricUnavailableReason::NonStreamingTtft => "non_streaming_ttft",
-        TraceMetricUnavailableReason::MissingTrueTiming => "missing_true_timing",
-        TraceMetricUnavailableReason::MissingUsage => "missing_usage",
-        TraceMetricUnavailableReason::MissingMetricValue => "missing_metric_value",
-    }
 }
 
 // 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。

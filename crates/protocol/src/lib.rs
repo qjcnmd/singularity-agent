@@ -6,9 +6,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use singularity_core::{ClientInfo, ErrorCode, JSON_RPC_METHOD_NOT_FOUND};
-pub use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
-};
 
 /// JSON-RPC 2.0 parse error code。
 pub const JSON_RPC_PARSE_ERROR: i64 = -32700;
@@ -154,16 +151,7 @@ method_registry! {
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
     TurnStatus => ("turn/status", Request, TurnIdParams, TurnResult),
-    ApprovalList => ("approval/list", Request, EmptyParams, ApprovalListResult),
-    ApprovalCenter => ("approval/center", Request, EmptyParams, ApprovalCenterResult),
-    ApprovalRequest => ("approval/request", Request, singularity_policy::ApprovalRequest, EmptyResult),
-    ApprovalDecision => ("approval/decision", Request, singularity_policy::ApprovalDecision, ApprovalDecisionResult),
     EventSubscribe => ("event/subscribe", Request, EventSubscribeParams, EventSubscribeResult),
-    ArtifactFetch => ("artifact/fetch", Request, ArtifactFetchParams, ArtifactFetchResult),
-    TraceList => ("trace/list", Request, TraceListParams, TraceListResult),
-    TraceShow => ("trace/show", Request, TraceShowParams, TraceShowResult),
-    TraceTail => ("trace/tail", Request, TraceTailParams, TraceListResult),
-    TraceMetrics => ("trace/metrics", Request, TraceMetricsParams, TraceMetricsResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
 
@@ -551,10 +539,6 @@ pub struct TransportCapability {
 pub struct ThreadStartParams {
     pub model: Option<String>,
     pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sandbox_mode: Option<PermissionProfileName>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -580,10 +564,6 @@ pub struct ThreadForkParams {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sandbox_mode: Option<PermissionProfileName>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -593,10 +573,6 @@ pub struct Thread {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub status: ThreadStatus,
-    #[serde(rename = "sandboxMode")]
-    pub sandbox_mode: PermissionProfileName,
-    #[serde(rename = "approvalPolicy")]
-    pub approval_policy: ApprovalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -923,20 +899,6 @@ pub struct TurnInterruptResult {
     pub agent_loop_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// approval/list 的响应。
-pub struct ApprovalListResult {
-    pub approvals: Vec<singularity_policy::ApprovalRequest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// approval 中心的待处理请求和决策。
-pub struct ApprovalCenterResult {
-    #[serde(rename = "pendingApprovals")]
-    pub pending_approvals: Vec<singularity_policy::ApprovalRequest>,
-    pub decisions: Vec<singularity_policy::ApprovalDecision>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// CLI 所需的脱敏 AgentLoop capability 投影。
 pub struct AgentLoopCapabilityStatus {
@@ -946,13 +908,7 @@ pub struct AgentLoopCapabilityStatus {
     pub blockers: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// approval/decision 的类型化响应。
-pub struct ApprovalDecisionResult {
-    pub decision: singularity_policy::ApprovalDecision,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 事件订阅请求参数；cursor 只用于声明客户端已观察到的边界。
 pub struct EventSubscribeParams {
@@ -969,47 +925,6 @@ pub struct EventSubscribeResult {
     #[serde(rename = "eventTypes")]
     pub event_types: Vec<String>,
     pub cursor: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// 获取 artifact 的参数。
-pub struct ArtifactFetchParams {
-    #[serde(rename = "artifactId")]
-    pub artifact_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// artifact/fetch 的响应。
-pub struct ArtifactFetchResult {
-    pub artifact: ArtifactRef,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/list 的筛选参数。
-pub struct TraceListParams {
-    #[serde(rename = "runId")]
-    pub run_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/show 的参数。
-pub struct TraceShowParams {
-    #[serde(rename = "eventId")]
-    pub event_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/tail 的分页参数。
-pub struct TraceTailParams {
-    #[serde(rename = "runId")]
-    pub run_id: String,
-    pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1810,31 +1725,6 @@ impl TraceMetrics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/metrics 的参数。
-pub struct TraceMetricsParams {
-    #[serde(rename = "runId")]
-    pub run_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/list 的响应。
-pub struct TraceListResult {
-    pub events: Vec<TraceEvent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/show 的类型化响应。
-pub struct TraceShowResult {
-    pub event: TraceEvent,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// trace/metrics 的类型化响应。
-pub struct TraceMetricsResult {
-    pub metrics: TraceMetrics,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// server/shutdown 的类型化响应。
 pub struct ServerShutdownResult {
@@ -2323,13 +2213,6 @@ pub enum EventRecoveryQuery {
         #[serde(rename = "turnId")]
         turn_id: String,
     },
-    #[serde(rename = "approval/list")]
-    ApprovalList(EmptyParams),
-    #[serde(rename = "trace/list")]
-    TraceList {
-        #[serde(rename = "runId")]
-        run_id: String,
-    },
 }
 
 impl EventRecoveryQuery {
@@ -2338,8 +2221,6 @@ impl EventRecoveryQuery {
         match self {
             Self::ThreadRead { .. } => "thread/read",
             Self::TurnStatus { .. } => "turn/status",
-            Self::ApprovalList(_) => "approval/list",
-            Self::TraceList { .. } => "trace/list",
         }
     }
 }
@@ -2426,14 +2307,6 @@ impl AppEvent {
         Self {
             method: "turn/completed".to_string(),
             params: serde_json::json!({"turn": turn}),
-        }
-    }
-
-    /// 构造待处理 approval 请求事件。
-    pub fn approval_requested(request: &singularity_policy::ApprovalRequest) -> Self {
-        Self {
-            method: "approval/requested".to_string(),
-            params: serde_json::json!({"approval": request}),
         }
     }
 

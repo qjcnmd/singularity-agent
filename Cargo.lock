@@ -1499,7 +1499,6 @@ dependencies = [
  "singularity_agent",
  "singularity_core",
  "singularity_model",
- "singularity_policy",
  "singularity_protocol",
  "singularity_store",
  "tempfile",
@@ -1573,8 +1572,6 @@ dependencies = [
  "serde",
  "serde_json",
  "singularity_core",
- "singularity_policy",
- "singularity_tools",
 ]
 
 [[package]]
@@ -1609,7 +1606,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "singularity_core",
- "singularity_policy",
  "singularity_protocol",
  "tempfile",
  "thiserror 2.0.18",

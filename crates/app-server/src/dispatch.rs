@@ -1,10 +1,6 @@
 //! JSON-RPC registry validation and request dispatch handlers.
 
 use super::*;
-use singularity_protocol::{
-    TraceListParams, TraceListResult, TraceMetricsParams, TraceMetricsResult, TraceShowParams,
-    TraceShowResult, TraceTailParams,
-};
 
 impl AppServer {
     /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
@@ -116,16 +112,7 @@ impl AppServer {
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),
-            Method::ApprovalList => self.approval_list(message),
-            Method::ApprovalCenter => self.approval_center(message),
-            Method::ApprovalRequest => self.approval_request(message),
-            Method::ApprovalDecision => self.approval_decision(message),
             Method::EventSubscribe => self.event_subscribe(message),
-            Method::ArtifactFetch => self.artifact_fetch(message),
-            Method::TraceList => self.trace_list(message),
-            Method::TraceShow => self.trace_show(message),
-            Method::TraceTail => self.trace_tail(message),
-            Method::TraceMetrics => self.trace_metrics(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
         if notification {
@@ -267,13 +254,9 @@ impl AppServer {
             Some(model) => Some(model.to_string()),
             None => self.provider_snapshot.resolved_default_selector(),
         };
-        let (thread, _trace) = self.store.create_thread_with_trace_and_policy(
+        let (thread, _trace) = self.store.create_thread_with_trace(
             model.as_deref(),
             Some(&cwd),
-            params
-                .sandbox_mode
-                .unwrap_or(PermissionProfileName::WorkspaceWrite),
-            params.approval_policy.unwrap_or(ApprovalPolicy::OnRequest),
             "app_server",
             "thread started",
         )?;
@@ -333,12 +316,7 @@ impl AppServer {
             Some(model) => Some(model.to_string()),
             None => self.provider_snapshot.resolved_default_selector(),
         };
-        let thread = self.store.create_thread_with_policy(
-            model.as_deref(),
-            Some(&cwd),
-            params.sandbox_mode.unwrap_or(source.sandbox_mode),
-            params.approval_policy.unwrap_or(source.approval_policy),
-        )?;
+        let thread = self.store.create_thread(model.as_deref(), Some(&cwd))?;
         Ok(vec![
             JsonRpcMessage::response(
                 message.required_id(),
@@ -396,76 +374,6 @@ impl AppServer {
                     "thread already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
                 ),
             ),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn artifact_fetch(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        let params: ArtifactFetchParams = parse_params(&message)?;
-        match self.store.get_artifact_ref(&params.artifact_id) {
-            Ok(artifact) => json_response(message.required_id(), ArtifactFetchResult { artifact }),
-            Err(StoreError::NotFound(_) | StoreError::InvalidState(_)) => {
-                not_found_response(message.required_id(), ARTIFACT_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn trace_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceListParams = parse_params(&message)?;
-        match self
-            .store
-            .list_trace_page(&params.run_id, params.limit, params.offset)
-        {
-            Ok(events) => json_response(message.required_id(), TraceListResult { events }),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn trace_show(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceShowParams = parse_params(&message)?;
-        match self.store.show_trace(&params.event_id) {
-            Ok(event) => json_response(message.required_id(), TraceShowResult { event }),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), TRACE_EVENT_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn trace_tail(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceTailParams = parse_params(&message)?;
-        match self
-            .store
-            .tail_trace(&params.run_id, params.limit.unwrap_or(50), params.offset)
-        {
-            Ok(events) => Ok(vec![
-                JsonRpcMessage::response(
-                    message.required_id(),
-                    serde_json::to_value(TraceListResult { events })?,
-                )
-                .to_wire_value(),
-            ]),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn trace_metrics(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceMetricsParams = parse_params(&message)?;
-        match self.store.trace_metrics(&params.run_id) {
-            Ok(metrics) => json_response(message.required_id(), TraceMetricsResult { metrics }),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
-            }
             Err(error) => Err(error.into()),
         }
     }

@@ -2,10 +2,6 @@
 
 use schemars::schema_for;
 use serde_json::Value;
-use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
-    PermissionResource, ToolId, WorkspaceRelativePath,
-};
 use singularity_protocol::{
     ItemKind, ThreadStatus, TraceApprovalOutcome, TraceApprovalProjection, TraceBindingError,
     TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
@@ -21,16 +17,6 @@ use singularity_store::{
     SessionStoreDescriptor, StoreError, ToolExecution, ToolExecutionState, TurnOutcomeAuthority,
 };
 use std::sync::{Arc, Barrier};
-
-fn tool_id(value: &str) -> ToolId {
-    ToolId::new(value).expect("valid tool id")
-}
-
-fn workspace_resource(value: &str) -> PermissionResource {
-    PermissionResource::WorkspacePath(
-        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
-    )
-}
 
 #[test]
 fn typed_turn_start_is_atomic_and_duplicate_start_is_idempotent() {
@@ -125,83 +111,8 @@ fn typed_turn_end_recovers_persisted_start_after_sqlite_reopen() {
     assert!(end.timestamp.is_some());
     assert!(end.duration_ms.is_some());
 }
-
 #[test]
-fn approval_wait_span_defers_without_end_then_closes_once_on_allow() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_typed_wait",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_typed_wait");
-    let checkpoint = serde_json::json!({"checkpoint": "opaque"});
-
-    let started = store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval start");
-    let turn_start = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|event| {
-            event.span_kind == Some(TraceSpanKind::Turn)
-                && event.span_phase == Some(TraceSpanPhase::Start)
-        })
-        .expect("turn start");
-    assert_eq!(started.span_kind, Some(TraceSpanKind::ApprovalWait));
-    assert_eq!(started.span_phase, Some(TraceSpanPhase::Start));
-    assert_eq!(started.parent_span_id, turn_start.span_id);
-
-    store
-        .record_approval_decision(
-            &ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Defer, "later"),
-            "approval",
-            "approval deferred",
-        )
-        .expect("defer");
-    let after_defer = store.list_trace(&thread.thread_id).expect("trace list");
-    assert_eq!(
-        after_defer
-            .iter()
-            .filter(|event| event.span_id == started.span_id)
-            .count(),
-        1
-    );
-    assert!(!after_defer.iter().any(|event| {
-        event.span_id == started.span_id && event.span_phase == Some(TraceSpanPhase::End)
-    }));
-
-    let allowed = store
-        .record_approval_decision(
-            &ApprovalDecision::new(
-                request.request_id.clone(),
-                ApprovalOutcome::Allow,
-                "approved",
-            ),
-            "approval",
-            "approval allowed",
-        )
-        .expect("allow");
-    assert_eq!(allowed.trace.span_kind, Some(TraceSpanKind::ApprovalWait));
-    assert_eq!(allowed.trace.span_phase, Some(TraceSpanPhase::End));
-    assert_eq!(allowed.trace.parent_span_id, turn_start.span_id);
-    assert!(allowed.trace.duration_ms.is_some());
-}
-
-// 验证 thread、turn、item、trace 与 approval 的基础持久化闭环。
-#[test]
-fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
+fn sqlite_store_persists_threads_turns_items_and_trace() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let descriptor = store.descriptor();
@@ -256,30 +167,23 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         "thread started",
     );
     store.append_trace(&trace).expect("trace");
-    let approval = ApprovalRequest::new(
-        "approval_1",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("write_file"),
-    );
-    store.create_approval(&approval).expect("approval");
-    let decision = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "ok");
-    store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("decision");
 
     let connection =
         rusqlite::Connection::open(dir.path().join("sessions.sqlite3")).expect("open sqlite");
-    let approval_binding: (String, String) = connection
+    let thread_binding: (String, String, String) = connection
         .query_row(
-            "select thread_id, turn_id from approvals where request_id = 'approval_1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "select thread_id, model, cwd from threads where thread_id = ?1",
+            [&thread.thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("approval binding projection");
+        .expect("thread binding projection");
     assert_eq!(
-        approval_binding,
-        (thread.thread_id.clone(), turn.turn_id.clone())
+        thread_binding,
+        (
+            thread.thread_id.clone(),
+            "gpt-test".to_string(),
+            "C:/repo".to_string()
+        )
     );
 
     assert_eq!(item.kind, ItemKind::UserMessage);
@@ -339,51 +243,8 @@ fn sqlite_store_rejects_future_schema_version() {
     ));
 }
 
-// v10 approval strings are converted only through the released tool-specific contract.
-#[test]
-fn v10_approval_resources_migrate_to_typed_v11_payloads() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    create_v10_database(&db_path);
-    let request = ApprovalRequest::new("approval_v10", "thread_v10", "turn_v10", tool_id("edit"))
-        .with_resources([workspace_resource("README.md")]);
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    let legacy_payload = serde_json::json!({
-        "request_id": request.request_id,
-        "thread_id": request.thread_id,
-        "turn_id": request.turn_id,
-        "tool_call_id": null,
-        "action": "edit",
-        "resources": ["README.md"],
-        "reason": ""
-    });
-    connection
-        .execute(
-            "insert into approvals(
-                 request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-             ) values(?1, ?2, ?3, ?4, null, null)",
-            rusqlite::params![
-                request.request_id,
-                request.thread_id,
-                request.turn_id,
-                serde_json::to_string(&legacy_payload).expect("legacy approval"),
-            ],
-        )
-        .expect("insert v10 approval");
-    drop(connection);
-
-    let migrated = SessionStore::open(&db_path).expect("migrate v10 store");
-    assert_eq!(migrated.descriptor().schema_version, 13);
-    assert_eq!(
-        migrated
-            .get_pending_approval("approval_v10")
-            .expect("typed approval")
-            .resources,
-        vec![workspace_resource("README.md")]
-    );
-}
-
-// 现行 v12（typed trace、但尚无 turn resume 表）必须原子升级到 v13，且不丢失既有行。
+// v12 降级脚本重建 released v12 形状（含 approval 三表与 threads policy 列），
+// 迁移必须保留 thread/turn/trace 行并加入恢复表。
 #[test]
 fn v12_to_v13_migration_adds_recovery_tables_and_preserves_rows() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -411,6 +272,46 @@ pragma foreign_keys = off;
 drop table turn_inputs;
 drop table turn_checkpoints;
 drop table tool_executions;
+alter table threads add column sandbox_mode text not null default 'workspace-write'
+    check(sandbox_mode in ('read-only', 'workspace-write'));
+alter table threads add column approval_policy text not null default 'on-request'
+    check(approval_policy in ('on-request', 'never'));
+create table approvals(
+    request_id text primary key,
+    thread_id text not null,
+    turn_id text not null,
+    payload text not null,
+    decision_outcome text
+        check(decision_outcome in ('allow', 'deny') or decision_outcome is null),
+    decision_reason text,
+    foreign key(thread_id) references threads(thread_id),
+    foreign key(turn_id) references turns(turn_id)
+);
+create table approval_decisions(
+    decision_id text primary key,
+    request_id text not null,
+    outcome text not null check(outcome in ('allow', 'deny')),
+    reason text not null,
+    payload text not null,
+    foreign key(request_id) references approvals(request_id)
+);
+create table pending_tool_calls(
+    request_id text primary key,
+    thread_id text not null,
+    turn_id text not null,
+    tool_call_id text not null,
+    payload text not null,
+    execution_state text not null default 'pending'
+        check(execution_state in ('pending', 'executing')),
+    foreign key(request_id) references approvals(request_id),
+    foreign key(thread_id) references threads(thread_id),
+    foreign key(turn_id) references turns(turn_id)
+);
+create unique index approval_decisions_request_unique on approval_decisions(request_id);
+create index approvals_pending_lookup on approvals(decision_outcome, request_id);
+create index approvals_thread_lookup on approvals(thread_id, decision_outcome, request_id);
+create index approvals_turn_lookup on approvals(turn_id, decision_outcome, request_id);
+create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
 create table turns_v12(
     turn_id text primary key,
     thread_id text not null,
@@ -473,7 +374,7 @@ pragma foreign_keys = on;
 }
 
 #[test]
-fn turn_input_is_idempotent_ordered_and_consumed_with_its_checkpoint_once() {
+fn turn_input_is_idempotent_ordered_at_boundaries() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
     let (turn, _, _) = store
@@ -534,38 +435,19 @@ fn turn_input_is_idempotent_ordered_and_consumed_with_its_checkpoint_once() {
         .iter()
         .map(|input| input.input_id.clone())
         .collect::<Vec<_>>();
-    store
-        .consume_turn_inputs_with_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &input_ids,
-            &serde_json::json!({"version": 2, "state": "after-input"}),
-            2,
-            false,
-        )
-        .expect("consume input and checkpoint");
+    assert_eq!(input_ids, vec!["input-1".to_string(), "input-2".to_string()]);
     assert!(
         store
             .turn_boundary_state(&turn.turn_id, true)
-            .expect("consumed boundary")
+            .expect("boundary still pending")
             .inputs
-            .is_empty()
+            .len()
+            == 2
     );
-    assert!(matches!(
-        store.consume_turn_inputs_with_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &input_ids,
-            &serde_json::json!({"version": 2, "state": "duplicate"}),
-            2,
-            false,
-        ),
-        Err(StoreError::InvalidState(_))
-    ));
 }
 
 #[test]
-fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
+fn accepted_turn_input_blocks_terminal_commit_and_stays_idempotent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -588,18 +470,8 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
             &input,
         )
         .expect("accepted input");
-    store
-        .consume_turn_inputs_with_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &["accepted-input".to_string()],
-            &serde_json::json!({"version": 2, "state": "after-input"}),
-            2,
-            false,
-        )
-        .expect("consume accepted input");
-    store
-        .commit_turn_outcome(
+    assert!(matches!(
+        store.commit_turn_outcome(
             &turn.turn_id,
             CommitTurnOutcomeParams {
                 status: TurnStatus::Completed,
@@ -614,8 +486,9 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
                     "terminal result",
                 ),
             },
-        )
-        .expect("terminal turn after consuming input");
+        ),
+        Err(StoreError::TurnBoundaryPending { .. })
+    ));
 
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     let counts_before_retry: (u64, u64) = connection
@@ -636,7 +509,7 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
         )
         .expect("same accepted input remains idempotent");
     assert_eq!(retried.turn_id, turn.turn_id);
-    assert_eq!(retried.status, TurnStatus::Completed);
+    assert_eq!(retried.status, TurnStatus::Running);
     assert!(matches!(
         store.append_turn_input(
             &turn.turn_id,
@@ -646,16 +519,6 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
         ),
         Err(StoreError::InvalidState(message))
             if message == "turn input idempotency key was reused with different content"
-    ));
-    assert!(matches!(
-        store.append_turn_input(
-            &turn.turn_id,
-            "new-input",
-            TurnInputDelivery::Steer,
-            &input,
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "terminal turn cannot accept interactive input"
     ));
 
     let counts_after_retry: (u64, u64) = connection
@@ -674,7 +537,17 @@ fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
             |row| row.get(0),
         )
         .expect("delivery state");
-    assert_eq!(delivery_state, "consumed");
+    assert_eq!(delivery_state, "pending");
+    assert!(
+        store
+            .append_turn_input(
+                &turn.turn_id,
+                "new-input",
+                TurnInputDelivery::Steer,
+                &input,
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -729,24 +602,11 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
     let boundary = store
         .turn_boundary_state(&turn.turn_id, true)
         .expect("pause boundary");
-    let input_ids = boundary
-        .inputs
-        .iter()
-        .map(|input| input.input_id.clone())
-        .collect::<Vec<_>>();
-    store
-        .consume_turn_inputs_with_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &input_ids,
-            &serde_json::json!({"version": 2, "state": "paused"}),
-            2,
-            true,
-        )
-        .expect("consume and pause");
+    assert!(boundary.pause_requested);
+    assert_eq!(boundary.inputs.len(), 1);
     assert_eq!(
-        store.get_turn(&turn.turn_id).expect("paused turn").status,
-        TurnStatus::Paused
+        store.get_turn(&turn.turn_id).expect("running turn").status,
+        TurnStatus::Running
     );
     assert!(
         store
@@ -759,180 +619,6 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
             .is_ok()
     );
 }
-
-#[test]
-fn approval_allow_hands_steer_to_one_turn_checkpoint_atomically() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_input_handoff",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_input_handoff");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(serde_json::json!({"approval_checkpoint": "opaque"})),
-            "approval",
-            "approval requested",
-        )
-        .expect("blocked approval");
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "approval-steer",
-            TurnInputDelivery::Steer,
-            &serde_json::json!([{"type": "text", "text": "change direction"}]),
-        )
-        .expect("steer");
-    let checkpoint = serde_json::json!({"version": 2, "state": "steered"});
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    assert!(matches!(
-        store.record_approval_decision(
-            &decision,
-            "approval",
-            "approval decision recorded without boundary"
-        ),
-        Err(StoreError::TurnBoundaryPending { .. })
-    ));
-    assert!(
-        store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending execution")
-    );
-
-    let recorded = store
-        .record_approval_decision_with_turn_checkpoint(
-            &decision,
-            "approval",
-            "approval decision recorded",
-            &["approval-steer".to_string()],
-            &checkpoint,
-            2,
-            false,
-        )
-        .expect("atomic approval input handoff");
-    assert_eq!(recorded.turn.status, TurnStatus::Running);
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint"),
-        Some(checkpoint)
-    );
-    assert!(
-        store
-            .turn_boundary_state(&turn.turn_id, true)
-            .expect("boundary")
-            .inputs
-            .is_empty()
-    );
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending execution")
-    );
-    assert_eq!(
-        store
-            .get_approval_decision(&decision.decision_id)
-            .expect("decision"),
-        decision
-    );
-}
-
-#[test]
-fn approval_deny_hands_pending_input_to_same_turn_without_terminalizing() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_deny_handoff",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_deny_handoff");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(serde_json::json!({"approval_checkpoint": "opaque"})),
-            "approval",
-            "approval requested",
-        )
-        .expect("blocked approval");
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "deny-follow-up",
-            TurnInputDelivery::FollowUp,
-            &serde_json::json!([{"type": "text", "text": "use a different approach"}]),
-        )
-        .expect("follow-up");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Deny,
-        "operator denied edit",
-    );
-    assert!(matches!(
-        store.record_approval_decision(
-            &decision,
-            "approval",
-            "approval decision recorded without boundary"
-        ),
-        Err(StoreError::TurnBoundaryPending { .. })
-    ));
-
-    let checkpoint = serde_json::json!({"version": 2, "state": "denied"});
-    let recorded = store
-        .record_approval_decision_with_turn_checkpoint(
-            &decision,
-            "approval",
-            "approval decision recorded",
-            &["deny-follow-up".to_string()],
-            &checkpoint,
-            2,
-            false,
-        )
-        .expect("deny handoff");
-    assert_eq!(recorded.turn.status, TurnStatus::Running);
-    assert_eq!(
-        store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint"),
-        Some(checkpoint)
-    );
-    assert!(
-        store
-            .turn_boundary_state(&turn.turn_id, true)
-            .expect("boundary")
-            .inputs
-            .is_empty()
-    );
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending execution")
-    );
-    assert_eq!(
-        store
-            .get_approval_decision(&decision.decision_id)
-            .expect("decision"),
-        decision
-    );
-}
-
-// Build the released v10 schema directly so v10 migration tests do not
-// relabel a current v13 database as an older version.
 fn create_v10_database(path: &std::path::Path) {
     let connection = rusqlite::Connection::open(path).expect("open v10 sqlite");
     connection
@@ -1069,191 +755,8 @@ fn create_v11_database(path: &std::path::Path) {
         )
         .expect("upgrade v10 schema metadata to v11");
 }
-
-fn prepare_v10_pending_checkpoint(
-    db_path: &std::path::Path,
-    checkpoint: &mut Value,
-) -> ApprovalRequest {
-    create_v10_database(db_path);
-    let request = ApprovalRequest::new(
-        "approval_pending_v10",
-        "thread_v10",
-        "turn_v10",
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    checkpoint["request_id"] = serde_json::json!(&request.request_id);
-    checkpoint["thread_id"] = serde_json::json!(&request.thread_id);
-    checkpoint["turn_id"] = serde_json::json!(&request.turn_id);
-    checkpoint["tool_call_id"] = serde_json::json!("call_1");
-    let connection = rusqlite::Connection::open(db_path).expect("open sqlite");
-    let legacy_approval = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": &request.tool_call_id,
-        "action": "edit",
-        "resources": ["README.md"],
-        "reason": ""
-    });
-    connection
-        .execute(
-            "update turns set status = 'blocked', agent_loop_status = 'blocked' where turn_id = ?1",
-            [&request.turn_id],
-        )
-        .expect("block v10 turn");
-    connection
-        .execute(
-            "insert into approvals(
-                 request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-             ) values(?1, ?2, ?3, ?4, null, null)",
-            rusqlite::params![
-                request.request_id,
-                request.thread_id,
-                request.turn_id,
-                serde_json::to_string(&legacy_approval).expect("legacy approval"),
-            ],
-        )
-        .expect("insert legacy approval");
-    connection
-        .execute(
-            "insert into pending_tool_calls(
-                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-             ) values(?1, ?2, ?3, ?4, ?5, 'pending')",
-            rusqlite::params![
-                request.request_id,
-                request.thread_id,
-                request.turn_id,
-                "call_1",
-                serde_json::to_string(checkpoint).expect("checkpoint"),
-            ],
-        )
-        .expect("insert legacy checkpoint");
-    drop(connection);
-    request
-}
-
-// 旧数据库含未完成 AgentLoop checkpoint 时，在任何 schema 写入前拒绝迁移。
 #[test]
-fn v10_pending_checkpoint_rejects_migration_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let mut checkpoint = serde_json::json!({
-        "request_id": "approval_pending_v10",
-        "thread_id": "thread_v10",
-        "turn_id": "turn_v10",
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": ["README.md"],
-        "checkpoint_version": 1,
-        "messages": [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "tool_call_id": "call_1",
-                "tool_name": "edit",
-                "arguments": {},
-                "raw_arguments": "{}",
-                "parse_status": "valid",
-                "validation_errors": []
-            }]
-        }],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {
-            "workspace_mutated": false,
-            "workspace_revision": null,
-            "successful_command_count": 0,
-            "required_command_counts": {},
-            "terminal_command_scope_digests": [],
-            "terminal_command_revisions": [],
-            "unresolved_failures": []
-        },
-        "last_completion_error": null
-    });
-    let request = prepare_v10_pending_checkpoint(&db_path, &mut checkpoint);
-    let before = sqlite_snapshot(&db_path);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message))
-            if message.contains("v10 pending AgentLoop checkpoint")
-                && message.contains(&request.request_id)
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-    assert!(!has_v11_temporary_tables(&db_path));
-}
-
-// 验证 thread policy 快照在 create/get/list 和 reopen 路径保持一致。
-#[test]
-fn thread_policy_snapshot_persists_and_reopens() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let created = store
-        .create_thread_with_policy(
-            Some("gpt-test"),
-            Some("C:/repo"),
-            PermissionProfileName::ReadOnly,
-            ApprovalPolicy::Never,
-        )
-        .expect("create thread with policy");
-    assert_eq!(created.sandbox_mode, PermissionProfileName::ReadOnly);
-    assert_eq!(created.approval_policy, ApprovalPolicy::Never);
-    assert_eq!(
-        store.get_thread(&created.thread_id).expect("get thread"),
-        created
-    );
-    assert_eq!(
-        store.list_threads().expect("list threads"),
-        vec![created.clone()]
-    );
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    let restored = reopened
-        .get_thread(&created.thread_id)
-        .expect("restore thread");
-    assert_eq!(restored.sandbox_mode, PermissionProfileName::ReadOnly);
-    assert_eq!(restored.approval_policy, ApprovalPolicy::Never);
-}
-
-// 验证 v8 threads 在同一 v11 迁移事务中填充安全默认快照。
-#[test]
-fn v8_threads_migrate_to_policy_snapshot_defaults() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    create_legacy_enum_database(&db_path, 8);
-    remove_legacy_pending_approval(&db_path, 8);
-
-    let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
-    assert_eq!(migrated.descriptor().schema_version, 13);
-    let thread_id = migrated
-        .list_threads()
-        .expect("migrated threads")
-        .into_iter()
-        .next()
-        .expect("migrated thread")
-        .thread_id;
-    let thread = migrated.get_thread(&thread_id).expect("migrated thread");
-    assert_eq!(thread.sandbox_mode, PermissionProfileName::WorkspaceWrite);
-    assert_eq!(thread.approval_policy, ApprovalPolicy::OnRequest);
-    assert!(
-        migrated
-            .applied_migrations()
-            .expect("migrations")
-            .iter()
-            .any(|migration| migration == "0009_thread_policy_snapshot")
-    );
-}
-
-// 验证不含未完成 checkpoint 的 v1-v9 历史 schema 在同一 v11 事务中完成转换。
-#[test]
-fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
+fn every_supported_legacy_schema_migrates_with_trace_data() {
     for schema_version in 1..=9 {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("sessions.sqlite3");
@@ -1296,22 +799,6 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
             )
             .expect("item kind");
         assert_eq!(item_kind, ItemKind::UserMessage.as_storage_text());
-        assert_eq!(
-            store
-                .list_pending_approvals()
-                .expect("pending approvals")
-                .iter()
-                .map(|request| request.request_id.as_str())
-                .collect::<Vec<_>>(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(
-            store
-                .get_approval_decision("approval_final_decision")
-                .ok()
-                .map(|decision| decision.outcome),
-            (schema_version >= 2).then_some(ApprovalOutcome::Allow)
-        );
         let repaired = store
             .show_trace("trace_legacy_turn_repair")
             .expect("repaired turn trace");
@@ -1329,55 +816,6 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
 }
 
 // 任何旧 schema 的 pending checkpoint 都不属于当前 AgentLoop codec；迁移不能伪造状态。
-#[test]
-fn pre_checkpoint_pending_tool_calls_are_rejected_without_mutation() {
-    for schema_version in 4..=6 {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        create_legacy_enum_database(&db_path, schema_version);
-        let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
-        let payload = serde_json::json!({
-            "request_id": "approval_pending",
-            "tool_call_id": "call_pending",
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-        });
-        if schema_version == 4 {
-            connection
-                .execute(
-                    "insert into pending_tool_calls(request_id, turn_id, payload)
-                     values('approval_pending', 'turn_pending', ?1)",
-                    [serde_json::to_string(&payload).expect("pending payload")],
-                )
-                .expect("insert v4 pending call");
-        } else {
-            connection
-                .execute(
-                    "insert into pending_tool_calls(
-                         request_id, thread_id, turn_id, tool_call_id, payload
-                     ) values(
-                         'approval_pending', 'thread_legacy', 'turn_pending', 'call_pending', ?1
-                     )",
-                    [serde_json::to_string(&payload).expect("pending payload")],
-                )
-                .expect("insert v5-v6 pending call");
-        }
-        drop(connection);
-        let before = sqlite_snapshot(&db_path);
-
-        assert!(matches!(
-            SessionStore::open(&db_path),
-            Err(StoreError::InvalidState(message))
-                if message.contains("pending AgentLoop checkpoint")
-        ));
-        assert_eq!(sqlite_snapshot(&db_path), before);
-        assert!(!has_v11_temporary_tables(&db_path));
-    }
-}
-
-// Released upgrades produced a few schema shapes that differ from a fresh
-// database of the same version. Each remains an explicit, bounded contract.
 #[test]
 fn released_legacy_schema_variants_migrate() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1493,64 +931,6 @@ fn released_legacy_schema_variants_migrate() {
 }
 
 // 旧 execution state 不能绕过 current-only checkpoint codec。
-#[test]
-fn v7_non_pending_execution_states_reject_migration_without_mutation() {
-    for legacy_state in ["approved", "executing", "outcome_recorded"] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join(format!("v7-{legacy_state}.sqlite3"));
-        create_legacy_enum_database(&db_path, 7);
-        let connection = rusqlite::Connection::open(&db_path).expect("open v7 db");
-        let decision = ApprovalDecision::new(
-            "approval_pending",
-            ApprovalOutcome::Allow,
-            "legacy execution handoff",
-        );
-        connection
-            .execute(
-                "update approvals
-                 set decision_outcome = ?1, decision_reason = ?2
-                 where request_id = 'approval_pending'",
-                rusqlite::params![
-                    serde_json::to_string(&ApprovalOutcome::Allow).expect("allow"),
-                    decision.reason,
-                ],
-            )
-            .expect("finalize legacy approval");
-        connection
-            .execute(
-                "insert into approval_decisions(
-                     decision_id, request_id, outcome, reason, payload
-                 ) values(?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    decision.decision_id,
-                    decision.request_id,
-                    serde_json::to_string(&decision.outcome).expect("allow"),
-                    decision.reason,
-                    serde_json::to_string(&decision).expect("decision"),
-                ],
-            )
-            .expect("insert legacy decision");
-        connection
-            .execute(
-                "update pending_tool_calls set execution_state = ?1
-                 where request_id = 'approval_pending'",
-                [legacy_state],
-            )
-            .expect("set legacy state");
-        drop(connection);
-        let before = sqlite_snapshot(&db_path);
-
-        assert!(matches!(
-            SessionStore::open(&db_path),
-            Err(StoreError::InvalidState(message))
-                if message.contains("v7 pending AgentLoop checkpoint")
-        ));
-        assert_eq!(sqlite_snapshot(&db_path), before);
-        assert!(!has_v11_temporary_tables(&db_path));
-    }
-}
-
-// 验证确定性损坏在任何迁移写入前拒绝，并保持 v1-v9 数据与临时对象不变。
 #[test]
 fn invalid_legacy_enum_is_rejected_without_mutating_any_supported_version() {
     for schema_version in 1..=9 {
@@ -1818,116 +1198,41 @@ fn store_open_rejects_parent_reparse_point_when_creation_is_available() {
     ));
 }
 
-// trusted reopen 不扫描 approval/checkpoint 全表，但每个读取或决定事务仍 fail closed。
+// trusted reopen 不扫描 checkpoint 全表，但每个读取事务仍 fail closed。
 #[test]
-fn trusted_reopen_defers_approval_and_checkpoint_validation_until_use() {
-    for corruption in ["approval_payload", "decision_payload", "checkpoint"] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        let store = SessionStore::open(&db_path).expect("open store");
-        let thread = store.create_thread(None, None).expect("thread");
-        let turn = store
-            .create_turn(&thread.thread_id, "running")
-            .expect("turn");
-        let request = ApprovalRequest::new(
-            format!("approval_trusted_{corruption}"),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            tool_id("edit"),
+fn trusted_reopen_defers_checkpoint_validation_until_use() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .save_turn_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &serde_json::json!({"version": 1, "state": "safe-boundary"}),
+            1,
         )
-        .with_tool_call_id("call_1");
-        let checkpoint = serde_json::json!({
-            "request_id": &request.request_id,
-            "thread_id": &request.thread_id,
-            "turn_id": &request.turn_id,
-            "tool_call_id": "call_1",
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        });
-        let has_pending_checkpoint = corruption != "approval_payload";
-        store
-            .create_approval_with_pending_tool_call_and_trace(
-                &request,
-                has_pending_checkpoint.then_some(checkpoint),
-                "approval",
-                "approval requested",
-            )
-            .expect("approval");
-        let decision_id = if corruption == "decision_payload" {
-            let decision = ApprovalDecision::new(
-                request.request_id.clone(),
-                ApprovalOutcome::Allow,
-                "allowed",
-            );
-            let decision_id = decision.decision_id.clone();
-            store
-                .record_approval_decision(&decision, "approval", "approval decision recorded")
-                .expect("decision");
-            Some(decision_id)
-        } else {
-            None
-        };
+        .expect("checkpoint");
 
-        let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-        match corruption {
-            "approval_payload" => {
-                connection
-                    .execute(
-                        "update approvals set payload = '{\"request_id\":\"wrong\"}'
-                         where request_id = ?1",
-                        rusqlite::params![request.request_id],
-                    )
-                    .expect("tamper approval payload");
-            }
-            "decision_payload" => {
-                connection
-                    .execute(
-                        "update approval_decisions set payload = '{\"decision_id\":\"wrong\"}'
-                         where request_id = ?1",
-                        rusqlite::params![request.request_id],
-                    )
-                    .expect("tamper decision payload");
-            }
-            "checkpoint" => {
-                connection
-                    .execute(
-                        "update pending_tool_calls set payload = '{}'
-                         where request_id = ?1",
-                        rusqlite::params![request.request_id],
-                    )
-                    .expect("tamper checkpoint");
-            }
-            _ => unreachable!("table-driven corruption case"),
-        }
-        drop(connection);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update turn_checkpoints set payload = '{\"version\":99,\"state\":\"tampered\"}' where turn_id = ?1",
+            [&turn.turn_id],
+        )
+        .expect("tamper checkpoint payload");
+    drop(connection);
 
-        let trusted = store.trusted_reopen().expect("trusted reopen");
-        match corruption {
-            "approval_payload" => assert!(matches!(
-                trusted.list_pending_approvals(),
-                Err(StoreError::InvalidState(_))
-            )),
-            "decision_payload" => assert!(matches!(
-                trusted.get_approval_decision(&decision_id.expect("decision id")),
-                Err(StoreError::InvalidState(_))
-            )),
-            "checkpoint" => assert_eq!(
-                trusted
-                    .get_pending_tool_call(&request.request_id)
-                    .expect("opaque checkpoint payload"),
-                Some(serde_json::json!({}))
-            ),
-            _ => unreachable!("table-driven corruption case"),
-        }
-    }
+    let trusted = store.trusted_reopen().expect("trusted reopen");
+    assert_eq!(
+        trusted
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint read after reopen"),
+        Some(serde_json::json!({"version": 99, "state": "tampered"}))
+    );
 }
 
 // 验证历史 turn-shaped trace 不能在关联不唯一时被猜测修复。
@@ -1990,27 +1295,6 @@ fn v11_missing_migration_marker_fails_closed() {
 
 // 验证 marker 或列只完成一半时，store 不会猜测并继续运行。
 #[test]
-fn partial_thread_policy_migration_fails_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("create current store");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute("alter table threads drop column approval_policy", [])
-        .expect("remove one policy column");
-    drop(connection);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message))
-            if message.contains("current schema fingerprint is not canonical")
-    ));
-}
-
-// v11 的 check/index/trigger 结构合同被削弱时，open 只读失败且不再追加任何对象或行。
-#[test]
 fn v11_structure_rejects_weak_check_index_and_trigger_without_mutation() {
     for corruption in ["check", "index", "trigger"] {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2049,7 +1333,7 @@ fn v11_structure_rejects_weak_check_index_and_trigger_without_mutation() {
             }
             "index" => {
                 connection
-                    .execute("drop index approvals_thread_lookup", [])
+                    .execute("drop index turns_history_lookup", [])
                     .expect("drop canonical index");
             }
             "trigger" => {
@@ -2076,28 +1360,6 @@ fn v11_structure_rejects_weak_check_index_and_trigger_without_mutation() {
 
 // 验证已经标记完成的 schema 也不会接受未知或伪造的持久化 policy 值。
 #[test]
-fn invalid_thread_policy_snapshot_value_fails_closed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    create_legacy_enum_database(&db_path, 9);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            r#"update threads set sandbox_mode = '"unsupported-mode"'"#,
-            [],
-        )
-        .expect("tamper sandbox mode");
-    drop(connection);
-
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message)) if message.contains("sandbox mode")
-    ));
-}
-
-// 验证迁移后关键表重新建立完整外键约束。
-#[test]
 fn migrated_schema_rebuilds_foreign_key_tables() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
@@ -2110,65 +1372,26 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
     connection
         .execute_batch("pragma foreign_keys = on;")
         .expect("enable foreign keys");
-    let pending_parents = foreign_key_parents(&connection, "pending_tool_calls");
-    assert!(pending_parents.contains(&"approvals".to_string()));
-    assert!(pending_parents.contains(&"threads".to_string()));
-    assert!(pending_parents.contains(&"turns".to_string()));
+    let turn_parents = foreign_key_parents(&connection, "turns");
+    assert!(turn_parents.contains(&"threads".to_string()));
     assert!(connection
         .execute(
-            "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload) values('approval_missing', 'thread_missing', 'turn_missing', 'call_2', '{}')",
-            [],
-        )
-        .is_err());
-    assert!(
-        connection
-            .execute(
-                "insert into pending_tool_calls(
-                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-             ) values(
-                 'approval_pending', 'thread_legacy', 'turn_pending', 'call_invalid',
-                 '{}', 'approved'
-             )",
-                [],
-            )
-            .is_err()
-    );
-}
-
-// 验证新 schema 拒绝孤儿 turn 与 pending tool call。
-#[test]
-fn fresh_schema_rejects_orphan_turn_and_pending_tool_call_rows() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch("pragma foreign_keys = on;")
-        .expect("enable foreign keys");
-
-    assert!(connection
-        .execute(
-            "insert into turns(turn_id, thread_id, status, agent_loop_status) values('turn_missing', 'thread_missing', 'running', 'running')",
+            "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status)
+             values('orphan_turn', 'missing_thread', 1, 'running', 'running')",
             [],
         )
         .is_err());
     assert!(connection
         .execute(
-            "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload) values('approval_missing', 'thread_missing', 'turn_missing', 'call_1', '{}')",
-            [],
-        )
-        .is_err());
-    assert!(connection
-        .execute(
-            "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values('approval_invalid', 'thread_missing', 'turn_missing', 'call_2', '{}', 'approved')",
+            "insert into turns(
+                 turn_id, thread_id, turn_sequence, status, agent_loop_status
+             ) values('bad_turn', 'thread_legacy', 1, 'unknown_status', 'running')",
             [],
         )
         .is_err());
 }
 
-// 验证缺失 thread、turn、trace run 和 artifact 时统一返回 NotFound。
+// 验证新 schema 拒绝孤儿 turn 与 artifact。
 #[test]
 fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2193,480 +1416,6 @@ fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
 }
 
 // 验证 pending tool call 的 request_id 必须绑定 approval。
-#[test]
-fn pending_tool_call_binding_rejects_request_mismatch() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_turn_call_1",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1");
-    let pending_tool_call = serde_json::json!({
-        "request_id": "approval_other",
-        "tool_call_id": "call_1",
-        "tool_name": "patch",
-        "raw_arguments": "{}",
-        "resources": []
-    });
-
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_tool_call),
-            "approval",
-            "approval requested",
-        )
-        .expect("Store persists opaque checkpoint payload");
-    assert_eq!(store.list_pending_approvals().expect("pending").len(), 1);
-}
-
-// 验证 approval 必须显式绑定已有 thread 与 turn。
-#[test]
-fn approval_creation_requires_explicit_existing_thread_turn_binding() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let request = ApprovalRequest {
-        request_id: "approval_1".to_string(),
-        thread_id: String::new(),
-        turn_id: String::new(),
-        tool_call_id: None,
-        action: tool_id("edit"),
-        resources: Vec::new(),
-        reason: String::new(),
-    };
-
-    assert!(matches!(
-        store.create_approval(&request),
-        Err(StoreError::InvalidState(message))
-            if message == "approval request must include explicit thread_id and turn_id"
-    ));
-}
-
-// 验证 approval 不得引用属于另一 thread 的 turn。
-#[test]
-fn approval_creation_rejects_turn_bound_to_another_thread() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let expected_thread = store.create_thread(None, None).expect("expected thread");
-    let other_thread = store.create_thread(None, None).expect("other thread");
-    let turn = store
-        .create_turn(&other_thread.thread_id, "blocked")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_1",
-        expected_thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    );
-
-    assert!(matches!(
-        store.create_approval(&request),
-        Err(StoreError::InvalidState(message))
-            if message == "approval request thread_id must match bound turn"
-    ));
-}
-
-// 验证 pending tool call 必须提供与 approval 一致的 tool_call_id。
-#[test]
-fn pending_tool_call_binding_requires_request_tool_call_id() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_turn_call_1",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    );
-    let pending_tool_call = serde_json::json!({
-        "request_id": "approval_turn_call_1",
-        "thread_id": &thread.thread_id,
-        "turn_id": &turn.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "patch",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-
-    assert!(matches!(
-        store.create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_tool_call),
-            "approval",
-            "approval requested",
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "pending approval checkpoint requires an explicit tool_call_id"
-    ));
-}
-
-// 验证缺少 checkpoint 的 pending approval 会整体回滚。
-#[test]
-fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_turn_call_1",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let pending_tool_call = serde_json::json!({
-        "request_id": "approval_turn_call_1",
-        "thread_id": &thread.thread_id,
-        "turn_id": &turn.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": []
-    });
-
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_tool_call.clone()),
-            "approval",
-            "approval requested",
-        )
-        .expect("Store persists opaque checkpoint payload");
-    assert_eq!(
-        store
-            .get_pending_tool_call(&request.request_id)
-            .expect("opaque checkpoint payload"),
-        Some(pending_tool_call)
-    );
-}
-
-// 验证相同对象型 checkpoint 的 approval batch 重试按持久化序列化保持幂等。
-#[test]
-fn approval_batch_retry_accepts_same_opaque_object_checkpoint() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_batch_idempotent",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-
-    store
-        .create_approval_batch_with_pending_tool_calls_and_trace(
-            &[(request.clone(), checkpoint.clone())],
-            "approval",
-            "approval requested",
-        )
-        .expect("initial approval batch");
-    let retry = store
-        .create_approval_batch_with_pending_tool_calls_and_trace(
-            &[(request, checkpoint)],
-            "approval",
-            "approval requested",
-        )
-        .expect("idempotent approval batch retry");
-
-    assert!(retry.is_empty());
-    assert_eq!(store.list_pending_approvals().expect("pending").len(), 1);
-}
-
-// 验证批次第二条 trace 写入失败时，approval、checkpoint、turn 和首条 trace 全部回滚。
-#[test]
-fn approval_batch_rolls_back_when_second_write_hits_existing_trace() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let first = ApprovalRequest::new(
-        "approval_batch_first",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let second = ApprovalRequest::new(
-        "approval_batch_second",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_2");
-    let checkpoint = |request: &ApprovalRequest, tool_call_id: &str| {
-        serde_json::json!({
-            "request_id": &request.request_id,
-            "thread_id": &request.thread_id,
-            "turn_id": &request.turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        })
-    };
-    store
-        .append_trace(&TraceEvent::for_turn(
-            format!("trace_{}", second.request_id),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "test",
-            "reserved event id",
-        ))
-        .expect("reserve second trace id");
-
-    let result = store.create_approval_batch_with_pending_tool_calls_and_trace(
-        &[
-            (first.clone(), checkpoint(&first, "call_1")),
-            (second.clone(), checkpoint(&second, "call_2")),
-        ],
-        "approval",
-        "approval requested",
-    );
-    assert!(matches!(result, Err(StoreError::Sqlite(_))));
-    assert_eq!(
-        store.get_turn(&turn.turn_id).expect("turn").status,
-        TurnStatus::Running
-    );
-    assert_eq!(
-        store
-            .get_turn(&turn.turn_id)
-            .expect("turn")
-            .agent_loop_status,
-        "running"
-    );
-    assert!(
-        store
-            .list_pending_approvals()
-            .expect("approvals")
-            .is_empty()
-    );
-    assert!(
-        !store
-            .has_pending_tool_call(&first.request_id)
-            .expect("first checkpoint")
-    );
-    assert!(
-        !store
-            .has_pending_tool_call(&second.request_id)
-            .expect("second checkpoint")
-    );
-    let trace_ids = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .filter(|trace| {
-            !(trace.span_kind == Some(TraceSpanKind::Turn)
-                && trace.span_phase == Some(TraceSpanPhase::Start))
-        })
-        .map(|trace| trace.event_id)
-        .collect::<Vec<_>>();
-    assert_eq!(trace_ids, vec![format!("trace_{}", second.request_id)]);
-}
-
-// 验证创建 pending approval 不会覆盖已请求取消的 turn。
-#[test]
-fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let trace = TraceEvent {
-        payload: serde_json::json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-        ..TraceEvent::for_turn(
-            "trace_cancel_before_approval",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "app_server",
-            "turn interrupt requested",
-        )
-    };
-    store
-        .request_turn_cancellation(&turn.turn_id, &trace)
-        .expect("request cancellation");
-    let request = ApprovalRequest::new(
-        "approval_after_cancel",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    assert!(matches!(
-        store.create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "pending approval requires a running or blocked turn"
-    ));
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    let cancelled = store.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(cancelled.status, TurnStatus::Running);
-    assert_eq!(cancelled.agent_loop_status, "cancel_requested");
-}
-
-// 验证 pending tool call 必须绑定已存在的 turn。
-#[test]
-fn pending_tool_call_binding_requires_existing_turn() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let request = ApprovalRequest::new(
-        "approval_missing_turn_call_1",
-        "missing_thread",
-        "missing_turn",
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1");
-    let pending_tool_call = serde_json::json!({
-        "request_id": "approval_missing_turn_call_1",
-        "tool_call_id": "call_1",
-        "tool_name": "patch",
-        "raw_arguments": "{}",
-        "resources": []
-    });
-
-    assert!(matches!(
-        store.create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_tool_call),
-            "approval",
-            "approval requested",
-        ),
-        Err(StoreError::NotFound(message)) if message == "turn missing_turn"
-    ));
-}
-
-// 验证 approval 决定拒绝跨 turn 的 pending tool call 绑定。
-#[test]
-fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let expected_turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("expected turn");
-    store
-        .update_turn_state(
-            &expected_turn.turn_id,
-            TurnStatus::Interrupted,
-            "interrupted",
-        )
-        .expect("finish expected turn fixture");
-    let other_turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("other turn");
-    let request = ApprovalRequest::new(
-        "approval_turn_call_1",
-        thread.thread_id.clone(),
-        expected_turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1");
-    store.create_approval(&request).expect("approval");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch("pragma foreign_keys = on;")
-        .expect("enable foreign keys");
-    connection
-        .execute(
-            "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload) values(?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                request.request_id.as_str(),
-                thread.thread_id.as_str(),
-                other_turn.turn_id.as_str(),
-                "call_1",
-                serde_json::json!({
-                    "request_id": request.request_id.as_str(),
-                    "tool_call_id": "call_1",
-                    "tool_name": "patch",
-                    "raw_arguments": "{}",
-                    "resources": []
-                })
-                .to_string()
-            ],
-        )
-        .expect("corrupt pending row");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-
-    assert!(matches!(
-        store.record_approval_decision(&decision, "approval", "approval decision recorded"),
-        Err(StoreError::InvalidState(message)) if message == "pending tool call turn_id must match approval request"
-    ));
-}
-
-// 验证终态 turn 不会被后续状态更新覆盖。
 #[test]
 fn terminal_turn_status_is_not_overwritten_by_later_updates() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2777,225 +1526,6 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
 
 // 验证 monitor 基础设施故障优先于 cancel_requested，并原子清理 executing checkpoint。
 #[test]
-fn infrastructure_failure_after_approval_claim_terminalizes_and_cleans_checkpoint() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_infra_after_claim",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending approval");
-    store
-        .record_approval_decision(
-            &ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Allow, "allow"),
-            "approval",
-            "approval decision recorded",
-        )
-        .expect("claim approval");
-    store
-        .request_turn_cancellation(
-            &turn.turn_id,
-            &TraceEvent::for_turn(
-                "trace_infra_after_claim_cancel",
-                thread.thread_id.clone(),
-                turn.turn_id.clone(),
-                "app_server",
-                "turn interrupt requested",
-            ),
-        )
-        .expect("request cancellation");
-
-    let committed = store
-        .commit_turn_outcome_and_resolve_pending_execution_with_authority(
-            &request.request_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Failed,
-                agent_loop_status: "failed",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_infra_after_claim_failed",
-                    thread.thread_id.clone(),
-                    turn.turn_id.clone(),
-                    "agent_loop",
-                    "turn execution failed",
-                ),
-            },
-            &[],
-            TurnOutcomeAuthority::InfrastructureFailure,
-        )
-        .expect("infra failure must win cancellation");
-    assert_eq!(committed.turn.status, TurnStatus::Failed);
-    assert_eq!(committed.turn.agent_loop_status, "failed");
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("executing checkpoint cleanup")
-    );
-}
-
-// 验证 claim 后的终态 trace 写入失败不会留下部分状态，随后安全补偿仍可原子收口。
-#[test]
-fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_terminal_store_failure",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("claim approval");
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "
-            create trigger fail_approval_terminal_trace
-            before insert on trace_events
-            when new.payload like '%forced approval terminal failure%'
-            begin
-                select raise(abort, 'forced approval terminal trace failure');
-            end;
-            ",
-        )
-        .expect("install trigger");
-    drop(connection);
-
-    let failed_attempt = store.commit_turn_outcome_and_resolve_pending_execution(
-        &request.request_id,
-        CommitTurnOutcomeParams {
-            status: TurnStatus::Failed,
-            agent_loop_status: "failed",
-            assistant_item_id: None,
-            assistant_delta: None,
-            trace: &TraceEvent {
-                payload: serde_json::json!({"error": "forced approval terminal failure"}),
-                ..TraceEvent::for_turn(
-                    "trace_approval_terminal_failure",
-                    thread.thread_id.clone(),
-                    turn.turn_id.clone(),
-                    "agent_loop",
-                    "approval terminal attempt",
-                )
-            },
-        },
-        &[],
-    );
-    assert!(matches!(failed_attempt, Err(StoreError::Sqlite(_))));
-    let after_rollback = store.get_turn(&turn.turn_id).expect("turn after rollback");
-    assert_eq!(after_rollback.status, TurnStatus::Blocked);
-    assert_eq!(after_rollback.agent_loop_status, "blocked");
-    assert!(
-        store
-            .has_pending_tool_call(&request.request_id)
-            .expect("executing checkpoint remains for compensation")
-    );
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch("drop trigger fail_approval_terminal_trace")
-        .expect("remove trigger");
-    drop(connection);
-
-    let committed = store
-        .commit_turn_outcome_and_resolve_pending_execution(
-            &request.request_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Failed,
-                agent_loop_status: "failed",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &TraceEvent::for_turn(
-                    "trace_approval_terminal_cleanup",
-                    thread.thread_id.clone(),
-                    turn.turn_id.clone(),
-                    "agent_loop",
-                    "approval continuation failed during approval_checkpoint",
-                ),
-            },
-            &[],
-        )
-        .expect("safe cleanup");
-    assert_eq!(committed.turn.status, TurnStatus::Failed);
-    assert_eq!(committed.turn.agent_loop_status, "failed");
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("checkpoint cleanup")
-    );
-}
-
-// Infrastructure authority is a typed Failed reduction, never an alternate
-// spelling of cancellation or a way to publish a successful late result.
-#[test]
 fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
     for (status, agent_loop_status) in [
         (TurnStatus::Interrupted, "cancelled"),
@@ -3054,170 +1584,6 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
 }
 
 // 验证 approval 决定只写入一次且保留在 decision history。
-#[test]
-fn approval_decision_is_written_once_and_kept_in_decision_history() {
-    for outcome in [
-        ApprovalOutcome::Allow,
-        ApprovalOutcome::Deny,
-        ApprovalOutcome::Defer,
-    ] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let thread = store.create_thread(None, None).expect("thread");
-        let turn = store
-            .create_turn(&thread.thread_id, "blocked")
-            .expect("turn");
-        let request = ApprovalRequest::new(
-            "approval_1",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            tool_id("write_file"),
-        );
-        store.create_approval(&request).expect("approval");
-        let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
-
-        let recorded = store
-            .record_approval_decision(&decision, "approval", "approval decision recorded")
-            .expect("decision");
-        let trace = recorded.trace;
-
-        assert_eq!(recorded.request, request);
-        assert_eq!(recorded.decision, decision);
-        assert_eq!(trace.run_id, thread.thread_id);
-        assert_eq!(trace.session_id, turn.turn_id);
-        assert_eq!(trace.task_id.as_deref(), Some(turn.turn_id.as_str()));
-        assert_eq!(trace.payload["request_id"], "approval_1");
-        assert_eq!(trace.payload["decision_id"], decision.decision_id);
-        assert_eq!(
-            trace.payload["outcome"],
-            serde_json::to_value(outcome).expect("serialize outcome")
-        );
-        assert_eq!(
-            store
-                .list_trace(&thread.thread_id)
-                .expect("trace list")
-                .into_iter()
-                .find(|event| event.event_id == trace.event_id)
-                .map(|event| event.event_id),
-            Some(trace.event_id)
-        );
-        if outcome == ApprovalOutcome::Defer {
-            assert!(matches!(
-                store.get_approval_decision(&decision.decision_id),
-                Err(StoreError::NotFound(_))
-            ));
-            assert_eq!(
-                store.list_pending_approvals().expect("pending"),
-                vec![request]
-            );
-            store
-                .record_approval_decision(&decision, "approval", "approval deferred")
-                .expect("repeated defer");
-        } else {
-            assert_eq!(
-                store
-                    .get_approval_decision(&decision.decision_id)
-                    .expect("decision history")
-                    .outcome,
-                outcome
-            );
-            assert!(store.list_pending_approvals().expect("pending").is_empty());
-            assert!(matches!(
-                store.record_approval_decision(
-                    &decision,
-                    "approval",
-                    "approval decision recorded"
-                ),
-                Err(StoreError::NotFound(message)) if message == "approval approval_1"
-            ));
-        }
-    }
-}
-
-// 验证进程恢复会中断 executing approval，且不会重放外部副作用。
-#[test]
-fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_recovery",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": &request.resources,
-        "checkpoint_version": 1,
-        "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":"call_1","tool_name":"edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {},
-        "last_completion_error": null
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval checkpoint");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("claim execution");
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("recover executing approval");
-
-    let recovered_turn = reopened.get_turn(&turn.turn_id).expect("recovered turn");
-    assert_eq!(recovered_turn.status, TurnStatus::Interrupted);
-    assert_eq!(recovered_turn.agent_loop_status, "interrupted");
-    assert!(
-        !reopened
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending lookup")
-    );
-    let recovery_trace = reopened
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|trace| trace.event_id == "trace_approval_recovery_recovered")
-        .expect("recovery trace");
-    assert_eq!(recovery_trace.payload["tool_replayed"], false);
-    assert_eq!(
-        recovery_trace.payload["recovery_reason"],
-        "approval_execution_outcome_unknown"
-    );
-}
-
-// B1：paused/suspended turn 的 interrupt 在当前进程当场收敛（无需重启），
-// checkpoint 审计证据保留，typed trace 记录 owner-loss 收敛。
 #[test]
 fn paused_and_suspended_interrupt_terminalizes_without_restart() {
     for (status, agent_loop_status) in [
@@ -3326,91 +1692,7 @@ fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings(
         .update_turn_state(&turn_2.turn_id, TurnStatus::Paused, "paused")
         .expect("pause 2");
 
-    // 场景 3：paused 带未解决 pending approval（approvals + pending_tool_calls）。
-    let thread_3 = store.create_thread(None, None).expect("thread 3");
-    let turn_3 = store
-        .create_turn(&thread_3.thread_id, "running")
-        .expect("turn 3");
-    let request_3 = ApprovalRequest::new(
-        "approval_recovery_3",
-        thread_3.thread_id.clone(),
-        turn_3.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_3")
-    .with_resources([workspace_resource("README.md")]);
-    let checkpoint_3 = serde_json::json!({
-        "request_id": &request_3.request_id,
-        "thread_id": &request_3.thread_id,
-        "turn_id": &request_3.turn_id,
-        "tool_call_id": "call_3",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": &request_3.resources,
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request_3,
-            Some(checkpoint_3),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending 3");
-    store
-        .update_turn_state(&turn_3.turn_id, TurnStatus::Paused, "paused")
-        .expect("pause 3");
-
-    // 场景 4：suspended 带未解决 pending approval（ownerless 状态残留的
-    // 不一致 pending；running+pending 会被 store 打开 preflight 拒绝，属于
-    // 不可归属损坏，保持 fail-closed，不在本场景内）。
-    let thread_4 = store.create_thread(None, None).expect("thread 4");
-    let turn_4 = store
-        .create_turn(&thread_4.thread_id, "running")
-        .expect("turn 4");
-    let request_4 = ApprovalRequest::new(
-        "approval_recovery_4",
-        thread_4.thread_id.clone(),
-        turn_4.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_4")
-    .with_resources([workspace_resource("README.md")]);
-    let checkpoint_4 = serde_json::json!({
-        "request_id": &request_4.request_id,
-        "thread_id": &request_4.thread_id,
-        "turn_id": &request_4.turn_id,
-        "tool_call_id": "call_4",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": &request_4.resources,
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request_4,
-            Some(checkpoint_4),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending 4");
-    store
-        .update_turn_state(&turn_4.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend 4");
-
-    // 健康 sibling 1：suspended 有 checkpoint（正常可恢复）。
+    // 健康 sibling：suspended 有 checkpoint（正常可恢复）。
     let thread_5 = store.create_thread(None, None).expect("thread 5");
     let turn_5 = store
         .create_turn(&thread_5.thread_id, "running")
@@ -3427,47 +1709,6 @@ fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings(
         .update_turn_state(&turn_5.turn_id, TurnStatus::Suspended, "suspended")
         .expect("suspend 5");
 
-    // 健康 sibling 2：blocked + 1 pending approval（正常待审批）。
-    let thread_6 = store.create_thread(None, None).expect("thread 6");
-    let turn_6 = store
-        .create_turn(&thread_6.thread_id, "running")
-        .expect("turn 6");
-    let request_6 = ApprovalRequest::new(
-        "approval_recovery_6",
-        thread_6.thread_id.clone(),
-        turn_6.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_6")
-    .with_resources([workspace_resource("README.md")]);
-    let checkpoint_6 = serde_json::json!({
-        "request_id": &request_6.request_id,
-        "thread_id": &request_6.thread_id,
-        "turn_id": &request_6.turn_id,
-        "tool_call_id": "call_6",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": &request_6.resources,
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request_6,
-            Some(checkpoint_6),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending 6");
-    store
-        .update_turn_state(&turn_6.turn_id, TurnStatus::Blocked, "blocked")
-        .expect("block 6");
-
     drop(store);
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
@@ -3475,43 +1716,12 @@ fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings(
         .recover_unowned_workspace_executions()
         .expect("recover inconsistent ownerless turns");
 
-    // 四个坏 turn 全部收敛为 Interrupted/interrupted。
-    for turn in [&turn_1, &turn_2, &turn_3, &turn_4] {
+    // 两个坏 turn 全部收敛为 Interrupted/interrupted。
+    for turn in [&turn_1, &turn_2] {
         let recovered = reopened.get_turn(&turn.turn_id).expect("recovered turn");
         assert_eq!(recovered.status, TurnStatus::Interrupted);
         assert_eq!(recovered.agent_loop_status, "interrupted");
     }
-    // 场景 3 的未解决 approval/pending 行已删除，不留下孤儿。
-    assert!(
-        !reopened
-            .has_pending_tool_call(&request_3.request_id)
-            .expect("pending 3 lookup")
-    );
-    // 场景 4 的 pending approval 行已删除。
-    assert!(
-        !reopened
-            .has_pending_tool_call(&request_4.request_id)
-            .expect("pending 4 lookup")
-    );
-    // 坏 turn 的未解决 approval 已删除，健康 blocked sibling 的 pending 保留。
-    let pending_requests = reopened
-        .list_pending_approvals()
-        .expect("pending approvals");
-    assert!(
-        !pending_requests
-            .iter()
-            .any(|request| request.request_id == request_3.request_id)
-    );
-    assert!(
-        !pending_requests
-            .iter()
-            .any(|request| request.request_id == request_4.request_id)
-    );
-    assert!(
-        pending_requests
-            .iter()
-            .any(|request| request.request_id == request_6.request_id)
-    );
     // unknown execution 保留为审计证据（不删除、不重放）。
     assert_eq!(
         reopened
@@ -3544,14 +1754,6 @@ fn recovery_terminalizes_inconsistent_ownerless_turns_without_blocking_siblings(
     let healthy_5 = reopened.get_turn(&turn_5.turn_id).expect("turn 5");
     assert_eq!(healthy_5.status, TurnStatus::Suspended);
     assert_eq!(healthy_5.agent_loop_status, "suspended");
-    let healthy_6 = reopened.get_turn(&turn_6.turn_id).expect("turn 6");
-    assert_eq!(healthy_6.status, TurnStatus::Blocked);
-    assert_eq!(healthy_6.agent_loop_status, "blocked");
-    assert!(
-        reopened
-            .has_pending_tool_call(&request_6.request_id)
-            .expect("pending 6 lookup")
-    );
 }
 
 #[test]
@@ -3749,81 +1951,6 @@ fn terminal_turn_rejects_late_tool_execution_begin_without_writes() {
             status
         );
     }
-}
-
-#[test]
-fn blocked_begin_rejects_cross_thread_executing_pending_tool_call_without_writes() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let other_thread = store.create_thread(None, None).expect("other thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_cross_thread_pending",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_cross_thread");
-    store.create_approval(&request).expect("approval");
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
-        .expect("blocked turn");
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "insert into pending_tool_calls(
-                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-             ) values(?1, ?2, ?3, ?4, ?5, 'executing')",
-            rusqlite::params![
-                request.request_id,
-                other_thread.thread_id,
-                turn.turn_id,
-                "call_cross_thread",
-                "{}"
-            ],
-        )
-        .expect("cross-thread pending execution");
-    drop(connection);
-
-    let checkpoint = serde_json::json!({
-        "checkpoint_version": 1,
-        "boundary": "tool_calls_ready"
-    });
-    let execution = ToolExecution {
-        execution_id: format!("turn:{}:tool:cross_thread", turn.turn_id),
-        thread_id: thread.thread_id.clone(),
-        turn_id: turn.turn_id.clone(),
-        tool_call_id: "call_cross_thread".to_string(),
-        state: ToolExecutionState::Running,
-        payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
-    };
-
-    assert!(matches!(
-        store
-            .begin_tool_executions_at_checkpoint(std::slice::from_ref(&execution), &checkpoint, 1,),
-        Err(StoreError::InvalidState(_))
-    ));
-    assert!(
-        store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint lookup")
-            .is_none()
-    );
-    assert!(
-        store
-            .get_tool_execution(&execution.execution_id)
-            .expect("execution lookup")
-            .is_none()
-    );
-    assert_eq!(
-        store.get_turn(&turn.turn_id).expect("turn lookup").status,
-        TurnStatus::Blocked
-    );
 }
 
 #[test]
@@ -4228,632 +2355,7 @@ fn suspended_turn_claim_allows_only_one_owner() {
 
 // 验证旧 handoff 半完成时恢复 pending successor 而不丢失执行上下文。
 #[test]
-fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let checkpoint = |request_id: &str, tool_call_id: &str| {
-        serde_json::json!({
-            "request_id": request_id,
-            "thread_id": &thread.thread_id,
-            "turn_id": &turn.turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":tool_call_id,"tool_name":"edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        })
-    };
-    let first = ApprovalRequest::new(
-        "approval_legacy_executing",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &first,
-            Some(checkpoint(&first.request_id, "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("first approval");
-    let first_decision =
-        ApprovalDecision::new(first.request_id.clone(), ApprovalOutcome::Allow, "allowed");
-    store
-        .record_approval_decision(&first_decision, "approval", "approval decision recorded")
-        .expect("claim first execution");
-
-    let next = ApprovalRequest::new(
-        "approval_pending_successor",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_2");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &next,
-            Some(checkpoint(&next.request_id, "call_2")),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending successor");
-    drop(store);
-
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("recover half handoff");
-    assert!(
-        !reopened
-            .has_pending_tool_call(&first.request_id)
-            .expect("first")
-    );
-    assert!(
-        reopened
-            .has_pending_tool_call(&next.request_id)
-            .expect("next")
-    );
-    assert_eq!(
-        reopened
-            .get_pending_approval(&next.request_id)
-            .expect("pending successor"),
-        next
-    );
-    assert_eq!(
-        reopened
-            .get_approval_decision(&first_decision.decision_id)
-            .expect("allow decision"),
-        first_decision
-    );
-    let recovered_turn = reopened.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(recovered_turn.status, TurnStatus::Blocked);
-    assert_eq!(recovered_turn.agent_loop_status, "blocked");
-    let recovery_trace = reopened
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|trace| trace.event_id == "trace_approval_legacy_executing_recovered")
-        .expect("half handoff recovery trace");
-    assert_eq!(recovery_trace.payload["tool_replayed"], false);
-    assert_eq!(
-        recovery_trace.payload["recovery_reason"],
-        "approval_execution_superseded_by_pending_handoff"
-    );
-
-    reopened
-        .recover_unowned_workspace_executions()
-        .expect("idempotent recovery");
-    assert_eq!(
-        reopened
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .into_iter()
-            .filter(|trace| trace.event_id == "trace_approval_legacy_executing_recovered")
-            .count(),
-        1
-    );
-}
-
-// 验证 v11 open 会在恢复前拒绝不一致的 approval/checkpoint 绑定且不改库。
-#[test]
-fn v11_open_rejects_inconsistent_approval_checkpoint_before_recovery() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let other_thread = store.create_thread(None, None).expect("other thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let checkpoint = |request_id: &str, tool_call_id: &str| {
-        serde_json::json!({
-            "request_id": request_id,
-            "thread_id": &thread.thread_id,
-            "turn_id": &turn.turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        })
-    };
-    let first = ApprovalRequest::new(
-        "approval_corrupt_first",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &first,
-            Some(checkpoint(&first.request_id, "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("first approval");
-    store
-        .record_approval_decision(
-            &ApprovalDecision::new(first.request_id.clone(), ApprovalOutcome::Allow, "allowed"),
-            "approval",
-            "approval decision recorded",
-        )
-        .expect("claim first execution");
-    let next = ApprovalRequest::new(
-        "approval_corrupt_next",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_2");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &next,
-            Some(checkpoint(&next.request_id, "call_2")),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending successor");
-    drop(store);
-
-    let orphan_request_id = "approval_orphan_pending";
-    let orphan_request = ApprovalRequest::new(
-        orphan_request_id,
-        other_thread.thread_id,
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_orphan");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "insert into approvals(request_id, thread_id, turn_id, payload)
-             values(?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                orphan_request_id,
-                thread.thread_id,
-                turn.turn_id,
-                serde_json::to_string(&orphan_request).expect("orphan approval payload")
-            ],
-        )
-        .expect("insert mismatched approval fixture");
-    connection
-        .execute(
-            "insert into pending_tool_calls(
-                request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-             ) values(?1, ?2, ?3, ?4, '{}', 'pending')",
-            rusqlite::params![
-                orphan_request_id,
-                thread.thread_id,
-                turn.turn_id,
-                "call_orphan"
-            ],
-        )
-        .expect("insert orphan pending execution");
-    drop(connection);
-
-    let before = sqlite_snapshot(&db_path);
-    assert!(matches!(
-        SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(_))
-    ));
-    assert_eq!(sqlite_snapshot(&db_path), before);
-    assert!(!has_v11_temporary_tables(&db_path));
-}
-
-// 验证 v11 open 会在恢复前拒绝缺失或游离 decision history，并保持数据库不变。
-#[test]
-fn v11_open_rejects_missing_or_stray_decision_history_without_mutation() {
-    for corruption in ["missing", "stray"] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("sessions.sqlite3");
-        let store = SessionStore::open(&db_path).expect("open store");
-        let thread = store.create_thread(None, None).expect("thread");
-        let turn = store
-            .create_turn(&thread.thread_id, "running")
-            .expect("turn");
-        let request = ApprovalRequest::new(
-            format!("approval_history_{corruption}"),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            tool_id("edit"),
-        )
-        .with_tool_call_id("call_1");
-        let checkpoint = serde_json::json!({
-            "request_id": &request.request_id,
-            "thread_id": &request.thread_id,
-            "turn_id": &request.turn_id,
-            "tool_call_id": "call_1",
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        });
-        store
-            .create_approval_with_pending_tool_call_and_trace(
-                &request,
-                Some(checkpoint),
-                "approval",
-                "approval requested",
-            )
-            .expect("approval");
-        let decision = ApprovalDecision::new(
-            request.request_id.clone(),
-            ApprovalOutcome::Allow,
-            "approved",
-        );
-        if corruption == "missing" {
-            store
-                .record_approval_decision(&decision, "approval", "approval decision recorded")
-                .expect("claim execution");
-        }
-        drop(store);
-
-        let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-        if corruption == "missing" {
-            connection
-                .execute(
-                    "delete from approval_decisions where request_id = ?1",
-                    rusqlite::params![request.request_id],
-                )
-                .expect("remove decision history");
-        } else {
-            connection
-                .execute(
-                    "insert into approval_decisions(decision_id, request_id, outcome, reason, payload)
-                     values(?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        decision.decision_id,
-                        request.request_id,
-                        ApprovalOutcome::Allow.as_storage_text(),
-                        decision.reason,
-                        serde_json::to_string(&decision).expect("decision"),
-                    ],
-                )
-                .expect("insert stray decision history");
-        }
-        drop(connection);
-
-        let before = sqlite_snapshot(&db_path);
-        assert!(matches!(
-            SessionStore::open(&db_path),
-            Err(StoreError::InvalidState(_))
-        ));
-        assert_eq!(sqlite_snapshot(&db_path), before);
-        assert!(!has_v11_temporary_tables(&db_path));
-    }
-}
-
-// 验证未带 checkpoint 的 unresolved tool approval 无法恢复。
-#[test]
-fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_missing_checkpoint",
-        thread.thread_id,
-        turn.turn_id,
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    store.create_approval(&request).expect("approval history");
-
-    assert!(matches!(
-        store.recover_unowned_workspace_executions(),
-        Err(StoreError::InvalidState(message))
-            if message == "approval approval_missing_checkpoint has inconsistent checkpoint state"
-    ));
-}
-
-// 验证 approval execution handoff 原子替换旧 checkpoint 与新 approval。
-#[test]
-fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_approval() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let first = ApprovalRequest::new(
-        "approval_first",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = |request_id: &str, tool_call_id: &str| {
-        serde_json::json!({
-            "request_id": request_id,
-            "thread_id": &thread.thread_id,
-            "turn_id": &turn.turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        })
-    };
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &first,
-            Some(checkpoint("approval_first", "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("first checkpoint");
-    store
-        .record_approval_decision(
-            &ApprovalDecision::new(first.request_id.clone(), ApprovalOutcome::Allow, "allow"),
-            "approval",
-            "approval decision recorded",
-        )
-        .expect("claim first execution");
-    let next = ApprovalRequest::new(
-        "approval_next",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_2");
-    let trace = TraceEvent::for_turn(
-        "trace_handoff",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        "agent_loop",
-        "agent loop blocked",
-    );
-
-    assert!(matches!(
-        store.commit_turn_outcome_and_resolve_pending_execution(
-            &first.request_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Interrupted,
-                agent_loop_status: "interrupted",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &trace,
-            },
-            &[(next.clone(), checkpoint("approval_next", "call_2"))],
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "next approval handoff requires a blocked turn outcome"
-    ));
-    assert!(
-        store
-            .has_pending_tool_call(&first.request_id)
-            .expect("first remains executing")
-    );
-    assert!(matches!(
-        store.get_pending_approval(&next.request_id),
-        Err(StoreError::NotFound(_))
-    ));
-
-    store
-        .commit_turn_outcome_and_resolve_pending_execution(
-            &first.request_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Blocked,
-                agent_loop_status: "blocked",
-                assistant_item_id: None,
-                assistant_delta: None,
-                trace: &trace,
-            },
-            &[(next.clone(), checkpoint("approval_next", "call_2"))],
-        )
-        .expect("atomic approval handoff");
-
-    assert!(
-        !store
-            .has_pending_tool_call(&first.request_id)
-            .expect("first")
-    );
-    assert!(store.has_pending_tool_call(&next.request_id).expect("next"));
-    assert_eq!(
-        store
-            .get_pending_approval(&next.request_id)
-            .expect("next approval"),
-        next
-    );
-    let blocked = store.get_turn(&turn.turn_id).expect("blocked turn");
-    assert_eq!(blocked.status, TurnStatus::Blocked);
-    assert_eq!(blocked.agent_loop_status, "blocked");
-    store
-        .record_approval_decision(
-            &ApprovalDecision::new(next.request_id.clone(), ApprovalOutcome::Allow, "allow"),
-            "approval",
-            "approval decision recorded",
-        )
-        .expect("successor approval has a typed wait span");
-}
-
-// 验证 deny with checkpoint 会终止 turn 并移除 checkpoint。
-#[test]
-fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_deny",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval checkpoint");
-    let decision =
-        ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Deny, "denied");
-
-    store
-        .record_approval_decision_with_first_attempt_failure(
-            &decision,
-            "approval",
-            "approval decision recorded",
-            true,
-        )
-        .expect("deny approval");
-
-    let denied_turn = store.get_turn(&turn.turn_id).expect("denied turn");
-    assert_eq!(denied_turn.status, TurnStatus::Failed);
-    assert_eq!(denied_turn.agent_loop_status, "failed");
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending lookup")
-    );
-    let denial_samples = store
-        .list_trace(&thread.thread_id)
-        .expect("trace")
-        .iter()
-        .flat_map(|event| event.metric_samples.iter())
-        .filter(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptFailure)
-        .count();
-    assert_eq!(denial_samples, 1);
-}
-
-// 验证 allow claim 在 store 事务内重新检查 active thread。
-#[test]
-fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_archive_race",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "update threads set status = ?1 where thread_id = ?2",
-            rusqlite::params![ThreadStatus::Archived.as_storage_text(), thread.thread_id],
-        )
-        .expect("simulate external archive race");
-
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    assert!(matches!(
-        store.record_approval_decision(&decision, "approval", "approval decision recorded"),
-        Err(StoreError::InvalidState(message))
-            if message == "pending approval allow requires an active thread"
-    ));
-    assert!(
-        store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending")
-    );
-    assert!(
-        store
-            .list_approval_decisions()
-            .expect("decisions")
-            .is_empty()
-    );
-    assert_eq!(
-        store.get_turn(&turn.turn_id).expect("turn").status,
-        TurnStatus::Blocked
-    );
-}
-
-// 验证删除 thread 会级联清理 approval、decision、trace 与相关数据。
-#[test]
-fn thread_delete_removes_bound_approvals_decisions_and_traces() {
+fn thread_delete_removes_bound_recovery_rows_and_traces() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -4861,73 +2363,36 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     let (turn, item, _) = store
         .create_turn_with_input_and_trace(
             &thread.thread_id,
-            "blocked",
+            "running",
             serde_json::json!([{"type": "text", "text": "delete me"}]),
             "test",
             "turn started",
         )
         .expect("turn");
     store
-        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_turn_call_1",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1");
-    let pending_tool_call = serde_json::json!({
-        "request_id": "approval_turn_call_1",
-        "thread_id": &thread.thread_id,
-        "turn_id": &turn.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": "patch",
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    let request_trace = store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_tool_call),
-            "approval",
-            "approval requested",
+        .commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "interrupted",
+                assistant_item_id: None,
+                assistant_delta: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_terminal_before_delete",
+                    &thread.thread_id,
+                    &turn.turn_id,
+                    "test",
+                    "interrupted before deletion",
+                ),
+            },
         )
-        .expect("approval");
-    assert_eq!(request_trace.run_id, thread.thread_id);
-    assert_eq!(request_trace.session_id, turn.turn_id);
-    assert_eq!(
-        request_trace.task_id.as_deref(),
-        Some(turn.turn_id.as_str())
-    );
+        .expect("terminal turn");
     assert!(
         store
             .list_trace(&thread.thread_id)
             .expect("thread trace")
             .iter()
-            .any(|event| event.event_id == request_trace.event_id)
-    );
-
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Deny,
-        "operator denied",
-    );
-    let decision_trace = store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("decision")
-        .trace;
-    assert_eq!(decision_trace.run_id, thread.thread_id);
-    assert_eq!(
-        decision_trace.task_id.as_deref(),
-        Some(turn.turn_id.as_str())
+            .any(|event| event.event_id == format!("trace_{}", turn.turn_id))
     );
 
     // Populate every recovery table with a real bound row before deletion.
@@ -4977,11 +2442,6 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         .delete_thread(&thread.thread_id)
         .expect("delete thread");
 
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    assert!(matches!(
-        store.get_approval_decision(&decision.decision_id),
-        Err(StoreError::NotFound(message)) if message == format!("approval decision {}", decision.decision_id)
-    ));
     assert!(matches!(
         store.list_trace(&thread.thread_id),
         Err(StoreError::NotFound(message)) if message == format!("trace run {}", thread.thread_id)
@@ -4989,12 +2449,9 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
 
     let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
     for table in [
-        "approval_decisions",
-        "pending_tool_calls",
         "turn_inputs",
         "tool_executions",
         "turn_checkpoints",
-        "approvals",
         "items",
         "trace_events",
         "artifact_refs",
@@ -5049,7 +2506,6 @@ fn malformed_checkpoint_terminalization_marks_unknown_and_never_replays() {
             &turn.turn_id,
             TurnStatus::Running,
             "running",
-            None,
         )
         .expect("terminalize malformed checkpoint");
     assert_eq!(failed.status, TurnStatus::Failed);
@@ -5082,7 +2538,6 @@ fn malformed_checkpoint_terminalization_marks_unknown_and_never_replays() {
             &turn.turn_id,
             TurnStatus::Running,
             "running",
-            None,
         ),
         Err(StoreError::InvalidState(message))
             if message.contains("owner/status changed")
@@ -5102,7 +2557,7 @@ fn foreign_key_parents(connection: &rusqlite::Connection, table: &str) -> Vec<St
 
 // 验证 turn user input 可供 approval resume 读取。
 #[test]
-fn turn_user_input_can_be_read_for_approval_resume() {
+fn turn_user_input_can_be_read_for_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
@@ -8242,13 +5697,6 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
             "trace metadata",
         ))
         .expect("trace");
-    let approval = ApprovalRequest::new(
-        "history_approval",
-        thread.thread_id.clone(),
-        completed.clone(),
-        tool_id("read"),
-    );
-    store.create_approval(&approval).expect("approval");
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute(
@@ -9147,9 +6595,10 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
                 rusqlite::params![
                     thread_id,
                     active,
-                    serde_json::to_string(&PermissionProfileName::WorkspaceWrite)
+                    serde_json::to_string(&serde_json::json!("workspace-write"))
                         .expect("sandbox mode"),
-                    serde_json::to_string(&ApprovalPolicy::OnRequest).expect("approval policy"),
+                    serde_json::to_string(&serde_json::json!("on-request"))
+                        .expect("approval policy"),
                 ],
             )
             .expect("insert legacy thread");
@@ -9269,134 +6718,6 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
         }
     }
 
-    let pending_request = if schema_version >= 7 {
-        ApprovalRequest::new(
-            "approval_pending",
-            thread_id,
-            pending_turn_id,
-            tool_id("edit"),
-        )
-        .with_tool_call_id("call_pending")
-    } else {
-        ApprovalRequest::new(
-            "approval_pending",
-            thread_id,
-            pending_turn_id,
-            tool_id("edit"),
-        )
-    };
-    let pending_payload = legacy_approval_payload(schema_version, &pending_request);
-    connection
-        .execute(
-            "insert into approvals(request_id, payload, decision_outcome, decision_reason)
-             values(?1, ?2, null, null)",
-            rusqlite::params![pending_request.request_id, pending_payload],
-        )
-        .expect("insert pending legacy approval");
-
-    if has_approval_decisions {
-        let final_request = ApprovalRequest::new(
-            "approval_final",
-            thread_id,
-            completed_turn_id,
-            tool_id("read"),
-        );
-        let final_decision = ApprovalDecision::new(
-            final_request.request_id.clone(),
-            ApprovalOutcome::Allow,
-            "legacy allow",
-        );
-        let allow = serde_json::to_string(&ApprovalOutcome::Allow).expect("approval outcome");
-        connection
-            .execute(
-                "insert into approvals(
-                     request_id, payload, decision_outcome, decision_reason
-                 ) values(?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    final_request.request_id,
-                    legacy_approval_payload(schema_version, &final_request),
-                    allow,
-                    final_decision.reason,
-                ],
-            )
-            .expect("insert final legacy approval");
-        connection
-            .execute(
-                "insert into approval_decisions(
-                     decision_id, request_id, outcome, reason, payload
-                 ) values(?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    final_decision.decision_id,
-                    final_decision.request_id,
-                    allow,
-                    final_decision.reason,
-                    serde_json::to_string(&final_decision).expect("final decision"),
-                ],
-            )
-            .expect("insert final legacy decision");
-    }
-
-    if schema_version >= 7 {
-        let checkpoint = serde_json::json!({
-            "request_id": pending_request.request_id,
-            "thread_id": thread_id,
-            "turn_id": pending_turn_id,
-            "tool_call_id": "call_pending",
-            "tool_name": "edit",
-            "raw_arguments": "{}",
-            "resources": [],
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        });
-        let checkpoint = serde_json::to_string(&checkpoint).expect("checkpoint");
-        if has_pending_bindings {
-            if has_execution_state {
-                connection
-                    .execute(
-                        "insert into pending_tool_calls(
-                             request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-                         ) values(?1, ?2, ?3, ?4, ?5, 'pending')",
-                        rusqlite::params![
-                            pending_request.request_id,
-                            thread_id,
-                            pending_turn_id,
-                            "call_pending",
-                            checkpoint,
-                        ],
-                    )
-                    .expect("insert pending checkpoint");
-            } else {
-                connection
-                    .execute(
-                        "insert into pending_tool_calls(
-                             request_id, thread_id, turn_id, tool_call_id, payload
-                         ) values(?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![
-                            pending_request.request_id,
-                            thread_id,
-                            pending_turn_id,
-                            "call_pending",
-                            checkpoint,
-                        ],
-                    )
-                    .expect("insert pending checkpoint");
-            }
-        } else {
-            connection
-                .execute(
-                    "insert into pending_tool_calls(request_id, turn_id, payload)
-                     values(?1, ?2, ?3)",
-                    rusqlite::params![pending_request.request_id, pending_turn_id, checkpoint],
-                )
-                .expect("insert pending checkpoint");
-        }
-    }
-
     if has_artifacts {
         connection
             .execute(
@@ -9435,47 +6756,6 @@ fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
     }
 }
 
-fn legacy_approval_payload(schema_version: u32, request: &ApprovalRequest) -> String {
-    let value = match schema_version {
-        1..=3 => serde_json::json!({
-            "request_id": request.request_id,
-            "session_id": request.thread_id,
-            "task_id": request.turn_id,
-            "action": request.action,
-            "reason": request.reason,
-        }),
-        4 => serde_json::json!({
-            "request_id": request.request_id,
-            "session_id": request.thread_id,
-            "task_id": request.turn_id,
-            "action": request.action,
-            "resources": request.resources,
-            "reason": request.reason,
-        }),
-        5 | 6 => serde_json::json!({
-            "request_id": request.request_id,
-            "session_id": request.thread_id,
-            "task_id": request.turn_id,
-            "thread_id": request.thread_id,
-            "turn_id": request.turn_id,
-            "tool_call_id": request.tool_call_id,
-            "action": request.action,
-            "resources": request.resources,
-            "reason": request.reason,
-        }),
-        7..=10 => serde_json::json!({
-            "request_id": request.request_id,
-            "thread_id": request.thread_id,
-            "turn_id": request.turn_id,
-            "tool_call_id": request.tool_call_id,
-            "action": request.action,
-            "resources": request.resources,
-            "reason": request.reason,
-        }),
-        _ => panic!("unsupported legacy schema version {schema_version}"),
-    };
-    serde_json::to_string(&value).expect("serialize legacy approval")
-}
 
 fn legacy_trace_payload(
     event_id: &str,

@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 
-//! 由 SQLite 支持的会话、turn、approval、追踪、产物和恢复状态。
+//! 由 SQLite 支持的会话、turn、追踪、产物和恢复状态。
 //!
-//! 变更操作使用事务和显式绑定，使 approval 检查点、turn 结果和执行所有权能够恢复，
+//! 变更操作使用事务和显式绑定，使 turn 结果和执行所有权能够恢复，
 //! 且无需重放未知的外部副作用。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,10 +26,6 @@ use sha2::{Digest, Sha256};
 use singularity_core::{
     Timestamp, bounded_stable_code, contains_sensitive_text, is_protected_path,
 };
-use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
-    PermissionProfileName, PermissionResource, ToolId, WorkspaceRelativePath,
-};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceBindingError, TraceEvent,
     TraceMetric, TraceMetricAvailability, TraceMetricDistribution, TraceMetricName,
@@ -45,7 +41,7 @@ use uuid::Uuid;
 const SCHEMA_VERSION: u32 = 13;
 const THREAD_POLICY_SCHEMA_VERSION: u32 = 9;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
-// 保留历史 migration id；当前代码表达 approval/trace event history，不表达密码学 ledger。
+// 保留历史 migration id；当前代码表达 trace event history，不表达密码学 ledger。
 const DURABLE_EVENT_HISTORY_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
 const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
 const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
@@ -79,19 +75,7 @@ const ARTIFACT_METADATA_MAX_DEPTH: usize = 8;
 const SHA256_HEX_LENGTH: usize = 64;
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
-const APPROVAL_BINDING_REQUIRED: &str =
-    "approval request must include explicit thread_id and turn_id";
-const APPROVAL_TURN_THREAD_MISMATCH: &str = "approval request thread_id must match bound turn";
-const PENDING_TOOL_CALL_ID_MISMATCH: &str =
-    "pending tool call tool_call_id must match approval request";
-const PENDING_TOOL_CALL_TURN_MISMATCH: &str =
-    "pending tool call turn_id must match approval request";
-const PENDING_TOOL_CALL_THREAD_MISMATCH: &str =
-    "pending tool call thread_id must match approval request";
-const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
-    "pending approval allow requires an active thread";
 
-mod approval;
 mod checkpoint_recovery;
 mod connection;
 mod error;
@@ -102,8 +86,7 @@ mod thread_turn;
 mod trace_artifact;
 mod turn_input;
 
-pub use approval::RecordedApprovalDecision;
-pub use checkpoint_recovery::{CheckpointFailureClaim, ToolExecution, ToolExecutionState};
+pub use checkpoint_recovery::{ToolExecution, ToolExecutionState};
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
 pub(crate) use thread_turn::typed_turn_end_trace;
@@ -114,10 +97,6 @@ pub use thread_turn::{
 pub use trace_artifact::RegisterArtifactRefParams;
 pub use turn_input::{PendingTurnInput, TurnBoundaryState};
 
-pub(crate) use approval::{
-    decode_final_approval_outcome, decode_stored_approval_request_row,
-    final_approval_outcome_to_db_text,
-};
 pub(crate) use connection::WorkspaceExecutionScope;
 pub(crate) use error::{DbEnum, decode_db_enum, unknown_db_enum};
 pub(crate) use file_identity::StoreIdentityGuard;

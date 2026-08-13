@@ -537,9 +537,7 @@ fn is_long_worker_method(message: &JsonRpcMessage) -> bool {
     matches!(
         message.method_name(),
         Some(method)
-            if method == Method::TurnStart.as_str()
-                || method == Method::TurnResume.as_str()
-                || method == Method::ApprovalDecision.as_str()
+            if method == Method::TurnStart.as_str() || method == Method::TurnResume.as_str()
     )
 }
 
@@ -665,10 +663,9 @@ fn run_request_worker(
                     .handle_turn_start_streaming_with_output(message, &mut send_streaming_output),
                 Some(method) if method == Method::TurnResume.as_str() => worker
                     .handle_turn_resume_streaming_with_output(message, &mut send_streaming_output),
-                _ => worker.handle_approval_decision_streaming_with_output(
-                    message,
-                    &mut send_streaming_output,
-                ),
+                _ => Err(AppServerError::Workspace(
+                    "streaming dispatch requires a long-running method".to_string(),
+                )),
             }
         } else {
             match worker.handle_with_output(message) {
@@ -2390,7 +2387,6 @@ mod tests {
                 {"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}},
                 {"jsonrpc":"2.0","method":"turn/start","id":3,"params":{}},
                 {"jsonrpc":"2.0","method":"turn/resume","id":4,"params":{}},
-                {"jsonrpc":"2.0","method":"approval/decision","id":5,"params":{}},
                 {"jsonrpc":"2.0","method":"turn/start","params":{}},
                 {"jsonrpc":"2.0","method":"server/capabilities","id":6,"params":{}}
             ]"#,
@@ -2401,20 +2397,20 @@ mod tests {
 
         let response = receiver.try_recv().expect("batch response").message;
         let responses = response.as_array().expect("batch response array");
-        assert_eq!(responses.len(), 6);
+        assert_eq!(responses.len(), 5);
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(
             responses[1]["result"]["transports"][0]["transport"],
             "stdio"
         );
-        for (response, id) in responses.iter().skip(2).zip([3, 4, 5]) {
+        for (response, id) in responses.iter().skip(2).zip([3, 4]) {
             assert_eq!(response["id"], id);
             assert_eq!(response["error"]["code"], -32600);
             assert_eq!(response["error"]["message"], "Invalid Request");
         }
-        assert_eq!(responses[5]["id"], 6);
-        assert!(responses[5]["result"]["transports"].is_array());
+        assert_eq!(responses[4]["id"], 6);
+        assert!(responses[4]["result"]["transports"].is_array());
         assert!(receiver.try_recv().is_err());
     }
 

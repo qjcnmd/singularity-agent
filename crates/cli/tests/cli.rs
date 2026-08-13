@@ -134,241 +134,10 @@ fn send(mut message: serde_json::Value) -> serde_json::Value {
 }
 
 fn fake_thread(thread_id: &str) -> serde_json::Value {
-    let mut thread = raw_fake_thread(thread_id);
-    thread["sandboxMode"] = json!("workspace-write");
-    thread["approvalPolicy"] = json!("on-request");
-    thread
-}
-
-fn fake_trace_event(event_id: &str, summary: &str) -> serde_json::Value {
-    json!({
-        "event_id": event_id,
-        "event_type": "trace.event",
-        "run_id": "run_fake",
-        "session_id": "session_fake",
-        "task_id": null,
-        "phase_id": null,
-        "action_id": null,
-        "parent_event_id": null,
-        "timestamp": null,
-        "monotonic_ms": null,
-        "component": "thread",
-        "severity": "info",
-        "summary": summary,
-        "payload": {},
-        "artifact_refs": [],
-        "policy_decision_id": null,
-        "approval_grant_id": null,
-        "sandbox_id": null,
-        "command_id": null,
-        "transaction_id": null,
-        "verification_id": null,
-        "span_id": null,
-        "redaction_applied": true,
-        "payload_hash": ""
-    })
-}
-
-// 构造 trace/metrics 的类型化响应测试数据。
-fn fake_trace_metrics_result(run_id: &str, metrics: serde_json::Value) -> serde_json::Value {
-    json!({
-        "metrics": {
-            "runId": run_id,
-            "metrics": metrics,
-        }
-    })
+    raw_fake_thread(thread_id)
 }
 
 // 验证 metrics CLI 只请求服务端派生结果，并原样渲染服务端聚合值。
-#[test]
-fn cli_trace_metrics_requests_typed_rpc_and_renders_server_aggregates() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let params_path = temp.path().join("trace-metrics-params.json");
-    let methods_path = temp.path().join("trace-metrics-methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "trace/metrics",
-                vec![
-                    capture_params(&params_path),
-                    respond(fake_trace_metrics_result(
-                        "run_metrics",
-                        json!([
-                            {
-                                "name": "task_duration_ms",
-                                "availability": {"state": "available"},
-                                "distribution": {
-                                    "count": 7,
-                                    "sum": 987654,
-                                    "min": 13,
-                                    "max": 9999,
-                                    "mean": 123.456789,
-                                    "p50": 321,
-                                    "p95": 9876
-                                }
-                            },
-                            {
-                                "name": "provider_error_count",
-                                "availability": {"state": "available"},
-                                "distribution": {
-                                    "count": 1,
-                                    "sum": 0,
-                                    "min": 0,
-                                    "max": 0,
-                                    "mean": 0.0,
-                                    "p50": 0,
-                                    "p95": 0
-                                }
-                            },
-                            {
-                                "name": "provider_input_tokens",
-                                "availability": {
-                                    "state": "unavailable",
-                                    "reason": "missing_usage"
-                                }
-                            }
-                        ]),
-                    )),
-                ],
-            )
-            .shutdown()
-            .trace_methods_to(&methods_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trace", "metrics", "run_metrics"])
-        .output()
-        .expect("trace metrics cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    let params: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(params_path).expect("trace metrics params"))
-            .expect("trace metrics params json");
-    assert_eq!(params, json!({"runId": "run_metrics"}));
-
-    let methods = std::fs::read_to_string(methods_path).expect("trace metrics methods");
-    assert_eq!(
-        methods,
-        "initialize\ninitialized\nevent/subscribe\ntrace/metrics\nserver/shutdown\n"
-    );
-
-    assert_eq!(
-        stdout(&output),
-        concat!(
-            "trace metrics run_metrics\n",
-            "metric task_duration_ms available count=7 sum=987654 min=13 max=9999 mean=123.456789 p50=321 p95=9876\n",
-            "metric provider_error_count available count=1 sum=0 min=0 max=0 mean=0.000000 p50=0 p95=0\n",
-            "metric provider_input_tokens unavailable reason=missing_usage\n",
-        )
-    );
-}
-
-// 验证 typed metrics 结果必须绑定到 CLI 请求的 run id。
-#[test]
-fn cli_trace_metrics_rejects_response_for_different_run() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let params_path = temp.path().join("trace-metrics-mismatch-params.json");
-    let methods_path = temp.path().join("trace-metrics-mismatch-methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "trace/metrics",
-                vec![
-                    capture_params(&params_path),
-                    respond(fake_trace_metrics_result("run_other", json!([]))),
-                ],
-            )
-            .shutdown()
-            .trace_methods_to(&methods_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trace", "metrics", "run_expected"])
-        .output()
-        .expect("trace metrics mismatch cli");
-
-    assert!(!output.status.success());
-    assert!(stdout(&output).is_empty());
-    assert_eq!(stderr(&output), "trace metrics response run mismatch\n");
-
-    let params: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(params_path).expect("trace metrics mismatch params"),
-    )
-    .expect("trace metrics mismatch params json");
-    assert_eq!(params, json!({"runId": "run_expected"}));
-
-    let methods = std::fs::read_to_string(methods_path).expect("trace metrics mismatch methods");
-    assert_eq!(
-        methods,
-        "initialize\ninitialized\nevent/subscribe\ntrace/metrics\nserver/shutdown\n"
-    );
-}
-
-// 验证 availability 与 distribution 不一致时 CLI fail closed。
-#[test]
-fn cli_trace_metrics_rejects_malformed_availability_distribution() {
-    for (metric, expected_error) in [
-        (
-            json!({
-                "name": "task_duration_ms",
-                "availability": {"state": "available"}
-            }),
-            "metric task_duration_ms is available without distribution",
-        ),
-        (
-            json!({
-                "name": "provider_input_tokens",
-                "availability": {
-                    "state": "unavailable",
-                    "reason": "missing_usage"
-                },
-                "distribution": {
-                    "count": 1,
-                    "sum": 7,
-                    "min": 7,
-                    "max": 7,
-                    "mean": 7.0,
-                    "p50": 7,
-                    "p95": 7
-                }
-            }),
-            "metric provider_input_tokens is unavailable with distribution",
-        ),
-    ] {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let db_path = temp.path().join("sessions.sqlite3");
-        let fake_server = FakeAppServer::new(
-            temp.path(),
-            Scenario::new()
-                .initialized()
-                .respond(
-                    "trace/metrics",
-                    fake_trace_metrics_result("run_metrics", json!([metric])),
-                )
-                .shutdown(),
-        );
-
-        let output = cli_with_fake_app_server(&fake_server, &db_path)
-            .args(["trace", "metrics", "run_metrics"])
-            .output()
-            .expect("malformed trace metrics cli");
-
-        assert!(!output.status.success());
-        assert_eq!(
-            stderr(&output),
-            format!("invalid trace metrics response: {expected_error}\n")
-        );
-        assert!(stdout(&output).is_empty());
-    }
-}
-
-// 确认 CLI 能启动并暴露 app-server 协议模式。
 #[test]
 fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
     let mut command = Command::cargo_bin("sg").expect("binary");
@@ -412,15 +181,13 @@ fn cli_help_does_not_expose_agent_host_selector() {
     assert!(!stdout(&output).contains("untrusted"));
 }
 
-// 验证 CLI 只发送受控的 thread sandbox/approval 枚举，并渲染服务端快照。
+// 验证 run 只发送 thread/model/cwd 参数并渲染 thread 身份，不再携带 policy 快照。
 #[test]
-fn cli_run_sends_and_renders_thread_policy_snapshot() {
+fn cli_run_renders_thread_identity_without_policy_params() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let params_path = temp.path().join("thread_start_params.json");
-    let mut thread = fake_thread("thread_policy");
-    thread["sandboxMode"] = json!("read-only");
-    thread["approvalPolicy"] = json!("never");
+    let thread = fake_thread("thread_policy");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
@@ -441,29 +208,22 @@ fn cli_run_sends_and_renders_thread_policy_snapshot() {
     );
 
     let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args([
-            "run",
-            "write tests",
-            "--sandbox-mode",
-            "read-only",
-            "--approval-policy",
-            "never",
-        ])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
     assert!(output.status.success(), "stderr={}", stderr(&output));
-    assert!(stdout(&output).contains("thread_policy sandbox_mode=read-only approval_policy=never"));
+    assert!(stdout(&output).contains("thread thread_policy"));
 
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(params_path).expect("thread params"))
             .expect("thread params json");
-    assert_eq!(params["sandboxMode"], "read-only");
-    assert_eq!(params["approvalPolicy"], "never");
+    assert!(params.get("sandboxMode").is_none());
+    assert!(params.get("approvalPolicy").is_none());
 }
 
-// 验证 run、continue、threads、trace、approval 与 doctor 共用 app-server 协议。
+// 验证 run、continue、threads 与 doctor 共用 app-server 协议。
 #[test]
-fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
+fn cli_run_continue_threads_and_doctor_use_app_server_protocol() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let thread = fake_thread("thread_fake");
@@ -489,11 +249,6 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
                     respond(json!({"turn": turn})),
                 ],
             )
-            .respond(
-                "trace/tail",
-                json!({"events": [fake_trace_event("trace_1", "thread started")]}),
-            )
-            .respond("approval/list", json!({"approvals": []}))
             .shutdown(),
     );
 
@@ -526,19 +281,6 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
         .expect("continue cli");
     assert!(continued.status.success(), "stderr={}", stderr(&continued));
     assert!(stdout(&continued).contains("turn/started"));
-
-    let trace = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trace", &thread_id, "--limit", "5"])
-        .output()
-        .expect("trace cli");
-    assert!(trace.status.success(), "stderr={}", stderr(&trace));
-    assert!(stdout(&trace).contains("thread started"));
-
-    let approvals = cli_with_fake_app_server(&fake_server, &db_path)
-        .arg("approvals")
-        .output()
-        .expect("approvals cli");
-    assert!(approvals.status.success(), "stderr={}", stderr(&approvals));
 
     let doctor = cli_with_fake_app_server(&fake_server, &db_path)
         .args(["config", "doctor"])
@@ -1022,108 +764,7 @@ fn cli_exits_nonzero_for_immediate_interrupted_turn() {
     assert_immediate_terminal_turn_exits_nonzero("interrupted", "cancelled");
 }
 
-// 验证 turn、approval 与 trace 查询都通过 app-server 协议渲染。
-#[test]
-fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "turn/status",
-                json!({"turn": fake_turn("turn_fake", "thread_fake", "running", "running")}),
-            )
-            .respond(
-                "turn/interrupt",
-                json!({"turnId": "turn_fake", "status": "interrupted"}),
-            )
-            .respond(
-                "approval/decision",
-                json!({
-                    "decision": {
-                        "request_id": "approval_fake",
-                        "decision_id": "approval_fake_decision",
-                        "outcome": "allow",
-                        "reason": "operator approved"
-                    }
-                }),
-            )
-            .respond(
-                "trace/show",
-                json!({
-                    "event": {
-                        "event_id": "event_fake",
-                        "event_type": "trace.event",
-                        "run_id": "run_fake",
-                        "session_id": "session_fake",
-                        "task_id": null,
-                        "phase_id": null,
-                        "action_id": null,
-                        "parent_event_id": null,
-                        "timestamp": null,
-                        "monotonic_ms": null,
-                        "component": "agent_loop",
-                        "severity": "info",
-                        "summary": "agent trace",
-                        "payload": {},
-                        "artifact_refs": [],
-                        "policy_decision_id": null,
-                        "approval_grant_id": null,
-                        "sandbox_id": null,
-                        "command_id": null,
-                        "transaction_id": null,
-                        "verification_id": null,
-                        "span_id": null,
-                        "redaction_applied": true,
-                        "payload_hash": ""
-                    }
-                }),
-            ),
-    );
-
-    let status = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "status", "turn_fake"])
-        .output()
-        .expect("turn status cli");
-    assert!(status.status.success(), "stderr={}", stderr(&status));
-    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=running"));
-
-    let interrupt = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "interrupt", "turn_fake"])
-        .output()
-        .expect("turn interrupt cli");
-    assert!(interrupt.status.success(), "stderr={}", stderr(&interrupt));
-    assert!(stdout(&interrupt).contains("turn turn_fake interrupted"));
-
-    let approve = cli_with_fake_app_server(&fake_server, &db_path)
-        .args([
-            "approve",
-            "approval_fake",
-            "--decision",
-            "allow",
-            "--reason",
-            "operator approved",
-        ])
-        .output()
-        .expect("approve cli");
-    assert!(approve.status.success(), "stderr={}", stderr(&approve));
-    assert!(stdout(&approve).contains("approval approval_fake allow"));
-
-    let trace_show = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trace", "show", "event_fake"])
-        .output()
-        .expect("trace show cli");
-    assert!(
-        trace_show.status.success(),
-        "stderr={}",
-        stderr(&trace_show)
-    );
-    assert!(stdout(&trace_show).contains("trace event_fake agent_loop agent trace"));
-}
-
-// 验证 turn 生命周期查询和中断输出 AgentLoop 状态。
+// 验证 turn 状态与中断查询都通过 app-server 协议渲染。
 #[test]
 fn cli_turn_lifecycle_status_and_interrupt_render_agent_loop_status() {
     let temp = tempfile::tempdir().expect("temp dir");

@@ -577,7 +577,6 @@ fn running_turn_failure_stages_terminalize_as_failed() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
     let stages = [
         TurnFailureStage::AgentLoop,
-        TurnFailureStage::ApprovalCheckpoint,
         TurnFailureStage::TerminalOutcome,
     ];
     let mut turns = Vec::new();
@@ -1477,15 +1476,6 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
     );
     assert!(messages[2].content.contains("Successfully wrote"));
     assert_eq!(messages[3].content, "done");
-    // 工具执行 trace 事件已投影。
-    let traces = server
-        .store
-        .list_trace(&thread.thread_id)
-        .expect("trace");
-    assert!(traces.iter().any(|event| {
-        event.payload["observation"] == "tool_execution"
-            && event.payload["tool_name"] == "write"
-    }));
 }
 
 #[test]

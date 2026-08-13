@@ -60,8 +60,6 @@ struct LegacyThreadRow {
     model: Option<String>,
     cwd: Option<String>,
     status: ThreadStatus,
-    sandbox_mode: PermissionProfileName,
-    approval_policy: ApprovalPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -91,78 +89,6 @@ struct LegacyTraceRow {
 }
 
 #[derive(Debug, Clone)]
-struct LegacyApprovalRow {
-    request: ApprovalRequest,
-    outcome: Option<ApprovalOutcome>,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyApprovalRequestV1 {
-    request_id: String,
-    session_id: String,
-    task_id: String,
-    action: String,
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyApprovalRequestV4 {
-    request_id: String,
-    session_id: String,
-    task_id: String,
-    action: String,
-    #[serde(default)]
-    resources: Vec<String>,
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyApprovalRequestV5 {
-    request_id: String,
-    session_id: String,
-    task_id: String,
-    thread_id: String,
-    turn_id: String,
-    tool_call_id: Option<String>,
-    action: String,
-    #[serde(default)]
-    resources: Vec<String>,
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyApprovalRequestCurrent {
-    request_id: String,
-    thread_id: String,
-    turn_id: String,
-    tool_call_id: Option<String>,
-    action: String,
-    #[serde(default)]
-    resources: Vec<String>,
-    reason: String,
-}
-
-#[derive(Debug, Clone)]
-struct LegacyDecisionRow {
-    decision: ApprovalDecision,
-}
-
-#[derive(Debug, Clone)]
-struct LegacyPendingRow {
-    request_id: String,
-    thread_id: String,
-    turn_id: String,
-    tool_call_id: String,
-    payload: String,
-    execution_state: String,
-}
-
-#[derive(Debug, Clone)]
 struct LegacyArtifactRow {
     artifact: ArtifactRef,
 }
@@ -173,9 +99,6 @@ struct LegacyData {
     turns: Vec<LegacyTurnRow>,
     items: Vec<LegacyItemRow>,
     traces: Vec<LegacyTraceRow>,
-    approvals: Vec<LegacyApprovalRow>,
-    decisions: Vec<LegacyDecisionRow>,
-    pending_tool_calls: Vec<LegacyPendingRow>,
     artifacts: Vec<LegacyArtifactRow>,
 }
 
@@ -223,6 +146,63 @@ fn create_v12_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 当前 schema 的 threads 定义：policy 快照列已随 approval/sandbox 消费面删除。
+const CURRENT_SCHEMA_SQL: &str = r#"
+create table schema_meta(
+schema_version integer not null check(schema_version = 11)
+);
+create table schema_migrations(
+migration_id text primary key,
+applied_at text not null default current_timestamp
+);
+create table threads(
+thread_id text primary key,
+model text,
+cwd text,
+status text not null default 'active'
+    check(status in ('active', 'archived'))
+);
+create table turns(
+turn_id text primary key,
+thread_id text not null,
+turn_sequence integer not null check(turn_sequence > 0),
+status text not null
+    check(status in ('running', 'completed', 'blocked', 'failed', 'interrupted')),
+agent_loop_status text not null,
+foreign key(thread_id) references threads(thread_id)
+);
+create table items(
+item_id text primary key,
+turn_id text not null,
+item_sequence integer not null check(item_sequence > 0),
+kind text not null
+    check(kind in ('userMessage', 'agentMessage', 'reasoning', 'commandExecution', 'fileChange')),
+payload text not null,
+status text not null check(status in ('started', 'completed')),
+redacted integer not null check(redacted in (0, 1)),
+foreign key(turn_id) references turns(turn_id)
+);
+create table trace_events(
+event_id text primary key,
+run_id text not null,
+session_id text not null default '',
+payload text not null
+);
+create table artifact_refs(
+artifact_id text primary key,
+run_id text not null,
+item_id text,
+kind text not null,
+uri text not null,
+content_digest text not null,
+summary text not null,
+metadata text not null,
+redacted integer not null check(redacted in (0, 1))
+);
+"#;
+
+// 已发布 v11 指纹：旧库校验仍要求 approval 三表与 threads policy 列；
+// 当前 schema（CURRENT_SCHEMA_SQL）不再创建它们，旧库迁移时直接丢弃。
 const V11_SCHEMA_SQL: &str = r#"
 create table schema_meta(
 schema_version integer not null check(schema_version = 11)
@@ -325,6 +305,15 @@ create index approvals_turn_lookup on approvals(turn_id, decision_outcome, reque
 create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
 "#;
 
+// 当前 schema 的索引面：V11 指纹保留 approval 索引供旧库校验，当前库不再创建。
+const CURRENT_INDEX_SQL: &str = r#"
+create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
+create unique index items_turn_sequence_unique on items(turn_id, item_sequence);
+create index turns_history_lookup on turns(thread_id, status, turn_sequence);
+create index items_history_lookup on items(turn_id, status, kind, item_sequence);
+create index trace_run_lookup on trace_events(run_id, event_id);
+"#;
+
 // Recovery tables are introduced with the current schema and must not be part
 // of the released v11 fingerprint used to validate legacy databases.
 const V13_RECOVERY_INDEX_SQL: &str = r#"
@@ -404,24 +393,46 @@ end;
 "#;
 
 fn v12_index_sql() -> String {
-    format!("{V11_INDEX_SQL}{V13_RECOVERY_INDEX_SQL}{V12_TRACE_INDEX_SQL}{V12_TRACE_TRIGGER_SQL}")
+    format!("{CURRENT_INDEX_SQL}{V13_RECOVERY_INDEX_SQL}{V12_TRACE_INDEX_SQL}{V12_TRACE_TRIGGER_SQL}")
 }
 
 // Reconstruct the released v12 shape so an existing v12 store can be upgraded
 // transactionally to the current v13 checkpoint schema. The only v13 additions
 // are the resumable turn states, checkpoint/execution state, and interactive input delivery.
 fn canonical_v12_legacy_schema_sql(suffix: &str) -> String {
-    let current = canonical_v12_schema_sql(suffix);
-    let recovery_start = current
-        .find("\ncreate table turn_checkpoints")
-        .expect("current schema must contain recovery tables");
-    current[..recovery_start]
-        .replace("schema_version = 13", "schema_version = 12")
-        .replace(
-            "status in ('running', 'paused', 'suspended', 'completed', 'blocked', 'failed', 'interrupted')",
-            "status in ('running', 'completed', 'blocked', 'failed', 'interrupted')",
-        )
-        .replace(",\npause_requested integer not null default 0 check(pause_requested in (0, 1))", "")
+    let mut sql = legacy_v11_schema_sql(suffix);
+    sql = sql.replace("schema_version = 11", "schema_version = 12");
+    let old_trace = format!(
+        "create table trace_events{suffix}(\n\
+event_id text primary key,\n\
+run_id text not null,\n\
+session_id text not null default '',\n\
+payload text not null\n\
+);"
+    );
+    let new_trace = format!(
+        "create table trace_events{suffix}(\n\
+event_id text primary key,\n\
+run_id text not null,\n\
+session_id text not null default '',\n\
+payload text not null,\n\
+span_id text\n    check(span_id is null or length(trim(span_id)) > 0),\n\
+parent_span_id text\n    check(parent_span_id is null or length(trim(parent_span_id)) > 0),\n\
+  span_kind text\n    check(span_kind in ('task', 'turn', 'prompt_assembly', 'provider_attempt', 'tool_call',\n                        'policy_decision', 'approval_wait', 'sandbox_execution',\n                        'verification', 'final_review')\n          or span_kind is null),\n\
+span_phase text\n    check(span_phase in ('start', 'end') or span_phase is null),\n\
+  span_status text\n    check(span_status in ('unset', 'ok', 'error', 'cancelled') or span_status is null),\n\
+duration_ms integer\n    check(duration_ms >= 0 or duration_ms is null),\n\
+  time_to_first_token_ms integer\n    check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),\n\
+  span_projection text\n    check(span_projection is null or json_valid(span_projection)),\n\
+  metric_samples text not null default '[]'\n    check(json_valid(metric_samples) and json_type(metric_samples) = 'array'),\n\
+  check((span_id is null and parent_span_id is null and span_kind is null\n       and span_phase is null and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and span_projection is null)\n      or (span_id is not null and span_kind is not null and span_phase is not null)),\n\
+  check((span_phase = 'start' and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and metric_samples = '[]')\n      or (span_phase = 'end' and span_status is not null and duration_ms is not null)\n      or span_phase is null),\n\
+check(time_to_first_token_ms is null or span_kind = 'provider_attempt'),\n\
+check(time_to_first_token_ms is null or duration_ms is null\n      or time_to_first_token_ms <= duration_ms),\n\
+check(parent_span_id is null or parent_span_id <> span_id)\n\
+);"
+    );
+    sql.replace(&old_trace, &new_trace)
 }
 
 fn canonical_v12_schema_sql(suffix: &str) -> String {
@@ -808,7 +819,7 @@ fn legacy_reference_schema_sql(
     sql
 }
 
-fn canonical_v11_schema_sql(suffix: &str) -> String {
+fn legacy_v11_schema_sql(suffix: &str) -> String {
     if suffix.is_empty() {
         return V11_SCHEMA_SQL.to_string();
     }
@@ -824,6 +835,25 @@ fn canonical_v11_schema_sql(suffix: &str) -> String {
         "turns",
         "items",
         "approvals",
+    ] {
+        sql = sql.replace(table, &format!("{table}{suffix}"));
+    }
+    sql
+}
+
+fn canonical_v11_schema_sql(suffix: &str) -> String {
+    if suffix.is_empty() {
+        return CURRENT_SCHEMA_SQL.to_string();
+    }
+    let mut sql = CURRENT_SCHEMA_SQL.to_string();
+    for table in [
+        "schema_meta",
+        "schema_migrations",
+        "trace_events",
+        "artifact_refs",
+        "threads",
+        "turns",
+        "items",
     ] {
         sql = sql.replace(table, &format!("{table}{suffix}"));
     }
@@ -1093,50 +1123,25 @@ fn decode_legacy_enum<T: DbEnum>(value: &str, legacy: bool) -> StoreResult<T> {
 }
 
 fn read_legacy_threads(connection: &Connection, legacy: bool) -> StoreResult<Vec<LegacyThreadRow>> {
-    let columns = table_columns(connection, "threads")?;
-    let has_sandbox = columns.contains("sandbox_mode");
-    let has_policy = columns.contains("approval_policy");
-    if has_sandbox != has_policy {
-        return Err(StoreError::InvalidState(
-            "thread policy schema is partially migrated".to_string(),
-        ));
-    }
-    let query = if has_sandbox {
-        "select thread_id, model, cwd, status, sandbox_mode, approval_policy from threads order by rowid"
-    } else {
-        "select thread_id, model, cwd, status, null, null from threads order by rowid"
-    };
-    let mut statement = connection.prepare(query)?;
+    let mut statement = connection.prepare(
+        "select thread_id, model, cwd, status from threads order by rowid",
+    )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut threads = Vec::new();
     for row in rows {
-        let (thread_id, model, cwd, status, sandbox_mode, approval_policy) = row?;
-        let sandbox_mode = sandbox_mode
-            .as_deref()
-            .map(|value| decode_legacy_enum::<PermissionProfileName>(value, legacy))
-            .transpose()?
-            .unwrap_or(PermissionProfileName::WorkspaceWrite);
-        let approval_policy = approval_policy
-            .as_deref()
-            .map(|value| decode_legacy_enum::<ApprovalPolicy>(value, legacy))
-            .transpose()?
-            .unwrap_or(ApprovalPolicy::OnRequest);
+        let (thread_id, model, cwd, status) = row?;
         threads.push(LegacyThreadRow {
             thread_id,
             model,
             cwd,
             status: decode_legacy_enum::<ThreadStatus>(&status, legacy)?,
-            sandbox_mode,
-            approval_policy,
         });
     }
     Ok(threads)
@@ -1431,392 +1436,6 @@ fn read_legacy_traces(
     }
     Ok(traces)
 }
-
-fn legacy_tool_id(action: String, context: &str) -> StoreResult<ToolId> {
-    ToolId::new(action).map_err(|error| {
-        StoreError::InvalidState(format!("{context} has an invalid tool id: {error}"))
-    })
-}
-
-fn legacy_permission_resources(
-    action: &ToolId,
-    resources: Vec<String>,
-    context: &str,
-) -> StoreResult<Vec<PermissionResource>> {
-    resources
-        .into_iter()
-        .map(|resource| match action.as_str() {
-            "read" | "list" | "grep" | "edit" | "patch" => {
-                WorkspaceRelativePath::from_canonical(resource)
-                    .map(PermissionResource::WorkspacePath)
-                    .map_err(|error| {
-                        StoreError::InvalidState(format!(
-                            "{context} has an invalid workspace resource: {error}"
-                        ))
-                    })
-            }
-            "command" => resource
-                .strip_prefix("command_script;scope_digest:")
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "{context} command resource is not an exact historical scope"
-                    ))
-                })
-                .and_then(|digest| {
-                    CommandScopeDigest::new(digest.to_string())
-                        .map(PermissionResource::CommandScope)
-                        .map_err(|error| {
-                            StoreError::InvalidState(format!(
-                                "{context} has an invalid command resource: {error}"
-                            ))
-                        })
-                }),
-            "update_plan" if resource == action.as_str() => {
-                Ok(PermissionResource::Tool(action.clone()))
-            }
-            _ => Err(StoreError::InvalidState(format!(
-                "{context} resource type cannot be uniquely recovered"
-            ))),
-        })
-        .collect()
-}
-
-fn current_approval_request(
-    value: LegacyApprovalRequestCurrent,
-    context: &str,
-) -> StoreResult<ApprovalRequest> {
-    let action = legacy_tool_id(value.action, context)?;
-    let resources = legacy_permission_resources(&action, value.resources, context)?;
-    Ok(ApprovalRequest {
-        request_id: value.request_id,
-        thread_id: value.thread_id,
-        turn_id: value.turn_id,
-        tool_call_id: value.tool_call_id,
-        action,
-        resources,
-        reason: value.reason,
-    })
-}
-
-fn decode_legacy_approval_request(
-    version: u32,
-    request_id: &str,
-    payload: &str,
-) -> StoreResult<ApprovalRequest> {
-    let invalid = |error: serde_json::Error| {
-        StoreError::InvalidState(format!(
-            "approval {request_id} payload is invalid for v{version}: {error}"
-        ))
-    };
-    let context = format!("approval {request_id}");
-    match version {
-        1..=3 => {
-            let value: LegacyApprovalRequestV1 = serde_json::from_str(payload).map_err(invalid)?;
-            Ok(ApprovalRequest {
-                request_id: value.request_id,
-                thread_id: value.session_id,
-                turn_id: value.task_id,
-                tool_call_id: None,
-                action: legacy_tool_id(value.action, &context)?,
-                resources: Vec::new(),
-                reason: value.reason,
-            })
-        }
-        4 => {
-            let value: LegacyApprovalRequestV4 = serde_json::from_str(payload).map_err(invalid)?;
-            let action = legacy_tool_id(value.action, &context)?;
-            let resources = legacy_permission_resources(&action, value.resources, &context)?;
-            Ok(ApprovalRequest {
-                request_id: value.request_id,
-                thread_id: value.session_id,
-                turn_id: value.task_id,
-                tool_call_id: None,
-                action,
-                resources,
-                reason: value.reason,
-            })
-        }
-        5 => {
-            let value: LegacyApprovalRequestV5 = serde_json::from_str(payload).map_err(invalid)?;
-            if value.session_id != value.thread_id || value.task_id != value.turn_id {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {request_id} legacy and durable bindings disagree"
-                )));
-            }
-            let action = legacy_tool_id(value.action, &context)?;
-            let resources = legacy_permission_resources(&action, value.resources, &context)?;
-            Ok(ApprovalRequest {
-                request_id: value.request_id,
-                thread_id: value.thread_id,
-                turn_id: value.turn_id,
-                tool_call_id: value.tool_call_id,
-                action,
-                resources,
-                reason: value.reason,
-            })
-        }
-        6 => {
-            if let Ok(value) = serde_json::from_str::<LegacyApprovalRequestCurrent>(payload) {
-                return current_approval_request(value, &context);
-            }
-            let value: LegacyApprovalRequestV5 = serde_json::from_str(payload).map_err(invalid)?;
-            if value.session_id != value.thread_id || value.task_id != value.turn_id {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {request_id} legacy and durable bindings disagree"
-                )));
-            }
-            let action = legacy_tool_id(value.action, &context)?;
-            let resources = legacy_permission_resources(&action, value.resources, &context)?;
-            Ok(ApprovalRequest {
-                request_id: value.request_id,
-                thread_id: value.thread_id,
-                turn_id: value.turn_id,
-                tool_call_id: value.tool_call_id,
-                action,
-                resources,
-                reason: value.reason,
-            })
-        }
-        7..=10 => {
-            let value =
-                serde_json::from_str::<LegacyApprovalRequestCurrent>(payload).map_err(invalid)?;
-            current_approval_request(value, &context)
-        }
-        11..=13 => serde_json::from_str::<ApprovalRequest>(payload).map_err(invalid),
-        _ => Err(StoreError::InvalidState(format!(
-            "approval {request_id} uses unsupported schema version {version}"
-        ))),
-    }
-}
-
-fn read_legacy_approvals(
-    connection: &Connection,
-    version: u32,
-) -> StoreResult<Vec<LegacyApprovalRow>> {
-    if !table_exists(connection, "approvals")? {
-        return Ok(Vec::new());
-    }
-    let columns = table_columns(connection, "approvals")?;
-    let has_thread_id = columns.contains("thread_id");
-    let has_turn_id = columns.contains("turn_id");
-    if has_thread_id != has_turn_id {
-        return Err(StoreError::InvalidState(
-            "approval binding projection is incomplete".to_string(),
-        ));
-    }
-    let query = if has_thread_id {
-        "select request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-         from approvals order by rowid"
-    } else {
-        "select request_id, null, null, payload, decision_outcome, decision_reason
-         from approvals order by rowid"
-    };
-    let mut statement = connection.prepare(query)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-    let mut approvals = Vec::new();
-    for row in rows {
-        let (request_id, stored_thread_id, stored_turn_id, payload, outcome, reason) = row?;
-        let request = decode_legacy_approval_request(version, &request_id, &payload)?;
-        if request.request_id != request_id
-            || request.thread_id.trim().is_empty()
-            || request.turn_id.trim().is_empty()
-        {
-            return Err(StoreError::InvalidState(format!(
-                "approval {request_id} payload binding is invalid"
-            )));
-        }
-        if has_thread_id && (stored_thread_id.is_none() || stored_turn_id.is_none()) {
-            return Err(StoreError::InvalidState(format!(
-                "approval {request_id} binding projection is null"
-            )));
-        }
-        if stored_thread_id
-            .as_deref()
-            .is_some_and(|value| value != request.thread_id)
-            || stored_turn_id
-                .as_deref()
-                .is_some_and(|value| value != request.turn_id)
-        {
-            return Err(StoreError::InvalidState(format!(
-                "approval {request_id} binding columns do not match payload"
-            )));
-        }
-        let outcome = outcome
-            .as_deref()
-            .map(decode_final_approval_outcome)
-            .transpose()?;
-        if outcome.is_none() && reason.is_some() {
-            return Err(StoreError::InvalidState(format!(
-                "approval {request_id} has a decision reason without a decision"
-            )));
-        }
-        approvals.push(LegacyApprovalRow {
-            request,
-            outcome,
-            reason,
-        });
-    }
-    Ok(approvals)
-}
-
-fn read_legacy_decisions(connection: &Connection) -> StoreResult<Vec<LegacyDecisionRow>> {
-    if !table_exists(connection, "approval_decisions")? {
-        return Ok(Vec::new());
-    }
-    let mut statement = connection.prepare(
-        "select decision_id, request_id, outcome, reason, payload
-     from approval_decisions order by rowid",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    let mut decisions = Vec::new();
-    for row in rows {
-        let (decision_id, request_id, outcome, reason, payload) = row?;
-        let decision: ApprovalDecision = serde_json::from_str(&payload).map_err(|error| {
-            StoreError::InvalidState(format!(
-                "approval decision {decision_id} payload is invalid: {error}"
-            ))
-        })?;
-        let expected_outcome = decode_final_approval_outcome(&outcome)?;
-        if decision.decision_id != decision_id
-            || decision.request_id != request_id
-            || decision.outcome != expected_outcome
-            || decision.reason != reason
-        {
-            return Err(StoreError::InvalidState(format!(
-                "approval decision {decision_id} columns do not match payload"
-            )));
-        }
-        decisions.push(LegacyDecisionRow { decision });
-    }
-    Ok(decisions)
-}
-
-fn read_legacy_pending_tool_calls(
-    connection: &Connection,
-    version: u32,
-    approvals: &[LegacyApprovalRow],
-) -> StoreResult<Vec<LegacyPendingRow>> {
-    if !table_exists(connection, "pending_tool_calls")? {
-        return Ok(Vec::new());
-    }
-    let columns = table_columns(connection, "pending_tool_calls")?;
-    let has_thread = columns.contains("thread_id");
-    let has_tool_call = columns.contains("tool_call_id");
-    let has_state = columns.contains("execution_state");
-    let query = format!(
-        "select request_id, {thread}, turn_id, {tool_call}, payload, {state}
-     from pending_tool_calls order by rowid",
-        thread = if has_thread { "thread_id" } else { "null" },
-        tool_call = if has_tool_call {
-            "tool_call_id"
-        } else {
-            "null"
-        },
-        state = if has_state { "execution_state" } else { "null" },
-    );
-    let mut statement = connection.prepare(&query)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-    let approval_by_id = approvals
-        .iter()
-        .map(|approval| (approval.request.request_id.as_str(), approval))
-        .collect::<BTreeMap<_, _>>();
-    let mut pending = Vec::new();
-    for row in rows {
-        let (request_id, thread_id, turn_id, tool_call_id, payload, state) = row?;
-        let approval = approval_by_id.get(request_id.as_str()).ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "pending tool call {request_id} has no approval request"
-            ))
-        })?;
-        if version < 11 {
-            return Err(StoreError::InvalidState(format!(
-                "v{version} pending AgentLoop checkpoint {request_id} cannot be migrated into the current checkpoint contract"
-            )));
-        }
-        // Current checkpoint payloads stay opaque here: syntax validation is the only payload
-        // check; Agent owns the versioned codec and all business-field validation.
-        if payload.trim().is_empty() {
-            return Err(StoreError::InvalidState(format!(
-                "pending tool call {request_id} payload is empty"
-            )));
-        }
-        serde_json::from_str::<Value>(&payload).map_err(|error| {
-            StoreError::InvalidState(format!(
-                "pending tool call {request_id} payload is invalid JSON: {error}"
-            ))
-        })?;
-        let thread_id = thread_id
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| approval.request.thread_id.clone());
-        let tool_call_id = tool_call_id
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "pending tool call {request_id} has no tool_call_id"
-                ))
-            })?;
-        let execution_state = match state.as_deref().unwrap_or("pending") {
-            "pending" => "pending".to_string(),
-            "executing" => "executing".to_string(),
-            _ => {
-                return Err(StoreError::InvalidState(format!(
-                    "pending tool call {request_id} has unknown execution state"
-                )));
-            }
-        };
-        if execution_state != "pending" && execution_state != "executing" {
-            return Err(StoreError::InvalidState(format!(
-                "pending tool call {request_id} has unknown execution state"
-            )));
-        }
-        if thread_id != approval.request.thread_id || turn_id != approval.request.turn_id {
-            return Err(StoreError::InvalidState(format!(
-                "pending tool call {request_id} binding does not match approval request"
-            )));
-        }
-        if approval.request.tool_call_id.as_deref() != Some(tool_call_id.as_str()) {
-            return Err(StoreError::InvalidState(format!(
-                "pending tool call {request_id} tool_call_id does not match approval request"
-            )));
-        }
-        pending.push(LegacyPendingRow {
-            request_id,
-            thread_id,
-            turn_id,
-            tool_call_id,
-            payload,
-            execution_state,
-        });
-    }
-    Ok(pending)
-}
-
 fn read_legacy_artifacts(connection: &Connection) -> StoreResult<Vec<LegacyArtifactRow>> {
     if !table_exists(connection, "artifact_refs")? {
         return Ok(Vec::new());
@@ -1910,16 +1529,6 @@ fn validate_legacy_sequences(data: &LegacyData, version: u32) -> StoreResult<()>
             )));
         }
     }
-    let mut pending_ids = BTreeSet::new();
-    for pending in &data.pending_tool_calls {
-        if pending.request_id.trim().is_empty() || !pending_ids.insert(pending.request_id.as_str())
-        {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate or empty pending request {}",
-                pending.request_id
-            )));
-        }
-    }
     let mut artifact_ids = BTreeSet::new();
     for artifact in &data.artifacts {
         if artifact.artifact.artifact_id.trim().is_empty()
@@ -1948,151 +1557,6 @@ const fn table_has_column_from_data_marker(version: u32) -> bool {
     version >= 6
 }
 
-fn validate_legacy_approvals(data: &LegacyData) -> StoreResult<()> {
-    let thread_ids = data
-        .threads
-        .iter()
-        .map(|thread| thread.thread_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut turns = BTreeMap::new();
-    for turn in &data.turns {
-        if turns.insert(turn.turn_id.as_str(), turn).is_some() {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate turn {}",
-                turn.turn_id
-            )));
-        }
-    }
-    let mut approvals = BTreeMap::new();
-    for approval in &data.approvals {
-        if approval.request.request_id.trim().is_empty()
-            || approvals
-                .insert(approval.request.request_id.as_str(), approval)
-                .is_some()
-        {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate or empty approval {}",
-                approval.request.request_id
-            )));
-        }
-    }
-    let mut decisions_by_request = BTreeMap::<&str, Vec<&LegacyDecisionRow>>::new();
-    let mut decision_ids = BTreeSet::new();
-    for decision in &data.decisions {
-        if decision.decision.decision_id.trim().is_empty()
-            || !decision_ids.insert(decision.decision.decision_id.as_str())
-        {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate or empty approval decision {}",
-                decision.decision.decision_id
-            )));
-        }
-        if !approvals.contains_key(decision.decision.request_id.as_str()) {
-            return Err(StoreError::InvalidState(format!(
-                "approval decision {} has no request",
-                decision.decision.decision_id
-            )));
-        }
-        decisions_by_request
-            .entry(decision.decision.request_id.as_str())
-            .or_default()
-            .push(decision);
-    }
-    for approval in &data.approvals {
-        let request = &approval.request;
-        if !thread_ids.contains(request.thread_id.as_str()) {
-            return Err(StoreError::InvalidState(format!(
-                "approval {} references a missing thread",
-                request.request_id
-            )));
-        }
-        let turn = turns.get(request.turn_id.as_str()).ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "approval {} references a missing turn",
-                request.request_id
-            ))
-        })?;
-        if turn.thread_id != request.thread_id {
-            return Err(StoreError::InvalidState(
-                APPROVAL_TURN_THREAD_MISMATCH.to_string(),
-            ));
-        }
-        let history = decisions_by_request
-            .get(request.request_id.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        match (approval.outcome, history) {
-            (None, []) => {}
-            (None, _) => {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {} has decision history without final columns",
-                    request.request_id
-                )));
-            }
-            (Some(expected), [decision]) => {
-                if decision.decision.outcome != expected
-                    || approval.reason.as_deref() != Some(decision.decision.reason.as_str())
-                {
-                    return Err(StoreError::InvalidState(format!(
-                        "approval {} columns do not match decision history",
-                        request.request_id
-                    )));
-                }
-            }
-            (Some(_), _) => {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {} has ambiguous decision history",
-                    request.request_id
-                )));
-            }
-        }
-    }
-    for pending in &data.pending_tool_calls {
-        let approval = approvals.get(pending.request_id.as_str()).ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "pending tool call {} has no approval request",
-                pending.request_id
-            ))
-        })?;
-        let history = decisions_by_request
-            .get(pending.request_id.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if approval.outcome.is_some() && approval.outcome != Some(ApprovalOutcome::Allow) {
-            return Err(StoreError::InvalidState(format!(
-                "approval {} retains a checkpoint after denial",
-                pending.request_id
-            )));
-        }
-        match (approval.outcome, pending.execution_state.as_str(), history) {
-            (None, "pending", []) => {}
-            (Some(ApprovalOutcome::Allow), "executing", [_]) => {}
-            _ => {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {} has inconsistent checkpoint state",
-                    pending.request_id
-                )));
-            }
-        }
-        let turn = turns.get(pending.turn_id.as_str()).ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "pending tool call {} references a missing turn",
-                pending.request_id
-            ))
-        })?;
-        if pending.execution_state == "pending"
-            && !(turn.status == TurnStatus::Blocked && turn.agent_loop_status == "blocked")
-            && turn.status != TurnStatus::Paused
-            && turn.status != TurnStatus::Suspended
-        {
-            return Err(StoreError::InvalidState(
-                "pending approval is not bound to a blocked turn".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn read_legacy_data(
     connection: &Connection,
     version: u32,
@@ -2108,9 +1572,6 @@ fn read_legacy_data(
     let threads = read_legacy_threads(connection, legacy)?;
     let turns = read_legacy_turns(connection, legacy)?;
     let items = read_legacy_items(connection, legacy)?;
-    let approvals = read_legacy_approvals(connection, version)?;
-    let decisions = read_legacy_decisions(connection)?;
-    let pending_tool_calls = read_legacy_pending_tool_calls(connection, version, &approvals)?;
     let traces = read_legacy_traces(connection, &threads, &turns, allow_trace_repair, version)?;
     let artifacts = read_legacy_artifacts(connection)?;
     let data = LegacyData {
@@ -2118,13 +1579,9 @@ fn read_legacy_data(
         turns,
         items,
         traces,
-        approvals,
-        decisions,
-        pending_tool_calls,
         artifacts,
     };
     validate_legacy_sequences(&data, version)?;
-    validate_legacy_approvals(&data)?;
     validate_trace_span_batch(
         &data
             .traces
@@ -2156,15 +1613,13 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     connection.execute_batch(&canonical_v12_schema_sql("_v12"))?;
     for thread in &data.threads {
         connection.execute(
-            "insert into threads_v12(thread_id, model, cwd, status, sandbox_mode, approval_policy)
-         values(?1, ?2, ?3, ?4, ?5, ?6)",
+            "insert into threads_v12(thread_id, model, cwd, status)
+         values(?1, ?2, ?3, ?4)",
             params![
                 thread.thread_id,
                 thread.model,
                 thread.cwd,
                 thread.status.to_db_text(),
-                thread.sandbox_mode.to_db_text(),
-                thread.approval_policy.to_db_text(),
             ],
         )?;
     }
@@ -2245,54 +1700,6 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
             ],
         )?;
     }
-    for approval in &data.approvals {
-        let outcome = approval
-            .outcome
-            .map(final_approval_outcome_to_db_text)
-            .transpose()?;
-        connection.execute(
-            "insert into approvals_v12(
-             request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-         ) values(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                approval.request.request_id,
-                approval.request.thread_id,
-                approval.request.turn_id,
-                serde_json::to_string(&approval.request)?,
-                outcome,
-                approval.reason,
-            ],
-        )?;
-    }
-    for decision in &data.decisions {
-        let outcome = final_approval_outcome_to_db_text(decision.decision.outcome)?;
-        connection.execute(
-            "insert into approval_decisions_v12(decision_id, request_id, outcome, reason, payload)
-         values(?1, ?2, ?3, ?4, ?5)",
-            params![
-                decision.decision.decision_id,
-                decision.decision.request_id,
-                outcome,
-                decision.decision.reason,
-                serde_json::to_string(&decision.decision)?,
-            ],
-        )?;
-    }
-    for pending in &data.pending_tool_calls {
-        connection.execute(
-            "insert into pending_tool_calls_v12(
-             request_id, thread_id, turn_id, tool_call_id, payload, execution_state
-         ) values(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                pending.request_id,
-                pending.thread_id,
-                pending.turn_id,
-                pending.tool_call_id,
-                &pending.payload,
-                pending.execution_state,
-            ],
-        )?;
-    }
     for artifact in &data.artifacts {
         let artifact = &artifact.artifact;
         connection.execute(
@@ -2348,10 +1755,7 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     alter table turns_v12 rename to turns;
     alter table items_v12 rename to items;
     alter table trace_events_v12 rename to trace_events;
-    alter table approvals_v12 rename to approvals;
-    alter table approval_decisions_v12 rename to approval_decisions;
     alter table artifact_refs_v12 rename to artifact_refs;
-    alter table pending_tool_calls_v12 rename to pending_tool_calls;
     alter table turn_checkpoints_v12 rename to turn_checkpoints;
     alter table tool_executions_v12 rename to tool_executions;
     alter table turn_inputs_v12 rename to turn_inputs;
@@ -2781,9 +2185,9 @@ mod tests {
                  ) values('thread_fault', null, null, ?1, ?2, ?3)",
                 params![
                     serde_json::to_string(&ThreadStatus::Active).expect("thread status"),
-                    serde_json::to_string(&PermissionProfileName::WorkspaceWrite)
+                    serde_json::to_string(&serde_json::json!("workspace-write"))
                         .expect("sandbox mode"),
-                    serde_json::to_string(&ApprovalPolicy::OnRequest).expect("approval policy"),
+                    serde_json::to_string(&serde_json::json!("on-request")).expect("approval policy"),
                 ],
             )
             .expect("insert thread");

@@ -180,8 +180,6 @@ impl SessionStore {
         let mut statement = self.connection.prepare(
             "select thread_id from turns
              where status not in (?1, ?2, ?3)
-             union
-             select thread_id from pending_tool_calls where execution_state = 'executing'
              order by thread_id",
         )?;
         let thread_ids = statement

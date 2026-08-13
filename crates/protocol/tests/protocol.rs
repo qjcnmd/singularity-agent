@@ -1,20 +1,19 @@
 //! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
 
 use singularity_core::{ClientInfo, ErrorCode};
-use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ArtifactFetchParams, ArtifactRef,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ArtifactRef,
     ConversationMessage, ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason,
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult,
     ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
     METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
     ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceApprovalOutcome,
     TraceApprovalProjection, TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
-    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceListParams, TraceMetricSample,
-    TraceMetricSampleKind, TraceMetrics, TraceMetricsParams, TraceMetricsResult, TracePolicyCause,
+    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceMetricSample,
+    TraceMetricSampleKind, TracePolicyCause,
     TracePolicyDecision, TracePolicyProjection, TraceProviderOperationPhase, TraceProviderProtocol,
-    TraceSandboxEnforcement, TraceSandboxProjection, TraceSandboxStatus, TraceShowParams,
-    TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus, TraceTailParams,
+    TraceSandboxEnforcement, TraceSandboxProjection, TraceSandboxStatus,
+    TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
     TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
     TraceVerificationStatus, TraceWorkspaceMutation, TurnIdParams, TurnStartParams, TurnStatus,
     parse_json_rpc_payload,
@@ -120,32 +119,28 @@ fn json_rpc_unassociated_error_responses_round_trip_with_null_id() {
 }
 
 #[test]
-fn thread_policy_params_round_trip_and_reject_unknown_public_values() {
+fn thread_start_params_round_trip_and_reject_unknown_public_values() {
     let params: ThreadStartParams = serde_json::from_value(serde_json::json!({
         "model": "gpt-test",
         "cwd": "C:/workspace",
-        "sandboxMode": "read-only",
-        "approvalPolicy": "never"
     }))
-    .expect("thread/start policy params");
-    assert_eq!(params.sandbox_mode, Some(PermissionProfileName::ReadOnly));
-    assert_eq!(params.approval_policy, Some(ApprovalPolicy::Never));
+    .expect("thread/start params");
+    assert_eq!(params.model.as_deref(), Some("gpt-test"));
+    assert_eq!(params.cwd.as_deref(), Some("C:/workspace"));
     assert_eq!(
-        serde_json::to_value(params).expect("serialize thread/start policy params"),
+        serde_json::to_value(params).expect("serialize thread/start params"),
         serde_json::json!({
             "model": "gpt-test",
             "cwd": "C:/workspace",
-            "sandboxMode": "read-only",
-            "approvalPolicy": "never"
         })
     );
 
     for value in [
-        serde_json::json!({"sandboxMode": "unsupported-mode"}),
-        serde_json::json!({"approvalPolicy": "untrusted"}),
+        serde_json::json!({"sandboxMode": "read-only"}),
+        serde_json::json!({"approvalPolicy": "on-request"}),
     ] {
         let result = serde_json::from_value::<ThreadStartParams>(value);
-        assert!(result.is_err(), "unknown policy value was accepted");
+        assert!(result.is_err(), "removed policy value was accepted");
     }
 }
 
@@ -167,8 +162,6 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
             model: Some("gpt-test".to_string()),
             cwd: Some("C:/workspace".to_string()),
             status: singularity_protocol::ThreadStatus::Active,
-            sandbox_mode: PermissionProfileName::WorkspaceWrite,
-            approval_policy: ApprovalPolicy::OnRequest,
         },
         messages: vec![ConversationMessage {
             item_id: "item_1".to_string(),
@@ -189,9 +182,7 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
                 "thread_id": "thread_1",
                 "model": "gpt-test",
                 "cwd": "C:/workspace",
-                "status": "active",
-                "sandboxMode": "workspace-write",
-                "approvalPolicy": "on-request"
+                "status": "active"
             },
             "messages": [{
                 "itemId": "item_1",
@@ -236,16 +227,12 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
     let thread = ThreadStartParams {
         model: Some("gpt-test".to_string()),
         cwd: Some("C:/repo".to_string()),
-        sandbox_mode: Some(PermissionProfileName::ReadOnly),
-        approval_policy: Some(ApprovalPolicy::Never),
     };
     assert_eq!(
         serde_json::to_value(thread).unwrap(),
         serde_json::json!({
             "model": "gpt-test",
             "cwd": "C:/repo",
-            "sandboxMode": "read-only",
-            "approvalPolicy": "never"
         })
     );
 
@@ -388,7 +375,7 @@ fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
 
 #[test]
 fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 28);
+    assert_eq!(METHOD_REGISTRY.len(), 19);
     for spec in METHOD_REGISTRY {
         assert_eq!(Method::parse(spec.name), Some(spec.method));
         assert_eq!(spec.method.as_str(), spec.name);
@@ -423,15 +410,7 @@ fn protocol_v1_methods_use_codex_names_without_cancel_or_generic_delta() {
         "turn/resume",
         "turn/interrupt",
         "turn/status",
-        "approval/list",
-        "approval/center",
-        "approval/request",
-        "approval/decision",
         "event/subscribe",
-        "artifact/fetch",
-        "trace/list",
-        "trace/show",
-        "trace/tail",
         "server/shutdown",
     ] {
         let parsed = Method::parse(method).expect("method is registered");
@@ -462,44 +441,12 @@ fn protocol_v1_id_params_are_camel_case_on_wire() {
         serde_json::json!({"turnId": "turn_1"})
     );
     assert_eq!(
-        serde_json::to_value(TraceListParams {
-            run_id: "run_1".to_string(),
-            limit: None,
-            offset: None
-        })
-        .unwrap(),
-        serde_json::json!({"runId": "run_1"})
-    );
-    assert_eq!(
-        serde_json::to_value(TraceShowParams {
-            event_id: "event_1".to_string()
-        })
-        .unwrap(),
-        serde_json::json!({"eventId": "event_1"})
-    );
-    assert_eq!(
-        serde_json::to_value(TraceTailParams {
-            run_id: "run_1".to_string(),
-            limit: Some(2),
-            offset: Some(1)
-        })
-        .unwrap(),
-        serde_json::json!({"runId": "run_1", "limit": 2, "offset": 1})
-    );
-    assert_eq!(
         serde_json::to_value(EventSubscribeParams {
             event_types: vec!["turn/started".to_string()],
             cursor: None,
         })
         .unwrap(),
         serde_json::json!({"eventTypes": ["turn/started"]})
-    );
-    assert_eq!(
-        serde_json::to_value(ArtifactFetchParams {
-            artifact_id: "artifact_1".to_string()
-        })
-        .unwrap(),
-        serde_json::json!({"artifactId": "artifact_1"})
     );
 }
 
@@ -1172,27 +1119,6 @@ fn prompt_identity_requires_end_fields_when_start_identity_is_known() {
             "rejected unknown Start with known End {field}"
         );
     }
-}
-
-#[test]
-fn trace_metrics_has_typed_request_and_result_contracts() {
-    let params = TraceMetricsParams {
-        run_id: "run".to_string(),
-    };
-    let metrics = TraceMetrics {
-        run_id: "run".to_string(),
-        metrics: Vec::new(),
-    };
-    let result = TraceMetricsResult { metrics };
-    assert_eq!(Method::parse("trace/metrics"), Some(Method::TraceMetrics));
-    assert_eq!(
-        serde_json::to_value(params).unwrap(),
-        serde_json::json!({"runId": "run"})
-    );
-    assert_eq!(
-        serde_json::to_value(result).unwrap()["metrics"]["runId"],
-        "run"
-    );
 }
 
 #[test]

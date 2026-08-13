@@ -145,59 +145,6 @@ impl SessionStore {
         })
     }
 
-    /// Atomically consume inputs and publish the checkpoint that already contains them.
-    pub fn consume_turn_inputs_with_checkpoint(
-        &self,
-        turn_id: &str,
-        thread_id: &str,
-        input_ids: &[String],
-        checkpoint: &Value,
-        checkpoint_version: u32,
-        pause: bool,
-    ) -> StoreResult<()> {
-        if input_ids.is_empty() || !checkpoint.is_object() {
-            return Err(StoreError::InvalidState(
-                "turn input checkpoint commit is invalid".to_string(),
-            ));
-        }
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let turn = self.turn_in_transaction(&transaction, turn_id)?;
-        if turn.thread_id != thread_id || is_terminal_turn_status(&turn.status) {
-            return Err(StoreError::InvalidState(
-                "turn input checkpoint binding is invalid".to_string(),
-            ));
-        }
-        for input_id in input_ids {
-            let changed = transaction.execute(
-                "update turn_inputs set delivery_state = 'consumed', consumed_at = current_timestamp
-                 where input_id = ?1 and turn_id = ?2 and delivery_state = 'pending'",
-                params![input_id, turn_id],
-            )?;
-            if changed != 1 {
-                return Err(StoreError::InvalidState(format!(
-                    "turn input {input_id} is not pending"
-                )));
-            }
-        }
-        Self::upsert_turn_checkpoint(
-            &transaction,
-            turn_id,
-            thread_id,
-            checkpoint,
-            checkpoint_version,
-        )?;
-        if pause {
-            transaction.execute(
-                "update turns set status = 'paused', agent_loop_status = 'paused',
-                                  pause_requested = 0 where turn_id = ?1",
-                params![turn_id],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Request a pause at the next safe boundary. Suspended turns can pause immediately.
     pub fn request_turn_pause(&self, turn_id: &str) -> StoreResult<Turn> {
         let transaction =
@@ -227,40 +174,6 @@ impl SessionStore {
             }
         }
         transaction.commit()?;
-        Ok(turn)
-    }
-
-    /// Publish a pause checkpoint and release the turn from running state in one transaction.
-    pub fn pause_turn_with_checkpoint(
-        &self,
-        turn_id: &str,
-        thread_id: &str,
-        checkpoint: &Value,
-        checkpoint_version: u32,
-    ) -> StoreResult<Turn> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut turn = self.turn_in_transaction(&transaction, turn_id)?;
-        if turn.thread_id != thread_id || is_terminal_turn_status(&turn.status) {
-            return Err(StoreError::InvalidState(
-                "pause checkpoint binding is invalid".to_string(),
-            ));
-        }
-        Self::upsert_turn_checkpoint(
-            &transaction,
-            turn_id,
-            thread_id,
-            checkpoint,
-            checkpoint_version,
-        )?;
-        transaction.execute(
-            "update turns set status = 'paused', agent_loop_status = 'paused',
-                              pause_requested = 0 where turn_id = ?1",
-            params![turn_id],
-        )?;
-        transaction.commit()?;
-        turn.status = TurnStatus::Paused;
-        turn.agent_loop_status = "paused".to_string();
         Ok(turn)
     }
 }

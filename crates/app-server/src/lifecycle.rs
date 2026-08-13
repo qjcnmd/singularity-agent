@@ -241,7 +241,7 @@ impl AppServer {
         json_response(message.required_id(), TurnResult { turn })
     }
 
-    /// Explicitly claim and resume a non-approval suspended turn. The store CAS prevents two
+    /// Explicitly claim and resume a suspended turn. The store CAS prevents two
     /// callers from issuing a duplicate first `ModelTurnRequest`.
     pub(super) fn turn_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
@@ -451,7 +451,7 @@ impl AppServer {
     /// - 跨轮历史由 `<thread_id>.jsonl` 会话文件承载（不再读 store checkpoint/history seed）。
     /// - run 前把 store 中尚未消费的 turn/input 按 delivery 注入 steer/follow-up 队列。
     /// - 事件映射：`on_message_update` → `item/agentMessage/delta`（`project_assistant_delta`）；
-    ///   `on_tool_execution_start` → 只进 trace；工具执行持久化只落 session 文件。
+    ///   工具执行持久化只落 session 文件。
     /// - 注册该 turn 的 steer handle（`turn/input` 运行中注入通道），guard drop 时注销。
     pub(super) fn run_agent_core(
         &self,
@@ -479,8 +479,6 @@ impl AppServer {
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .insert(turn.turn_id.clone(), steer_handle);
         let callback_error = RefCell::new(None);
-        let projector =
-            observability::TraceProjector::new(&self.store, &thread.thread_id, &turn.turn_id)?;
         let mut on_message_update = |delta: &str| {
             if callback_error.borrow().is_some() {
                 return;
@@ -490,17 +488,8 @@ impl AppServer {
                 Err(error) => *callback_error.borrow_mut() = Some(error),
             }
         };
-        let mut on_tool_execution_start = |name: &str, args: &str| {
-            if callback_error.borrow().is_some() {
-                return;
-            }
-            if let Err(error) = projector.project_tool_execution(name, args) {
-                *callback_error.borrow_mut() = Some(AppServerError::Store(error));
-            }
-        };
         let mut events = AgentEvents::new();
         events.on_message_update = Some(&mut on_message_update);
-        events.on_tool_execution_start = Some(&mut on_tool_execution_start);
         let outcome = match agent.run(input_text, &mut events, cancellation) {
             Ok(outcome) => outcome,
             // provider 调用内的取消（interrupt/pause/shutdown）：外部已请求停止，
@@ -517,7 +506,6 @@ impl AppServer {
         if let Some(error) = callback_error.into_inner() {
             return Err(error);
         }
-        projector.project_outcome(&outcome)?;
         Ok(outcome_to_run_status(outcome))
     }
 

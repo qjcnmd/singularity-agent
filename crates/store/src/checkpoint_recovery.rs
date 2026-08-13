@@ -1,8 +1,6 @@
-//! Checkpoint handoff, approval execution recovery, and workspace recovery.
+//! Checkpoint handoff, execution recovery, and workspace recovery.
 
-use super::support::*;
 use super::*;
-use crate::approval::typed_approval_wait_start_trace;
 use std::collections::BTreeSet;
 
 /// Durable execution ownership state. `Unknown` is intentionally terminal for that execution:
@@ -27,24 +25,6 @@ impl ToolExecutionState {
             "running" => Some(Self::Running),
             "unknown" => Some(Self::Unknown),
             _ => None,
-        }
-    }
-}
-
-/// Approval ownership observed while terminalizing a malformed checkpoint.
-/// A pending approval has not started its external side effect; an executing
-/// approval has crossed the Store claim boundary and must not be replayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckpointFailureClaim {
-    Pending,
-    Executing,
-}
-
-impl CheckpointFailureClaim {
-    const fn as_storage_text(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Executing => "executing",
         }
     }
 }
@@ -147,18 +127,16 @@ impl SessionStore {
 
     /// Atomically fail a turn whose opaque checkpoint cannot be decoded.
     ///
-    /// The expected turn owner/status and, for approval resumes, the exact
-    /// pending-call state form the CAS boundary. Running tool executions are
-    /// retained as `Unknown`; no external operation is started or replayed.
-    /// The durable turn checkpoint remains available for audit while unresolved
-    /// approvals are removed and a typed failure trace is appended.
+    /// The expected turn owner/status forms the CAS boundary. Running tool
+    /// executions are retained as `Unknown`; no external operation is started
+    /// or replayed. The durable turn checkpoint remains available for audit and
+    /// a typed failure trace is appended.
     pub fn terminalize_checkpoint_failure(
         &self,
         thread_id: &str,
         turn_id: &str,
         expected_status: TurnStatus,
         expected_agent_loop_status: &str,
-        expected_approval: Option<(&str, CheckpointFailureClaim)>,
     ) -> StoreResult<Turn> {
         if thread_id.trim().is_empty()
             || turn_id.trim().is_empty()
@@ -200,68 +178,6 @@ impl SessionStore {
             return Ok(current);
         }
 
-        let mut pending_statement = transaction.prepare(
-            "select request_id, thread_id, execution_state from pending_tool_calls
-             where turn_id = ?1 order by rowid",
-        )?;
-        let pending_rows = pending_statement
-            .query_map(params![turn_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(pending_statement);
-
-        if pending_rows
-            .iter()
-            .any(|(_, stored_thread_id, _)| stored_thread_id != thread_id)
-        {
-            return Err(StoreError::InvalidState(
-                "checkpoint failure approval thread binding mismatch".to_string(),
-            ));
-        }
-
-        let executing_count = pending_rows
-            .iter()
-            .filter(|(_, _, state)| state == "executing")
-            .count();
-        match expected_approval {
-            Some((request_id, expected_claim)) => {
-                let Some((stored_request_id, _, stored_state)) = pending_rows
-                    .iter()
-                    .find(|(stored_request_id, _, _)| stored_request_id == request_id)
-                else {
-                    return Err(StoreError::InvalidState(format!(
-                        "checkpoint failure approval {request_id} is not present"
-                    )));
-                };
-                if stored_state != expected_claim.as_storage_text() {
-                    return Err(StoreError::InvalidState(format!(
-                        "checkpoint failure approval {stored_request_id} state changed"
-                    )));
-                }
-                if expected_claim == CheckpointFailureClaim::Pending && executing_count != 0 {
-                    return Err(StoreError::InvalidState(
-                        "checkpoint failure has another executing approval owner".to_string(),
-                    ));
-                }
-                if expected_claim == CheckpointFailureClaim::Executing && executing_count != 1 {
-                    return Err(StoreError::InvalidState(
-                        "checkpoint failure approval execution owner is ambiguous".to_string(),
-                    ));
-                }
-            }
-            None if executing_count != 0 => {
-                return Err(StoreError::InvalidState(
-                    "checkpoint failure approval execution owner is missing".to_string(),
-                ));
-            }
-            None => {}
-        }
-
         let running_execution_count: i64 = transaction.query_row(
             "select count(*) from tool_executions
              where thread_id = ?1 and turn_id = ?2 and execution_state = 'running'",
@@ -290,57 +206,6 @@ impl SessionStore {
             ));
         }
 
-        if let Some((request_id, CheckpointFailureClaim::Executing)) = expected_approval {
-            let deleted = transaction.execute(
-                "delete from pending_tool_calls
-                 where request_id = ?1 and thread_id = ?2 and turn_id = ?3 and execution_state = 'executing'",
-                params![request_id, thread_id, turn_id],
-            )?;
-            if deleted != 1 {
-                return Err(StoreError::InvalidState(format!(
-                    "checkpoint failure approval {request_id} was not resolved"
-                )));
-            }
-        }
-        if let Some((request_id, CheckpointFailureClaim::Pending)) = expected_approval {
-            let deleted = transaction.execute(
-                "delete from pending_tool_calls
-                 where request_id = ?1 and thread_id = ?2 and turn_id = ?3 and execution_state = 'pending'",
-                params![request_id, thread_id, turn_id],
-            )?;
-            if deleted != 1 {
-                return Err(StoreError::InvalidState(format!(
-                    "checkpoint failure approval {request_id} was not resolved"
-                )));
-            }
-        }
-
-        let pending_count_before_cleanup: i64 = transaction.query_row(
-            "select count(*) from pending_tool_calls where thread_id = ?1 and turn_id = ?2 and execution_state = 'pending'",
-            params![thread_id, turn_id],
-            |row| row.get(0),
-        )?;
-        let cleaned_pending = Self::delete_unresolved_pending_approvals(&transaction, turn_id)?;
-        if cleaned_pending as i64 != pending_count_before_cleanup {
-            return Err(StoreError::InvalidState(
-                "checkpoint failure changed an unexpected pending approval count".to_string(),
-            ));
-        }
-        let unresolved_approval_count: i64 = transaction.query_row(
-            "select count(*) from approvals where thread_id = ?1 and turn_id = ?2 and decision_outcome is null",
-            params![thread_id, turn_id],
-            |row| row.get(0),
-        )?;
-        let deleted_unresolved_approvals = transaction.execute(
-            "delete from approvals where thread_id = ?1 and turn_id = ?2 and decision_outcome is null",
-            params![thread_id, turn_id],
-        )? as i64;
-        if deleted_unresolved_approvals != unresolved_approval_count {
-            return Err(StoreError::InvalidState(
-                "checkpoint failure changed an unexpected unresolved approval count".to_string(),
-            ));
-        }
-
         let mut trace = TraceEvent::for_turn(
             format!(
                 "trace_{turn_id}_checkpoint_decode_failed_{}",
@@ -357,7 +222,6 @@ impl SessionStore {
             "previous_status": current.status.clone(),
             "previous_agent_loop_status": current.agent_loop_status.clone(),
             "running_executions_marked_unknown": marked_unknown,
-            "pending_approvals_cleared": cleaned_pending as i64 + deleted_unresolved_approvals,
             "tool_replayed": false,
         });
         let trace = if find_trace_span_start(&transaction, thread_id, turn_id, TraceSpanKind::Turn)?
@@ -429,25 +293,9 @@ impl SessionStore {
         }
         match turn.status {
             TurnStatus::Running => {}
-            TurnStatus::Blocked => {
-                let has_executing_pending_tool_call: bool = transaction.query_row(
-                    "select exists(
-                        select 1 from pending_tool_calls
-                        where thread_id = ?1 and turn_id = ?2 and execution_state = 'executing'
-                    )",
-                    params![first.thread_id, first.turn_id],
-                    |row| row.get(0),
-                )?;
-                if !has_executing_pending_tool_call {
-                    return Err(StoreError::InvalidState(
-                        "blocked turn has no executing pending tool call".to_string(),
-                    ));
-                }
-            }
             _ => {
                 return Err(StoreError::InvalidState(
-                    "tool execution batch requires a running turn or an approval-executing blocked turn"
-                        .to_string(),
+                    "tool execution batch requires a running turn".to_string(),
                 ));
             }
         }
@@ -708,440 +556,6 @@ impl SessionStore {
 }
 
 impl SessionStore {
-    /// 原子地用 turn 结果和后续检查点（如有）解决执行中的 approval。
-    pub fn commit_turn_outcome_and_resolve_pending_execution(
-        &self,
-        request_id: &str,
-        params: CommitTurnOutcomeParams<'_>,
-        next_approvals: &[(ApprovalRequest, Value)],
-    ) -> StoreResult<CommittedTurnOutcome> {
-        self.commit_turn_outcome_and_resolve_pending_execution_with_authority(
-            request_id,
-            params,
-            next_approvals,
-            TurnOutcomeAuthority::AgentLoop,
-        )
-    }
-
-    /// 在 typed 基础设施故障权限下提交 executing approval 的终态并清理 checkpoint。
-    pub fn commit_turn_outcome_and_resolve_pending_execution_with_authority(
-        &self,
-        request_id: &str,
-        params: CommitTurnOutcomeParams<'_>,
-        next_approvals: &[(ApprovalRequest, Value)],
-        authority: TurnOutcomeAuthority,
-    ) -> StoreResult<CommittedTurnOutcome> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        if !next_approvals.is_empty()
-            && (params.status != TurnStatus::Blocked || params.agent_loop_status != "blocked")
-        {
-            return Err(StoreError::InvalidState(
-                "next approval handoff requires a blocked turn outcome".to_string(),
-            ));
-        }
-        let bound_turn_id: String = transaction
-            .query_row(
-                "select turn_id from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
-                params![request_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => StoreError::InvalidState(format!(
-                    "pending execution {request_id} is not in executing state"
-                )),
-                other => StoreError::Sqlite(other),
-            })?;
-        // 先提交当前 executing approval 的 turn 结果。
-        let committed = self.commit_turn_outcome_in_transaction(
-            &transaction,
-            &bound_turn_id,
-            params,
-            authority,
-        )?;
-        // 原子移除已解决 checkpoint，再写入 successor approvals。
-        let deleted = transaction.execute(
-            "delete from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
-            params![request_id],
-        )?;
-        if deleted != 1 {
-            return Err(StoreError::InvalidState(format!(
-                "pending execution {request_id} was not resolved"
-            )));
-        }
-        for (request, checkpoint) in next_approvals {
-            if request.turn_id != bound_turn_id {
-                return Err(StoreError::InvalidState(
-                    "next approval turn binding mismatch".to_string(),
-                ));
-            }
-            insert_approval(&transaction, request)?;
-            let tool_call_id = request.tool_call_id.as_deref().ok_or_else(|| {
-                StoreError::InvalidState(
-                    "pending approval checkpoint requires an explicit tool_call_id".to_string(),
-                )
-            })?;
-            ensure_request_turn_binding(&transaction, request)?;
-            transaction.execute(
-                "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values(?1, ?2, ?3, ?4, ?5, 'pending')",
-                params![
-                    request.request_id,
-                    request.thread_id,
-                    request.turn_id,
-                    tool_call_id,
-                    serde_json::to_string(checkpoint)?
-                ],
-            )?;
-            let approval_trace = typed_approval_wait_start_trace(
-                &transaction,
-                request,
-                "approval",
-                "approval requested",
-            )?;
-            Self::insert_turn_trace(
-                &transaction,
-                &approval_trace,
-                &request.thread_id,
-                &request.turn_id,
-            )?;
-        }
-        transaction.commit()?;
-        Ok(committed)
-    }
-
-    /// 对执行中的 approval 进行协调，而不重放其未知的外部副作用。
-    pub(crate) fn recover_incomplete_approval_executions_for_thread(
-        transaction: &Connection,
-        thread_id: &str,
-    ) -> StoreResult<Vec<String>> {
-        // approval 与 pending execution 的联合恢复行。
-        struct RecoveryRow {
-            approval_rowid: i64,
-            request: ApprovalRequest,
-            decision: Option<ApprovalOutcome>,
-            pending_rowid: Option<i64>,
-            pending_state: Option<String>,
-            turn_status: TurnStatus,
-            agent_loop_status: String,
-        }
-
-        let mut statement = transaction.prepare(
-            "select a.rowid, a.request_id, a.thread_id, a.turn_id, a.payload,
-                    a.decision_outcome, a.decision_reason,
-                    p.rowid, p.thread_id, p.turn_id, p.tool_call_id, p.payload,
-                    p.execution_state
-             from approvals a
-             left join pending_tool_calls p on p.request_id = a.request_id
-             where a.thread_id = ?1
-             order by a.rowid",
-        )?;
-        // 先读取 approval、decision 与 pending execution 的联合快照。
-        let persisted_rows = statement
-            .query_map(params![thread_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
-        // 再将快照解码为可逐行校验和修复的恢复记录。
-        let mut rows = Vec::with_capacity(persisted_rows.len());
-        for (
-            approval_rowid,
-            request_id,
-            stored_thread_id,
-            stored_turn_id,
-            request_payload,
-            decision,
-            decision_reason,
-            pending_rowid,
-            pending_thread_id,
-            pending_turn_id,
-            pending_tool_call_id_value,
-            pending_payload,
-            pending_state,
-        ) in persisted_rows
-        {
-            let request = decode_stored_approval_request_row(
-                transaction,
-                &request_id,
-                &stored_thread_id,
-                &stored_turn_id,
-                &request_payload,
-                decision.as_deref(),
-                decision_reason.as_deref(),
-            )?;
-            if request.thread_id != thread_id {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {request_id} recovery thread filter mismatch"
-                )));
-            }
-            let (turn_status, agent_loop_status) = transaction
-                .query_row(
-                    "select status, agent_loop_status from turns where turn_id = ?1 and thread_id = ?2",
-                    params![request.turn_id, request.thread_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "approval {request_id} is not bound to an existing turn"
-                    ))
-                })?;
-            let status = TurnStatus::from_db_text(&turn_status)
-                .ok_or_else(|| unknown_db_enum("turn status", &turn_status))?;
-            let decision = decision
-                .as_deref()
-                .map(decode_final_approval_outcome)
-                .transpose()?;
-            let mut decision_statement = transaction.prepare(
-                "select decision_id, request_id, outcome, reason, payload
-                 from approval_decisions where request_id = ?1 order by rowid",
-            )?;
-            let decision_rows = decision_statement
-                .query_map(params![request_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(decision_statement);
-            match decision {
-                None if !decision_rows.is_empty() => {
-                    return Err(StoreError::InvalidState(format!(
-                        "approval {request_id} has inconsistent decision history"
-                    )));
-                }
-                None => {}
-                Some(ApprovalOutcome::Defer) => {
-                    return Err(StoreError::InvalidState(format!(
-                        "approval {request_id} has inconsistent decision history"
-                    )));
-                }
-                Some(expected_outcome) => {
-                    let [(decision_id, history_request_id, outcome, reason, payload)] =
-                        decision_rows.as_slice()
-                    else {
-                        return Err(StoreError::InvalidState(format!(
-                            "approval {request_id} has inconsistent decision history"
-                        )));
-                    };
-                    let history_decision: ApprovalDecision = serde_json::from_str(payload)?;
-                    if history_request_id != &request_id
-                        || decode_final_approval_outcome(outcome)? != expected_outcome
-                        || decision_reason.as_deref() != Some(reason.as_str())
-                        || history_decision.decision_id != *decision_id
-                        || history_decision.request_id != request_id
-                        || history_decision.outcome != expected_outcome
-                        || history_decision.reason != *reason
-                    {
-                        return Err(StoreError::InvalidState(format!(
-                            "approval {request_id} has inconsistent decision history"
-                        )));
-                    }
-                }
-            }
-
-            match (
-                pending_rowid,
-                pending_thread_id.as_deref(),
-                pending_turn_id.as_deref(),
-                pending_tool_call_id_value.as_deref(),
-                pending_payload.as_deref(),
-                pending_state.as_deref(),
-            ) {
-                (None, None, None, None, None, None) => {}
-                (
-                    Some(_),
-                    Some(thread_id),
-                    Some(turn_id),
-                    Some(tool_call_id),
-                    Some(payload),
-                    Some(_),
-                ) => {
-                    if thread_id != request.thread_id {
-                        return Err(StoreError::InvalidState(
-                            PENDING_TOOL_CALL_THREAD_MISMATCH.to_string(),
-                        ));
-                    }
-                    if turn_id != request.turn_id {
-                        return Err(StoreError::InvalidState(
-                            PENDING_TOOL_CALL_TURN_MISMATCH.to_string(),
-                        ));
-                    }
-                    if request.tool_call_id.as_deref() != Some(tool_call_id) {
-                        return Err(StoreError::InvalidState(
-                            PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
-                        ));
-                    }
-                    if payload.trim().is_empty() {
-                        return Err(StoreError::InvalidState(format!(
-                            "approval {request_id} has an empty pending checkpoint payload"
-                        )));
-                    }
-                }
-                _ => {
-                    return Err(StoreError::InvalidState(format!(
-                        "approval {request_id} has incomplete pending checkpoint metadata"
-                    )));
-                }
-            }
-
-            if request.tool_call_id.is_none() && pending_rowid.is_some() {
-                return Err(StoreError::InvalidState(format!(
-                    "approval {request_id} has inconsistent checkpoint state"
-                )));
-            }
-            rows.push(RecoveryRow {
-                approval_rowid,
-                request,
-                decision,
-                pending_rowid,
-                pending_state,
-                turn_status: status,
-                agent_loop_status,
-            });
-        }
-
-        let mut rows_by_turn = BTreeMap::<String, Vec<usize>>::new();
-        for (index, row) in rows.iter().enumerate() {
-            rows_by_turn
-                .entry(row.request.turn_id.clone())
-                .or_default()
-                .push(index);
-        }
-        let mut superseded_executions = BTreeSet::new();
-        for indexes in rows_by_turn.values() {
-            let pending = indexes
-                .iter()
-                .copied()
-                .filter(|index| rows[*index].pending_state.as_deref() == Some("pending"))
-                .collect::<Vec<_>>();
-            let executing = indexes
-                .iter()
-                .copied()
-                .filter(|index| rows[*index].pending_state.as_deref() == Some("executing"))
-                .collect::<Vec<_>>();
-            if pending.len() > 1 || executing.len() > 1 {
-                return Err(StoreError::InvalidState(
-                    "turn has ambiguous approval execution recovery state".to_string(),
-                ));
-            }
-            if let (Some(executing_index), Some(pending_index)) =
-                (executing.first(), pending.first())
-            {
-                if rows[*executing_index].approval_rowid >= rows[*pending_index].approval_rowid {
-                    return Err(StoreError::InvalidState(
-                        "pending approval does not follow executing approval".to_string(),
-                    ));
-                }
-                superseded_executions.insert(rows[*executing_index].request.request_id.clone());
-            }
-
-            for index in indexes {
-                let row = &rows[*index];
-                if row.request.tool_call_id.is_none() {
-                    continue;
-                }
-                let terminal = is_terminal_turn_status(&row.turn_status);
-                let has_later_active_approval = indexes.iter().any(|candidate| {
-                    rows[*candidate].approval_rowid > row.approval_rowid
-                        && rows[*candidate].pending_rowid.is_some()
-                });
-                let valid = match (row.decision, row.pending_state.as_deref(), terminal) {
-                    (None, Some("pending"), false) => {
-                        // 正常 pending approval 绑定 blocked turn；paused/suspended
-                        // 是 ownerless 状态（残留 pending 行交给
-                        // recover_abandoned_turns_for_thread 终态化，B2）。Running
-                        // 在 store 打开时已被 migration preflight 拒绝，此处为防御性
-                        // 放行（当前 approval 创建与 blocked 转换在同一事务内）。
-                        (row.turn_status == TurnStatus::Blocked
-                            && row.agent_loop_status == "blocked")
-                            || row.turn_status == TurnStatus::Paused
-                            || row.turn_status == TurnStatus::Suspended
-                            || row.turn_status == TurnStatus::Running
-                    }
-                    (Some(ApprovalOutcome::Allow), Some("executing"), _) => true,
-                    (Some(ApprovalOutcome::Allow), None, true) => true,
-                    (Some(ApprovalOutcome::Allow), None, false) => has_later_active_approval,
-                    (Some(ApprovalOutcome::Deny), None, true) => true,
-                    _ => false,
-                };
-                if !valid {
-                    return Err(StoreError::InvalidState(format!(
-                        "approval {} has inconsistent checkpoint state",
-                        row.request.request_id
-                    )));
-                }
-            }
-        }
-
-        let mut recovered = Vec::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.pending_state.as_deref() == Some("executing"))
-        {
-            let request_id = &row.request.request_id;
-            let turn_id = &row.request.turn_id;
-            let superseded = superseded_executions.contains(request_id);
-            if !superseded && !is_terminal_turn_status(&row.turn_status) {
-                transaction.execute(
-                    "update turns set status = ?1, agent_loop_status = 'interrupted' where turn_id = ?2",
-                    params![TurnStatus::Interrupted.to_db_text(), turn_id],
-                )?;
-            }
-            let recovery_reason = if superseded {
-                "approval_execution_superseded_by_pending_handoff"
-            } else {
-                "approval_execution_outcome_unknown"
-            };
-            let summary = if superseded {
-                "stale approval execution reconciled during process recovery"
-            } else {
-                "approval execution interrupted during process recovery"
-            };
-            let trace = TraceEvent {
-                task_id: Some(turn_id.clone()),
-                payload: serde_json::json!({
-                    "request_id": request_id,
-                    "recovery_reason": recovery_reason,
-                    "tool_replayed": false,
-                }),
-                ..TraceEvent::for_turn(
-                    format!("trace_{request_id}_recovered"),
-                    row.request.thread_id.clone(),
-                    turn_id.clone(),
-                    "app_server",
-                    summary,
-                )
-            };
-            Self::insert_turn_trace(transaction, &trace, &row.request.thread_id, turn_id)?;
-            transaction.execute(
-                "delete from pending_tool_calls where request_id = ?1",
-                params![request_id],
-            )?;
-            recovered.push(request_id.clone());
-        }
-        Ok(recovered)
-    }
-
     /// 对执行保护覆盖的每个线程应用所有权丢失恢复。
     pub(crate) fn recover_abandoned_workspace_execution(
         &self,
@@ -1178,7 +592,6 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::recover_tool_executions_for_thread(&transaction, thread_id)?;
-        Self::recover_incomplete_approval_executions_for_thread(&transaction, thread_id)?;
         Self::recover_abandoned_turns_for_thread(&transaction, thread_id)?;
         transaction.commit()?;
         Ok(())
@@ -1243,16 +656,15 @@ impl SessionStore {
 
     /// 将无 active owner 的非终态 turn 终态化为 Interrupted。
     ///
-    /// B1（用户 interrupt）与 B2（启动恢复）共用：同一事务内清理未解决 pending
-    /// approval、更新状态、写 typed trace；保留 checkpoint 与 tool_executions 审计
-    /// 证据；不执行/不重放/不删除 unknown。trace 插入失败会使事务回滚。
+    /// B1（用户 interrupt）与 B2（启动恢复）共用：同一事务内更新状态、写
+    /// typed trace；保留 checkpoint 与 tool_executions 审计证据；不执行/不重放/
+    /// 不删除 unknown。trace 插入失败会使事务回滚。
     pub(crate) fn terminalize_ownerless_turn(
         transaction: &Connection,
         thread_id: &str,
         turn_id: &str,
         params: OwnerlessTerminalization<'_>,
     ) -> StoreResult<()> {
-        Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
         transaction.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
             params![
@@ -1310,18 +722,6 @@ impl SessionStore {
         for (turn_id, serialized_status, agent_loop_status) in turns {
             let status = TurnStatus::from_db_text(&serialized_status)
                 .ok_or_else(|| unknown_db_enum("turn status", &serialized_status))?;
-            let pending_count: i64 = transaction.query_row(
-                "select count(*) from pending_tool_calls
-                 where turn_id = ?1 and execution_state = 'pending'",
-                params![&turn_id],
-                |row| row.get(0),
-            )?;
-            let executing_count: i64 = transaction.query_row(
-                "select count(*) from pending_tool_calls
-                 where turn_id = ?1 and execution_state = 'executing'",
-                params![&turn_id],
-                |row| row.get(0),
-            )?;
             let unknown_count: i64 = transaction.query_row(
                 "select count(*) from tool_executions
                  where turn_id = ?1 and execution_state = 'unknown'",
@@ -1334,9 +734,8 @@ impl SessionStore {
                 |row| row.get(0),
             )?;
             if status == TurnStatus::Suspended && agent_loop_status == "suspended" {
-                // 可归属不一致：缺 checkpoint 或残留 pending/executing。
-                // 正常 suspended（有 checkpoint、无 pending）保持可恢复。
-                if !has_checkpoint || pending_count != 0 || executing_count != 0 {
+                // 可归属不一致：缺 checkpoint。正常 suspended（有 checkpoint）保持可恢复。
+                if !has_checkpoint {
                     let trace = TraceEvent::for_turn(
                         format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
                         thread_id,
@@ -1361,7 +760,7 @@ impl SessionStore {
                 continue;
             }
             if status == TurnStatus::Paused && agent_loop_status == "paused" {
-                if !has_checkpoint || pending_count != 0 || executing_count != 0 {
+                if !has_checkpoint {
                     let trace = TraceEvent::for_turn(
                         format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
                         thread_id,
@@ -1385,47 +784,11 @@ impl SessionStore {
                 }
                 continue;
             }
-            if has_checkpoint
-                && status == TurnStatus::Running
-                && pending_count == 0
-                && executing_count == 0
-                && unknown_count == 0
-            {
+            if has_checkpoint && status == TurnStatus::Running && unknown_count == 0 {
                 transaction.execute(
                     "update turns set status = 'suspended', agent_loop_status = 'suspended' where turn_id = ?1",
                     params![&turn_id],
                 )?;
-                continue;
-            }
-            if status == TurnStatus::Blocked
-                && agent_loop_status == "blocked"
-                && pending_count == 1
-                && executing_count == 0
-            {
-                continue;
-            }
-            if pending_count != 0 || executing_count != 0 {
-                // 可归属不一致：pending/executing 计数无法归入任何合法状态。
-                let trace = TraceEvent::for_turn(
-                    format!("trace_{turn_id}_inconsistent_{}", Uuid::new_v4()),
-                    thread_id,
-                    turn_id.clone(),
-                    "app_server",
-                    "turn interrupted after inconsistent state was detected",
-                );
-                Self::terminalize_ownerless_turn(
-                    transaction,
-                    thread_id,
-                    &turn_id,
-                    OwnerlessTerminalization {
-                        previous_status: status,
-                        previous_agent_loop_status: &agent_loop_status,
-                        terminal_agent_loop_status: "interrupted",
-                        recovery_reason: "inconsistent_turn_state",
-                        trace: &trace,
-                    },
-                )?;
-                recovered.push(turn_id);
                 continue;
             }
 

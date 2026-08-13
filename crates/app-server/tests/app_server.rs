@@ -1,15 +1,10 @@
-//! AppServer protocol、approval continuation、recovery 和 sandbox 边界测试。
+//! AppServer protocol、recovery 和 sandbox 边界测试。
 
 use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
-use singularity_model::{ModelUsage, ProviderAttemptMetadata, ProviderConfigSnapshot};
-use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
-    WorkspaceRelativePath,
-};
-use singularity_protocol::ItemKind;
+use singularity_model::ProviderConfigSnapshot;
 #[cfg(windows)]
 use singularity_protocol::{ConversationRole, TraceMetricSampleKind};
-use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
+use singularity_store::{SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
 use std::io::Write;
@@ -26,16 +21,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
-
-fn tool_id(value: &str) -> ToolId {
-    ToolId::new(value).expect("valid tool id")
-}
-
-fn workspace_resource(value: &str) -> PermissionResource {
-    PermissionResource::WorkspacePath(
-        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
-    )
-}
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -122,30 +107,6 @@ fn configured_provider_drops_cleanly_inside_app_server_runtime() {
     );
 }
 
-fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": tool_call_id,
-        "tool_name": &request.action,
-        "raw_arguments": r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,
-        "resources": &request.resources,
-        "checkpoint_version": 8,
-        "project_instructions_digest": null,
-        "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]},"raw_arguments":r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,"parse_status":"valid","validation_errors":[]}]}],
-        "tool_result_occurrences": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "model_usage": ModelUsage::default(),
-        "provider_attempts": ProviderAttemptMetadata::default(),
-        "context_trace": null,
-        "seen_tool_call_fingerprints": [],
-        "completed_tool_call_fingerprints": []
-    })
-}
-
 #[test]
 fn app_server_enforces_initialize_and_emits_item_events() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -228,12 +189,13 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
 
     let thread = server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":4,"params":{"model":"gpt-test","sandboxMode":"read-only","approvalPolicy":"never"}}"#)
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"thread/start","id":4,"params":{"model":"gpt-test"}}"#,
+        )
         .unwrap();
     let thread_result = result_message(&thread);
     let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
-    assert_eq!(thread_result["thread"]["sandboxMode"], "read-only");
-    assert_eq!(thread_result["thread"]["approvalPolicy"], "never");
+    assert_eq!(thread_result["thread"]["model"], "gpt-test");
     assert_eq!(
         thread_result["thread"]["cwd"],
         std::env::current_dir()
@@ -279,78 +241,12 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     assert_eq!(turn[0]["error"]["code"], -32602);
     assert_eq!(turn[0]["error"]["message"], "Invalid params");
 
-    let missing_trace_list = server
+    let missing_trace = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"trace/list","id":6,"params":{"runId":"missing"}}"#,
         )
         .unwrap();
-    assert_eq!(
-        missing_trace_list[0]["error"]["message"],
-        "Trace run not found"
-    );
-
-    let missing_trace_show = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"trace/show","id":7,"params":{"eventId":"missing"}}"#,
-        )
-        .unwrap();
-    assert_eq!(
-        missing_trace_show[0]["error"]["message"],
-        "Trace event not found"
-    );
-
-    let trace_tail = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":8,"params":{{"runId":"{thread_id}","limit":1}}}}"#
-        ))
-        .unwrap();
-    assert_eq!(
-        trace_tail[0]["result"]["events"].as_array().unwrap().len(),
-        1
-    );
-    let trace_tail_with_offset = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":82,"params":{{"runId":"{thread_id}","limit":1,"offset":1}}}}"#
-        ))
-        .unwrap();
-    assert_eq!(
-        trace_tail_with_offset[0]["result"]["events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
-    let empty_trace_page = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/list","id":81,"params":{{"runId":"{thread_id}","limit":1,"offset":99}}}}"#
-        ))
-        .unwrap();
-    assert!(
-        empty_trace_page[0]["result"]["events"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let trace_metrics = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/metrics","id":83,"params":{{"runId":"{thread_id}"}}}}"#
-        ))
-        .unwrap();
-    assert_eq!(trace_metrics[0]["result"]["metrics"]["runId"], thread_id);
-    assert_eq!(
-        trace_metrics[0]["result"]["metrics"]["metrics"]
-            .as_array()
-            .unwrap()
-            .len(),
-        30
-    );
-    assert!(
-        trace_metrics[0]["result"]["metrics"]["metrics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|metric| metric["name"] == "tool_success_rate_bps")
-    );
+    assert_eq!(missing_trace[0]["error"]["code"], -32601);
 
     let archived = server
         .handle_json(&format!(
@@ -381,8 +277,6 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(unchanged[0]["result"]["thread"]["status"], "archived");
-    assert_eq!(unchanged[0]["result"]["thread"]["sandboxMode"], "read-only");
-    assert_eq!(unchanged[0]["result"]["thread"]["approvalPolicy"], "never");
 
     let resumed = server
         .handle_json(&format!(
@@ -390,8 +284,6 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(resumed[0]["result"]["thread"]["status"], "active");
-    assert_eq!(resumed[0]["result"]["thread"]["sandboxMode"], "read-only");
-    assert_eq!(resumed[0]["result"]["thread"]["approvalPolicy"], "never");
 
     let forked = server
         .handle_json(&format!(
@@ -404,22 +296,13 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         forked[0]["result"]["thread"]["cwd"],
         thread_result["thread"]["cwd"]
     );
-    assert_eq!(forked[0]["result"]["thread"]["sandboxMode"], "read-only");
-    assert_eq!(forked[0]["result"]["thread"]["approvalPolicy"], "never");
 
     let overridden_fork = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"thread/fork","id":45,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#
         ))
         .unwrap();
-    assert_eq!(
-        overridden_fork[0]["result"]["thread"]["sandboxMode"],
-        "workspace-write"
-    );
-    assert_eq!(
-        overridden_fork[0]["result"]["thread"]["approvalPolicy"],
-        "on-request"
-    );
+    assert_eq!(overridden_fork[0]["error"]["code"], -32602);
 
     let deleted = server
         .handle_json(&format!(
@@ -906,491 +789,6 @@ fn turn_start_rejects_agent_host_selector_before_turn_creation() {
 }
 
 #[test]
-fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
-    for outcome in [
-        ApprovalOutcome::Allow,
-        ApprovalOutcome::Deny,
-        ApprovalOutcome::Defer,
-    ] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let mut server = app_server(store);
-        server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-            .unwrap();
-        server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-            .unwrap();
-
-        let center_without_records = server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":21,"params":{}}"#)
-            .unwrap();
-        assert!(
-            center_without_records[0]["result"]["pendingApprovals"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            center_without_records[0]["result"]["decisions"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("reopen store");
-        let thread = store.create_thread(None, None).expect("thread");
-        let turn = store
-            .create_turn(&thread.thread_id, "blocked")
-            .expect("turn");
-        let request = ApprovalRequest::new(
-            "approval_1",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            tool_id("write_file"),
-        );
-        store
-            .create_approval_with_trace(&request, "approval", "approval requested")
-            .expect("approval");
-        drop(store);
-
-        let approvals = server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/list","id":22,"params":{}}"#)
-            .unwrap();
-        assert_eq!(
-            approvals[0]["result"]["approvals"][0]["request_id"],
-            "approval_1"
-        );
-        let center = server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":23,"params":{}}"#)
-            .unwrap();
-        assert_eq!(
-            center[0]["result"]["pendingApprovals"][0]["request_id"],
-            "approval_1"
-        );
-
-        let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
-        let decision_message = serde_json::json!({
-            "jsonrpc": "2.0", "method": "approval/decision",
-            "id": 3,
-            "params": decision,
-        });
-        let decision_result = server.handle_json(&decision_message.to_string()).unwrap();
-        assert_eq!(
-            decision_result[0]["result"]["decision"]["request_id"],
-            "approval_1"
-        );
-        let center_after_decision = server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":24,"params":{}}"#)
-            .unwrap();
-        if outcome == ApprovalOutcome::Defer {
-            assert_eq!(
-                center_after_decision[0]["result"]["pendingApprovals"][0]["request_id"],
-                "approval_1"
-            );
-            assert!(
-                center_after_decision[0]["result"]["decisions"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
-            let repeated = server.handle_json(&decision_message.to_string()).unwrap();
-            assert_eq!(
-                repeated[0]["result"]["decision"]["request_id"],
-                "approval_1"
-            );
-        } else {
-            assert!(
-                center_after_decision[0]["result"]["pendingApprovals"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(
-                center_after_decision[0]["result"]["decisions"][0]["request_id"],
-                "approval_1"
-            );
-            let duplicate = server.handle_json(&decision_message.to_string()).unwrap();
-            assert_eq!(
-                duplicate[0]["error"]["message"],
-                "Pending approval not found"
-            );
-        }
-    }
-}
-
-#[test]
-fn approval_decision_allow_without_pending_tool_call_is_rejected() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    std::fs::write(workspace.join("README.md"), "before").expect("readme");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut server = app_server(store);
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .unwrap();
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .unwrap();
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "blocked",
-            serde_json::json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            singularity_protocol::TurnStatus::Blocked,
-            "blocked",
-        )
-        .expect("blocked state");
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    store
-        .create_approval_with_trace(&request, "approval", "approval requested")
-        .expect("approval");
-    drop(store);
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("README.md")).expect("read before"),
-        "before"
-    );
-
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "operator approved",
-    );
-    let response = server
-        .handle_json(
-            &serde_json::json!({
-                "jsonrpc": "2.0", "method": "approval/decision",
-                "id": 4,
-                "params": decision,
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-    assert_eq!(
-        response[0]["error"]["message"],
-        "Pending approval not found"
-    );
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
-        "before"
-    );
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let turn_after_decision = store.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(
-        turn_after_decision.status,
-        singularity_protocol::TurnStatus::Blocked
-    );
-    assert_eq!(turn_after_decision.agent_loop_status, "blocked");
-    assert!(
-        store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .into_iter()
-            .all(|event| event.component != "agent_loop")
-    );
-    assert_eq!(
-        store.list_pending_approvals().expect("pending approvals")[0].request_id,
-        request.request_id
-    );
-}
-
-#[test]
-fn pending_approval_prevents_thread_archive_and_delete() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut server = app_server(store);
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .expect("initialize");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialized");
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            singularity_protocol::TurnStatus::Blocked,
-            "blocked",
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_archived",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(approval_checkpoint(&request, "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    drop(store);
-
-    for method in ["thread/archive", "thread/delete"] {
-        let response = server
-            .handle_json(
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "method": method,
-                    "id": 4,
-                    "params": {"threadId": &thread.thread_id},
-                })
-                .to_string(),
-            )
-            .expect("lifecycle response");
-
-        assert_eq!(
-            response[0]["error"]["message"],
-            format!(
-                "thread already has an active or pending turn {}; use sg turn resume/pause/input {}",
-                turn.turn_id, turn.turn_id
-            )
-        );
-    }
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    assert_eq!(
-        store
-            .list_pending_approvals()
-            .expect("pending approvals")
-            .iter()
-            .map(|request| request.request_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["approval_archived"]
-    );
-}
-
-#[test]
-fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut server = app_server(store);
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .expect("initialize");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialized");
-    subscribe_events(&mut server);
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let thread = store
-        .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "blocked",
-            serde_json::json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            singularity_protocol::TurnStatus::Blocked,
-            "blocked",
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_interrupted",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(approval_checkpoint(&request, "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    drop(store);
-
-    let response = server
-        .handle_json(
-            &serde_json::json!({
-                "jsonrpc": "2.0", "method": "turn/interrupt",
-                "id": 4,
-                "params": {"turnId": &turn.turn_id},
-            })
-            .to_string(),
-        )
-        .expect("interrupt response");
-    assert!(
-        response.iter().any(|message| {
-            message["method"] == "turn/completed"
-                && message["params"]["turn"]["status"] == "interrupted"
-        }),
-        "{response:#?}"
-    );
-    let interrupt_response = response.last().expect("interrupt response");
-    assert_eq!(interrupt_response["result"]["status"], "interrupted");
-    assert_eq!(
-        interrupt_response["result"]["agent_loop_status"],
-        "cancelled"
-    );
-
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let interrupted = store.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(
-        interrupted.status,
-        singularity_protocol::TurnStatus::Interrupted
-    );
-    assert_eq!(interrupted.agent_loop_status, "cancelled");
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending lookup")
-    );
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    assert!(
-        store
-            .list_approval_decisions()
-            .expect("decisions")
-            .is_empty()
-    );
-    store
-        .recover_unowned_workspace_executions()
-        .expect("recovery");
-}
-
-#[test]
-fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop_turn() {
-    for (outcome, request_resource) in [
-        (ApprovalOutcome::Deny, "README.md"),
-        (ApprovalOutcome::Defer, "README.md"),
-        (ApprovalOutcome::Allow, "other.md"),
-    ] {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir(&workspace).expect("workspace");
-        std::fs::write(workspace.join("README.md"), "before").expect("readme");
-        let db_path = dir.path().join("sessions.sqlite3");
-        let store = SessionStore::open(&db_path).expect("open store");
-        let mut server = app_server(store);
-        server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-            .unwrap();
-        server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-            .unwrap();
-        let thread = server
-            .handle_json(&format!(
-                r#"{{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{{"cwd":{}}}}}"#,
-                serde_json::to_string(&workspace.to_string_lossy()).expect("cwd")
-            ))
-            .unwrap();
-        let thread_id = result_message(&thread)["thread"]["thread_id"]
-            .as_str()
-            .unwrap();
-        let store = SessionStore::open(&db_path).expect("reopen store");
-        let (turn, _item, _trace) = store
-            .create_turn_with_input_and_trace(
-                thread_id,
-                "blocked",
-                serde_json::json!([{"type": "text", "text": "edit readme"}]),
-                "app_server",
-                "turn started",
-            )
-            .expect("blocked turn");
-        store
-            .update_turn_state(
-                &turn.turn_id,
-                singularity_protocol::TurnStatus::Blocked,
-                "blocked",
-            )
-            .expect("blocked state");
-        let request = ApprovalRequest::new(
-            format!("approval_{}_call_1", turn.turn_id),
-            thread_id.to_string(),
-            turn.turn_id.clone(),
-            tool_id("edit"),
-        )
-        .with_tool_call_id("call_1")
-        .with_resources([workspace_resource(request_resource)]);
-        store
-            .create_approval_with_trace(&request, "approval", "approval requested")
-            .expect("approval");
-        drop(store);
-        let decision =
-            ApprovalDecision::new(request.request_id.clone(), outcome, "operator decision");
-
-        let response = server
-            .handle_json(
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "method": "approval/decision",
-                    "id": 3,
-                    "params": decision,
-                })
-                .to_string(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            response[0]["error"]["message"],
-            "Pending approval not found"
-        );
-        assert!(
-            !response
-                .iter()
-                .any(|message| message["method"] == "item/agentMessage/delta")
-        );
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
-            "before"
-        );
-        let store = SessionStore::open(&db_path).expect("reopen store");
-        assert_eq!(
-            store.get_turn(&turn.turn_id).expect("turn").status,
-            singularity_protocol::TurnStatus::Blocked
-        );
-        assert!(
-            store
-                .list_trace(thread_id)
-                .expect("trace list")
-                .into_iter()
-                .all(|event| event.component != "agent_loop")
-        );
-    }
-}
-
-#[test]
 fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -1412,107 +810,21 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         "Thread not found"
     );
 
-    let request = ApprovalRequest::new(
-        "approval_public",
-        "thread_1",
-        "turn_1",
-        tool_id("write_file"),
-    );
-    let request_message = serde_json::json!({
-        "jsonrpc": "2.0", "method": "approval/request",
-        "id": 3,
-        "params": request,
-    });
-    let public_request = server.handle_json(&request_message.to_string()).unwrap();
-
-    assert_eq!(public_request[0]["error"]["code"], -32005);
-    assert_eq!(
-        public_request[0]["error"]["message"],
-        "approval/request is internal to the AgentLoop approval history"
-    );
-
-    let missing_artifact = server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"artifact/fetch","id":4,"params":{"artifactId":"missing"}}"#)
+    let unknown_method = server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"approval/request","id":3,"params":{}}"#)
         .unwrap();
+    assert_eq!(unknown_method[0]["error"]["code"], -32601);
     assert_eq!(
-        missing_artifact[0]["error"]["message"],
-        "Artifact not found"
+        unknown_method[0]["error"]["message"],
+        "Method not found"
     );
-}
 
-#[test]
-fn artifact_fetch_returns_only_registered_bound_artifacts_and_hides_deleted_threads() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let item = store
-        .append_item(
-            &turn.turn_id,
-            ItemKind::FileChange,
-            serde_json::json!({"changed_files": ["safe/result.txt"]}),
+    let unknown_artifact = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"artifact/fetch","id":4,"params":{"artifactId":"missing"}}"#,
         )
-        .expect("item");
-    let digest = format!("sha256:{}", "d".repeat(64));
-    let artifact = store
-        .register_artifact_ref(RegisterArtifactRefParams {
-            run_id: &thread.thread_id,
-            item_id: Some(&item.item_id),
-            kind: "file",
-            uri: "artifact://safe/result.txt",
-            content_digest: &digest,
-            summary: "safe result",
-            metadata: serde_json::json!({"path": "safe/result.txt"}),
-        })
-        .expect("artifact");
-    assert!(matches!(
-        store.register_artifact_ref(RegisterArtifactRefParams {
-            run_id: "synthetic_run",
-            item_id: None,
-            kind: "file",
-            uri: "artifact://synthetic/result.txt",
-            content_digest: &digest,
-            summary: "must fail",
-            metadata: serde_json::json!({}),
-        }),
-        Err(StoreError::NotFound(message)) if message == "artifact run synthetic_run"
-    ));
-    store
-        .update_turn_status(&turn.turn_id, singularity_protocol::TurnStatus::Completed)
-        .expect("complete turn");
-
-    let mut server = app_server(store);
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .expect("initialize");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialized");
-    let fetched = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"artifact/fetch","id":2,"params":{{"artifactId":"{}"}}}}"#,
-            artifact.artifact_id
-        ))
-        .expect("fetch artifact");
-    assert_eq!(
-        fetched[0]["result"]["artifact"]["artifactId"],
-        artifact.artifact_id
-    );
-
-    let deleter = SessionStore::open(&db_path).expect("reopen store");
-    deleter
-        .delete_thread(&thread.thread_id)
-        .expect("delete thread");
-    let deleted = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"artifact/fetch","id":3,"params":{{"artifactId":"{}"}}}}"#,
-            artifact.artifact_id
-        ))
-        .expect("fetch deleted artifact");
-    assert_eq!(deleted[0]["error"]["message"], "Artifact not found");
+        .unwrap();
+    assert_eq!(unknown_artifact[0]["error"]["code"], -32601);
 }
 
 #[test]
@@ -1719,9 +1031,7 @@ fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_mess
     }));
     let traces = store.list_trace(&thread_id).expect("provider trace");
     assert!(traces.iter().any(|event| {
-        event.payload["observation"] == "agent_outcome"
-            && event.payload["status"] == "completed"
-            && event.payload["turns"] == 1
+        event.payload["status"] == "completed" && event.payload["model_turns"] == 1
     }));
 }
 
@@ -1860,22 +1170,14 @@ fn turn_status_recovers_an_unowned_running_turn() {
         response[0]["result"]["turn"]["agent_loop_status"],
         "interrupted"
     );
-    let trace = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/list","id":3,"params":{{"runId":"{}"}}}}"#,
-            thread.thread_id
-        ))
-        .expect("trace list");
-    assert!(
-        trace[0]["result"]["events"]
-            .as_array()
-            .is_some_and(|events| {
-                events.iter().any(|event| {
-                    event["session_id"] == turn.turn_id
-                        && event["payload"]["recovery_reason"] == "execution_owner_lost"
-                })
-            })
-    );
+    let traces = SessionStore::open(&db_path)
+        .expect("reopen store")
+        .list_trace(&thread.thread_id)
+        .expect("recovery trace");
+    assert!(traces.iter().any(|event| {
+        event.session_id == turn.turn_id
+            && event.payload["recovery_reason"] == "execution_owner_lost"
+    }));
 }
 
 #[test]
@@ -2032,7 +1334,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
             "params": {"eventTypes": [
                 "thread/started", "turn/started", "turn/completed",
                 "item/started", "item/completed",
-                "item/agentMessage/delta", "approval/requested"
+                "item/agentMessage/delta"
             ]}
         }),
     );
@@ -2040,20 +1342,6 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     assert!(subscription.get("result").is_some());
 }
 
-fn subscribe_events(server: &mut AppServer) {
-    let response = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":99,"params":{"eventTypes":["thread/started","turn/started","turn/completed","item/started","item/completed","item/agentMessage/delta","approval/requested"]}}"#,
-        )
-        .expect("event subscription");
-    assert!(
-        response
-            .iter()
-            .any(|message| message.get("result").is_some())
-    );
-}
-
-#[cfg(windows)]
 fn start_process_thread(
     input: &mut ChildStdin,
     output: &mut JsonOutput,

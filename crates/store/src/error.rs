@@ -92,9 +92,6 @@ impl_db_enum!(ThreadStatus, "thread status");
 impl_db_enum!(TurnStatus, "turn status");
 impl_db_enum!(ItemKind, "item kind");
 impl_db_enum!(ItemStatus, "item status");
-impl_db_enum!(ApprovalOutcome, "approval outcome");
-impl_db_enum!(PermissionProfileName, "sandbox mode");
-impl_db_enum!(ApprovalPolicy, "approval policy");
 
 pub(crate) fn unknown_db_enum(label: &str, value: &str) -> StoreError {
     StoreError::InvalidState(format!("unknown {label} database value {value:?}"))

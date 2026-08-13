@@ -166,44 +166,6 @@ pub(crate) fn fail_closed_on_foreign_key_violations(
     Ok(())
 }
 
-// 校验 approval request 的显式 thread/turn 绑定。
-pub(crate) fn ensure_approval_request_binding(
-    connection: &Connection,
-    request: &ApprovalRequest,
-) -> StoreResult<()> {
-    if request.thread_id.trim().is_empty() || request.turn_id.trim().is_empty() {
-        return Err(StoreError::InvalidState(
-            APPROVAL_BINDING_REQUIRED.to_string(),
-        ));
-    }
-    ensure_request_turn_binding(connection, request)
-}
-
-// 校验 pending checkpoint 与 request 的 turn 绑定。
-pub(crate) fn ensure_request_turn_binding(
-    connection: &Connection,
-    request: &ApprovalRequest,
-) -> StoreResult<()> {
-    let thread_id = connection
-        .query_row(
-            "select thread_id from turns where turn_id = ?1",
-            params![request.turn_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
-                StoreError::NotFound(format!("turn {}", request.turn_id))
-            }
-            other => StoreError::Sqlite(other),
-        })?;
-    if thread_id != request.thread_id {
-        return Err(StoreError::InvalidState(
-            APPROVAL_TURN_THREAD_MISMATCH.to_string(),
-        ));
-    }
-    Ok(())
-}
-
 // 判断 turn status 是否已经不可再推进。
 pub(crate) fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     matches!(
@@ -246,35 +208,6 @@ pub(crate) fn validate_turn_status_update(
             ));
         }
     }
-    Ok(())
-}
-
-// 将 approval request 编码并写入 approvals 表。
-pub(crate) fn insert_approval(
-    connection: &Connection,
-    request: &ApprovalRequest,
-) -> StoreResult<()> {
-    ensure_approval_request_binding(connection, request)?;
-    connection
-        .execute(
-            "insert into approvals(
-                 request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
-             ) values(?1, ?2, ?3, ?4, null, null)",
-            params![
-                request.request_id,
-                request.thread_id,
-                request.turn_id,
-                serde_json::to_string(request)?
-            ],
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::SqliteFailure(ref sqlite_error, _)
-                if sqlite_error.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                StoreError::AlreadyExists(format!("approval {}", request.request_id))
-            }
-            other => StoreError::Sqlite(other),
-        })?;
     Ok(())
 }
 

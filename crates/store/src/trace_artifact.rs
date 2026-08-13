@@ -361,29 +361,6 @@ pub(crate) fn find_trace_span_start(
     row.map(decode_stored_trace_row).transpose()
 }
 
-/// Read one persisted typed span start by its exact stable span identity.
-pub(crate) fn find_trace_span_start_by_id(
-    connection: &Connection,
-    run_id: &str,
-    session_id: &str,
-    span_kind: TraceSpanKind,
-    span_id: &str,
-) -> StoreResult<Option<TraceEvent>> {
-    let row = connection
-        .query_row(
-            "select event_id, run_id, session_id, payload, span_id, parent_span_id,
-                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
-                    span_projection, metric_samples
-             from trace_events
-             where run_id = ?1 and session_id = ?2 and span_kind = ?3
-               and span_phase = 'start' and span_id = ?4",
-            params![run_id, session_id, span_kind.as_storage_text(), span_id],
-            stored_trace_row,
-        )
-        .optional()?;
-    row.map(decode_stored_trace_row).transpose()
-}
-
 fn validate_trace_batch_input(events: &[TraceEvent]) -> StoreResult<()> {
     let mut event_ids = BTreeSet::new();
     for event in events {

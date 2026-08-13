@@ -4,13 +4,9 @@
 //!
 //! 服务将协议处理与工作线程执行分离，并通过 `SessionStore` 提交终态后再发出对应事件。
 
-mod approval;
 mod dispatch;
 mod events;
 mod lifecycle;
-mod observability;
-
-pub use observability::TraceProjector;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -33,12 +29,8 @@ use singularity_core::{
     load_project_instructions,
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
-use singularity_policy::{
-    ApprovalDecision, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
-};
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
-    ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent,
     EventClass, EventDelivery, EventGap, EventGapReason,
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
     InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method, MethodKind,
@@ -60,12 +52,6 @@ const THREAD_ARCHIVED_CONTINUATION: &str =
     "Thread is archived; resume it before continuing the turn";
 const WORKSPACE_EXECUTION_ACTIVE: &str = "Workspace already has an active or pending turn";
 const TURN_NOT_FOUND: &str = "Turn not found";
-const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
-const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
-const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
-const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
-    "approval/request is internal to the AgentLoop approval history";
-const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
@@ -113,7 +99,6 @@ pub type AppServerResult<T> = Result<T, AppServerError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnFailureStage {
     AgentLoop,
-    ApprovalCheckpoint,
     CancellationMonitor,
     TerminalOutcome,
     EventNotification,
@@ -123,7 +108,6 @@ impl TurnFailureStage {
     fn as_str(self) -> &'static str {
         match self {
             Self::AgentLoop => "agent_loop",
-            Self::ApprovalCheckpoint => "approval_checkpoint",
             Self::CancellationMonitor => "cancellation_monitor",
             Self::TerminalOutcome => "terminal_outcome",
             Self::EventNotification => "event_notification",
@@ -264,7 +248,6 @@ impl From<TurnFailureStage> for TurnFailure {
         Self {
             stage,
             cause: match stage {
-                TurnFailureStage::ApprovalCheckpoint => TurnFailureCause::Store,
                 TurnFailureStage::CancellationMonitor => TurnFailureCause::CancellationMonitor,
                 _ => TurnFailureCause::Internal,
             },
@@ -489,7 +472,7 @@ pub struct AppServerOutput {
     pub trace_binding: Option<TransportTraceBinding>,
 }
 
-/// 协调线程、turn、approval、追踪和工作线程的有状态 JSON-RPC 服务。
+/// 协调线程、turn、追踪和工作线程的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
     initialized: bool,
@@ -794,13 +777,6 @@ fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery, Option<EventR
                 }
             }),
         ),
-        "approval/requested" => (
-            EventClass::State,
-            EventDelivery::Reliable,
-            Some(EventRecoveryQuery::ApprovalList(
-                singularity_protocol::EmptyParams {},
-            )),
-        ),
         _ => (EventClass::State, EventDelivery::Reliable, None),
     }
 }
@@ -809,19 +785,6 @@ fn json_response<T: serde::Serialize>(id: JsonRpcId, result: T) -> AppServerResu
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
     ])
-}
-
-fn approval_decision_response(
-    id: JsonRpcId,
-    decision: &ApprovalDecision,
-) -> AppServerResult<Value> {
-    Ok(JsonRpcMessage::response(
-        id,
-        serde_json::to_value(ApprovalDecisionResult {
-            decision: decision.clone(),
-        })?,
-    )
-    .to_wire_value())
 }
 
 fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
