@@ -335,10 +335,10 @@ flowchart LR
 
 | Phase | 内容 | 状态 |
 | --- | --- | --- |
-| 1 | 剥离死表面（evaluator_only、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | 进行中（规格：`outputs/exec/phase1-spec.md`；工作树已有对应剥离改动，未提交） |
-| 2 | 新建 JSONL SessionManager + Pi 式 Agent 循环 + Compaction + 事件流（新模块，与旧机制并存不切换） | 未开始（规格：`outputs/exec/phase2a-spec.md`） |
-| 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | 未开始 |
-| 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | 未开始 |
+| 1 | 剥离死表面（evaluator_only、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | **完成**（提交 `8c44439b`） |
+| 2 | 新建 JSONL SessionManager + Pi 式 Agent 循环 + Compaction + 事件流（新模块，与旧机制并存不切换） | **完成**（提交 `5213e604` / `602303d` / `d2e79e0` / `da6c689`：message/session/compaction/tools/loop + 真实模型端到端） |
+| 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | **部分完成**：3a 已切换 app-server turn 执行到新核心（提交 `2df1d7fa`）；3b（删三 crate + 旧 AgentLoop）调查中 |
+| 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | 未开始（与 3b 联动，依赖面盘点中） |
 | 5 | Provider 简化：删 capability probe 全链，静态声明 + 用户覆盖；保留双协议 adapter / 重试 / usage 记账 | 未开始 |
 | 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局 config.toml | 未开始 |
 | 7 | 清理与文档：退役 command-runner / setup 二进制、删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | 未开始 |
