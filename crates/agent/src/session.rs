@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use singularity_model::{ModelMessage, ModelRole};
+use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::macros::format_description;
@@ -298,8 +298,7 @@ pub struct SessionContext {
 /// Pi 式 JSONL 会话管理器（见模块文档）。
 pub struct SessionManager {
     file: PathBuf,
-    /// 会话 cwd（header 字段来源）。Phase 2a 无读取方，契约保留，后续阶段消费。
-    #[allow(dead_code)]
+    /// 会话 cwd（header 字段来源；Phase 2d 起由 agent loop 提供给工具执行）。
     cwd: PathBuf,
     entries: Vec<SessionEntry>,
     by_id: HashMap<String, usize>,
@@ -498,6 +497,11 @@ impl SessionManager {
         &self.file
     }
 
+    /// 会话工作目录（header 中记录的绝对路径）。
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// 构建活跃的、compaction 感知的条目列表（Pi `buildContextEntries`）。
     ///
     /// 沿 leaf→root 路径取最后一个 compaction 条目；结果 = [compaction] +
@@ -618,10 +622,33 @@ fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
                 vec![ModelMessage::text(ModelRole::User, message.content.clone())]
             }
             AgentMessageRole::Assistant => {
-                vec![ModelMessage::text(
-                    ModelRole::Assistant,
-                    message.content.clone(),
-                )]
+                // 带工具调用的 assistant 消息必须重放 tool_calls（对齐 Pi convertToLlm：
+                // assistant 消息原样进入 LLM 上下文）。真实 provider 拒绝孤立 tool_call_id
+                // 的 tool 消息（无对应 assistant tool_calls 的历史，实测 HTTP 400）。
+                // raw_arguments 由 args 重新序列化（Phase 2a 会话 schema 不存原始文本）。
+                let (Some(tool_name), Some(args)) = (&message.tool_name, &message.args) else {
+                    return vec![ModelMessage::text(
+                        ModelRole::Assistant,
+                        message.content.clone(),
+                    )];
+                };
+                let Some(tool_call_id) = &message.tool_call_id else {
+                    // 缺 call id 无法构造合法工具调用历史；退化为纯文本，不伪造 id。
+                    return vec![ModelMessage::text(
+                        ModelRole::Assistant,
+                        message.content.clone(),
+                    )];
+                };
+                let mut llm = ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: args.clone(),
+                    raw_arguments: serde_json::to_string(args).unwrap_or_default(),
+                    parse_status: ModelToolParseStatus::Valid,
+                    validation_errors: Vec::new(),
+                }]);
+                llm.content = message.content.clone();
+                vec![llm]
             }
             AgentMessageRole::ToolResult => {
                 let mut llm = ModelMessage::text(ModelRole::Tool, message.content.clone());
@@ -1070,6 +1097,77 @@ mod tests {
             .collect();
         assert_eq!(rewritten[0]["version"], 3);
         assert_eq!(rewritten[2]["message"]["role"], "custom");
+    }
+
+    /// 7. assistant 带 tool call 的消息投影为带 tool_calls 的 LLM 消息（Phase 2d 扩展，
+    /// 对齐 Pi convertToLlm：assistant 消息携带 tool call 结构进入上下文）。
+    #[test]
+    fn build_session_context_replays_assistant_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+        manager
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: String::new(),
+                tool_call_id: Some("call_1".to_string()),
+                tool_name: Some("write".to_string()),
+                args: Some(serde_json::json!({
+                    "path": "hello.txt",
+                    "content": "hello",
+                })),
+                timestamp: None,
+            })
+            .unwrap();
+        manager
+            .append_message(tool_result(
+                "call_1",
+                "Successfully wrote 5 bytes to hello.txt",
+            ))
+            .unwrap();
+
+        // 落盘重开：字段持久化后投影语义一致。
+        let file = manager.path().to_path_buf();
+        drop(manager);
+        let manager = SessionManager::open(&file).unwrap();
+        let ctx = manager.build_session_context().unwrap();
+        assert_eq!(ctx.messages.len(), 2);
+        assert_eq!(ctx.messages[0].role, ModelRole::Assistant);
+        assert_eq!(ctx.messages[0].content, "");
+        assert_eq!(ctx.messages[0].tool_calls.len(), 1);
+        let call = &ctx.messages[0].tool_calls[0];
+        assert_eq!(call.tool_call_id, "call_1");
+        assert_eq!(call.tool_name, "write");
+        assert_eq!(call.parse_status, ModelToolParseStatus::Valid);
+        assert!(call.validation_errors.is_empty());
+        // raw_arguments 由 args 重序列化，语义等价。
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.raw_arguments).unwrap(),
+            serde_json::json!({ "path": "hello.txt", "content": "hello" })
+        );
+        assert_eq!(ctx.messages[1].role, ModelRole::Tool);
+        assert_eq!(ctx.messages[1].tool_call_id.as_deref(), Some("call_1"));
+
+        // 无 tool call 的 assistant 消息保持纯文本投影；缺 call id 时退化纯文本。
+        let mut plain = SessionManager::create(dir.path(), dir.path()).unwrap();
+        plain.append_message(assistant("hi")).unwrap();
+        let ctx = plain.build_session_context().unwrap();
+        assert_eq!(ctx.messages[0].role, ModelRole::Assistant);
+        assert!(ctx.messages[0].tool_calls.is_empty());
+        let mut missing_id = SessionManager::create(dir.path(), dir.path()).unwrap();
+        missing_id
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "text".to_string(),
+                tool_call_id: None,
+                tool_name: Some("write".to_string()),
+                args: Some(serde_json::json!({})),
+                timestamp: None,
+            })
+            .unwrap();
+        let ctx = missing_id.build_session_context().unwrap();
+        assert_eq!(ctx.messages[0].role, ModelRole::Assistant);
+        assert!(ctx.messages[0].tool_calls.is_empty());
+        assert_eq!(ctx.messages[0].content, "text");
     }
 
     /// 5. build_context_entries：无 compaction = 全量；有 compaction = 正确切片。

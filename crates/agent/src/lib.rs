@@ -40,6 +40,8 @@ use singularity_tools::{
 };
 use thiserror::Error;
 
+#[path = "loop.rs"]
+pub mod agent;
 mod checkpoint;
 pub mod compaction;
 mod context;
@@ -48,8 +50,8 @@ mod model_turn;
 mod observation;
 mod occurrence;
 pub mod session;
-pub mod tools;
 mod tool_occurrence;
+pub mod tools;
 
 use checkpoint::HistoricalModelContext;
 
