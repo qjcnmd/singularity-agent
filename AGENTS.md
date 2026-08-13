@@ -12,7 +12,7 @@ Singularity 是一个可实际使用、可持续演进的 coding agent harness�
 
 任何比参考基线明显更复杂的核心机制，都必须有当前真实消费者和明确必要性。未来可能需要的模型路由、多 Agent、任务图、自定义 Context 策略、额外工具、Sandbox、权限控制、插件或桌面能力，不作为提前增加核心复杂度的理由。
 
-核心能力保持 headless，并与具体 CLI、TUI 或未来 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。具体进程边界、App Server 和 transport 根据真实客户端需求决定，不在本文件冻结。
+核心能力保持 headless，并与具体 CLI、TUI 或未来 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。当前进程边界按定基线裁决：headless core 库 + 薄 app-server（stdio JSON-RPC）+ 所有客户端（CLI、未来 Desktop）经同一协议连接；配置为共享全局文件、会话为统一 JSONL 格式。若更简单的进程边界被证明合理，可在用户裁决后调整。
 
 现有源码、测试、Schema、历史实现和 Git 历史只能证明“当前这样实现”，不能证明设计本身正确。基础方向不合理时允许重构、替换或删除。
 
@@ -132,6 +132,8 @@ Agent 核心应尽量保持小而稳定。
 - Memory；
 - 项目或用户工作流。
 
+Sandbox、Approval、Permission 不进入产品核心：默认工具继承进程权限直接执行，隔离与权限控制由外部环境或扩展提供。
+
 扩展性不等于提前实现完整插件平台。只建立当前重构真正需要的稳定接缝。
 
 不要因为现有测试依赖某个对象，就默认该对象必须继续存在。先判断对象本身是否仍属于目标架构。
@@ -159,14 +161,7 @@ CLI、TUI 和未来 Desktop 应消费同一核心 Agent 能力。
 
 Provider 行为以当前配置、实际 API 合同和真实 wire 证据为准。
 
-不从模型名称猜测：
-
-- Context Window；
-- Tool Calling 支持；
-- Reasoning 模式；
-- API protocol；
-- 并发能力；
-- 其他 Provider capability。
+Provider 能力（Context Window、Tool Calling、Reasoning、API protocol、并发能力等）以模型静态声明（内置模型表 + 用户配置覆盖）为事实来源：不凭模型名称猜测、不运行自动探测；声明与实际不符时以用户配置为准，溢出等运行时偏差由重试/兜底处理。
 
 不要为了统一抽象而建立没有真实消费者的 capability system。
 
@@ -194,7 +189,7 @@ Provider transport retry 只处理可明确重试的同一请求失败，不通�
 2. 精确受影响测试；
 3. 受影响 crate 的 `check` / `clippy`；
 4. 必要的跨模块集成测试；
-5. 只有真实产品行为无法由前述证据证明时才运行真实 Provider 调用；
+5. 涉及 harness 真实链路行为的验证运行真实模型调用（见下方细粒度原则）；纯逻辑单元测试使用 mock；
 6. 只有用户明确要求或修改确实涉及完整 Evaluation 行为时才运行昂贵 Evaluation。
 
 不要因为修改发生在 Agent、Provider、Store、Tool 或 Evaluation crate 就机械运行全仓测试。
