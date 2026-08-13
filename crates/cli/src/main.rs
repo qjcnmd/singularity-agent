@@ -37,7 +37,6 @@ const EVENT_TYPES: &[&str] = &[
     "thread/started",
     "turn/started",
     "turn/completed",
-    "turn/diff/updated",
     "approval/requested",
     "item/started",
     "item/completed",

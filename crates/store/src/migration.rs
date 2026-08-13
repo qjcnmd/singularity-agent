@@ -256,7 +256,7 @@ item_id text primary key,
 turn_id text not null,
 item_sequence integer not null check(item_sequence > 0),
 kind text not null
-    check(kind in ('userMessage', 'agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange')),
+    check(kind in ('userMessage', 'agentMessage', 'reasoning', 'commandExecution', 'fileChange')),
 payload text not null,
 status text not null check(status in ('started', 'completed')),
 redacted integer not null check(redacted in (0, 1)),

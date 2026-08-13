@@ -1577,7 +1577,7 @@ mod tests {
 
     fn reliable_state_event(cursor: u64) -> Value {
         JsonRpcMessage::notification(
-            "turn/diff/updated",
+            "turn/completed",
             serde_json::json!({
                 "turnId": "turn_state",
                 "diff": {"files": []},

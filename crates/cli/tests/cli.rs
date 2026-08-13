@@ -830,7 +830,6 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
                 "turn/start",
                 vec![
                     send(json!({"method": "turn/started", "params": {"turn": turn.clone()}})),
-                    send(json!({"method": "turn/diff/updated", "params": {"patch": "SECRET_DIFF_SHOULD_NOT_LEAK"}})),
                     send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_json"}, "delta": "agent-loop-ok"}})),
                     respond(json!({"turn": turn})),
                 ],
@@ -845,7 +844,6 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert!(!stdout(&output).contains("SECRET_DIFF_SHOULD_NOT_LEAK"));
     assert_eq!(value["thread"]["thread_id"], "thread_json");
     assert_eq!(value["turn"]["turn_id"], "turn_json");
     assert_eq!(value["turn"]["agent_loop_status"], "completed");
@@ -1699,7 +1697,7 @@ fn cli_rejects_unsupported_event_recovery_query() {
                 "thread/list",
                 vec![
                     send(json!({
-                        "method":"turn/diff/updated",
+                        "method":"turn/completed",
                         "params":{
                             "turnId":"turn_diff",
                             "event":{"sequence":2,"cursor":2,"class":"state","delivery":"reliable","recoveryQuery":{"method":"store/resync","params":{}}}

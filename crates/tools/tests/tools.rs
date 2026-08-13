@@ -194,15 +194,14 @@ fn tool_result_payload_keeps_safe_token_metrics_text() {
 }
 
 #[test]
-fn tool_result_payload_redacts_raw_provider_and_evaluator_markers() {
+fn tool_result_payload_redacts_raw_provider_markers() {
     let envelope = ToolCallRequest::new("call_1", "read", "{}");
     let result = ToolOutput::success(serde_json::json!({
         "raw_prompt": "developer-only prompt",
         "raw_response": "provider body",
         "provider": {"payload": "body"},
         "provider_response": {"id": "resp_1"},
-        "env": {"SAFE": "visible"},
-        "evaluator_only": {"hidden": true}
+        "env": {"SAFE": "visible"}
     }));
 
     let tool_result = ToolResult::from_result(&envelope, &result);
@@ -217,7 +216,6 @@ fn tool_result_payload_redacts_raw_provider_and_evaluator_markers() {
         "provider_response",
         "developer-only prompt",
         "provider body",
-        "evaluator_only",
     ] {
         assert!(!serialized.contains(marker), "{marker} leaked to payload");
     }

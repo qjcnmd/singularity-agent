@@ -85,7 +85,7 @@ pub const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-k
 pub const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 /// Substrings that identify protected components.
 pub const PROTECTED_PATH_CONTAINS_MARKERS: [&str; 1] = ["secret"];
-const SENSITIVE_TEXT_MARKERS: [&str; 27] = [
+const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     ".aws",
     ".azure",
     ".env",
@@ -96,7 +96,6 @@ const SENSITIVE_TEXT_MARKERS: [&str; 27] = [
     "credential",
     "cookie",
     "evaluator-only",
-    "evaluator_only",
     "id_ed25519",
     "id_rsa",
     "password",

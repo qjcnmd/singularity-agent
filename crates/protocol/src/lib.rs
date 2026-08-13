@@ -813,7 +813,6 @@ pub enum ItemKind {
     UserMessage,
     AgentMessage,
     Reasoning,
-    Plan,
     CommandExecution,
     FileChange,
 }
@@ -825,7 +824,6 @@ impl ItemKind {
             Self::UserMessage => "userMessage",
             Self::AgentMessage => "agentMessage",
             Self::Reasoning => "reasoning",
-            Self::Plan => "plan",
             Self::CommandExecution => "commandExecution",
             Self::FileChange => "fileChange",
         }
@@ -837,7 +835,6 @@ impl ItemKind {
             "userMessage" => Some(Self::UserMessage),
             "agentMessage" => Some(Self::AgentMessage),
             "reasoning" => Some(Self::Reasoning),
-            "plan" => Some(Self::Plan),
             "commandExecution" => Some(Self::CommandExecution),
             "fileChange" => Some(Self::FileChange),
             _ => None,
@@ -2429,14 +2426,6 @@ impl AppEvent {
         Self {
             method: "turn/completed".to_string(),
             params: serde_json::json!({"turn": turn}),
-        }
-    }
-
-    /// 构造 diff 更新事件。
-    pub fn turn_diff_updated(turn_id: impl Into<String>, diff: Value) -> Self {
-        Self {
-            method: "turn/diff/updated".to_string(),
-            params: serde_json::json!({"turnId": turn_id.into(), "diff": diff}),
         }
     }
 

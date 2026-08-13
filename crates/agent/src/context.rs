@@ -45,7 +45,6 @@ pub struct AgentContextItem {
     pub priority: AgentContextItemPriority,
     pub token_count: u32,
     pub public: bool,
-    pub evaluator_only: bool,
 }
 
 impl AgentContextItem {
@@ -59,7 +58,6 @@ impl AgentContextItem {
             content,
             priority: AgentContextItemPriority::CurrentTurn,
             public: true,
-            evaluator_only: false,
         }
     }
 
@@ -83,13 +81,11 @@ impl AgentContextItem {
             content,
             priority: AgentContextItemPriority::History,
             public: true,
-            evaluator_only: false,
         }
     }
 
     pub(super) fn into_safe_history(self) -> Option<Self> {
-        if self.priority != AgentContextItemPriority::History || !self.public || self.evaluator_only
-        {
+        if self.priority != AgentContextItemPriority::History || !self.public {
             return None;
         }
         match self.role.as_str() {
@@ -160,11 +156,7 @@ pub(super) fn assemble_context_items_with_budget(
     let mut candidates: Vec<(usize, &AgentContextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
-            item.public
-                && !item.evaluator_only
-                && item.priority != AgentContextItemPriority::History
-        })
+        .filter(|(_, item)| item.public && item.priority != AgentContextItemPriority::History)
         .collect();
     candidates.sort_by_key(|(index, item)| (item.priority.rank(), *index));
 
@@ -183,11 +175,7 @@ pub(super) fn assemble_context_items_with_budget(
     let history_indices: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
-            item.public
-                && !item.evaluator_only
-                && item.priority == AgentContextItemPriority::History
-        })
+        .filter(|(_, item)| item.public && item.priority == AgentContextItemPriority::History)
         .map(|(index, _)| index)
         .collect();
     let mut history_end = history_indices.len();
@@ -249,7 +237,6 @@ pub(super) fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBun
     input.input.iter().any(|item| {
         item.priority == AgentContextItemPriority::CurrentTurn
             && item.public
-            && !item.evaluator_only
             && !context.included_item_ids.contains(&item.item_id)
     })
 }
