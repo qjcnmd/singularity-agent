@@ -189,8 +189,6 @@ $checksumPath = Join-Path $OutputDirectory "SHA256SUMS.txt"
 $stableSbomPaths = @{
     "sg" = Join-Path $OutputDirectory "sbom-sg.cdx.json"
     "singularity_app_server" = Join-Path $OutputDirectory "sbom-singularity-app-server.cdx.json"
-    "singularity-command-runner" = Join-Path $OutputDirectory "sbom-singularity-command-runner.cdx.json"
-    "singularity-windows-sandbox-setup" = Join-Path $OutputDirectory "sbom-singularity-windows-sandbox-setup.cdx.json"
 }
 
 if ($DryRun) {
@@ -210,8 +208,6 @@ New-Item -ItemType Directory -Force -Path $directory | Out-Null
 $binaryNames = @(
     "sg"
     "singularity_app_server"
-    "singularity-command-runner"
-    "singularity-windows-sandbox-setup"
 )
 $binaryFiles = @(
     $binaryNames | ForEach-Object {
@@ -228,11 +224,10 @@ foreach ($source in $binaryFiles) {
 $metadataFiles = @(
     (Join-Path $WorkspaceRoot "README.md")
     (Join-Path $WorkspaceRoot "LICENSE")
-    (Join-Path $WorkspaceRoot "THIRD_PARTY_NOTICES.md")
     (Join-Path $WorkspaceRoot "docs/INSTALL.md")
 )
-Copy-Item -LiteralPath $metadataFiles[0..2] -Destination $directory
-Copy-Item -LiteralPath $metadataFiles[3] -Destination (Join-Path $directory "INSTALL.md")
+Copy-Item -LiteralPath $metadataFiles[0..1] -Destination $directory
+Copy-Item -LiteralPath $metadataFiles[2] -Destination (Join-Path $directory "INSTALL.md")
 
 Compress-Archive -LiteralPath $directory -DestinationPath $archive
 $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -248,11 +243,6 @@ $sbomRequests = @(
         Manifest = Join-Path $WorkspaceRoot "crates/app-server/Cargo.toml"
         Directory = Join-Path $WorkspaceRoot "crates/app-server"
         ExpectedNames = @("singularity_app_server")
-    }
-    [ordered]@{
-        Manifest = Join-Path $WorkspaceRoot "crates/windows-sandbox/Cargo.toml"
-        Directory = Join-Path $WorkspaceRoot "crates/windows-sandbox"
-        ExpectedNames = @("singularity-command-runner", "singularity-windows-sandbox-setup")
     }
 )
 $generatedBomFiles = @()
@@ -328,7 +318,7 @@ try {
         }
     }
     if ($generatedBomFiles.Count -ne $binaryNames.Count) {
-        throw "expected four generated binary BOMs, found $($generatedBomFiles.Count)"
+        throw "expected $($binaryNames.Count) generated binary BOMs, found $($generatedBomFiles.Count)"
     }
 
     foreach ($bomFile in @($generatedBomFiles | Sort-Object FullName)) {
@@ -360,7 +350,7 @@ try {
         }
     }
     if ($validatedBoms.Count -ne $binaryNames.Count) {
-        throw "expected four validated binary BOMs, found $($validatedBoms.Count)"
+        throw "expected $($binaryNames.Count) validated binary BOMs, found $($validatedBoms.Count)"
     }
 
     foreach ($binaryName in $binaryNames) {
@@ -406,5 +396,3 @@ Set-WorkflowOutput -Name "archive" -Value $archive
 Set-WorkflowOutput -Name "checksum" -Value $checksumPath
 Set-WorkflowOutput -Name "sbom_sg" -Value $stableSbomPaths["sg"]
 Set-WorkflowOutput -Name "sbom_app_server" -Value $stableSbomPaths["singularity_app_server"]
-Set-WorkflowOutput -Name "sbom_command_runner" -Value $stableSbomPaths["singularity-command-runner"]
-Set-WorkflowOutput -Name "sbom_windows_sandbox_setup" -Value $stableSbomPaths["singularity-windows-sandbox-setup"]

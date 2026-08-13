@@ -32,8 +32,6 @@ function Set-WorkflowOutput {
 $binaryNames = @(
     "sg"
     "singularity_app_server"
-    "singularity-command-runner"
-    "singularity-windows-sandbox-setup"
 )
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 $binaryPaths = @(

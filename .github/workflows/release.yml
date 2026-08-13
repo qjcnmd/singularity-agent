@@ -60,7 +60,7 @@ jobs:
           "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Build release binaries
-        run: cargo build --release --locked --package singularity_cli --package singularity_app_server --package singularity_windows_sandbox --bins
+        run: cargo build --release --locked --package singularity_cli --package singularity_app_server --bins
 
       - name: Sign release binaries
         id: sign
@@ -133,8 +133,6 @@ jobs:
             ${{ steps.package.outputs.checksum }}
             ${{ steps.package.outputs.sbom_sg }}
             ${{ steps.package.outputs.sbom_app_server }}
-            ${{ steps.package.outputs.sbom_command_runner }}
-            ${{ steps.package.outputs.sbom_windows_sandbox_setup }}
           if-no-files-found: error
 
       - name: Generate artifact provenance attestation
@@ -145,8 +143,6 @@ jobs:
             ${{ steps.package.outputs.checksum }}
             ${{ steps.package.outputs.sbom_sg }}
             ${{ steps.package.outputs.sbom_app_server }}
-            ${{ steps.package.outputs.sbom_command_runner }}
-            ${{ steps.package.outputs.sbom_windows_sandbox_setup }}
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -174,12 +170,10 @@ jobs:
           $sbomNames = @(
             "sbom-sg.cdx.json"
             "sbom-singularity-app-server.cdx.json"
-            "sbom-singularity-command-runner.cdx.json"
-            "sbom-singularity-windows-sandbox-setup.cdx.json"
           )
           $sboms = @(Get-ChildItem -LiteralPath dist -Filter "sbom-*.cdx.json" -File | Sort-Object Name)
           if ($sboms.Count -ne $sbomNames.Count -or @($sboms.Name | Where-Object { $sbomNames -notcontains $_ }).Count -ne 0) {
-            throw "expected exactly four release SBOMs"
+            throw "expected exactly two release SBOMs"
           }
           $assets = @($archive, (Join-Path $PWD "dist/SHA256SUMS.txt")) + @($sboms.FullName)
           if (gh release view $env:GITHUB_REF_NAME *> $null) {

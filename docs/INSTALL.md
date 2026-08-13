@@ -1,6 +1,6 @@
 # 安装与运行
 
-Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用同目录发现，不需要注册服务、为 Singularity 安装解释器或配置 sandbox backend。目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
+Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用同目录发现，不需要注册服务，也不需要为 Singularity 安装解释器。目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
 
 ## 安装 release
 
@@ -18,8 +18,6 @@ Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用�
    ```text
    sg.exe
    singularity_app_server.exe
-   singularity-command-runner.exe
-   singularity-windows-sandbox-setup.exe
    ```
 
 5. 将目录加入当前用户的 `PATH`，重新打开 PowerShell 7，然后运行：
@@ -33,7 +31,7 @@ release archive 不执行安装脚本，也不修改系统级 `PATH`。
 
 ## Release Authenticode 签名
 
-Windows tagged release 的签名接口已经接入 `.github/workflows/release.yml`：四个发布 `.exe` 会先使用 Authenticode 和 SHA-256 文件摘要签名，再生成 archive、`SHA256SUMS.txt`、SBOM 和 provenance attestation。这里的“接口已接入”不代表当前本地 checkout 已经持有真实证书或能够证明真实签名。
+Windows tagged release 的签名接口已经接入 `.github/workflows/release.yml`：两个发布 `.exe` 会先使用 Authenticode 和 SHA-256 文件摘要签名，再生成 archive、`SHA256SUMS.txt`、SBOM 和 provenance attestation。这里的“接口已接入”不代表当前本地 checkout 已经持有真实证书或能够证明真实签名。
 
 工作流使用以下 GitHub 配置，名称必须完全一致：
 
@@ -187,16 +185,16 @@ $env:SINGULARITY_HOME = "D:\SingularityHome"
 - Visual Studio Build Tools 的 Desktop development with C++ 组件
 - PowerShell 7
 
-仓库已经通过 `rust-toolchain.toml` 固定 toolchain。只构建四个产品 release binary：
+仓库已经通过 `rust-toolchain.toml` 固定 toolchain。只构建两个产品 release binary：
 
 ```powershell
 git clone https://github.com/qjcnmd/singularity-agent.git
 Set-Location singularity-agent
 $env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
-cargo build --release --locked --package singularity_cli --package singularity_app_server --package singularity_windows_sandbox --bins
+cargo build --release --locked --package singularity_cli --package singularity_app_server --bins
 ```
 
-将 `$env:CARGO_TARGET_DIR\release` 中的四个 binary 保持在同一目录。若不设置 `CARGO_TARGET_DIR`，默认输出位于仓库的 `target\release`。
+将 `$env:CARGO_TARGET_DIR\release` 中的两个 binary 保持在同一目录。若不设置 `CARGO_TARGET_DIR`，默认输出位于仓库的 `target\release`。
 
 ## 运行与状态位置
 
@@ -214,9 +212,9 @@ sg run "检查当前项目并修复一个明确问题"
 
 ## 更新与卸载
 
-更新时退出正在运行的任务，用新 release 的四个 binary 一起替换旧目录，不要混用不同版本的 helper。
+更新时退出正在运行的任务，用新 release 的两个 binary 一起替换旧目录。
 
-卸载时删除安装目录并从 `PATH` 移除该目录。工作区中的 `.singularity` 和 sandbox home 都是用户状态，不会由解压式安装自动删除；确认不再需要历史和 sandbox 缓存后再手动清理。
+卸载时删除安装目录并从 `PATH` 移除该目录。工作区中的 `.singularity` 是用户状态，不会由解压式安装自动删除；确认不再需要历史后再手动清理。
 
 ## 完整验证
 
@@ -226,19 +224,11 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 cargo test --workspace --all-targets --locked --no-fail-fast
-cargo build --release --locked --package singularity_cli --package singularity_app_server --package singularity_windows_sandbox --bins
+cargo build --release --locked --package singularity_cli --package singularity_app_server --bins
 ```
 
-影响 AgentLoop、provider、工具、sandbox 或 approval 时，还需在代表性工作区配置真实 provider，并通过发布产品链运行普通任务：
+影响 AgentLoop、provider、工具或会话时，还需在代表性工作区配置真实 provider，并通过发布产品链运行普通任务：
 
 ```powershell
 sg run "检查当前项目并完成一项可验证的修改"
 ```
-
-Evaluation 是源码仓库中的独立开发工具，不进入发布包。修改 Evaluation runner、task set 或评估证据合同后，才从源码运行：
-
-```powershell
-cargo run --locked -p singularity_evaluation --bin singularity-evaluation -- run docs/evaluation/public-representative-task.json --run-id development-validation-<timestamp> --json
-```
-
-两类真实验证都不能用 fake、mock 或 scripted provider 代替；Evaluation 结果不替代普通产品链验证。

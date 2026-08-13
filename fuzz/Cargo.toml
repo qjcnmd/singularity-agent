@@ -13,8 +13,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1.0"
-singularity_agent = { path = "../crates/agent" }
-singularity_policy = { path = "../crates/policy" }
 singularity_protocol = { path = "../crates/protocol" }
 
 [[bin]]
@@ -27,13 +25,6 @@ bench = false
 [[bin]]
 name = "event_decode"
 path = "fuzz_targets/event_decode.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "typed_checkpoint_decode"
-path = "fuzz_targets/typed_checkpoint_decode.rs"
 test = false
 doc = false
 bench = false

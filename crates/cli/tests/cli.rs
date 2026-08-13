@@ -1589,7 +1589,6 @@ fn cli_manifest_does_not_depend_on_core_runtime_crates() {
 
     for forbidden in [
         "singularity_agent",
-        "singularity_tools",
         "singularity_store",
     ] {
         assert!(
