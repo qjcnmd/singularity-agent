@@ -1476,14 +1476,10 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "singularity_agent"
 version = "0.1.0"
 dependencies = [
- "schemars",
  "serde",
  "serde_json",
- "sha2",
  "singularity_core",
  "singularity_model",
- "singularity_policy",
- "singularity_tools",
  "tempfile",
  "thiserror 2.0.18",
  "time",

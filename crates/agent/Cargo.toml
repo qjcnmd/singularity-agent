@@ -10,16 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 singularity_core = { path = "../core" }
 time.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
-singularity_policy = { path = "../policy" }
-singularity_tools = { path = "../tools" }
 thiserror.workspace = true
 
 [dev-dependencies]
