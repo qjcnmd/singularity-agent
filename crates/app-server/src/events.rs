@@ -119,26 +119,6 @@ impl AppServer {
         .to_wire_value())
     }
 
-    pub(super) fn pending_approval_events_for_turn(
-        &self,
-        turn_id: &str,
-    ) -> AppServerResult<Vec<Value>> {
-        let approvals = self
-            .store
-            .list_pending_approvals()?
-            .into_iter()
-            .filter(|request| request.turn_id == turn_id);
-        let mut messages = Vec::new();
-        for request in approvals {
-            if let Some(message) =
-                self.event_notification(AppEvent::approval_requested(&request))?
-            {
-                messages.push(message);
-            }
-        }
-        Ok(messages)
-    }
-
     pub(super) fn committed_turn_events(
         &self,
         committed: &CommittedTurnOutcome,

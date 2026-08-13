@@ -314,12 +314,46 @@ impl SessionManager {
     /// header：`{"type":"session","version":3,"id":...,"timestamp":...,"cwd":...}`，
     /// 无父会话时省略 `parentSession`。`cwd` 取绝对路径（无需已存在）。
     pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
-        let cwd = normalize_abs_path(cwd)?;
-        std::fs::create_dir_all(sessions_dir)?;
         let session_id = Uuid::now_v7().to_string();
         let timestamp = now_iso();
         let file_timestamp = timestamp.replace([':', '.'], "-");
-        let file = sessions_dir.join(format!("{file_timestamp}_{session_id}.jsonl"));
+        Self::create_with_file(
+            cwd,
+            sessions_dir,
+            format!("{file_timestamp}_{session_id}.jsonl"),
+            session_id,
+            timestamp,
+        )
+    }
+
+    /// 新建会话：使用调用方指定的确定性文件名（`<name>.jsonl`，无时间戳前缀）。
+    ///
+    /// 供需要 thread ↔ 会话文件稳定绑定的调用方使用（如 app-server 的
+    /// `thread_id.jsonl` 映射）；文件已存在时 `create_new` 会报错，调用方应先检查。
+    /// 其余语义与 `create` 相同。
+    pub fn create_with_name(cwd: &Path, sessions_dir: &Path, name: &str) -> Result<Self> {
+        let session_id = Uuid::now_v7().to_string();
+        let timestamp = now_iso();
+        Self::create_with_file(
+            cwd,
+            sessions_dir,
+            format!("{name}.jsonl"),
+            session_id,
+            timestamp,
+        )
+    }
+
+    /// 共用的新建会话实现：写入 header 并打开新文件（`create_new` 语义）。
+    fn create_with_file(
+        cwd: &Path,
+        sessions_dir: &Path,
+        file_name: String,
+        session_id: String,
+        timestamp: String,
+    ) -> Result<Self> {
+        let cwd = normalize_abs_path(cwd)?;
+        std::fs::create_dir_all(sessions_dir)?;
+        let file = sessions_dir.join(file_name);
         let header = json!({
             "type": "session",
             "version": CURRENT_SESSION_VERSION,
@@ -934,6 +968,34 @@ mod tests {
             SessionEntryType::Message(m) if m.role == AgentMessageRole::ToolResult
                 && m.tool_call_id.as_deref() == Some("call_1")
                 && m.tool_name.as_deref() == Some("bash")));
+    }
+
+    /// 1b. create_with_name：确定性文件名，追加/重开语义与 create 一致。
+    #[test]
+    fn create_with_name_uses_deterministic_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let cwd = dir.path().join("project");
+        let mut manager = SessionManager::create_with_name(&cwd, &sessions, "thread_abc").unwrap();
+        assert_eq!(manager.path().file_name().unwrap(), "thread_abc.jsonl");
+        assert!(manager.leaf_id().is_empty());
+
+        let id1 = manager.append_message(user("hello")).unwrap();
+        let file = manager.path().to_path_buf();
+        drop(manager);
+
+        let opened = SessionManager::open(&file).unwrap();
+        assert_eq!(opened.leaf_id(), id1);
+        let entries = opened.build_context_entries().unwrap();
+        assert_eq!(entry_ids(&entries), vec![id1]);
+        // header cwd 与 create 语义一致（绝对路径）。
+        let content = std::fs::read_to_string(&file).unwrap();
+        let first_line: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(first_line["type"], "session");
+        assert_eq!(
+            first_line["cwd"],
+            normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
+        );
     }
 
     /// 2. 追加顺序：每条 parent = 前一条 id，首条为根（磁盘上 parentId 为 null）。

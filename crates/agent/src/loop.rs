@@ -12,7 +12,7 @@
 //! - 中断：外部 `CancellationToken` 取消时终止并返回已完成的文本（`aborted=true`）。
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -114,6 +114,10 @@ pub struct AgentOutcome {
     pub aborted: bool,
 }
 
+/// steer 注入的线程安全句柄：`Agent::steer_handle` 的返回类型，供进程边界
+/// （app-server turn/input）在 `run` 期间向队列注入消息；`run` 每轮开始时 drain。
+pub type SteerHandle = Arc<Mutex<VecDeque<String>>>;
+
 /// 新 headless core 的 Agent：会话 + compaction + 工具注册表 + 模型提供方。
 pub struct Agent {
     session: SessionManager,
@@ -122,9 +126,9 @@ pub struct Agent {
     provider: Arc<dyn Provider + Send + Sync>,
     config: AgentConfig,
     /// 转向队列：下一轮（工具执行后交付）注入，内存态不持久化。
-    steer_queue: VecDeque<String>,
+    steer_queue: SteerHandle,
     /// 跟进队列：代理将要停止时注入，内存态不持久化。
-    follow_up_queue: VecDeque<String>,
+    follow_up_queue: SteerHandle,
 }
 
 impl Agent {
@@ -141,19 +145,24 @@ impl Agent {
             registry,
             provider,
             config,
-            steer_queue: VecDeque::new(),
-            follow_up_queue: VecDeque::new(),
+            steer_queue: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
         })
+    }
+
+    /// 返回 steer 队列的线程安全句柄；`run` 每轮开始时 drain 队列内容。
+    pub fn steer_handle(&self) -> SteerHandle {
+        Arc::clone(&self.steer_queue)
     }
 
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
     pub fn steer(&mut self, text: &str) {
-        self.steer_queue.push_back(text.to_string());
+        lock_queue(&self.steer_queue).push_back(text.to_string());
     }
 
     /// 注入跟进：代理将要停止（无工具调用且文本非空）时继续一轮再停止。
     pub fn follow_up(&mut self, text: &str) {
-        self.follow_up_queue.push_back(text.to_string());
+        lock_queue(&self.follow_up_queue).push_back(text.to_string());
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用与
@@ -213,7 +222,9 @@ impl Agent {
                     return Ok(outcome);
                 }
                 // 注入 steer 队列全部消息（作为 user 消息追加到本轮上下文）。
-                for text in self.steer_queue.drain(..) {
+                let steer_messages =
+                    std::mem::take(&mut *lock_queue(&self.steer_queue));
+                for text in steer_messages {
                     self.session.append_message(user_message(&text))?;
                 }
                 let request = self.build_request(
@@ -309,7 +320,7 @@ impl Agent {
                 break;
             }
             // 代理将要停止：消费 follow-up 队列后回到内层循环。
-            let follow_ups: Vec<String> = self.follow_up_queue.drain(..).collect();
+            let follow_ups = std::mem::take(&mut *lock_queue(&self.follow_up_queue));
             if follow_ups.is_empty() {
                 return Ok(outcome);
             }
@@ -464,6 +475,11 @@ impl Agent {
         }
         Ok(usage.total_tokens + trailing)
     }
+}
+
+/// 加锁 steer/follow-up 队列；中毒时恢复（工具执行中 panic 不应使注入通道永久不可用）。
+fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn user_message(text: &str) -> AgentMessage {
@@ -887,6 +903,46 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content == "please continue")
+        );
+    }
+
+    /// 4b. steer_handle：run 期间经共享队列注入 → 下一轮上下文出现。
+    #[test]
+    fn steer_handle_injects_during_run() {
+        let (mut agent, _dir, provider) = setup(vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![tool_call("call_1", "bash", json!({ "command": "echo hi" }))],
+                usage: usage(50, 10),
+            },
+            FakeStep {
+                text: "final".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(100, 10),
+            },
+        ]);
+        let handle = agent.steer_handle();
+        let mut events = AgentEvents::new();
+        // 工具执行开始时（run 期间）从外部句柄注入转向消息。
+        let mut on_tool_execution_start = |_name: &str, _args: &str| {
+            handle
+                .lock()
+                .unwrap()
+                .push_back("steer during run".to_string());
+        };
+        events.on_tool_execution_start = Some(&mut on_tool_execution_start);
+        let outcome = agent
+            .run("do the task", &mut events, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(outcome.final_text, "final");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        // 工具执行后的下一轮请求包含运行中注入的消息。
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content == "steer during run")
         );
     }
 

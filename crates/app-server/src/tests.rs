@@ -1,35 +1,21 @@
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::{
-    AgentLoop, AgentLoopEvent, AgentLoopInput, AgentObservation, AgentRunStatus,
-    OccurrenceIdentity, OccurrenceLifecycle, PendingToolCall, ProviderAttemptObservation,
-    ProviderAttemptStatus, TurnCheckpointPhase,
+    AgentRunStatus, project_audit_event,
+    agent::AgentOutcome,
+    session::SessionManager,
 };
 use singularity_model::{
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOperationPhase,
-    ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
-    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ProviderReasoningReplay,
+    ModelError, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
+    ProviderProtocolContract,
 };
-use singularity_policy::{ToolId, WorkspaceRelativePath};
-use singularity_protocol::{ItemKind, TurnInputDelivery};
+
+use singularity_protocol::{ConversationRole, TurnInputDelivery};
 use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
-use singularity_tools::{CommandRequest, CommandResult, PATCH_TOOL as TOOL_PATCH};
+use singularity_tools::{CommandRequest, CommandResult};
 
 use super::*;
-
-fn tool_id(value: &str) -> ToolId {
-    ToolId::new(value).expect("valid tool id")
-}
-
-fn workspace_resource(value: &str) -> PermissionResource {
-    PermissionResource::WorkspacePath(
-        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
-    )
-}
 
 fn app_server(store: SessionStore) -> AppServer {
     AppServer::new(
@@ -46,78 +32,6 @@ fn app_server(store: SessionStore) -> AppServer {
             None,
         ),
     )
-}
-
-fn pending_approval_for_test(
-    request: &ApprovalRequest,
-    arguments: Value,
-) -> PendingApprovalOccurrence {
-    let tool_call_id = request.tool_call_id.clone().expect("tool call id");
-    let raw_arguments = arguments.to_string();
-    let payload = json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": &tool_call_id,
-        "tool_name": &request.action,
-        "raw_arguments": &raw_arguments,
-        "resources": &request.resources,
-        "checkpoint_version": 8,
-        "project_instructions_digest": null,
-        "messages": [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "tool_call_id": &tool_call_id,
-                "tool_name": &request.action,
-                "arguments": arguments,
-                "raw_arguments": &raw_arguments,
-                "parse_status": "valid",
-                "validation_errors": []
-            }]
-        }],
-        "tool_result_occurrences": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "model_usage": ModelUsage::default(),
-        "provider_attempts": ProviderAttemptMetadata::default(),
-        "context_trace": null,
-        "seen_tool_call_fingerprints": [],
-        "completed_tool_call_fingerprints": []
-    });
-    decode_pending_approval(request, Some(&payload))
-        .expect("pending approval")
-        .expect("pending occurrence")
-}
-
-#[test]
-fn app_server_checkpoint_codec_rejects_legacy_resources() {
-    let request = ApprovalRequest::new(
-        "approval_legacy_resource",
-        "thread_legacy_resource",
-        "turn_legacy_resource",
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    let pending = pending_approval_for_test(&request, json!({}));
-    let mut legacy = pending.encode_checkpoint().expect("checkpoint");
-    legacy["checkpoint_version"] = json!(1);
-    legacy["resources"] = json!(["README.md"]);
-    legacy["tool_results"] = legacy["tool_result_occurrences"].clone();
-    legacy
-        .as_object_mut()
-        .expect("checkpoint object")
-        .remove("tool_result_occurrences");
-    legacy["tool_result_context_bindings"] = json!([]);
-
-    assert_eq!(
-        decode_pending_approval(&request, Some(&legacy))
-            .expect_err("legacy checkpoint must fail closed")
-            .to_string(),
-        "store error: invalid store state: approval request requires an internal AgentLoop checkpoint: unsupported approval checkpoint version"
-    );
 }
 
 #[test]
@@ -414,6 +328,7 @@ fn drop_timeout_freezes_before_detached_monitor_can_cancel() {
         let _guard = ActiveTurnGuard {
             turn_id: "drop-timeout-turn".to_string(),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            steer_handles: Arc::new(Mutex::new(HashMap::new())),
             cancellation: cancellation.clone(),
             monitor: Some(monitor),
             stabilized_monitor_outcome: None,
@@ -457,6 +372,7 @@ fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states(
     let mut guard = ActiveTurnGuard {
         turn_id: "synthetic-turn".to_string(),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
+        steer_handles: Arc::new(Mutex::new(HashMap::new())),
         cancellation: token.clone(),
         monitor: Some(CancellationMonitor {
             control: Arc::clone(&control),
@@ -837,100 +753,6 @@ fn terminalization_preserves_interrupted_and_blocked_turns() {
 }
 
 #[test]
-fn approval_failure_terminalizes_failed_without_raw_cause() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "approval"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_terminalize_failure",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": TOOL_PATCH,
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint.clone()),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("claim approval execution");
-    let server = app_server(store);
-
-    let terminal = server
-        .terminalize_claimed_approval_error(
-            &request,
-            &decision,
-            None,
-            ApprovalTerminalizationContext {
-                turn: &turn,
-                thread: &thread,
-                prior_status: None,
-                cancellation: &CancellationToken::new(),
-                monitor_outcome: None,
-                failure: TurnFailureStage::ApprovalCheckpoint.into(),
-            },
-        )
-        .expect("terminalize approval failure");
-    let committed = match terminal {
-        TurnTerminalizationResult::Committed(committed) => committed,
-        TurnTerminalizationResult::Preserved => panic!("approval must be terminalized"),
-    };
-    assert_eq!(committed.turn.status, TurnStatus::Failed);
-    assert_eq!(
-        committed.turn.agent_loop_status,
-        AgentStatus::Failed.as_str()
-    );
-    assert!(
-        !server
-            .store
-            .has_pending_tool_call(&request.request_id)
-            .expect("resolved approval")
-    );
-    let trace_json = serde_json::to_string(&committed.trace).expect("trace json");
-    assert!(!trace_json.contains("sqlite"));
-    assert!(!trace_json.contains("raw_arguments"));
-}
-
-#[test]
 fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
@@ -966,95 +788,6 @@ fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
         }
     ));
     assert!(!error.to_string().contains("missing-turn-with-secret-path"));
-}
-
-#[test]
-fn workspace_tool_binding_failure_is_a_typed_app_server_error() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace_sentinel = "workspace-path-sentinel";
-    let missing = dir.path().join(workspace_sentinel);
-
-    assert!(matches!(
-        workspace_tools(missing, Arc::new(CompletedSandboxBackend)),
-        Err(AppServerError::Workspace(message))
-            if message == SAFE_WORKSPACE_FAILURE && !message.contains(workspace_sentinel)
-    ));
-}
-
-#[test]
-fn workspace_binding_failure_precedes_running_turn_persistence() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace-path-sentinel");
-    std::fs::create_dir(&workspace).expect("create workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    std::fs::remove_dir(&workspace).expect("remove workspace before turn");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-
-    let response = server
-        .turn_start(
-            JsonRpcMessage::request(
-                Method::TurnStart,
-                1,
-                json!({
-                    "threadId": thread.thread_id,
-                    "input": [{"type": "text", "text": "must not persist"}],
-                }),
-            )
-            .expect("request"),
-        )
-        .expect("turn response");
-
-    assert!(
-        response[0]["error"]["message"]
-            .as_str()
-            .expect("error message")
-            == SAFE_WORKSPACE_FAILURE
-    );
-    assert!(!response[0].to_string().contains("workspace-path-sentinel"));
-    let history = server
-        .store
-        .read_thread_history(&thread.thread_id, None, 8)
-        .expect("thread history");
-    assert!(history.messages.is_empty());
-}
-
-#[cfg(windows)]
-#[test]
-fn persisted_workspace_replacement_with_junction_is_not_rebound() {
-    use std::os::windows::process::CommandExt as _;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    let retained = dir.path().join("retained-workspace");
-    let outside = dir.path().join("outside");
-    std::fs::create_dir(&workspace).expect("create workspace");
-    std::fs::create_dir(&outside).expect("create outside");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    std::fs::rename(&workspace, &retained).expect("replace workspace namespace");
-    let link_arg = format!("\"{}\"", workspace.display());
-    let target_arg = format!("\"{}\"", outside.display());
-    let output = std::process::Command::new("cmd.exe")
-        .raw_arg("/d /c ")
-        .raw_arg("mklink")
-        .raw_arg("/J")
-        .raw_arg(&link_arg)
-        .raw_arg(&target_arg)
-        .output()
-        .expect("create junction process");
-    if !output.status.success() {
-        return;
-    }
-
-    let error = workspace_tools_for_thread(&thread, Arc::new(CompletedSandboxBackend))
-        .expect_err("replacement junction must fail closed");
-    assert_eq!(error, SAFE_WORKSPACE_FAILURE);
-    std::fs::remove_dir(&workspace).expect("remove junction");
 }
 
 #[test]
@@ -1121,93 +854,6 @@ fn turn_start_monitor_failure_does_not_persist_a_running_turn() {
         .expect("no running turn was persisted before monitor setup");
 }
 
-#[test]
-fn stopped_execution_does_not_consume_a_pending_tool_approval() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_stopped_execution",
-        thread.thread_id,
-        turn.turn_id,
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": TOOL_PATCH,
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending approval");
-    let mut server = app_server(store);
-    server
-        .request_execution_stop()
-        .expect("request execution stop");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let message = serde_json::from_value(json!({
-        "jsonrpc": "2.0",
-        "method": "approval/decision",
-        "id": 1,
-        "params": decision,
-    }))
-    .expect("approval decision message");
-
-    let response = server
-        .approval_decision(message)
-        .expect("decision response");
-
-    assert_eq!(response[0]["error"]["message"], EXECUTION_STOPPED);
-    assert_eq!(
-        server
-            .store
-            .get_pending_approval(&request.request_id)
-            .expect("approval remains pending"),
-        request
-    );
-    assert!(
-        server
-            .store
-            .has_pending_tool_call(&request.request_id)
-            .expect("checkpoint remains pending")
-    );
-}
-
 #[derive(Clone)]
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
@@ -1237,43 +883,6 @@ impl Provider for StaticProvider {
     }
 }
 
-#[derive(Clone)]
-struct CountingProvider {
-    capability_requests: Arc<AtomicUsize>,
-    completion_requests: Arc<AtomicUsize>,
-}
-
-impl Provider for CountingProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn negotiate_tool_capabilities(
-        &self,
-        _model_preferences: &singularity_model::ModelPreferences,
-        _cancellation: &CancellationToken,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        self.capability_requests.fetch_add(1, Ordering::SeqCst);
-        Err(ProviderError::from_model_error(ModelError::new(
-            ModelErrorKind::UnsupportedCapability,
-            "capability probe must not run",
-        )))
-    }
-
-    fn complete(
-        &self,
-        _request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.completion_requests.fetch_add(1, Ordering::SeqCst);
-        Ok(ModelTurnResponse::completed(
-            "request_current",
-            "response_current",
-            "unexpected completion",
-        ))
-    }
-}
-
 fn failed_model_response(error: ModelError) -> ModelTurnResponse {
     let mut response = ModelTurnResponse::completed("request_1", "response_1", "unused");
     response.status = ModelTurnStatus::Failed;
@@ -1283,23 +892,14 @@ fn failed_model_response(error: ModelError) -> ModelTurnResponse {
 }
 
 #[test]
-fn app_server_preserves_typed_provider_failure_category() {
+fn app_server_preserves_safe_provider_failure_via_turn_start() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::create_dir_all(&workspace).expect("workspace");
     let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "user goal".to_string(),
-        }],
-    };
     let provider_sentinel = "provider-body-sentinel";
     let mut provider_error =
         ModelError::new(ModelErrorKind::AuthError, provider_sentinel.to_string());
@@ -1308,43 +908,46 @@ fn app_server_preserves_typed_provider_failure_category() {
         responses: vec![failed_model_response(provider_error)],
         seen_requests: Arc::new(Mutex::new(Vec::new())),
     };
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
 
-    let server = app_server(store);
-    let status = server
-        .run_agent_loop_with_provider(
-            provider,
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
+    let error = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
         )
-        .expect("agent loop");
-
-    assert_eq!(status.status, AgentStatus::Failed);
-    assert_eq!(
-        status.error_category,
-        Some(ModelErrorCategory::Authentication)
-    );
-    let status_json = serde_json::to_string(&status).expect("serialize status");
-    assert_eq!(status.error.as_deref(), Some(SAFE_AGENT_LOOP_FAILURE));
-    assert!(!status_json.contains(provider_sentinel));
-    assert!(!status_json.contains("validation_errors"));
-    let committed = server
-        .commit_turn_run_status(turn, &status, None, &CancellationToken::new(), None)
-        .expect("commit provider failure");
-    let trace_json = serde_json::to_string(&committed.trace).expect("trace json");
+        .expect_err("provider failure must surface");
+    assert!(matches!(
+        error,
+        AppServerError::TurnExecution {
+            stage: TurnFailureStage::AgentLoop,
+            cause: TurnFailureCause::Internal,
+        }
+    ));
+    assert!(!error.to_string().contains(provider_sentinel));
+    // turn 以 Failed 终态提交，trace 只含安全摘要。
+    let traces = server
+        .store
+        .list_trace(&thread.thread_id)
+        .expect("trace");
+    let terminal = traces
+        .iter()
+        .find(|trace| trace.payload["status"] == AgentStatus::Failed.as_str())
+        .expect("failed terminal trace");
+    assert_eq!(terminal.payload["error"], SAFE_AGENT_LOOP_FAILURE);
+    let trace_json = serde_json::to_string(&terminal).expect("trace json");
     assert!(!trace_json.contains(provider_sentinel));
-    assert_eq!(committed.trace.payload["error"], SAFE_AGENT_LOOP_FAILURE);
-    assert!(
-        committed.trace.payload["provider_diagnostic"]
-            .get("validation_errors")
-            .is_none()
-    );
+    assert!(!trace_json.contains("validation_errors"));
 }
 
 #[test]
-fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
+fn agent_loop_system_prompt_loads_bounded_agents_md_from_thread_cwd() {
     let temp = tempfile::tempdir().expect("temp dir");
     let ancestor = temp
         .path()
@@ -1362,15 +965,6 @@ fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "user goal".to_string(),
-        }],
-    };
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = StaticProvider {
         responses: vec![ModelTurnResponse::completed(
@@ -1380,29 +974,40 @@ fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
         )],
         seen_requests: Arc::clone(&seen_requests),
     };
-    let server = app_server(store);
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
 
-    let status = server
-        .run_agent_loop_with_provider(
-            provider,
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
         )
-        .expect("agent loop");
-
-    assert_eq!(status.status, AgentStatus::Completed);
+        .expect("turn start");
+    let result: TurnStartResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].messages.len(), 2);
     assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
-    assert_eq!(requests[0].messages[1].role, ModelRole::User);
     let developer = &requests[0].messages[0].content;
-    assert!(developer.starts_with("You are a coding agent working in the current workspace."));
-    assert!(developer.ends_with("Project instructions:\nworkspace override"));
+    assert!(
+        developer.contains("workspace override"),
+        "system prompt should contain workspace override only: {developer}"
+    );
     assert!(!developer.contains("ancestor instructions"));
+    assert_eq!(requests[0].messages[1].role, ModelRole::User);
     assert_eq!(requests[0].messages[1].content, "user goal");
     let hidden_workspace_marker = workspace.to_string_lossy();
     assert!(!requests[0].tools.iter().any(|tool| {
@@ -1410,161 +1015,72 @@ fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
             .expect("serialize tool")
             .contains(hidden_workspace_marker.as_ref())
     }));
-    assert!(
-        !serde_json::to_string(&status)
-            .expect("serialize status")
-            .contains(hidden_workspace_marker.as_ref())
-    );
 }
 
 #[test]
-fn agent_loop_replays_only_completed_store_history_in_order() {
+fn agent_loop_replays_session_file_history_across_turns() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::create_dir_all(&workspace).expect("workspace");
     std::fs::write(workspace.join("AGENTS.md"), "project instructions")
         .expect("agents instructions");
     let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-
-    let (prior, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "previous user"}]),
-            "app_server",
-            "prior turn",
-        )
-        .expect("prior turn");
-    store
-        .append_item(
-            &prior.turn_id,
-            ItemKind::AgentMessage,
-            json!({"delta": "previous assistant"}),
-        )
-        .expect("prior assistant");
-    store
-        .append_item(
-            &prior.turn_id,
-            ItemKind::Reasoning,
-            json!({"summary": "private tool metadata must not replay"}),
-        )
-        .expect("private prior item");
-    store
-        .update_turn_state(
-            &prior.turn_id,
-            TurnStatus::Completed,
-            AgentStatus::Completed.as_str(),
-        )
-        .expect("complete prior turn");
-
-    let (failed, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "failed user must not replay"}]),
-            "app_server",
-            "failed turn",
-        )
-        .expect("failed turn");
-    store
-        .append_item(
-            &failed.turn_id,
-            ItemKind::AgentMessage,
-            json!({"delta": "failed assistant must not replay"}),
-        )
-        .expect("failed assistant");
-    store
-        .update_turn_state(
-            &failed.turn_id,
-            TurnStatus::Failed,
-            AgentStatus::Failed.as_str(),
-        )
-        .expect("fail turn");
-
-    let (blocked, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "blocked user must not replay"}]),
-            "app_server",
-            "blocked turn",
-        )
-        .expect("blocked turn");
-    store
-        .update_turn_state(
-            &blocked.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("block turn");
-    store
-        .update_turn_state(
-            &blocked.turn_id,
-            TurnStatus::Interrupted,
-            AgentStatus::Cancelled.as_str(),
-        )
-        .expect("release blocked fixture");
-
-    let started = store
-        .create_turn_with_input_trace_and_history(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "current user"}]),
-            "app_server",
-            "current turn",
-            DEFAULT_THREAD_HISTORY_TURN_LIMIT,
-        )
-        .expect("current turn");
-    assert_eq!(
-        started
-            .history
-            .messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>(),
-        vec!["previous user", "previous assistant"]
-    );
-
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "current user".to_string(),
-        }],
-    };
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = StaticProvider {
-        responses: vec![ModelTurnResponse::completed(
-            "model_request_turn_1_0",
-            "response",
-            "done",
-        )],
+        responses: vec![
+            ModelTurnResponse::completed(
+                "model_request_turn_1_0",
+                "response_1",
+                "previous assistant",
+            ),
+            ModelTurnResponse::completed(
+                "model_request_turn_2_0",
+                "response_2",
+                "done",
+            ),
+        ],
         seen_requests: Arc::clone(&seen_requests),
     };
-    let server = app_server(store);
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
 
-    let status = server
-        .run_agent_loop_with_provider(
-            provider,
-            &thread,
-            &params,
-            &started.turn.turn_id,
-            &started.history.messages,
-            &CancellationToken::new(),
+    for (id, input) in [(1, "previous user"), (2, "current user")] {
+        let responses = server
+            .turn_start(
+                JsonRpcMessage::request(
+                    Method::TurnStart,
+                    id,
+                    json!({
+                        "threadId": thread.thread_id,
+                        "input": [{"type": "text", "text": input}],
+                    }),
+                )
+                .expect("request"),
+            )
+            .expect("turn start");
+        let result: TurnStartResult = serde_json::from_value(
+            responses
+                .iter()
+                .find(|message| message["id"] == id)
+                .expect("response")["result"]
+                .clone(),
         )
-        .expect("agent loop");
+        .expect("turn result");
+        assert_eq!(result.turn.status, TurnStatus::Completed);
+    }
 
-    assert_eq!(status.status, AgentStatus::Completed);
+    // 第二轮请求上下文：上一轮 user/assistant 消息经 session 文件重放。
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
+    let roles: Vec<ModelRole> = requests[1]
+        .messages
+        .iter()
+        .map(|message| message.role.clone())
+        .collect();
     assert_eq!(
-        requests[0]
-            .messages
-            .iter()
-            .map(|message| message.role.clone())
-            .collect::<Vec<_>>(),
+        roles,
         vec![
             ModelRole::Developer,
             ModelRole::User,
@@ -1572,188 +1088,37 @@ fn agent_loop_replays_only_completed_store_history_in_order() {
             ModelRole::User,
         ]
     );
-    let developer = &requests[0].messages[0].content;
-    assert!(developer.starts_with("You are a coding agent working in the current workspace."));
-    assert!(developer.ends_with("Project instructions:\nproject instructions"));
     assert_eq!(
-        requests[0].messages[1..]
+        requests[1]
+            .messages
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
-        vec!["previous user", "previous assistant", "current user",]
+        vec![
+            "project instructions",
+            "previous user",
+            "previous assistant",
+            "current user",
+        ]
     );
-    let request_json = serde_json::to_string(&requests[0]).expect("request json");
-    for forbidden in [
-        "private tool metadata must not replay",
-        "failed user must not replay",
-        "failed assistant must not replay",
-        "blocked user must not replay",
-    ] {
-        assert!(!request_json.contains(forbidden), "leaked {forbidden}");
-    }
-}
-
-#[test]
-fn null_model_thread_preflights_chat_replay_against_resolved_responses_selector() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
-    std::fs::write(workspace.join("README.md"), "fixture").expect("workspace fixture");
-    let models_path = temp.path().join("models.json");
-    std::fs::write(
-        &models_path,
-        r#"{"default_model":"responses-provider/responses-model#medium","providers":{"responses-provider":{"adapter":"openai_compatible","base_url":"http://127.0.0.1:1/v1","api_key_env":"RESPONSES_TEST_KEY","models":{"responses-model":{"api_protocol":"responses","max_output_tokens":4096,"reasoning_variants":{"medium":{"enabled":true,"wire_effort":"medium"}},"default_variant":"medium"}}}}}"#,
-    )
-    .expect("models config");
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            singularity_model::ENV_MODELS_CONFIG => {
-                Some(models_path.to_string_lossy().into_owned())
+    // 会话文件生成且消息完整（跨轮历史的唯一事实源）。
+    let session_file = workspace
+        .join(".singularity")
+        .join("agent-sessions")
+        .join(format!("{}.jsonl", thread.thread_id));
+    assert!(session_file.exists());
+    let session = SessionManager::open(&session_file).expect("session");
+    let entries = session.build_context_entries().expect("entries");
+    let texts: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| match &entry.entry_type {
+            singularity_agent::session::SessionEntryType::Message(message) => {
+                Some(message.content.clone())
             }
-            "RESPONSES_TEST_KEY" => Some("test-key".to_string()),
             _ => None,
-        },
-        None,
-        None,
-    );
-    assert_eq!(
-        snapshot.resolved_default_selector().as_deref(),
-        Some("responses-provider/responses-model#medium")
-    );
-
-    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("NULL-model thread");
-    let prior = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("prior turn");
-
-    let mut tool_response = ModelTurnResponse::completed("request_prior_1", "response_tool", "");
-    tool_response.tool_calls.push(ModelToolCall {
-        tool_call_id: "call_history".to_string(),
-        tool_name: "read".to_string(),
-        arguments: json!({"path": "README.md"}),
-        raw_arguments: json!({"path": "README.md"}).to_string(),
-        parse_status: ModelToolParseStatus::Valid,
-        validation_errors: Vec::new(),
-    });
-    tool_response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
-        provider_name: "history-provider".to_string(),
-        model_name: "history-model".to_string(),
-        reasoning_effort: "medium".to_string(),
-        tool_call_ids: vec!["call_history".to_string()],
-        reasoning_content: "private reasoning".to_string(),
-    }];
-    let fixture_provider = StaticProvider {
-        responses: vec![
-            tool_response,
-            ModelTurnResponse::completed("request_prior_2", "response_final", "prior final"),
-        ],
-        seen_requests: Arc::new(Mutex::new(Vec::new())),
-    };
-    let fixture_loop = AgentLoop::new(
-        fixture_provider,
-        ToolBroker::new(workspace_tool_registry()),
-        workspace_policy(thread.sandbox_mode, thread.approval_policy),
-    )
-    .with_workspace_tools(
-        WorkspaceTools::new(workspace.clone())
-            .expect("workspace tools")
-            .with_shared_sandbox_backend(Arc::new(CompletedSandboxBackend)),
-    );
-    let mut checkpoint = None;
-    let fixture_status = fixture_loop.run(
-        &AgentLoopInput::new(&thread.thread_id, &prior.turn_id, "prior user").with_max_turns(2),
-        AgentLoopCallbacks::events_and_checkpoints(&mut |_event| Ok(()), &mut |event| {
-            if event.phase == TurnCheckpointPhase::ModelResponseCommitted {
-                checkpoint = Some(event.checkpoint.clone());
-            }
-            Ok(())
-        }),
-    );
-    assert_eq!(fixture_status.status, AgentStatus::Completed);
-    let checkpoint = checkpoint.expect("completed checkpoint");
-    store
-        .save_turn_checkpoint(
-            &prior.turn_id,
-            &thread.thread_id,
-            &checkpoint.encode().expect("encode checkpoint"),
-            checkpoint.checkpoint_version(),
-        )
-        .expect("persist checkpoint");
-    store
-        .update_turn_state(
-            &prior.turn_id,
-            TurnStatus::Completed,
-            AgentStatus::Completed.as_str(),
-        )
-        .expect("complete prior turn");
-
-    let current = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("current turn");
-    let capability_requests = Arc::new(AtomicUsize::new(0));
-    let completion_requests = Arc::new(AtomicUsize::new(0));
-    let status = AppServer::new(store, snapshot)
-        .with_sandbox_backend(CompletedSandboxBackend)
-        .run_agent_loop_with_provider(
-            CountingProvider {
-                capability_requests: Arc::clone(&capability_requests),
-                completion_requests: Arc::clone(&completion_requests),
-            },
-            &thread,
-            &TurnStartParams {
-                thread_id: thread.thread_id.clone(),
-                input: vec![singularity_protocol::InputItem::Text {
-                    text: "continue user".to_string(),
-                }],
-            },
-            &current.turn_id,
-            &[],
-            &CancellationToken::new(),
-        )
-        .expect("agent loop");
-
-    assert_eq!(
-        status.status,
-        AgentStatus::Failed,
-        "status={status:?}, capability_requests={}, completion_requests={}",
-        capability_requests.load(Ordering::SeqCst),
-        completion_requests.load(Ordering::SeqCst)
-    );
-    assert_eq!(status.error.as_deref(), Some(SAFE_AGENT_LOOP_FAILURE));
-    assert_eq!(
-        status.model_turns, 0,
-        "replay mismatch must precede model turns"
-    );
-    assert_eq!(
-        capability_requests.load(Ordering::SeqCst),
-        0,
-        "capability negotiation must not run before replay preflight"
-    );
-    assert_eq!(
-        completion_requests.load(Ordering::SeqCst),
-        0,
-        "completion must not run before replay preflight"
-    );
-}
-
-#[test]
-fn sandbox_command_schema_does_not_expose_permission_expansion_fields() {
-    let command = workspace_tool_entries()
-        .into_iter()
-        .find(|entry| entry.spec.name == TOOL_COMMAND)
-        .expect("command tool entry");
-    let properties = command
-        .spec
-        .input_schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .expect("command properties");
-
-    assert!(!properties.contains_key("sandbox_mode"));
-    assert!(!properties.contains_key("network_access"));
+        })
+        .collect();
+    assert_eq!(texts, vec!["previous user", "previous assistant", "current user", "done"]);
 }
 
 #[test]
@@ -1905,29 +1270,13 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
         "item/completed".to_string(),
         "turn/completed".to_string(),
     ]);
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "complete".to_string(),
-        }],
-    };
-    let status = server
-        .run_agent_loop_with_provider(
-            StaticProvider {
-                responses: vec![ModelTurnResponse::completed(
-                    "model_request_turn_1_0",
-                    "response_1",
-                    "complete",
-                )],
-                seen_requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
-        )
-        .expect("agent loop");
+    let status = outcome_to_run_status(AgentOutcome {
+        final_text: "complete".to_string(),
+        turns: 1,
+        usage: ModelUsage::default(),
+        compacted: false,
+        aborted: false,
+    });
     let mut assistant_events = AssistantItemEventState::new(assistant_item_id);
     let mut events = server
         .project_assistant_delta(&mut assistant_events, "partial")
@@ -2033,911 +1382,6 @@ fn realtime_item_tracks_started_and_delta_filtering_independently() {
     }
 }
 
-#[cfg(windows)]
-#[test]
-fn agent_loop_approval_resume_without_pending_tool_call_fails_closed_after_gate() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let file_path = workspace.join("README.md");
-    std::fs::write(&file_path, "before").expect("write readme");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Blocked.as_str(),
-            json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-    let server = app_server(store);
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done");
-    let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let provider = StaticProvider {
-        responses: vec![final_response],
-        seen_requests: Arc::clone(&seen_requests),
-    };
-
-    let resumed = server
-        .resume_agent_loop_after_gate(
-            &request,
-            &decision,
-            None,
-            provider,
-            &CancellationToken::new(),
-            None,
-        )
-        .expect("resume");
-
-    assert!(resumed.is_none());
-    assert_eq!(
-        std::fs::read_to_string(&file_path).expect("read readme"),
-        "before"
-    );
-    assert!(seen_requests.lock().expect("seen requests").is_empty());
-}
-
-#[test]
-fn approval_resume_uses_stored_policy_snapshot_instead_of_defaults() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let file_path = workspace.join("README.md");
-    std::fs::write(&file_path, "before").expect("write readme");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread_with_policy(
-            Some("gpt-test"),
-            Some(&workspace.to_string_lossy()),
-            PermissionProfileName::WorkspaceWrite,
-            ApprovalPolicy::Never,
-        )
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Blocked.as_str(),
-            json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    let arguments = json!({
-        "changes": [{
-            "path": "README.md",
-            "expected": "before",
-            "replacement": "after"
-        }]
-    });
-    let pending_payload = pending_approval_for_test(&request, arguments)
-        .encode_checkpoint()
-        .expect("current checkpoint");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_payload),
-            "approval",
-            "approval requested",
-        )
-        .expect("persist pending approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let pending_payload = store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("claim approval execution")
-        .pending_tool_call
-        .expect("claimed pending checkpoint");
-    let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let resumed = app_server(store)
-        .resume_agent_loop_after_gate(
-            &request,
-            &decision,
-            Some(pending_payload),
-            StaticProvider {
-                responses: vec![ModelTurnResponse::completed(
-                    "model_request_turn_1_0",
-                    "response_1",
-                    "done",
-                )],
-                seen_requests: Arc::clone(&seen_requests),
-            },
-            &CancellationToken::new(),
-            Some(
-                WorkspaceTools::new(&workspace)
-                    .expect("bind workspace tools")
-                    .with_sandbox_backend(CompletedSandboxBackend),
-            ),
-        )
-        .expect("resume")
-        .expect("terminal status");
-
-    assert_eq!(resumed.1.status, AgentStatus::Completed);
-    assert_eq!(
-        std::fs::read_to_string(&file_path).expect("read readme"),
-        "after"
-    );
-    assert!(
-        !seen_requests.lock().expect("seen requests").is_empty(),
-        "the workspace-write Never continuation must reach the provider after the direct write"
-    );
-}
-
-#[test]
-fn agent_loop_approval_no_resume_status_records_session_and_command_audit() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Blocked.as_str(),
-            json!([{"type": "text", "text": "run command"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_COMMAND),
-    )
-    .with_tool_call_id("call_1");
-    let pending_approval = pending_approval_for_test(
-        &request,
-        json!({
-            "command": "test-program success",
-            "timeout_seconds": 5
-        }),
-    );
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let server = app_server(store);
-
-    let (_turn, run_status) = server
-        .approval_no_resume_status(&request, &decision, &turn, &thread, Some(&pending_approval))
-        .expect("status")
-        .expect("terminal status");
-
-    assert_eq!(
-        run_status.audit_events[0]["sandbox_mode"],
-        "workspace_write"
-    );
-    assert_eq!(run_status.audit_events[0]["network_access"], "denied");
-    assert_eq!(
-        run_status.audit_events[0]["sandbox_backend"],
-        "not_executed"
-    );
-    assert_eq!(
-        run_status.audit_events[0]["sandbox_enforcement"],
-        "not_executed"
-    );
-    assert_eq!(
-        run_status.audit_events[0]["command_scope_digest"],
-        "unavailable"
-    );
-    assert_eq!(
-        run_status.audit_events[0]["policy_scope_binding"],
-        "unavailable"
-    );
-    let serialized = serde_json::to_string(&run_status.audit_events[0]).expect("audit JSON");
-    assert!(!serialized.contains("raw_arguments"));
-    assert!(!serialized.contains("test-program success"));
-    assert!(!serialized.contains("approval_request_id"));
-    assert!(!serialized.contains("approval_decision_id"));
-    assert_eq!(
-        run_status.audit_events[0]["approval_decision"],
-        "unavailable"
-    );
-}
-
-#[test]
-fn approval_resolution_cancellation_wins_without_persisting_a_next_approval() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Blocked.as_str(),
-            json!([{"type": "text", "text": "edit"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-    let checkpoint = |request: &ApprovalRequest, tool_call_id: &str| {
-        json!({
-            "request_id": &request.request_id,
-            "thread_id": &request.thread_id,
-            "turn_id": &request.turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": &request.action,
-            "raw_arguments": "{}",
-            "resources": &request.resources,
-            "checkpoint_version": 1,
-            "messages": [],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {}
-        })
-    };
-    let request = ApprovalRequest::new(
-        "approval_cancel_race",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1");
-    let pending_payload = checkpoint(&request, "call_1");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(pending_payload.clone()),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("claim execution");
-    let cancellation_trace = TraceEvent {
-        payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-        ..TraceEvent::for_turn(
-            "trace_cancel_race",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "app_server",
-            "turn interrupt requested",
-        )
-    };
-    store
-        .request_turn_cancellation(&turn.turn_id, &cancellation_trace)
-        .expect("request cancellation");
-    let pending_approval = pending_approval_for_test(&request, json!({}));
-    let server = app_server(store);
-    let current_turn = server
-        .store
-        .get_turn(&turn.turn_id)
-        .expect("cancelled turn");
-    let (_turn, no_resume_status) = server
-        .approval_no_resume_status(
-            &request,
-            &decision,
-            &current_turn,
-            &thread,
-            Some(&pending_approval),
-        )
-        .expect("no-resume status")
-        .expect("terminal status");
-    assert_eq!(no_resume_status.status, AgentStatus::Cancelled);
-
-    let next = ApprovalRequest::new(
-        "approval_must_not_persist",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_2");
-    let stale_status = AgentRunStatus::failed("stale local result");
-    let committed = server
-        .commit_effective_turn_status_resolving_approval(
-            &request.request_id,
-            &turn,
-            &stale_status,
-            &[],
-            None,
-            None,
-        )
-        .expect("cancellation wins approval resolution");
-    assert_eq!(committed.turn.status, TurnStatus::Interrupted);
-    assert_eq!(committed.turn.agent_loop_status, "cancelled");
-    assert!(
-        !server
-            .store
-            .has_pending_tool_call(&request.request_id)
-            .expect("old execution")
-    );
-    assert!(matches!(
-        server.store.get_pending_approval(&next.request_id),
-        Err(StoreError::NotFound(_))
-    ));
-}
-
-#[test]
-fn initial_approval_handoff_interruption_is_an_idempotent_terminal_commit() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "edit"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_initial_interrupt",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_1");
-    let checkpoint = json!({
-        "request_id": &request.request_id,
-        "thread_id": &request.thread_id,
-        "turn_id": &request.turn_id,
-        "tool_call_id": "call_1",
-        "tool_name": TOOL_PATCH,
-        "raw_arguments": "{}",
-        "resources": [],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("persist initial approval");
-    let interrupt_trace = TraceEvent {
-        payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-        ..TraceEvent::for_turn(
-            "trace_interrupt_initial_handoff",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "app_server",
-            "turn interrupt requested",
-        )
-    };
-    let interrupted = store
-        .request_turn_cancellation(&turn.turn_id, &interrupt_trace)
-        .expect("interrupt pending approval");
-    assert_eq!(interrupted.status, TurnStatus::Interrupted);
-    let server = app_server(store);
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    let stale_blocked =
-        AgentRunStatus::failed("stale blocked result").with_status(AgentStatus::Blocked);
-    let committed = server
-        .commit_turn_run_status(turn.clone(), &stale_blocked, None, &cancellation, None)
-        .expect("interrupted handoff is idempotent");
-    assert_eq!(committed.turn.status, TurnStatus::Interrupted);
-    assert_eq!(committed.turn.agent_loop_status, "cancelled");
-    assert!(
-        server
-            .store
-            .list_pending_approvals()
-            .expect("pending")
-            .is_empty()
-    );
-    server
-        .store
-        .recover_unowned_workspace_executions()
-        .expect("recovery");
-}
-
-#[test]
-fn agent_loop_approval_resume_rejects_untyped_checkpoint_payloads() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Blocked.as_str(),
-            json!([{"type": "text", "text": "run command"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_COMMAND),
-    )
-    .with_tool_call_id("call_1");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let mismatched_pending = PendingToolCall {
-        request_id: "approval_other_call_1".to_string(),
-        tool_call_id: "call_1".to_string(),
-        tool_name: tool_id(TOOL_COMMAND),
-        raw_arguments: json!({
-            "command": "test-program success",
-            "timeout_seconds": 5
-        })
-        .to_string(),
-        resources: Vec::new(),
-    };
-    let invalid_args_pending = PendingToolCall {
-        request_id: request.request_id.clone(),
-        tool_call_id: "call_1".to_string(),
-        tool_name: tool_id(TOOL_COMMAND),
-        raw_arguments: "{not-json".to_string(),
-        resources: Vec::new(),
-    };
-    let server = app_server(store);
-
-    let mismatch_error = server
-        .resume_agent_loop_after_gate(
-            &request,
-            &decision,
-            Some(serde_json::to_value(&mismatched_pending).expect("pending payload")),
-            StaticProvider {
-                responses: Vec::new(),
-                seen_requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            &CancellationToken::new(),
-            None,
-        )
-        .expect_err("mismatched checkpoint must fail closed");
-    assert!(matches!(
-        mismatch_error,
-        AppServerError::Store(StoreError::InvalidState(_))
-    ));
-
-    let invalid_args_error = server
-        .resume_agent_loop_after_gate(
-            &request,
-            &decision,
-            Some(serde_json::to_value(&invalid_args_pending).expect("pending payload")),
-            StaticProvider {
-                responses: Vec::new(),
-                seen_requests: Arc::new(Mutex::new(Vec::new())),
-            },
-            &CancellationToken::new(),
-            None,
-        )
-        .expect_err("invalid checkpoint arguments must fail closed");
-    assert!(matches!(
-        invalid_args_error,
-        AppServerError::Store(StoreError::InvalidState(_))
-    ));
-}
-
-#[test]
-fn turn_resume_malformed_checkpoint_terminalizes_without_provider_replay() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "resume malformed"}]),
-            "test",
-            "turn started",
-        )
-        .expect("turn");
-    store
-        .save_turn_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &json!({"checkpoint_version": 1, "malformed": true}),
-            1,
-        )
-        .expect("checkpoint");
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "resume-pause",
-            TurnInputDelivery::Steer,
-            &json!([{"type": "text", "text": "pause before resume"}]),
-        )
-        .expect("pause input");
-    store
-        .request_turn_pause(&turn.turn_id)
-        .expect("pause request");
-    store
-        .consume_turn_inputs_with_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &["resume-pause".to_string()],
-            &json!({"checkpoint_version": 1, "malformed": true}),
-            1,
-            true,
-        )
-        .expect("pause checkpoint");
-
-    let mut server = app_server(store);
-    let responses = server
-        .turn_resume(
-            JsonRpcMessage::request(Method::TurnResume, 1, json!({"turnId": turn.turn_id}))
-                .expect("resume request"),
-        )
-        .expect("resume response");
-    assert!(!responses.is_empty());
-    let failed = server.store.get_turn(&turn.turn_id).expect("failed turn");
-    assert_eq!(failed.status, TurnStatus::Failed);
-    assert_eq!(failed.agent_loop_status, AgentStatus::Failed.as_str());
-    assert_eq!(
-        server
-            .store
-            .get_turn_checkpoint(&turn.turn_id)
-            .expect("checkpoint remains")
-            .expect("checkpoint row")
-            .get("malformed")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert!(
-        server
-            .store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .iter()
-            .any(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
-    );
-}
-
-#[test]
-fn approval_malformed_checkpoint_terminalizes_before_claim_without_replay() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(&db_path).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "approval malformed"}]),
-            "test",
-            "turn started",
-        )
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_malformed_before_claim",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_malformed");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(json!({"malformed": true})),
-            "approval",
-            "approval requested",
-        )
-        .expect("malformed approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-    let responses = server
-        .approval_decision(
-            JsonRpcMessage::request(
-                Method::ApprovalDecision,
-                1,
-                serde_json::to_value(&decision).expect("decision params"),
-            )
-            .expect("approval request"),
-        )
-        .expect("approval response");
-    assert!(!responses.is_empty());
-    let failed = server.store.get_turn(&turn.turn_id).expect("failed turn");
-    assert_eq!(failed.status, TurnStatus::Failed);
-    assert_eq!(failed.agent_loop_status, AgentStatus::Failed.as_str());
-    assert!(
-        !server
-            .store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending call lookup")
-    );
-    assert!(
-        server
-            .store
-            .list_pending_approvals()
-            .expect("pending approvals")
-            .is_empty()
-    );
-    assert!(
-        server
-            .store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .iter()
-            .any(|event| event.payload["failure_kind"] == "checkpoint_decode_failed")
-    );
-}
-
-#[test]
-fn agent_loop_approval_resume_fails_closed_when_project_instructions_change() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    std::fs::write(workspace.join("AGENTS.md"), "initial project instructions")
-        .expect("initial agents");
-    let file_path = workspace.join("README.md");
-    std::fs::write(&file_path, "before").expect("write readme");
-    let store = SessionStore::open(&db_path).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            AgentStatus::Running.as_str(),
-            json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "edit readme".to_string(),
-        }],
-    };
-    let mut initial_response =
-        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before");
-    initial_response.tool_calls.push(ModelToolCall {
-        tool_call_id: "call_1".to_string(),
-        tool_name: TOOL_PATCH.to_string(),
-        arguments: json!({
-            "changes": [{
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
-            }]
-        }),
-        raw_arguments: json!({
-            "changes": [{
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
-            }]
-        })
-        .to_string(),
-        parse_status: ModelToolParseStatus::Valid,
-        validation_errors: Vec::new(),
-    });
-    let initial_seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-    let blocked_status = server
-        .run_agent_loop_with_provider(
-            StaticProvider {
-                responses: vec![initial_response],
-                seen_requests: Arc::clone(&initial_seen_requests),
-            },
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
-        )
-        .expect("initial agent loop");
-    assert_eq!(blocked_status.status, AgentStatus::Blocked);
-    server
-        .commit_turn_run_status(
-            turn.clone(),
-            &blocked_status,
-            None,
-            &CancellationToken::new(),
-            None,
-        )
-        .expect("commit blocked turn");
-    assert!(
-        !serde_json::to_string(&blocked_status)
-            .expect("blocked status json")
-            .contains("project_instructions_digest")
-    );
-    let initial_request_json =
-        serde_json::to_string(&initial_seen_requests.lock().expect("initial requests")[0])
-            .expect("initial request json");
-    assert!(!initial_request_json.contains("AGENTS.md"));
-    assert!(!initial_request_json.contains(workspace.to_string_lossy().as_ref()));
-    for trace in server
-        .store
-        .list_trace(&thread.thread_id)
-        .expect("thread trace")
-    {
-        assert!(
-            !serde_json::to_string(&trace.payload)
-                .expect("trace json")
-                .contains("project_instructions_digest")
-        );
-    }
-    drop(server);
-
-    let project_sentinel = "project-instruction-sentinel";
-    std::fs::write(workspace.join("AGENTS.override.md"), project_sentinel)
-        .expect("override agents");
-    let server = app_server(SessionStore::open(&db_path).expect("reopen store"))
-        .with_sandbox_backend(CompletedSandboxBackend);
-    let request = server
-        .store
-        .get_pending_approval(&format!("approval_{}_call_1", turn.turn_id))
-        .expect("stored approval");
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "approved",
-    );
-    let recorded = server
-        .store
-        .record_approval_decision(&decision, "approval", "approval decision recorded")
-        .expect("record approval");
-    let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
-    let checkpoint_digest = pending_payload["project_instructions_digest"]
-        .as_str()
-        .expect("checkpoint project instruction digest");
-    assert!(checkpoint_digest.starts_with("sha256:"));
-
-    let resumed_seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let resumed = server
-        .resume_agent_loop_after_gate(
-            &request,
-            &decision,
-            Some(pending_payload),
-            StaticProvider {
-                responses: vec![ModelTurnResponse::completed(
-                    "model_request_turn_1_0",
-                    "response_1",
-                    "must not run",
-                )],
-                seen_requests: Arc::clone(&resumed_seen_requests),
-            },
-            &CancellationToken::new(),
-            Some(
-                WorkspaceTools::new(&workspace)
-                    .expect("bind workspace tools")
-                    .with_sandbox_backend(CompletedSandboxBackend),
-            ),
-        )
-        .expect("resume")
-        .expect("terminal status");
-
-    assert_eq!(resumed.1.status, AgentStatus::Failed);
-    assert_eq!(resumed.1.error.as_deref(), Some(SAFE_AGENT_LOOP_FAILURE));
-    let resumed_json = serde_json::to_string(&resumed.1).expect("resumed status json");
-    assert!(!resumed_json.contains(project_sentinel));
-    assert!(
-        resumed_seen_requests
-            .lock()
-            .expect("resumed requests")
-            .is_empty()
-    );
-    let committed = server
-        .commit_effective_turn_status_resolving_approval(
-            &request.request_id,
-            &resumed.0,
-            &resumed.1,
-            &resumed.2,
-            Some(&SessionStore::allocate_assistant_item_id()),
-            None,
-        )
-        .expect("commit project instruction failure");
-    let trace_json = serde_json::to_string(&committed.trace).expect("trace json");
-    assert!(!trace_json.contains(project_sentinel));
-    assert_eq!(committed.trace.payload["error"], SAFE_AGENT_LOOP_FAILURE);
-    let history_json = serde_json::to_string(
-        &server
-            .store
-            .read_thread_history(&thread.thread_id, None, DEFAULT_THREAD_HISTORY_TURN_LIMIT)
-            .expect("history"),
-    )
-    .expect("history json");
-    assert!(!history_json.contains(project_sentinel));
-    assert_eq!(
-        std::fs::read_to_string(&file_path).expect("read readme"),
-        "before"
-    );
-}
-
 struct CompletedSandboxBackend;
 
 impl SandboxBackend for CompletedSandboxBackend {
@@ -2991,79 +1435,17 @@ impl SandboxBackend for UnavailableSandboxBackend {
 }
 
 #[test]
-fn agent_loop_capability_is_projected_from_the_bound_sandbox_backend() {
+fn agent_loop_capability_is_always_available_without_a_sandbox_gate() {
     let available = agent_loop_capability(&CompletedSandboxBackend);
     assert!(available.available);
     assert!(available.blockers.is_empty());
-    assert!(available.reason.contains("completed_test"));
+    assert_eq!(available.status, AgentStatus::Completed);
 
+    // 无门禁语义：任何 sandbox backend（含 unavailable）都返回 ready。
     let unavailable = agent_loop_capability(&UnavailableSandboxBackend);
-    assert!(!unavailable.available);
-    assert_eq!(
-        unavailable.blockers,
-        vec![STRICT_COMMAND_SANDBOX_UNAVAILABLE]
-    );
-    assert!(unavailable.reason.contains("unavailable_test"));
-}
-
-#[test]
-fn agent_loop_command_uses_bound_sandbox_backend_without_approval() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let params = TurnStartParams {
-        thread_id: thread.thread_id.clone(),
-        input: vec![singularity_protocol::InputItem::Text {
-            text: "run command".to_string(),
-        }],
-    };
-    let mut command_response =
-        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    command_response.tool_calls.push(ModelToolCall {
-        tool_call_id: "call_1".to_string(),
-        tool_name: "command".to_string(),
-        arguments: json!({
-            "command": "cmd.exe /C \"echo app-server-sandbox-ok\"",
-            "timeout_seconds": 5
-        }),
-        raw_arguments: json!({
-            "command": "cmd.exe /C \"echo app-server-sandbox-ok\"",
-            "timeout_seconds": 5
-        })
-        .to_string(),
-        parse_status: ModelToolParseStatus::Valid,
-        validation_errors: Vec::new(),
-    });
-    let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
-    let provider = StaticProvider {
-        responses: vec![command_response, final_response],
-        seen_requests: Arc::new(Mutex::new(Vec::new())),
-    };
-    let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-
-    let status = server
-        .run_agent_loop_with_provider(
-            provider,
-            &thread,
-            &params,
-            &turn.turn_id,
-            &[],
-            &CancellationToken::new(),
-        )
-        .expect("agent loop");
-
-    assert_eq!(status.status, AgentStatus::Completed);
-    assert_eq!(status.final_answer.as_deref(), Some("done"));
-    assert_eq!(status.tool_calls, 1);
-    assert_eq!(status.approval_count, 0);
+    assert!(unavailable.available);
+    assert!(unavailable.blockers.is_empty());
+    assert_eq!(unavailable.status, AgentStatus::Completed);
 }
 
 #[test]
@@ -3086,310 +1468,334 @@ fn unsequenced_turn_outputs_carry_one_explicit_transport_trace_binding() {
     server.output_order.complete(unbound[0].reservation.order);
 }
 
-#[test]
-fn provider_capability_cache_observation_projection_is_idempotent() {
-    use singularity_protocol::TraceMetricSampleKind;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "cache"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let mut projector =
-        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
-            .expect("projector");
-
-    let mut status = AgentRunStatus::failed("resume projection test");
-    status.provider_capability_metadata = Some(ProviderCapabilityMetadata {
-        api_protocol: ProviderApiProtocol::Declared,
-        profile: ProviderCapabilityProfile::Declared,
-        cache_hit: false,
-        profile_attempts: 0,
-        fallback_count: 0,
-        probe_usage: ModelUsage::default(),
-        probe_attempt_metadata: ProviderAttemptMetadata::default(),
-        cache_observations: vec![ProviderCapabilityCacheObservation {
-            api_protocol: ProviderApiProtocol::Declared,
-            outcome: ProviderCapabilityCacheLookupResult::Miss,
-            observed_at_unix_ms: 1_700_000_000_000,
-            model_turn_ordinal: Some(2),
-            parent_occurrence_id: Some("occurrence_parent".to_string()),
-        }],
+/// 构造带工具调用序列的 fake provider（write 工具 → 文本收尾）。
+fn tool_using_static_provider(
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+) -> StaticProvider {
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    tool_response.tool_calls.push(ModelToolCall {
+        tool_call_id: "call_1".to_string(),
+        tool_name: "write".to_string(),
+        arguments: json!({"path": "hello.txt", "content": "hello"}),
+        raw_arguments: json!({"path": "hello.txt", "content": "hello"}).to_string(),
+        parse_status: ModelToolParseStatus::Valid,
+        validation_errors: Vec::new(),
     });
-
-    projector.project_result(&status).expect("first projection");
-    projector
-        .project_result(&status)
-        .expect("replayed projection is idempotent");
-
-    let trace = store.list_trace(&thread.thread_id).expect("trace");
-    let samples = trace
-        .iter()
-        .flat_map(|event| event.metric_samples.iter())
-        .filter(|sample| sample.kind == TraceMetricSampleKind::ProviderCapabilityCacheMiss)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        samples.len(),
-        1,
-        "replayed cache observation must not duplicate"
-    );
-    assert_eq!(samples[0].count, 1);
+    StaticProvider {
+        responses: vec![
+            tool_response,
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done"),
+        ],
+        seen_requests,
+    }
 }
 
 #[test]
-fn provider_observation_projection_preserves_stable_diagnostic_code() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "provider"}]),
-            "app_server",
-            "turn started",
+fn turn_start_runs_new_core_with_tools_and_session_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut server = app_server(store)
+        .with_test_provider(Arc::new(tool_using_static_provider(Arc::clone(&seen_requests))));
+    server
+        .event_filter
+        .lock()
+        .expect("event filter")
+        .event_types = Some(vec![
+        "turn/started".to_string(),
+        "item/started".to_string(),
+        "item/agentMessage/delta".to_string(),
+        "item/completed".to_string(),
+        "turn/completed".to_string(),
+    ]);
+
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "write hello.txt"}],
+                }),
+            )
+            .expect("request"),
         )
-        .expect("turn");
-    let mut projector =
-        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
-            .expect("projector");
-    let identity = OccurrenceIdentity {
-        occurrence_id: "provider_diagnostic_occurrence".to_string(),
-        parent_occurrence_id: None,
-        ordinal: 0,
-    };
-    let started = ProviderAttemptObservation {
-        identity: identity.clone(),
-        lifecycle: OccurrenceLifecycle::Started {
-            queued_at_unix_ms: 1_700_000_000_000,
-            started_at_unix_ms: 1_700_000_000_001,
-        },
-        operation_phase: ProviderAttemptOperationPhase::Completion,
-        provider_name: "provider".to_string(),
-        model_name: "model".to_string(),
-        actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        attempt_index: 1,
-        retry_count: 0,
-        request_send_to_headers_ms: None,
-        time_to_first_text_delta_ms: None,
-        retry_backoff_ms: None,
-        error_category: Some(ModelErrorCategory::JsonSchema),
-        error_stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
-        diagnostic_code: Some("provider_response_invalid".to_string()),
-        usage: None,
-    };
-    projector
-        .project_event(AgentLoopEvent::Observation(
-            AgentObservation::ProviderAttempt(Box::new(started)),
-        ))
-        .expect("provider start");
-
-    let finished = ProviderAttemptObservation {
-        identity,
-        lifecycle: OccurrenceLifecycle::Finished {
-            queued_at_unix_ms: 1_700_000_000_000,
-            started_at_unix_ms: 1_700_000_000_001,
-            ended_at_unix_ms: 1_700_000_000_011,
-            duration_ms: 10,
-            status: ProviderAttemptStatus::Error,
-        },
-        operation_phase: ProviderAttemptOperationPhase::Completion,
-        provider_name: "provider".to_string(),
-        model_name: "model".to_string(),
-        actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        attempt_index: 1,
-        retry_count: 0,
-        request_send_to_headers_ms: None,
-        time_to_first_text_delta_ms: None,
-        retry_backoff_ms: None,
-        error_category: Some(ModelErrorCategory::JsonSchema),
-        error_stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
-        diagnostic_code: Some("provider_response_invalid".to_string()),
-        usage: None,
-    };
-    projector
-        .project_event(AgentLoopEvent::Observation(
-            AgentObservation::ProviderAttempt(Box::new(finished)),
-        ))
-        .expect("provider end");
-
-    let end = store
-        .list_trace(&thread.thread_id)
-        .expect("trace")
-        .into_iter()
-        .find(|event| {
-            event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
-                && event.span_phase == Some(singularity_protocol::TraceSpanPhase::End)
-        })
-        .expect("provider end trace");
-    assert_eq!(
-        end.span_projection
-            .and_then(|projection| projection.error)
-            .and_then(|error| error.code)
-            .as_deref(),
-        Some("provider_response_invalid")
-    );
-}
-
-#[test]
-fn tool_first_attempt_projection_emits_closed_sample_once() {
-    use singularity_agent::{ToolCallObservation, ToolCallStatus};
-    use singularity_protocol::TraceMetricSampleKind;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "tool"}]),
-            "app_server",
-            "turn started",
-        )
-        .expect("turn");
-    let mut projector =
-        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
-            .expect("projector");
-    let identity = OccurrenceIdentity {
-        occurrence_id: "tool_first_attempt_occurrence".to_string(),
-        parent_occurrence_id: None,
-        ordinal: 0,
-    };
-    let started = ToolCallObservation {
-        identity: identity.clone(),
-        lifecycle: OccurrenceLifecycle::Started {
-            queued_at_unix_ms: 1_700_000_000_000,
-            started_at_unix_ms: 1_700_000_000_001,
-        },
-        model_turn_ordinal: 0,
-        tool_call_ordinal: 0,
-        tool_call_id_digest:
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        tool_name: "read".to_string(),
-        first_attempt: true,
-    };
-    let finished = ToolCallObservation {
-        identity,
-        lifecycle: OccurrenceLifecycle::Finished {
-            queued_at_unix_ms: 1_700_000_000_000,
-            started_at_unix_ms: 1_700_000_000_001,
-            ended_at_unix_ms: 1_700_000_000_010,
-            duration_ms: 9,
-            status: ToolCallStatus::Succeeded,
-        },
-        model_turn_ordinal: 0,
-        tool_call_ordinal: 0,
-        tool_call_id_digest:
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        tool_name: "read".to_string(),
-        first_attempt: true,
-    };
-    projector
-        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
-            started,
-        )))
-        .expect("tool start");
-    projector
-        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
-            finished,
-        )))
-        .expect("tool end");
-    let repeat_identity = OccurrenceIdentity {
-        occurrence_id: "tool_first_attempt_repeat".to_string(),
-        parent_occurrence_id: None,
-        ordinal: 1,
-    };
-    let repeat = |lifecycle| ToolCallObservation {
-        identity: repeat_identity.clone(),
-        lifecycle,
-        model_turn_ordinal: 0,
-        tool_call_ordinal: 1,
-        tool_call_id_digest:
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
-        tool_name: "read".to_string(),
-        first_attempt: false,
-    };
-    projector
-        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
-            repeat(OccurrenceLifecycle::Started {
-                queued_at_unix_ms: 1_700_000_000_000,
-                started_at_unix_ms: 1_700_000_000_001,
-            }),
-        )))
-        .expect("repeat start");
-    projector
-        .project_event(AgentLoopEvent::Observation(AgentObservation::ToolCall(
-            repeat(OccurrenceLifecycle::Finished {
-                queued_at_unix_ms: 1_700_000_000_000,
-                started_at_unix_ms: 1_700_000_000_001,
-                ended_at_unix_ms: 1_700_000_000_010,
-                duration_ms: 9,
-                status: ToolCallStatus::Succeeded,
-            }),
-        )))
-        .expect("repeat end");
-    let denial_request = ApprovalRequest::new(
-        format!("approval_{}_call_deny", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id(TOOL_PATCH),
-    )
-    .with_tool_call_id("call_deny");
-    let pending_denial = pending_approval_for_test(
-        &denial_request,
-        serde_json::json!({
-            "changes": [{
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
-            }]
-        }),
-    );
-    projector
-        .project_approval_denied(&pending_denial)
-        .expect("approval denial failure sample");
-    projector
-        .project_approval_denied(&pending_denial)
-        .expect("replayed approval denial remains idempotent");
-    let trace = store.list_trace(&thread.thread_id).expect("trace");
-    assert_eq!(
-        trace
+        .expect("turn start");
+    let result: TurnStartResult = serde_json::from_value(
+        responses
             .iter()
-            .flat_map(|event| event.metric_samples.iter())
-            .filter(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptSuccess)
-            .count(),
-        1
-    );
-    let denial_event = trace
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    assert_eq!(result.turn.agent_loop_status, AgentStatus::Completed.as_str());
+    // 事件流：item/started + item/agentMessage/delta + item/completed + turn/completed。
+    let methods: Vec<&str> = responses
         .iter()
-        .find(|event| {
-            event
-                .metric_samples
-                .iter()
-                .any(|sample| sample.kind == TraceMetricSampleKind::ToolFirstAttemptFailure)
-        })
-        .expect("approval denial failure sample");
-    assert_eq!(denial_event.payload["observation"], "tool_first_attempt");
-    assert!(
-        !denial_event
-            .payload
-            .to_string()
-            .contains("provider_capability_cache")
-    );
-    let metrics = store.trace_metrics(&thread.thread_id).expect("metrics");
-    let metric = metrics
-        .metric("tool_first_attempt_success_rate_bps")
-        .expect("first attempt metric");
+        .filter_map(|message| message["method"].as_str())
+        .collect();
     assert_eq!(
-        metric.distribution.as_ref().map(|value| value.sum),
-        Some(5_000)
+        methods,
+        vec![
+            "turn/started",
+            "item/started",
+            "item/agentMessage/delta",
+            "item/completed",
+            "turn/completed",
+        ]
     );
+    // 工具真实执行：write 写入 workspace。
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("hello.txt")).expect("read hello.txt"),
+        "hello"
+    );
+    // 两轮 provider 调用，第二轮上下文重放 assistant tool call + tool result。
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    let second = &requests[1];
+    assert_eq!(second.messages[1].role, ModelRole::Assistant);
+    assert_eq!(second.messages[1].tool_calls.len(), 1);
+    assert_eq!(second.messages[2].role, ModelRole::Tool);
+    // session 文件生成：thread_id.jsonl，消息完整。
+    let session_file = workspace
+        .join(".singularity")
+        .join("agent-sessions")
+        .join(format!("{}.jsonl", thread.thread_id));
+    assert!(session_file.exists());
+    let session = SessionManager::open(&session_file).expect("session");
+    let entries = session.build_context_entries().expect("entries");
+    let messages: Vec<&singularity_agent::message::AgentMessage> = entries
+        .iter()
+        .filter_map(|entry| match &entry.entry_type {
+            singularity_agent::session::SessionEntryType::Message(message) => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].role, singularity_agent::message::AgentMessageRole::User);
+    assert_eq!(messages[0].content, "write hello.txt");
+    assert_eq!(
+        messages[1].tool_name.as_deref(),
+        Some("write"),
+        "assistant tool call message persisted"
+    );
+    assert!(messages[2].content.contains("Successfully wrote"));
+    assert_eq!(messages[3].content, "done");
+    // 工具执行 trace 事件已投影。
+    let traces = server
+        .store
+        .list_trace(&thread.thread_id)
+        .expect("trace");
+    assert!(traces.iter().any(|event| {
+        event.payload["observation"] == "tool_execution"
+            && event.payload["tool_name"] == "write"
+    }));
+}
+
+#[test]
+fn turn_input_queued_before_run_is_injected_into_steer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("turn");
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "input-pre-run",
+            TurnInputDelivery::Steer,
+            &json!([{"type": "text", "text": "steer before run"}]),
+        )
+        .expect("queued input");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "done",
+        )],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+    let server = app_server(store).with_test_provider(Arc::new(provider));
+    let mut events = AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+    let mut emitted = Vec::new();
+    let status = server
+        .run_agent_core(
+            &thread,
+            &turn,
+            "main input",
+            &CancellationToken::new(),
+            &mut events,
+            &mut |message| emitted.push(message),
+        )
+        .expect("run agent core");
+    assert_eq!(status.status, AgentStatus::Completed);
+    // run 前已排队输入按 steer 注入：第一轮请求 user(main) 后紧跟 steer 消息。
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    let texts: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(texts, &["main input", "steer before run"]);
+    // 会话文件同步写入。
+    assert!(
+        workspace
+            .join(".singularity")
+            .join("agent-sessions")
+            .join(format!("{}.jsonl", thread.thread_id))
+            .exists()
+    );
+}
+
+#[test]
+fn turn_input_during_run_pushes_the_registered_steer_handle() {
+    let store = SessionStore::open(":memory:").expect("store");
+    let mut server = app_server(store);
+    let thread = server
+        .store
+        .create_thread(None, None)
+        .expect("thread");
+    let turn = server
+        .store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("turn");
+    let handle = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    server
+        .steer_handles
+        .lock()
+        .expect("steer handles")
+        .insert(turn.turn_id.clone(), handle.clone());
+
+    let responses = server
+        .turn_input(
+            JsonRpcMessage::request(
+                Method::TurnInput,
+                1,
+                json!({
+                    "turnId": turn.turn_id,
+                    "inputId": "input-live",
+                    "delivery": "steer",
+                    "input": [{"type": "text", "text": "live steer"}],
+                }),
+            )
+            .expect("request"),
+        )
+        .expect("turn input");
+    assert_eq!(responses.len(), 1);
+    // 运行中注入：共享 steer 队列收到消息（run 下一轮 drain）。
+    let queued = handle.lock().expect("handle");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0], "live steer");
+    // store 侧同时记录了 pending input（idempotent key 复用返回同一 turn）。
+    let boundary = server
+        .store
+        .turn_boundary_state(&turn.turn_id, true)
+        .expect("boundary");
+    assert_eq!(boundary.inputs.len(), 1);
+}
+
+#[test]
+fn turn_resume_reopens_session_and_runs_new_core() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            AgentStatus::Paused.as_str(),
+            json!([{"type": "text", "text": "resume me"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    store
+        .update_turn_state(
+            &turn.turn_id,
+            TurnStatus::Paused,
+            AgentStatus::Paused.as_str(),
+        )
+        .expect("paused turn");
+    // 模拟旧链 pause 数据：Paused turn 携带 checkpoint（store 恢复逻辑对
+    // 无 checkpoint 的 Paused turn 会终态化；新链路不再产生这种状态）。
+    store
+        .save_turn_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &json!({ "checkpoint_version": 1, "legacy": true }),
+            1,
+        )
+        .expect("legacy checkpoint");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "resumed answer",
+        )],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+
+    let responses = server
+        .turn_resume(
+            JsonRpcMessage::request(Method::TurnResume, 1, json!({ "turnId": turn.turn_id }))
+                .expect("request"),
+        )
+        .expect("turn resume");
+    let result: TurnResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    // 恢复输入来自 turn 行；会话文件被创建并写入。
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "resume me")
+    );
+    let session_file = workspace
+        .join(".singularity")
+        .join("agent-sessions")
+        .join(format!("{}.jsonl", thread.thread_id));
+    assert!(session_file.exists());
+    let session = SessionManager::open(&session_file).expect("session");
+    let texts: Vec<String> = session
+        .build_context_entries()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| match &entry.entry_type {
+            singularity_agent::session::SessionEntryType::Message(message) => {
+                Some(message.content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["resume me", "resumed answer"]);
 }

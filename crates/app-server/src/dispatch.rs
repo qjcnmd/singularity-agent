@@ -233,8 +233,9 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend)) {
-            return invalid_state_response(message.required_id(), error);
+        // 恢复线程时确保绑定会话文件存在（缺失则创建空会话；旧 SQLite 历史不迁移）。
+        if open_or_create_thread_session(&thread).is_err() {
+            return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
         match self.store.update_thread_status(
             &params.thread_id,
@@ -247,6 +248,7 @@ impl AppServer {
             Err(error) => Err(error.into()),
         }
     }
+
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadStartParams = parse_params(&message)?;
         let cwd = match canonical_thread_cwd(params.cwd.as_deref()) {
@@ -275,6 +277,14 @@ impl AppServer {
             "app_server",
             "thread started",
         )?;
+        // 线程 ↔ 会话文件绑定：`<sessions_dir>/<thread_id>.jsonl`（Phase 3a 跨轮历史通道）。
+        let thread_cwd = thread.cwd.clone().unwrap_or(cwd);
+        let sessions_dir = Path::new(&thread_cwd).join(".singularity").join("agent-sessions");
+        if SessionManager::create_with_name(Path::new(&thread_cwd), &sessions_dir, &thread.thread_id)
+            .is_err()
+        {
+            return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
+        }
         let mut messages = Vec::new();
         if let Some(event) = self.event_notification(AppEvent::thread_started(&thread))? {
             messages.push(event);

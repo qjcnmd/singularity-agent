@@ -24,40 +24,37 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentContextItem, AgentContinuation, AgentLoop, AgentLoopCallbacks, AgentLoopCapability,
-    AgentLoopEvent, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRunStatus,
-    AgentStatus, ApprovalGrant, PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent,
-    TurnCheckpointPhase, project_audit_event,
+    AgentLoopCapability, AgentRunStatus, AgentStatus,
+    agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
+    session::SessionManager,
+    tools::ToolRegistry,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
     load_project_instructions,
 };
-use singularity_model::{Provider, ProviderConfigSnapshot};
+use singularity_model::{
+    DEFAULT_MAX_CONTEXT_TOKENS, Provider, ProviderConfigSnapshot,
+};
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
-    PermissionResource, workspace_policy,
+    ApprovalDecision, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
     ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
-    ConversationMessage, ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason,
+    EventClass, EventDelivery, EventGap, EventGapReason,
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
     InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method, MethodKind,
     ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputParams, TurnInterruptResult,
-    TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputDelivery, TurnInputParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
-use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
+use singularity_sandbox::{SandboxBackend, WindowsSandboxBackend};
 use singularity_store::{
-    AllocatedAssistantItemId, CheckpointFailureClaim, CommitTurnOutcomeParams,
-    CommittedTurnOutcome, CreateStartedTurnParams, SessionStore, StoreError, ToolExecution,
-    ToolExecutionState, TurnOutcomeAuthority,
-};
-use singularity_tools::{
-    COMMAND_TOOL as TOOL_COMMAND, ToolBroker, ToolRegistry, WorkspaceTools, workspace_tool_entries,
+    AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
+    CreateStartedTurnParams, SessionStore, StoreError, TurnOutcomeAuthority,
 };
 use thiserror::Error;
 
@@ -66,13 +63,10 @@ const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a t
 const THREAD_ARCHIVED_CONTINUATION: &str =
     "Thread is archived; resume it before continuing the turn";
 const WORKSPACE_EXECUTION_ACTIVE: &str = "Workspace already has an active or pending turn";
-const EXECUTION_STOPPED: &str = "AppServer is stopping; execution was not started";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
-const APPROVAL_CHECKPOINT_REQUIRED: &str =
-    "approval request requires an internal AgentLoop checkpoint";
 const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
     "approval/request is internal to the AgentLoop approval history";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
@@ -81,9 +75,6 @@ const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
 const TURN_MONITOR_SHUTDOWN_WAIT_MS: u64 = 100;
-const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
-const SAFE_PROVIDER_FAILURE: &str = "provider request failed";
-const SAFE_PROJECT_INSTRUCTIONS_FAILURE: &str = "project instructions unavailable";
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_AGENT_LOOP_FAILURE: &str = "agent loop execution failed";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
@@ -102,6 +93,8 @@ pub enum AppServerError {
     Store(#[from] StoreError),
     #[error("project instructions error: {0}")]
     ProjectInstructions(#[from] ProjectInstructionError),
+    #[error("agent error: {0}")]
+    Agent(#[from] AgentError),
     #[error("workspace error: {0}")]
     Workspace(String),
     #[error("turn execution failed during {stage} ({cause})")]
@@ -243,21 +236,6 @@ impl CancellationMonitorOutcome {
     }
 }
 
-fn monitor_infrastructure_failure(control: Option<&CancellationMonitorControl>) -> bool {
-    control.and_then(|control| {
-        CancellationMonitorOutcome::from_code(control.outcome.load(Ordering::SeqCst))
-    }) == Some(CancellationMonitorOutcome::InfrastructureFailure)
-}
-
-struct AgentLoopInvocation<'a> {
-    thread: &'a Thread,
-    params: &'a TurnStartParams,
-    turn_id: &'a str,
-    history: &'a [ConversationMessage],
-    cancellation: &'a CancellationToken,
-    monitor_control: Option<&'a CancellationMonitorControl>,
-}
-
 /// 一次 AgentLoop 调用预分配的 assistant item 及实际通过订阅过滤器生成的事件状态。
 struct AssistantItemEventState {
     item_id: AllocatedAssistantItemId,
@@ -279,29 +257,6 @@ impl AssistantItemEventState {
     fn appeared(&self) -> bool {
         self.started_generated || self.delta_generated
     }
-}
-
-struct ApprovalResumeContext<'a> {
-    cancellation: &'a CancellationToken,
-    monitor_control: Option<&'a CancellationMonitorControl>,
-    prepared_workspace_tools: Option<WorkspaceTools>,
-}
-
-struct ApprovalResumeInput<'a> {
-    request: &'a ApprovalRequest,
-    decision: &'a ApprovalDecision,
-    turn: &'a Turn,
-    thread: &'a Thread,
-    pending_approval: Option<PendingApprovalOccurrence>,
-}
-
-struct ApprovalTerminalizationContext<'a> {
-    turn: &'a Turn,
-    thread: &'a Thread,
-    prior_status: Option<&'a AgentRunStatus>,
-    cancellation: &'a CancellationToken,
-    monitor_outcome: Option<CancellationMonitorOutcome>,
-    failure: TurnFailure,
 }
 
 enum TurnTerminalizationResult {
@@ -482,6 +437,8 @@ pub struct AppServer {
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// 每个活动 turn 的 steer 注入句柄（turn/input 运行中注入通道）。
+    steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     execution_stopped: Arc<AtomicBool>,
     output_order: OutputOrderCoordinator,
     pending_transport_trace_binding: Option<TransportTraceBinding>,
@@ -522,6 +479,7 @@ impl AppServerCancellationHandle {
 struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     cancellation: CancellationToken,
     monitor: Option<CancellationMonitor>,
     stabilized_monitor_outcome: Option<Option<CancellationMonitorOutcome>>,
@@ -644,21 +602,6 @@ impl ActiveTurnGuard {
         }
     }
 
-    fn monitor_outcome(&self) -> Option<CancellationMonitorOutcome> {
-        if let Some(outcome) = self.stabilized_monitor_outcome {
-            return outcome;
-        }
-        self.monitor.as_ref().and_then(|monitor| {
-            CancellationMonitorOutcome::from_code(monitor.control.outcome.load(Ordering::SeqCst))
-        })
-    }
-
-    fn monitor_control(&self) -> Option<&CancellationMonitorControl> {
-        self.monitor
-            .as_ref()
-            .map(|monitor| monitor.control.as_ref())
-    }
-
     /// 在终态提交前冻结 monitor 结果，避免取消 token 覆盖晚到的基础设施故障。
     fn stabilize_monitor(
         &mut self,
@@ -711,6 +654,9 @@ impl Drop for ActiveTurnGuard {
         self.teardown_monitor_with_timeout(shutdown_wait);
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
+        }
+        if let Ok(mut steer_handles) = self.steer_handles.lock() {
+            steer_handles.remove(&self.turn_id);
         }
     }
 }
@@ -893,115 +839,6 @@ fn cancellation_monitor(
     }))
 }
 
-fn approval_terminal_status(
-    thread: &Thread,
-    decision: &ApprovalDecision,
-    pending_approval: Option<&PendingApprovalOccurrence>,
-    status: AgentStatus,
-    audit_decision: &str,
-    message: impl Into<String>,
-) -> AgentRunStatus {
-    let mut run_status = AgentRunStatus::failed(message).with_status(status);
-    run_status.approval_count = 1;
-    let mut audit_event = json!({
-        "approval_policy": thread.approval_policy,
-        "approval_decision": audit_decision,
-        "approval_request_id": decision.request_id,
-        "approval_decision_id": decision.decision_id,
-        "command_provenance": "agent_requested",
-    });
-    if let Some(command_audit) = pending_command_audit_metadata(pending_approval, thread) {
-        merge_json_object(&mut audit_event, command_audit);
-    }
-    run_status
-        .audit_events
-        .push(project_audit_event(&audit_event));
-    run_status
-}
-
-/// 在 approval 请求进入执行状态前，唯一解码 opaque checkpoint 的 typed 边界。
-fn decode_pending_approval(
-    request: &ApprovalRequest,
-    payload: Option<&Value>,
-) -> AppServerResult<Option<PendingApprovalOccurrence>> {
-    match (request.tool_call_id.is_some(), payload) {
-        (false, None) => Ok(None),
-        (true, Some(payload)) => {
-            PendingApprovalOccurrence::from_checkpoint_payload(request.clone(), payload)
-                .map(Some)
-                .map_err(|error| {
-                    AppServerError::Store(StoreError::InvalidState(format!(
-                        "{APPROVAL_CHECKPOINT_REQUIRED}: {error}"
-                    )))
-                })
-        }
-        (true, None) | (false, Some(_)) => Err(AppServerError::Store(StoreError::InvalidState(
-            APPROVAL_CHECKPOINT_REQUIRED.to_string(),
-        ))),
-    }
-}
-
-fn pending_command_audit_metadata(
-    pending_approval: Option<&PendingApprovalOccurrence>,
-    thread: &Thread,
-) -> Option<Value> {
-    let pending = pending_approval?.pending_tool_call();
-    if pending.tool_name.as_str() != TOOL_COMMAND {
-        return None;
-    }
-    let scope_digest = pending
-        .resources
-        .iter()
-        .find_map(|resource| match resource {
-            PermissionResource::CommandScope(digest) => Some(digest.as_str()),
-            _ => None,
-        });
-    let audit = json!({
-        "sandbox_backend": "not_executed",
-        "sandbox_enforcement": "not_executed",
-        "sandbox_mode": sandbox_mode_audit_label(thread.sandbox_mode),
-        "network_access": "denied",
-        "command_scope_digest": scope_digest.unwrap_or("unavailable"),
-        "policy_scope_binding": if scope_digest.is_some() {
-            "bound"
-        } else {
-            "unavailable"
-        },
-    });
-    Some(audit)
-}
-
-fn merge_json_object(target: &mut Value, source: Value) {
-    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
-        for (key, value) in source {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-}
-
-/// 在 AppServer 与 Store 的持久化边界一次性编码 typed checkpoint。
-fn encode_pending_approvals(
-    checkpoints: &[PendingApprovalOccurrence],
-) -> Result<Vec<(ApprovalRequest, Value)>, StoreError> {
-    checkpoints
-        .iter()
-        .map(|occurrence| {
-            let payload = occurrence
-                .encode_checkpoint()
-                .map_err(StoreError::InvalidState)?;
-            Ok((occurrence.request().clone(), payload))
-        })
-        .collect()
-}
-
-fn workspace_tool_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::default();
-    for entry in workspace_tool_entries() {
-        registry.register(entry).expect("valid builtin tool");
-    }
-    registry
-}
-
 fn history_turn_limit(limit: Option<u32>) -> Result<usize, String> {
     let limit = limit.unwrap_or(DEFAULT_THREAD_HISTORY_TURN_LIMIT as u32);
     if limit == 0 || limit > MAX_THREAD_HISTORY_TURN_LIMIT as u32 {
@@ -1018,10 +855,10 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
         None => std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     };
-    let workspace_tools =
-        WorkspaceTools::new(path).map_err(|error| format!("failed to bind thread cwd: {error}"))?;
-    workspace_tools
-        .workspace_root()
+    // canonicalize 保留旧语义：cwd 必须是存在的真实目录（解析符号链接）。
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|_| "failed to bind thread cwd".to_string())?;
+    canonical
         .to_str()
         .map(str::to_string)
         .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
@@ -1039,87 +876,106 @@ fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn workspace_tools_for_thread(
-    thread: &Thread,
-    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
-) -> Result<WorkspaceTools, String> {
-    let workspace_path = workspace_path(thread).map_err(|_| SAFE_WORKSPACE_FAILURE.to_string())?;
-    WorkspaceTools::new(workspace_path)
-        .map(|tools| tools.with_shared_sandbox_backend(sandbox_backend))
-        .map_err(|_| SAFE_WORKSPACE_FAILURE.to_string())
+/// 线程级会话目录：workspace 根下的 `.singularity/agent-sessions/`（与旧 `sessions/` 隔离）。
+fn agent_sessions_dir(thread: &Thread) -> Result<PathBuf, String> {
+    Ok(workspace_path(thread)?.join(".singularity").join("agent-sessions"))
 }
 
-#[cfg(test)]
-fn workspace_tools(
-    workspace_root: PathBuf,
-    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
-) -> AppServerResult<WorkspaceTools> {
-    WorkspaceTools::new(workspace_root)
-        .map(|tools| tools.with_shared_sandbox_backend(sandbox_backend))
+/// 打开线程绑定的会话文件（`<thread_id>.jsonl`）；文件不存在时创建新会话。
+///
+/// thread ↔ 会话文件的确定性映射是跨轮历史的唯一通道（Phase 3a 起）。
+fn open_or_create_thread_session(thread: &Thread) -> AppServerResult<SessionManager> {
+    let sessions_dir = agent_sessions_dir(thread).map_err(|_| {
+        AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string())
+    })?;
+    let file = sessions_dir.join(format!("{}.jsonl", thread.thread_id));
+    if file.exists() {
+        SessionManager::open(&file)
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))
+    } else {
+        SessionManager::create_with_name(
+            Path::new(thread.cwd.as_deref().unwrap_or_default()),
+            &sessions_dir,
+            &thread.thread_id,
+        )
         .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))
+    }
 }
 
-fn agent_loop_input(
-    thread: &Thread,
-    params: &TurnStartParams,
-    turn_id: &str,
-    workspace_root: &std::path::Path,
-    history: &[ConversationMessage],
-    historical_seed: Option<&TurnCheckpoint>,
-    resolved_default_selector: Option<String>,
-) -> Result<AgentLoopInput, ProjectInstructionError> {
-    let goal = params
-        .input
-        .iter()
+/// 将持久化的 `InputItem` 数组投影为拼接文本（Agent 输入/转向消息的本地边界）。
+fn input_items_to_text(input: &Value) -> AppServerResult<String> {
+    let items: Vec<singularity_protocol::InputItem> =
+        serde_json::from_value(input.clone()).map_err(AppServerError::InvalidJson)?;
+    let text = items
+        .into_iter()
         .map(|item| match item {
-            singularity_protocol::InputItem::Text { text } => text.as_str(),
+            singularity_protocol::InputItem::Text { text } => text,
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let model_name = thread.model.clone().or(resolved_default_selector);
-    let mut input =
-        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(model_name);
-    if let Some(checkpoint) = historical_seed {
-        // 跨轮 seed：完整 checkpoint 历史是唯一历史通道，不再注入公共文本历史
-        // 或 provider history segments（避免双重注入）。
-        input = input.with_historical_checkpoint(checkpoint);
+    if text.trim().is_empty() {
+        return Err(AppServerError::Workspace(
+            "persisted turn input is empty".to_string(),
+        ));
+    }
+    Ok(text)
+}
+
+/// 组装新核心 `Agent` 的配置：model 选择器、system prompt（项目指令）、
+/// context window（provider 静态声明，缺省时用模型默认值）。
+fn agent_config_for_thread(
+    thread: &Thread,
+    provider: &dyn Provider,
+    snapshot: &ProviderConfigSnapshot,
+) -> AppServerResult<AgentConfig> {
+    let cwd = workspace_path(thread).map_err(|_| {
+        AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string())
+    })?;
+    let system_prompt = match load_project_instructions(&cwd, &cwd) {
+        Ok(Some(instructions)) => instructions.content().to_string(),
+        Ok(None) => String::new(),
+        Err(_) => String::new(),
+    };
+    let context_window = provider
+        .protocol_contract()
+        .max_context_tokens
+        .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS) as u64;
+    Ok(AgentConfig {
+        model: thread
+            .model
+            .clone()
+            .or_else(|| snapshot.resolved_default_selector())
+            .unwrap_or_default(),
+        system_prompt,
+        context_window,
+        ..AgentConfig::default()
+    })
+}
+
+/// 新核心 `AgentOutcome` → store/CLI 依赖的 `AgentRunStatus` 投影。
+///
+/// aborted 对应取消（Cancelled）；其余按 Completed 提交，final_text 为空时
+/// `agent_completed_delta` 的兜底路径会省略终态 delta（事件层 item/failed）。
+fn outcome_to_run_status(outcome: AgentOutcome) -> AgentRunStatus {
+    let mut status = AgentRunStatus::failed("agent loop did not reach a final assistant message");
+    if outcome.aborted {
+        mark_run_cancelled(&mut status);
     } else {
-        let history = history.iter().map(|message| match message.role {
-            ConversationRole::User => {
-                AgentContextItem::history_user(&message.item_id, &message.content)
-            }
-            ConversationRole::Assistant => {
-                AgentContextItem::history_assistant(&message.item_id, &message.content)
-            }
-        });
-        input = input.with_history(history);
+        status.status = AgentStatus::Completed;
+        status.error = None;
+        status.final_answer = Some(outcome.final_text.clone())
+            .filter(|text| !text.trim().is_empty());
     }
-    if let Some(instructions) = load_project_instructions(workspace_root, workspace_root)? {
-        input = input.with_project_instructions(instructions);
-    }
-    Ok(input)
+    status.model_turns = outcome.turns;
+    status.model_usage = outcome.usage;
+    status
 }
 
 fn agent_loop_capability(sandbox_backend: &dyn SandboxBackend) -> AgentLoopCapability {
-    if sandbox_backend.capabilities().enforcement() == SandboxBackendEnforcement::Strict {
-        AgentLoopCapability::available(format!(
-            "AgentLoop uses the {} strict sandbox backend",
-            sandbox_backend.name()
-        ))
-    } else {
-        AgentLoopCapability::unavailable(
-            format!(
-                "AgentLoop requires a strict command sandbox; backend {} is unavailable",
-                sandbox_backend.name()
-            ),
-            STRICT_COMMAND_SANDBOX_UNAVAILABLE,
-        )
-    }
-}
-
-fn agent_loop_ready(sandbox_backend: &dyn SandboxBackend) -> bool {
-    let capability = agent_loop_capability(sandbox_backend);
-    agent_loop_capability_ready(&capability)
+    AgentLoopCapability::available(format!(
+        "AgentLoop uses the headless core; {} sandbox backend gating is not applied",
+        sandbox_backend.name()
+    ))
 }
 
 fn provider_configuration(snapshot: &ProviderConfigSnapshot) -> ProviderConfigurationStatus {
@@ -1170,52 +1026,24 @@ impl AppServer {
             .provider_for_selector(thread.model.as_deref())
     }
 
-    /// 最近一个 completed turn 的完整 checkpoint，作为下一轮的历史 seed。
-    ///
-    /// 选择入口是 `turns.status=completed`（不得直接取 `turn_checkpoints` 表最新行，
-    /// 该表还保存非终态快照）；checkpoint 非法或 thread/turn 绑定不符时 fail closed。
-    fn completed_turn_seed(&self, thread_id: &str) -> AppServerResult<Option<TurnCheckpoint>> {
-        let Some(turn_id) = self.store.latest_completed_turn_id(thread_id)? else {
-            return Ok(None);
-        };
-        let Some(payload) = self.store.get_turn_checkpoint(&turn_id)? else {
-            return Ok(None);
-        };
-        let checkpoint = TurnCheckpoint::decode(&payload).map_err(|error| {
-            AppServerError::Store(StoreError::InvalidState(format!(
-                "completed turn checkpoint is invalid: {error}"
-            )))
-        })?;
-        if checkpoint.thread_id() != thread_id || checkpoint.turn_id() != turn_id {
-            return Err(AppServerError::Store(StoreError::InvalidState(
-                "completed turn checkpoint binding mismatch".to_string(),
-            )));
-        }
-        Ok(Some(checkpoint))
-    }
-}
-
-fn agent_loop_capability_ready(capability: &AgentLoopCapability) -> bool {
-    capability.available
-        && capability.blockers.is_empty()
-        && capability.status == AgentStatus::Completed
-}
-
-fn agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
-    let blockers = if capability.blockers.is_empty() {
-        "none".to_string()
-    } else {
-        capability.blockers.join(",")
-    };
-    format!(
-        "AgentLoop is not available: status={}; blockers={blockers}",
-        capability.status.as_str()
-    )
-}
-fn sandbox_mode_audit_label(mode: PermissionProfileName) -> &'static str {
-    match mode {
-        PermissionProfileName::ReadOnly => "read_only",
-        PermissionProfileName::WorkspaceWrite => "workspace_write",
+    /// 返回解析后的 provider（测试覆盖优先），并组装新核心 Agent 配置。
+    fn provider_and_config_for_thread(
+        &self,
+        thread: &Thread,
+    ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig)> {
+        let provider: Arc<dyn Provider + Send + Sync> =
+            if let Some(test_provider) = &self.test_provider_override {
+                Arc::clone(test_provider)
+            } else {
+                Arc::new(self.provider_for_thread(thread).map_err(|_| {
+                    AppServerError::TurnExecution {
+                        stage: TurnFailureStage::AgentLoop,
+                        cause: TurnFailureCause::Internal,
+                    }
+                })?)
+            };
+        let config = agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
+        Ok((provider, config))
     }
 }
 
@@ -1251,6 +1079,7 @@ fn turn_failure_cause(error: &AppServerError) -> TurnFailureCause {
         AppServerError::Store(_) => TurnFailureCause::Store,
         AppServerError::ProjectInstructions(_) => TurnFailureCause::ProjectInstructions,
         AppServerError::Workspace(_) => TurnFailureCause::Workspace,
+        AppServerError::Agent(_) => TurnFailureCause::Internal,
         AppServerError::InvalidJson(_) => TurnFailureCause::Serialization,
         AppServerError::InvalidParams(_) => TurnFailureCause::Internal,
         AppServerError::TurnExecution { cause, .. }
@@ -1301,28 +1130,6 @@ fn failed_turn_status(failure: TurnFailure) -> AgentRunStatus {
     status
 }
 
-/// 将 AgentLoop 内部失败投影为固定摘要，并保留稳定的阶段/原因审计字段。
-fn safe_failed_agent_status(message: &'static str, cause: &'static str) -> AgentRunStatus {
-    let mut status = AgentRunStatus::failed(message).with_status(AgentStatus::Failed);
-    status.audit_events.push(json!({
-        "component": "app_server",
-        "failure_kind": "agent_loop",
-        "failure_stage": TurnFailureStage::AgentLoop.as_str(),
-        "failure_cause": cause,
-    }));
-    status
-}
-
-/// 不允许 AgentLoop、provider 或 workspace 的原始错误进入状态和持久化边界。
-fn sanitize_agent_run_status_error(status: &mut AgentRunStatus) {
-    if status.error.is_some() {
-        status.error = Some(SAFE_AGENT_LOOP_FAILURE.to_string());
-    }
-    if let Some(provider_diagnostic) = status.provider_diagnostic.as_mut() {
-        provider_diagnostic.validation_errors.clear();
-    }
-}
-
 fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
     match status {
         AgentStatus::Completed => TurnStatus::Completed,
@@ -1355,48 +1162,20 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
         "agent_loop",
         "AgentLoop result translated",
     );
+    // 新核心（Phase 3a）不再提供 context/provider attempt/provider protocol 观测；
+    // 终态 trace 只投影 AgentOutcome 能提供的字段。
     event.payload = json!({
         "component": "agent_loop",
         "status": status.status.as_str(),
         "model_turns": status.model_turns,
         "model_turn_limit": status.model_turn_limit,
-        "context": status.context_trace.as_ref().map(|context| json!({
-            "included_item_ids": context
-                .included_item_ids
-                .iter()
-                .map(|item_id| redact_app_server_text(item_id))
-                .collect::<Vec<_>>(),
-            "excluded_item_ids": context
-                .excluded_item_ids
-                .iter()
-                .map(|item_id| redact_app_server_text(item_id))
-                .collect::<Vec<_>>(),
-            "budget": &context.budget,
-            "compaction_count": context.compaction_count,
-            "compacted_message_count": context.compacted_message_count,
-            "last_compaction_before_tokens": context.last_compaction_before_tokens,
-            "last_compaction_after_tokens": context.last_compaction_after_tokens,
-        })),
-        "tool_calls": status.tool_calls,
-        "approval_count": status.approval_count,
         "model_usage": &status.model_usage,
-        "provider_attempts": &status.provider_attempts,
-        "provider_protocol": {
-            "contract": &status.provider_protocol_contract,
-            "capability_metadata": &status.provider_capability_metadata,
-        },
+        "final_text": status.final_answer.as_deref().map(redact_app_server_text),
         "audit_events": &status.audit_events,
         "error": status
             .error
             .as_deref()
             .map(|_| SAFE_AGENT_LOOP_FAILURE),
-        "provider_diagnostic": status.provider_diagnostic.as_ref().map(|diagnostic| json!({
-            "code": &diagnostic.code,
-            "stage": &diagnostic.stage,
-            "transport_category": &diagnostic.transport_category,
-            "timeout_seconds": diagnostic.timeout_seconds,
-            "http_status": diagnostic.http_status,
-        })),
     });
     event
 }

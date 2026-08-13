@@ -1,6 +1,6 @@
 //! AppServer protocol、approval continuation、recovery 和 sandbox 边界测试。
 
-use singularity_app_server::{AppServer, AppServerError};
+use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
 use singularity_model::{ModelUsage, ProviderAttemptMetadata, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
@@ -91,23 +91,6 @@ fn request_worker_reopens_the_initialized_file_store() {
         thread.thread_id
     );
 }
-
-fn configured_app_server(store: SessionStore) -> AppServer {
-    AppServer::new(
-        store,
-        ProviderConfigSnapshot::capture(
-            |name| match name {
-                "SINGULARITY_MODEL" => Some("test-model".to_string()),
-                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
-                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
-                _ => None,
-            },
-            None,
-            None,
-        ),
-    )
-}
-
 #[test]
 fn configured_provider_drops_cleanly_inside_app_server_runtime() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -534,16 +517,19 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
         );
     }
 
-    let turn = server
+    let turn_error = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{}","input":[{{"type":"text","text":"do not run"}}]}}}}"#,
             active_missing.thread_id
         ))
-        .expect("turn response");
-    assert!(
-        turn[0]["error"]["message"].as_str().expect("turn error")
-            == "workspace capability unavailable"
-    );
+        .expect_err("turn start without workspace must fail");
+    assert!(matches!(
+        turn_error,
+        AppServerError::TurnExecution {
+            stage: TurnFailureStage::AgentLoop,
+            cause: TurnFailureCause::Workspace,
+        }
+    ));
 
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert_eq!(
@@ -1204,244 +1190,6 @@ fn pending_approval_prevents_thread_archive_and_delete() {
 }
 
 #[test]
-fn allow_resume_precondition_failure_is_terminalized_without_replay() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let file_path = workspace.join("README.md");
-    std::fs::write(&file_path, "before").expect("readme");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let mut server = configured_app_server(store);
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .expect("initialize");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialized");
-    subscribe_events(&mut server);
-
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let thread = store
-        .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    // Deliberately omit the durable user-input item. On Windows the Allow is claimed first,
-    // then resume reaches this ordinary runtime inconsistency before any tool executes. On
-    // unsupported platforms, the capability gate fails closed before that seam is reached.
-    let turn = store
-        .create_turn(&thread.thread_id, "blocked")
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            singularity_protocol::TurnStatus::Blocked,
-            "blocked",
-        )
-        .expect("blocked turn");
-    let request = ApprovalRequest::new(
-        "approval_resume_error",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(approval_checkpoint(&request, "call_1")),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    drop(store);
-
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "operator approved",
-    );
-    let response = server
-        .handle_json(
-            &serde_json::json!({
-                "jsonrpc": "2.0", "method": "approval/decision",
-                "id": 4,
-                "params": decision,
-            })
-            .to_string(),
-        )
-        .expect("allow error converges in current process");
-    assert!(response.iter().any(|message| {
-        message["method"] == "turn/completed" && message["params"]["turn"]["status"] == "failed"
-    }));
-    assert_eq!(
-        response.last().expect("decision response")["result"]["decision"]["outcome"],
-        "allow"
-    );
-
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let failed_turn = store.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(failed_turn.status, singularity_protocol::TurnStatus::Failed);
-    assert_eq!(failed_turn.agent_loop_status, "failed");
-    assert!(
-        !store
-            .has_pending_tool_call(&request.request_id)
-            .expect("pending lookup")
-    );
-    assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    let terminal_trace = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .into_iter()
-        .find(|trace| trace.component == "agent_loop" && trace.payload["status"] == "failed")
-        .expect("terminal trace");
-    let error = terminal_trace.payload["error"]
-        .as_str()
-        .expect("terminal trace error");
-    assert_eq!(error, "agent loop execution failed");
-    assert_eq!(
-        std::fs::read_to_string(file_path).expect("readme"),
-        "before"
-    );
-}
-
-#[test]
-fn unavailable_workspace_only_blocks_allow_decisions() {
-    for outcome in [
-        ApprovalOutcome::Allow,
-        ApprovalOutcome::Deny,
-        ApprovalOutcome::Defer,
-    ] {
-        let outcome_label = match outcome {
-            ApprovalOutcome::Allow => "allow",
-            ApprovalOutcome::Deny => "deny",
-            ApprovalOutcome::Defer => "defer",
-        };
-        let dir = tempfile::tempdir().expect("temp dir");
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let db_path = dir.path().join("sessions.sqlite3");
-        let store = SessionStore::open(&db_path).expect("open store");
-        let mut server = app_server(store);
-        server
-                .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-                .expect("initialize");
-        server
-            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-            .expect("initialized");
-
-        let store = SessionStore::open(&db_path).expect("reopen store");
-        let thread = store
-            .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
-            .expect("thread");
-        let (turn, _item, _trace) = store
-            .create_turn_with_input_and_trace(
-                &thread.thread_id,
-                "blocked",
-                serde_json::json!([{"type": "text", "text": "edit readme"}]),
-                "app_server",
-                "turn started",
-            )
-            .expect("turn");
-        store
-            .update_turn_state(
-                &turn.turn_id,
-                singularity_protocol::TurnStatus::Blocked,
-                "blocked",
-            )
-            .expect("blocked turn");
-        let request = ApprovalRequest::new(
-            format!("approval_workspace_missing_{outcome_label}"),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            tool_id("patch"),
-        )
-        .with_tool_call_id("call_1")
-        .with_resources([workspace_resource("README.md")]);
-        store
-            .create_approval_with_pending_tool_call_and_trace(
-                &request,
-                Some(approval_checkpoint(&request, "call_1")),
-                "approval",
-                "approval requested",
-            )
-            .expect("approval");
-        std::fs::remove_dir(&workspace).expect("remove workspace");
-        drop(store);
-
-        let decision =
-            ApprovalDecision::new(request.request_id.clone(), outcome, "operator decision");
-        let response = server
-            .handle_json(
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "method": "approval/decision",
-                    "id": 4,
-                    "params": decision,
-                })
-                .to_string(),
-            )
-            .expect("decision response");
-        let store = SessionStore::open(&db_path).expect("reopen store");
-
-        match outcome {
-            ApprovalOutcome::Allow => {
-                assert!(response[0]["error"]["message"].is_string());
-                assert!(
-                    store
-                        .has_pending_tool_call(&request.request_id)
-                        .expect("pending")
-                );
-                assert!(
-                    store
-                        .list_approval_decisions()
-                        .expect("decisions")
-                        .is_empty()
-                );
-                assert_eq!(
-                    store.get_turn(&turn.turn_id).expect("turn").status,
-                    singularity_protocol::TurnStatus::Blocked
-                );
-            }
-            ApprovalOutcome::Deny => {
-                assert_eq!(
-                    response.last().expect("decision response")["result"]["decision"]["outcome"],
-                    "deny"
-                );
-                assert!(
-                    !store
-                        .has_pending_tool_call(&request.request_id)
-                        .expect("pending")
-                );
-                assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
-                assert_eq!(
-                    store.get_turn(&turn.turn_id).expect("turn").status,
-                    singularity_protocol::TurnStatus::Failed
-                );
-            }
-            ApprovalOutcome::Defer => {
-                assert_eq!(response[0]["result"]["decision"]["outcome"], "defer");
-                assert!(
-                    store
-                        .has_pending_tool_call(&request.request_id)
-                        .expect("pending")
-                );
-                assert!(
-                    store
-                        .list_approval_decisions()
-                        .expect("decisions")
-                        .is_empty()
-                );
-                assert_eq!(
-                    store.get_turn(&turn.turn_id).expect("turn").status,
-                    singularity_protocol::TurnStatus::Blocked
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
@@ -1971,9 +1719,9 @@ fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_mess
     }));
     let traces = store.list_trace(&thread_id).expect("provider trace");
     assert!(traces.iter().any(|event| {
-        event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
-            && event.span_phase == Some(singularity_protocol::TraceSpanPhase::End)
-            && event.time_to_first_token_ms.is_some()
+        event.payload["observation"] == "agent_outcome"
+            && event.payload["status"] == "completed"
+            && event.payload["turns"] == 1
     }));
 }
 
@@ -2053,125 +1801,6 @@ fn app_server_serializes_shared_workspace_across_processes_and_observes_interrup
     release.send(()).expect("release provider");
     provider_worker.join().expect("provider worker joins");
     shutdown_process(&mut primary, &mut primary_input, &mut primary_output, 6);
-}
-
-#[cfg(windows)]
-#[test]
-fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    std::fs::write(workspace.join("README.md"), "before").expect("readme");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let (base_url, accepted, release, provider_worker) = hanging_provider();
-
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let (turn, _item, _trace) = store
-        .create_turn_with_input_and_trace(
-            &thread.thread_id,
-            "blocked",
-            serde_json::json!([{"type": "text", "text": "edit readme"}]),
-            "app_server",
-            "approval turn",
-        )
-        .expect("turn");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            singularity_protocol::TurnStatus::Blocked,
-            "blocked",
-        )
-        .expect("blocked state");
-    let request = ApprovalRequest::new(
-        format!("approval_{}_call_1", turn.turn_id),
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("patch"),
-    )
-    .with_tool_call_id("call_1")
-    .with_resources([workspace_resource("README.md")]);
-    let mut checkpoint = approval_checkpoint(&request, "call_1");
-    let arguments = serde_json::json!({
-        "changes": [{
-            "path": "README.md",
-            "expected": "before",
-            "replacement": "after"
-        }]
-    });
-    checkpoint["raw_arguments"] = serde_json::json!(arguments.to_string());
-    checkpoint["messages"][0]["tool_calls"][0]["arguments"] = arguments.clone();
-    checkpoint["messages"][0]["tool_calls"][0]["raw_arguments"] =
-        serde_json::json!(arguments.to_string());
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint),
-            "approval",
-            "approval requested",
-        )
-        .expect("approval");
-    drop(store);
-
-    let (mut child, mut input, mut output) = spawn_app_server(&db_path, &workspace, &base_url);
-    initialize_process(&mut input, &mut output);
-    send_json(
-        &mut input,
-        serde_json::json!({
-            "jsonrpc": "2.0", "method": "approval/decision",
-            "id": 3,
-            "params": {
-                "request_id": request.request_id,
-                "decision_id": "decision_approval_continuation",
-                "outcome": "allow",
-                "reason": "operator approved"
-            }
-        }),
-    );
-    accepted
-        .recv_timeout(Duration::from_secs(2))
-        .expect("approval continuation reached provider");
-
-    send_json(
-        &mut input,
-        serde_json::json!({
-            "jsonrpc": "2.0", "method": "turn/interrupt",
-            "id": 4,
-            "params": {"turnId": turn.turn_id}
-        }),
-    );
-    let interrupt = output.recv_id(4, Duration::from_secs(2));
-    assert_eq!(interrupt["result"]["status"], "cancel_requested");
-    assert_eq!(interrupt["result"]["agent_loop_status"], "cancel_requested");
-
-    send_json(
-        &mut input,
-        serde_json::json!({
-            "jsonrpc": "2.0", "method": "server/shutdown",
-            "id": 5,
-            "params": {}
-        }),
-    );
-    let shutdown = output.recv_id(5, Duration::from_secs(2));
-    assert_eq!(shutdown["result"]["shutdown"], true);
-
-    release.send(()).expect("release provider");
-    let decision = output.recv_id(3, Duration::from_secs(7));
-    assert_eq!(decision["result"]["decision"]["outcome"], "allow");
-    drop(input);
-    let status = child.wait().expect("wait app-server");
-    assert!(status.success(), "app-server exited with {status}");
-    provider_worker.join().expect("provider worker joins");
-
-    let store = SessionStore::open(&db_path).expect("reopen store");
-    let persisted = store.get_turn(&turn.turn_id).expect("persisted turn");
-    assert_eq!(
-        persisted.status,
-        singularity_protocol::TurnStatus::Interrupted
-    );
-    assert_eq!(persisted.agent_loop_status, "cancelled");
 }
 
 #[test]

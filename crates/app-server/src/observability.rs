@@ -1,15 +1,14 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use singularity_agent::PendingApprovalOccurrence;
 use singularity_agent::{
     AgentLoopEvent, AgentObservation, AgentRunStatus, OccurrenceIdentity, OccurrenceLifecycle,
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus, PromptAssemblyStatus,
     ProviderAttemptObservation, ProviderAttemptStatus as AgentProviderAttemptStatus,
     ProviderAttemptUsageObservation, SandboxExecutionOccurrence, SandboxExecutionStatus,
     ToolCallStatus, ToolResultObservation,
+    agent::AgentOutcome,
 };
-use singularity_core::{Timestamp, bounded_stable_code};
+use singularity_core::{Timestamp, bounded_stable_code, contains_sensitive_text};
 use singularity_model::{
     ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase,
     ProviderCapabilityCacheLookupResult,
@@ -137,24 +136,58 @@ impl<'a> TraceProjector<'a> {
     }
 
     /// Project an approval denial that terminates a pending tool call without resuming AgentLoop.
-    /// The standalone sample has no timing semantics, so omitting its timestamp keeps retries
-    /// byte-identical while preserving the stable event identity.
-    #[cfg(test)]
-    pub(crate) fn project_approval_denied(
-        &self,
-        pending: &PendingApprovalOccurrence,
-    ) -> Result<(), StoreError> {
-        if !pending.first_attempt().map_err(StoreError::InvalidState)? {
-            return Ok(());
-        }
-        let identity = format!("approval_deny:{}", pending.request().request_id);
-        self.append_metric_sample(
-            &identity,
-            None,
-            TraceMetricSampleKind::ToolFirstAttemptFailure,
-            "tool first attempt approval denial",
-            "tool_first_attempt",
-        )
+
+    /// 投影一次工具执行（`AgentEvents::on_tool_execution_start` 回调，Phase 3a 新核心）。
+    ///
+    /// 参数原文不落 trace（可能含敏感内容），只投影名称与参数摘要；
+    /// 同一 turn 内相同名称+参数只写一条（幂等）。
+    pub fn project_tool_execution(&self, tool_name: &str, args: &str) -> Result<(), StoreError> {
+        let args_digest = digest_identifier(args);
+        let identity = format!("tool_execution:{tool_name}:{args_digest}");
+        let mut event = self.new_trace_event(
+            trace_event_id(&self.session_id, &identity, TraceSpanPhase::End),
+            "tool execution",
+        );
+        event.payload = json!({
+            "observation": "tool_execution",
+            "tool_name": tool_name,
+            "arguments_digest": args_digest,
+        });
+        self.store.append_trace_idempotent(&event).map(|_| ())
+    }
+
+    /// 投影 `Agent::run` 终态（usage/turns/compaction 等聚合信息，Phase 3a 新核心）。
+    pub fn project_outcome(&self, outcome: &AgentOutcome) -> Result<(), StoreError> {
+        let status_label = if outcome.aborted {
+            "aborted"
+        } else {
+            "completed"
+        };
+        let identity = format!("agent_outcome:{}:{status_label}", self.session_id);
+        let mut event = self.new_trace_event(
+            trace_event_id(&self.session_id, &identity, TraceSpanPhase::End),
+            "agent outcome",
+        );
+        event.payload = json!({
+            "observation": "agent_outcome",
+            "status": status_label,
+            "turns": outcome.turns,
+            "compacted": outcome.compacted,
+            "aborted": outcome.aborted,
+            "usage": {
+                "input_tokens": outcome.usage.input_tokens,
+                "output_tokens": outcome.usage.output_tokens,
+                "total_tokens": outcome.usage.total_tokens,
+                "cached_input_tokens": outcome.usage.cached_input_tokens,
+                "reasoning_tokens": outcome.usage.reasoning_tokens,
+            },
+            "final_text": if outcome.final_text.trim().is_empty() {
+                Value::Null
+            } else {
+                json!(redact_app_server_text(&outcome.final_text))
+            },
+        });
+        self.store.append_trace_idempotent(&event).map(|_| ())
     }
 
     fn project_observation(&mut self, observation: AgentObservation) -> Result<(), StoreError> {
@@ -518,6 +551,14 @@ impl<'a> TraceProjector<'a> {
 fn trace_event_id(turn_id: &str, identity: &str, phase: TraceSpanPhase) -> String {
     let material = format!("{turn_id}\u{0}{identity}\u{0}{}", phase.as_storage_text());
     format!("trace_obs_{:x}", Sha256::digest(material.as_bytes()))
+}
+
+fn redact_app_server_text(text: &str) -> String {
+    if contains_sensitive_text(text) {
+        "[redacted sensitive app-server output]".to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 fn digest_identifier(value: &str) -> String {
