@@ -5,7 +5,7 @@
 //! 变更操作使用事务和显式绑定，使 turn 结果与执行所有权能够恢复，
 //! 且无需重放未知的外部副作用。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +32,6 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 13;
-const THREAD_POLICY_SCHEMA_VERSION: u32 = 9;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 // 保留历史 migration id；当前代码不表达密码学 ledger。
 const DURABLE_EVENT_HISTORY_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
@@ -46,9 +45,6 @@ const STABLE_ENUM_TEXT_SCHEMA_MIGRATION: &str = "0010_stable_enum_text";
 const TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION: &str = "0011_typed_permission_resources";
 const TYPED_TRACE_SPAN_SCHEMA_MIGRATION: &str = "0012_typed_trace_spans";
 const TURN_RESUME_CHECKPOINT_SCHEMA_MIGRATION: &str = "0013_turn_resume_checkpoints";
-// This migration existed only while the removed sidecar-run runtime was live.
-// It is accepted while reading old databases and deliberately not retained in the current schema.
-const RETIRED_ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
 const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
 const HISTORY_SCAN_BATCH_TURNS: usize = 64;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;

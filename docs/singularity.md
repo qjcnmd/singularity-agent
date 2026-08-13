@@ -267,7 +267,7 @@ flowchart LR
 - batch 按输入顺序串行分发；notification 项不产生响应；batch response 保持输入顺序。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（目标形态）**：收敛为 Pi RPC 级命令集 + 事件流——initialize/initialized 握手、thread 生命周期命令（start/fork/resume 等）、turn 命令（start/input/pause/resume/interrupt/status 等）、server/shutdown；事件流为实时输出，使用 Pi 事件集（agent_start / agent_end / agent_settled、turn_start / turn_end、message_start / message_update / message_end、tool_execution_start / update / end、compaction_start / compaction_end、session_compact、session_start / session_shutdown 等），**会话文件是唯一持久记录**。最终命令清单在 Phase 2/6 定稿（遗留事项）。
+**命令/事件集（目标形态）**：收敛为 Pi RPC 级命令集 + 事件流——initialize/initialized 握手、thread 生命周期命令（start/fork/resume 等）、turn 命令（start/input/pause/resume/interrupt/status 等）、server/shutdown；事件流为实时输出，使用 Pi 事件集（agent_start / agent_end / agent_settled、turn_start / turn_end、message_start / message_update / message_end、tool_execution_start / update / end、compaction_start / compaction_end、session_compact、session_start / session_shutdown 等），**会话文件是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出；客户端事件投影只含安全字段，不泄露 raw payload。
 
