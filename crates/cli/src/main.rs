@@ -12,13 +12,11 @@ use serde_json::{Value, json};
 use singularity_core::ClientInfo;
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
-    AgentCapabilityResult, EmptyParams,
-    EventClass, EventDelivery, EventGapReason, EventMetadata, EventRecoveryQuery,
-    EventSubscribeParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId, JsonRpcMessage,
-    JsonRpcNotification, Method, ProviderConfigurationStatus, RpcMethod,
-    Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams,
-    Turn, TurnEventParams, TurnIdParams, TurnInputDelivery,
-    TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
+    AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
+    ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method,
+    ProviderConfigurationStatus, RpcMethod, Thread, ThreadEventParams, ThreadIdParams,
+    ThreadStartParams, Turn, TurnEventParams, TurnIdParams, TurnInputDelivery, TurnInputParams,
+    TurnStartParams, TurnStatus, rpc_methods,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -31,16 +29,6 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const EVENT_TYPES: &[&str] = &[
-    "thread/started",
-    "turn/started",
-    "turn/completed",
-    "item/started",
-    "item/completed",
-    "item/failed",
-    "item/agentMessage/delta",
-    "item/commandExecution/outputDelta",
-];
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -389,8 +377,6 @@ struct AppServerClient {
     stdout_reader: Option<JoinHandle<()>>,
     response_timeout: Duration,
     next_id: i64,
-    subscription_id: Option<String>,
-    event_cursor: u64,
 }
 
 /// 与 typed request id 匹配的结果及其之前到达的通知。
@@ -427,38 +413,16 @@ impl AppServerClient {
             stdout_reader: Some(stdout_reader),
             response_timeout: RESPONSE_TIMEOUT,
             next_id: 1,
-            subscription_id: None,
-            event_cursor: 0,
         })
     }
 
-    // 完成 JSON-RPC initialize/initialized 握手。
+    // 完成 JSON-RPC initialize/initialized 握手；事件全量接收，无需订阅。
     fn initialize(&mut self) -> Result<(), String> {
         let _ = self.request::<rpc_methods::Initialize>(&InitializeParams {
             client_info: ClientInfo::new(CLI_CLIENT_NAME, CLI_CLIENT_TITLE, CLI_CLIENT_VERSION),
             capabilities: None,
         })?;
         self.notify::<rpc_methods::Initialized>(&EmptyParams::default())?;
-        let reply = self.request::<rpc_methods::EventSubscribe>(&EventSubscribeParams {
-            event_types: EVENT_TYPES
-                .iter()
-                .map(|event| (*event).to_string())
-                .collect(),
-            cursor: None,
-        })?;
-        if reply.notifications.is_empty() {
-            return Err(
-                "app-server event/subscribe response omitted cursor-not-replayed gap".to_string(),
-            );
-        }
-        let result = reply.result;
-        if result.subscription_id.is_empty() || result.cursor == 0 {
-            return Err("app-server returned an invalid event subscription cursor".to_string());
-        }
-        if self.event_cursor != result.cursor {
-            return Err("event/subscribe cursor does not match its preceding gap".to_string());
-        }
-        self.subscription_id = Some(result.subscription_id);
         Ok(())
     }
 
@@ -647,26 +611,12 @@ impl AppServerClient {
             .map_err(|error| format!("failed to serialize app-server request: {error}"))?;
         self.write_message(&message)?;
         let mut notifications = Vec::new();
-        let mut initial_gap_seen = false;
         loop {
             match self.read_message(self.response_timeout)? {
                 JsonRpcMessage::Notification(notification) => {
-                    if self.subscription_id.is_some() || method == Method::EventSubscribe {
-                        self.validate_event_notification(
-                            &notification,
-                            method == Method::EventSubscribe,
-                            &mut initial_gap_seen,
-                        )?;
-                    }
                     notifications.push(notification);
                 }
                 JsonRpcMessage::Success(response) if response.id == id => {
-                    if method == Method::EventSubscribe && !initial_gap_seen {
-                        return Err(
-                            "event/subscribe response arrived before cursor-not-replayed gap"
-                                .to_string(),
-                        );
-                    }
                     let result = serde_json::from_value(response.result)
                         .map_err(|error| format!("invalid {} result: {error}", method.as_str()))?;
                     return Ok(RpcReply {
@@ -683,79 +633,6 @@ impl AppServerClient {
                 }
             }
         }
-    }
-
-    /// 严格校验事件 cursor、delivery、gap 范围和可调用恢复入口。
-    fn validate_event_notification(
-        &mut self,
-        notification: &JsonRpcNotification,
-        initial_subscription: bool,
-        initial_gap_seen: &mut bool,
-    ) -> Result<(), String> {
-        let metadata_value = notification
-            .params
-            .get("event")
-            .cloned()
-            .ok_or_else(|| "event notification is missing typed metadata".to_string())?;
-        let metadata: EventMetadata = serde_json::from_value(metadata_value)
-            .map_err(|_| "event notification has invalid typed metadata".to_string())?;
-        if metadata.sequence == 0 || metadata.cursor == 0 || metadata.sequence != metadata.cursor {
-            return Err(
-                "event notification cursor and sequence must be non-zero and equal".to_string(),
-            );
-        }
-        let expected = self
-            .event_cursor
-            .checked_add(1)
-            .ok_or_else(|| "event cursor exhausted".to_string())?;
-        if initial_subscription {
-            if *initial_gap_seen
-                || notification.method != "event/gap"
-                || metadata.class != EventClass::Gap
-                || metadata.delivery != EventDelivery::Gap
-            {
-                return Err("event/subscribe must begin with one typed gap".to_string());
-            }
-            let gap = metadata
-                .gap
-                .as_ref()
-                .ok_or_else(|| "event gap metadata is missing its range".to_string())?;
-            if gap.reason != EventGapReason::CursorNotReplayed
-                || gap.from_cursor != expected
-                || gap.to_cursor != metadata.cursor
-            {
-                return Err("event/subscribe gap has an invalid cursor range".to_string());
-            }
-            *initial_gap_seen = true;
-            self.event_cursor = metadata.cursor;
-            return Ok(());
-        }
-        if metadata.sequence != expected {
-            return Err(format!(
-                "event cursor gap is not declared: expected {expected}, got {}",
-                metadata.sequence
-            ));
-        }
-        match metadata.class {
-            EventClass::State if metadata.delivery == EventDelivery::Reliable => {}
-            EventClass::Progress if metadata.delivery == EventDelivery::BestEffort => {}
-            EventClass::Gap if metadata.delivery == EventDelivery::Gap => {
-                let gap = metadata
-                    .gap
-                    .as_ref()
-                    .ok_or_else(|| "event gap metadata is missing its range".to_string())?;
-                if gap.reason == EventGapReason::CursorNotReplayed
-                    || gap.from_cursor != expected
-                    || gap.to_cursor != metadata.cursor
-                {
-                    return Err("event gap has an invalid reason or cursor range".to_string());
-                }
-            }
-            _ => return Err("event class and delivery do not match".to_string()),
-        }
-        validate_event_recovery(notification, &metadata)?;
-        self.event_cursor = metadata.cursor;
-        Ok(())
     }
 
     // 向 app-server 发送 JSON-RPC notification。
@@ -900,47 +777,6 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>
     (receiver, handle)
 }
 
-fn validate_event_recovery(
-    notification: &JsonRpcNotification,
-    metadata: &EventMetadata,
-) -> Result<(), String> {
-    match notification.method.as_str() {
-        "thread/started" => {
-            let thread_id = notification.params["thread"]["thread_id"]
-                .as_str()
-                .ok_or_else(|| "thread/started event has no thread id".to_string())?;
-            match metadata.recovery_query.as_ref() {
-                Some(EventRecoveryQuery::ThreadRead {
-                    thread_id: query_id,
-                }) if query_id == thread_id => Ok(()),
-                _ => Err(
-                    "thread/started event has an invalid thread/read recovery query".to_string(),
-                ),
-            }
-        }
-        "turn/started" | "turn/completed" => {
-            let turn_id = notification.params["turn"]["turn_id"]
-                .as_str()
-                .ok_or_else(|| "turn lifecycle event has no turn id".to_string())?;
-            match metadata.recovery_query.as_ref() {
-                Some(EventRecoveryQuery::TurnStatus { turn_id: query_id })
-                    if query_id == turn_id =>
-                {
-                    Ok(())
-                }
-                _ => Err(
-                    "turn lifecycle event has an invalid turn/status recovery query".to_string(),
-                ),
-            }
-        }
-        _ if metadata.recovery_query.is_none() => Ok(()),
-        _ => Err(format!(
-            "event {} declares an unsupported recovery query",
-            notification.method
-        )),
-    }
-}
-
 // 获取并规范化当前工作目录，作为 thread/start 的 cwd。
 fn canonical_current_dir() -> Result<String, String> {
     let cwd = std::env::current_dir()
@@ -1020,13 +856,13 @@ fn render_messages(messages: &[JsonRpcNotification], render_assistant_summary: b
                     println!("{method} {}", params.item.item_id);
                 }
             }
-            "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
+            "item/agentMessage/delta" => {
                 if let Ok(params) =
                     serde_json::from_value::<ItemEventParams>(message.params.clone())
                 {
-                    let text = params.delta.or(params.output).unwrap_or_default();
+                    let text = params.delta.unwrap_or_default();
                     println!("{method} {text}");
-                    if render_assistant_summary && method == "item/agentMessage/delta" {
+                    if render_assistant_summary {
                         println!("assistant {text}");
                     }
                 }

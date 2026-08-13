@@ -130,7 +130,7 @@ fn execute_actions(
 
 fn decorate_event(
     message: &mut Value,
-    next_event_sequence: &mut u64,
+    _next_event_sequence: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(method) = message
         .get("method")
@@ -142,50 +142,19 @@ fn decorate_event(
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
         return Ok(());
     };
-    if let Some(existing) = params.get("event") {
-        if let Some(sequence) = existing.get("sequence").and_then(Value::as_u64) {
-            *next_event_sequence = (*next_event_sequence).max(sequence.saturating_add(1));
-        }
+    if params.contains_key("event") {
         return Ok(());
     }
-    if method == "event/gap" {
-        return Ok(());
-    }
-    let is_progress = matches!(
-        method.as_str(),
-        "item/agentMessage/delta" | "item/commandExecution/outputDelta"
-    );
+    let is_progress = method == "item/agentMessage/delta";
     let class = if is_progress { "progress" } else { "state" };
-    let delivery = if is_progress {
-        "best_effort"
-    } else {
-        "reliable"
-    };
-    let recovery_query = match method.as_str() {
-        "thread/started" => params
-            .get("thread")
-            .and_then(|thread| thread.get("thread_id"))
-            .and_then(Value::as_str)
-            .map(|thread_id| json!({"method":"thread/read","params":{"threadId":thread_id}})),
-        "turn/started" | "turn/completed" => params
-            .get("turn")
-            .and_then(|turn| turn.get("turn_id"))
-            .and_then(Value::as_str)
-            .map(|turn_id| json!({"method":"turn/status","params":{"turnId":turn_id}})),
-        _ => None,
-    };
-    let sequence = *next_event_sequence;
-    *next_event_sequence = (*next_event_sequence).saturating_add(1);
-    let mut metadata = json!({
-        "sequence": sequence,
-        "cursor": sequence,
-        "class": class,
-        "delivery": delivery,
-    });
-    if let Some(query) = recovery_query {
-        metadata["recoveryQuery"] = query;
-    }
-    params.insert("event".to_string(), metadata);
+    let delivery = if is_progress { "best_effort" } else { "reliable" };
+    params.insert(
+        "event".to_string(),
+        json!({
+            "class": class,
+            "delivery": delivery,
+        }),
+    );
     Ok(())
 }
 
