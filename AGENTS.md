@@ -1,161 +1,399 @@
 # Singularity 仓库指令
 
-## 适用范围与任务收敛
+## 项目目标与设计基线
 
-本文件只保存 Singularity 仓库长期有效、可直接执行的项目规则；个人偏好、一次性任务要求和工具自身编排合同由更高层指令、当前用户消息或对应 Skill 管理，不在这里重复。子目录出现更具体的 `AGENTS.md` 时，只覆盖其目录树内的差异。
+Singularity 是一个可实际使用、可持续演进的 coding agent harness，当前以 CLI 为主要产品形态，后续计划支持桌面端。
 
-- 中大型、跨模块或高风险任务先明确可验证的目标、范围、禁止变化的合同、完成条件和风险；短小明确的修改直接执行，不为形式完整增加计划、文档或验证。
-- 长任务只维护一个当前状态台账，复用已有台账优先。台账记录当前目标、候选 revision、仍有效与已失效证据、阻断和下一步，并用 `verified`、`inferred`、`unknown`、`invalidated` 区分事实状态。聊天摘要、计划勾选和代理报告不能替代当前 Git、源码、运行结果及外部状态。
-- 台账、长日志、一次性提示词和诊断文件放在已忽略的 `outputs/` 或 `work/` 中，不加入 Git。稳定架构事实进入 `docs/singularity.md`，代码历史由 Git 保存。
-- 长时间 Worker、Provider、构建或 Evaluation 只按真实进展、领域 timeout、明确阻断和取消信号判断；不得自行添加短墙钟上限来强制结束仍在推进的任务，也不为证明仍在运行而短间隔轮询或重复播报无变化状态。
+当前核心架构与默认行为优先参考维护活跃、经过实际使用验证的主流 coding agent，主要以 Pi 的小核心、Agent Loop、Session、Context Compaction、Tool、Extension 和可嵌入能力作为基线；Codex CLI 等项目可作为辅助参考。
 
-## 事实来源与外部参考
+参考外部项目时复用其已经验证的对象边界、状态模型、数据流和默认策略，不机械复制语言、文件结构或内部命名。
 
-- 当前源码、Git 对象、协议 payload、可复现运行和一手官方资料是事实来源；代码图、生成文档、历史日志、搜索摘要和模型输出只用于导航或提出待验证假设。
-- 非平凡设计或根因修复前，先有界核对对应标准、平台原生机制或维护活跃的成熟实现。证据链应能回答：当前问题与约束、先例的具体机制和版本、适用差异、最终选择与明确省略项。
-- 外部先例用于复用已验证的不变量和责任边界，不因知名而整套照搬。与当前产品消费者、安全合同或平台事实不符的表面不引入兼容层或占位接口。
-- 调查预先写清待回答问题、所需证据和停止条件；检索不到直接先例时，明确标准空白，只实现最小、隔离且可删除的项目扩展。
+当 Singularity 没有明确的当前需求要求不同设计时，优先采用参考实现中更简单、成熟的方案。
+
+任何比参考基线明显更复杂的核心机制，都必须有当前真实消费者和明确必要性。未来可能需要的模型路由、多 Agent、任务图、自定义 Context 策略、额外工具、Sandbox、权限控制、插件或桌面能力，不作为提前增加核心复杂度的理由。
+
+核心能力保持 headless，并与具体 CLI、TUI 或未来 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。具体进程边界、App Server 和 transport 根据真实客户端需求决定，不在本文件冻结。
+
+现有源码、测试、Schema、历史实现和 Git 历史只能证明“当前这样实现”，不能证明设计本身正确。基础方向不合理时允许重构、替换或删除。
+
+---
+
+## 任务范围与复杂度控制
+
+短小、明确、低风险的修改直接执行，不为形式完整额外创建计划、文档、状态机或验证流程。
+
+中大型、跨模块或高风险任务先明确：
+
+- 要解决的真实问题；
+- 可验证的目标；
+- 直接影响范围；
+- 必须保持的外部合同；
+- 完成条件；
+- 已知风险或未知项。
+
+调查和实现都应有明确停止条件。不要因为发现相邻问题而无限扩大当前任务。
+
+复杂任务如果确实需要跨多个阶段或跨上下文保存状态，可以在 ignored 的 `outputs/` 或 `work/` 中维护简短状态记录；不为普通任务强制创建台账、计划或额外管理文件。
+
+采用以下复杂度原则：
+
+1. 删除优先，合并其次，新增最后。
+2. 新增 crate、Trait、Manager、Service、Adapter、Schema、缓存、锁、队列或状态机必须有当前真实消费者或明确边界。
+3. 同一事实只保留一个权威来源。
+4. 不为了兼容已经废弃且尚未发布的本地设计保留双轨状态、别名、迁移层或兼容垫片。
+5. 不为未来假设需求预建框架。
+6. 当局部修复开始产生重复状态、级联例外或跨层补丁时，停止继续打补丁并重新检查抽象边界。
+7. 更复杂不等于更 production-grade。优先选择边界清晰、行为可解释、状态更少、失败明确且易于维护的设计。
+
+---
+
+## 事实来源与架构调查
+
+事实优先级：
+
+1. 当前源码；
+2. 当前 Git 状态和历史；
+3. 实际协议 payload / trace / 持久化数据；
+4. 可复现运行结果；
+5. 对应版本的一手官方文档和上游源码。
+
+代码图、搜索摘要、生成文档、历史日志和模型输出主要用于导航和形成假设，不能替代当前源码事实。
+
+涉及非平凡架构设计、协议、Provider、Context、Session、Tool、持久化、并发或平台行为时，应有界核对维护活跃的一手实现或官方资料。
+
+外部参考必须回答：
+
+- 对方真正解决什么问题；
+- 使用什么运行时对象和数据流；
+- 哪些状态持久化，哪些只存在内存；
+- 为什么采用这一边界；
+- Singularity 与它有哪些真实需求差异。
+
+如果 Singularity 比成熟参考设计更复杂，应明确说明额外复杂度解决的当前问题。没有充分理由时，默认向更简单的基线收敛。
+
+---
 
 ## 代码图导航
 
-主代理与委派的子代理理解仓库结构、查找符号、调用关系和影响范围时，都优先使用 `codebase-memory-mcp` 缩小检索范围（如 `search_graph`、`search_code`、`trace_path`、`get_code_snippet`），查询不足或结果可能过期时再用 `rg`、Git 和当前源文件验证。代码图不是代码事实的唯一来源，且只查询当前任务需要的局部信息，不无条件输出完整仓库地图。
+理解仓库结构、查找符号、调用关系和影响范围时，优先使用 `codebase-memory-mcp`：
 
-主代理每次成功创建 Git 提交后，必须调用 `codebase-memory-mcp` 的 `index_repository`，使用当前工作树根目录的绝对路径刷新代码图；子代理在独立 worktree 中的阶段提交不刷新，由主代理集成提交时统一刷新覆盖。索引失败不撤销已经创建的提交，但必须明确报告失败原因和当前索引状态。无法访问 `codebase-memory-mcp` 的环境（未配置该 MCP 的其他 agent）跳过本节的索引要求，直接使用 `rg` 和 Git 检索，并在最终回复中说明索引未刷新。
+- `search_graph`
+- `search_code`
+- `trace_path`
+- `get_code_snippet`
+- 以及任务需要的其他代码图能力。
 
-不要开启 `auto_watch`，直到已验证的上游版本修复 dirty worktree 下的重复索引问题（2026-07 记录；确认上游修复后删除本条）。
+代码图用于缩小范围；关键结论仍需通过当前源码、`rg`、Git 或实际运行验证。
 
-## 命令与磁盘
+不要无目的输出完整仓库地图，只查询当前任务真正需要的部分。
 
-1. 本项目 Cargo 产物必须写入本地不提交的 `.cargo/config.toml` 或任务级 `CARGO_TARGET_DIR` 指定的专用 target 目录，不得静默回落到工作区 `target/`；运行 Cargo 前用 `cargo metadata --no-deps --format-version 1 --locked` 核对 `target_directory`。不提交机器专用绝对路径配置。
-2. 默认保留本项目 Cargo 增量编译缓存，不在任务结束时执行 `cargo clean`；仅当缓存损坏、Rust 工具链切换、产物归属不明、专用 target 磁盘空间不足或用户明确要求时，才在核对 target 后清理。
-3. Evaluation 的临时 scratch、日志、一次性 Worktree、测试临时目录和其他任务临时文件在每次任务结束时清理；Evaluation run 的发布产物和失败/取消时保留的不完整运行证据按输出契约保留，不当作临时文件删除。
-4. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
-5. 最终回复说明产物实际写入位置、保留的 Cargo 缓存、已清理内容、清理失败项和保留原因。
-6. 默认完整 Evaluation 使用 `docs/evaluation/public-representative-task.json`（3 个 task × 每个 2 个 trial，共 6 个 trial），并必须显式传入 `--full --max-workers 6`。并发单位是 trial：`--max-workers 6` 表示最多同时调度全部 6 个 trial，不得解释为只并发 3 个 task、再在每个 task 内串行运行 trial；实际并发声明必须以 trial start/end trace、进程或时间戳证据支持，参数值本身不构成并发事实。`docs/evaluation/public-long-tasks.json`（5 个 SWE-bench 长任务）仅在用户明确说明要运行时才使用，其他情况一律不指定、不启用。
+成功创建包含产品代码或结构变化的 Git 提交后，使用当前工作树根目录刷新 `codebase-memory-mcp` 仓库索引。纯文档、提示词或不影响代码图结构的微小提交不要求机械重复索引。
 
-## 项目实现与目标仓库语言边界
+如果索引失败：
 
-1. Singularity 的核心产品运行时、公共协议、安全边界和发布二进制使用 Rust。允许为构建、测试、审计或维护引入职责明确的主流辅助工具，但不得形成第二套产品运行时、绕过 Rust 主链路或安全协议，也不得恢复 Python agent runtime、sidecar 或兼容入口。
-2. 目标仓库可以使用 Python、Rust、Node.js、Go 或其他语言；命令工具应在严格 sandbox 中使用宿主机 `PATH` 已安装的工具链，不得把实现语言边界误作目标仓库能力限制。
-3. 当前 `sg` 的线程、turn、`AgentLoop`、工具和 `Store` 产品运行时仅通过 stdio JSON-RPC 调用 `singularity_app_server`；CLI 可直接调用共享的 `singularity_model` 配置库完成用户级 Provider 配置导入、模型目录读取/刷新和脱敏诊断，不在 CLI 中创建 `AgentLoop`、执行 turn 或维护 `Store` 状态；CLI 不直接依赖 `singularity_agent`、`singularity_tools` 或 `singularity_store`。
-4. 终端 TUI 和桌面 App 是同一无界面（headless）产品运行时的客户端；`singularity_app_server` 单一拥有 thread、turn、`AgentLoop`、工具和 `Store`，共享的 `singularity_model` 配置库是 Provider config、catalog 和 auth refs 的单一事实源，供 CLI、未来 Rust app backend 和 App Server RPC 复用。客户端接入沿该边界按需选择 transport；当前 `sg` 使用 stdio JSON-RPC，不将 stdio 固化为所有未来客户端的永久唯一 transport，也不为此预建多客户端编排、第二 daemon、插件运行时或重复状态。
-5. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
-6. Evaluation 使用 `evaluation`、`eval`、`task`、`task set`、`runner`、`result`、`report` 等主流命名，不恢复迁移期自造分类。
+- 不撤销已经完成的代码修改或提交；
+- 明确报告失败原因和当前索引状态；
+- 继续使用源码、`rg` 和 Git 完成事实验证。
 
-## Sandbox 上游复用边界
+不依赖 `auto_watch` 作为代码事实来源。
 
-- `crates/windows-sandbox` 负责 Windows 账户、ACL、WFP、Job Object、setup、路径保护和进程生命周期；优先复用或轻量移植官方 `openai/codex` 中与当前威胁模型匹配的成熟 Win32 机制，但使用 Singularity 自有二进制、账户、GUID、配置和状态，不共享本机 Codex 实例或安全状态。
-- `crates/sandbox` 只把通用 permission profile 投影到平台实现并返回 typed execution result，不维护第二套 ACL、setup、observer 或进程生命周期事实。
-- 只保留当前消费者需要的 strict workspace-write/read-only、protected paths、network denied、Job Object、取消/超时、workspace change 和失败关闭；终端 TUI 和桌面 App 复用同一无界面（headless）产品运行时，客户端 UI 与 transport surface 按实现阶段的真实需求增加。当前不预建 PTY、ConPTY、managed proxy、多会话服务、Codex 配置协议和 telemetry 等尚无具体消费者的兼容表面。
-- 上游采用点、必要本地差异和明确省略项记录在 `crates/windows-sandbox/UPSTREAM.md`。本地严格增强必须有直接威胁或运行证据；未知变更、monitor 丢失、路径身份不明和 enforcement 不可用继续失败关闭，不使用 local-process fallback 或环境特判。
+---
 
-## Agent、Provider 与 Evaluation 边界
+## Agent 核心与扩展边界
 
-- 模型可见产品工具由单一注册事实源产生；功能任务不通过 Evaluation task、required capability 或内部阶段维护第二套工具表面。工具选择自由与权限控制分离，副作用由 Policy、Approval 和 OS sandbox 约束。
-- Provider 能力必须由显式配置、协商或实际 wire 证据确定，不从模型名称推断。一次 Evaluation trial 在任何完成请求前固定 `provider_id`、`model_id`、已选 API protocol 和相关模型参数；能力协商可依据声明或协议证据在完成请求前确定单一 protocol，但完成请求中不自动路由、轮换或 fallback。
-- 本仓库的计划内真实产品测试与 Evaluation 已获长期授权：task、trial、Evaluation 和其他模型驱动验收必须以 `opencode-go/deepseek-v4-flash#max` 为主模型；`longcat/LongCat-2.0#high` 可自由用于细粒度小测试、补充覆盖和跨模型对照。允许消耗两者的已购测试额度，并执行对应模型的一次显式 capability probe 及其原子配置更新；固定 candidate、selector 和 protocol，保留首次结果并脱敏，不逐次请求授权。其他 Provider/模型、计划外完整 Evaluation、push、发布和 GitHub 写入不在此授权内。
-- 真实模型调用默认使用显式 config、catalog 或 capability probe 已证明支持的最高 reasoning variant；当前 `opencode-go/deepseek-v4-flash` 使用 `#max`，`longcat/LongCat-2.0` 使用 `#high`。能力未证明时先执行一次显式 probe，不从模型名称推断；只有任务明确测试较低档位或模型没有 reasoning variant 时才使用其他模式。
-- 模型交互行为按单一不变量拆成细粒度真实产品调用：自然停止、工具选择与结果消费、多轮修复、approval/resume、上下文续接和模型可见错误恢复优先直接调用主模型，并可用 LongCat 对照定位模型差异；不必等到完整 trial 才调用模型。wire/schema 解析、事务、权限、安全失败关闭和 no-replay 等要求确定性与故障注入的边界继续使用隔离测试，但 mock 结果不能替代真实模型产品链证据。
-- 可由真实模型产品调用完整覆盖的行为不保留 mock、fake 或模拟测试副本；真实调用建立等价或更强证据后，按测试数量、日常总耗时、稳定性与外部依赖权衡删除对应测试及其专用 fixture、helper 和分支。若覆盖测试 B 的同环境实测耗时不超过 3 分钟，即使它慢于 A+C+D 的总和也可删除 A、C、D；仅当 B 超过 3 分钟且拆分测试更快时才应保留拆分。优先删除重复的模型行为副本；不涉及模型行为，或真实模型调用不能证明其测试目的的 test double 不属于替换目标，继续按普通覆盖合并规则处理。保留能低成本保护协议、安全、事务、权限、取消、恢复和 no-replay 的确定性边界，并在测试语义中明确其不可替代的不变量。
-- Provider transport retry 是同一请求的网络恢复，不等于重新采样 Trial。错误分类、attempt 计数和最终失败必须保留在 typed trace 中，不通过吞错、换模型或重跑制造成功。
-- 失败归因顺序：只有充分排除 Harness、AgentLoop、Store、checkpoint、completion gate、verification tracker、Evaluation runner、并发调度和测试环境问题后，才能把剩余失败归因于模型能力；除模型能力之外的任何问题都必须继续调查并修复，不得以“可能是模型问题”“artifact 被 redacted”“Evaluation 提前结束”为理由停止。每个失败明确分类：已确认 Harness/Evaluation 缺陷（修复）、已确认模型能力问题（保留原始证据并报告）、仍未确定（继续调查，不得作为最终 blocker）。
-- Evaluation 是开发工具和普通产品调用方，不进入发布二进制或定义 Agent 语义。功能正确性主要由真实 patch、baseline/public/hidden tests 和最终 diff 判断；工具配对、参数、恢复、取消和 completion 等协议不变量由独立确定性 conformance 测试证明。
-- `functional_task_success`、`agent_protocol_success` 与 `sandbox_security_success` 分别计算、发布和归因；外部门禁可以同时要求三者，但不得合并成无法定位责任层的单一失败。Evaluator 保护自身 patch、tests、`.git` 和依赖/系统路径，并审计异常改动，不用路径白名单向模型泄露答案位置或阻止合理跨文件修复。
-- 计划内严格 Windows Sandbox 产品验收已获长期授权：可触发 UAC，并创建或修复 Singularity 自有 sandbox 账户、ACL、WFP、Job Object 和 setup 状态；按冻结 candidate 与受控 scratch 执行，不逐次请求授权。该授权不扩展到 Singularity 之外的账户、网络策略或系统配置。
+Agent 核心应尽量保持小而稳定。
 
-## 工程原则
+核心优先负责：
 
-1. 测试、Evaluation、benchmark、监控指标和验收分数是观察产品行为的证据，不是反向定义产品语义的控制信号；不得为改善某次结果增加与真实领域合同无关的特判、放宽门禁或改变安全边界。
-2. 对缺陷修复和非平凡功能，进入实现前先做有界的方向校验：从当前目标、威胁模型和真实调用链出发，判断现有架构、责任边界、状态模型与算法复杂度是否仍然合理，并在必要时对照行业通行设计、平台原生机制或权威资料。历史代码、现有测试和“当前就是这样做的”只能证明实现事实，不能证明设计正确。若基础方向错误，或继续沿用会产生级联补丁、重复事实源或不可接受的复杂度，应先提出并采用最小完整的结构性修正，不得在错误基础上叠加局部补丁；小型、明确、低风险修改只需核对直接边界，不借此扩大为无关重构或泛化调研。
-3. 失败现象只能证明某个不变量被破坏，不能自动决定修改哪一层；修复前沿真实调用链区分各层责任，在拥有该不变量的最小正确抽象层修复。
-4. 进入通用运行时的机制必须是稳定、可复用、对所有适用输入一致成立的领域规则；仅服务于某个实现、供应商、任务、数据集或当前分数的逻辑不是通用能力，必要的临时兼容必须隔离边界并记录原因、适用范围、生命周期和移除条件。
-5. 外部系统或可替换实现的能力必须显式声明、验证和协商，不从名称、接口兼容、历史表现或乐观假设推断；能力不足时走明确、可审计的降级或拒绝路径。
-6. 外部输入即使声称已校验，仍须在本地信任边界完整验证；复合输入或批量操作先整体验证再产生副作用，任一成员非法时不得静默挑选、改写或执行其余子集，除非领域合同明确规定部分成功语义。
-7. 编排必须显式表达依赖、副作用和一致性边界；只有证明互不依赖且无冲突的操作才可并行；并发或批处理能力必须同时定义结果顺序、部分失败、取消、超时、授权、恢复、审计和持久化语义。
-8. 错误模型保留输入拒绝、能力不支持、策略拒绝、权限边界、执行失败和基础设施故障的因果差异；可重试、可降级、需授权或必须终止由稳定错误语义决定，不由字符串匹配或当前验收需要决定。
-9. 自动修复、规范化和兼容转换只在语义唯一、无权限扩大、无信息损失且属于明确领域合同时允许；存在歧义时拒绝或请求新的合法输入，不猜测意图或执行调用方没有合法提交的操作。
-10. “最小改动”指在正确抽象层实现满足真实需求的最小完整机制；局部修复开始产生跨样本特判、重复分支或级联例外时，暂停实现，重新识别缺失的抽象、不变量或状态模型，并说明必要的架构范围。
-11. 验证从领域不变量和确定性边界测试开始，逐级覆盖跨模块集成、真实运行和外部验收；保留失败证据和原始 gate 语义，让验收验证架构结果，不让实现迎合测试样本。
-12. 非平凡设计和实现默认检查真实热路径、重复工作、缓存机会、锁粒度、I/O、进程创建与实际并发度；性能判断以可比较测量为依据。在不牺牲正确性、安全性、隔离性和可复现性的前提下，优先消除结构性等待与重复工作；缓存必须有与真实输入和兼容边界绑定的失效键，共享内容默认只读，锁只覆盖必须原子保护的共享状态，不用提高 worker 数、增加 timeout 或降低门禁掩盖瓶颈。
+- Agent Loop；
+- Model / Provider 调用；
+- Message 与 Tool Call / Tool Result 流转；
+- Session；
+- Context 构造与 Compaction；
+- 基础 Tool 注册和执行；
+- Interrupt / Steer / Queue 等必要交互语义；
+- 必要的持久化与错误传播。
 
-## 验收证据边界
+默认工具集、Session 语义、Context Compaction 和 Agent Loop 应优先参考 Pi 当前真实实现，再根据 Singularity 已确认需求做最小必要差异。
 
-- 产品能力与 Evaluation 工具分别维护验收矩阵。Evaluation 只提供开发期评估证据，不得进入发布二进制、产品运行依赖或反向定义 Agent 语义；产品结论不能只靠 Evaluation 分数证明。
-- 安全、协议和恢复结论必须在拥有不变量的真实边界取证：Provider 历史检查实际 `ModelTurnRequest`，sandbox 检查操作系统实际 enforcement，workspace 身份检查 pinned handle 对应的对象身份，崩溃恢复检查真实 kill/restart 后的 Store 状态。marker、路径字符串、日志或局部 mock 不能替代这些事实。
-- 跨 Provider、MCP 或 JSON-RPC 边界的字段、状态和错误语义，必须由适用版本的 wire schema 或规范具体条款定义，并通过实际出站或入站 payload 验证投影；内部 DTO 名称、trace 字段、测试 fixture 和 Evaluation 结果不构成外部协议事实。
-- 每个自包含工作流形成稳定的本地候选提交；冻结 Evaluation 和其他昂贵验收必须绑定明确 candidate revision、输入与能力合同，最终通过后才 push。后续修改只使其实际影响范围内的旧证据失效，不机械重跑无关门禁。
-- Issue 中的新发现分为当前 blocker、当前改动 regression、相邻缺陷和后续需求。只有前两类进入当前关闭条件；相邻缺陷和后续需求单独记录，不把一个 Issue 扩成持续吸收所有改进的长期分支。
+未来可能变化较大的能力应优先通过清晰扩展边界实现，而不是提前固化进 Agent 核心，例如：
 
-## 复杂度与设计门禁
+- 自定义 Tool；
+- Tool 替换或启停；
+- 自定义 Context / Compaction；
+- 模型路由；
+- 多 Agent；
+- 任务图；
+- MCP；
+- 外部搜索；
+- 自定义 Verification；
+- Sandbox 或外部隔离环境；
+- 权限确认；
+- Memory；
+- 项目或用户工作流。
 
-Singularity 当前是供单个用户安装在自己电脑上使用、可实际运行并持续演进的 Agent，不是面向未知产品形态或企业部署的通用框架。设计优先服务当前真实调用链和已确认的近期需求；不为未来插件、多租户、分布式服务、高可用、负载均衡或数据库替换预建基础设施，也不为这些没有当前消费者的假设增加部署、性能或验收复杂度。
+扩展性不等于提前实现完整插件平台。只建立当前重构真正需要的稳定接缝。
 
-- 采用“删除优先、合并其次、新增最后”。新增 crate、Trait、Manager、Service、Repository、Adapter、Schema、缓存、锁或消息机制，必须有当前消费者，或明确建立安全、事务、平台、协议、恢复或测试替身边界；否则使用私有函数、枚举或小型内部结构。
-- 同一事实只能有一个权威来源。不得用并行数组、重复 DTO、动态 JSON、JSON/SQLite 双权威、长期双轨 checkpoint、无消费者兼容表或纯转发层维持状态。
-- 保留安全和一致性所需的复杂度：受限令牌、ACL、Job Object、路径能力、TOCTOU、Approval/Policy、Checkpoint/迁移、Completion/Verification、Provider 能力协商、Tool 信任边界、JSON-RPC、Trace/Audit/Evaluation。不得以“简化”为名降低权限、恢复能力、错误区分或失败关闭。
-- App Server 当前以 stdio transport 清晰表达 JSON-RPC、请求/Turn 生命周期、事件输出、取消、关闭和 Store/Provider 初始化；未来 TUI 与桌面 App 的接入仍复用这一 runtime owner，transport 只按实际消费者需求扩展，不预建 Broker、CQRS、Event Sourcing、分布式队列、多租户连接或通用工作流框架。
-- Provider、Store、Tool、Evaluation 的抽象必须对应真实消费者和不变量。指标只计算一次再投影；缓存失败是否可视为 miss 应按真实并发和安全合同决定，不为统一而制造反向依赖。
+不要因为现有测试依赖某个对象，就默认该对象必须继续存在。先判断对象本身是否仍属于目标架构。
+
+---
+
+## Rust 与产品边界
+
+Singularity 核心产品代码和发布二进制使用 Rust。
+
+允许使用职责明确的主流辅助工具进行构建、测试、审计和维护，但不要形成第二套 Agent 核心实现。
+
+目标仓库可以使用 Python、Rust、Node.js、Go 或其他语言；不要把 Singularity 自身实现语言误作目标仓库语言限制。
+
+CLI、TUI 和未来 Desktop 应消费同一核心 Agent 能力。
+
+当前 App Server、JSON-RPC、stdio transport 或其他协议边界属于当前实现事实，不在本文件中冻结为永久架构。如果更简单或更适合桌面端的所有权/进程边界被证明合理，可以调整。
+
+不要为了未来桌面端提前构造多进程服务、通用 daemon、多客户端调度、CQRS、Event Sourcing、分布式队列或其他没有当前消费者的基础设施。
+
+---
+
+## Tool、Session 与 Context 原则
+
+### Tool
+
+模型可见工具应来自单一注册事实源。
+
+核心默认工具保持精简。额外工具优先通过可注册、可替换的工具边界增加，而不是为每种工具建立新的核心控制层。
+
+工具 Schema、参数校验和真实执行必须使用同一明确合同。
+
+模型产生合法 Tool Call 后，Agent Loop 应按照工具语义处理，不因为 Evaluation、测试方便或内部评分要求改变工具行为。
+
+执行可靠性，例如：
+
+- timeout；
+- cancellation；
+- exit status；
+- stdout/stderr；
+- 文件写入正确性；
+- 并发修改检测；
+
+应与权限、安全或产品策略概念分开。
+
+### Session
+
+Session 的目标是保存用户真正需要继续会话的数据，而不是默认序列化整个 Agent 内存状态机。
+
+设计 Session、resume、continue、fork、branch 或 crash recovery 时，优先参考 Pi 和 Codex 当前真实持久化方式。
+
+只有用户可感知且确实要求跨进程恢复的状态才默认进入持久化合同。
+
+瞬时执行状态、内部计数器、调试字段或某个历史实现所需的恢复 bookkeeping 不应因为“可能以后有用”进入持久化 Schema。
+
+### Context 与 Compaction
+
+完整会话历史和“当前发送给模型的上下文”是两个不同概念。
+
+Compaction 默认应遵循成熟 coding agent 的简单策略：
+
+- 完整历史继续保留；
+- 接近模型 Context Window 时触发压缩；
+- 保留最近一段原始上下文；
+- 对较旧历史生成可继续工作的摘要；
+- 不在非法 Tool Call / Tool Result 边界切断上下文；
+- 压缩结果影响后续模型上下文，不应无必要破坏原始 Session 历史。
+
+具体阈值、保留 token 数、摘要 Prompt 和 Provider 差异属于代码和架构文档，不在本文件永久冻结。
+
+未来需要更复杂 Context 策略时，优先替换策略，而不是不断增加并行事实源。
+
+---
+
+## Provider 与外部协议
+
+Provider 行为以当前配置、实际 API 合同和真实 wire 证据为准。
+
+不从模型名称猜测：
+
+- Context Window；
+- Tool Calling 支持；
+- Reasoning 模式；
+- API protocol；
+- 并发能力；
+- 其他 Provider capability。
+
+不要为了统一抽象而建立没有真实消费者的 capability system。
+
+只有当不同 Provider 的真实协议差异确实需要显式建模时，才增加对应字段或类型。
+
+Provider transport retry 只处理可明确重试的同一请求失败，不通过换模型、静默 fallback、重采样或吞错制造成功。
+
+外部协议输入在本地边界进行必要校验，但不要为理论上所有非法状态构建庞大内部状态机。
+
+错误应保留足够的真实因果差异，方便 Agent、用户和测试判断失败来源；不要依赖字符串匹配驱动关键控制流。
+
+具体使用哪个 Provider、模型、reasoning level、API key 或 Evaluation 模型由当前配置、任务要求或测试配置决定，不写死在仓库长期指令中。
+
+---
 
 ## 测试与验证
 
-验证按最终 diff 的实际风险选择最小充分层级，低层证据通过后才升级；不得把“文件位于 Provider、Agent、sandbox 或 Evaluation crate”本身当作运行昂贵验收的理由。
+验证目标是证明当前修改满足真实行为，而不是证明所有历史机制仍然存在。
 
-| 改动类型 | 默认最小验证 |
-| --- | --- |
-| 文档、注释、项目指令、格式或不改变行为的元数据 | 静态阅读、引用/结构检查、`git diff --check`；不运行 Cargo、Provider、sandbox 或 Evaluation |
-| 孤立常量、默认值、retry 数或同类参数，且不改变控制流结构、协议、错误分类、状态、安全或公共接口 | 静态确认最终值、直接引用、断言与文档一致 |
-| 测试夹具、lint、CI 元数据或 hosted runner 兼容性 | 失败检查或精确受影响测试；必要时观察对应 CI，不运行 Provider Task 或 Evaluation |
-| 局部产品行为 | 受影响 crate 的精确定向测试，按编译边界补最小 `check`/`clippy`；不默认全仓 |
-| 模型调用链路、工具 schema/选择、Provider adapter、history/reasoning replay、tool recovery 或 completion | 确定性 ModelTurnRequest/状态转换回归通过后，至少一次真实普通产品调用 |
-| Sandbox、Approval、workspace observation 或安全边界 | 拥有不变量的确定性测试和实际 OS enforcement 证据；未知状态继续失败关闭 |
-| Evaluation runner、task success 归约或端到端能力 | 先做确定性归约回归，再运行实际受影响 task 的单 trial；该 trial 通过且候选稳定后，才运行一次完整冻结 Evaluation |
+按最终 diff 的实际风险选择最小充分验证。
 
-- 已通过且未受后续 diff 影响的证据保持有效，不因任务结束、push、CI 修复或文档提交机械重跑。
-- 本地测试默认使用显式 mock 配置（Provider、模型、地址、测试 key），不得读取真实用户级配置、凭据或外部服务；隔离后的测试失败才按产品缺陷处理。
-- 完整构建、全仓测试、跨平台验证和完整 Evaluation 只有在实际影响范围无法由更窄证据证明时运行。完整 Evaluation 不是模型调用链改动后的首次真实测试。
-- 不新增或操纵 Trial 重采样、预算、timeout、门禁、task、工具权限或隐藏答案来赌分。真实 Provider Task 首次正确完成即为有效证据；失败保留首个错误、阶段和耗时，只修通用根因。
-- 测试集合按行为证明关系保持最小：若测试 B 的可观察行为与断言完整证明测试 A、C、D 的全部不变量，且 B 的同环境实测耗时不超过 3 分钟，结合数量收益与日常时间/稳定性成本决定删除 A、C、D 及其专用 fixture/helper；只有 B 超过 3 分钟且拆分测试更快时才保留较快的拆分测试。覆盖关系和耗时必须来自当前源码与实际运行，不从测试名称或历史结果推断。
-- Issue 或任务文档逐条列出的真实链路要求（如同一用户轮次内多次模型与工具交互、中断后恢复、上下文压缩后续接、Provider/model/protocol 变化等），每条必须映射到可指认的真实模型调用证据，或显式标注“由确定性测试覆盖（不涉真实执行链路）”；仅 mock 或确定性测试不得作为此类要求的完成证据。
-- 默认不运行 Codex Security 扫描；只有用户明确要求使用时才运行。
-- 最终回复列出实际运行的检查、精确结果和未验证范围，不把局部证据描述为全量通过。
+默认顺序：
+
+1. 静态检查和直接源码事实；
+2. 精确受影响测试；
+3. 受影响 crate 的 `check` / `clippy`；
+4. 必要的跨模块集成测试；
+5. 只有真实产品行为无法由前述证据证明时才运行真实 Provider 调用；
+6. 只有用户明确要求或修改确实涉及完整 Evaluation 行为时才运行昂贵 Evaluation。
+
+不要因为修改发生在 Agent、Provider、Store、Tool 或 Evaluation crate 就机械运行全仓测试。
+
+已通过且未受后续修改影响的证据继续有效，不机械重跑。
+
+Mock、fake 和 test double 用于证明确定性边界；真实模型调用用于证明真实模型交互行为。两者根据测试目的选择，不规定“真实调用一定优于 mock”或相反。
+
+测试已经存在不能证明对应架构必须保留。重构删除机制时同步删除只服务于该机制的测试、fixture 和 helper。
+
+不为了通过 Evaluation 或 benchmark：
+
+- 修改真实产品语义；
+- 添加任务特判；
+- 放宽正确性约束；
+- 隐藏失败；
+- 重采样直到成功；
+- 调高 timeout 掩盖结构性问题。
+
+完整 Evaluation、长期 benchmark 和昂贵真实 Provider 测试不作为普通修改的默认完成条件。
+
+最终报告必须明确：
+
+- 实际运行了什么；
+- 哪些通过；
+- 哪些失败；
+- 哪些没有验证；
+- 哪些结论只是推断。
+
+不要把局部证据表述为全量通过。
+
+---
+
+## Cargo、临时文件与磁盘
+
+本项目 Cargo 构建产物使用专用 target 目录，不提交机器专用绝对路径配置。
+
+默认保留 Cargo 增量编译缓存，不在普通任务结束时执行 `cargo clean`。
+
+只有以下情况才清理缓存：
+
+- 缓存损坏；
+- Rust 工具链发生不兼容切换；
+- target 归属不明；
+- 磁盘空间问题；
+- 用户明确要求。
+
+临时测试目录、一次性 worktree、诊断日志和 scratch 文件在确认属于当前任务后清理。
+
+删除目录或文件前确认：
+
+- 真实绝对路径；
+- 所有权；
+- 是否由当前任务创建；
+- 是否包含用户数据或未知成果。
+
+不得为了获得 clean working tree 删除来源不明的文件。
+
+---
+
+## Git 与远程操作
+
+开始任务前检查：
+
+- 当前 branch；
+- HEAD；
+- staged / unstaged；
+- tracked / untracked；
+- 必要时 ignored 状态。
+
+保护用户已有修改。
+
+未经用户明确授权，不：
+
+- push；
+- force push；
+- 发布 release；
+- 创建 PR；
+- merge 远程分支；
+- 创建或关闭 GitHub Issue；
+- 修改其他远程状态。
+
+不得使用 `reset`、`rebase`、`clean`、强制 checkout 或其他破坏性 Git 操作丢弃未知修改，除非用户明确授权该具体操作。
+
+大型改动可以按独立、可审查、可回滚的阶段创建本地提交；简单修改不为了形式完整强制拆 commit。
+
+Git 历史保存历史实现。当前代码和文档只描述当前有效设计，不为尚未发布的旧本地方案增加兼容层。
+
+---
+
+## Issue 与任务记录
+
+优先复用与任务直接相关的现有 GitHub Issue。
+
+创建新 Issue、修改或关闭 Issue 必须有用户明确授权。
+
+复杂任务如果已有 Issue，记录应聚焦：
+
+- 问题；
+- 已确认根因；
+- 最终方案；
+- 关键验证；
+- 未解决范围。
+
+不要把原始思维过程、所有读取文件、每条命令或大段日志写入 Issue。
+
+相邻缺陷和未来需求不自动进入当前任务完成条件。
+
+---
 
 ## 文档
 
-1. `docs/singularity.md` 是唯一架构事实文档，只描述当前核心产品运行时中的 crate 边界、对象、调用链、持久化和失败路径。
-2. 主链路、协议、状态映射、sandbox、approval、provider、evaluation、trace 或 store 变化时，同步更新 `docs/singularity.md` 的相关部分。
-3. Skill、配置、提示词、架构文档和代码注释直接描述当前有效的行为、接口、约束和风险，不写对话过程、措辞迭代、临时路线或已结束方案。需要保留的失败证据和决策历史只进入对应状态台账、Issue 或 Git 历史。
-4. 说明性文字按接收者最小化上下文；传给模型、工具或子代理的任务胶囊只包含当前动作需要的事实、授权、所有权、验收和升级边界，不转发无关对话或完整历史。
+`docs/singularity.md` 维护当前核心架构概览，包括主要 crate、对象、调用链、状态、持久化和客户端边界。
+
+如果某个领域未来需要独立详细文档，从 `docs/singularity.md` 链接到对应文档，不复制多个互相竞争的架构事实源。
+
+架构发生实质变化时同步更新当前事实文档。
+
+文档只描述当前有效设计，不保留已经结束的迁移过程、历史路线和失效接口。历史由 Git 和必要的 Issue 保存。
+
+具体 Evaluation 操作、工具使用说明、测试运行手册和临时任务规则放在对应 `docs/`、Skill、配置或当前任务中，不塞入仓库全局指令。
+
+---
 
 ## 代码注释与可读性
 
-1. 为模块、公共类型、结构体、枚举、trait 以及职责或语义无法从名称直接判断的关键函数、方法和更小独立单元补充简洁注释；通常使用一句话说明其含义、职责、契约或存在原因，并选择能够完整表达该语义的最小注释单元。
-2. 注释应帮助读者理解代码“是什么、负责什么或为什么存在”，不得逐行复述实现过程、解释显而易见的语法、为简单 getter 或字段转发机械补注释，也不得以增加注释数量为目标制造阅读噪音。
-3. 修改代码时必须检查同一语义单元及其直接相关注释；行为、职责、边界、错误语义或不变量发生变化时，同一改动中必须同步更新或删除过时注释。与代码事实不一致的注释视为缺陷。
-4. Rust 公共 API 优先使用 `///` 或 `//!` 形成可生成文档的说明；仅与局部实现约束、非显然安全条件或特定算法原因有关的内容使用普通行内注释。
+模块、公共类型、Trait 和职责无法直接从名称判断的重要函数应有简洁注释。
 
-## 任务记录
+注释说明：
 
-优先复用与任务直接相关的现有 GitHub Issue。创建新 Issue 必须先取得用户对该 Issue 的一次性明确授权；没有授权时只在本地状态台账记录，不擅自创建。
+- 对象是什么；
+- 负责什么；
+- 为什么需要；
+- 重要的不变量或非显然约束。
 
-对已授权或已有的复杂 Issue，最多追加两次简短评论：
+不要逐行解释代码，不为简单 getter、字段转发或明显 Rust 语法机械增加注释。
 
-1. 确认可靠根因后，记录现象、根因、关键证据和处理计划。
-2. 任务完成后，记录实际修改、选择该方案的原因、验证结果、未验证范围和关联 commit。
+代码职责或行为变化时同步更新相关注释；过时注释视为缺陷。
 
-记录应使用清晰中文解释真实文件、对象和调用链，帮助维护者理解和学习。不要记录原始推理、每条命令、文件读取过程、大段日志、敏感信息或重复内容。
+Rust 公共 API 优先使用 `///` 和 `//!`。
 
-简单、低风险且无需调查的任务不创建 Issue，只在最终回复中简要说明问题、原因、解决方式和验证结果。GitHub 写入失败时明确报告，不得静默跳过。
+命名优先采用 Rust 生态、Agent、LLM、Tool Calling、Session、Context、Provider、RPC 等领域已经广泛使用的术语。
 
-## Git、CI 与交付
+不要仅根据中文语义创造新的架构名词。
 
-- 开始前核对 `HEAD`、branch、tracked/untracked/ignored 状态并保护用户改动；不得用 reset、checkout、stash、rebase 或 clean 绕开 dirty tree，除非用户对该具体操作明确授权。
-- 中大型任务按可独立验证、审查和回滚的阶段创建范围单一的本地提交。提交只是恢复点，不代表完成；未经明确授权不 push、发布、创建 PR、评论或关闭 Issue。
-- 审查按稳定阶段候选批量触发：把多个相关局部改动集成后做一次互补复核；局部测试清理、文档或小型 fixture 提交只做实现者定向验证，不为每个提交单独创建 Reviewer。
-- 每次本地提交后按本文件“代码图导航”刷新索引。索引失败不回滚提交，但必须记录失败和当前索引状态。
-- 纯文档、注释、项目指令或测试夹具的后续提交只失效其实际影响的证据；不为与产品行为无关的文件更换 Provider/Evaluation 候选或重跑全套验收。
-- Git 只跟踪源码、测试、稳定配置和必要文档。`outputs/`、`work/`、session、prompt、probe、临时日志、一次性脚本和本机绝对路径配置保持 ignored；任务结束时只删除能够证明由本任务创建的临时产物。
+---
 
-## Agent skills
+## Agent Skills
 
 ### Issue tracker
 
@@ -163,8 +401,8 @@ Singularity 当前是供单个用户安装在自己电脑上使用、可实际�
 
 ### Triage labels
 
-使用默认的五类 triage 标签。详见 `docs/agents/triage-labels.md`。
+使用仓库当前定义的 triage 标签。详见 `docs/agents/triage-labels.md`。
 
 ### Domain docs
 
-单上下文（single-context）布局；现有仓库指令和当前架构文档优先。详见 `docs/agents/domain.md`。
+现有仓库指令和当前架构事实优先。详见 `docs/agents/domain.md`。
