@@ -47,10 +47,8 @@ impl ControlledProvider {
                     break;
                 }
                 let request = read_http_json(&mut stream);
-                // 仅响应 capability probe；保留测试不产生 production 请求。
-                if let Some(response) = capability_probe_response(&request) {
-                    write_json_response(&mut stream, &response);
-                }
+                // 静态能力声明后这些测试不再发起任何 provider 请求；意外请求必须失败。
+                panic!("unexpected provider request after static capability declaration: {request}");
             }
         });
         Self {
@@ -140,9 +138,6 @@ impl Process {
         self.expect_ok(99);
     }
 
-
-
-
     fn send_request(&mut self, id: i64, method: &str, params: Value) {
         send_json(
             &mut self.input,
@@ -199,15 +194,6 @@ impl Drop for Process {
     }
 }
 
-fn usage() -> Value {
-    json!({
-        "input_tokens": 1,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1,
-        "output_tokens_details": {"reasoning_tokens": 0}
-    })
-}
-
 fn read_http_json(stream: &mut TcpStream) -> Value {
     let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
     let mut request_line = String::new();
@@ -233,71 +219,6 @@ fn read_http_json(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&body).expect("provider request json")
 }
 
-fn capability_probe_response(request: &Value) -> Option<Value> {
-    let tools = request.get("tools")?.as_array()?;
-    let names = tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    if !names.contains(&"singularity_capability_probe_a") {
-        return None;
-    }
-    let continuation = request
-        .get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["type"] == "function_call_output")
-        });
-    let strict = tools
-        .iter()
-        .any(|tool| tool.get("strict").and_then(Value::as_bool) == Some(true));
-    let arguments = if strict {
-        json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
-    } else {
-        json!({})
-    };
-    let mut output = vec![json!({
-        "type": "function_call",
-        "call_id": if continuation { "probe_call_continuation" } else { "probe_call_a" },
-        "name": "singularity_capability_probe_a",
-        "arguments": arguments.to_string()
-    })];
-    if !continuation
-        && names.contains(&"singularity_capability_probe_b")
-        && request["parallel_tool_calls"] == true
-    {
-        output.push(json!({
-            "type": "function_call",
-            "call_id": "probe_call_b",
-            "name": "singularity_capability_probe_b",
-            "arguments": arguments.to_string()
-        }));
-    }
-    Some(json!({
-        "id": if continuation {
-            "capability_probe_continuation_response"
-        } else {
-            "capability_probe_response"
-        },
-        "object": "response",
-        "status": "completed",
-        "output": output,
-        "usage": usage()
-    }))
-}
-
-fn write_json_response(stream: &mut TcpStream, body: &Value) {
-    let body = body.to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-}
-
-
 fn send_json(input: &mut impl Write, message: Value) {
     writeln!(input, "{message}").expect("write app-server request");
     input.flush().expect("flush app-server request");
@@ -312,7 +233,6 @@ impl JsonOutput {
     fn recv_id(&mut self, id: i64, timeout: Duration) -> Value {
         self.recv_where(timeout, |message| message["id"] == id)
     }
-
 
     fn recv_where(&mut self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
         if let Some(index) = self.buffered.iter().position(&predicate) {

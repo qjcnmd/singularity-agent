@@ -1,12 +1,6 @@
 //! provider HTTP transport、retry、bounded body read 和取消传播。
 
-use super::capability::{
-    BoundProviderProtocolNegotiation, InMemoryProviderCapabilityCacheState,
-    ProviderCapabilityCache, capability_probe_deadline_error, is_stable_capability_rejection,
-};
-use super::contract::{
-    attach_capability_metadata, provider_request_validation_error, request_uses_tool_protocol,
-};
+use super::contract::{provider_request_validation_error, request_uses_tool_protocol};
 use super::openai::{
     OpenAiCompletion, models_endpoint, openai_reasoning_content_present, openai_request_payload,
     openai_responses_reasoning_content_present, openai_responses_request_payload,
@@ -14,34 +8,31 @@ use super::openai::{
     parse_openai_responses_response,
 };
 use super::{
-    CAPABILITY_PROBE_DEADLINE_SECONDS, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
-    HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
-    HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_RESPONSE_BODY_BYTES, ModelError,
-    ModelErrorKind, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage,
-    OpenAiProvider, OpenAiProviderConfig, PROVIDER_CANCELLATION_POLL_MS,
-    PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
-    PROVIDER_RUNTIME_WORKER_THREADS, PROVIDER_TIMEOUT_SECONDS, Provider, ProviderApiProtocol,
-    ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderCapabilityMetadata, ProviderError, ProviderErrorStage, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ProviderRuntime, ProviderStreamEvent, ProviderStreamingCapability,
-    ProviderToolReasoningMode, ProviderTransportCategory, provider_streaming_unsupported_error,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
+    HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
+    MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_RESPONSE_BODY_BYTES, ModelError, ModelErrorKind,
+    ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, OpenAiProvider,
+    OpenAiProviderConfig, PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS,
+    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_RUNTIME_WORKER_THREADS,
+    PROVIDER_TIMEOUT_SECONDS, Provider, ProviderApiProtocol, ProviderAttemptEvent,
+    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
+    ProviderAttemptStarted, ProviderAttemptStatus, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, ProviderRuntime, ProviderStreamEvent,
+    ProviderStreamingCapability, ProviderToolReasoningMode, ProviderTransportCategory,
+    provider_streaming_unsupported_error, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities,
 };
 use serde_json::Value;
 use singularity_core::CancellationToken;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The single validated protocol choice shared by one provider completion.
 struct CompletionContext {
     capabilities: ProviderProtocolContract,
-    capability_metadata: Option<ProviderCapabilityMetadata>,
     api_protocol: ProviderApiProtocol,
-    capability_binding: Option<BoundProviderProtocolNegotiation>,
 }
 
 /// A stream attempt error plus whether retrying could duplicate visible text.
@@ -158,33 +149,16 @@ impl OpenAiProvider {
         config: OpenAiProviderConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
-        Self::new_with_runtime_handle_and_cache_path(
+        Self::new_with_runtime(
             config,
             PROVIDER_TIMEOUT_SECONDS,
-            None,
-            runtime_handle,
+            ProviderRuntime::External(runtime_handle),
         )
-    }
-
-    /// 创建 provider，并显式绑定可选的持久 capability cache 文件。
-    pub fn new_with_cache_path(
-        config: OpenAiProviderConfig,
-        cache_path: Option<PathBuf>,
-    ) -> Result<Self, ProviderError> {
-        Self::new_with_request_timeout_and_cache_path(config, PROVIDER_TIMEOUT_SECONDS, cache_path)
     }
 
     pub(super) fn new_with_request_timeout(
         config: OpenAiProviderConfig,
         request_timeout_seconds: u64,
-    ) -> Result<Self, ProviderError> {
-        Self::new_with_request_timeout_and_cache_path(config, request_timeout_seconds, None)
-    }
-
-    pub(super) fn new_with_request_timeout_and_cache_path(
-        config: OpenAiProviderConfig,
-        request_timeout_seconds: u64,
-        cache_path: Option<PathBuf>,
     ) -> Result<Self, ProviderError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(PROVIDER_RUNTIME_WORKER_THREADS)
@@ -194,29 +168,13 @@ impl OpenAiProvider {
         Self::new_with_runtime(
             config,
             request_timeout_seconds,
-            cache_path,
             ProviderRuntime::Owned(Arc::new(runtime)),
-        )
-    }
-
-    pub(super) fn new_with_runtime_handle_and_cache_path(
-        config: OpenAiProviderConfig,
-        request_timeout_seconds: u64,
-        cache_path: Option<PathBuf>,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Result<Self, ProviderError> {
-        Self::new_with_runtime(
-            config,
-            request_timeout_seconds,
-            cache_path,
-            ProviderRuntime::External(runtime_handle),
         )
     }
 
     fn new_with_runtime(
         config: OpenAiProviderConfig,
         request_timeout_seconds: u64,
-        cache_path: Option<PathBuf>,
         runtime: ProviderRuntime,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
@@ -229,15 +187,6 @@ impl OpenAiProvider {
             client,
             runtime: Arc::new(runtime),
             request_timeout_seconds,
-            capability_probe_deadline: Duration::from_secs(CAPABILITY_PROBE_DEADLINE_SECONDS),
-            tool_capability_cache: Arc::new(
-                Mutex::new(InMemoryProviderCapabilityCacheState::new()),
-            ),
-            tool_capability_probe_in_flight: Arc::new(Mutex::new(HashMap::new())),
-            persistent_capability_cache: cache_path
-                .and_then(ProviderCapabilityCache::new)
-                .map(Arc::new),
-            capability_cache_diagnostic: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -246,7 +195,7 @@ impl OpenAiProvider {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        super::ProviderConfigSnapshot::capture(get_env, None, None).provider()
+        super::ProviderConfigSnapshot::capture(get_env, None).provider()
     }
 
     /// Discover public model ids from the provider's standard `/models` endpoint.
@@ -263,7 +212,6 @@ impl OpenAiProvider {
             "provider_models_request_failed",
             ProviderErrorStage::RequestSend,
             self.request_timeout_seconds,
-            None,
             || {
                 self.client
                     .get(&endpoint)
@@ -281,7 +229,6 @@ impl OpenAiProvider {
             runtime,
             &cancellation,
             self.request_timeout_seconds,
-            None,
             response,
         )?;
         if body.len() > super::MAX_DISCOVERY_RESPONSE_BYTES {
@@ -426,13 +373,6 @@ impl OpenAiProvider {
         self.selected_model
             .as_ref()
             .map(|selection| selection.api_protocol)
-    }
-
-    pub(super) fn protocol_candidates(&self) -> Vec<ProviderApiProtocol> {
-        self.selected_model
-            .as_ref()
-            .map(|selection| vec![selection.api_protocol])
-            .unwrap_or_else(|| self.config.api_protocol_candidates())
     }
 
     /// Convert the internal composite selector to the bare upstream model id.
@@ -631,8 +571,6 @@ impl OpenAiProvider {
     fn prepare_completion_context_observed(
         &self,
         request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<CompletionContext, ProviderError> {
         let local_validation = validate_model_request(request);
         if !local_validation.valid {
@@ -641,92 +579,26 @@ impl OpenAiProvider {
                 &self.config,
             ));
         }
-        let mut capability_binding = None;
-        let (capabilities, capability_metadata, api_protocol) =
-            if !request_uses_tool_protocol(request) {
-                let mut capabilities = self.protocol_contract();
-                if self.selected_model.is_some() {
-                    // A catalog's developer-role flag controls wire projection;
-                    // it must not reject valid internal system/developer history.
-                    capabilities.supports_system_message = true;
-                    capabilities.supports_developer_message = true;
-                }
-                (
-                    capabilities,
-                    None,
-                    self.selected_model
-                        .as_ref()
-                        .map(|selection| selection.api_protocol)
-                        .unwrap_or_else(|| self.config.completion_protocol_without_tools()),
-                )
-            } else {
-                let effective_model_name = request
-                    .model_preferences
-                    .model_name
-                    .as_deref()
-                    .unwrap_or(&self.config.model_name);
-                let binding = self.negotiate_openai_tool_capabilities_bound_observed(
-                    effective_model_name,
-                    cancellation,
-                    on_attempt,
-                )?;
-                let api_protocol = binding.negotiation.metadata.api_protocol;
-                capability_binding = Some(binding.clone());
-                (
-                    binding.negotiation.contract,
-                    Some(binding.negotiation.metadata),
-                    api_protocol,
-                )
-            };
+        // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
+        // selected_model 或 endpoint 后缀决定（删 probe 后不再探测协议）。
+        let capabilities = self.protocol_contract();
+        let api_protocol = self
+            .selected_model
+            .as_ref()
+            .map(|selection| selection.api_protocol)
+            .unwrap_or_else(|| self.config.completion_protocol_without_tools());
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
-            let provider_error =
-                provider_request_validation_error(request_validation, &self.config);
-            return Err(attach_capability_metadata(
-                provider_error,
-                &capability_metadata,
+            return Err(provider_request_validation_error(
+                request_validation,
+                &self.config,
             ));
         }
         Ok(CompletionContext {
             capabilities,
-            capability_metadata,
             api_protocol,
-            capability_binding,
         })
-    }
-
-    /// Apply capability-cache invalidation and attach safe negotiation metadata once.
-    fn finish_completion_result<T>(
-        &self,
-        result: Result<T, ProviderError>,
-        cancellation: &CancellationToken,
-        context: &CompletionContext,
-    ) -> Result<T, ProviderError> {
-        let cache_invalidation_deadline =
-            Instant::now() + Duration::from_secs(self.request_timeout_seconds);
-        let result = if let (Some(binding), Err(error)) = (&context.capability_binding, &result)
-            && is_stable_capability_rejection(error)
-        {
-            match self.invalidate_tool_capability_negotiation(
-                &binding.key,
-                cancellation,
-                cache_invalidation_deadline,
-            ) {
-                Ok(()) => result,
-                Err(invalidation_error) => result.map_err(|mut original| {
-                    original.error.validation_errors.push(
-                        invalidation_error.error.code.unwrap_or_else(|| {
-                            "provider_capability_cache_invalidation_failed".to_string()
-                        }),
-                    );
-                    original
-                }),
-            }
-        } else {
-            result
-        };
-        result.map_err(|error| attach_capability_metadata(error, &context.capability_metadata))
     }
 
     fn complete_with_contract_observed(
@@ -744,7 +616,6 @@ impl OpenAiProvider {
             capabilities,
             api_protocol,
             model_name,
-            None,
             on_attempt,
         )?;
         validate_response_tool_reasoning_contract(
@@ -811,7 +682,6 @@ impl OpenAiProvider {
                 "provider_request_send_failed",
                 ProviderErrorStage::RequestSend,
                 self.request_timeout_seconds,
-                None,
                 || {
                     self.client
                         .post(&endpoint)
@@ -993,7 +863,6 @@ impl OpenAiProvider {
         capabilities: &ProviderProtocolContract,
         api_protocol: ProviderApiProtocol,
         model_name: &str,
-        probe_deadline: Option<Instant>,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = self.runtime.as_ref();
@@ -1053,11 +922,7 @@ impl OpenAiProvider {
                 )
             }
         };
-        let operation_phase = if probe_deadline.is_some() {
-            ProviderAttemptOperationPhase::CapabilityProbe
-        } else {
-            ProviderAttemptOperationPhase::Completion
-        };
+        let operation_phase = ProviderAttemptOperationPhase::Completion;
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -1079,7 +944,6 @@ impl OpenAiProvider {
                 "provider_request_send_failed",
                 ProviderErrorStage::RequestSend,
                 self.request_timeout_seconds,
-                probe_deadline,
                 || {
                     self.client
                         .post(&endpoint)
@@ -1098,12 +962,13 @@ impl OpenAiProvider {
                 {
                     let retry_backoff =
                         record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
-                    wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
-                        .map_err(|cancelled| {
+                    wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
+                        |cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
                                 &metadata, started_at,
                             ))
-                        })?;
+                        },
+                    )?;
                     continue;
                 }
                 Err(error) => {
@@ -1133,12 +998,13 @@ impl OpenAiProvider {
                 {
                     let retry_backoff =
                         record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
-                    wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
-                        .map_err(|cancelled| {
+                    wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
+                        |cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
                                 &metadata, started_at,
                             ))
-                        })?;
+                        },
+                    )?;
                     continue;
                 }
                 record_provider_attempt(
@@ -1158,7 +1024,6 @@ impl OpenAiProvider {
                 runtime,
                 cancellation,
                 self.request_timeout_seconds,
-                probe_deadline,
                 response,
             ) {
                 Ok(body) => body,
@@ -1168,12 +1033,13 @@ impl OpenAiProvider {
                 {
                     let retry_backoff =
                         record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
-                    wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
-                        .map_err(|cancelled| {
+                    wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
+                        |cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
                                 &metadata, started_at,
                             ))
-                        })?;
+                        },
+                    )?;
                     continue;
                 }
                 Err(error) => {
@@ -1279,7 +1145,7 @@ impl OpenAiProvider {
     }
 }
 
-/// Enforce the negotiated tool-reasoning contract on a completed response.
+/// Enforce the declared tool-reasoning contract on a completed response.
 ///
 /// A response is rejected only when the contract is actually violated: the
 /// provider returned reasoning content despite `DisabledForToolCalls`, or the
@@ -1326,7 +1192,37 @@ fn validate_response_tool_reasoning_contract(
 
 impl Provider for OpenAiProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
-        self.config.protocol_contract()
+        let mut contract = self.config.protocol_contract();
+        // Catalog 克隆：用户显式能力声明（config.json `capabilities` 块）叠加到静态基线；
+        // 顶层字段优先的合并已在配置解析时完成，这里只做声明 → 契约投影。
+        if let Some(overrides) = self
+            .selected_model
+            .as_ref()
+            .and_then(|selection| selection.capability_overrides.as_ref())
+        {
+            contract.supports_tools =
+                overrides.supports_tools.unwrap_or(contract.supports_tools);
+            contract.supports_parallel_tool_calls =
+                overrides.supports_parallel_tool_calls.unwrap_or(contract.supports_parallel_tool_calls);
+            contract.supports_required_tool_choice = overrides
+                .supports_required_tool_choice
+                .unwrap_or(contract.supports_required_tool_choice);
+            contract.supports_strict_tool_schema =
+                overrides.supports_strict_tool_schema.unwrap_or(contract.supports_strict_tool_schema);
+            contract.supports_json_mode =
+                overrides.supports_json_mode.unwrap_or(contract.supports_json_mode);
+            contract.supports_system_message =
+                overrides.supports_system_message.unwrap_or(contract.supports_system_message);
+            contract.supports_developer_message =
+                overrides.supports_developer_message.unwrap_or(contract.supports_developer_message);
+            contract.max_tools_per_request =
+                overrides.max_tools_per_request.unwrap_or(contract.max_tools_per_request);
+            contract.max_context_tokens =
+                overrides.max_context_tokens.or(contract.max_context_tokens);
+            contract.max_output_tokens =
+                overrides.max_output_tokens.unwrap_or(contract.max_output_tokens);
+        }
+        contract
     }
 
     fn streaming_capability(
@@ -1334,49 +1230,6 @@ impl Provider for OpenAiProvider {
         selected_protocol: ProviderApiProtocol,
     ) -> ProviderStreamingCapability {
         ProviderStreamingCapability::for_protocol(selected_protocol)
-    }
-
-    fn negotiate_tool_capabilities(
-        &self,
-        model_preferences: &ModelPreferences,
-        cancellation: &CancellationToken,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        let mut ignore_attempt = |_| true;
-        self.negotiate_tool_capabilities_observed(
-            model_preferences,
-            cancellation,
-            &mut ignore_attempt,
-        )
-    }
-
-    fn negotiate_tool_capabilities_observed(
-        &self,
-        model_preferences: &ModelPreferences,
-        cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        let model_preferences = if model_preferences.model_name.is_some() {
-            let request = ModelTurnRequest {
-                request_id: "provider_capability_selection".to_string(),
-                messages: Vec::new(),
-                tools: Vec::new(),
-                tool_choice: Default::default(),
-                model_preferences: model_preferences.clone(),
-                provider_reasoning_history: Vec::new(),
-            };
-            self.normalize_request_model(&request)?.model_preferences
-        } else {
-            model_preferences.clone()
-        };
-        self.negotiate_openai_tool_capabilities_bound_observed(
-            model_preferences
-                .model_name
-                .as_deref()
-                .unwrap_or(&self.config.model_name),
-            cancellation,
-            on_attempt,
-        )
-        .map(|bound| bound.negotiation)
     }
 
     fn complete_stream(
@@ -1401,46 +1254,36 @@ impl Provider for OpenAiProvider {
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
         let request = self.normalize_request_model(request)?;
-        let context =
-            self.prepare_completion_context_observed(&request, cancellation, on_attempt)?;
+        let context = self.prepare_completion_context_observed(&request)?;
         if self.streaming_capability(context.api_protocol)
             != ProviderStreamingCapability::OutputTextDelta
         {
-            return Err(attach_capability_metadata(
-                provider_streaming_unsupported_error(),
-                &context.capability_metadata,
-            ));
+            return Err(provider_streaming_unsupported_error());
         }
         let model_name = request
             .model_preferences
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let result = self
-            .complete_responses_stream(
-                &request,
-                cancellation,
+        self.complete_responses_stream(
+            &request,
+            cancellation,
+            &context.capabilities,
+            model_name,
+            on_event,
+            on_attempt,
+        )
+        .and_then(|completion| {
+            validate_response_tool_reasoning_contract(
+                request_uses_tool_protocol(&request),
+                &completion,
                 &context.capabilities,
-                model_name,
-                on_event,
-                on_attempt,
+                self.selected_model.as_ref().is_some_and(|selection| {
+                    selection.requires_reasoning_content_for_tool_calls
+                }),
             )
-            .and_then(|completion| {
-                validate_response_tool_reasoning_contract(
-                    request_uses_tool_protocol(&request),
-                    &completion,
-                    &context.capabilities,
-                    self.selected_model.as_ref().is_some_and(|selection| {
-                        selection.requires_reasoning_content_for_tool_calls
-                    }),
-                )
-                .map(|()| completion.response)
-            })
-            .map(|mut response| {
-                response.provider_capability_metadata = context.capability_metadata.clone();
-                response
-            });
-        self.finish_completion_result(result, cancellation, &context)
+            .map(|()| completion.response)
+        })
     }
 
     fn complete(
@@ -1463,27 +1306,20 @@ impl Provider for OpenAiProvider {
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
         let request = self.normalize_request_model(request)?;
-        let context =
-            self.prepare_completion_context_observed(&request, cancellation, on_attempt)?;
+        let context = self.prepare_completion_context_observed(&request)?;
         let effective_model_name = request
             .model_preferences
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let result = self
-            .complete_with_contract_observed(
-                &request,
-                cancellation,
-                &context.capabilities,
-                context.api_protocol,
-                effective_model_name,
-                on_attempt,
-            )
-            .map(|mut response| {
-                response.provider_capability_metadata = context.capability_metadata.clone();
-                response
-            });
-        self.finish_completion_result(result, cancellation, &context)
+        self.complete_with_contract_observed(
+            &request,
+            cancellation,
+            &context.capabilities,
+            context.api_protocol,
+            effective_model_name,
+            on_attempt,
+        )
     }
 }
 
@@ -1494,7 +1330,7 @@ fn wait_stream_retry_backoff(
     metadata: &ProviderAttemptMetadata,
     started_at: Instant,
 ) -> Result<(), ProviderError> {
-    wait_provider_backoff(runtime, cancellation, duration, None).map_err(|error| {
+    wait_provider_backoff(runtime, cancellation, duration).map_err(|error| {
         error.with_provider_attempt_metadata(provider_attempt_metadata(metadata, started_at))
     })
 }
@@ -1526,7 +1362,6 @@ fn read_openai_responses_sse(
             "provider_response_body_read_failed",
             ProviderErrorStage::ResponseBodyRead,
             request_timeout_seconds,
-            None,
             || response.chunk(),
         ) {
             Ok(chunk) => chunk,
@@ -1800,24 +1635,6 @@ fn provider_response_stream_too_large_error() -> ProviderError {
     ProviderError::from_model_error(error)
 }
 
-pub(super) fn add_provider_attempt_metadata(
-    total: &mut ProviderAttemptMetadata,
-    metadata: &ProviderAttemptMetadata,
-) {
-    let first_attempt_index = total.attempt_count.saturating_add(1);
-    total.attempt_count = total.attempt_count.saturating_add(metadata.attempt_count);
-    total.retry_count = total.retry_count.saturating_add(metadata.retry_count);
-    total.latency_ms = total.latency_ms.saturating_add(metadata.latency_ms);
-    total
-        .occurrences
-        .extend(metadata.occurrences.iter().cloned().enumerate().map(
-            |(offset, mut occurrence)| {
-                occurrence.attempt_index =
-                    first_attempt_index.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-                occurrence
-            },
-        ));
-}
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -2035,28 +1852,17 @@ pub(super) fn wait_provider_backoff(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     duration: Duration,
-    probe_deadline: Option<Instant>,
 ) -> Result<(), ProviderError> {
     let deadline = Instant::now() + duration;
     loop {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(capability_probe_deadline_error());
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(());
         }
-        let poll = probe_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(remaining)
-            .min(remaining)
-            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
-        if poll.is_zero() {
-            return Err(capability_probe_deadline_error());
-        }
+        let poll = remaining.min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
         runtime.block_on(async {
             tokio::time::sleep(poll).await;
         });
@@ -2069,7 +1875,6 @@ pub(super) fn block_on_provider_future<C, F, T>(
     error_code: &'static str,
     error_stage: ProviderErrorStage,
     request_timeout_seconds: u64,
-    probe_deadline: Option<Instant>,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -2090,16 +1895,7 @@ where
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(capability_probe_deadline_error());
-        }
-        let poll = probe_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_else(|| Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS))
-            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
-        if poll.is_zero() {
-            return Err(capability_probe_deadline_error());
-        }
+        let poll = Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS);
         match runtime.block_on(async { tokio::time::timeout(poll, future.as_mut()).await }) {
             Ok(result) => {
                 return result.map_err(|error| {
@@ -2120,7 +1916,6 @@ pub(super) fn read_bounded_provider_response_body(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
-    probe_deadline: Option<Instant>,
     mut response: reqwest::Response,
 ) -> Result<Vec<u8>, ProviderError> {
     if response
@@ -2142,7 +1937,6 @@ pub(super) fn read_bounded_provider_response_body(
             "provider_response_body_read_failed",
             ProviderErrorStage::ResponseBodyRead,
             request_timeout_seconds,
-            probe_deadline,
             || response.chunk(),
         )?;
         let Some(chunk) = chunk else {

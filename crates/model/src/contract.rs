@@ -3,11 +3,10 @@
 use super::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelValidationResult, OpenAiProviderConfig, ProviderAttemptMetadata,
-    ProviderCapabilityMetadata, ProviderError, ProviderErrorStage, ProviderProtocolContract,
-    REQUIRED_TOOL_CHOICE_MISSING_ERROR, REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR,
-    REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR, TEXT_TOOL_CALL_ENVELOPE_ERROR, ToolChoiceMode,
-    ToolChoicePolicy,
+    ModelValidationResult, OpenAiProviderConfig, ProviderAttemptMetadata, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, REQUIRED_TOOL_CHOICE_MISSING_ERROR,
+    REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR, REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR,
+    TEXT_TOOL_CALL_ENVELOPE_ERROR, ToolChoiceMode, ToolChoicePolicy,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -62,16 +61,6 @@ pub(super) fn provider_request_validation_error(
     error.validation_errors = validation.errors;
     ProviderError::from_model_error(error)
         .with_provider_attempt_metadata(ProviderAttemptMetadata::zero())
-}
-
-pub(super) fn attach_capability_metadata(
-    mut error: ProviderError,
-    metadata: &Option<ProviderCapabilityMetadata>,
-) -> ProviderError {
-    if let Some(metadata) = metadata {
-        error.capability_metadata = Some(Box::new(metadata.clone()));
-    }
-    error
 }
 
 pub(super) fn provider_response_validation_error(

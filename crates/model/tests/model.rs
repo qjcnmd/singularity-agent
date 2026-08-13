@@ -1,18 +1,16 @@
-//! Provider adapter、Direct capability probe、协议投影和错误归因测试。
+//! Provider adapter、协议投影和错误归因测试。
 
 use schemars::schema_for;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_MODELS_CONFIG, ModelBlockerKind,
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences,
-    ModelProviderConfig, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider,
-    OpenAiProviderConfig, Provider, ProviderApiProtocol, ProviderAttemptEvent,
-    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStatus, ProviderCapabilityCacheLookupResult, ProviderCapabilityMetadata,
-    ProviderCapabilityProfile, ProviderConfigSnapshot, ProviderConfigSource,
-    ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract,
-    ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability,
-    ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig,
+    ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig,
+    Provider, ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata,
+    ProviderAttemptOccurrence, ProviderAttemptOperationPhase, ProviderAttemptStatus,
+    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
+    ProviderErrorStage, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
+    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, responses_endpoint, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
@@ -20,8 +18,7 @@ use singularity_model::{
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
-    Arc, Barrier, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    Mutex,
     mpsc::{self, Receiver},
 };
 use std::thread;
@@ -86,45 +83,16 @@ fn capability_test_request(
     request
 }
 
-fn history_only_finalization_request(request_id: &str) -> ModelTurnRequest {
-    let mut request = ModelTurnRequest::new(
-        request_id,
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    request
-        .messages
-        .push(ModelMessage::assistant_tool_calls(vec![tool_call(
-            "call_read",
-            "read",
-        )]));
-    let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
-    tool_result.tool_call_id = Some("call_read".to_string());
-    request.messages.push(tool_result);
-    request.tool_choice = ToolChoicePolicy {
-        mode: ToolChoiceMode::None,
-        max_tool_calls: 0,
-        strict_tool_schema: false,
-    };
-    request
-}
-
 fn single_response_server(status_line: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test provider");
     let addr = listener.local_addr().expect("test provider address");
     thread::spawn(move || {
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept test provider request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if let Some(probe_body) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, false);
-                continue;
-            }
-            write_provider_response(&mut stream, status_line, body, false);
-            break;
-        }
+        let (mut stream, _) = listener.accept().expect("accept test provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let (first_line, headers, _) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        write_provider_response(&mut stream, status_line, body, false);
     });
     format!("http://{addr}")
 }
@@ -153,20 +121,13 @@ fn captured_request_server(
     let addr = listener.local_addr().expect("test provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept test provider request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if let Some(probe_body) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
-                continue;
-            }
-            tx.send(request_body).expect("send request body");
-            write_provider_response(&mut stream, status_line, body, true);
-            break;
-        }
+        let (mut stream, _) = listener.accept().expect("accept test provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        tx.send(request_body).expect("send request body");
+        write_provider_response(&mut stream, status_line, body, true);
     });
     (format!("http://{addr}"), rx)
 }
@@ -178,25 +139,17 @@ fn responses_provider_server(
     let addr = listener.local_addr().expect("Responses provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept Responses request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/responses"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            requests.push((first_line, request_body.clone()));
-            if let Some(body) = responses_capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-                continue;
-            }
-            let body = actual_body.to_string();
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-            tx.send(requests).expect("send Responses requests");
-            break;
-        }
+        let (mut stream, _) = listener.accept().expect("accept Responses request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/responses"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        let body = actual_body.to_string();
+        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+        tx.send(vec![(first_line, request_body)]).expect("send Responses requests");
     });
-    (format!("http://{addr}"), rx)
+    // 静态协议选择：legacy provider 按 endpoint 后缀决定协议，显式 /v1/responses。
+    (format!("http://{addr}/v1/responses"), rx)
 }
 
 fn responses_stream_server(
@@ -236,881 +189,8 @@ fn responses_stream_server(
     (format!("http://{addr}/v1/responses"), rx)
 }
 
-fn finalization_protocol_server() -> (String, Receiver<Vec<(String, String)>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind finalization provider");
-    let addr = listener
-        .local_addr()
-        .expect("finalization provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept finalization request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            requests.push((first_line.clone(), request_body.clone()));
-            if first_line.contains("/v1/responses")
-                && let Some(body) = responses_capability_probe_response(&request_body)
-            {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-                continue;
-            }
-            let body = if first_line.contains("/v1/responses") {
-                serde_json::json!({
-                    "id": "response_final",
-                    "object": "response",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "done"}]
-                    }],
-                    "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
-                })
-            } else {
-                serde_json::json!({
-                    "id": "chat_final",
-                    "choices": [{
-                        "message": {"role": "assistant", "content": "done"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
-                })
-            };
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body.to_string(), false);
-            tx.send(requests).expect("send finalization requests");
-            break;
-        }
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn responses_to_chat_fallback_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind protocol fallback provider");
-    let addr = listener
-        .local_addr()
-        .expect("protocol fallback provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut paths = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept protocol request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, _, request_body) = read_provider_request(&mut reader);
-            paths.push(first_line.clone());
-            if first_line.contains("/v1/responses") {
-                write_provider_response(
-                    &mut stream,
-                    "HTTP/1.1 404 Not Found",
-                    r#"{"error":"unsupported endpoint"}"#,
-                    false,
-                );
-                continue;
-            }
-            assert!(first_line.contains("/v1/chat/completions"));
-            if let Some(body) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-                continue;
-            }
-            write_provider_response(
-                &mut stream,
-                "HTTP/1.1 200 OK",
-                &serde_json::json!({
-                    "id": "chat_actual",
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": null,
-                            "tool_calls": [{
-                                "id": "call_read",
-                                "type": "function",
-                                "function": {"name": "read", "arguments": "{}"}
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }],
-                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                })
-                .to_string(),
-                false,
-            );
-            tx.send(paths).expect("send protocol fallback paths");
-            break;
-        }
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn protocol_status_server(
-    status_line: &'static str,
-    body: &'static str,
-) -> (String, Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind protocol status provider");
-    let addr = listener
-        .local_addr()
-        .expect("protocol status provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept protocol request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone protocol stream"));
-        let (first_line, headers, _) = read_provider_request(&mut reader);
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
-        write_provider_response(&mut stream, status_line, body, false);
-        tx.send(first_line).expect("send protocol request path");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn configurable_probe_server(
-    probe_responses: Vec<(&'static str, &'static str)>,
-    actual_body: &'static str,
-    actual_count: usize,
-) -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capability provider");
-    let addr = listener.local_addr().expect("capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut probe_index = 0;
-        let mut seen_requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept capability request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone capability stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if is_capability_probe_continuation_request(&request_body) {
-                let body = capability_probe_response(&request_body)
-                    .expect("capability continuation response");
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, true);
-                continue;
-            }
-            if request_body.contains("singularity_capability_probe") {
-                let (status_line, body) = probe_responses
-                    .get(probe_index)
-                    .copied()
-                    .expect("capability probe response configured");
-                probe_index += 1;
-                write_provider_response(&mut stream, status_line, body, true);
-                if actual_count == 0 && probe_index == probe_responses.len() {
-                    tx.send(seen_requests).expect("send probe-only requests");
-                    break;
-                }
-                continue;
-            }
-            seen_requests.push(request_body);
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", actual_body, true);
-            if seen_requests.len() == actual_count {
-                tx.send(seen_requests)
-                    .expect("send captured actual request");
-                break;
-            }
-        }
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn strict_probe_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind strict capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("strict capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept strict capability request");
-        let mut reader =
-            BufReader::new(stream.try_clone().expect("clone strict capability stream"));
-        let (first_line, headers, request_body) = read_provider_request(&mut reader);
-        assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
-
-        let request: serde_json::Value =
-            serde_json::from_str(&request_body).expect("strict capability request JSON");
-        let parameters = request
-            .pointer("/tools/0/function/parameters")
-            .expect("strict probe parameters");
-        let valid_schema = parameters.get("oneOf").is_none()
-            && parameters["type"] == "object"
-            && parameters["required"] == serde_json::json!(["probe", "values"])
-            && parameters["additionalProperties"] == false
-            && parameters["properties"]["probe"]["type"] == "string"
-            && parameters["properties"]["probe"]["enum"]
-                == serde_json::json!(["schema_sentinel_alpha", "schema_sentinel_beta"])
-            && parameters["properties"]["values"]["type"] == "array"
-            && parameters["properties"]["values"]["items"]["type"] == "integer"
-            && parameters["properties"]["values"]["items"]["enum"] == serde_json::json!([7]);
-        let valid_roles = request["messages"][0]["role"] == "developer"
-            && request["messages"][1]["role"] == "user";
-        if valid_schema && valid_roles {
-            write_provider_response(
-                &mut stream,
-                "HTTP/1.1 200 OK",
-                PROBE_STRICT_PARALLEL_RESPONSE,
-                true,
-            );
-        } else {
-            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
-            tx.send(vec![request_body])
-                .expect("send invalid strict capability request");
-            return;
-        }
-        let (mut stream, _) = listener
-            .accept()
-            .expect("accept strict capability continuation");
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .expect("clone strict capability continuation stream"),
-        );
-        let (_, _, continuation_body) = read_provider_request(&mut reader);
-        let response = capability_probe_response(&continuation_body)
-            .expect("strict capability continuation response");
-        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-        tx.send(vec![request_body, continuation_body])
-            .expect("send strict capability requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn reasoning_stabilization_probe_server(
-    disabled_status: &'static str,
-    disabled_body: &'static str,
-    actual_body: &'static str,
-    actual_count: usize,
-) -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reasoning capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("reasoning capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        let mut actual_seen = 0;
-        loop {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept reasoning capability request");
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .expect("clone reasoning capability stream"),
-            );
-            let (_, _, request_body) = read_provider_request(&mut reader);
-            let request: serde_json::Value =
-                serde_json::from_str(&request_body).expect("reasoning capability request JSON");
-            requests.push(request_body);
-            if is_reasoning_probe_continuation_request(
-                requests.last().expect("continuation request"),
-            ) {
-                assert_eq!(request["thinking"]["type"], "disabled");
-                let response =
-                    capability_probe_response(requests.last().expect("continuation request body"))
-                        .expect("reasoning capability continuation response");
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-                if actual_count == 0 {
-                    tx.send(requests).expect("send reasoning probe requests");
-                    break;
-                }
-                continue;
-            }
-            if request["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains("singularity_capability_probe"))
-                })
-            }) {
-                if request
-                    .pointer("/thinking/type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("disabled")
-                {
-                    write_provider_response(&mut stream, disabled_status, disabled_body, true);
-                } else {
-                    write_provider_response(
-                        &mut stream,
-                        "HTTP/1.1 200 OK",
-                        PROBE_STRICT_PARALLEL_REASONING_RESPONSE,
-                        true,
-                    );
-                }
-                if actual_count == 0 && requests.len() == 2 {
-                    tx.send(requests).expect("send reasoning probe requests");
-                    break;
-                }
-                continue;
-            }
-            actual_seen += 1;
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", actual_body, true);
-            if actual_seen == actual_count {
-                tx.send(requests)
-                    .expect("send reasoning negotiation requests");
-                break;
-            }
-        }
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (String, Receiver<()>) {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").expect("bind strict constraint capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("strict constraint capability provider address");
-    let (tx, rx) = mpsc::channel();
-    let bad_response = serde_json::json!({
-        "id": "probe_strict_constraint_mismatch",
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "probe_call_a",
-                        "type": "function",
-                        "function": {
-                            "name": "singularity_capability_probe_a",
-                            "arguments": bad_arguments
-                        }
-                    },
-                    {
-                        "id": "probe_call_b",
-                        "type": "function",
-                        "function": {
-                            "name": "singularity_capability_probe_b",
-                            "arguments": bad_arguments
-                        }
-                    }
-                ]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    })
-    .to_string();
-    thread::spawn(move || {
-        for (status_line, body) in [
-            ("HTTP/1.1 200 OK", bad_response.as_str()),
-            ("HTTP/1.1 200 OK", PROBE_BAD_ARGUMENTS_RESPONSE),
-            ("HTTP/1.1 200 OK", bad_response.as_str()),
-        ] {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept strict constraint capability request");
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .expect("clone strict constraint capability stream"),
-            );
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            assert!(request_body.contains("singularity_capability_probe"));
-            write_provider_response(&mut stream, status_line, body, true);
-        }
-        let (mut stream, _) = listener
-            .accept()
-            .expect("accept strict constraint continuation request");
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .expect("clone strict constraint continuation stream"),
-        );
-        let (_, _, request_body) = read_provider_request(&mut reader);
-        let response = capability_probe_response(&request_body)
-            .expect("strict constraint continuation response");
-        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-        tx.send(())
-            .expect("send strict constraint probe completion");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn delayed_probe_server(
-    probe_responses: Vec<(&'static str, &'static str)>,
-    response_delay: Duration,
-) -> (String, Receiver<Vec<String>>, Receiver<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("delayed capability provider address");
-    let (request_tx, request_rx) = mpsc::channel();
-    let (started_tx, started_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut seen_requests = Vec::new();
-        let mut expect_continuation = false;
-        for (status_line, body) in probe_responses {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept delayed capability request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone capability stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            assert!(request_body.contains("singularity_capability_probe"));
-            started_tx
-                .send(())
-                .expect("send capability request started");
-            thread::sleep(response_delay);
-            seen_requests.push(request_body);
-            write_provider_response_best_effort(&mut stream, status_line, body, true);
-            expect_continuation = status_line.contains("200 OK") && body.contains("\"tool_calls\"");
-        }
-        if expect_continuation {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept delayed capability continuation");
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .expect("clone delayed capability continuation stream"),
-            );
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            assert!(is_capability_probe_continuation_request(&request_body));
-            started_tx
-                .send(())
-                .expect("send capability continuation started");
-            thread::sleep(response_delay);
-            let body = capability_probe_response(&request_body)
-                .expect("delayed capability continuation response");
-            seen_requests.push(request_body);
-            write_provider_response_best_effort(&mut stream, "HTTP/1.1 200 OK", &body, true);
-        }
-        request_tx
-            .send(seen_requests)
-            .expect("send delayed capability requests");
-    });
-    (format!("http://{addr}"), request_rx, started_rx)
-}
-
-fn direct_only_probe_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind direct capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("direct capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..4 {
-            let (mut stream, _) = listener.accept().expect("accept direct capability request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone direct stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            assert!(request_body.contains("singularity_capability_probe"));
-            requests.push(request_body);
-            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
-        }
-        tx.send(requests).expect("send direct capability requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn persistent_probe_server(expected_requests: usize) -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind persistent capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("persistent capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..expected_requests {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept persistent capability request");
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .expect("clone persistent capability stream"),
-            );
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            let response = capability_probe_response(&request_body)
-                .expect("persistent capability probe request");
-            requests.push(request_body);
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-        }
-        tx.send(requests)
-            .expect("send persistent capability requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn parallel_persistent_probe_server(
-    expected_requests: usize,
-) -> (String, Receiver<(usize, Vec<String>)>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind parallel capability provider");
-    let addr = listener
-        .local_addr()
-        .expect("parallel capability provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let mut workers = Vec::new();
-        for _ in 0..expected_requests {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept parallel capability request");
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            let requests = Arc::clone(&requests);
-            workers.push(thread::spawn(move || {
-                let mut reader = BufReader::new(
-                    stream
-                        .try_clone()
-                        .expect("clone parallel capability stream"),
-                );
-                let (first_line, headers, request_body) = read_provider_request(&mut reader);
-                assert!(first_line.contains("/v1/chat/completions"));
-                assert!(headers.contains("authorization: Bearer sk-secret-value"));
-                requests
-                    .lock()
-                    .expect("parallel request list")
-                    .push(request_body.clone());
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                maximum.fetch_max(current, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(100));
-                let response = capability_probe_response(&request_body)
-                    .expect("parallel capability probe request");
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("join parallel capability request");
-        }
-        let requests = Arc::try_unwrap(requests)
-            .expect("parallel request list ownership")
-            .into_inner()
-            .expect("parallel request list mutex");
-        tx.send((maximum.load(Ordering::SeqCst), requests))
-            .expect("send parallel capability requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-/// 供 `openai_cached_capability_rejection_invalidates_persistent_record` 使用：
-/// probe（非 continuation）返回带 reasoning_content 的 probe 响应，协商出
-/// ReplayReasoningContent 模式；continuation 用通用 probe 响应；actual 响应为
-/// 带 tool call 但无 reasoning_content 的真实回放义务违规。共 5 个请求
-/// （first 协商 2 + actual 1 + 失效后 second 重新协商 2）。
-fn cached_reasoning_rejection_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reasoning invalidation provider");
-    let addr = listener
-        .local_addr()
-        .expect("reasoning invalidation provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..5 {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept reasoning invalidation request");
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .expect("clone reasoning invalidation stream"),
-            );
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if let Some(response) = capability_probe_response(&request_body) {
-                let body = if is_capability_probe_continuation_request(&request_body) {
-                    response
-                } else {
-                    PROBE_STRICT_PARALLEL_REASONING_RESPONSE.to_string()
-                };
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, true);
-            } else {
-                write_provider_response(
-                    &mut stream,
-                    "HTTP/1.1 200 OK",
-                    ACTUAL_TOOL_CALL_RESPONSE,
-                    true,
-                );
-            }
-            requests.push(request_body);
-        }
-        tx.send(requests)
-            .expect("send reasoning invalidation requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn ordinary_http_400_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ordinary 400 provider");
-    let addr = listener
-        .local_addr()
-        .expect("ordinary 400 provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..3 {
-            let (mut stream, _) = listener.accept().expect("accept ordinary 400 request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone ordinary 400 stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if let Some(response) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
-            } else {
-                write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
-            }
-            requests.push(request_body);
-        }
-        tx.send(requests).expect("send ordinary 400 requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-model provider");
-    let addr = listener.local_addr().expect("multi-model provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut actual_requests = Vec::new();
-        let mut all_requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept multi-model request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone multi-model stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            all_requests.push(request_body.clone());
-            if let Some(probe_body) = capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
-                continue;
-            }
-            actual_requests.push(request_body);
-            write_provider_response(&mut stream, "HTTP/1.1 200 OK", ACTUAL_DONE_RESPONSE, true);
-            if actual_requests.len() == actual_count {
-                tx.send(all_requests).expect("send multi-model requests");
-                break;
-            }
-        }
-    });
-    (format!("http://{addr}"), rx)
-}
-
-fn multi_turn_probe_recovery_server() -> (String, Receiver<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-turn probe provider");
-    let addr = listener
-        .local_addr()
-        .expect("multi-turn probe provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut requests = Vec::new();
-        for index in 0..7 {
-            let (mut stream, _) = listener.accept().expect("accept multi-turn probe request");
-            let mut reader =
-                BufReader::new(stream.try_clone().expect("clone multi-turn probe stream"));
-            let (_, _, request_body) = read_provider_request(&mut reader);
-            requests.push(request_body.clone());
-            let (status, body) = match index {
-                0..=2 => ("HTTP/1.1 400 Bad Request", "{}".to_string()),
-                3 => ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE.to_string()),
-                4 => ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE.to_string()),
-                5 => (
-                    "HTTP/1.1 200 OK",
-                    PROBE_STRICT_PARALLEL_RESPONSE.to_string(),
-                ),
-                6 => (
-                    "HTTP/1.1 200 OK",
-                    capability_probe_response(&request_body)
-                        .expect("successful second multi-turn probe continuation"),
-                ),
-                _ => unreachable!(),
-            };
-            write_provider_response(&mut stream, status, &body, true);
-        }
-        tx.send(requests).expect("send multi-turn probe requests");
-    });
-    (format!("http://{addr}"), rx)
-}
-
-const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
-    "id": "probe_strict_parallel",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "probe_call_a",
-                    "type": "function",
-                    "function": {
-                        "name": "singularity_capability_probe_a",
-                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
-                    }
-                },
-                {
-                    "id": "probe_call_b",
-                    "type": "function",
-                    "function": {
-                        "name": "singularity_capability_probe_b",
-                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
-                    }
-                }
-            ]
-        },
-        "finish_reason": "tool_calls"
-    }],
-    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
-}"#;
-
-const PROBE_STRICT_PARALLEL_REASONING_RESPONSE: &str = r#"{
-    "id": "probe_strict_parallel_reasoning",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "fixed private probe reasoning",
-            "tool_calls": [
-                {
-                    "id": "probe_call_a",
-                    "type": "function",
-                    "function": {
-                        "name": "singularity_capability_probe_a",
-                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
-                    }
-                },
-                {
-                    "id": "probe_call_b",
-                    "type": "function",
-                    "function": {
-                        "name": "singularity_capability_probe_b",
-                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
-                    }
-                }
-            ]
-        },
-        "finish_reason": "tool_calls"
-    }],
-    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
-}"#;
-
-const PROBE_STRICT_SINGLE_RESPONSE: &str = r#"{
-    "id": "probe_strict_single",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe_call_a",
-                "type": "function",
-                "function": {
-                    "name": "singularity_capability_probe_a",
-                    "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
-                }
-            }
-            ]
-        },
-        "finish_reason": "tool_calls"
-    }]
-}"#;
-
-const PROBE_NON_STRICT_SINGLE_RESPONSE: &str = r#"{
-    "id": "probe_non_strict_single",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe_call_a",
-                "type": "function",
-                "function": {
-                    "name": "singularity_capability_probe_a",
-                    "arguments": "{}"
-                }
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }]
-}"#;
-
-const PROBE_TEXT_RESPONSE: &str = r#"{
-    "id": "probe_text",
-    "choices": [{
-        "message": {"role": "assistant", "content": "call singularity_capability_probe_a"},
-        "finish_reason": "stop"
-    }]
-}"#;
-
-const PROBE_BAD_ARGUMENTS_RESPONSE: &str = r#"{
-    "id": "probe_bad_arguments",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe_call_a",
-                "type": "function",
-                "function": {"name": "singularity_capability_probe_a", "arguments": "[]"}
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }]
-}"#;
-
-const ACTUAL_DONE_RESPONSE: &str = r#"{
-    "id": "actual_response",
-    "choices": [{
-        "message": {"role": "assistant", "content": "done"},
-        "finish_reason": "stop"
-    }]
-}"#;
-
-const ACTUAL_TOOL_REASONING_RESPONSE: &str = r#"{
-    "id": "actual_tool_reasoning_response",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "private reasoning that requires replay",
-            "tool_calls": [{
-                "id": "actual_tool_call",
-                "type": "function",
-                "function": {"name": "read", "arguments": "{}"}
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }]
-}"#;
-
 /// Chat 实际响应：带 tool call 但没有 reasoning_content——在 ReplayReasoningContent
 /// 模式下这是真实的回放义务违规（有 tool call 必须回放 reasoning_content）。
-const ACTUAL_TOOL_CALL_RESPONSE: &str = r#"{
-    "id": "actual_tool_call_response",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "actual_tool_call",
-                "type": "function",
-                "function": {"name": "read", "arguments": "{}"}
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }]
-}"#;
-
-const CHAT_HISTORY_REASONING_RESPONSE: &str = r#"{
-    "id": "chat_history_reasoning",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "done",
-            "reasoning_content": "private reasoning that requires replay"
-        },
-        "finish_reason": "stop"
-    }]
-}"#;
 
 fn sequence_response_server(
     responses: Vec<(&'static str, &'static str)>,
@@ -1120,18 +200,11 @@ fn sequence_response_server(
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for (attempt, (status_line, body)) in responses.into_iter().enumerate() {
-            loop {
-                let (mut stream, _) = listener.accept().expect("accept sequence provider request");
-                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                let (_, _, request_body) = read_provider_request(&mut reader);
-                if let Some(probe_body) = capability_probe_response(&request_body) {
-                    write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
-                    continue;
-                }
-                tx.send(attempt + 1).expect("send provider attempt");
-                write_provider_response(&mut stream, status_line, body, true);
-                break;
-            }
+            let (mut stream, _) = listener.accept().expect("accept sequence provider request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (_, _, _) = read_provider_request(&mut reader);
+            tx.send(attempt + 1).expect("send provider attempt");
+            write_provider_response(&mut stream, status_line, body, true);
         }
     });
     (format!("http://{addr}"), rx)
@@ -1176,229 +249,6 @@ fn write_provider_response(stream: &mut TcpStream, status_line: &str, body: &str
         body.len()
     )
     .expect("write provider response");
-}
-
-fn write_provider_response_best_effort(
-    stream: &mut TcpStream,
-    status_line: &str,
-    body: &str,
-    close: bool,
-) {
-    let connection = if close { "connection: close\r\n" } else { "" };
-    let _ = write!(
-        stream,
-        "{status_line}\r\n{connection}content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-        body.len()
-    );
-}
-
-fn capability_probe_response(request_body: &str) -> Option<String> {
-    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
-    let tools = request.get("tools")?.as_array()?;
-    let names = tools
-        .iter()
-        .filter_map(|tool| {
-            tool.pointer("/function/name")
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<Vec<_>>();
-    let continuation = request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
-    if !names.contains(&"singularity_capability_probe_a") {
-        return None;
-    }
-    let strict = tools.iter().any(|tool| {
-        tool.pointer("/function/strict")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    });
-    if continuation {
-        let arguments = if strict {
-            serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
-        } else {
-            serde_json::json!({})
-        };
-        return Some(capability_probe_continuation_response(
-            "singularity_capability_probe_a",
-            arguments,
-        ));
-    }
-    if strict {
-        return Some(
-            if names.contains(&"singularity_capability_probe_b") {
-                PROBE_STRICT_PARALLEL_RESPONSE
-            } else {
-                PROBE_STRICT_SINGLE_RESPONSE
-            }
-            .to_string(),
-        );
-    }
-    let tool_calls = if names.contains(&"singularity_capability_probe_b") {
-        vec![
-            serde_json::json!({
-                "id": "probe_call_a",
-                "type": "function",
-                "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
-            }),
-            serde_json::json!({
-                "id": "probe_call_b",
-                "type": "function",
-                "function": {"name": "singularity_capability_probe_b", "arguments": "{}"}
-            }),
-        ]
-    } else {
-        vec![serde_json::json!({
-            "id": "probe_call_a",
-            "type": "function",
-            "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
-        })]
-    };
-    Some(
-        serde_json::json!({
-            "id": "capability_probe_response",
-            "choices": [{
-                "message": {"role": "assistant", "content": null, "tool_calls": tool_calls},
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
-        })
-        .to_string(),
-    )
-}
-
-fn responses_capability_probe_response(request_body: &str) -> Option<String> {
-    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
-    let tools = request.get("tools")?.as_array()?;
-    let names = tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>();
-    let continuation = request
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["type"] == "function_call_output")
-        });
-    let (tool_name, arguments) = if names.contains(&"singularity_capability_probe_a") {
-        let strict = tools
-            .iter()
-            .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
-        (
-            "singularity_capability_probe_a",
-            if strict {
-                serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
-            } else {
-                serde_json::json!({})
-            },
-        )
-    } else {
-        return None;
-    };
-    let mut calls = vec![serde_json::json!({
-        "type": "function_call",
-        "call_id": if continuation { "probe_call_continuation" } else { "probe_call_a" },
-        "name": tool_name,
-        "arguments": arguments.to_string(),
-    })];
-    if request
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|effort| effort != "none")
-    {
-        calls.insert(
-            0,
-            serde_json::json!({
-                "type": "reasoning",
-                "id": "probe_reasoning",
-                "summary": []
-            }),
-        );
-    }
-    if !continuation
-        && names.contains(&"singularity_capability_probe_b")
-        && request["parallel_tool_calls"] == true
-    {
-        let strict = tools
-            .iter()
-            .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
-        calls.push(serde_json::json!({
-            "type": "function_call",
-            "call_id": "probe_call_b",
-            "name": "singularity_capability_probe_b",
-            "arguments": if strict {
-                serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]}).to_string()
-            } else {
-                serde_json::json!({}).to_string()
-            },
-        }));
-    }
-    Some(
-        serde_json::json!({
-            "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
-            "object": "response",
-            "status": "completed",
-            "output": calls,
-            "usage": {
-                "input_tokens": 2,
-                "output_tokens": 1,
-                "total_tokens": 3,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0}
-            }
-        })
-        .to_string(),
-    )
-}
-
-fn is_capability_probe_continuation_request(request_body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(request_body)
-        .ok()
-        .and_then(|request| request.get("messages").cloned())
-        .and_then(|messages| messages.as_array().cloned())
-        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"))
-}
-
-fn is_reasoning_probe_continuation_request(request_body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(request_body)
-        .ok()
-        .and_then(|request| request.get("messages").cloned())
-        .and_then(|messages| messages.as_array().cloned())
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message["role"] == "tool"
-                    && message["tool_call_id"]
-                        .as_str()
-                        .is_some_and(|tool_call_id| tool_call_id.starts_with("probe_"))
-            })
-        })
-}
-
-fn capability_probe_continuation_response(tool_name: &str, arguments: serde_json::Value) -> String {
-    serde_json::json!({
-        "id": "capability_probe_continuation_response",
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "probe_continuation_call",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": arguments.to_string()
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }],
-        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
-    })
-    .to_string()
 }
 
 #[test]
@@ -1561,7 +411,6 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
             }
         },
         None,
-        None,
     );
 
     assert_eq!(
@@ -1589,7 +438,6 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
             "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     assert_ne!(snapshot.snapshot_id(), same_config.snapshot_id());
@@ -1623,7 +471,6 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
                 }),
                 _ => None,
             },
-            None,
             None,
         );
 
@@ -1840,105 +687,6 @@ fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_tran
     );
     assert!(!error.message.contains("sk-secret-value"));
     assert!(!error.message.contains("provider.example"));
-}
-
-#[test]
-fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
-    let (base_url, requests) = responses_provider_server(serde_json::json!({
-        "id": "response_actual",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "function_call",
-            "call_id": "call_read",
-            "name": "read",
-            "arguments": "{}"
-        }],
-        "usage": {
-            "input_tokens": 9,
-            "output_tokens": 4,
-            "total_tokens": 13,
-            "input_tokens_details": {"cached_tokens": 2},
-            "output_tokens_details": {"reasoning_tokens": 0}
-        }
-    }));
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-    let negotiation = provider
-        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
-        .expect("Responses capability negotiation");
-
-    assert_eq!(
-        negotiation.metadata.api_protocol,
-        ProviderApiProtocol::OpenAiResponses
-    );
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::StrictParallel
-    );
-    assert_eq!(
-        negotiation.contract.tool_reasoning_mode,
-        ProviderToolReasoningMode::DisabledForToolCalls
-    );
-
-    let request = capability_test_request(None, false, 2);
-    let response = provider
-        .complete(&request, &cancellation)
-        .expect("Responses completion");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_name, "read");
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_read");
-    assert_eq!(response.usage.input_tokens, 9);
-    assert_eq!(response.usage.cached_input_tokens, 2);
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured Responses requests");
-    assert_eq!(captured.len(), 3);
-    let first: serde_json::Value =
-        serde_json::from_str(&captured[0].1).expect("first Responses probe JSON");
-    assert_eq!(first["store"], false);
-    assert_eq!(first["reasoning"]["effort"], "none");
-    assert_eq!(first["tool_choice"], "auto");
-    assert_eq!(first["parallel_tool_calls"], true);
-    assert!(
-        first["instructions"]
-            .as_str()
-            .is_some_and(|instructions| instructions.contains("capability probe"))
-    );
-    assert_eq!(first["input"][0]["role"], "user");
-    assert!(
-        first["input"]
-            .as_array()
-            .is_some_and(|items| items.iter().all(|item| item["role"] != "developer"))
-    );
-    assert_eq!(first["tools"][0]["type"], "function");
-    assert_eq!(first["tools"][0]["strict"], true);
-    assert!(first["tools"][0].get("function").is_none());
-
-    let continuation: serde_json::Value =
-        serde_json::from_str(&captured[1].1).expect("Responses continuation JSON");
-    let continuation_items = continuation["input"]
-        .as_array()
-        .expect("Responses continuation items");
-    assert!(
-        continuation_items
-            .iter()
-            .any(|item| item["type"] == "function_call")
-    );
-    assert!(
-        continuation_items
-            .iter()
-            .any(|item| item["type"] == "function_call_output")
-    );
-
-    let actual: serde_json::Value =
-        serde_json::from_str(&captured[2].1).expect("actual Responses request JSON");
-    assert_eq!(actual["tools"][0]["name"], "read");
-    assert_eq!(actual["tools"][0]["strict"], false);
-    assert_eq!(actual["tool_choice"], "auto");
-    assert_eq!(actual["reasoning"]["effort"], "none");
 }
 
 #[test]
@@ -2487,124 +1235,6 @@ fn openai_responses_stream_cancellation_reaches_inflight_body_read() {
 }
 
 #[test]
-fn openai_tool_history_finalization_reuses_negotiated_protocol_without_tools() {
-    let (base_url, requests) = finalization_protocol_server();
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-    let negotiation = provider
-        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
-        .expect("Responses capability negotiation");
-    assert_eq!(
-        negotiation.metadata.api_protocol,
-        ProviderApiProtocol::OpenAiResponses
-    );
-
-    let request = history_only_finalization_request("request_finalization");
-
-    let response = provider
-        .complete(&request, &cancellation)
-        .expect("tool-history finalization response");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(
-        response
-            .assistant_message
-            .as_ref()
-            .map(|message| message.content.as_str()),
-        Some("done")
-    );
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured finalization requests");
-    assert_eq!(captured.len(), 3);
-    assert!(
-        captured
-            .iter()
-            .all(|(path, _)| path.contains("/v1/responses"))
-    );
-    let final_payload: serde_json::Value =
-        serde_json::from_str(&captured[2].1).expect("finalization request JSON");
-    let input = final_payload["input"]
-        .as_array()
-        .expect("Responses finalization input");
-    assert!(input.iter().any(|item| item["type"] == "function_call"));
-    assert!(
-        input
-            .iter()
-            .any(|item| item["type"] == "function_call_output")
-    );
-    assert!(final_payload.get("tools").is_none());
-    assert_eq!(final_payload["reasoning"]["effort"], "none");
-}
-
-#[test]
-fn openai_chat_tool_history_finalization_disables_reasoning_without_tools() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 200 OK",
-        PROBE_STRICT_PARALLEL_RESPONSE,
-        ACTUAL_DONE_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-
-    let response = provider
-        .complete(
-            &history_only_finalization_request("chat_request_finalization"),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("Chat tool-history finalization response");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured Chat finalization requests");
-    assert_eq!(captured.len(), 4);
-    let payload: serde_json::Value =
-        serde_json::from_str(captured.last().expect("Chat finalization request"))
-            .expect("Chat finalization request JSON");
-    assert!(payload.get("tools").is_none());
-    assert_eq!(payload["thinking"]["type"], "disabled");
-}
-
-#[test]
-fn openai_chat_tool_history_finalization_rejects_reasoning_content() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 200 OK",
-        PROBE_STRICT_PARALLEL_RESPONSE,
-        CHAT_HISTORY_REASONING_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-
-    let error = provider
-        .complete(
-            &history_only_finalization_request("chat_request_reasoning"),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("Chat history-only reasoning must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_mode_not_honored")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_reasoning_disable_not_honored".to_string())
-    );
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured Chat reasoning boundary requests");
-    assert_eq!(captured.len(), 4);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(captured.last().expect("actual request JSON"))
-            .expect("actual request JSON")["thinking"]["type"],
-        "disabled"
-    );
-}
-
-#[test]
 fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
     let (base_url, requests) = responses_provider_server(serde_json::json!({
         "id": "response_text_tool_call",
@@ -2623,7 +1253,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
     let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
     let response = provider
         .complete(
-            &capability_test_request(None, false, 2),
+            &capability_test_request(None, false, 1),
             &singularity_core::CancellationToken::new(),
         )
         .expect("invalid provider response remains observable");
@@ -2639,105 +1269,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
             .recv_timeout(Duration::from_secs(1))
             .expect("captured Responses requests")
             .len(),
-        3
-    );
-}
-
-#[test]
-fn openai_provider_falls_back_from_unsupported_responses_endpoint_to_chat() {
-    let (base_url, requests) = responses_to_chat_fallback_server();
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-    let negotiation = provider
-        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
-        .expect("Chat fallback negotiation");
-
-    assert_eq!(
-        negotiation.metadata.api_protocol,
-        ProviderApiProtocol::OpenAiChatCompletions
-    );
-    assert_eq!(negotiation.metadata.profile_attempts, 2);
-    assert_eq!(negotiation.metadata.fallback_count, 1);
-
-    let response = provider
-        .complete(&capability_test_request(None, false, 2), &cancellation)
-        .expect("Chat fallback completion");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls[0].tool_name, "read");
-
-    let paths = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured protocol fallback paths");
-    assert_eq!(paths.len(), 4);
-    assert!(paths[0].contains("/v1/responses"));
-    assert!(
-        paths[1..]
-            .iter()
-            .all(|path| path.contains("/v1/chat/completions"))
-    );
-}
-
-#[test]
-fn openai_provider_does_not_fallback_protocol_on_authentication_failure() {
-    let (base_url, request_path) =
-        protocol_status_server("HTTP/1.1 401 Unauthorized", r#"{"error":"unauthorized"}"#);
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
-    let error = provider
-        .negotiate_tool_capabilities(
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("authentication failure must terminate protocol negotiation");
-
-    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
-    assert_eq!(error.error.http_status, Some(401));
-    assert_eq!(
-        error
-            .capability_metadata
-            .expect("capability metadata")
-            .api_protocol,
-        ProviderApiProtocol::OpenAiResponses
-    );
-    assert!(
-        request_path
-            .recv_timeout(Duration::from_secs(1))
-            .expect("captured protocol request")
-            .contains("/v1/responses")
-    );
-}
-
-#[test]
-fn openai_provider_does_not_retry_or_fallback_malformed_responses_output() {
-    let (base_url, request_path) = protocol_status_server(
-        "HTTP/1.1 200 OK",
-        r#"{"id":"bad_response","status":"completed","output":[{"type":"unsupported"}]}"#,
-    );
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
-    let error = provider
-        .negotiate_tool_capabilities(
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("malformed Responses output must terminate negotiation");
-
-    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
-    assert_eq!(
-        error.error.stage,
-        Some(ProviderErrorStage::ResponseValidation)
-    );
-    assert_eq!(
-        error.error.validation_errors,
-        vec!["responses_output_item_unsupported"]
-    );
-    let metadata = error.capability_metadata.expect("capability metadata");
-    assert_eq!(metadata.api_protocol, ProviderApiProtocol::OpenAiResponses);
-    assert_eq!(metadata.profile_attempts, 1);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 1);
-    assert!(
-        request_path
-            .recv_timeout(Duration::from_secs(1))
-            .expect("captured protocol request")
-            .contains("/v1/responses")
+        1
     );
 }
 
@@ -2759,11 +1291,11 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
         DEFAULT_MAX_OUTPUT_TOKENS
     );
     assert!(
-        !default_config
+        default_config
             .protocol_contract()
             .supports_developer_message
     );
-    assert!(!default_config.protocol_contract().supports_system_message);
+    assert!(default_config.protocol_contract().supports_system_message);
     assert!(!default_config.protocol_contract().supports_json_mode);
     assert!(
         !default_config
@@ -2793,1631 +1325,6 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
 
     let provider = OpenAiProvider::new(configured).expect("provider");
     assert_eq!(Provider::protocol_contract(&provider), capabilities);
-}
-
-#[test]
-fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments() {
-    let (base_url, request_rx) = strict_probe_server();
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("strict parallel negotiation");
-
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::StrictParallel
-    );
-    assert!(negotiation.contract.supports_strict_tool_schema);
-    assert!(negotiation.contract.supports_developer_message);
-    assert!(!negotiation.contract.supports_system_message);
-    assert!(!negotiation.contract.supports_json_mode);
-    assert!(negotiation.contract.supports_parallel_tool_calls);
-    assert_eq!(negotiation.contract.max_tools_per_request, 8);
-    let request_bodies = request_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured strict capability requests");
-    assert_eq!(request_bodies.len(), 2);
-    let request: serde_json::Value =
-        serde_json::from_str(&request_bodies[0]).expect("strict capability request JSON");
-    assert_eq!(request["tools"].as_array().map(Vec::len), Some(8));
-    let parameters = &request["tools"][0]["function"]["parameters"];
-    assert_eq!(request["messages"][0]["role"], "developer");
-    assert_eq!(request["messages"][1]["role"], "user");
-    assert!(parameters.get("oneOf").is_none());
-    assert_eq!(parameters["type"], "object");
-    assert_eq!(
-        parameters["required"],
-        serde_json::json!(["probe", "values"])
-    );
-    assert_eq!(parameters["additionalProperties"], false);
-    assert_eq!(
-        parameters["properties"]["probe"]["enum"],
-        serde_json::json!(["schema_sentinel_alpha", "schema_sentinel_beta"])
-    );
-    assert_eq!(parameters["properties"]["values"]["type"], "array");
-    assert_eq!(parameters["properties"]["values"]["minItems"], 2);
-    assert_eq!(parameters["properties"]["values"]["maxItems"], 2);
-    assert_eq!(
-        parameters["properties"]["values"]["items"]["type"],
-        "integer"
-    );
-    assert_eq!(
-        parameters["properties"]["values"]["items"]["enum"],
-        serde_json::json!([7])
-    );
-    let instruction = request["messages"][1]["content"]
-        .as_str()
-        .expect("strict probe instruction");
-    assert_eq!(
-        instruction,
-        "First call singularity_capability_probe_a and singularity_capability_probe_b once each. After both tool results, call singularity_capability_probe_a once more."
-    );
-    assert!(!instruction.contains("schema_sentinel_alpha"));
-    assert!(!instruction.contains("7"));
-    assert!(!instruction.contains("values"));
-    for tool in request["tools"].as_array().expect("strict probe tools") {
-        let description = tool["function"]["description"]
-            .as_str()
-            .expect("strict probe description");
-        assert_eq!(
-            description,
-            "Fixed capability probe tool; no external side effect."
-        );
-        assert!(!description.contains("schema_sentinel_alpha"));
-        assert!(!description.contains("7"));
-    }
-    assert_eq!(request["tools"][0]["function"]["strict"], true);
-    assert!(!negotiation.contract.supports_required_tool_choice);
-    let continuation: serde_json::Value = serde_json::from_str(&request_bodies[1])
-        .expect("strict capability continuation request JSON");
-    assert_eq!(continuation["tool_choice"], "auto");
-    assert_eq!(continuation["parallel_tool_calls"], false);
-    assert_eq!(continuation["messages"][2]["role"], "assistant");
-    assert_eq!(
-        continuation["messages"][2]["tool_calls"]
-            .as_array()
-            .map(Vec::len),
-        Some(2)
-    );
-    assert_eq!(continuation["messages"][3]["role"], "tool");
-    assert_eq!(continuation["messages"][3].get("name"), None);
-    assert_eq!(continuation["messages"][3]["tool_call_id"], "probe_call_a");
-    assert_eq!(continuation["messages"][4]["role"], "tool");
-    assert_eq!(continuation["messages"][4].get("name"), None);
-    assert_eq!(continuation["messages"][4]["tool_call_id"], "probe_call_b");
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
-    assert_eq!(
-        negotiation
-            .metadata
-            .probe_attempt_metadata
-            .occurrences
-            .iter()
-            .map(|occurrence| (
-                occurrence.operation_phase,
-                occurrence.attempt_index,
-                occurrence.terminal_status,
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                ProviderAttemptOperationPhase::CapabilityProbe,
-                1,
-                ProviderAttemptStatus::Ok,
-            ),
-            (
-                ProviderAttemptOperationPhase::CapabilityProbe,
-                2,
-                ProviderAttemptStatus::Ok,
-            ),
-        ]
-    );
-    let cached = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("cached strict capability negotiation");
-    assert!(cached.metadata.cache_hit);
-    assert_eq!(cached.metadata.profile_attempts, 0);
-    assert_eq!(cached.metadata.fallback_count, 0);
-    assert_eq!(cached.metadata.probe_usage, ModelUsage::default());
-    assert_eq!(
-        cached.metadata.probe_attempt_metadata,
-        ProviderAttemptMetadata::default()
-    );
-}
-
-#[test]
-fn openai_capability_negotiation_stabilizes_reasoning_content_tool_calls() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 200 OK",
-        PROBE_STRICT_PARALLEL_RESPONSE,
-        ACTUAL_DONE_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("reasoning tool calls stabilized");
-
-    assert_eq!(
-        negotiation.contract.tool_reasoning_mode,
-        ProviderToolReasoningMode::DisabledForToolCalls
-    );
-    assert_eq!(negotiation.metadata.profile_attempts, 1);
-    assert_eq!(negotiation.metadata.fallback_count, 0);
-    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 9);
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 3);
-
-    provider
-        .complete(
-            &capability_test_request(None, true, 2),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("actual completion uses negotiated reasoning mode");
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured reasoning negotiation requests");
-    assert_eq!(captured.len(), 4);
-    let captured = captured
-        .iter()
-        .map(|request| {
-            serde_json::from_str::<serde_json::Value>(request).expect("captured request JSON")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(captured[0].get("thinking"), None);
-    assert_eq!(captured[1]["thinking"]["type"], "disabled");
-    assert_eq!(captured[2]["thinking"]["type"], "disabled");
-    assert_eq!(captured[3]["thinking"]["type"], "disabled");
-    assert!(
-        captured
-            .iter()
-            .all(|request| request["tool_choice"] == "auto")
-    );
-}
-
-#[test]
-fn openai_provider_rejects_tool_reasoning_when_negotiated_disable_is_not_honored() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 200 OK",
-        PROBE_STRICT_PARALLEL_RESPONSE,
-        ACTUAL_TOOL_REASONING_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("reasoning disable negotiation");
-    assert_eq!(
-        negotiation.contract.tool_reasoning_mode,
-        ProviderToolReasoningMode::DisabledForToolCalls
-    );
-
-    let error = provider
-        .complete(
-            &capability_test_request(None, true, 2),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("unreplayable tool reasoning must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_mode_not_honored")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_reasoning_disable_not_honored".to_string())
-    );
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured reasoning boundary requests");
-    assert_eq!(captured.len(), 4);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&captured[3]).expect("actual request JSON")["thinking"]
-            ["type"],
-        "disabled"
-    );
-}
-
-#[test]
-fn openai_capability_negotiation_rejects_unstable_reasoning_tool_mode() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 400 Bad Request",
-        "{}",
-        ACTUAL_DONE_RESPONSE,
-        0,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("unsupported reasoning control must fail closed");
-
-    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
-    assert_eq!(error.error.code.as_deref(), Some("provider_http_status"));
-    assert_eq!(error.error.stage, Some(ProviderErrorStage::ResponseStatus));
-    assert_eq!(error.error.http_status, Some(400));
-    assert!(
-        error
-            .error
-            .validation_errors
-            .iter()
-            .any(|error| error == "tool_reasoning_disable_unsupported")
-    );
-    let metadata = error
-        .capability_metadata
-        .expect("reasoning failure capability metadata");
-    assert_eq!(metadata.profile_attempts, 1);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 2);
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured failed reasoning probes");
-    assert_eq!(captured.len(), 2);
-}
-
-#[test]
-fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
-    let (base_url, requests, _started) = delayed_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
-        Duration::ZERO,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("bounded tool-definition negotiation");
-    let cached = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("cached tool-definition negotiation");
-
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::StrictParallel
-    );
-    assert!(negotiation.contract.supports_parallel_tool_calls);
-    assert_eq!(negotiation.contract.max_tools_per_request, 8);
-    assert_eq!(negotiation.metadata.profile_attempts, 1);
-    assert_eq!(negotiation.metadata.fallback_count, 0);
-    assert!(cached.metadata.cache_hit);
-    assert_eq!(cached.contract, negotiation.contract);
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured tool-definition probes");
-    let tool_counts = captured
-        .iter()
-        .map(|request| {
-            serde_json::from_str::<serde_json::Value>(request).expect("probe JSON")["tools"]
-                .as_array()
-                .map(Vec::len)
-                .expect("probe tools")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(tool_counts, vec![8, 8]);
-}
-
-#[test]
-fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict() {
-    for (case_name, bad_arguments) in [
-        ("const", r#"{"probe":"wrong_probe","values":[7,7]}"#),
-        (
-            "array",
-            r#"{"probe":"schema_sentinel_alpha","values":{"value":7}}"#,
-        ),
-    ] {
-        let (base_url, done) = strict_constraint_mismatch_probe_server(bad_arguments);
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-        let negotiation = Provider::negotiate_tool_capabilities(
-            &provider,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-        .unwrap_or_else(|error| panic!("{case_name} mismatch should fall back: {error:?}"));
-
-        assert_eq!(
-            negotiation.metadata.profile,
-            ProviderCapabilityProfile::NonStrictParallel
-        );
-        assert!(!negotiation.contract.supports_strict_tool_schema);
-        assert!(negotiation.contract.supports_parallel_tool_calls);
-        assert_eq!(negotiation.contract.max_tools_per_request, 8);
-        assert_eq!(negotiation.metadata.profile_attempts, 3);
-        assert_eq!(negotiation.metadata.fallback_count, 2);
-        done.recv_timeout(Duration::from_secs(1))
-            .expect("strict constraint probe fallback completed");
-    }
-}
-
-#[test]
-fn openai_capability_probe_non_strict_single_uses_auto_tool_choice() {
-    let (base_url, requests, _started) = delayed_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_NON_STRICT_SINGLE_RESPONSE),
-        ],
-        Duration::ZERO,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("non-strict single negotiation");
-
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::NonStrictSingle
-    );
-    assert!(!negotiation.contract.supports_strict_tool_schema);
-    assert_eq!(negotiation.contract.max_tools_per_request, 8);
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured non-strict probe requests");
-    let single_request: serde_json::Value =
-        serde_json::from_str(captured.last().expect("single probe request"))
-            .expect("single probe JSON");
-    assert_eq!(single_request["tool_choice"], "auto");
-    assert_eq!(single_request["tools"].as_array().map(Vec::len), Some(8));
-    assert_eq!(single_request["tools"][0]["function"].get("strict"), None);
-}
-
-#[test]
-fn openai_capability_probe_fails_closed_when_direct_tools_are_unsupported() {
-    let (base_url, requests) = direct_only_probe_server();
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("unsupported direct tools must not become a negotiated capability");
-
-    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
-    assert_eq!(error.error.code.as_deref(), Some("provider_http_status"));
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured direct capability requests");
-    assert_eq!(captured.len(), 4);
-    for request in captured {
-        let request: serde_json::Value = serde_json::from_str(&request).expect("probe JSON");
-        let names = request["tools"]
-            .as_array()
-            .expect("probe tools")
-            .iter()
-            .filter_map(|tool| {
-                tool.pointer("/function/name")
-                    .and_then(serde_json::Value::as_str)
-            })
-            .collect::<Vec<_>>();
-        assert!(!names.is_empty());
-        assert!(
-            names
-                .iter()
-                .all(|name| name.starts_with("singularity_capability_probe_"))
-        );
-    }
-}
-
-#[test]
-fn openai_capability_probe_preserves_strict_when_parallel_is_unproven() {
-    let (base_url, requests) = configurable_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE)],
-        ACTUAL_DONE_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("strict single negotiation");
-
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::StrictSingle
-    );
-    assert!(negotiation.contract.supports_strict_tool_schema);
-    assert!(!negotiation.contract.supports_parallel_tool_calls);
-    assert_eq!(negotiation.metadata.profile_attempts, 1);
-    assert_eq!(negotiation.metadata.fallback_count, 0);
-
-    let response = provider
-        .complete(
-            &capability_test_request(None, true, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("actual completion after cached negotiation");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured actual request");
-    let actual: serde_json::Value = serde_json::from_str(&captured[0]).expect("actual JSON");
-    assert_eq!(actual["model"], "gpt-test");
-    assert_eq!(actual["parallel_tool_calls"], false);
-    assert_eq!(actual["tools"][0]["function"]["strict"], true);
-}
-
-#[test]
-fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
-    let (base_url, requests, _started) = delayed_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 422 Unprocessable Entity", "{}"),
-        ],
-        Duration::from_millis(100),
-    );
-    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
-    let start = Arc::new(Barrier::new(4));
-    let handles = (0..4)
-        .map(|_| {
-            let provider = Arc::clone(&provider);
-            let start = Arc::clone(&start);
-            thread::spawn(move || {
-                start.wait();
-                Provider::negotiate_tool_capabilities(
-                    provider.as_ref(),
-                    &ModelPreferences::default(),
-                    &singularity_core::CancellationToken::new(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let results = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("join capability caller"))
-        .collect::<Vec<_>>();
-
-    let first_error = results[0].as_ref().expect_err("probe must fail");
-    for result in results.iter().skip(1) {
-        assert_eq!(result.as_ref().expect_err("probe must fail"), first_error);
-    }
-    assert_eq!(first_error.error.kind, ModelErrorKind::UnknownProviderError);
-    assert_eq!(first_error.error.http_status, Some(422));
-    assert_eq!(
-        first_error
-            .capability_metadata
-            .as_ref()
-            .expect("capability metadata")
-            .profile_attempts,
-        4
-    );
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(2))
-        .expect("captured capability probes");
-    assert_eq!(captured.len(), 4, "one shared probe round is required");
-}
-
-#[test]
-fn openai_capability_probe_waiter_cancellation_is_caller_local() {
-    let (base_url, requests, started) = delayed_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE)],
-        Duration::from_millis(250),
-    );
-    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
-    let owner_provider = Arc::clone(&provider);
-    let (owner_tx, owner_rx) = mpsc::channel();
-    let owner = thread::spawn(move || {
-        owner_tx
-            .send(Provider::negotiate_tool_capabilities(
-                owner_provider.as_ref(),
-                &ModelPreferences::default(),
-                &singularity_core::CancellationToken::new(),
-            ))
-            .expect("send owner result");
-    });
-    started
-        .recv_timeout(Duration::from_secs(1))
-        .expect("owner probe started");
-
-    let waiter_cancellation = singularity_core::CancellationToken::new();
-    let waiter_provider = Arc::clone(&provider);
-    let waiter_token = waiter_cancellation.clone();
-    let (waiter_tx, waiter_rx) = mpsc::channel();
-    let waiter = thread::spawn(move || {
-        waiter_tx
-            .send(Provider::negotiate_tool_capabilities(
-                waiter_provider.as_ref(),
-                &ModelPreferences::default(),
-                &waiter_token,
-            ))
-            .expect("send waiter result");
-    });
-    thread::sleep(Duration::from_millis(50));
-    waiter_cancellation.cancel();
-
-    let waiter_error = waiter_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("waiter cancellation was bounded")
-        .expect_err("waiter must be cancelled locally");
-    assert_eq!(waiter_error.error.kind, ModelErrorKind::Cancelled);
-    assert!(
-        owner_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("owner result")
-            .is_ok()
-    );
-    owner.join().expect("join owner");
-    waiter.join().expect("join waiter");
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured owner capability probe");
-    assert_eq!(
-        captured.len(),
-        2,
-        "waiter cancellation must not cancel owner"
-    );
-}
-
-#[test]
-fn openai_capability_probe_owner_cancellation_allows_waiter_takeover() {
-    let (base_url, requests, started) = delayed_probe_server(
-        vec![
-            ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE),
-            ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE),
-        ],
-        Duration::from_millis(250),
-    );
-    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
-    let owner_cancellation = singularity_core::CancellationToken::new();
-    let owner_token = owner_cancellation.clone();
-    let owner_provider = Arc::clone(&provider);
-    let (owner_tx, owner_rx) = mpsc::channel();
-    let owner = thread::spawn(move || {
-        owner_tx
-            .send(Provider::negotiate_tool_capabilities(
-                owner_provider.as_ref(),
-                &ModelPreferences::default(),
-                &owner_token,
-            ))
-            .expect("send owner result");
-    });
-    started
-        .recv_timeout(Duration::from_secs(1))
-        .expect("owner probe started");
-
-    let waiter_provider = Arc::clone(&provider);
-    let (waiter_tx, waiter_rx) = mpsc::channel();
-    let waiter = thread::spawn(move || {
-        waiter_tx
-            .send(Provider::negotiate_tool_capabilities(
-                waiter_provider.as_ref(),
-                &ModelPreferences::default(),
-                &singularity_core::CancellationToken::new(),
-            ))
-            .expect("send waiter result");
-    });
-    thread::sleep(Duration::from_millis(50));
-    owner_cancellation.cancel();
-
-    let owner_error = owner_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("owner cancellation was bounded")
-        .expect_err("owner must be cancelled");
-    assert_eq!(owner_error.error.kind, ModelErrorKind::Cancelled);
-    assert!(
-        waiter_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("waiter takeover result")
-            .is_ok()
-    );
-    owner.join().expect("join owner");
-    waiter.join().expect("join waiter");
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured owner and takeover probes");
-    assert_eq!(
-        captured.len(),
-        3,
-        "waiter must take over after owner cancellation"
-    );
-}
-
-#[test]
-fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_metadata() {
-    let (base_url, requests) = configurable_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE),
-        ],
-        ACTUAL_DONE_RESPONSE,
-        0,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("text pseudo-call must not prove native tools");
-
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"capability_probe_native_tool_calls_missing".to_string())
-    );
-    let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile, ProviderCapabilityProfile::NonStrictSingle);
-    assert_eq!(metadata.profile_attempts, 4);
-    assert_eq!(metadata.fallback_count, 3);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
-    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
-}
-
-#[test]
-fn openai_capability_probe_requires_native_tool_calls_after_tool_results_before_caching() {
-    let (base_url, requests) = multi_turn_probe_recovery_server();
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect_err("a text continuation must not prove multi-turn native tools");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"capability_probe_multi_turn_tool_calls_missing".to_string())
-    );
-    let failed_metadata = error.capability_metadata.expect("failed probe metadata");
-    assert_eq!(failed_metadata.profile_attempts, 4);
-    assert_eq!(failed_metadata.probe_attempt_metadata.attempt_count, 5);
-
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("a failed multi-turn probe must not poison or populate the success cache");
-    assert!(!negotiation.metadata.cache_hit);
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::StrictParallel
-    );
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
-    let cached = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("successful multi-turn probe is cached");
-    assert!(cached.metadata.cache_hit);
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured failed and successful multi-turn probes");
-    assert_eq!(captured.len(), 7);
-    for continuation_index in [4, 6] {
-        let request: serde_json::Value =
-            serde_json::from_str(&captured[continuation_index]).expect("continuation JSON");
-        assert_eq!(request["tool_choice"], "auto");
-        assert!(
-            request["messages"]
-                .as_array()
-                .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"))
-        );
-    }
-}
-
-#[test]
-fn openai_capability_probe_auth_failure_does_not_fallback() {
-    let (base_url, requests) = configurable_probe_server(
-        vec![("HTTP/1.1 401 Unauthorized", "{}")],
-        ACTUAL_DONE_RESPONSE,
-        0,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("auth failure must be preserved");
-
-    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
-    assert_eq!(error.error.http_status, Some(401));
-    let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile_attempts, 1);
-    assert_eq!(metadata.fallback_count, 0);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 1);
-    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
-}
-
-#[test]
-fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
-    let (base_url, requests) = configurable_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 422 Unprocessable Entity", "{}"),
-        ],
-        ACTUAL_DONE_RESPONSE,
-        0,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("profile rejection cause must be preserved");
-
-    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
-    assert_eq!(error.error.http_status, Some(422));
-    assert_eq!(error.error.stage, Some(ProviderErrorStage::ResponseStatus));
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"capability_profiles_exhausted".to_string())
-    );
-    let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile_attempts, 4);
-    assert_eq!(metadata.fallback_count, 3);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
-    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
-}
-
-#[test]
-fn openai_capability_probe_preserves_structured_validation_errors() {
-    let (base_url, _requests) = configurable_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_BAD_ARGUMENTS_RESPONSE),
-        ],
-        ACTUAL_DONE_RESPONSE,
-        0,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let error = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("invalid structured arguments must not prove tools");
-
-    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_response_invalid")
-    );
-    assert_eq!(
-        error.error.stage,
-        Some(ProviderErrorStage::ResponseValidation)
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"schema_mismatch".to_string())
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_call_arguments_must_be_object".to_string())
-    );
-}
-
-#[test]
-fn openai_capability_cache_is_partitioned_by_effective_model_and_shared_by_clones() {
-    let (base_url, requests) = multi_model_probe_server(3);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    provider
-        .complete(
-            &capability_test_request(None, false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("default model completion");
-    provider
-        .complete(
-            &capability_test_request(Some("model-b"), false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("override model completion");
-    let clone = provider.clone();
-    clone
-        .complete(
-            &capability_test_request(Some("model-b"), false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("same override model cache hit");
-    let cache_hit = Provider::negotiate_tool_capabilities(
-        &clone,
-        &ModelPreferences {
-            model_name: Some("model-b".to_string()),
-            ..ModelPreferences::default()
-        },
-        &singularity_core::CancellationToken::new(),
-    );
-    assert!(
-        cache_hit
-            .expect("same model cache metadata")
-            .metadata
-            .cache_hit
-    );
-
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured model requests");
-    let probe_count = captured
-        .iter()
-        .filter(|request| request.contains("singularity_capability_probe"))
-        .count();
-    assert_eq!(
-        probe_count, 4,
-        "different models probe independently; clone shares cache"
-    );
-    let models = captured
-        .iter()
-        .filter(|request| !request.contains("singularity_capability_probe"))
-        .map(|request| {
-            serde_json::from_str::<serde_json::Value>(request).expect("actual JSON")["model"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(models, vec!["gpt-test", "model-b", "model-b"]);
-}
-
-#[test]
-fn openai_persistent_capability_cache_survives_provider_recreation_without_secrets() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = persistent_probe_server(2);
-    let config = provider_test_config(base_url.clone());
-
-    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
-        .expect("first provider");
-    let first_negotiation = Provider::negotiate_tool_capabilities(
-        &first,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("first capability probe");
-    assert!(!first_negotiation.metadata.cache_hit);
-    drop(first);
-
-    let mut changed_key_config = config;
-    changed_key_config.api_key = "different-test-key".to_string();
-    let second = OpenAiProvider::new_with_cache_path(changed_key_config, Some(cache_path.clone()))
-        .expect("recreated provider");
-    let cached = Provider::negotiate_tool_capabilities(
-        &second,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("persistent capability cache hit");
-    assert!(cached.metadata.cache_hit);
-    assert_eq!(cached.contract, first_negotiation.contract);
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        2
-    );
-
-    let cache_text = std::fs::read_to_string(cache_path).expect("cache file");
-    for forbidden in [
-        "sk-secret-value",
-        "api_key",
-        base_url.as_str(),
-        "singularity_capability_probe",
-        "schema_sentinel",
-        "http://",
-    ] {
-        assert!(!cache_text.contains(forbidden), "cache leaked {forbidden}");
-    }
-}
-
-#[test]
-fn openai_persistent_capability_cache_replaces_existing_file_for_distinct_key() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = persistent_probe_server(4);
-    let first_config = provider_test_config(base_url);
-    let first = OpenAiProvider::new_with_cache_path(first_config.clone(), Some(cache_path.clone()))
-        .expect("first provider");
-    Provider::negotiate_tool_capabilities(
-        &first,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("first capability probe");
-    drop(first);
-
-    let mut second_config = first_config;
-    second_config.max_output_tokens -= 1;
-    let second = OpenAiProvider::new_with_cache_path(second_config, Some(cache_path.clone()))
-        .expect("second provider");
-    Provider::negotiate_tool_capabilities(
-        &second,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("second capability probe");
-
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        4
-    );
-    let cache: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(cache_path).expect("read cache"))
-            .expect("cache remains JSON");
-    assert_eq!(cache["records"].as_array().map(Vec::len), Some(2));
-    assert_ne!(
-        cache["records"][0]["key"]["max_output_tokens"],
-        cache["records"][1]["key"]["max_output_tokens"]
-    );
-}
-
-#[test]
-fn openai_persistent_capability_cache_misses_expired_unknown_and_invalid_records() {
-    for mutation in [
-        "expired",
-        "future",
-        "corrupt",
-        "unknown",
-        "invalid_contract",
-        "overclaimed_contract",
-        "model",
-        "endpoint",
-        "protocol",
-        "limits",
-        "adapter",
-        "probe_contract",
-    ] {
-        let directory = tempdir().expect("persistent cache directory");
-        let cache_path = directory.path().join("provider-capability-cache.json");
-        let (base_url, requests) = persistent_probe_server(4);
-        let config = provider_test_config(base_url);
-        let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
-            .expect("first provider");
-        Provider::negotiate_tool_capabilities(
-            &first,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("populate persistent cache");
-        drop(first);
-
-        if mutation == "corrupt" {
-            std::fs::write(&cache_path, b"{not-json").expect("corrupt cache");
-        } else {
-            let mut cache: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&cache_path).expect("read persistent cache"),
-            )
-            .expect("valid cache JSON");
-            match mutation {
-                "expired" => cache["records"][0]["expires_at_unix_seconds"] = serde_json::json!(0),
-                "future" => {
-                    cache["records"][0]["stored_at_unix_seconds"] = serde_json::json!(u64::MAX)
-                }
-                "unknown" => cache["records"][0]["unexpected"] = serde_json::json!(true),
-                "invalid_contract" => {
-                    cache["records"][0]["contract"]["max_tools_per_request"] = serde_json::json!(0)
-                }
-                "overclaimed_contract" => {
-                    cache["records"][0]["contract"]["supports_json_mode"] = serde_json::json!(true)
-                }
-                "model" => cache["records"][0]["key"]["model_name"] = serde_json::json!("other"),
-                "endpoint" => {
-                    cache["records"][0]["key"]["endpoint_sha256"] =
-                        serde_json::json!("00".repeat(32))
-                }
-                "protocol" => {
-                    cache["records"][0]["key"]["api_protocol"] =
-                        serde_json::json!("open_ai_responses")
-                }
-                "limits" => cache["records"][0]["key"]["max_output_tokens"] = serde_json::json!(1),
-                "adapter" => cache["records"][0]["key"]["adapter_version"] = serde_json::json!(2),
-                "probe_contract" => {
-                    cache["records"][0]["key"]["probe_contract_version"] = serde_json::json!(2)
-                }
-                _ => unreachable!(),
-            }
-            std::fs::write(
-                &cache_path,
-                serde_json::to_vec(&cache).expect("serialize mutated cache"),
-            )
-            .expect("write mutated cache");
-        }
-
-        let second =
-            OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("second provider");
-        let negotiation = Provider::negotiate_tool_capabilities(
-            &second,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("cache miss reprobe");
-        assert!(!negotiation.metadata.cache_hit, "{mutation} must miss");
-        assert_eq!(
-            requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-            4
-        );
-    }
-}
-
-#[test]
-fn openai_persistent_capability_cache_concurrent_writes_retain_a_valid_record() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = persistent_probe_server(2);
-    let config = provider_test_config(base_url);
-    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
-        .expect("first provider");
-    let second = OpenAiProvider::new_with_cache_path(config, Some(cache_path.clone()))
-        .expect("second provider");
-    let barrier = Arc::new(Barrier::new(3));
-    let handles = [first, second]
-        .into_iter()
-        .map(|provider| {
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                Provider::negotiate_tool_capabilities(
-                    &provider,
-                    &ModelPreferences::default(),
-                    &singularity_core::CancellationToken::new(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    barrier.wait();
-    let mut results = Vec::new();
-    for handle in handles {
-        results.push(handle.join().expect("join concurrent cache writer"));
-    }
-    for result in results {
-        result.expect("concurrent capability probe");
-    }
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        2
-    );
-    let cache: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(cache_path).expect("read concurrent cache"))
-            .expect("concurrent cache remains JSON");
-    assert_eq!(cache["records"].as_array().map(Vec::len), Some(1));
-}
-
-#[test]
-fn openai_persistent_capability_cache_different_keys_probe_in_parallel() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = parallel_persistent_probe_server(4);
-    let first = OpenAiProvider::new_with_cache_path(
-        provider_test_config(base_url.clone()),
-        Some(cache_path.clone()),
-    )
-    .expect("first provider");
-    let mut second_config = provider_test_config(base_url);
-    second_config.max_output_tokens -= 1;
-    let second = OpenAiProvider::new_with_cache_path(second_config, Some(cache_path))
-        .expect("second provider");
-    let barrier = Arc::new(Barrier::new(3));
-    let first_barrier = Arc::clone(&barrier);
-    let first_thread = thread::spawn(move || {
-        first_barrier.wait();
-        Provider::negotiate_tool_capabilities(
-            &first,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-    });
-    let second_barrier = Arc::clone(&barrier);
-    let second_thread = thread::spawn(move || {
-        second_barrier.wait();
-        Provider::negotiate_tool_capabilities(
-            &second,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        )
-    });
-    barrier.wait();
-    first_thread
-        .join()
-        .expect("join first parallel provider")
-        .expect("first parallel capability probe");
-    second_thread
-        .join()
-        .expect("join second parallel provider")
-        .expect("second parallel capability probe");
-    let (maximum, requests) = requests
-        .recv_timeout(Duration::from_secs(2))
-        .expect("parallel capability requests");
-    assert!(maximum >= 2, "different keys must not share a network lock");
-    assert_eq!(requests.len(), 4);
-}
-
-#[test]
-fn openai_persistent_capability_cache_write_failure_does_not_fail_probe() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("cache-directory");
-    std::fs::create_dir(&cache_path).expect("cache failure directory");
-    let (base_url, requests) = persistent_probe_server(2);
-    let provider =
-        OpenAiProvider::new_with_cache_path(provider_test_config(base_url), Some(cache_path))
-            .expect("provider");
-    Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("cache write failure must not fail probe");
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        2
-    );
-}
-
-#[test]
-fn openai_failed_capability_probe_does_not_create_persistent_record() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = direct_only_probe_server();
-    let provider = OpenAiProvider::new_with_cache_path(
-        provider_test_config(base_url),
-        Some(cache_path.clone()),
-    )
-    .expect("provider");
-    Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect_err("failed probe");
-    assert!(!cache_path.is_file());
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        4
-    );
-}
-
-#[test]
-fn openai_cancelled_capability_probe_does_not_publish_cache() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests, started) = delayed_probe_server(
-        vec![("HTTP/1.1 400 Bad Request", "{}")],
-        Duration::from_millis(250),
-    );
-    let provider = Arc::new(
-        OpenAiProvider::new_with_cache_path(
-            provider_test_config(base_url),
-            Some(cache_path.clone()),
-        )
-        .expect("provider"),
-    );
-    let cancellation = singularity_core::CancellationToken::new();
-    let worker_provider = Arc::clone(&provider);
-    let worker_cancellation = cancellation.clone();
-    let (result_tx, result_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        result_tx
-            .send(Provider::negotiate_tool_capabilities(
-                worker_provider.as_ref(),
-                &ModelPreferences::default(),
-                &worker_cancellation,
-            ))
-            .expect("send cancelled probe result");
-    });
-    // Cold parallel CI can spend more than one second initializing the HTTP client before accept.
-    started
-        .recv_timeout(Duration::from_secs(5))
-        .expect("probe started");
-    cancellation.cancel();
-    let error = result_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("cancelled probe result")
-        .expect_err("cancelled probe must fail");
-    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
-    assert_eq!(
-        error
-            .capability_metadata
-            .as_ref()
-            .expect("cancelled lookup observation")
-            .cache_observations
-            .len(),
-        1
-    );
-    assert!(
-        !cache_path.exists(),
-        "cancelled probe must not publish a record"
-    );
-    worker.join().expect("join cancelled probe");
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        1
-    );
-}
-
-/// 稳定 capability rejection 会失效持久缓存记录。
-///
-/// 行为合法变化说明：本修复前，Unspecified 模式下响应只要含 reasoning content
-/// 就会被拒绝；本修复后该场景合法——replay 义务只由已协商的回放模式
-/// （ReplayReasoningContent / ReplayResponsesItems）与响应实际包含的 tool call
-/// 触发。因此 fixture 改为：probe 返回带 reasoning_content 的响应，协商出
-/// ReplayReasoningContent；actual 响应为带 tool call 但缺失 reasoning_content
-/// 的真实合同违规，触发同一稳定错误
-/// `provider_tool_reasoning_history_unsupported` /
-/// `tool_reasoning_content_requires_adapter_history_support`；测试目的（稳定拒绝
-/// → 持久缓存记录失效）与全部断言不变。
-#[test]
-fn openai_cached_capability_rejection_invalidates_persistent_record() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = cached_reasoning_rejection_server();
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
-                    }
-                }
-            }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let config_path = config_path.to_string_lossy().to_string();
-    let first = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(config_path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-            _ => None,
-        },
-        None,
-        Some(cache_path.clone()),
-    )
-    .provider_for_selector(Some("reasoning_test/chat#high"))
-    .expect("selected Chat provider");
-    Provider::negotiate_tool_capabilities(
-        &first,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("populate cache");
-    let error = first
-        .complete(
-            &capability_test_request(None, false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("stable capability rejection");
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_history_unsupported")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
-    );
-    assert!(
-        !error
-            .capability_metadata
-            .as_ref()
-            .expect("rejection lookup observations")
-            .cache_observations
-            .is_empty()
-    );
-    let invalidated: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&cache_path).expect("read invalidated cache"),
-    )
-    .expect("invalidated cache remains JSON");
-    assert_eq!(invalidated["records"].as_array().map(Vec::len), Some(0));
-    drop(first);
-
-    let second = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(config_path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
-            _ => None,
-        },
-        None,
-        Some(cache_path),
-    )
-    .provider_for_selector(Some("reasoning_test/chat#high"))
-    .expect("recreated provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &second,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("reprobe after invalidation");
-    assert!(!negotiation.metadata.cache_hit);
-    assert_eq!(
-        negotiation
-            .metadata
-            .cache_observations
-            .iter()
-            .map(|observation| observation.outcome)
-            .collect::<Vec<_>>(),
-        vec![ProviderCapabilityCacheLookupResult::Miss]
-    );
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        5
-    );
-}
-
-#[test]
-fn openai_ordinary_http_400_does_not_invalidate_persistent_record() {
-    let directory = tempdir().expect("persistent cache directory");
-    let cache_path = directory.path().join("provider-capability-cache.json");
-    let (base_url, requests) = ordinary_http_400_server();
-    let config = provider_test_config(base_url);
-    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
-        .expect("first provider");
-    Provider::negotiate_tool_capabilities(
-        &first,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("populate cache");
-    let error = first
-        .complete(
-            &capability_test_request(None, false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("ordinary HTTP 400");
-    assert_eq!(error.error.http_status, Some(400));
-    assert_ne!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_history_unsupported")
-    );
-    drop(first);
-
-    let second =
-        OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("second provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &second,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("ordinary HTTP 400 must preserve the cache");
-    assert!(negotiation.metadata.cache_hit);
-    assert_eq!(
-        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
-        3
-    );
-}
-
-#[test]
-fn provider_runtime_fingerprint_is_stable_partitioned_and_secret_free() {
-    let config = provider_config_with_base_url("https://provider.example/v1".to_string());
-    let first = OpenAiProvider::new(config.clone()).expect("first provider");
-    let second = OpenAiProvider::new(config.clone()).expect("second provider");
-    let first_fingerprint = first.runtime_fingerprint(Some("gpt-test"));
-    let second_fingerprint = second.runtime_fingerprint(Some("gpt-test"));
-    assert_eq!(first_fingerprint, second_fingerprint);
-    assert!(first_fingerprint.negotiation_fingerprint.is_none());
-
-    let mut changed_key_config = config;
-    changed_key_config.api_key = "different-test-key".to_string();
-    let changed_key_provider =
-        OpenAiProvider::new(changed_key_config).expect("changed key provider");
-    assert_eq!(
-        first_fingerprint,
-        changed_key_provider.runtime_fingerprint(Some("gpt-test"))
-    );
-
-    let model_fingerprint = first.runtime_fingerprint(Some("other-model"));
-    assert_eq!(
-        first_fingerprint.provider_fingerprint,
-        model_fingerprint.provider_fingerprint
-    );
-    assert_ne!(
-        first_fingerprint.model_fingerprint,
-        model_fingerprint.model_fingerprint
-    );
-    let endpoint_provider = OpenAiProvider::new(provider_config_with_base_url(
-        "https://provider.example/other".to_string(),
-    ))
-    .expect("endpoint provider");
-    assert_ne!(
-        first_fingerprint.provider_fingerprint,
-        endpoint_provider
-            .runtime_fingerprint(Some("gpt-test"))
-            .provider_fingerprint
-    );
-    let mut limited_config =
-        provider_config_with_base_url("https://provider.example/v1".to_string());
-    limited_config.max_context_tokens = limited_config.max_context_tokens.map(|value| value + 1);
-    let limited_provider = OpenAiProvider::new(limited_config).expect("limited provider");
-    assert_ne!(
-        first_fingerprint.provider_fingerprint,
-        limited_provider
-            .runtime_fingerprint(Some("gpt-test"))
-            .provider_fingerprint
-    );
-    let mut unknown_context_config =
-        provider_config_with_base_url("https://provider.example/v1".to_string());
-    unknown_context_config.max_context_tokens = None;
-    let unknown_context_provider =
-        OpenAiProvider::new(unknown_context_config).expect("unknown-context provider");
-    assert_ne!(
-        first_fingerprint.provider_fingerprint,
-        unknown_context_provider
-            .runtime_fingerprint(Some("gpt-test"))
-            .provider_fingerprint
-    );
-
-    let negotiation = singularity_model::ProviderProtocolNegotiation {
-        contract: ProviderProtocolContract {
-            supports_strict_tool_schema: true,
-            ..ProviderProtocolContract::default()
-        },
-        metadata: singularity_model::ProviderCapabilityMetadata {
-            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            profile: ProviderCapabilityProfile::StrictSingle,
-            cache_hit: false,
-            profile_attempts: 1,
-            fallback_count: 0,
-            probe_usage: ModelUsage::default(),
-            probe_attempt_metadata: ProviderAttemptMetadata::default(),
-            cache_observations: Vec::new(),
-        },
-    };
-    let negotiated = first.runtime_fingerprint_for_negotiation(Some("gpt-test"), &negotiation);
-    let negotiated_again =
-        second.runtime_fingerprint_for_negotiation(Some("gpt-test"), &negotiation);
-    assert_eq!(negotiated, negotiated_again);
-    assert_eq!(
-        negotiated.provider_fingerprint,
-        first_fingerprint.provider_fingerprint
-    );
-    assert_eq!(
-        negotiated.model_fingerprint,
-        first_fingerprint.model_fingerprint
-    );
-    assert!(negotiated.negotiation_fingerprint.is_some());
-    let mut other_protocol_negotiation = negotiation.clone();
-    other_protocol_negotiation.metadata.api_protocol = ProviderApiProtocol::OpenAiResponses;
-    let other_protocol =
-        first.runtime_fingerprint_for_negotiation(Some("gpt-test"), &other_protocol_negotiation);
-    assert_ne!(
-        negotiated.negotiation_fingerprint,
-        other_protocol.negotiation_fingerprint
-    );
-
-    let catalog_directory = tempdir().expect("thinking wire format catalog directory");
-    let write_catalog = |thinking_wire_format: &str| {
-        let path = catalog_directory
-            .path()
-            .join(format!("{thinking_wire_format}.json"));
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "default_model": "catalog/model",
-                "providers": {
-                    "catalog": {
-                        "adapter": "openai_compatible",
-                        "base_url": "https://provider.example/v1",
-                        "api_key_env": "CATALOG_KEY",
-                        "models": {
-                            "model": {
-                                "api_protocol": "chat",
-                                "max_context_tokens": 1000000,
-                                "max_output_tokens": 384000,
-                                "thinking_wire_format": thinking_wire_format
-                            }
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write thinking wire format catalog");
-        path.to_string_lossy().into_owned()
-    };
-    let thinking_type_path = write_catalog("thinking_type");
-    let enable_thinking_path = write_catalog("enable_thinking");
-    let thinking_type_provider = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(thinking_type_path.clone()),
-            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
-            _ => None,
-        },
-        None,
-        None,
-    )
-    .provider_for_selector(Some("catalog/model"))
-    .expect("thinking_type catalog provider");
-    let enable_thinking_provider = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(enable_thinking_path.clone()),
-            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
-            _ => None,
-        },
-        None,
-        None,
-    )
-    .provider_for_selector(Some("catalog/model"))
-    .expect("enable_thinking catalog provider");
-    let thinking_type_fingerprint = thinking_type_provider.runtime_fingerprint(None);
-    let enable_thinking_fingerprint = enable_thinking_provider.runtime_fingerprint(None);
-    assert_ne!(
-        thinking_type_fingerprint.provider_fingerprint,
-        enable_thinking_fingerprint.provider_fingerprint,
-        "thinking wire format must partition provider capability identity"
-    );
-    assert_ne!(
-        thinking_type_fingerprint.model_fingerprint, enable_thinking_fingerprint.model_fingerprint,
-        "thinking wire format must partition model capability identity"
-    );
-
-    let serialized = serde_json::to_string(&negotiated).expect("fingerprint JSON");
-    for forbidden in [
-        "provider.example",
-        "sk-secret-value",
-        "api_key",
-        "singularity_capability_probe",
-    ] {
-        assert!(
-            !serialized.contains(forbidden),
-            "fingerprint leaked {forbidden}"
-        );
-    }
 }
 
 #[test]
@@ -5070,67 +1977,6 @@ fn openai_provider_rejects_observer_start_before_network_side_effect() {
 }
 
 #[test]
-fn provider_capability_cache_lookup_observations_are_closed_and_runtime_only() {
-    let (base_url, _requests, _started) = delayed_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
-        Duration::ZERO,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let cancellation = singularity_core::CancellationToken::new();
-
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("initial capability negotiation");
-    let cached = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &cancellation,
-    )
-    .expect("cached capability negotiation");
-
-    assert_eq!(
-        negotiation
-            .metadata
-            .cache_observations
-            .iter()
-            .map(|observation| observation.outcome)
-            .collect::<Vec<_>>(),
-        vec![ProviderCapabilityCacheLookupResult::Miss]
-    );
-    assert_eq!(
-        cached
-            .metadata
-            .cache_observations
-            .iter()
-            .map(|observation| observation.outcome)
-            .collect::<Vec<_>>(),
-        vec![ProviderCapabilityCacheLookupResult::Hit]
-    );
-
-    let mut response = ModelTurnResponse::completed("runtime_response", "response", "done");
-    response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
-        cache_observations: cached.metadata.cache_observations.clone(),
-        ..negotiation.metadata
-    });
-    let wire = serde_json::to_value(&response).expect("serialize model response");
-    assert!(wire.get("provider_capability_metadata").is_none());
-    let schema = serde_json::to_value(schema_for!(ModelTurnResponse)).expect("response schema");
-    assert!(
-        schema["properties"]
-            .get("provider_capability_metadata")
-            .is_none()
-    );
-    assert!(
-        schema["definitions"]
-            .get("ProviderCapabilityCacheObservation")
-            .is_none()
-    );
-}
-
-#[test]
 fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
     let success_body = r#"{
         "id": "resp_external_runtime",
@@ -5551,8 +2397,8 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
             "additionalProperties": false
         }),
     });
-    request.tool_choice.max_tool_calls = 2;
-    request.tool_choice.strict_tool_schema = true;
+    request.tool_choice.max_tool_calls = 1;
+    request.tool_choice.strict_tool_schema = false;
 
     let mut invalid_request = request.clone();
     invalid_request.tools[0].name = "builtin.read".to_string();
@@ -5573,8 +2419,12 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
 
     assert_eq!(captured["tools"][0]["function"]["name"], "read");
     assert_eq!(captured["tool_choice"], "auto");
-    assert_eq!(captured["parallel_tool_calls"], true);
-    assert_eq!(captured["tools"][0]["function"]["strict"], true);
+    // 静态契约下 legacy provider 不声明 parallel/strict 支持，wire 投影跟随请求值。
+    assert_eq!(captured["parallel_tool_calls"], false);
+    assert!(
+        captured["tools"][0]["function"].get("strict").is_none(),
+        "strict field must be omitted when the request is not strict"
+    );
     assert_eq!(response.tool_calls[0].tool_name, "read");
     assert_eq!(response.status, ModelTurnStatus::Success);
 }
@@ -5632,9 +2482,11 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         panic!("one invalid response attempt occurrence expected");
     };
     assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    // 静态契约（parallel 未声明）下，超过 agent 上限的并行响应同时违反
+    // parallel 支持声明，parallel 拒绝优先映射为 UnsupportedCapability。
     assert_eq!(
         occurrence.error_category,
-        Some(ModelErrorCategory::JsonSchema)
+        Some(ModelErrorCategory::UnsupportedCapability)
     );
     assert_eq!(
         occurrence.error_stage,
@@ -5642,18 +2494,23 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
     );
     assert_eq!(
         occurrence.diagnostic_code.as_deref(),
-        Some("provider_response_invalid")
+        Some("provider_does_not_support_parallel_tool_calls")
     );
     assert!(occurrence.usage.is_none());
     let error = response.error.expect("contract violation error");
-    assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
     assert_eq!(
-        error.message,
-        "provider_response_invalid: max_tool_calls_exceeded"
+        error.code.as_deref(),
+        Some("provider_does_not_support_parallel_tool_calls")
     );
-    assert_eq!(error.code.as_deref(), Some("provider_response_invalid"));
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
-    assert_eq!(error.validation_errors, vec!["max_tool_calls_exceeded"]);
+    assert_eq!(
+        error.validation_errors,
+        vec![
+            "max_tool_calls_exceeded",
+            "provider_does_not_support_parallel_tool_calls"
+        ]
+    );
 }
 
 #[test]
@@ -6201,7 +3058,6 @@ fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
             }
         },
         None,
-        None,
     );
 
     assert!(snapshot.configuration().configured);
@@ -6301,7 +3157,6 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("deep/chat#high"))
@@ -6390,7 +3245,6 @@ fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_pro
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("catalog/model"))
@@ -6464,7 +3318,6 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("dashscope/deepseek-v4-flash-0731#max"))
@@ -6531,7 +3384,6 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("unknown/model#max"))
@@ -6596,7 +3448,6 @@ fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
             _ => None,
         },
         None,
-        None,
     );
     let error = snapshot
         .provider()
@@ -6653,7 +3504,6 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
             "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -6750,7 +3600,6 @@ fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
             "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let error = snapshot
@@ -6921,51 +3770,6 @@ const CHAT_REASONING_ONLY_RESPONSE: &str = r#"{
     }]
 }"#;
 
-/// Responses 能力探测 + SSE 实际响应共用的 fake server：探测请求用
-/// `responses_capability_probe_response` 应答，实际请求以 text/event-stream
-/// 流式返回 chunks（模式来源：`responses_provider_server` + `responses_stream_server`）。
-fn responses_stream_probe_server(chunks: Vec<Vec<u8>>) -> (String, Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Responses stream probe provider");
-    let addr = listener
-        .local_addr()
-        .expect("Responses stream probe provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        loop {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept Responses stream probe request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/responses"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if let Some(body) = responses_capability_probe_response(&request_body) {
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-                continue;
-            }
-            tx.send(request_body)
-                .expect("send Responses stream probe request");
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
-            )
-            .expect("write Responses stream probe headers");
-            stream
-                .flush()
-                .expect("flush Responses stream probe headers");
-            for chunk in chunks {
-                stream
-                    .write_all(&chunk)
-                    .expect("write Responses stream probe chunk");
-                stream.flush().expect("flush Responses stream probe chunk");
-                thread::sleep(Duration::from_millis(1));
-            }
-            break;
-        }
-    });
-    (format!("http://{addr}/v1/responses"), rx)
-}
-
 /// 矩阵项 1：Chat non-stream，请求带 tool schema 且模式为 ReplayReasoningContent；
 /// 响应仅含 reasoning_content 而无 tool call → 成功，assistant content 保留，
 /// `provider_reasoning_history` 为空（不产生 replay 义务）。
@@ -7013,7 +3817,6 @@ fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_rep
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7112,7 +3915,6 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7220,7 +4022,6 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -7316,7 +4117,6 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -7392,7 +4192,6 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7478,7 +4277,6 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7569,7 +4367,6 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -7627,7 +4424,7 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
         .chunks(3)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let (base_url, requests) = responses_stream_server(chunks, None);
     let directory = tempdir().expect("catalog directory");
     let config_path = directory.path().join("models.json");
     std::fs::write(
@@ -7664,7 +4461,6 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7760,7 +4556,6 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -7861,7 +4656,6 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -7916,7 +4710,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
         .chunks(3)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let (base_url, requests) = responses_stream_server(chunks, None);
     let directory = tempdir().expect("catalog directory");
     let config_path = directory.path().join("models.json");
     std::fs::write(
@@ -7953,7 +4747,6 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
         None,
     );
     let provider = snapshot
@@ -8024,7 +4817,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
         .chunks(3)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let (base_url, requests) = responses_stream_probe_server(chunks);
+    let (base_url, requests) = responses_stream_server(chunks, None);
     let directory = tempdir().expect("catalog directory");
     let config_path = directory.path().join("models.json");
     std::fs::write(
@@ -8062,7 +4855,6 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
             _ => None,
         },
         None,
-        None,
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -8091,43 +4883,6 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
 /// 已精确覆盖 Chat 无当前 tool call 时返回 reasoning content 的失败关闭（请求无 tools）；
 /// 本测试补充“请求含 tools 但响应仅 reasoning-only 无 tool call”的变体，覆盖新谓词
 /// `disabled_mode_not_honored` 不依赖响应是否有 tool call 的路径。
-#[test]
-fn reasoning_replay_obligation_disabled_mode_rejects_reasoning_only_tool_request() {
-    let (base_url, requests) = reasoning_stabilization_probe_server(
-        "HTTP/1.1 200 OK",
-        PROBE_STRICT_PARALLEL_RESPONSE,
-        CHAT_REASONING_ONLY_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-
-    let error = provider
-        .complete(
-            &capability_test_request(None, false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect_err("disabled mode with reasoning content must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_mode_not_honored")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_reasoning_disable_not_honored".to_string())
-    );
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured disabled-mode reasoning requests");
-    assert_eq!(captured.len(), 4);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(captured.last().expect("actual request JSON"))
-            .expect("actual request JSON")["thinking"]["type"],
-        "disabled"
-    );
-}
 
 // SINGULARITY_HOME 环境隔离：这两个端到端测试互相串行，其他测试不读该变量。
 static USER_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());

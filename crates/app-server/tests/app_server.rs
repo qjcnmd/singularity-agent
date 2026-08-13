@@ -42,7 +42,6 @@ fn app_server(store: SessionStore) -> AppServer {
                 _ => None,
             },
             None,
-            None,
         ),
     )
 }
@@ -93,7 +92,6 @@ fn configured_provider_drops_cleanly_inside_app_server_runtime() {
                     _ => None,
                 },
                 Some(runtime_handle),
-                None,
             );
             assert!(provider_snapshot.configuration().configured);
             let store = SessionStore::open(":memory:").expect("open store");
@@ -590,7 +588,6 @@ fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
             _ => None,
         },
         None,
-        None,
     );
     let expected_snapshot_id = snapshot.snapshot_id().to_string();
     let mut server = AppServer::new(store, snapshot);
@@ -969,15 +966,20 @@ fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_mess
     assert_eq!(second["params"]["delta"], "answer");
 
     let terminal = output.recv_id(3, Duration::from_secs(2));
-    assert_eq!(terminal["result"]["turn"]["status"], "completed");
+    assert_eq!(
+        terminal["result"]["turn"]["status"],
+        "completed",
+        "turn/start terminal: {terminal}"
+    );
     assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "completed");
     output.recv_method("turn/completed", Duration::from_secs(2));
     let request_bodies = requests
         .recv_timeout(Duration::from_secs(2))
         .expect("provider request sequence");
-    assert!(
-        request_bodies.len() >= 2,
-        "capability probe and stream request"
+    assert_eq!(
+        request_bodies.len(),
+        1,
+        "static capability contract issues exactly one streaming request"
     );
     assert!(
         request_bodies.iter().any(|body| body["stream"] == true),
@@ -1386,17 +1388,17 @@ fn streaming_responses_provider() -> (
     let address = listener.local_addr().expect("streaming provider address");
     let (requests_tx, requests_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let mut requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("accept streaming provider request");
-            let request_body = read_http_json_body(&mut stream);
-            let request: serde_json::Value =
-                serde_json::from_str(&request_body).expect("provider request json");
-            requests.push(request.clone());
-            if request["stream"] == true {
-                let completed = serde_json::json!({
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept streaming provider request");
+        let request_body = read_http_json_body(&mut stream);
+        let request: serde_json::Value =
+            serde_json::from_str(&request_body).expect("provider request json");
+        assert!(
+            request["stream"] == true,
+            "static capability contract must issue one streaming request"
+        );
+        let completed = serde_json::json!({
                     "type": "response.completed",
                     "response": {
                         "id": "response_app_server_stream",
@@ -1430,13 +1432,16 @@ fn streaming_responses_provider() -> (
                 stream.flush().expect("flush second streaming delta");
                 write!(stream, "event: response.completed\ndata: {completed}\n\n")
                     .expect("write streaming completion");
-                requests_tx.send(requests).expect("send request sequence");
-                break;
-            }
-            let response = responses_capability_probe_response(&request)
-                .expect("non-stream request must be a capability probe");
-            write_json_response(&mut stream, &response);
-        }
+                stream.flush().expect("flush streaming completion");
+                // 保留连接直到 child 消费完 SSE 响应：若在 child 的解码回调
+                // （store 写）尚未消费完时关闭 socket，Windows 会以 RST 终止连接，
+                // child 的 body read 报 provider_response_body_read_failed。
+                // 不能阻塞等待 EOF（child 需 worker 关闭才能得到 EOF，会死锁），
+                // 因此给足解码/持久化延迟余量后再关闭。
+                thread::sleep(Duration::from_millis(750));
+                requests_tx
+                    .send(vec![request])
+                    .expect("send request sequence");
     });
     (
         format!("http://{address}/v1/responses"),
@@ -1469,75 +1474,6 @@ fn read_http_json_body(stream: &mut TcpStream) -> String {
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).expect("read provider body");
     String::from_utf8(body).expect("provider request utf8")
-}
-
-#[cfg(windows)]
-fn responses_capability_probe_response(request: &serde_json::Value) -> Option<serde_json::Value> {
-    let tools = request.get("tools")?.as_array()?;
-    let names = tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>();
-    if !names.contains(&"singularity_capability_probe_a") {
-        return None;
-    }
-    let continuation = request
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["type"] == "function_call_output")
-        });
-    let strict = tools
-        .iter()
-        .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
-    let arguments = if strict {
-        serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
-    } else {
-        serde_json::json!({})
-    };
-    let mut output = vec![serde_json::json!({
-        "type": "function_call",
-        "call_id": if continuation { "probe_call_continuation" } else { "probe_call_a" },
-        "name": "singularity_capability_probe_a",
-        "arguments": arguments.to_string()
-    })];
-    if !continuation
-        && names.contains(&"singularity_capability_probe_b")
-        && request["parallel_tool_calls"] == true
-    {
-        output.push(serde_json::json!({
-            "type": "function_call",
-            "call_id": "probe_call_b",
-            "name": "singularity_capability_probe_b",
-            "arguments": arguments.to_string()
-        }));
-    }
-    Some(serde_json::json!({
-        "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
-        "object": "response",
-        "status": "completed",
-        "output": output,
-        "usage": {
-            "input_tokens": 2,
-            "output_tokens": 1,
-            "total_tokens": 3,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens_details": {"reasoning_tokens": 0}
-        }
-    }))
-}
-
-#[cfg(windows)]
-fn write_json_response(stream: &mut TcpStream, body: &serde_json::Value) {
-    let body = body.to_string();
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .expect("write provider json response");
 }
 
 fn app_server_bin() -> String {

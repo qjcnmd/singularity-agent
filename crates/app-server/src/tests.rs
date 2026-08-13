@@ -23,7 +23,6 @@ fn app_server(store: SessionStore) -> AppServer {
                 _ => None,
             },
             None,
-            None,
         ),
     )
 }

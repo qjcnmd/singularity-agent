@@ -16,7 +16,7 @@ use singularity_app_server::{
     OutputOrderCoordinator,
 };
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
-use singularity_model::{PROVIDER_CAPABILITY_CACHE_FILE_NAME, ProviderConfigSnapshot};
+use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{
     EventClass, EventDelivery, EventGap, EventGapReason, EventMetadata, JsonRpcBatchItem,
     JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
@@ -34,8 +34,6 @@ const FILE_BACKED_STORE_REQUIRED: &str =
     "app-server requires a file-backed SINGULARITY_APP_SERVER_DB";
 const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
     "app-server requires a canonical regular file-backed state database";
-const CACHE_TEMP_FILE_PREFIX: &str = ".provider-capability-cache.json.tmp-";
-const CACHE_KEY_LOCK_FILE_PREFIX: &str = ".provider-capability-cache.key-lock-";
 
 #[derive(Clone)]
 struct OutputChannels {
@@ -446,7 +444,7 @@ fn initialize_app_server(
     configured_db_path: &str,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<AppServer, String> {
-    let (db_path, capability_cache_path) = prepare_app_server_state_paths(configured_db_path)?;
+    let db_path = prepare_app_server_state_paths(configured_db_path)?;
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
     validate_database_file(Path::new(&db_path), false)?;
@@ -456,7 +454,6 @@ fn initialize_app_server(
     let provider_snapshot = ProviderConfigSnapshot::capture(
         |name| std::env::var(name).ok(),
         Some(runtime_handle),
-        Some(capability_cache_path),
     );
     Ok(AppServer::new(store, provider_snapshot))
 }
@@ -1087,7 +1084,7 @@ fn internal_error_value(id: Option<JsonRpcId>, _diagnostic: impl Into<String>) -
     .to_wire_value()
 }
 
-fn resolve_app_server_state_paths(configured_db_path: &str) -> Result<(String, PathBuf), String> {
+fn resolve_app_server_state_paths(configured_db_path: &str) -> Result<String, String> {
     if is_unsupported_sqlite_database_path(configured_db_path) {
         return Err(FILE_BACKED_STORE_REQUIRED.to_string());
     }
@@ -1097,12 +1094,7 @@ fn resolve_app_server_state_paths(configured_db_path: &str) -> Result<(String, P
         .and_then(|name| name.to_str())
         .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
     validate_database_name(database_name)?;
-    let parent = Path::new(db_path)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let cache_path = parent.join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-    Ok((db_path.to_string(), cache_path))
+    Ok(db_path.to_string())
 }
 
 fn is_unsupported_sqlite_database_path(configured_db_path: &str) -> bool {
@@ -1113,8 +1105,8 @@ fn is_unsupported_sqlite_database_path(configured_db_path: &str) -> bool {
         || lower.starts_with("sqlite:")
 }
 
-fn prepare_app_server_state_paths(configured_db_path: &str) -> Result<(String, PathBuf), String> {
-    let (raw_db_path, _) = resolve_app_server_state_paths(configured_db_path)?;
+fn prepare_app_server_state_paths(configured_db_path: &str) -> Result<String, String> {
+    let raw_db_path = resolve_app_server_state_paths(configured_db_path)?;
     let raw_db_path = Path::new(&raw_db_path);
     let raw_parent = raw_db_path
         .parent()
@@ -1126,14 +1118,10 @@ fn prepare_app_server_state_paths(configured_db_path: &str) -> Result<(String, P
         .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
     let database_path = canonical_parent.join(database_name);
     validate_database_file(&database_path, true)?;
-    let cache_path = canonical_parent.join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-    Ok((
-        database_path
-            .to_str()
-            .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?
-            .to_string(),
-        cache_path,
-    ))
+    database_path
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())
 }
 
 fn prepare_state_directory(parent: &Path) -> Result<PathBuf, String> {
@@ -1179,12 +1167,7 @@ fn validate_database_name(name: &str) -> Result<(), String> {
         .to_ascii_lowercase()
         .trim_end_matches([' ', '.'])
         .to_string();
-    if normalized.is_empty()
-        || normalized == PROVIDER_CAPABILITY_CACHE_FILE_NAME
-        || normalized == "provider-capability-cache.lock"
-        || normalized.starts_with(CACHE_TEMP_FILE_PREFIX)
-        || normalized.starts_with(CACHE_KEY_LOCK_FILE_PREFIX)
-    {
+    if normalized.is_empty() {
         return Err(SAFE_FILE_BACKED_STATE_REQUIRED.to_string());
     }
     #[cfg(windows)]
@@ -1417,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn state_path_rejects_sqlite_uri_before_cache_injection() {
+    fn state_path_rejects_sqlite_uri_before_state_preparation() {
         for path in [
             ":memory:",
             " :MEMORY: ",
@@ -1435,30 +1418,15 @@ mod tests {
     }
 
     #[test]
-    fn state_path_injects_cache_next_to_file_backed_database() {
-        let (db_path, cache_path) =
-            resolve_app_server_state_paths("state/rust-app-server.sqlite3").expect("state paths");
-        assert_eq!(db_path, "state/rust-app-server.sqlite3");
-        assert_eq!(
-            cache_path,
-            PathBuf::from("state").join(PROVIDER_CAPABILITY_CACHE_FILE_NAME)
-        );
-    }
-
-    #[test]
     fn prepared_state_paths_use_the_canonical_directory() {
         let directory = tempfile::tempdir().expect("state directory");
         let configured = directory.path().join("nested").join("sessions.sqlite3");
-        let (db_path, cache_path) =
+        let db_path =
             prepare_app_server_state_paths(configured.to_str().expect("configured path"))
-                .expect("prepared state paths");
+                .expect("prepared state path");
         let canonical_parent = std::fs::canonicalize(configured.parent().expect("parent"))
             .expect("canonical state directory");
-        assert_eq!(
-            Path::new(&db_path).parent(),
-            Some(canonical_parent.as_path())
-        );
-        assert_eq!(cache_path.parent(), Some(canonical_parent.as_path()));
+        assert_eq!(Path::new(&db_path).parent(), Some(canonical_parent.as_path()));
         assert!(!Path::new(&db_path).exists());
     }
 
@@ -1475,20 +1443,6 @@ mod tests {
         let error = prepare_app_server_state_paths(database.to_str().expect("database path"))
             .expect_err("hard-linked database rejected");
         assert_eq!(error, SAFE_FILE_BACKED_STATE_REQUIRED);
-    }
-
-    #[test]
-    fn state_path_rejects_cache_lock_and_temp_name_collisions() {
-        for name in [
-            PROVIDER_CAPABILITY_CACHE_FILE_NAME,
-            "provider-capability-cache.lock",
-            ".provider-capability-cache.key-lock-00.lock",
-            ".provider-capability-cache.json.tmp-owned",
-        ] {
-            let error = resolve_app_server_state_paths(name)
-                .expect_err("reserved cache state name rejected");
-            assert_eq!(error, SAFE_FILE_BACKED_STATE_REQUIRED);
-        }
     }
 
     #[test]
@@ -1981,7 +1935,7 @@ mod tests {
     fn mixed_batch_is_sequential_and_only_requests_produce_ordered_responses() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server =
-            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
@@ -2023,7 +1977,7 @@ mod tests {
     fn batch_rejects_long_worker_methods_and_continues_with_short_items() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server =
-            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(16, 8);
         let payload = parse_json_rpc_payload(
@@ -2064,7 +2018,7 @@ mod tests {
     fn all_notification_batch_has_no_output_even_for_unknown_method_or_invalid_params() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server =
-            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
@@ -2086,7 +2040,7 @@ mod tests {
     fn notification_only_request_is_invalid_without_changing_batch_notification_contract() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server =
-            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(2, 2);
         let payload = parse_json_rpc_payload(
@@ -2145,7 +2099,7 @@ mod tests {
     fn empty_batch_returns_standard_invalid_request() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server =
-            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None, None));
+            AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
         let cancellation = server.cancellation_handle();
         let (outputs, mut receiver, _event_receiver) = test_output_channels(1, 1);
 

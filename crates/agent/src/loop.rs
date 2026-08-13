@@ -188,11 +188,8 @@ impl Agent {
         if !self.config.model.is_empty() {
             preferences.model_name = Some(self.config.model.clone());
         }
-        // 一次能力协商决定 system prompt 角色、输出上限与 tool 策略（旧 AgentLoop 同款）。
-        let capabilities = self
-            .provider
-            .negotiate_tool_capabilities(&preferences, cancellation)?
-            .contract;
+        // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略（旧 AgentLoop 同款）。
+        let capabilities = self.provider.protocol_contract();
         let max_output_tokens = u32::try_from(
             self.config
                 .max_output_tokens
@@ -601,7 +598,6 @@ mod tests {
                 provider_name: Some("fake".to_string()),
                 model_name: Some("fake-model".to_string()),
                 provider_attempt_metadata: None,
-                provider_capability_metadata: None,
                 provider_reasoning_history: Vec::new(),
             }
         }
@@ -610,27 +606,6 @@ mod tests {
     impl Provider for FakeProvider {
         fn protocol_contract(&self) -> ProviderProtocolContract {
             self.contract.clone()
-        }
-
-        fn negotiate_tool_capabilities(
-            &self,
-            _model_preferences: &ModelPreferences,
-            _cancellation: &CancellationToken,
-        ) -> std::result::Result<singularity_model::ProviderProtocolNegotiation, ProviderError>
-        {
-            Ok(singularity_model::ProviderProtocolNegotiation {
-                contract: self.contract.clone(),
-                metadata: singularity_model::ProviderCapabilityMetadata {
-                    api_protocol: singularity_model::ProviderApiProtocol::Declared,
-                    profile: singularity_model::ProviderCapabilityProfile::Declared,
-                    cache_hit: false,
-                    profile_attempts: 0,
-                    fallback_count: 0,
-                    probe_usage: ModelUsage::default(),
-                    probe_attempt_metadata: singularity_model::ProviderAttemptMetadata::default(),
-                    cache_observations: Vec::new(),
-                },
-            })
         }
 
         fn streaming_capability(

@@ -10,21 +10,21 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 
 use super::{
-    CHAT_COMPLETIONS_PATH, DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
-    DEFAULT_MAX_TOOLS_PER_REQUEST, DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
+    DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL,
     ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS, ENV_MODEL, ENV_PROVIDER,
     MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, MAX_DISCOVERED_MODEL_IDS,
     ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus, ModelError, ModelErrorCategory,
     ModelErrorKind, ModelProviderConfig, OpenAiProvider, OpenAiProviderConfig,
     PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX,
-    PROVIDER_TIMEOUT_SECONDS, ProviderApiProtocol, ProviderConfigResolution,
-    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ProviderToolReasoningMode, RESPONSES_PATH,
-    ThinkingWireFormat, USER_AUTH_GENERATION_PREFIX, USER_AUTH_SCHEMA_VERSION,
-    USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME, USER_MODELS_CACHE_FILE_NAME,
-    USER_MODELS_CACHE_SCHEMA_VERSION, USER_MODELS_CACHE_TTL_SECONDS, UserConfigImportResult,
-    UserModelCatalog, UserModelCatalogEntry, UserProviderModelCatalog, chat_completions_endpoint,
-    validate_provider_config,
+    ProviderApiProtocol, ProviderCapabilityDeclaration,
+    ProviderConfigResolution, ProviderConfigSnapshot, ProviderConfigSource,
+    ProviderConfigurationStatus, ProviderError, ProviderErrorStage, ProviderProtocolContract,
+    ProviderToolReasoningMode, RESPONSES_PATH, ThinkingWireFormat, USER_AUTH_GENERATION_PREFIX,
+    USER_AUTH_SCHEMA_VERSION, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME,
+    USER_MODELS_CACHE_FILE_NAME, USER_MODELS_CACHE_SCHEMA_VERSION, USER_MODELS_CACHE_TTL_SECONDS,
+    UserConfigImportResult, UserModelCatalog, UserModelCatalogEntry, UserProviderModelCatalog,
+    chat_completions_endpoint, validate_provider_config,
 };
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -58,6 +58,8 @@ struct ConfiguredModel {
     supports_tool_choice: bool,
     requires_reasoning_content_for_tool_calls: bool,
     requires_assistant_content_for_tool_calls: bool,
+    /// 合并后的用户显式能力声明（config.json `capabilities` 块）；models.json 路径为 None。
+    capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,25 +178,16 @@ impl ProviderConfigSnapshot {
     /// 从环境读取并固定一份 provider 配置快照。
     ///
     /// runtime_handle 由已有异步宿主提供时复用该 runtime；否则 provider 自己拥有
-    /// runtime。cache_path 为空时不启用持久 capability cache。
-    pub fn capture<F>(
-        get_env: F,
-        runtime_handle: Option<tokio::runtime::Handle>,
-        cache_path: Option<PathBuf>,
-    ) -> Self
+    /// runtime。
+    pub fn capture<F>(get_env: F, runtime_handle: Option<tokio::runtime::Handle>) -> Self
     where
         F: FnMut(&str) -> Option<String>,
     {
         Self::capture_with_provider(get_env, move |config| {
             if let Some(runtime_handle) = runtime_handle.as_ref() {
-                OpenAiProvider::new_with_runtime_handle_and_cache_path(
-                    config,
-                    PROVIDER_TIMEOUT_SECONDS,
-                    cache_path.clone(),
-                    runtime_handle.clone(),
-                )
+                OpenAiProvider::new_with_runtime_handle(config, runtime_handle.clone())
             } else {
-                OpenAiProvider::new_with_cache_path(config, cache_path.clone())
+                OpenAiProvider::new(config)
             }
         })
     }
@@ -724,6 +717,7 @@ where
                         .requires_reasoning_content_for_tool_calls,
                     requires_assistant_content_for_tool_calls: model_file
                         .requires_assistant_content_for_tool_calls,
+                    capability_overrides: None,
                 },
             );
         }
@@ -868,6 +862,7 @@ fn provider_for_selection(
             requires_reasoning_content_for_tool_calls: false,
             requires_assistant_content_for_tool_calls: model
                 .requires_assistant_content_for_tool_calls,
+            capability_overrides: model.capability_overrides.clone(),
         }));
     };
     let variant = model
@@ -907,6 +902,7 @@ fn provider_for_selection(
         supports_tool_choice: model.supports_tool_choice,
         requires_reasoning_content_for_tool_calls,
         requires_assistant_content_for_tool_calls: model.requires_assistant_content_for_tool_calls,
+        capability_overrides: model.capability_overrides.clone(),
     }))
 }
 
@@ -1095,20 +1091,6 @@ impl OpenAiProviderConfig {
         chat_completions_endpoint(&self.base_url)
     }
 
-    pub(super) fn api_protocol_candidates(&self) -> Vec<ProviderApiProtocol> {
-        let base_url = self.base_url.trim().trim_end_matches('/');
-        if base_url.ends_with(RESPONSES_PATH) {
-            vec![ProviderApiProtocol::OpenAiResponses]
-        } else if base_url.ends_with(CHAT_COMPLETIONS_PATH) {
-            vec![ProviderApiProtocol::OpenAiChatCompletions]
-        } else {
-            vec![
-                ProviderApiProtocol::OpenAiResponses,
-                ProviderApiProtocol::OpenAiChatCompletions,
-            ]
-        }
-    }
-
     pub(super) fn completion_protocol_without_tools(&self) -> ProviderApiProtocol {
         if self
             .base_url
@@ -1132,8 +1114,8 @@ impl OpenAiProviderConfig {
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
-            supports_system_message: false,
-            supports_developer_message: false,
+            supports_system_message: true,
+            supports_developer_message: true,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
         }
@@ -1390,6 +1372,7 @@ struct ResolvedProviderValues {
 
 fn configured_model_from_file(
     model_file: ModelsFileModel,
+    capability_overrides: Option<ProviderCapabilityDeclaration>,
 ) -> Result<ConfiguredModel, ProviderError> {
     let protocol = parse_catalog_protocol(&model_file.api_protocol)?;
     let reasoning_variants = model_file
@@ -1473,36 +1456,60 @@ fn configured_model_from_file(
             .requires_reasoning_content_for_tool_calls,
         requires_assistant_content_for_tool_calls: model_file
             .requires_assistant_content_for_tool_calls,
+        capability_overrides,
     })
 }
 
 fn configured_model_from_user_file(
     model_file: &UserConfigModel,
 ) -> Result<ConfiguredModel, ProviderError> {
+    // 合并优先级：顶层字段 > capabilities 内嵌 > 默认值。capabilities 块是旧
+    // probe 时代 config.json 的显式声明残留，接受并投影到静态契约。
+    let capabilities = model_file.capabilities.clone().unwrap_or_default();
     let (Some(api_protocol), Some(max_output_tokens)) = (
         model_file.api_protocol.as_deref(),
-        model_file.max_output_tokens,
+        model_file.max_output_tokens.or(capabilities.max_output_tokens),
     ) else {
         return Err(configuration_error(
             "model override is incomplete; api_protocol and max_output_tokens are required",
             "provider_configuration_invalid",
         ));
     };
-    configured_model_from_file(ModelsFileModel {
-        api_protocol: api_protocol.to_string(),
-        max_context_tokens: model_file.max_context_tokens,
-        max_output_tokens,
-        reasoning_variants: model_file.reasoning_variants.clone(),
-        default_variant: model_file.default_variant.clone(),
-        tool_reasoning_history: model_file.tool_reasoning_history.clone(),
-        supports_developer_role: model_file.supports_developer_role.unwrap_or(true),
-        supports_tool_choice: model_file.supports_tool_choice.unwrap_or(true),
-        requires_reasoning_content_for_tool_calls: model_file
-            .requires_reasoning_content_for_tool_calls,
-        requires_assistant_content_for_tool_calls: model_file
-            .requires_assistant_content_for_tool_calls,
-        thinking_wire_format: model_file.thinking_wire_format.clone(),
-    })
+    let capability_overrides = ProviderCapabilityDeclaration {
+        supports_tools: capabilities.supports_tools,
+        supports_parallel_tool_calls: capabilities.supports_parallel_tool_calls,
+        supports_required_tool_choice: capabilities.supports_required_tool_choice,
+        supports_strict_tool_schema: capabilities.supports_strict_tool_schema,
+        supports_json_mode: capabilities.supports_json_mode,
+        supports_system_message: capabilities.supports_system_message,
+        supports_developer_message: capabilities.supports_developer_message,
+        supports_reasoning: capabilities.supports_reasoning,
+        max_tools_per_request: capabilities.max_tools_per_request,
+        max_parallel_tool_calls: capabilities.max_parallel_tool_calls,
+        max_context_tokens: model_file.max_context_tokens.or(capabilities.max_context_tokens),
+        max_output_tokens: model_file.max_output_tokens.or(capabilities.max_output_tokens),
+    };
+    configured_model_from_file(
+        ModelsFileModel {
+            api_protocol: api_protocol.to_string(),
+            max_context_tokens: capability_overrides.max_context_tokens,
+            max_output_tokens,
+            reasoning_variants: model_file.reasoning_variants.clone(),
+            default_variant: model_file.default_variant.clone(),
+            tool_reasoning_history: model_file.tool_reasoning_history.clone(),
+            supports_developer_role: model_file
+                .supports_developer_role
+                .or(capabilities.supports_developer_message)
+                .unwrap_or(true),
+            supports_tool_choice: model_file.supports_tool_choice.unwrap_or(true),
+            requires_reasoning_content_for_tool_calls: model_file
+                .requires_reasoning_content_for_tool_calls,
+            requires_assistant_content_for_tool_calls: model_file
+                .requires_assistant_content_for_tool_calls,
+            thinking_wire_format: model_file.thinking_wire_format.clone(),
+        },
+        Some(capability_overrides),
+    )
 }
 
 fn capture_user_model_selection<P>(
@@ -1713,6 +1720,9 @@ struct UserConfigModel {
     requires_assistant_content_for_tool_calls: bool,
     #[serde(default)]
     thinking_wire_format: Option<String>,
+    /// 旧 probe 时代 config.json 的显式能力声明块；接受并合并到静态契约。
+    #[serde(default)]
+    capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]

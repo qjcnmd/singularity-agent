@@ -5,11 +5,9 @@
 //! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -71,37 +69,9 @@ const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
 const HTTP_STATUS_NOT_FOUND: u16 = 404;
-const HTTP_STATUS_BAD_REQUEST: u16 = 400;
-const HTTP_STATUS_UNPROCESSABLE_ENTITY: u16 = 422;
 const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
-const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
-const CAPABILITY_PROBE_CONTINUATION_REQUEST_ID: &str = "singularity_capability_probe_continuation";
-const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
-const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
-const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "schema_sentinel_alpha";
-const CAPABILITY_PROBE_ALTERNATE_LABEL: &str = "schema_sentinel_beta";
-const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
-const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
-    "Follow the fixed capability probe request using native structured tool calls.";
-/// app-server 状态目录中 provider capability cache 的文件名。
-pub const PROVIDER_CAPABILITY_CACHE_FILE_NAME: &str = "provider-capability-cache.json";
-const PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME: &str = "provider-capability-cache.lock";
-const PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION: u32 = 2;
-const PROVIDER_CAPABILITY_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
-const MAX_PROVIDER_CAPABILITY_CACHE_BYTES: usize = 1024 * 1024;
-const MAX_PROVIDER_CAPABILITY_CACHE_RECORDS: usize = 256;
-const PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS: u64 = 25;
-const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX: &str = ".provider-capability-cache.key-lock-";
-const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX: &str = ".lock";
-const MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES: usize = 256;
-const CAPABILITY_PROBE_DEADLINE_SECONDS: u64 = 120;
-const PROVIDER_ADAPTER_VERSION: u32 = 1;
-const CAPABILITY_PROBE_CONTRACT_VERSION: u32 = 1;
-const PROVIDER_CAPABILITY_CACHE_INVALIDATION_DEADLINE_CODE: &str =
-    "provider_capability_cache_invalidation_deadline_exceeded";
 
-mod capability;
 mod config;
 mod contract;
 mod openai;
@@ -117,13 +87,6 @@ pub use openai::{
     chat_completions_endpoint, models_endpoint, provider_error_response, responses_endpoint,
 };
 
-#[cfg(all(test, windows))]
-use capability::replace_existing_atomic;
-#[cfg(test)]
-use capability::{
-    ProviderCapabilityCache, ProviderCapabilityCacheError, capability_probe_metadata,
-    capability_probe_tool_reasoning_error, sha256_hex,
-};
 #[cfg(test)]
 use config::provider_initialization_blocker;
 #[cfg(test)]
@@ -637,15 +600,26 @@ impl Default for ProviderProtocolContract {
     }
 }
 
-/// 协商得到的模型提供方配置档案，用于诊断和后续请求校验。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// 模型条目的显式能力声明（旧 probe 时代 config.json 的 `capabilities` 块）。
+///
+/// 全部字段可选：顶层配置字段优先，其次本声明，最后 `ProviderProtocolContract`
+/// 默认值。`supports_reasoning`/`max_parallel_tool_calls` 只解析接受，当前
+/// 契约没有对应消费点。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderCapabilityProfile {
-    Declared,
-    StrictParallel,
-    StrictSingle,
-    NonStrictParallel,
-    NonStrictSingle,
+pub struct ProviderCapabilityDeclaration {
+    pub supports_tools: Option<bool>,
+    pub supports_parallel_tool_calls: Option<bool>,
+    pub supports_required_tool_choice: Option<bool>,
+    pub supports_strict_tool_schema: Option<bool>,
+    pub supports_json_mode: Option<bool>,
+    pub supports_system_message: Option<bool>,
+    pub supports_developer_message: Option<bool>,
+    pub supports_reasoning: Option<bool>,
+    pub max_tools_per_request: Option<u32>,
+    pub max_parallel_tool_calls: Option<u32>,
+    pub max_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
 }
 
 /// `AgentLoop` 为完成请求提供的可选模型参数。
@@ -750,7 +724,7 @@ pub struct ProviderConfigurationStatus {
     pub blocker: Option<ModelBlockerKind>,
 }
 
-/// 从模型提供方完成和能力探测中累积的令牌与成本计数器。
+/// 从模型提供方完成中累积的令牌与成本计数器。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -759,60 +733,6 @@ pub struct ModelUsage {
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_estimate: Option<f64>,
-}
-
-/// 描述能力探测和选定协议配置档案的清理后证据。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderCapabilityCacheLookupResult {
-    Hit,
-    Miss,
-}
-
-/// 一次真实 capability-cache 逻辑查找的短生命周期 typed 结果。
-///
-/// Provider 只填充真实 cache boundary 与 Hit/Miss；AgentLoop 在真实
-/// PromptAssembly ownership boundary 绑定 model-turn 和 parent occurrence。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCapabilityCacheObservation {
-    pub api_protocol: ProviderApiProtocol,
-    pub outcome: ProviderCapabilityCacheLookupResult,
-    /// Unix milliseconds captured at the actual cache lookup boundary.
-    pub observed_at_unix_ms: u64,
-    pub model_turn_ordinal: Option<u32>,
-    pub parent_occurrence_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ProviderCapabilityMetadata {
-    pub api_protocol: ProviderApiProtocol,
-    pub profile: ProviderCapabilityProfile,
-    pub cache_hit: bool,
-    pub profile_attempts: u32,
-    pub fallback_count: u32,
-    pub probe_usage: ModelUsage,
-    pub probe_attempt_metadata: ProviderAttemptMetadata,
-    /// Runtime-only lookup observations; persistence and public schema expose no entries.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub cache_observations: Vec<ProviderCapabilityCacheObservation>,
-}
-
-/// 模型提供方能力协商返回的契约和诊断信息。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ProviderProtocolNegotiation {
-    pub contract: ProviderProtocolContract,
-    pub metadata: ProviderCapabilityMetadata,
-}
-
-/// provider runtime 的脱敏稳定指纹；provider 与 model 身份保持可独立引用。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ProviderRuntimeFingerprint {
-    /// 绑定 provider、规范化 endpoint 摘要、adapter/probe 版本和配置上限，不包含 model 或凭证。
-    pub provider_fingerprint: String,
-    /// 仅绑定 effective model 的稳定脱敏摘要。
-    pub model_fingerprint: String,
-    /// 在已知最终 protocol/contract 时绑定前两个指纹及协商结果。
-    pub negotiation_fingerprint: Option<String>,
 }
 
 /// 模型侧请求或响应的校验错误和非致命警告。
@@ -1036,11 +956,7 @@ pub struct ModelTurnResponse {
     pub model_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
-    /// Runtime-only capability metadata delivered with this response/error.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub provider_capability_metadata: Option<ProviderCapabilityMetadata>,
-    /// Internal opaque reasoning continuation state; never serialized to the
+    /// 内部 opaque reasoning continuation state；never serialized to the
     /// app-server or trace/evidence projections.
     #[serde(skip)]
     #[schemars(skip)]
@@ -1067,7 +983,6 @@ impl ModelTurnResponse {
             provider_name: None,
             model_name: None,
             provider_attempt_metadata: None,
-            provider_capability_metadata: None,
             provider_reasoning_history: Vec::new(),
         }
     }
@@ -1127,8 +1042,6 @@ impl ProviderStreamingCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptOperationPhase {
-    /// Provider capability negotiation probe.
-    CapabilityProbe,
     /// A caller-requested model completion.
     Completion,
 }
@@ -1205,57 +1118,10 @@ impl ProviderAttemptMetadata {
     }
 }
 
-impl ProviderCapabilityMetadata {
-    fn declared() -> Self {
-        Self {
-            api_protocol: ProviderApiProtocol::Declared,
-            profile: ProviderCapabilityProfile::Declared,
-            cache_hit: false,
-            profile_attempts: 0,
-            fallback_count: 0,
-            probe_usage: ModelUsage::default(),
-            probe_attempt_metadata: ProviderAttemptMetadata::zero(),
-            cache_observations: Vec::new(),
-        }
-    }
-}
-
-impl ProviderProtocolNegotiation {
-    fn declared(contract: ProviderProtocolContract) -> Self {
-        Self {
-            contract,
-            metadata: ProviderCapabilityMetadata::declared(),
-        }
-    }
-}
-
 /// `AgentLoop` 用于能力协商和完成请求的模型提供方边界。
 pub trait Provider {
-    /// 在动态协商前返回模型提供方声明的基线契约。
+    /// 返回模型提供方声明的基线契约。
     fn protocol_contract(&self) -> ProviderProtocolContract;
-
-    /// 在发送带 tool 的请求前探测或解析 tool 能力。
-    fn negotiate_tool_capabilities(
-        &self,
-        _model_preferences: &ModelPreferences,
-        _cancellation: &CancellationToken,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        Ok(ProviderProtocolNegotiation::declared(
-            self.protocol_contract(),
-        ))
-    }
-
-    /// Negotiate tool capabilities while exposing real HTTP attempt boundaries.
-    ///
-    /// Providers without transport-level observations retain the legacy behavior.
-    fn negotiate_tool_capabilities_observed(
-        &self,
-        model_preferences: &ModelPreferences,
-        cancellation: &CancellationToken,
-        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        self.negotiate_tool_capabilities(model_preferences, cancellation)
-    }
 
     /// Report the typed stream capability for the protocol selected by this provider.
     ///
@@ -1314,23 +1180,6 @@ pub trait Provider {
 impl Provider for Arc<dyn Provider + Send + Sync> {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         (**self).protocol_contract()
-    }
-
-    fn negotiate_tool_capabilities(
-        &self,
-        model_preferences: &ModelPreferences,
-        cancellation: &CancellationToken,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        (**self).negotiate_tool_capabilities(model_preferences, cancellation)
-    }
-
-    fn negotiate_tool_capabilities_observed(
-        &self,
-        model_preferences: &ModelPreferences,
-        cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        (**self).negotiate_tool_capabilities_observed(model_preferences, cancellation, on_attempt)
     }
 
     fn streaming_capability(
@@ -1407,6 +1256,8 @@ pub(crate) struct SelectedModel {
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
+    /// 合并后的用户显式能力声明；协议契约构造时叠加到静态基线。
+    pub(crate) capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
 /// Provider transport runtime ownership: an app-server borrows its existing handle, while
@@ -1426,48 +1277,6 @@ impl ProviderRuntime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-struct ProviderCapabilityCacheKey {
-    provider_name: String,
-    endpoint_sha256: String,
-    model_name: String,
-    api_protocol: ProviderApiProtocol,
-    adapter_version: u32,
-    probe_contract_version: u32,
-    max_context_tokens: Option<u32>,
-    max_output_tokens: u32,
-    reasoning_effort: Option<String>,
-    reasoning_variant_enabled: bool,
-    wire_reasoning_effort: Option<String>,
-    thinking_wire_format: ThinkingWireFormat,
-    tool_reasoning_mode: ProviderToolReasoningMode,
-    supports_developer_role: bool,
-    supports_tool_choice: bool,
-    requires_reasoning_content_for_tool_calls: bool,
-    requires_assistant_content_for_tool_calls: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProviderCapabilityProbeKey {
-    provider_name: String,
-    endpoint_sha256: String,
-    model_name: String,
-    adapter_version: u32,
-    probe_contract_version: u32,
-    max_context_tokens: Option<u32>,
-    max_output_tokens: u32,
-    reasoning_effort: Option<String>,
-    reasoning_variant_enabled: bool,
-    wire_reasoning_effort: Option<String>,
-    thinking_wire_format: ThinkingWireFormat,
-    tool_reasoning_mode: ProviderToolReasoningMode,
-    supports_developer_role: bool,
-    supports_tool_choice: bool,
-    requires_reasoning_content_for_tool_calls: bool,
-    requires_assistant_content_for_tool_calls: bool,
-}
-
 /// 协商能力并校验每次完成请求的兼容 OpenAI 模型提供方。
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -1478,22 +1287,27 @@ pub struct OpenAiProvider {
     /// 所有 provider clone 共享同一 runtime ownership 绑定。
     runtime: Arc<ProviderRuntime>,
     request_timeout_seconds: u64,
-    capability_probe_deadline: Duration,
-    tool_capability_cache: Arc<Mutex<capability::InMemoryProviderCapabilityCacheState>>,
-    tool_capability_probe_in_flight:
-        Arc<Mutex<HashMap<ProviderCapabilityProbeKey, Arc<capability::CapabilityProbeState>>>>,
-    persistent_capability_cache: Option<Arc<capability::ProviderCapabilityCache>>,
-    capability_cache_diagnostic: Arc<Mutex<Option<String>>>,
+}
+
+impl fmt::Debug for OpenAiProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiProvider")
+            .field("config", &self.config)
+            .field("client", &"[redacted]")
+            .field("runtime", &"[shared]")
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Error)]
 #[error("{message}")]
-/// 模型提供方失败，包含类型化模型错误、尝试元数据和可选能力证据。
+/// 模型提供方失败，包含类型化模型错误和尝试元数据。
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
-    pub capability_metadata: Option<Box<ProviderCapabilityMetadata>>,
 }
 
 impl ProviderError {
@@ -1503,19 +1317,12 @@ impl ProviderError {
             message: error.message.clone(),
             error: Box::new(error),
             provider_attempt_metadata: None,
-            capability_metadata: None,
         }
     }
 
     /// 附加一次 provider attempt 的脱敏元数据。
     pub fn with_provider_attempt_metadata(mut self, metadata: ProviderAttemptMetadata) -> Self {
         self.provider_attempt_metadata = Some(metadata);
-        self
-    }
-
-    /// 附加能力协商的脱敏元数据。
-    pub fn with_capability_metadata(mut self, metadata: ProviderCapabilityMetadata) -> Self {
-        self.capability_metadata = Some(Box::new(metadata));
         self
     }
 }
@@ -1544,7 +1351,6 @@ mod transport_tests {
     use std::time::Duration;
 
     use super::*;
-    use std::time::Instant;
 
     fn test_provider_config(base_url: String) -> OpenAiProviderConfig {
         OpenAiProviderConfig {
@@ -1576,331 +1382,6 @@ mod transport_tests {
             body
         )
         .expect("write provider response");
-    }
-
-    #[test]
-    fn capability_cache_sha256_matches_standard_vector() {
-        assert_eq!(
-            sha256_hex("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_file_replacement_covers_success_and_failure_paths() {
-        let directory = tempfile::tempdir().expect("Windows replacement directory");
-        let source = directory.path().join("source-测试.tmp");
-        let destination = directory.path().join("destination-缓存.json");
-        std::fs::write(&source, b"replacement").expect("source file");
-        std::fs::write(&destination, b"old").expect("destination file");
-
-        replace_existing_atomic(&source, &destination).expect("replace existing file");
-        assert!(
-            !source.exists(),
-            "successful replacement consumes the source"
-        );
-        assert_eq!(
-            std::fs::read(&destination).expect("replacement destination"),
-            b"replacement"
-        );
-
-        let missing = directory.path().join("missing.tmp");
-        let error = replace_existing_atomic(&missing, &destination)
-            .expect_err("missing source must report the Windows error");
-        assert!(error.raw_os_error().is_some());
-        assert_eq!(
-            std::fs::read(&destination).expect("destination after failed replacement"),
-            b"replacement"
-        );
-
-        let embedded_nul = std::path::PathBuf::from("invalid\0source.tmp");
-        let error = replace_existing_atomic(&embedded_nul, &destination)
-            .expect_err("embedded NUL must be rejected before the FFI call");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            std::fs::read(&destination).expect("destination after invalid path"),
-            b"replacement"
-        );
-    }
-
-    #[test]
-    fn capability_cache_key_lock_is_exclusive_across_instances() {
-        let directory = tempfile::tempdir().expect("cache lock directory");
-        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-        let first = ProviderCapabilityCache::new(cache_path.clone()).expect("first cache");
-        let second = ProviderCapabilityCache::new(cache_path).expect("second cache");
-        let key = ProviderCapabilityCacheKey {
-            provider_name: "provider".to_string(),
-            endpoint_sha256: "00".repeat(32),
-            model_name: "model".to_string(),
-            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            adapter_version: PROVIDER_ADAPTER_VERSION,
-            probe_contract_version: CAPABILITY_PROBE_CONTRACT_VERSION,
-            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            reasoning_effort: None,
-            reasoning_variant_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: ThinkingWireFormat::ThinkingType,
-            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            supports_developer_role: true,
-            supports_tool_choice: true,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: false,
-        };
-        let first_lock = first
-            .acquire_key_lock(
-                &key,
-                &CancellationToken::new(),
-                Some(Instant::now() + Duration::from_secs(1)),
-            )
-            .expect("first key lock");
-        let second_result = second.acquire_key_lock(
-            &key,
-            &CancellationToken::new(),
-            Some(Instant::now() + Duration::from_millis(100)),
-        );
-        assert!(matches!(
-            second_result,
-            Err(ProviderCapabilityCacheError::Deadline)
-        ));
-        drop(first_lock);
-    }
-
-    #[test]
-    fn capability_cache_lock_wait_is_cancellable() {
-        let directory = tempfile::tempdir().expect("cache lock directory");
-        let cache = ProviderCapabilityCache::new(
-            directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME),
-        )
-        .expect("cache");
-        let holder = cache
-            .acquire_global_lock(
-                true,
-                &CancellationToken::new(),
-                Some(Instant::now() + Duration::from_secs(1)),
-            )
-            .expect("hold cache lock");
-        let cancellation = CancellationToken::new();
-        let cancellation_for_thread = cancellation.clone();
-        let canceller = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            cancellation_for_thread.cancel();
-        });
-        let started = Instant::now();
-        let result = cache.acquire_global_lock(
-            false,
-            &cancellation,
-            Some(Instant::now() + Duration::from_secs(1)),
-        );
-        assert!(matches!(
-            result,
-            Err(ProviderCapabilityCacheError::Cancelled)
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        drop(holder);
-        canceller.join().expect("join cache lock canceller");
-    }
-
-    #[test]
-    fn capability_cache_invalidation_reuses_caller_cancellation_while_lock_held() {
-        let directory = tempfile::tempdir().expect("cache directory");
-        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-        let provider = OpenAiProvider::new_with_cache_path(
-            test_provider_config("http://127.0.0.1:1".to_string()),
-            Some(cache_path),
-        )
-        .expect("provider");
-        let key =
-            provider.capability_cache_key("gpt-test", ProviderApiProtocol::OpenAiChatCompletions);
-        let persistent_cache = Arc::clone(
-            provider
-                .persistent_capability_cache
-                .as_ref()
-                .expect("persistent cache"),
-        );
-        let holder = persistent_cache
-            .acquire_global_lock(
-                true,
-                &CancellationToken::new(),
-                Some(Instant::now() + Duration::from_secs(1)),
-            )
-            .expect("hold cache lock");
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let started = Instant::now();
-        let error = provider
-            .invalidate_tool_capability_negotiation(
-                &key,
-                &cancellation,
-                Instant::now() + Duration::from_secs(5),
-            )
-            .expect_err("cancelled invalidation must report cancellation");
-        assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_request_cancelled")
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "cancelled invalidation must not wait for the held persistent lock"
-        );
-        assert_eq!(
-            provider
-                .capability_cache_diagnostic
-                .lock()
-                .expect("cache diagnostic lock")
-                .as_deref(),
-            Some("cancelled")
-        );
-        drop(holder);
-    }
-
-    #[test]
-    fn fresh_probe_rejection_invalidation_preserves_cause_when_cancelled() {
-        let directory = tempfile::tempdir().expect("cache directory");
-        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-        let provider = OpenAiProvider::new_with_cache_path(
-            test_provider_config("http://127.0.0.1:1".to_string()),
-            Some(cache_path),
-        )
-        .expect("provider");
-        let persistent_cache = Arc::clone(
-            provider
-                .persistent_capability_cache
-                .as_ref()
-                .expect("persistent cache"),
-        );
-        let holder = persistent_cache
-            .acquire_global_lock(
-                true,
-                &CancellationToken::new(),
-                Some(Instant::now() + Duration::from_secs(1)),
-            )
-            .expect("hold cache lock");
-        let mut rejection = capability_probe_tool_reasoning_error(
-            &ModelTurnResponse::completed("probe", "response", "done"),
-            "tool_reasoning_disable_not_honored",
-        );
-        rejection.capability_metadata = Some(Box::new(capability_probe_metadata(
-            ProviderApiProtocol::OpenAiChatCompletions,
-            ProviderCapabilityProfile::StrictSingle,
-            1,
-            0,
-            &ModelUsage::default(),
-            &ProviderAttemptMetadata::zero(),
-        )));
-        let original_code = rejection.error.code.clone();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let started = Instant::now();
-        let rejection = provider.invalidate_fresh_probe_rejection(
-            "gpt-test",
-            &cancellation,
-            Instant::now() + Duration::from_secs(5),
-            rejection,
-        );
-        assert_eq!(rejection.error.code, original_code);
-        assert!(
-            rejection
-                .error
-                .validation_errors
-                .contains(&"provider_request_cancelled".to_string())
-        );
-        assert!(
-            !rejection
-                .error
-                .validation_errors
-                .contains(&"provider_capability_cache_invalidation_failed".to_string())
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "fresh rejection invalidation must honor caller cancellation"
-        );
-        drop(holder);
-    }
-
-    #[test]
-    fn capability_probe_total_deadline_does_not_publish_cache() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind deadline provider");
-        let address = listener.local_addr().expect("deadline provider address");
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept deadline provider request");
-            let mut reader = BufReader::new(stream);
-            let mut request_line = String::new();
-            reader
-                .read_line(&mut request_line)
-                .expect("read deadline provider request");
-            seen_tx.send(()).expect("signal deadline request");
-            thread::sleep(Duration::from_millis(750));
-        });
-        let directory = tempfile::tempdir().expect("deadline cache directory");
-        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-        let mut provider = OpenAiProvider::new_with_cache_path(
-            test_provider_config(format!("http://{address}")),
-            Some(cache_path.clone()),
-        )
-        .expect("deadline provider");
-        provider.capability_probe_deadline = Duration::from_millis(500);
-        let error = provider
-            .negotiate_tool_capabilities(
-                &ModelPreferences {
-                    model_name: Some("gpt-test".to_string()),
-                    ..ModelPreferences::default()
-                },
-                &CancellationToken::new(),
-            )
-            .expect_err("capability probe deadline must fail closed");
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_capability_probe_deadline_exceeded")
-        );
-        assert!(!cache_path.exists(), "deadline must not publish cache");
-        seen_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("deadline provider request observed");
-        server.join().expect("join deadline provider");
-    }
-
-    #[test]
-    fn failed_persistent_invalidation_leaves_a_tombstone_and_diagnostic() {
-        let directory = tempfile::tempdir().expect("cache directory");
-        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
-        std::fs::create_dir(&cache_path).expect("unwritable cache target directory");
-        let provider = OpenAiProvider::new_with_cache_path(
-            test_provider_config("http://127.0.0.1:1".to_string()),
-            Some(cache_path),
-        )
-        .expect("provider");
-        let key =
-            provider.capability_cache_key("gpt-test", ProviderApiProtocol::OpenAiChatCompletions);
-        let error = provider
-            .invalidate_tool_capability_negotiation(
-                &key,
-                &CancellationToken::new(),
-                Instant::now() + Duration::from_secs(1),
-            )
-            .expect_err("persistent invalidation must report the write/read failure");
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_capability_cache_invalidation_failed")
-        );
-        let cache = provider
-            .tool_capability_cache
-            .lock()
-            .expect("cache state lock");
-        assert!(cache.tombstones.contains_key(&key));
-        drop(cache);
-        assert_eq!(
-            provider
-                .capability_cache_diagnostic
-                .lock()
-                .expect("cache diagnostic lock")
-                .as_deref(),
-            Some("unavailable")
-        );
     }
 
     fn concurrent_provider_server() -> (String, Receiver<usize>, thread::JoinHandle<()>) {
