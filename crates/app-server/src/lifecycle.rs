@@ -14,6 +14,7 @@ impl AppServer {
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
+            usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             test_provider_override: None,
         }
@@ -62,6 +63,7 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             steer_handles: Arc::clone(&self.steer_handles),
+            usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
             test_provider_override: self.test_provider_override.clone(),
         })
@@ -311,7 +313,7 @@ impl AppServer {
             JsonRpcMessage::response(
                 message.required_id(),
                 serde_json::to_value(TurnResult {
-                    turn: committed.turn,
+                    turn: self.turn_with_usage(committed.turn),
                 })?,
             )
             .to_wire_value(),
@@ -509,7 +511,7 @@ impl AppServer {
             }
         };
         let terminal_events = self.committed_turn_events(&committed, Some(&assistant_events))?;
-        let turn = committed.turn;
+        let turn = self.turn_with_usage(committed.turn);
         emit_messages(&mut emit, terminal_events);
         emit(
             JsonRpcMessage::response(
@@ -676,6 +678,12 @@ impl AppServer {
             .into());
         }
         self.commit_effective_turn_status(&turn, &effective_status, assistant_item_id)
+            .map(|committed| {
+                if effective_status.model_turns > 0 {
+                    self.remember_usage(&turn.turn_id, &effective_status.model_usage);
+                }
+                committed
+            })
             .map_err(Into::into)
     }
 
@@ -777,7 +785,7 @@ impl AppServer {
             Ok(turn) => json_response(
                 message.required_id(),
                 TurnResult {
-                    turn: self.refresh_turn_if_unowned(turn)?,
+                    turn: self.turn_with_usage(self.refresh_turn_if_unowned(turn)?),
                 },
             ),
             Err(StoreError::NotFound(_)) => {
@@ -785,6 +793,30 @@ impl AppServer {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// 将已提交 turn 的聚合 usage 注入协议 Turn（进程内缓存；无缓存时保持 None）。
+    pub(super) fn turn_with_usage(&self, turn: Turn) -> Turn {
+        let usage = self
+            .usage_by_turn
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))
+            .ok()
+            .and_then(|cache| cache.get(&turn.turn_id).cloned());
+        match usage {
+            Some(usage) => Turn {
+                model_usage: Some(usage_to_wire(&usage)),
+                ..turn
+            },
+            None => turn,
+        }
+    }
+
+    /// 提交后缓存聚合 usage（进程内缓存；usage 不持久化，裁决 6）。
+    pub(super) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage) {
+        let _ = self.usage_by_turn.lock().map(|mut cache| {
+            cache.insert(turn_id.to_string(), usage.clone());
+        });
     }
 
     pub(super) fn server_shutdown(

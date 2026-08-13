@@ -644,16 +644,26 @@ fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
 
 // 产品 CLI 不暴露开发期 Evaluation runner。
 #[test]
-fn cli_does_not_expose_development_evaluation_command() {
-    let output = Command::cargo_bin("sg")
+fn cli_exposes_eval_subcommand_without_legacy_eval_args() {
+    // W7-2：`sg eval` 是正式评估子命令；旧的开发评估参数形态（run manifest.json）不再存在。
+    let help = Command::cargo_bin("sg")
+        .expect("binary")
+        .args(["eval", "--help"])
+        .output()
+        .expect("sg cli");
+    assert!(help.status.success());
+    let help_text = stdout(&help);
+    assert!(help_text.contains("--config"));
+    assert!(help_text.contains("--models"));
+
+    let legacy = Command::cargo_bin("sg")
         .expect("binary")
         .args(["eval", "run", "manifest.json", "--run-id", "run"])
         .output()
         .expect("sg cli");
-
-    assert!(!output.status.success());
-    let error = stderr(&output);
-    assert!(error.contains("unrecognized subcommand"));
+    assert!(!legacy.status.success());
+    let error = stderr(&legacy);
+    assert!(error.contains("unrecognized subcommand") || error.contains("unexpected argument"));
     assert!(error.contains("eval"));
 }
 // 验证完成的 turn 会渲染 AgentLoop 状态与 assistant answer。

@@ -19,6 +19,8 @@ use singularity_protocol::{
     TurnStartParams, TurnStatus, rpc_methods,
 };
 
+mod eval;
+
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
@@ -66,6 +68,24 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Run the fixed task set against the configured model list (lightweight regression eval).
+    Eval {
+        /// Path to eval-config.json (default: evaluations/eval-config.json).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Comma-separated task id override.
+        #[arg(long)]
+        tasks: Option<String>,
+        /// Comma-separated model selector override.
+        #[arg(long)]
+        models: Option<String>,
+        /// Maximum parallel cells (default: 10).
+        #[arg(long)]
+        max_parallel: Option<usize>,
+        /// Per-cell timeout in seconds (default: config or 1800).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -289,10 +309,21 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         },
+        Command::Eval {
+            config,
+            tasks,
+            models,
+            max_parallel,
+            timeout_secs,
+        } => eval::run_eval(
+            config,
+            tasks.as_deref(),
+            models.as_deref(),
+            max_parallel,
+            timeout_secs,
+        ),
     }
 }
-
-// 在启动新 turn 前确认 AgentLoop 已完成且无 blocker。
 fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
     let capability = client.agent_capability()?;
     let blockers = agent_loop_blockers(&capability.agent_loop.blockers);

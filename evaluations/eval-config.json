@@ -1,0 +1,15 @@
+{
+  "tasks": [
+    "invoice-bug",
+    "log-stats-feature",
+    "config-diagnose",
+    "cart-refactor",
+    "pipeline-mislead"
+  ],
+  "models": [
+    "opencode-go/deepseek-v4-flash#max",
+    "longcat/LongCat-2.0#high"
+  ],
+  "output_dir": "evaluations/output",
+  "timeout_secs": 1800
+}

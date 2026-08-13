@@ -228,6 +228,18 @@ struct TurnFailure {
     cause: TurnFailureCause,
 }
 
+/// 将 provider 层聚合 usage 投影为协议线格式（评估工具数据源）。
+fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage {
+    singularity_protocol::TurnModelUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        cost_estimate: usage.cost_estimate,
+    }
+}
+
 impl From<TurnFailureStage> for TurnFailure {
     fn from(stage: TurnFailureStage) -> Self {
         Self {
@@ -278,6 +290,8 @@ pub struct AppServer {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// 每个活动 turn 的 steer 注入句柄（turn/input 运行中注入通道）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化，裁决 6）。
+    usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
     #[doc(hidden)]
     pub test_provider_override:
@@ -460,15 +474,22 @@ fn agent_config_for_thread(
 ///
 /// aborted 对应取消（Cancelled）；其余按 Completed 提交，final_text 为空时
 /// `agent_completed_delta` 的兜底路径会省略终态 delta（事件层 item/failed）。
+///
+/// 非取消但无最终答复（如耗尽 max_turns）时标为 Failed：store 不变量要求
+/// Completed 必须携带 assistant 消息，直接提交会以 Internal error 失败。
 fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     let mut status = RunStatus::failed("agent loop did not reach a final assistant message");
     if outcome.aborted {
         mark_run_cancelled(&mut status);
+    } else if outcome.final_text.trim().is_empty() {
+        status.status = AgentStatus::Failed;
+        status.error = Some(
+            "agent loop exhausted its turn budget without a final message".to_string(),
+        );
     } else {
         status.status = AgentStatus::Completed;
         status.error = None;
-        status.final_answer = Some(outcome.final_text.clone())
-            .filter(|text| !text.trim().is_empty());
+        status.final_answer = Some(outcome.final_text.clone());
     }
     status.model_turns = outcome.turns;
     status.model_usage = outcome.usage;

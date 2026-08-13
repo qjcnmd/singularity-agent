@@ -1015,6 +1015,7 @@ impl SessionStore {
             thread_id: row.get(1)?,
             status: decode_db_enum(status, 2)?,
             agent_loop_status: row.get(3)?,
+            model_usage: None,
         })
     }
 
@@ -1079,6 +1080,7 @@ impl SessionStore {
             thread_id: thread_id.to_string(),
             status: TurnStatus::Running,
             agent_loop_status: agent_loop_status.to_string(),
+            model_usage: None,
         }
     }
 

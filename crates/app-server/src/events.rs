@@ -44,7 +44,9 @@ impl AppServer {
         {
             messages.push(event);
         }
-        messages.push(self.event_notification(AppEvent::turn_completed(&committed.turn))?);
+        messages.push(self.event_notification(AppEvent::turn_completed(
+            &self.turn_with_usage(committed.turn.clone()),
+        ))?);
         Ok(messages)
     }
 

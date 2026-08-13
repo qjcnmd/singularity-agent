@@ -29,3 +29,6 @@ plan/
 
 # Windows can accidentally create this reserved device name as a file.
 nul
+
+# Evaluation run artifacts (evidence kept locally).
+evaluations/output/

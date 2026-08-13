@@ -1217,6 +1217,9 @@ impl Provider for OpenAiProvider {
                 overrides.supports_developer_message.unwrap_or(contract.supports_developer_message);
             contract.max_tools_per_request =
                 overrides.max_tools_per_request.unwrap_or(contract.max_tools_per_request);
+            contract.max_parallel_tool_calls = overrides
+                .max_parallel_tool_calls
+                .unwrap_or(contract.max_parallel_tool_calls);
             contract.max_context_tokens =
                 overrides.max_context_tokens.or(contract.max_context_tokens);
             contract.max_output_tokens =

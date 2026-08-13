@@ -728,6 +728,27 @@ pub struct Turn {
     pub thread_id: String,
     pub status: TurnStatus,
     pub agent_loop_status: String,
+    /// 进程内聚合的 provider usage 投影（评估工具数据源）。
+    ///
+    /// 可选字段保持协议向后兼容：旧客户端读新响应时忽略未知字段，
+    /// 新客户端读旧服务端时字段缺失回退为 None。usage 不持久化（裁决 6），
+    /// 仅 app-server 进程内可提供；进程重启后查询历史 turn 为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage: Option<TurnModelUsage>,
+}
+
+/// 模型 usage 的协议线格式（与 `singularity_model::ModelUsage` 同构，
+/// 避免 protocol 依赖 model crate）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// 各轮均提供时才有成本估算；否则为 None。
+    pub cost_estimate: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

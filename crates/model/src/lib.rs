@@ -578,6 +578,8 @@ pub struct ProviderProtocolContract {
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
+    /// 单次请求可携带的最大工具调用数（并行上限；执行侧仍逐个顺序完成）。
+    pub max_parallel_tool_calls: u32,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -594,6 +596,7 @@ impl Default for ProviderProtocolContract {
             supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
+            max_parallel_tool_calls: 1,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }

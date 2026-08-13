@@ -7,8 +7,8 @@ use singularity_protocol::{
     InitializeParams, InitializeResult, ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId,
     JsonRpcMessage, JsonRpcPayload, METHOD_REGISTRY, Method, MethodKind,
     ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams, ThreadReadResult,
-    ThreadStartParams, ThreadStatus, TurnIdParams, TurnStartParams, TurnStatus,
-    parse_json_rpc_payload,
+    ThreadStartParams, ThreadStatus, Turn, TurnIdParams, TurnModelUsage, TurnStartParams,
+    TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -245,6 +245,7 @@ fn event_metadata_is_class_and_delivery_only() {
         thread_id: "thread_1".to_string(),
         status: singularity_protocol::TurnStatus::Completed,
         agent_loop_status: "completed".to_string(),
+        model_usage: None,
     });
     let value = event
         .to_notification_with_metadata(EventMetadata {
@@ -462,4 +463,47 @@ fn storage_enum_text_is_stable_and_rejects_unknown_values() {
     );
     assert_eq!(TurnStatus::from_storage_text("unknown"), None);
     assert_eq!(ItemKind::from_storage_text("command_execution"), None);
+}
+
+#[test]
+fn turn_model_usage_wire_is_optional_and_backward_compatible() {
+    // 旧 wire（无 model_usage 字段）反序列化为 None：新客户端读旧服务端兼容。
+    let legacy = r#"{
+        "turn_id": "turn_1",
+        "thread_id": "thread_1",
+        "status": "completed",
+        "agent_loop_status": "completed"
+    }"#;
+    let turn: Turn = serde_json::from_str(legacy).unwrap();
+    assert_eq!(turn.model_usage, None);
+
+    // 新 wire 完整往返。
+    let turn = Turn {
+        turn_id: "turn_1".to_string(),
+        thread_id: "thread_1".to_string(),
+        status: TurnStatus::Completed,
+        agent_loop_status: "completed".to_string(),
+        model_usage: Some(TurnModelUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            cached_input_tokens: 40,
+            reasoning_tokens: 10,
+            cost_estimate: Some(0.01),
+        }),
+    };
+    let value = serde_json::to_value(&turn).unwrap();
+    assert_eq!(value["model_usage"]["input_tokens"], 100);
+    assert_eq!(value["model_usage"]["cached_input_tokens"], 40);
+    assert_eq!(value["model_usage"]["cost_estimate"], 0.01);
+    let round_trip: Turn = serde_json::from_value(value).unwrap();
+    assert_eq!(round_trip, turn);
+
+    // None 时字段整体省略：旧客户端读新响应无新增必需字段。
+    let bare = Turn {
+        model_usage: None,
+        ..turn
+    };
+    let value = serde_json::to_value(&bare).unwrap();
+    assert!(value.get("model_usage").is_none());
 }

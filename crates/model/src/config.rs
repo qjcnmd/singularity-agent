@@ -1116,6 +1116,7 @@ impl OpenAiProviderConfig {
             supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
+            max_parallel_tool_calls: 1,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
         }

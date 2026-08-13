@@ -2504,12 +2504,11 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         Some("provider_does_not_support_parallel_tool_calls")
     );
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
+    // 响应超限已降级为 warning（agent loop 逐个顺序执行全部工具调用），
+    // 不再作为致命校验；parallel 未声明时 parallel 拒绝仍是唯一致命校验。
     assert_eq!(
         error.validation_errors,
-        vec![
-            "max_tool_calls_exceeded",
-            "provider_does_not_support_parallel_tool_calls"
-        ]
+        vec!["provider_does_not_support_parallel_tool_calls"]
     );
 }
 
@@ -2978,10 +2977,13 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         duplicate_result.errors,
         vec![
             "duplicate_tool_call_id",
-            "max_tool_calls_exceeded",
             "provider_does_not_support_parallel_tool_calls"
         ]
     );
+    // 超限（> 请求上限）只产生 warning，不阻止 agent 逐个执行。
+    assert!(duplicate_result
+        .warnings
+        .contains(&"max_tool_calls_exceeded".to_string()));
 }
 
 #[test]

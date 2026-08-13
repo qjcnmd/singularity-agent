@@ -199,8 +199,14 @@ impl Agent {
         let tools = self.tool_schemas(&capabilities);
         let tool_choice = ToolChoicePolicy {
             mode: ToolChoiceMode::Auto,
-            // Pi 顺序执行基线：一次最多一个工具调用，逐个执行并等待结果。
-            max_tool_calls: 1,
+            // 请求上限对齐 provider 静态声明的并行工具能力（无声明或声明不支持
+            // 并行时回退 1）；执行仍逐个顺序完成（Pi 顺序执行基线）。请求上限
+            // 低于 provider 声明会导致合法多调用响应被响应校验拒绝。
+            max_tool_calls: if capabilities.supports_parallel_tool_calls {
+                capabilities.max_parallel_tool_calls
+            } else {
+                1
+            },
             strict_tool_schema: capabilities.supports_strict_tool_schema
                 && tools
                     .iter()
@@ -653,6 +659,7 @@ mod tests {
             supports_json_mode: false,
             supports_system_message: false,
             supports_developer_message: true,
+            max_parallel_tool_calls: 1,
             max_context_tokens: Some(128_000),
             max_output_tokens: 4_096,
         }
