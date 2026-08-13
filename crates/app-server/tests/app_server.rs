@@ -166,25 +166,14 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             r#"{"jsonrpc":"2.0","method":"event/subscribe","id":32,"params":{"eventTypes":["thread/started","turn/started"]}}"#,
         )
         .unwrap();
-    assert_eq!(subscription[0]["method"], "event/gap");
-    assert_eq!(
-        subscription[0]["params"]["event"]["gap"]["reason"],
-        "cursor_not_replayed"
-    );
-    assert!(
-        subscription[0]["params"]["event"]["cursor"]
-            .as_u64()
-            .is_some_and(|cursor| cursor > 0)
-    );
+    // 单 worker 传输无 cursor/gap：订阅只确认结果，事件全量发。
+    assert_eq!(subscription.len(), 1);
     let subscription_result = result_message(&subscription);
     assert_eq!(
         subscription_result["eventTypes"],
         serde_json::json!(["thread/started", "turn/started"])
     );
-    assert_eq!(
-        subscription_result["cursor"],
-        subscription[0]["params"]["event"]["cursor"]
-    );
+    assert_eq!(subscription_result["cursor"], 0);
 
     let thread = server
         .handle_json(
@@ -214,10 +203,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .expect("thread started event");
     assert_eq!(thread_started["params"]["event"]["class"], "state");
     assert_eq!(thread_started["params"]["event"]["delivery"], "reliable");
-    assert_eq!(
-        thread_started["params"]["event"]["recoveryQuery"]["method"],
-        "thread/read"
-    );
+    assert!(thread_started["params"]["event"].get("recoveryQuery").is_none());
 
     let list = server
         .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":41,"params":{}}"#)
@@ -304,7 +290,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 }
 
 #[test]
-fn event_subscription_is_inactive_until_explicit_and_rejects_invalid_cursor() {
+fn event_subscribe_returns_result_without_gap_or_type_filtering() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
     let mut server = app_server(store);
@@ -317,6 +303,7 @@ fn event_subscription_is_inactive_until_explicit_and_rejects_invalid_cursor() {
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
 
+    // 事件全量发：订阅前的 thread/start 也携带 thread/started 事件。
     let before_subscribe = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#,
@@ -325,20 +312,17 @@ fn event_subscription_is_inactive_until_explicit_and_rejects_invalid_cursor() {
     assert!(
         before_subscribe
             .iter()
-            .all(|message| message["method"] != "thread/started")
-    );
-    assert!(
-        before_subscribe
-            .iter()
-            .any(|message| message["result"].is_object())
+            .any(|message| message["method"] == "thread/started")
     );
 
-    let invalid = server
+    // cursor 参数不再参与校验；订阅返回单一结果且不发射 event/gap。
+    let subscription = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"event/subscribe","id":3,"params":{"eventTypes":[],"cursor":0}}"#,
         )
-        .expect("invalid cursor response");
-    assert_eq!(invalid[0]["error"]["code"], -32602);
+        .expect("subscription result");
+    assert_eq!(subscription.len(), 1);
+    assert_eq!(subscription[0]["result"]["cursor"], 0);
 }
 
 #[test]
@@ -1050,29 +1034,33 @@ fn app_server_serializes_shared_workspace_across_processes_and_observes_interrup
         rejected["error"]["message"],
         "Workspace already has an active or pending turn"
     );
-    send_json(
+    // 跨进程 interrupt 不再投递（无持久化轮询监视器）；secondary 只做 workspace
+    // 串行化验证后退出，由 primary 在同一 stdio 上进程内直连取消。
+    shutdown_process(
+        &mut secondary,
         &mut secondary_input,
+        &mut secondary_output,
+        12,
+    );
+
+    send_json(
+        &mut primary_input,
         serde_json::json!({
             "jsonrpc": "2.0", "method": "turn/interrupt",
             "id": 12,
             "params": {"turnId": turn_id}
         }),
     );
-    let interrupt = secondary_output.recv_id(12, Duration::from_secs(2));
+    let interrupt = primary_output.recv_id(12, Duration::from_secs(2));
     assert_eq!(interrupt["result"]["status"], "cancel_requested");
-    shutdown_process(
-        &mut secondary,
-        &mut secondary_input,
-        &mut secondary_output,
-        13,
-    );
+    assert_eq!(interrupt["result"]["agent_loop_status"], "cancel_requested");
 
     let terminal = primary_output.recv_id(3, Duration::from_secs(2));
     assert_eq!(terminal["result"]["turn"]["status"], "interrupted");
     assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "cancelled");
     release.send(()).expect("release provider");
     provider_worker.join().expect("provider worker joins");
-    shutdown_process(&mut primary, &mut primary_input, &mut primary_output, 6);
+    shutdown_process(&mut primary, &mut primary_input, &mut primary_output, 13);
 }
 
 #[test]

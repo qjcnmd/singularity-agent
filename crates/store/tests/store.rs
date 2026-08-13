@@ -1,7 +1,7 @@
 //! 验证 SessionStore 的 schema、绑定、恢复、历史与事务不变量。
 
 use schemars::schema_for;
-use singularity_protocol::{ItemKind, ThreadStatus, TurnInputDelivery, TurnStatus};
+use singularity_protocol::{ItemKind, ThreadStatus, TurnStatus};
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, SessionStore, SessionStoreDescriptor, StoreError,
     TurnOutcomeAuthority,
@@ -217,7 +217,6 @@ fn v12_to_v13_migration_drops_legacy_tables_and_preserves_rows() {
         .execute_batch(
             r#"
 pragma foreign_keys = off;
-drop table turn_inputs;
 alter table threads add column sandbox_mode text not null default 'workspace-write'
     check(sandbox_mode in ('read-only', 'workspace-write'));
 alter table threads add column approval_policy text not null default 'on-request'
@@ -441,7 +440,7 @@ pragma foreign_keys = on;
             |row| row.get(0),
         )
         .expect("turn_inputs lookup");
-    assert!(turn_inputs, "turn_inputs must exist in migrated schema");
+    assert!(!turn_inputs, "turn_inputs must be dropped by migration");
     let has_pause_requested: bool = connection
         .query_row(
             "select exists(
@@ -458,8 +457,10 @@ pragma foreign_keys = on;
     );
 }
 
+
+
 #[test]
-fn turn_input_is_idempotent_ordered_at_boundaries() {
+fn pause_request_blocks_terminal_commit_until_cleared() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
     let (turn, _) = store
@@ -469,180 +470,10 @@ fn turn_input_is_idempotent_ordered_at_boundaries() {
             serde_json::json!([{"type": "text", "text": "original"}]),
         )
         .expect("started turn");
-    let first = serde_json::json!([{"type": "text", "text": "first"}]);
-    let second = serde_json::json!([{"type": "text", "text": "second"}]);
 
     store
-        .append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &first)
-        .expect("first input");
-    store
-        .append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &first)
-        .expect("same idempotent input");
-    assert!(matches!(
-        store.append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &second,),
-        Err(StoreError::InvalidState(_))
-    ));
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "input-2",
-            TurnInputDelivery::FollowUp,
-            &second,
-        )
-        .expect("second input");
-
-    let steer_boundary = store
-        .turn_boundary_state(&turn.turn_id, false)
-        .expect("steer boundary");
-    assert_eq!(
-        steer_boundary
-            .inputs
-            .iter()
-            .map(|input| input.input_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["input-1"]
-    );
-    let finalization_boundary = store
-        .turn_boundary_state(&turn.turn_id, true)
-        .expect("finalization boundary");
-    assert_eq!(
-        finalization_boundary
-            .inputs
-            .iter()
-            .map(|input| input.input_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["input-1", "input-2"]
-    );
-    let input_ids = finalization_boundary
-        .inputs
-        .iter()
-        .map(|input| input.input_id.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(input_ids, vec!["input-1".to_string(), "input-2".to_string()]);
-    assert!(
-        store
-            .turn_boundary_state(&turn.turn_id, true)
-            .expect("boundary still pending")
-            .inputs
-            .len()
-            == 2
-    );
-}
-
-#[test]
-fn accepted_turn_input_blocks_terminal_commit_and_stays_idempotent() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _) = store
-        .create_turn_with_input(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "original"}]),
-        )
-        .expect("started turn");
-    let input = serde_json::json!([{"type": "text", "text": "accepted"}]);
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "accepted-input",
-            TurnInputDelivery::Steer,
-            &input,
-        )
-        .expect("accepted input");
-    assert!(matches!(
-        store.commit_turn_outcome(
-            &turn.turn_id,
-            CommitTurnOutcomeParams {
-                status: TurnStatus::Completed,
-                agent_loop_status: "completed",
-                assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
-                assistant_delta: Some("done"),
-            },
-        ),
-        Err(StoreError::TurnBoundaryPending { .. })
-    ));
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    let counts_before_retry: (u64, u64) = connection
-        .query_row(
-            "select (select count(*) from items where turn_id = ?1),
-                    (select count(*) from turn_inputs where turn_id = ?1)",
-            [&turn.turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("counts before retry");
-
-    let retried = store
-        .append_turn_input(
-            &turn.turn_id,
-            "accepted-input",
-            TurnInputDelivery::Steer,
-            &input,
-        )
-        .expect("same accepted input remains idempotent");
-    assert_eq!(retried.turn_id, turn.turn_id);
-    assert_eq!(retried.status, TurnStatus::Running);
-    assert!(matches!(
-        store.append_turn_input(
-            &turn.turn_id,
-            "accepted-input",
-            TurnInputDelivery::Steer,
-            &serde_json::json!([{"type": "text", "text": "different"}]),
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "turn input idempotency key was reused with different content"
-    ));
-
-    let counts_after_retry: (u64, u64) = connection
-        .query_row(
-            "select (select count(*) from items where turn_id = ?1),
-                    (select count(*) from turn_inputs where turn_id = ?1)",
-            [&turn.turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("counts after retry");
-    assert_eq!(counts_after_retry, counts_before_retry);
-    let delivery_state: String = connection
-        .query_row(
-            "select delivery_state from turn_inputs where input_id = 'accepted-input'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("delivery state");
-    assert_eq!(delivery_state, "pending");
-    assert!(
-        store
-            .append_turn_input(
-                &turn.turn_id,
-                "new-input",
-                TurnInputDelivery::Steer,
-                &input,
-            )
-            .is_ok()
-    );
-}
-
-#[test]
-fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
-    let store = SessionStore::open(":memory:").expect("open store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _) = store
-        .create_turn_with_input(
-            &thread.thread_id,
-            "running",
-            serde_json::json!([{"type": "text", "text": "original"}]),
-        )
-        .expect("started turn");
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "follow-up",
-            TurnInputDelivery::FollowUp,
-            &serde_json::json!([{"type": "text", "text": "more work"}]),
-        )
-        .expect("follow-up");
+        .request_turn_pause(&turn.turn_id)
+        .expect("pause requested");
     assert!(matches!(
         store.commit_turn_outcome(
             &turn.turn_id,
@@ -660,28 +491,24 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
         TurnStatus::Running
     );
 
+    // 转 suspended 后 request_turn_pause 清除 pause_requested，终态提交恢复可用。
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspended turn");
     store
         .request_turn_pause(&turn.turn_id)
-        .expect("pause requested");
-    let boundary = store
-        .turn_boundary_state(&turn.turn_id, true)
-        .expect("pause boundary");
-    assert!(boundary.pause_requested);
-    assert_eq!(boundary.inputs.len(), 1);
-    assert_eq!(
-        store.get_turn(&turn.turn_id).expect("running turn").status,
-        TurnStatus::Running
-    );
-    assert!(
-        store
-            .append_turn_input(
-                &turn.turn_id,
-                "paused-input",
-                TurnInputDelivery::Steer,
-                &serde_json::json!([{"type": "text", "text": "after pause"}]),
-            )
-            .is_ok()
-    );
+        .expect("pause cleared");
+    store
+        .commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "cancelled",
+                assistant_item_id: None,
+                assistant_delta: None,
+            },
+        )
+        .expect("terminal commit after pause cleared");
 }
 #[test]
 fn every_supported_legacy_schema_migrates() {
@@ -1338,14 +1165,14 @@ fn paused_and_suspended_interrupt_terminalizes_without_restart() {
         assert_eq!(persisted.agent_loop_status, "cancelled");
     }
 }
-// 验证 delete_thread 级联删除绑定行（turn_inputs/items/turns/threads）。
+// 验证 delete_thread 级联删除绑定行（items/turns/threads）。
 #[test]
-fn thread_delete_removes_bound_turn_inputs_items_and_turns() {
+fn thread_delete_removes_bound_items_and_turns() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
-    let (turn, item) = store
+    let (turn, _) = store
         .create_turn_with_input(
             &thread.thread_id,
             "running",
@@ -1364,31 +1191,12 @@ fn thread_delete_removes_bound_turn_inputs_items_and_turns() {
         )
         .expect("terminal turn");
 
-    // 删除前放入一条真实绑定的 turn_input 行。
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "insert into turn_inputs(input_id, turn_id, item_id, delivery, delivery_state, consumed_at)
-             values(?1, ?2, ?3, 'steer', 'consumed', current_timestamp)",
-            rusqlite::params!["input_delete", turn.turn_id, item.item_id],
-        )
-        .expect("turn input");
-    let actual: i64 = connection
-        .query_row(
-            "select count(*) from turn_inputs where turn_id = ?1",
-            [&turn.turn_id],
-            |row| row.get(0),
-        )
-        .expect("turn input fixture count");
-    assert_eq!(actual, 1, "turn_inputs fixture");
-    drop(connection);
-
     store
         .delete_thread(&thread.thread_id)
         .expect("delete thread");
 
     let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
-    for table in ["turn_inputs", "items", "turns", "threads"] {
+    for table in ["items", "turns", "threads"] {
         let count: i64 = connection
             .query_row(&format!("select count(*) from {table}"), [], |row| {
                 row.get(0)

@@ -4,19 +4,17 @@ use super::*;
 use std::cell::RefCell;
 
 impl AppServer {
-    /// 使用平台沙箱和已捕获的模型提供方配置快照创建未初始化的服务。
+    /// 使用已捕获的模型提供方配置快照创建未初始化的服务。
     pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
         Self {
             store,
             initialized: false,
             initialized_acknowledged: false,
-            event_filter: Arc::new(Mutex::new(EventSubscriptionState::default())),
             shutdown_requested: false,
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            output_order: OutputOrderCoordinator::new(),
             test_provider_override: None,
         }
     }
@@ -54,51 +52,27 @@ impl AppServer {
         }
     }
 
-    /// 返回当前 app-server 生命周期共享的 stdout reservation 协调器。
-    pub fn output_order_coordinator(&self) -> OutputOrderCoordinator {
-        self.output_order.clone()
-    }
-
-    /// 为请求工作线程打开独立的存储连接，同时共享停止和事件订阅状态。
+    /// 为单一 turn 工作线程打开独立的存储连接，同时共享停止与 steer 状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
             store: self.store.trusted_reopen()?,
             initialized: true,
             initialized_acknowledged: true,
-            event_filter: Arc::clone(&self.event_filter),
             shutdown_requested: false,
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             steer_handles: Arc::clone(&self.steer_handles),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            output_order: self.output_order.clone(),
             test_provider_override: self.test_provider_override.clone(),
         })
     }
 
-    /// 注册一个活动 turn，并为其附加持久化取消监视器。
+    /// 注册一个活动 turn；guard drop 时从注册表注销。
     pub(super) fn activate_turn(
         &self,
         turn_id: &str,
     ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
-        let (cancellation, guard) = self.prepare_turn_activation(turn_id)?;
-        guard.start_monitor();
-        Ok((cancellation, guard))
-    }
-
-    // Establish every fallible runtime resource before a new running Turn is
-    // committed. The monitor remains paused until the caller starts it after commit.
-    pub(super) fn prepare_turn_activation(
-        &self,
-        turn_id: &str,
-    ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
         let cancellation = CancellationToken::new();
-        // Open the fallible monitor connection before publishing the registry entry.
-        let monitor_store = if self.store.descriptor().path == ":memory:" {
-            None
-        } else {
-            Some(self.store.trusted_reopen()?)
-        };
         let mut active_turns = self
             .active_turns
             .lock()
@@ -108,7 +82,6 @@ impl AppServer {
                 "turn {turn_id} is already active"
             )));
         }
-        let monitor = cancellation_monitor(monitor_store, turn_id, cancellation.clone())?;
         if self.execution_stopped.load(Ordering::SeqCst) {
             cancellation.cancel();
         }
@@ -118,9 +91,6 @@ impl AppServer {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
             steer_handles: Arc::clone(&self.steer_handles),
-            cancellation: cancellation.clone(),
-            monitor,
-            stabilized_monitor_outcome: None,
         };
         Ok((cancellation, guard))
     }
@@ -142,51 +112,50 @@ impl AppServer {
         Ok(messages)
     }
 
-    /// Persist interactive user input and, when the turn is running in-process, inject it
-    /// into the steer queue so the next agent loop round consumes it.
+    /// 将真实用户输入直连到运行中 turn 的 steer 内存队列（裁决 9：不持久化）。
+    ///
+    /// turn 必须在本 app-server 进程内运行（已注册 steer handle）；跨进程或非运行
+    /// turn 无法投递，显式报错而非静默丢弃。
     pub(super) fn turn_input(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnInputParams = parse_params(&message)?;
         let input = serde_json::to_value(&params.input)?;
-        let turn = match self.store.append_turn_input(
-            &params.turn_id,
-            &params.input_id,
-            params.delivery,
-            &input,
-        ) {
+        let turn = match self.store.get_turn(&params.turn_id) {
             Ok(turn) => turn,
             Err(StoreError::NotFound(_)) => {
                 return not_found_response(message.required_id(), TURN_NOT_FOUND);
             }
-            Err(StoreError::InvalidState(error)) => {
-                return invalid_state_response(message.required_id(), error);
-            }
             Err(error) => return Err(error.into()),
         };
-        if let Ok(handle) = self
+        if is_terminal_turn_status(&turn.status) {
+            return invalid_state_response(
+                message.required_id(),
+                "terminal turn cannot accept interactive input",
+            );
+        }
+        let handle = self
             .steer_handles
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))
-            .and_then(|handles| {
-                handles
-                    .get(&params.turn_id)
-                    .cloned()
-                    .ok_or_else(|| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))
-            })
-            && let Ok(text) = input_items_to_text(&input)
-        {
-            // 运行中注入：进入共享 steer 队列，下一轮开头被 drain（对齐 Pi steer 语义）。
-            handle
-                .lock()
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                .push_back(text);
-        }
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(&params.turn_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppServerError::Workspace(
+                    "turn is not running in this app-server; interactive input is delivered \
+                     only while a turn executes"
+                        .to_string(),
+                )
+            })?;
+        let text = input_items_to_text(&input)?;
+        // 运行中注入：进入共享 steer 队列，下一轮开头被 drain（对齐 Pi steer 语义）。
+        handle
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .push_back(text);
         json_response(message.required_id(), TurnResult { turn })
     }
 
-    /// Request a durable pause without conflating it with cancellation.
-    ///
-    /// Phase 3a 起无 checkpoint 挂钩：pause 语义为「请求取消」——store 侧置
-    /// cancel_requested，CancellationMonitor 轮询到后取消进程内 Agent。
+    /// 请求取消而不混淆终态化语义：运行中 turn 置 cancel_requested 并当场取消
+    /// 进程内 CancellationToken（单 worker 直连，无持久化轮询）。
     pub(super) fn turn_pause(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = parse_params(&message)?;
         let turn = match self.store.get_turn(&params.turn_id) {
@@ -226,21 +195,7 @@ impl AppServer {
         message: JsonRpcMessage,
         mut emit: impl FnMut(AppServerOutput),
     ) -> AppServerResult<()> {
-        let coordinator = self.output_order.clone();
-        let mut sequencing_error = None;
-        let result = self.handle_turn_resume_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => emit(output),
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
-        if let Some(error) = sequencing_error {
-            return Err(error);
-        }
-        result
+        self.handle_turn_resume_streaming_values(message, &mut emit)
     }
 
     fn handle_turn_resume_streaming_values(
@@ -285,39 +240,29 @@ impl AppServer {
             );
             return Ok(());
         };
-        let (cancellation, mut active_turn) = self.activate_turn(&current.turn_id)?;
+        let (cancellation, _active_turn) = self.activate_turn(&current.turn_id)?;
         let mut assistant_events =
             AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-        active_turn.start_monitor();
         // 恢复输入：turn 行的持久化用户输入（无 checkpoint 语义；会话文件承载历史）。
         let user_input = match self.store.get_turn_user_input(&current.turn_id) {
             Ok(input) => input,
             Err(error) => {
-                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
                 return self.finish_turn_failure(
                     &mut emit,
                     &current,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        turn_failure_from_error(&AppServerError::Store(error), TurnFailureStage::AgentLoop),
-                    ),
+                    turn_failure_from_error(&AppServerError::Store(error), TurnFailureStage::AgentLoop),
                 );
             }
         };
         let input_text = match input_items_to_text(&user_input) {
             Ok(text) => text,
             Err(error) => {
-                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
                 return self.finish_turn_failure(
                     &mut emit,
                     &current,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(monitor_outcome, turn_failure_from_error(&error, TurnFailureStage::AgentLoop)),
+                    turn_failure_from_error(&error, TurnFailureStage::AgentLoop),
                 );
             }
         };
@@ -331,40 +276,19 @@ impl AppServer {
         ) {
             Ok(status) => status,
             Err(error) => {
-                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
                 return self.finish_turn_failure(
                     &mut emit,
                     &current,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        turn_failure_from_error(&error, TurnFailureStage::AgentLoop),
-                    ),
+                    turn_failure_from_error(&error, TurnFailureStage::AgentLoop),
                 );
             }
         };
-        let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
-        if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
-            return self.finish_turn_failure(
-                &mut emit,
-                &current,
-                Some(&assistant_events),
-                &cancellation,
-                monitor_outcome,
-                TurnFailure {
-                    stage: TurnFailureStage::CancellationMonitor,
-                    cause: TurnFailureCause::CancellationMonitor,
-                },
-            );
-        }
         let committed = match self.commit_turn_run_status(
             current.clone(),
             &status,
             Some(&assistant_events.item_id),
             &cancellation,
-            monitor_outcome,
         ) {
             Ok(committed) => committed,
             Err(error) => {
@@ -372,15 +296,10 @@ impl AppServer {
                     &mut emit,
                     &current,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        TurnFailure {
-                            stage: TurnFailureStage::TerminalOutcome,
-                            cause: turn_failure_cause(&error),
-                        },
-                    ),
+                    TurnFailure {
+                        stage: TurnFailureStage::TerminalOutcome,
+                        cause: turn_failure_cause(&error),
+                    },
                 );
             }
         };
@@ -403,7 +322,6 @@ impl AppServer {
     /// 用新 headless core 执行一个 turn：会话文件 open/create → `Agent::new` → `run`。
     ///
     /// - 跨轮历史由 `<thread_id>.jsonl` 会话文件承载（不再读 store checkpoint/history seed）。
-    /// - run 前把 store 中尚未消费的 turn/input 按 delivery 注入 steer/follow-up 队列。
     /// - 事件映射：`on_message_update` → `item/agentMessage/delta`（`project_assistant_delta`）；
     ///   工具执行持久化只落 session 文件。
     /// - 注册该 turn 的 steer handle（`turn/input` 运行中注入通道），guard drop 时注销。
@@ -419,14 +337,6 @@ impl AppServer {
         let session = open_or_create_thread_session(thread)?;
         let (provider, config) = self.provider_and_config_for_thread(thread)?;
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
-        let boundary = self.store.turn_boundary_state(&turn.turn_id, true)?;
-        for pending in boundary.inputs {
-            let text = input_items_to_text(&pending.input)?;
-            match pending.delivery {
-                TurnInputDelivery::Steer => agent.steer(&text),
-                TurnInputDelivery::FollowUp => agent.follow_up(&text),
-            }
-        }
         let steer_handle = agent.steer_handle();
         self.steer_handles
             .lock()
@@ -463,53 +373,13 @@ impl AppServer {
         Ok(outcome_to_run_status(outcome))
     }
 
-    /// 执行 `turn/start`，并在每个阶段完成时返回已预留顺序的输出。
+    /// 执行 `turn/start`，并在每个持久化阶段完成时实时发出生命周期事件。
     pub fn handle_turn_start_streaming_with_output(
         &mut self,
         message: JsonRpcMessage,
         mut emit: impl FnMut(AppServerOutput),
     ) -> AppServerResult<()> {
-        let coordinator = self.output_order.clone();
-        let mut sequencing_error = None;
-        let result = self.handle_turn_start_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => emit(output),
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
-        if let Some(error) = sequencing_error {
-            return Err(error);
-        }
-        result
-    }
-
-    /// 执行 `turn/start` 并返回未携带 transport 顺序的兼容消息。
-    pub fn handle_turn_start_streaming(
-        &mut self,
-        message: JsonRpcMessage,
-        mut emit: impl FnMut(Value),
-    ) -> AppServerResult<()> {
-        let coordinator = self.output_order.clone();
-        let mut sequencing_error = None;
-        let result = self.handle_turn_start_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => {
-                    coordinator.complete(output.reservation.order);
-                    emit(output.message);
-                }
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
-        if let Some(error) = sequencing_error {
-            return Err(error);
-        }
-        result
+        self.handle_turn_start_streaming_values(message, &mut emit)
     }
 
     /// 执行 `turn/start`，并在每个持久化阶段完成时发出生命周期事件。
@@ -565,8 +435,7 @@ impl AppServer {
             }
         };
         let allocated_turn_id = SessionStore::allocate_turn_id();
-        let (cancellation, mut active_turn) =
-            self.prepare_turn_activation(allocated_turn_id.as_str())?;
+        let (cancellation, _active_turn) = self.activate_turn(allocated_turn_id.as_str())?;
         let started = match self.store.create_allocated_turn_with_input_and_history(
             allocated_turn_id,
             CreateStartedTurnParams {
@@ -601,25 +470,7 @@ impl AppServer {
         let turn = started.turn;
         let mut assistant_events =
             AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-        active_turn.start_monitor();
-        match self.event_notification(AppEvent::turn_started(&turn)) {
-            Ok(Some(event)) => emit(event),
-            Ok(None) => {}
-            Err(error) => {
-                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
-                return self.finish_turn_failure(
-                    &mut emit,
-                    &turn,
-                    Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        turn_failure_from_error(&error, TurnFailureStage::EventNotification),
-                    ),
-                );
-            }
-        }
+        emit(self.event_notification(AppEvent::turn_started(&turn))?);
         let status = match self.run_agent_core(
             &thread,
             &turn,
@@ -630,40 +481,19 @@ impl AppServer {
         ) {
             Ok(status) => status,
             Err(error) => {
-                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
                 return self.finish_turn_failure(
                     &mut emit,
                     &turn,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        turn_failure_from_error(&error, TurnFailureStage::AgentLoop),
-                    ),
+                    turn_failure_from_error(&error, TurnFailureStage::AgentLoop),
                 );
             }
         };
-        let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
-        if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
-            return self.finish_turn_failure(
-                &mut emit,
-                &turn,
-                Some(&assistant_events),
-                &cancellation,
-                monitor_outcome,
-                TurnFailure {
-                    stage: TurnFailureStage::CancellationMonitor,
-                    cause: TurnFailureCause::CancellationMonitor,
-                },
-            );
-        }
         let committed = match self.commit_turn_run_status(
             turn.clone(),
             &status,
             Some(&assistant_events.item_id),
             &cancellation,
-            monitor_outcome,
         ) {
             Ok(committed) => committed,
             Err(error) => {
@@ -671,15 +501,10 @@ impl AppServer {
                     &mut emit,
                     &turn,
                     Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        TurnFailure {
-                            stage: TurnFailureStage::TerminalOutcome,
-                            cause: turn_failure_cause(&error),
-                        },
-                    ),
+                    TurnFailure {
+                        stage: TurnFailureStage::TerminalOutcome,
+                        cause: turn_failure_cause(&error),
+                    },
                 );
             }
         };
@@ -701,12 +526,10 @@ impl AppServer {
         emit: &mut impl FnMut(Value),
         turn: &Turn,
         assistant_events: Option<&AssistantItemEventState>,
-        cancellation: &CancellationToken,
-        monitor_outcome: Option<CancellationMonitorOutcome>,
         failure: impl Into<TurnFailure>,
     ) -> AppServerResult<()> {
         let failure = failure.into();
-        match self.terminalize_turn_failure(turn, cancellation, monitor_outcome, failure) {
+        match self.terminalize_turn_failure(turn, failure) {
             Ok(TurnTerminalizationResult::Committed(committed)) => {
                 match self.committed_turn_events(&committed, assistant_events) {
                     Ok(events) => emit_messages(emit, events),
@@ -745,8 +568,6 @@ impl AppServer {
     pub(super) fn terminalize_turn_failure(
         &self,
         turn: &Turn,
-        cancellation: &CancellationToken,
-        monitor_outcome: Option<CancellationMonitorOutcome>,
         failure: impl Into<TurnFailure>,
     ) -> Result<TurnTerminalizationResult, TurnTerminalizationFailure> {
         let failure = failure.into();
@@ -758,10 +579,9 @@ impl AppServer {
             return Ok(TurnTerminalizationResult::Preserved);
         }
 
-        let user_cancelled = monitor_outcome
-            != Some(CancellationMonitorOutcome::InfrastructureFailure)
-            && (current.agent_loop_status == AgentStatus::CancelRequested.as_str()
-                || cancellation.is_cancelled());
+        // 用户取消优先：store 的 cancel_requested 由 turn/interrupt、turn/pause 在
+        // 进程内直连 CancellationToken 时一并写入。
+        let user_cancelled = current.agent_loop_status == AgentStatus::CancelRequested.as_str();
         let status = if user_cancelled {
             let mut status = RunStatus::failed("turn interrupted by user request");
             mark_run_cancelled(&mut status);
@@ -769,13 +589,7 @@ impl AppServer {
         } else {
             failed_turn_status(failure)
         };
-        let authority =
-            if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
-                TurnOutcomeAuthority::InfrastructureFailure
-            } else {
-                TurnOutcomeAuthority::AgentLoop
-            };
-        match self.commit_effective_turn_status_with_authority(&current, &status, None, authority) {
+        match self.commit_effective_turn_status(&current, &status, None) {
             Ok(committed) => Ok(TurnTerminalizationResult::Committed(Box::new(committed))),
             Err(_) => {
                 let latest = self
@@ -784,9 +598,7 @@ impl AppServer {
                     .map_err(|_| TurnTerminalizationFailure::Store)?;
                 if is_safe_turn_state(&latest) {
                     Ok(TurnTerminalizationResult::Preserved)
-                } else if latest.agent_loop_status == AgentStatus::CancelRequested.as_str()
-                    && monitor_outcome != Some(CancellationMonitorOutcome::InfrastructureFailure)
-                {
+                } else if latest.agent_loop_status == AgentStatus::CancelRequested.as_str() {
                     let mut interrupted = RunStatus::failed("turn interrupted by user request");
                     mark_run_cancelled(&mut interrupted);
                     match self.commit_effective_turn_status(&latest, &interrupted, None) {
@@ -844,18 +656,10 @@ impl AppServer {
         run_status: &RunStatus,
         assistant_item_id: Option<&AllocatedAssistantItemId>,
         cancellation: &CancellationToken,
-        monitor_outcome: Option<CancellationMonitorOutcome>,
     ) -> AppServerResult<CommittedTurnOutcome> {
         let current = self.store.get_turn(&turn.turn_id)?;
-        if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
-            return Err(AppServerError::TurnExecution {
-                stage: TurnFailureStage::CancellationMonitor,
-                cause: TurnFailureCause::CancellationMonitor,
-            });
-        }
         let mut effective_status = run_status.clone();
-        if monitor_outcome == Some(CancellationMonitorOutcome::UserCancellation)
-            || cancellation.is_cancelled()
+        if cancellation.is_cancelled()
             || current.agent_loop_status == AgentStatus::CancelRequested.as_str()
             || (current.status == TurnStatus::Interrupted
                 && current.agent_loop_status == AgentStatus::Cancelled.as_str())
@@ -950,10 +754,8 @@ impl AppServer {
             turn.status.as_storage_text()
         };
         let mut messages = Vec::new();
-        if is_terminal_turn_status(&turn.status)
-            && let Some(event) = self.event_notification(AppEvent::turn_completed(&turn))?
-        {
-            messages.push(event);
+        if is_terminal_turn_status(&turn.status) {
+            messages.push(self.event_notification(AppEvent::turn_completed(&turn))?);
         }
         messages.push(
             JsonRpcMessage::response(

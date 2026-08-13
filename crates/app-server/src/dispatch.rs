@@ -11,20 +11,15 @@ impl AppServer {
 
     /// 处理一个已解析的 JSON-RPC 请求，并返回零个或多个协议响应或事件。
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let outputs = self.handle_with_output(message)?;
-        for output in &outputs {
-            self.output_order.complete(output.reservation.order);
-        }
-        Ok(outputs.into_iter().map(|output| output.message).collect())
+        self.handle_with_output(message)
     }
 
-    /// 处理请求并在生成消息时原子预留 stdout order 与事件 cursor。
+    /// 处理请求并返回生成的协议消息；单 worker 传输无需排序预留。
     pub fn handle_with_output(
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<AppServerOutput>> {
-        let messages = self.handle_unsequenced(message)?;
-        self.sequence_outputs(messages)
+        self.handle_unsequenced(message)
     }
 
     pub(super) fn handle_unsequenced(
@@ -263,9 +258,7 @@ impl AppServer {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
         let mut messages = Vec::new();
-        if let Some(event) = self.event_notification(AppEvent::thread_started(&thread))? {
-            messages.push(event);
-        }
+        messages.push(self.event_notification(AppEvent::thread_started(&thread))?);
         messages.push(
             JsonRpcMessage::response(
                 message.required_id(),

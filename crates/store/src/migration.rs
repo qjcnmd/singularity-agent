@@ -279,13 +279,6 @@ create index turns_history_lookup on turns(thread_id, status, turn_sequence);
 create index items_history_lookup on items(turn_id, status, kind, item_sequence);
 "#;
 
-// Recovery tables are introduced with the current schema and must not be part
-// of the released v11 fingerprint used to validate legacy databases.
-const V13_RECOVERY_INDEX_SQL: &str = r#"
-create unique index turn_inputs_item_unique on turn_inputs(item_id);
-create index turn_inputs_pending on turn_inputs(turn_id, delivery_state, delivery, item_id);
-"#;
-
 const V12_TRACE_INDEX_SQL: &str = r#"
 create unique index trace_span_phase_unique
     on trace_events(run_id, span_id, span_phase)
@@ -356,7 +349,7 @@ end;
 "#;
 
 fn v12_index_sql() -> String {
-    format!("{CURRENT_INDEX_SQL}{V13_RECOVERY_INDEX_SQL}")
+    CURRENT_INDEX_SQL.to_string()
 }
 
 // Reconstruct the released v12 shape so an existing v12 store can be upgraded
@@ -398,8 +391,9 @@ check(parent_span_id is null or parent_span_id <> span_id)\n\
     sql.replace(&old_trace, &new_trace)
 }
 
-// Build the current schema shape from CURRENT_SCHEMA_SQL: v13 turn states,
-// pause_requested column, and the durable turn_inputs delivery table.
+// Build the current schema shape from CURRENT_SCHEMA_SQL: v13 turn states and
+// the pause_requested column. The durable turn_inputs delivery table was
+// removed with memory-only steer delivery; legacy databases drop the table.
 fn canonical_v12_schema_sql(suffix: &str) -> String {
     let mut sql = canonical_v11_schema_sql(suffix);
     sql = sql.replace("schema_version = 11", "schema_version = 13");
@@ -411,22 +405,6 @@ fn canonical_v12_schema_sql(suffix: &str) -> String {
         "agent_loop_status text not null,\nforeign key(thread_id)",
         "agent_loop_status text not null,\npause_requested integer not null default 0 check(pause_requested in (0, 1)),\nforeign key(thread_id)",
     );
-    let table_suffix = suffix;
-    sql.push_str(&format!(
-        "\ncreate table turn_inputs{table_suffix}(\n\
-input_id text primary key,\n\
-turn_id text not null,\n\
-item_id text not null,\n\
-delivery text not null check(delivery in ('steer', 'follow_up')),\n\
-delivery_state text not null check(delivery_state in ('pending', 'consumed')),\n\
-created_at text not null default current_timestamp,\n\
-consumed_at text,\n\
-check((delivery_state = 'pending' and consumed_at is null)\n\
-   or (delivery_state = 'consumed' and consumed_at is not null)),\n\
-foreign key(turn_id) references turns(turn_id),\n\
-foreign key(item_id) references items(item_id)\n\
-);\n"
-    ));
     sql
 }
 
@@ -1358,7 +1336,6 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     alter table threads_v12 rename to threads;
     alter table turns_v12 rename to turns;
     alter table items_v12 rename to items;
-    alter table turn_inputs_v12 rename to turn_inputs;
     "#,
     )?;
     connection.execute_batch(&v12_index_sql())?;

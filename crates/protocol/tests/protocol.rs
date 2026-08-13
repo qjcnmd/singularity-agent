@@ -3,11 +3,11 @@
 use singularity_core::{ClientInfo, ErrorCode};
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ConversationMessage,
-    ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason, EventMetadata,
-    EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
-    ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, METHOD_REGISTRY,
-    Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams,
-    ThreadReadResult, ThreadStartParams, ThreadStatus, TurnIdParams, TurnStartParams, TurnStatus,
+    ConversationRole, EventClass, EventDelivery, EventMetadata, EventSubscribeParams,
+    InitializeParams, InitializeResult, ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId,
+    JsonRpcMessage, JsonRpcPayload, METHOD_REGISTRY, Method, MethodKind,
+    ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams, ThreadReadResult,
+    ThreadStartParams, ThreadStatus, TurnIdParams, TurnStartParams, TurnStatus,
     parse_json_rpc_payload,
 };
 
@@ -236,14 +236,10 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
         AppEvent::item_agent_message_delta("item_1", "hi").method(),
         "item/agentMessage/delta"
     );
-    assert_eq!(
-        AppEvent::item_command_execution_output_delta("item_1", "stdout", "hi").method(),
-        "item/commandExecution/outputDelta"
-    );
 }
 
 #[test]
-fn event_metadata_is_typed_and_recovery_queries_are_bounded() {
+fn event_metadata_is_class_and_delivery_only() {
     let event = AppEvent::turn_completed(&singularity_protocol::Turn {
         turn_id: "turn_1".to_string(),
         thread_id: "thread_1".to_string(),
@@ -252,46 +248,38 @@ fn event_metadata_is_typed_and_recovery_queries_are_bounded() {
     });
     let value = event
         .to_notification_with_metadata(EventMetadata {
-            sequence: 4,
-            cursor: 4,
             class: EventClass::State,
             delivery: EventDelivery::Reliable,
-            recovery_query: Some(EventRecoveryQuery::TurnStatus {
-                turn_id: "turn_1".to_string(),
-            }),
-            gap: None,
         })
         .to_wire_value();
-    assert_eq!(value["params"]["event"]["sequence"], 4);
+    assert_eq!(value["params"]["event"]["class"], "state");
     assert_eq!(value["params"]["event"]["delivery"], "reliable");
-    assert_eq!(
-        value["params"]["event"]["recoveryQuery"]["method"],
-        "turn/status"
-    );
+    assert!(value["params"]["event"].get("sequence").is_none());
+    assert!(value["params"]["event"].get("cursor").is_none());
+    assert!(value["params"]["event"].get("recoveryQuery").is_none());
+    assert!(value["params"]["event"].get("gap").is_none());
 
-    let gap = EventMetadata {
-        sequence: 5,
-        cursor: 5,
-        class: EventClass::Gap,
-        delivery: EventDelivery::Gap,
-        recovery_query: None,
-        gap: Some(EventGap {
-            reason: EventGapReason::ProgressDropped,
-            from_cursor: 5,
-            to_cursor: 5,
+    // 已删除的 cursor/gap/recovery 字段不再属于事件信封。
+    for metadata in [
+        serde_json::json!({
+            "sequence": 4,
+            "cursor": 4,
+            "class": "state",
+            "delivery": "reliable",
+            "recoveryQuery": {"method": "turn/status", "params": {"turnId": "turn_1"}}
         }),
-    };
-    assert!(
-        serde_json::from_value::<EventMetadata>(serde_json::json!({
-            "sequence": 5,
-            "cursor": 5,
+        serde_json::json!({
             "class": "gap",
             "delivery": "gap",
-            "gap": serde_json::to_value(gap).unwrap(),
-            "recoveryQuery": {"method": "store/resync", "params": {}}
-        }))
-        .is_err()
-    );
+            "gap": {"reason": "progress_dropped", "fromCursor": 5, "toCursor": 5}
+        }),
+        serde_json::json!({"class": "state"}),
+    ] {
+        assert!(
+            serde_json::from_value::<EventMetadata>(metadata).is_err(),
+            "removed event envelope was accepted"
+        );
+    }
 }
 
 #[test]

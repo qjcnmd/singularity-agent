@@ -155,23 +155,6 @@ impl SessionStore {
 
         // 按 child-first 顺序删除所有子表。每次删除都核对
         // 事务快照中的行数，避免关系投影不完整时静默留下孤儿数据。
-        let expected_turn_inputs: i64 = transaction.query_row(
-            "select count(*) from turn_inputs where turn_id in
-                 (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_turn_inputs = transaction.execute(
-            "delete from turn_inputs where turn_id in
-                 (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_turn_inputs != expected_turn_inputs {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed turn input rows".to_string(),
-            ));
-        }
-
         let expected_items: i64 = transaction.query_row(
             "select count(*) from items where turn_id in
                  (select turn_id from turns where thread_id = ?1)",
@@ -472,10 +455,7 @@ impl SessionStore {
         validate_turn_status_update(&current, &status, Some(agent_loop_status), authority)?;
         if is_terminal_turn_status(&status) {
             let boundary_pending: bool = transaction.query_row(
-                "select pause_requested = 1 or exists(
-                    select 1 from turn_inputs
-                    where turn_id = ?1 and delivery_state = 'pending'
-                 ) from turns where turn_id = ?1",
+                "select pause_requested = 1 from turns where turn_id = ?1",
                 params![turn_id],
                 |row| row.get(0),
             )?;
@@ -573,6 +553,41 @@ impl SessionStore {
             params![turn_id],
         )?;
         turn.agent_loop_status = "cancel_requested".to_string();
+        transaction.commit()?;
+        Ok(turn)
+    }
+
+    /// Request a pause at the next safe boundary. Suspended turns can pause immediately.
+    ///
+    /// The durable `pause_requested` marker survives without an active owner; a later
+    /// resume clears it when the turn transitions to paused.
+    pub fn request_turn_pause(&self, turn_id: &str) -> StoreResult<Turn> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut turn = self.turn_in_transaction(&transaction, turn_id)?;
+        if is_terminal_turn_status(&turn.status) {
+            return Err(StoreError::InvalidState(
+                "terminal turn cannot be paused".to_string(),
+            ));
+        }
+        match turn.status {
+            TurnStatus::Paused => {}
+            TurnStatus::Suspended => {
+                transaction.execute(
+                    "update turns set status = 'paused', agent_loop_status = 'paused',
+                                      pause_requested = 0 where turn_id = ?1",
+                    params![turn_id],
+                )?;
+                turn.status = TurnStatus::Paused;
+                turn.agent_loop_status = "paused".to_string();
+            }
+            _ => {
+                transaction.execute(
+                    "update turns set pause_requested = 1 where turn_id = ?1",
+                    params![turn_id],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(turn)
     }

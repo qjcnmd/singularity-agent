@@ -24,7 +24,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::contains_sensitive_text;
 use singularity_protocol::{
-    Item, ItemKind, ItemStatus, Thread, ThreadStatus, Turn, TurnInputDelivery, TurnStatus,
+    Item, ItemKind, ItemStatus, Thread, ThreadStatus, Turn, TurnStatus,
 };
 /// 供上层重建 conversation history 的 protocol 类型。
 pub use singularity_protocol::{ConversationMessage, ConversationRole};
@@ -65,7 +65,6 @@ mod file_identity;
 mod migration;
 mod support;
 mod thread_turn;
-mod turn_input;
 
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
@@ -73,7 +72,6 @@ pub use thread_turn::{
     AllocatedAssistantItemId, AllocatedTurnId, CommitTurnOutcomeParams, CommittedTurnOutcome,
     CreateStartedTurnParams, StartedTurn, ThreadHistoryPage, TurnOutcomeAuthority,
 };
-pub use turn_input::{PendingTurnInput, TurnBoundaryState};
 
 pub(crate) use error::{DbEnum, decode_db_enum, unknown_db_enum};
 pub(crate) use file_identity::StoreIdentityGuard;

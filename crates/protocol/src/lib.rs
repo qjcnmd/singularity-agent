@@ -958,62 +958,22 @@ pub enum EventDelivery {
     Gap,
 }
 
-/// 可由现有 JSON-RPC 查询重建的事件恢复入口。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "method", content = "params")]
-pub enum EventRecoveryQuery {
-    #[serde(rename = "thread/read")]
-    ThreadRead {
-        #[serde(rename = "threadId")]
-        thread_id: String,
-    },
-    #[serde(rename = "turn/status")]
-    TurnStatus {
-        #[serde(rename = "turnId")]
-        turn_id: String,
-    },
-}
-
-impl EventRecoveryQuery {
-    /// 返回恢复入口的公共 method 名，供客户端严格校验。
-    pub const fn method(&self) -> &'static str {
-        match self {
-            Self::ThreadRead { .. } => "thread/read",
-            Self::TurnStatus { .. } => "turn/status",
-        }
-    }
-}
-
-/// 事件丢失或未重放的可观察范围。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EventGap {
-    pub reason: EventGapReason,
-    pub from_cursor: u64,
-    pub to_cursor: u64,
-}
-
 /// 事件 gap 的稳定原因分类。
+///
+/// 单 worker 传输不再产生 gap（无背压丢弃），此枚举保留为协议合同面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventGapReason {
     CursorNotReplayed,
     ProgressDropped,
-    ClientDisconnected,
 }
 
 /// JSON-RPC notification 中附带的严格事件元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventMetadata {
-    pub sequence: u64,
-    pub cursor: u64,
     pub class: EventClass,
     pub delivery: EventDelivery,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recovery_query: Option<EventRecoveryQuery>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap: Option<EventGap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1081,22 +1041,6 @@ impl AppEvent {
             params: serde_json::json!({
                 "item": {"item_id": item_id.into()},
                 "delta": delta.into(),
-            }),
-        }
-    }
-
-    /// 构造 command 输出增量事件。
-    pub fn item_command_execution_output_delta(
-        item_id: impl Into<String>,
-        stream: impl Into<String>,
-        output: impl Into<String>,
-    ) -> Self {
-        Self {
-            method: "item/commandExecution/outputDelta".to_string(),
-            params: serde_json::json!({
-                "item": {"item_id": item_id.into()},
-                "stream": stream.into(),
-                "output": output.into(),
             }),
         }
     }

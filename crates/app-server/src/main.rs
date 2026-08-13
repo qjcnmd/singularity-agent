@@ -9,7 +9,9 @@ mod transport;
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 fn main() {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    // 单 stdin owner + 单 turn worker：current_thread runtime 足够，stdio 适配器
+    // 与 writer 在同一线程上协作，blocking 工作走 Tokio 阻塞池。
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {

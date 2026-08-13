@@ -7,7 +7,7 @@ use singularity_model::{
     ProviderProtocolContract,
 };
 
-use singularity_protocol::{ConversationRole, TurnInputDelivery};
+use singularity_protocol::ConversationRole;
 
 use super::*;
 
@@ -57,38 +57,6 @@ fn initialized_request_is_rejected_as_an_invalid_envelope() {
 }
 
 #[test]
-fn event_subscription_binds_gap_cursor_to_one_output_reservation() {
-    let store = SessionStore::open(":memory:").expect("store");
-    let mut server = app_server(store);
-    server
-            .handle_json(
-                r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
-            )
-            .expect("initialize");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .expect("initialized");
-
-    let message = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":2,"params":{"eventTypes":["thread/started"]}}"#,
-        )
-        .expect("subscription request");
-    let outputs = server
-        .handle_with_output(message)
-        .expect("subscription outputs");
-
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(
-        outputs[1].reservation.order,
-        outputs[0].reservation.order + 1
-    );
-    assert_eq!(outputs[0].reservation.event_cursor, Some(1));
-    assert_eq!(outputs[1].reservation.event_cursor, None);
-    assert_eq!(outputs[0].message["params"]["event"]["cursor"], 1);
-    assert_eq!(outputs[1].message["result"]["cursor"], 1);
-}
-
-#[test]
 fn duplicate_activation_preserves_the_original_and_global_stop_cancels_future_turns() {
     let server = app_server(SessionStore::open(":memory:").expect("store"));
     let (original, _guard) = server.activate_turn("turn_1").expect("activate turn");
@@ -106,228 +74,7 @@ fn duplicate_activation_preserves_the_original_and_global_stop_cancels_future_tu
 }
 
 #[test]
-fn cancellation_monitor_classifies_non_contention_store_failure_as_infrastructure() {
-    let token = CancellationToken::new();
-    let monitor = cancellation_monitor(
-        Some(SessionStore::open(":memory:").expect("store")),
-        "missing-turn",
-        token.clone(),
-    )
-    .expect("monitor setup")
-    .expect("monitor");
-    monitor.control.started.store(true, Ordering::SeqCst);
-    monitor.control.wake.send(()).expect("start monitor");
-    monitor
-        .done
-        .recv_timeout(Duration::from_secs(1))
-        .expect("monitor completion");
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(monitor.control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-    assert!(token.is_cancelled());
-}
-
-#[test]
-fn cancellation_monitor_classifies_persisted_user_cancellation_separately() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let monitor_store = store.trusted_reopen().expect("monitor store");
-    let token = CancellationToken::new();
-    let monitor = cancellation_monitor(Some(monitor_store), &turn.turn_id, token.clone())
-        .expect("monitor setup")
-        .expect("monitor");
-    store
-        .update_turn_state(
-            &turn.turn_id,
-            TurnStatus::Running,
-            AgentStatus::CancelRequested.as_str(),
-        )
-        .expect("request cancellation");
-    monitor.control.started.store(true, Ordering::SeqCst);
-    monitor.control.wake.send(()).expect("start monitor");
-    monitor
-        .done
-        .recv_timeout(Duration::from_secs(1))
-        .expect("monitor completion");
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(monitor.control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::UserCancellation)
-    );
-    assert!(token.is_cancelled());
-}
-
-#[test]
-fn cancellation_monitor_classifies_external_cancellation_as_user_cancellation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let monitor_store = store.trusted_reopen().expect("monitor store");
-    let token = CancellationToken::new();
-    let monitor = cancellation_monitor(Some(monitor_store), &turn.turn_id, token.clone())
-        .expect("monitor setup")
-        .expect("monitor");
-    token.cancel();
-    monitor.control.started.store(true, Ordering::SeqCst);
-    monitor.control.wake.send(()).expect("start monitor");
-    monitor
-        .done
-        .recv_timeout(Duration::from_secs(1))
-        .expect("monitor completion");
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(monitor.control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::UserCancellation)
-    );
-}
-
-fn in_flight_monitor_for_teardown_test(
-    cancellation: &CancellationToken,
-    shutdown_wait: Duration,
-) -> (
-    CancellationMonitor,
-    Arc<CancellationMonitorControl>,
-    Sender<()>,
-    Receiver<bool>,
-    Receiver<()>,
-) {
-    let (wake, _wake_receiver) = mpsc::channel();
-    let (done_sender, done) = mpsc::channel();
-    let (release_sender, release_receiver) = mpsc::channel();
-    let (published_sender, published_receiver) = mpsc::channel();
-    let (finished_sender, finished_receiver) = mpsc::channel();
-    let control = Arc::new(CancellationMonitorControl {
-        started: AtomicBool::new(true),
-        stop: AtomicBool::new(false),
-        outcome: AtomicU8::new(0),
-        wake,
-    });
-    let thread_control = Arc::clone(&control);
-    let thread_cancellation = cancellation.clone();
-    let thread = std::thread::spawn(move || {
-        release_receiver.recv().expect("release in-flight monitor");
-        let published = thread_control.record_outcome(CancellationMonitorOutcome::UserCancellation);
-        if published {
-            thread_cancellation.cancel();
-        }
-        published_sender.send(published).expect("published result");
-        let _ = done_sender.send(());
-        finished_sender.send(()).expect("monitor finished");
-    });
-    (
-        CancellationMonitor {
-            control: Arc::clone(&control),
-            done,
-            thread: Some(thread),
-            shutdown_wait,
-        },
-        control,
-        release_sender,
-        published_receiver,
-        finished_receiver,
-    )
-}
-
-#[test]
-fn in_flight_monitor_timeout_freezes_before_late_cancellation() {
-    let cancellation = CancellationToken::new();
-    let (monitor, control, release, published, finished) =
-        in_flight_monitor_for_teardown_test(&cancellation, Duration::ZERO);
-
-    assert_eq!(
-        monitor.stabilize(&cancellation),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-    assert!(cancellation.is_cancelled());
-    release.send(()).expect("release monitor");
-    assert!(!published.recv().expect("late publication result"));
-    finished.recv().expect("monitor finished");
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-}
-
-#[test]
-fn drop_timeout_freezes_before_detached_monitor_can_cancel() {
-    let cancellation = CancellationToken::new();
-    let (monitor, control, release, published, finished) =
-        in_flight_monitor_for_teardown_test(&cancellation, Duration::ZERO);
-    {
-        let _guard = ActiveTurnGuard {
-            turn_id: "drop-timeout-turn".to_string(),
-            active_turns: Arc::new(Mutex::new(HashMap::new())),
-            steer_handles: Arc::new(Mutex::new(HashMap::new())),
-            cancellation: cancellation.clone(),
-            monitor: Some(monitor),
-            stabilized_monitor_outcome: None,
-        };
-    }
-
-    assert!(cancellation.is_cancelled());
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-    release.send(()).expect("release detached monitor");
-    assert!(!published.recv().expect("late publication result"));
-    finished.recv().expect("monitor finished");
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-}
-
-#[test]
-fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states() {
-    let (wake, _wake_receiver) = mpsc::channel();
-    let (done_sender, done) = mpsc::channel();
-    let (recorded_sender, recorded) = mpsc::channel();
-    let control = Arc::new(CancellationMonitorControl {
-        started: AtomicBool::new(true),
-        stop: AtomicBool::new(false),
-        outcome: AtomicU8::new(0),
-        wake,
-    });
-    let thread_control = Arc::clone(&control);
-    std::thread::spawn(move || {
-        thread_control.record_outcome(CancellationMonitorOutcome::InfrastructureFailure);
-        recorded_sender.send(()).expect("recorded outcome");
-        done_sender.send(()).expect("monitor done");
-    });
-    recorded.recv().expect("monitor outcome recorded");
-    let token = CancellationToken::new();
-
-    let mut guard = ActiveTurnGuard {
-        turn_id: "synthetic-turn".to_string(),
-        active_turns: Arc::new(Mutex::new(HashMap::new())),
-        steer_handles: Arc::new(Mutex::new(HashMap::new())),
-        cancellation: token.clone(),
-        monitor: Some(CancellationMonitor {
-            control: Arc::clone(&control),
-            done,
-            thread: None,
-            shutdown_wait: Duration::from_millis(TURN_MONITOR_SHUTDOWN_WAIT_MS),
-        }),
-        stabilized_monitor_outcome: None,
-    };
-    token.cancel();
-    assert_eq!(
-        guard.stabilize_monitor(&token),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-    control.record_outcome(CancellationMonitorOutcome::UserCancellation);
-    assert_eq!(
-        CancellationMonitorOutcome::from_code(control.outcome.load(Ordering::SeqCst)),
-        Some(CancellationMonitorOutcome::InfrastructureFailure)
-    );
-
+fn cancelled_run_commits_as_interrupted_and_safe_states_are_preserved() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
     let thread = store.create_thread(None, None).expect("thread");
@@ -335,62 +82,20 @@ fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states(
         .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
         .expect("running turn");
     let server = app_server(store);
-    let failure_status = RunStatus::failed("late monitor failure");
-    assert!(matches!(
-        server.commit_turn_run_status(
-            turn.clone(),
-            &failure_status,
-            None,
-            &token,
-            Some(CancellationMonitorOutcome::InfrastructureFailure),
-        ),
-        Err(AppServerError::TurnExecution {
-            stage: TurnFailureStage::CancellationMonitor,
-            cause: TurnFailureCause::CancellationMonitor,
-        })
-    ));
-    let mut emitted = Vec::new();
-    let mut emit = |message| emitted.push(message);
-    let failure = TurnFailure {
-        stage: TurnFailureStage::CancellationMonitor,
-        cause: TurnFailureCause::CancellationMonitor,
-    };
-    assert!(matches!(
-        server.finish_turn_failure(
-            &mut emit,
-            &turn,
-            None,
-            &token,
-            Some(CancellationMonitorOutcome::InfrastructureFailure),
-            failure,
-        ),
-        Err(AppServerError::TurnExecution {
-            stage: TurnFailureStage::CancellationMonitor,
-            cause: TurnFailureCause::CancellationMonitor,
-        })
-    ));
-    let failed = server.store.get_turn(&turn.turn_id).expect("failed turn");
-    assert_eq!(failed.status, TurnStatus::Failed);
-    assert_eq!(failed.agent_loop_status, AgentStatus::Failed.as_str());
 
-    let cancelled_turn = server
-        .store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("cancelled turn");
     let cancelled_token = CancellationToken::new();
     cancelled_token.cancel();
     server
         .commit_turn_run_status(
-            cancelled_turn.clone(),
+            turn.clone(),
             &RunStatus::failed("late user result"),
             None,
             &cancelled_token,
-            Some(CancellationMonitorOutcome::UserCancellation),
         )
         .expect("user cancellation commit");
     let interrupted = server
         .store
-        .get_turn(&cancelled_turn.turn_id)
+        .get_turn(&turn.turn_id)
         .expect("interrupted turn");
     assert_eq!(interrupted.status, TurnStatus::Interrupted);
     assert_eq!(
@@ -398,132 +103,30 @@ fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states(
         AgentStatus::Cancelled.as_str()
     );
 
-    let blocked_thread = server
-        .store
-        .create_thread(None, None)
-        .expect("blocked thread");
-    let blocked_turn = server
-        .store
-        .create_turn(&blocked_thread.thread_id, AgentStatus::Running.as_str())
-        .expect("blocked turn");
-    server
-        .store
-        .update_turn_state(
-            &blocked_turn.turn_id,
-            TurnStatus::Blocked,
-            AgentStatus::Blocked.as_str(),
-        )
-        .expect("blocked state");
-    let blocked_result = server
-        .terminalize_turn_failure(
-            &blocked_turn,
-            &token,
-            Some(CancellationMonitorOutcome::InfrastructureFailure),
-            failure,
-        )
-        .expect("preserve blocked turn");
+    // 已终态 turn 不被失败终态化覆盖。
+    let mut emitted = Vec::new();
+    let mut emit = |message| emitted.push(message);
+    let result = server.finish_turn_failure(
+        &mut emit,
+        &interrupted,
+        None,
+        TurnFailureStage::AgentLoop,
+    );
     assert!(matches!(
-        blocked_result,
-        TurnTerminalizationResult::Preserved
+        result,
+        Err(AppServerError::TurnExecution {
+            stage: TurnFailureStage::AgentLoop,
+            ..
+        })
     ));
     assert_eq!(
         server
             .store
-            .get_turn(&blocked_turn.turn_id)
-            .expect("blocked")
+            .get_turn(&turn.turn_id)
+            .expect("safe turn")
             .status,
-        TurnStatus::Blocked
+        TurnStatus::Interrupted
     );
-
-    let completed_thread = server
-        .store
-        .create_thread(None, None)
-        .expect("completed thread");
-    let completed_turn = server
-        .store
-        .create_turn(&completed_thread.thread_id, AgentStatus::Running.as_str())
-        .expect("completed turn");
-    server
-        .store
-        .update_turn_state(
-            &completed_turn.turn_id,
-            TurnStatus::Completed,
-            AgentStatus::Completed.as_str(),
-        )
-        .expect("completed state");
-    let completed_result = server
-        .terminalize_turn_failure(
-            &completed_turn,
-            &token,
-            Some(CancellationMonitorOutcome::InfrastructureFailure),
-            failure,
-        )
-        .expect("preserve completed turn");
-    assert!(matches!(
-        completed_result,
-        TurnTerminalizationResult::Preserved
-    ));
-    assert_eq!(
-        server
-            .store
-            .get_turn(&completed_turn.turn_id)
-            .expect("completed")
-            .status,
-        TurnStatus::Completed
-    );
-}
-
-#[test]
-fn turn_started_event_failure_terminalizes_the_running_turn() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let mut server = app_server(store);
-    let filter = Arc::clone(&server.event_filter);
-    let poisoned = std::thread::spawn(move || {
-        let _guard = filter.lock().expect("event filter");
-        panic!("poison event filter");
-    })
-    .join();
-    assert!(poisoned.is_err());
-
-    let message = JsonRpcMessage::request(
-        Method::TurnStart,
-        1,
-        json!({
-            "threadId": &thread.thread_id,
-            "input": [{"type": "text", "text": "event failure"}]
-        }),
-    )
-    .expect("turn start request");
-    let error = server
-        .handle_turn_start_streaming(message, |_| {})
-        .expect_err("event failure must be surfaced");
-    assert!(matches!(
-        error,
-        AppServerError::TurnTerminalization {
-            stage: TurnFailureStage::EventNotification,
-            cause: TurnFailureCause::Workspace,
-            failure: TurnTerminalizationFailure::EventNotification,
-        }
-    ));
-    let persisted = server
-        .store
-        .list_threads()
-        .expect("threads")
-        .first()
-        .expect("thread")
-        .thread_id
-        .clone();
-    let turns = server
-        .store
-        .read_thread_history(&persisted, None, 8)
-        .expect("history");
-    assert!(turns.messages.is_empty());
 }
 
 #[test]
@@ -550,7 +153,6 @@ fn late_turn_failure_does_not_overwrite_a_blocked_turn() {
                 &RunStatus::failed("stale run failure"),
                 None,
                 &CancellationToken::new(),
-                None,
             )
             .is_err()
     );
@@ -591,21 +193,14 @@ fn running_turn_failure_stages_terminalize_as_failed() {
                         &invalid_commit,
                         None,
                         &CancellationToken::new(),
-                        None,
                     )
                     .is_err()
             );
         }
         let mut emitted = Vec::new();
         let mut emit = |message| emitted.push(message);
-        let result = server.finish_turn_failure(
-            &mut emit,
-            &turn,
-            None,
-            &CancellationToken::new(),
-            None,
-            stage,
-        );
+        let result =
+            server.finish_turn_failure(&mut emit, &turn, None, stage);
         assert!(matches!(
             result,
             Err(AppServerError::TurnExecution { stage: actual, .. }) if actual == stage
@@ -644,8 +239,6 @@ fn terminalization_preserves_interrupted_and_blocked_turns() {
             &mut emit,
             &turn,
             None,
-            &CancellationToken::new(),
-            None,
             TurnFailureStage::AgentLoop,
         );
 
@@ -681,8 +274,6 @@ fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
             &mut emit,
             &missing_turn,
             None,
-            &CancellationToken::new(),
-            None,
             TurnFailure {
                 stage: TurnFailureStage::TerminalOutcome,
                 cause: TurnFailureCause::Store,
@@ -698,70 +289,6 @@ fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
         }
     ));
     assert!(!error.to_string().contains("missing-turn-with-secret-path"));
-}
-
-#[test]
-fn monitor_open_failure_does_not_publish_active_turn() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let server = app_server(SessionStore::open(&db_path).expect("store"));
-    std::fs::hard_link(&db_path, dir.path().join("sessions-alias.sqlite3"))
-        .expect("hard link store");
-
-    assert!(matches!(
-        server.activate_turn("turn_monitor_failure"),
-        Err(AppServerError::Store(StoreError::InvalidState(message)))
-            if message.contains("hard links")
-    ));
-    assert!(
-        server
-            .active_turns
-            .lock()
-            .expect("active turn registry")
-            .is_empty()
-    );
-}
-
-#[test]
-fn turn_start_monitor_failure_does_not_persist_a_running_turn() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("workspace");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("store");
-    let thread = store
-        .create_thread(None, Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let mut server = app_server(store);
-    std::fs::hard_link(&db_path, dir.path().join("sessions-alias.sqlite3"))
-        .expect("hard link store");
-    let message: JsonRpcMessage = serde_json::from_value(json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "turn/start",
-        "params": {
-            "threadId": &thread.thread_id,
-            "input": [{"type": "text", "text": "must not persist"}]
-        }
-    }))
-    .expect("turn/start message");
-
-    assert!(matches!(
-        server.handle_turn_start_streaming(message, |_| {}),
-        Err(AppServerError::Store(StoreError::InvalidState(message)))
-            if message.contains("hard links")
-    ));
-    assert!(
-        server
-            .active_turns
-            .lock()
-            .expect("active registry")
-            .is_empty()
-    );
-    server
-        .store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("no running turn was persisted before monitor setup");
 }
 
 #[derive(Clone)]
@@ -1027,17 +554,6 @@ fn partial_realtime_item_fails_without_persisting_or_completing() {
     std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
     let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
     let server = app_server(store);
-    server
-        .event_filter
-        .lock()
-        .expect("event filter")
-        .event_types = Some(vec![
-        "item/started".to_string(),
-        "item/agentMessage/delta".to_string(),
-        "item/failed".to_string(),
-        "item/completed".to_string(),
-        "turn/completed".to_string(),
-    ]);
 
     for (label, cancelled) in [
         ("raw provider stream failure sentinel", false),
@@ -1072,7 +588,6 @@ fn partial_realtime_item_fails_without_persisting_or_completing() {
                 &status,
                 Some(&assistant_events.item_id),
                 &CancellationToken::new(),
-                None,
             )
             .expect("commit safe terminal status");
         events.extend(
@@ -1147,17 +662,6 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
         )
         .expect("turn");
     let server = app_server(store);
-    server
-        .event_filter
-        .lock()
-        .expect("event filter")
-        .event_types = Some(vec![
-        "item/started".to_string(),
-        "item/agentMessage/delta".to_string(),
-        "item/failed".to_string(),
-        "item/completed".to_string(),
-        "turn/completed".to_string(),
-    ]);
     let status = outcome_to_run_status(AgentOutcome {
         final_text: "complete".to_string(),
         turns: 1,
@@ -1177,7 +681,6 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
                 &status,
                 Some(&assistant_events.item_id),
                 &CancellationToken::new(),
-                None,
             )
             .is_err()
     );
@@ -1185,8 +688,6 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
         &mut |event| events.push(event),
         &turn,
         Some(&assistant_events),
-        &CancellationToken::new(),
-        None,
         TurnFailure {
             stage: TurnFailureStage::TerminalOutcome,
             cause: TurnFailureCause::Store,
@@ -1222,52 +723,54 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
 }
 
 #[test]
-fn realtime_item_tracks_started_and_delta_filtering_independently() {
+fn realtime_item_events_are_always_emitted_and_deduplicated_at_commit() {
     let temp = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
     let server = app_server(store);
 
-    for (subscriptions, expected, started_generated, delta_generated) in [
-        (
-            vec!["item/started".to_string()],
-            vec!["item/started"],
-            true,
-            false,
-        ),
-        (
-            vec!["item/agentMessage/delta".to_string()],
-            vec!["item/agentMessage/delta", "item/agentMessage/delta"],
-            false,
-            true,
-        ),
-        (Vec::new(), Vec::new(), false, false),
-    ] {
+    let mut assistant_events =
+        AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+    let mut events = server
+        .project_assistant_delta(&mut assistant_events, "first")
+        .expect("first delta");
+    events.extend(
         server
-            .event_filter
-            .lock()
-            .expect("event filter")
-            .event_types = Some(subscriptions);
-        let mut assistant_events =
-            AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-        let mut events = server
-            .project_assistant_delta(&mut assistant_events, "first")
-            .expect("first delta");
-        events.extend(
-            server
-                .project_assistant_delta(&mut assistant_events, "second")
-                .expect("second delta"),
-        );
+            .project_assistant_delta(&mut assistant_events, "second")
+            .expect("second delta"),
+    );
 
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event["method"].as_str().expect("event method"))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(assistant_events.started_generated, started_generated);
-        assert_eq!(assistant_events.delta_generated, delta_generated);
-    }
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["method"].as_str().expect("event method"))
+            .collect::<Vec<_>>(),
+        vec![
+            "item/started",
+            "item/agentMessage/delta",
+            "item/agentMessage/delta",
+        ]
+    );
+    assert!(assistant_events.started_generated);
+    assert!(assistant_events.delta_generated);
+
+    // 终态提交不再重复 realtime 已发射的 item/started 与 delta，只补 item/completed。
+    let committed_item = singularity_protocol::Item {
+        item_id: assistant_events.item_id.as_str().to_string(),
+        turn_id: "turn_1".to_string(),
+        kind: singularity_protocol::ItemKind::AgentMessage,
+        payload: serde_json::json!({"delta": "first"}),
+        status: singularity_protocol::ItemStatus::Completed,
+    };
+    let terminal = server
+        .agent_terminal_item_events(Some(&committed_item), Some(&assistant_events))
+        .expect("terminal item events");
+    assert_eq!(
+        terminal
+            .iter()
+            .map(|event| event["method"].as_str().expect("event method"))
+            .collect::<Vec<_>>(),
+        vec!["item/completed"]
+    );
 }
 
 #[test]
@@ -1322,17 +825,6 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let mut server = app_server(store)
         .with_test_provider(Arc::new(tool_using_static_provider(Arc::clone(&seen_requests))));
-    server
-        .event_filter
-        .lock()
-        .expect("event filter")
-        .event_types = Some(vec![
-        "turn/started".to_string(),
-        "item/started".to_string(),
-        "item/agentMessage/delta".to_string(),
-        "item/completed".to_string(),
-        "turn/completed".to_string(),
-    ]);
 
     let responses = server
         .turn_start(
@@ -1412,68 +904,6 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
 }
 
 #[test]
-fn turn_input_queued_before_run_is_injected_into_steer() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
-    let thread = store
-        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-        .expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    store
-        .append_turn_input(
-            &turn.turn_id,
-            "input-pre-run",
-            TurnInputDelivery::Steer,
-            &json!([{"type": "text", "text": "steer before run"}]),
-        )
-        .expect("queued input");
-    let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let provider = StaticProvider {
-        responses: vec![ModelTurnResponse::completed(
-            "model_request_turn_1_0",
-            "response_1",
-            "done",
-        )],
-        seen_requests: Arc::clone(&seen_requests),
-    };
-    let server = app_server(store).with_test_provider(Arc::new(provider));
-    let mut events = AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-    let mut emitted = Vec::new();
-    let status = server
-        .run_agent_core(
-            &thread,
-            &turn,
-            "main input",
-            &CancellationToken::new(),
-            &mut events,
-            &mut |message| emitted.push(message),
-        )
-        .expect("run agent core");
-    assert_eq!(status.status, AgentStatus::Completed);
-    // run 前已排队输入按 steer 注入：第一轮请求 user(main) 后紧跟 steer 消息。
-    let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 1);
-    let texts: Vec<&str> = requests[0]
-        .messages
-        .iter()
-        .map(|message| message.content.as_str())
-        .collect();
-    assert_eq!(texts, &["main input", "steer before run"]);
-    // 会话文件同步写入。
-    assert!(
-        workspace
-            .join(".singularity")
-            .join("agent-sessions")
-            .join(format!("{}.jsonl", thread.thread_id))
-            .exists()
-    );
-}
-
-#[test]
 fn turn_input_during_run_pushes_the_registered_steer_handle() {
     let store = SessionStore::open(":memory:").expect("store");
     let mut server = app_server(store);
@@ -1512,12 +942,6 @@ fn turn_input_during_run_pushes_the_registered_steer_handle() {
     let queued = handle.lock().expect("handle");
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0], "live steer");
-    // store 侧同时记录了 pending input（idempotent key 复用返回同一 turn）。
-    let boundary = server
-        .store
-        .turn_boundary_state(&turn.turn_id, true)
-        .expect("boundary");
-    assert_eq!(boundary.inputs.len(), 1);
 }
 
 #[test]

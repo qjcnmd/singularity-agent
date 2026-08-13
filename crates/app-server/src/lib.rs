@@ -8,14 +8,11 @@ mod dispatch;
 mod events;
 mod lifecycle;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{Builder as ThreadBuilder, JoinHandle};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
@@ -29,15 +26,13 @@ use singularity_core::{
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent,
-    EventClass, EventDelivery, EventGap, EventGapReason,
-    EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method, MethodKind,
-    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
-    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TransportCapability, Turn, TurnIdParams, TurnInputDelivery, TurnInputParams,
-    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
+    EventMetadata, EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult,
+    Item, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus,
+    ServerCapabilitiesResult, ServerShutdownResult, Thread, ThreadDeleteResult, ThreadForkParams,
+    ThreadForkResult, ThreadIdParams, ThreadListResult, ThreadReadParams, ThreadReadResult,
+    ThreadResult, ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
+    TurnInputParams, TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
@@ -54,13 +49,9 @@ const TURN_NOT_FOUND: &str = "Turn not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
-const TURN_CANCELLATION_POLL_MS: u64 = 25;
-const TURN_MONITOR_SHUTDOWN_WAIT_MS: u64 = 100;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
-const CANCELLATION_MONITOR_FROZEN: u8 = 0x80;
-const CANCELLATION_MONITOR_OUTCOME_MASK: u8 = !CANCELLATION_MONITOR_FROZEN;
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
@@ -97,7 +88,6 @@ pub type AppServerResult<T> = Result<T, AppServerError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnFailureStage {
     AgentLoop,
-    CancellationMonitor,
     TerminalOutcome,
     EventNotification,
 }
@@ -106,7 +96,6 @@ impl TurnFailureStage {
     fn as_str(self) -> &'static str {
         match self {
             Self::AgentLoop => "agent_loop",
-            Self::CancellationMonitor => "cancellation_monitor",
             Self::TerminalOutcome => "terminal_outcome",
             Self::EventNotification => "event_notification",
         }
@@ -126,7 +115,6 @@ pub enum TurnFailureCause {
     Workspace,
     ProjectInstructions,
     Serialization,
-    CancellationMonitor,
     StoredInputUnavailable,
     Internal,
 }
@@ -138,7 +126,6 @@ impl TurnFailureCause {
             Self::Workspace => "workspace",
             Self::ProjectInstructions => "project_instructions",
             Self::Serialization => "serialization",
-            Self::CancellationMonitor => "cancellation_monitor",
             Self::StoredInputUnavailable => "stored_input_unavailable",
             Self::Internal => "internal",
         }
@@ -245,36 +232,7 @@ impl From<TurnFailureStage> for TurnFailure {
     fn from(stage: TurnFailureStage) -> Self {
         Self {
             stage,
-            cause: match stage {
-                TurnFailureStage::CancellationMonitor => TurnFailureCause::CancellationMonitor,
-                _ => TurnFailureCause::Internal,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancellationMonitorOutcome {
-    UserCancellation,
-    InfrastructureFailure,
-}
-
-impl CancellationMonitorOutcome {
-    const USER_CANCELLATION_CODE: u8 = 1;
-    const INFRASTRUCTURE_FAILURE_CODE: u8 = 2;
-
-    const fn code(self) -> u8 {
-        match self {
-            Self::UserCancellation => Self::USER_CANCELLATION_CODE,
-            Self::InfrastructureFailure => Self::INFRASTRUCTURE_FAILURE_CODE,
-        }
-    }
-
-    const fn from_code(code: u8) -> Option<Self> {
-        match code & CANCELLATION_MONITOR_OUTCOME_MASK {
-            Self::USER_CANCELLATION_CODE => Some(Self::UserCancellation),
-            Self::INFRASTRUCTURE_FAILURE_CODE => Some(Self::InfrastructureFailure),
-            _ => None,
+            cause: TurnFailureCause::Internal,
         }
     }
 }
@@ -307,160 +265,20 @@ enum TurnTerminalizationResult {
     Preserved,
 }
 
-/// stdout transport 使用的全局输出顺序与事件 cursor reservation。
-///
-/// 一个 reservation 同时占用输出 order 和可选事件 cursor；request worker 在交给
-/// stdout queue 前先取得两者，避免事件 cursor 已分配而 worker 尚未排队时被并发 worker 越过。
-#[derive(Clone, Debug, Default)]
-pub struct OutputOrderCoordinator {    state: Arc<Mutex<OutputOrderState>>,
-}
-
-#[derive(Debug, Default)]
-struct OutputOrderState {
-    next_order: u64,
-    next_event_cursor: u64,
-    next_write_order: u64,
-    in_flight: BTreeSet<u64>,
-    ready: BTreeSet<u64>,
-    skipped: BTreeSet<u64>,
-}
-
-/// 一个已经原子预留的 stdout 输出位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutputReservation {
-    /// 全局 stdout 输出顺序。
-    pub order: u64,
-    /// 事件输出对应的事件 cursor；控制输出为 `None`。
-    pub event_cursor: Option<u64>,
-}
-
-impl OutputOrderCoordinator {
-    /// 创建新的进程级输出 reservation 协调器。
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 原子预留一个输出 order，并按需分配连续事件 cursor。
-    pub fn reserve(&self, event: bool) -> Result<OutputReservation, String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "output ordering state poisoned".to_string())?;
-        let order = state.next_order;
-        let next_order = state
-            .next_order
-            .checked_add(1)
-            .ok_or_else(|| "output order exhausted".to_string())?;
-        let event_cursor = if event {
-            let cursor = state
-                .next_event_cursor
-                .checked_add(1)
-                .ok_or_else(|| "event cursor exhausted".to_string())?;
-            state.next_event_cursor = cursor;
-            Some(cursor)
-        } else {
-            None
-        };
-        state.next_order = next_order;
-        state.in_flight.insert(order);
-        Ok(OutputReservation {
-            order,
-            event_cursor,
-        })
-    }
-
-    /// 返回当前已观察到的最大事件 cursor。
-    pub fn current_event_cursor(&self) -> Result<u64, String> {
-        self.state
-            .lock()
-            .map(|state| state.next_event_cursor)
-            .map_err(|_| "output ordering state poisoned".to_string())
-    }
-
-    /// 丢弃未进入 transport queue 的 reservation，避免 direct API 阻塞后续输出。
-    pub fn complete(&self, order: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.in_flight.remove(&order);
-            state.skipped.insert(order);
-            advance_write_order(&mut state);
-        }
-    }
-
-    /// 丢弃一段未进入 transport queue 的 reservation。
-    pub fn complete_range(&self, from_order: u64, to_order: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            for order in from_order..=to_order {
-                state.in_flight.remove(&order);
-                state.skipped.insert(order);
-            }
-            advance_write_order(&mut state);
-        }
-    }
-
-    /// 标记一条输出已经进入 transport queue，但仍须由 writer 按 order 写出。
-    pub fn enqueue(&self, order: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.in_flight.remove(&order);
-            state.ready.insert(order);
-        }
-    }
-
-    /// 标记一个 gap 输出代表一段连续 reservation。
-    pub fn enqueue_range(&self, from_order: u64, to_order: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            for order in from_order..=to_order {
-                state.in_flight.remove(&order);
-            }
-            state.ready.insert(from_order);
-        }
-    }
-
-    /// 判断指定输出是否正好轮到 writer 写出。
-    pub fn is_next_ready(&self, order: u64) -> bool {
-        self.state
-            .lock()
-            .map(|state| state.next_write_order == order && state.ready.contains(&order))
-            .unwrap_or(false)
-    }
-
-    /// 写入并 flush 成功后推进 writer 游标；`to_order` 用于 gap 的跳跃。
-    pub fn acknowledge_written(&self, from_order: u64, to_order: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.ready.remove(&from_order);
-            state.next_write_order = to_order.saturating_add(1);
-            advance_write_order(&mut state);
-        }
-    }
-}
-
-fn advance_write_order(state: &mut OutputOrderState) {
-    while state.skipped.remove(&state.next_write_order) {
-        state.next_write_order = state.next_write_order.saturating_add(1);
-    }
-}
-
-/// AppServer 交给 stdout transport 的已排序消息。
-#[derive(Debug, Clone)]
-pub struct AppServerOutput {
-    /// 与其他 worker 共享的全局 stdout order。
-    pub reservation: OutputReservation,
-    /// 脱敏 JSON-RPC wire value。
-    pub message: Value,
-}
+/// AppServer 交给 stdout transport 的消息；单 worker 传输无需全局排序。
+pub type AppServerOutput = Value;
 
 /// 协调线程、turn、追踪和工作线程的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
     initialized: bool,
     initialized_acknowledged: bool,
-    event_filter: Arc<Mutex<EventSubscriptionState>>,
     shutdown_requested: bool,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// 每个活动 turn 的 steer 注入句柄（turn/input 运行中注入通道）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     execution_stopped: Arc<AtomicBool>,
-    output_order: OutputOrderCoordinator,
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
@@ -471,12 +289,6 @@ pub struct AppServer {
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
-}
-
-/// 每个 stdio app-server 生命周期共享的事件订阅和传输 cursor。
-#[derive(Debug, Default)]
-struct EventSubscriptionState {
-    event_types: Option<Vec<String>>,
 }
 
 impl AppServerCancellationHandle {
@@ -499,178 +311,10 @@ struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    cancellation: CancellationToken,
-    monitor: Option<CancellationMonitor>,
-    stabilized_monitor_outcome: Option<Option<CancellationMonitorOutcome>>,
-}
-
-struct CancellationMonitorControl {
-    started: AtomicBool,
-    stop: AtomicBool,
-    outcome: AtomicU8,
-    wake: Sender<()>,
-}
-
-impl CancellationMonitorControl {
-    /// 发布 monitor 结果；基础设施故障可在冻结前优先于用户取消。
-    fn record_outcome(&self, outcome: CancellationMonitorOutcome) -> bool {
-        let mut state = self.outcome.load(Ordering::SeqCst);
-        loop {
-            if state & CANCELLATION_MONITOR_FROZEN != 0 {
-                return false;
-            }
-            let current = CancellationMonitorOutcome::from_code(state);
-            if current == Some(CancellationMonitorOutcome::InfrastructureFailure)
-                || (current == Some(CancellationMonitorOutcome::UserCancellation)
-                    && outcome == CancellationMonitorOutcome::UserCancellation)
-            {
-                return false;
-            }
-            match self.outcome.compare_exchange(
-                state,
-                outcome.code(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(next) => state = next,
-            }
-        }
-    }
-
-    /// 在没有强制结果时冻结当前快照，阻止 detached monitor 再发布结果。
-    fn freeze(&self) -> Option<CancellationMonitorOutcome> {
-        let state = self
-            .outcome
-            .fetch_or(CANCELLATION_MONITOR_FROZEN, Ordering::SeqCst);
-        CancellationMonitorOutcome::from_code(state)
-    }
-
-    /// 以基础设施故障原子冻结 monitor；超时本身是 owner 发布的故障结果。
-    fn freeze_as_infrastructure_failure(&self) -> (Option<CancellationMonitorOutcome>, bool) {
-        let mut state = self.outcome.load(Ordering::SeqCst);
-        loop {
-            if state & CANCELLATION_MONITOR_FROZEN != 0 {
-                return (CancellationMonitorOutcome::from_code(state), false);
-            }
-            let next = CANCELLATION_MONITOR_FROZEN
-                | CancellationMonitorOutcome::InfrastructureFailure.code();
-            match self
-                .outcome
-                .compare_exchange(state, next, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => {
-                    return (
-                        Some(CancellationMonitorOutcome::InfrastructureFailure),
-                        true,
-                    );
-                }
-                Err(next_state) => state = next_state,
-            }
-        }
-    }
-}
-
-struct CancellationMonitor {
-    control: Arc<CancellationMonitorControl>,
-    done: Receiver<()>,
-    thread: Option<JoinHandle<()>>,
-    shutdown_wait: Duration,
-}
-
-impl CancellationMonitor {
-    fn stabilize(self, cancellation: &CancellationToken) -> Option<CancellationMonitorOutcome> {
-        let shutdown_wait = self.shutdown_wait;
-        self.stabilize_with_timeout(cancellation, shutdown_wait)
-    }
-
-    fn stabilize_with_timeout(
-        self,
-        cancellation: &CancellationToken,
-        shutdown_wait: Duration,
-    ) -> Option<CancellationMonitorOutcome> {
-        self.control.stop.store(true, Ordering::SeqCst);
-        let _ = self.control.wake.send(());
-        match self.done.recv_timeout(shutdown_wait) {
-            Ok(()) => {
-                if cancellation.is_cancelled() {
-                    let _ = self
-                        .control
-                        .record_outcome(CancellationMonitorOutcome::UserCancellation);
-                }
-                self.control.freeze()
-            }
-            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => {
-                // The monitor may still be inside SQLite. Publish and freeze before
-                // detaching so a late read result cannot change the token or outcome.
-                let (outcome, published) = self.control.freeze_as_infrastructure_failure();
-                if published {
-                    cancellation.cancel();
-                }
-                outcome.or(Some(CancellationMonitorOutcome::InfrastructureFailure))
-            }
-        }
-    }
-}
-
-impl ActiveTurnGuard {
-    fn start_monitor(&self) {
-        if let Some(monitor) = &self.monitor {
-            monitor.control.started.store(true, Ordering::SeqCst);
-            let _ = monitor.control.wake.send(());
-        }
-    }
-
-    /// 在终态提交前冻结 monitor 结果，避免取消 token 覆盖晚到的基础设施故障。
-    fn stabilize_monitor(
-        &mut self,
-        cancellation: &CancellationToken,
-    ) -> Option<CancellationMonitorOutcome> {
-        if let Some(outcome) = self.stabilized_monitor_outcome {
-            return outcome;
-        }
-        let outcome = match self.monitor.take() {
-            Some(monitor) => monitor.stabilize(cancellation),
-            None if cancellation.is_cancelled() => {
-                Some(CancellationMonitorOutcome::UserCancellation)
-            }
-            None => None,
-        };
-        self.stabilized_monitor_outcome = Some(outcome);
-        outcome
-    }
-
-    fn teardown_monitor_with_timeout(&mut self, shutdown_wait: Duration) {
-        if let Some(mut monitor) = self.monitor.take() {
-            monitor.control.stop.store(true, Ordering::SeqCst);
-            let _ = monitor.control.wake.send(());
-            match monitor.done.recv_timeout(shutdown_wait) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                    // `done` is sent after the final monitor operation; dropping the
-                    // handle avoids an unbounded join during request teardown.
-                    monitor.control.freeze();
-                    drop(monitor.thread.take());
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Freeze before detaching. A successful infrastructure publication
-                    // also stops the token; late monitor results cannot cancel it again.
-                    let (_, published) = monitor.control.freeze_as_infrastructure_failure();
-                    if published {
-                        self.cancellation.cancel();
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
-        let shutdown_wait = self.monitor.as_ref().map_or(
-            Duration::from_millis(TURN_MONITOR_SHUTDOWN_WAIT_MS),
-            |monitor| monitor.shutdown_wait,
-        );
-        self.teardown_monitor_with_timeout(shutdown_wait);
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
         }
@@ -680,77 +324,10 @@ impl Drop for ActiveTurnGuard {
     }
 }
 
-fn sequence_output(
-    coordinator: &OutputOrderCoordinator,
-    mut message: Value,
-) -> AppServerResult<AppServerOutput> {
-    let is_event = message
-        .get("params")
-        .and_then(Value::as_object)
-        .is_some_and(|params| params.contains_key("event"));
-    let reservation = coordinator
-        .reserve(is_event)
-        .map_err(AppServerError::Workspace)?;
-    if let Some(cursor) = reservation.event_cursor {
-        let patch_result: AppServerResult<()> = (|| {
-            let is_gap = message["method"] == "event/gap";
-            let params = message
-                .get_mut("params")
-                .and_then(Value::as_object_mut)
-                .ok_or_else(|| {
-                    AppServerError::Workspace("event params are unavailable".to_string())
-                })?;
-            if is_gap && let Some(gap) = params.get_mut("gap").and_then(Value::as_object_mut) {
-                gap.insert("toCursor".to_string(), cursor.into());
-            }
-            let metadata = params
-                .get_mut("event")
-                .and_then(Value::as_object_mut)
-                .ok_or_else(|| {
-                    AppServerError::Workspace("event metadata is unavailable".to_string())
-                })?;
-            metadata.insert("sequence".to_string(), cursor.into());
-            metadata.insert("cursor".to_string(), cursor.into());
-            if is_gap && let Some(gap) = metadata.get_mut("gap").and_then(Value::as_object_mut) {
-                gap.insert("toCursor".to_string(), cursor.into());
-            }
-            Ok(())
-        })();
-        if let Err(error) = patch_result {
-            coordinator.complete(reservation.order);
-            return Err(error);
-        }
-    }
-    Ok(AppServerOutput {
-        reservation,
-        message,
-    })
-}
-
-fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery, Option<EventRecoveryQuery>) {
+fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery) {
     match event.method.as_str() {
-        "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
-            (EventClass::Progress, EventDelivery::BestEffort, None)
-        }
-        "thread/started" => (
-            EventClass::State,
-            EventDelivery::Reliable,
-            event.params["thread"]["thread_id"]
-                .as_str()
-                .map(|thread_id| EventRecoveryQuery::ThreadRead {
-                    thread_id: thread_id.to_string(),
-                }),
-        ),
-        "turn/started" | "turn/completed" => (
-            EventClass::State,
-            EventDelivery::Reliable,
-            event.params["turn"]["turn_id"].as_str().map(|turn_id| {
-                EventRecoveryQuery::TurnStatus {
-                    turn_id: turn_id.to_string(),
-                }
-            }),
-        ),
-        _ => (EventClass::State, EventDelivery::Reliable, None),
+        "item/agentMessage/delta" => (EventClass::Progress, EventDelivery::BestEffort),
+        _ => (EventClass::State, EventDelivery::Reliable),
     }
 }
 
@@ -764,76 +341,6 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
     for message in messages {
         emit(message);
     }
-}
-
-/// 监视持久化 turn 状态，使外部中断能够到达进程内 `AgentLoop`。
-fn cancellation_monitor(
-    store: Option<SessionStore>,
-    turn_id: &str,
-    cancellation: CancellationToken,
-) -> AppServerResult<Option<CancellationMonitor>> {
-    let Some(store) = store else {
-        return Ok(None);
-    };
-    let turn_id = turn_id.to_string();
-    let (wake, wake_receiver) = mpsc::channel();
-    let (done_sender, done) = mpsc::channel();
-    let control = Arc::new(CancellationMonitorControl {
-        started: AtomicBool::new(false),
-        stop: AtomicBool::new(false),
-        outcome: AtomicU8::new(0),
-        wake,
-    });
-    let thread_control = Arc::clone(&control);
-    let thread = ThreadBuilder::new()
-        .name("turn-cancellation-monitor".to_string())
-        .spawn(move || {
-            while !thread_control.started.load(Ordering::SeqCst)
-                && !thread_control.stop.load(Ordering::SeqCst)
-            {
-                match wake_receiver.recv_timeout(Duration::from_millis(TURN_CANCELLATION_POLL_MS)) {
-                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            while !thread_control.stop.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
-                match store.get_turn(&turn_id) {
-                    Ok(turn) if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() => {
-                        if thread_control
-                            .record_outcome(CancellationMonitorOutcome::UserCancellation)
-                        {
-                            cancellation.cancel();
-                        }
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.is_transient_contention() => {}
-                    Err(_) => {
-                        if thread_control
-                            .record_outcome(CancellationMonitorOutcome::InfrastructureFailure)
-                        {
-                            cancellation.cancel();
-                        }
-                        break;
-                    }
-                }
-                match wake_receiver.recv_timeout(Duration::from_millis(TURN_CANCELLATION_POLL_MS)) {
-                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            if !thread_control.stop.load(Ordering::SeqCst) && cancellation.is_cancelled() {
-                let _ = thread_control.record_outcome(CancellationMonitorOutcome::UserCancellation);
-            }
-            let _ = done_sender.send(());
-        })
-        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-    Ok(Some(CancellationMonitor {
-        control,
-        done,
-        thread: Some(thread),
-        shutdown_wait: Duration::from_millis(TURN_MONITOR_SHUTDOWN_WAIT_MS),
-    }))
 }
 
 fn history_turn_limit(limit: Option<u32>) -> Result<usize, String> {
@@ -1091,20 +598,6 @@ fn turn_failure_from_error(
             stage: fallback_stage,
             cause: turn_failure_cause(error),
         },
-    }
-}
-
-fn monitor_failure_or(
-    monitor_outcome: Option<CancellationMonitorOutcome>,
-    fallback: TurnFailure,
-) -> TurnFailure {
-    if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
-        TurnFailure {
-            stage: TurnFailureStage::CancellationMonitor,
-            cause: TurnFailureCause::CancellationMonitor,
-        }
-    } else {
-        fallback
     }
 }
 
