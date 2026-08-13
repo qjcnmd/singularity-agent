@@ -20,12 +20,6 @@ pub enum StoreError {
     /// 数据库 schema 版本高于当前实现支持的版本。
     #[error("unsupported schema version {found}; supported version is {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
-    /// trace payload 与持久化完整性校验不一致。
-    #[error("trace integrity check failed: {0}")]
-    TraceIntegrity(String),
-    /// trace 与其 turn 的身份绑定不一致。
-    #[error("trace binding failed: {0}")]
-    TraceBinding(#[from] TraceBindingError),
     /// 数据违反 store 的绑定或状态不变量。
     #[error("invalid store state: {0}")]
     InvalidState(String),

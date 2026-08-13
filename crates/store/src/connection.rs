@@ -198,6 +198,110 @@ impl SessionStore {
         }
         Ok(())
     }
+
+    /// 对执行保护覆盖的每个线程应用所有权丢失恢复。
+    pub(crate) fn recover_abandoned_workspace_execution(
+        &self,
+        guard: &WorkspaceExecutionGuard,
+    ) -> StoreResult<()> {
+        self.validate_workspace_execution_guard(guard)?;
+        for thread_id in self.workspace_execution_thread_ids(&guard.execution_scope)? {
+            self.recover_abandoned_thread_execution(&thread_id)?;
+        }
+        Ok(())
+    }
+
+    // 查询执行锁覆盖的 thread 集合。
+    pub(crate) fn workspace_execution_thread_ids(
+        &self,
+        execution_scope: &WorkspaceExecutionScope,
+    ) -> StoreResult<Vec<String>> {
+        match execution_scope {
+            WorkspaceExecutionScope::Workspace(workspace) => {
+                let mut statement = self
+                    .connection
+                    .prepare("select thread_id from threads where cwd = ?1 order by rowid")?;
+                let thread_ids = statement
+                    .query_map(params![workspace], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(thread_ids)
+            }
+            WorkspaceExecutionScope::Thread(thread_id) => Ok(vec![thread_id.clone()]),
+        }
+    }
+
+    // 恢复单个 thread 的 abandoned execution：无 checkpoint/工具执行可恢复，
+    // 全部非终态 turn 直接收敛为 Interrupted（新核心会话文件承载历史）。
+    pub(crate) fn recover_abandoned_thread_execution(&self, thread_id: &str) -> StoreResult<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::recover_abandoned_turns_for_thread(&transaction, thread_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    // 将 thread 中遗留的非终态 turn 收敛为 Interrupted。
+    pub(crate) fn recover_abandoned_turns_for_thread(
+        transaction: &Connection,
+        thread_id: &str,
+    ) -> StoreResult<Vec<String>> {
+        let mut statement = transaction.prepare(
+            "select turn_id from turns
+             where thread_id = ?1 and status not in (?2, ?3, ?4)
+             order by turn_sequence",
+        )?;
+        let turn_ids = statement
+            .query_map(
+                params![
+                    thread_id,
+                    TurnStatus::Completed.to_db_text(),
+                    TurnStatus::Failed.to_db_text(),
+                    TurnStatus::Interrupted.to_db_text(),
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut recovered = Vec::new();
+        for turn_id in turn_ids {
+            Self::terminalize_ownerless_turn(
+                transaction,
+                &turn_id,
+                TurnStatus::Interrupted,
+                "interrupted",
+            )?;
+            recovered.push(turn_id);
+        }
+        Ok(recovered)
+    }
+
+    // 将无 active owner 的非终态 turn 终态化为 Interrupted。
+    pub(crate) fn terminalize_ownerless_turn(
+        transaction: &Connection,
+        turn_id: &str,
+        terminal_status: TurnStatus,
+        terminal_agent_loop_status: &str,
+    ) -> StoreResult<()> {
+        transaction.execute(
+            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
+            params![terminal_status.to_db_text(), terminal_agent_loop_status, turn_id],
+        )?;
+        Ok(())
+    }
+
+    // 确认 guard 仍属于当前 store 和正确的执行范围。
+    pub(crate) fn validate_workspace_execution_guard(
+        &self,
+        guard: &WorkspaceExecutionGuard,
+    ) -> StoreResult<()> {
+        if self.runtime_path.as_ref() != Some(&guard.store_path) {
+            return Err(StoreError::InvalidState(
+                "workspace execution guard belongs to another store".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn configure_connection(connection: &Connection) -> StoreResult<()> {

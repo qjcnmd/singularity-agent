@@ -1,6 +1,5 @@
 //! Thread, turn, item, and conversation-history operations.
 
-use super::checkpoint_recovery::OwnerlessTerminalization;
 use super::support::*;
 use super::*;
 
@@ -13,15 +12,13 @@ pub struct ThreadHistoryPage {
     pub next_before_turn_sequence: Option<u64>,
 }
 
-/// 创建 turn、用户条目、追踪和初始历史页后得到的原子结果。
+/// 创建 turn、用户条目和初始历史页后得到的原子结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartedTurn {
     /// 新建的 turn。
     pub turn: Turn,
     /// 清理后的 user input item。
     pub item: Item,
-    /// 与创建操作绑定的 trace event。
-    pub trace: TraceEvent,
     /// 创建边界之前可供模型重建的历史页。
     pub history: ThreadHistoryPage,
 }
@@ -56,23 +53,17 @@ pub struct CreateStartedTurnParams<'a> {
     pub agent_loop_status: &'a str,
     /// 未清理的用户输入。
     pub input: Value,
-    /// started trace 的组件名。
-    pub component: &'a str,
-    /// started trace 的摘要。
-    pub summary: &'a str,
     /// 创建边界需要读取的历史 turn 上限。
     pub history_turn_limit: usize,
 }
 
-/// turn 的原子结果，以及助手条目和追踪（如有）。
+/// turn 的原子结果，以及可选的助手条目。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     /// 提交后的 turn 状态。
     pub turn: Turn,
     /// 可选的持久化 assistant item。
     pub assistant_item: Option<Item>,
-    /// 与结果提交绑定的 trace event。
-    pub trace: TraceEvent,
 }
 
 /// 终态提交时拥有该状态归约权的 typed 原因。
@@ -84,7 +75,7 @@ pub enum TurnOutcomeAuthority {
     InfrastructureFailure,
 }
 
-/// 为一个终止、已中断或 approval 阻塞的 turn 结果提交的持久化字段。
+/// 为一个终止或已中断的 turn 结果提交的持久化字段。
 pub struct CommitTurnOutcomeParams<'a> {
     /// turn 的目标终态。
     pub status: TurnStatus,
@@ -94,8 +85,6 @@ pub struct CommitTurnOutcomeParams<'a> {
     pub assistant_item_id: Option<&'a AllocatedAssistantItemId>,
     /// 可选的 assistant 增量。
     pub assistant_delta: Option<&'a str>,
-    /// 与提交绑定的 trace event。
-    pub trace: &'a TraceEvent,
 }
 
 impl SessionStore {
@@ -158,13 +147,13 @@ impl SessionStore {
         self.get_thread(thread_id)
     }
 
-    /// 删除 thread 及其绑定的 turn、item、trace 和 artifact。
+    /// 删除 thread 及其绑定的 turn 与 item。
     pub fn delete_thread(&self, thread_id: &str) -> StoreResult<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
 
-        // 按 child-first 顺序删除所有恢复子表。每次删除都核对
+        // 按 child-first 顺序删除所有子表。每次删除都核对
         // 事务快照中的行数，避免关系投影不完整时静默留下孤儿数据。
         let expected_turn_inputs: i64 = transaction.query_row(
             "select count(*) from turn_inputs where turn_id in
@@ -183,51 +172,6 @@ impl SessionStore {
             ));
         }
 
-        let expected_tool_executions: i64 = transaction.query_row(
-            "select count(*) from tool_executions where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_tool_executions = transaction.execute(
-            "delete from tool_executions where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_tool_executions != expected_tool_executions {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed tool execution rows".to_string(),
-            ));
-        }
-
-        let expected_turn_checkpoints: i64 = transaction.query_row(
-            "select count(*) from turn_checkpoints where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_turn_checkpoints = transaction.execute(
-            "delete from turn_checkpoints where thread_id = ?1
-             or turn_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_turn_checkpoints != expected_turn_checkpoints {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed turn checkpoint rows".to_string(),
-            ));
-        }
-
-        let artifact_ids = {
-            let mut statement = transaction.prepare(
-                "select artifact_id from artifact_refs where run_id = ?1
-                 or item_id in (select item_id from items where turn_id in
-                     (select turn_id from turns where thread_id = ?1))",
-            )?;
-            statement
-                .query_map(params![thread_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
         let expected_items: i64 = transaction.query_row(
             "select count(*) from items where turn_id in
                  (select turn_id from turns where thread_id = ?1)",
@@ -242,37 +186,6 @@ impl SessionStore {
         if deleted_items != expected_items {
             return Err(StoreError::InvalidState(
                 "thread deletion changed item rows".to_string(),
-            ));
-        }
-
-        let expected_trace_events: i64 = transaction.query_row(
-            "select count(*) from trace_events where run_id = ?1
-             or session_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-            |row| row.get(0),
-        )?;
-        let deleted_trace_events = transaction.execute(
-            "delete from trace_events where run_id = ?1
-             or session_id in (select turn_id from turns where thread_id = ?1)",
-            params![thread_id],
-        )? as i64;
-        if deleted_trace_events != expected_trace_events {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed trace rows".to_string(),
-            ));
-        }
-
-        let expected_artifact_refs = artifact_ids.len() as i64;
-        let mut deleted_artifact_refs = 0_i64;
-        for artifact_id in &artifact_ids {
-            deleted_artifact_refs += transaction.execute(
-                "delete from artifact_refs where artifact_id = ?1",
-                params![artifact_id],
-            )? as i64;
-        }
-        if deleted_artifact_refs != expected_artifact_refs {
-            return Err(StoreError::InvalidState(
-                "thread deletion changed artifact rows".to_string(),
             ));
         }
 
@@ -300,29 +213,6 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 原子创建 thread 及其初始 trace。
-    pub fn create_thread_with_trace(
-        &self,
-        model: Option<&str>,
-        cwd: Option<&str>,
-        component: &str,
-        summary: &str,
-    ) -> StoreResult<(Thread, TraceEvent)> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let thread = Self::new_thread(model, cwd);
-        Self::insert_thread(&transaction, &thread)?;
-        let trace = TraceEvent::new(
-            format!("trace_{}", thread.thread_id),
-            thread.thread_id.clone(),
-            thread.thread_id.clone(),
-            component,
-            summary,
-        );
-        let trace = Self::insert_trace(&transaction, &trace)?;
-        transaction.commit()?;
-        Ok((thread, trace))
-    }
-
     /// 创建一个受 thread 与 workspace 并发约束的 turn。
     pub fn create_turn(&self, thread_id: &str, agent_loop_status: &str) -> StoreResult<Turn> {
         let transaction =
@@ -332,56 +222,40 @@ impl SessionStore {
         let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
         Self::insert_turn(&transaction, &turn, turn_sequence)?;
-        let trace = typed_turn_start_trace(
-            format!("trace_{}", turn.turn_id),
-            thread_id,
-            &turn.turn_id,
-            "store",
-            "turn started",
-        );
-        Self::insert_turn_trace(&transaction, &trace, thread_id, &turn.turn_id)?;
         transaction.commit()?;
         Ok(turn)
     }
 
-    /// 创建 turn、user input 和 trace，不返回历史页。
-    pub fn create_turn_with_input_and_trace(
+    /// 创建 turn 与 user input，不返回历史页。
+    pub fn create_turn_with_input(
         &self,
         thread_id: &str,
         agent_loop_status: &str,
         input: Value,
-        component: &str,
-        summary: &str,
-    ) -> StoreResult<(Turn, Item, TraceEvent)> {
-        let started = self.create_turn_with_input_trace_and_history(
+    ) -> StoreResult<(Turn, Item)> {
+        let started = self.create_turn_with_input_and_history(
             thread_id,
             agent_loop_status,
             input,
-            component,
-            summary,
             0,
         )?;
-        Ok((started.turn, started.item, started.trace))
+        Ok((started.turn, started.item))
     }
 
-    /// 原子地创建 turn、清理其输入、记录追踪，并读取此前的历史。
-    pub fn create_turn_with_input_trace_and_history(
+    /// 原子地创建 turn、清理其输入，并读取此前的历史。
+    pub fn create_turn_with_input_and_history(
         &self,
         thread_id: &str,
         agent_loop_status: &str,
         input: Value,
-        component: &str,
-        summary: &str,
         history_turn_limit: usize,
     ) -> StoreResult<StartedTurn> {
-        self.create_allocated_turn_with_input_trace_and_history(
+        self.create_allocated_turn_with_input_and_history(
             Self::allocate_turn_id(),
             CreateStartedTurnParams {
                 thread_id,
                 agent_loop_status,
                 input,
-                component,
-                summary,
                 history_turn_limit,
             },
         )
@@ -397,8 +271,8 @@ impl SessionStore {
         AllocatedAssistantItemId(format!("item_{}", short_id()))
     }
 
-    /// 使用预分配 id 原子创建 turn、输入、trace 和此前历史。
-    pub fn create_allocated_turn_with_input_trace_and_history(
+    /// 使用预分配 id 原子创建 turn、输入和此前历史。
+    pub fn create_allocated_turn_with_input_and_history(
         &self,
         allocated_turn_id: AllocatedTurnId,
         params: CreateStartedTurnParams<'_>,
@@ -424,19 +298,10 @@ impl SessionStore {
         let (input, redacted) = sanitize_item_payload(&ItemKind::UserMessage, params.input)?;
         let item = Self::new_item(&turn.turn_id, ItemKind::UserMessage, input);
         Self::insert_item(&transaction, &item, item_sequence, redacted)?;
-        let trace = typed_turn_start_trace(
-            format!("trace_{}", turn.turn_id),
-            params.thread_id,
-            &turn.turn_id,
-            params.component,
-            params.summary,
-        );
-        let trace = Self::insert_turn_trace(&transaction, &trace, params.thread_id, &turn.turn_id)?;
         transaction.commit()?;
         Ok(StartedTurn {
             turn,
             item,
-            trace,
             history,
         })
     }
@@ -578,7 +443,7 @@ impl SessionStore {
         Ok(committed)
     }
 
-    // 在既有事务中写入 turn 终态、附加 items 和 trace。
+    // 在既有事务中写入 turn 终态与附加 items。
     pub(crate) fn commit_turn_outcome_in_transaction(
         &self,
         transaction: &Transaction<'_>,
@@ -591,7 +456,6 @@ impl SessionStore {
             agent_loop_status,
             assistant_item_id,
             assistant_delta,
-            trace,
         } = params;
         let current = transaction
             .query_row(
@@ -606,7 +470,6 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         validate_turn_status_update(&current, &status, Some(agent_loop_status), authority)?;
-        validate_turn_trace_binding(trace, &current.thread_id, &current.turn_id)?;
         if is_terminal_turn_status(&status) {
             let boundary_pending: bool = transaction.query_row(
                 "select pause_requested = 1 or exists(
@@ -620,26 +483,6 @@ impl SessionStore {
                 return Err(StoreError::TurnBoundaryPending {
                     turn_id: turn_id.to_string(),
                 });
-            }
-
-            let running_execution_count: i64 = transaction.query_row(
-                "select count(*) from tool_executions
-                 where turn_id = ?1 and execution_state = 'running'",
-                params![turn_id],
-                |row| row.get(0),
-            )?;
-            if running_execution_count != 0 {
-                if status == TurnStatus::Completed {
-                    return Err(StoreError::InvalidState(
-                        "completed turn outcome cannot commit with running tool execution"
-                            .to_string(),
-                    ));
-                }
-                transaction.execute(
-                    "update tool_executions set execution_state = 'unknown'
-                     where turn_id = ?1 and execution_state = 'running'",
-                    params![turn_id],
-                )?;
             }
         }
         match (&status, assistant_item_id, assistant_delta) {
@@ -659,17 +502,10 @@ impl SessionStore {
                 ));
             }
         }
-        let trace = if is_terminal_turn_status(&status) {
-            typed_turn_end_trace(transaction, trace, &current, &status)?
-        } else {
-            trace.clone()
-        };
-
         transaction.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
             params![status.to_db_text(), agent_loop_status, turn_id],
         )?;
-        let trace_thread_id = current.thread_id.clone();
         let turn = Turn {
             status,
             agent_loop_status: agent_loop_status.to_string(),
@@ -692,20 +528,14 @@ impl SessionStore {
                 Ok(item)
             })
             .transpose()?;
-        let trace = Self::insert_turn_trace(transaction, &trace, &trace_thread_id, turn_id)?;
         Ok(CommittedTurnOutcome {
             turn,
             assistant_item,
-            trace,
         })
     }
 
     /// 记录取消；paused/suspended 当场终态化，running 置 cancel_requested。
-    pub fn request_turn_cancellation(
-        &self,
-        turn_id: &str,
-        trace: &TraceEvent,
-    ) -> StoreResult<Turn> {
+    pub fn request_turn_cancellation(&self, turn_id: &str) -> StoreResult<Turn> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut turn = transaction
@@ -724,21 +554,14 @@ impl SessionStore {
             transaction.commit()?;
             return Ok(turn);
         }
-        validate_turn_trace_binding(trace, &turn.thread_id, &turn.turn_id)?;
         // paused/suspended 已无 active owner，不会再有 worker 收敛
         // cancel_requested；用户 interrupt 时当场终态化，避免卡死到重启。
         if turn.status == TurnStatus::Paused || turn.status == TurnStatus::Suspended {
             Self::terminalize_ownerless_turn(
                 &transaction,
-                &turn.thread_id,
                 &turn.turn_id,
-                OwnerlessTerminalization {
-                    previous_status: turn.status.clone(),
-                    previous_agent_loop_status: &turn.agent_loop_status,
-                    terminal_agent_loop_status: "cancelled",
-                    recovery_reason: "execution_owner_lost",
-                    trace,
-                },
+                TurnStatus::Interrupted,
+                "cancelled",
             )?;
             turn.status = TurnStatus::Interrupted;
             turn.agent_loop_status = "cancelled".to_string();
@@ -749,7 +572,6 @@ impl SessionStore {
             "update turns set agent_loop_status = 'cancel_requested' where turn_id = ?1",
             params![turn_id],
         )?;
-        Self::insert_turn_trace(&transaction, trace, &turn.thread_id, &turn.turn_id)?;
         turn.agent_loop_status = "cancel_requested".to_string();
         transaction.commit()?;
         Ok(turn)
@@ -1328,49 +1150,6 @@ impl SessionStore {
         )?;
         Ok(())
     }
-    // 脱敏、哈希并写入 trace event，返回持久化投影。
-    pub(crate) fn insert_trace(
-        connection: &Connection,
-        event: &TraceEvent,
-    ) -> StoreResult<TraceEvent> {
-        Self::insert_trace_with_internal_payload(connection, event, None)
-    }
-
-    /// Insert a sanitized trace event and, when present, bind one private typed payload to the
-    /// same SQLite row. The payload is never returned by public trace reads.
-    pub(crate) fn insert_trace_with_internal_payload(
-        connection: &Connection,
-        event: &TraceEvent,
-        internal_payload: Option<&Value>,
-    ) -> StoreResult<TraceEvent> {
-        let mut event = sanitize_trace_event(event);
-        if let Some(internal_payload) = internal_payload {
-            event.payload_hash = trace_envelope_hash_with_internal(&event, Some(internal_payload));
-        }
-        let payload = encode_trace_payload(&event, internal_payload)?;
-        connection.execute(
-            "insert into trace_events(event_id, run_id, session_id, payload) values(?1, ?2, ?3, ?4)",
-            params![
-                event.event_id,
-                event.run_id,
-                event.session_id,
-                payload
-            ],
-        )?;
-        Ok(event)
-    }
-
-    // 在所有 turn 相关写入前统一检查 thread/turn 身份绑定。
-    pub(crate) fn insert_turn_trace(
-        connection: &Connection,
-        event: &TraceEvent,
-        thread_id: &str,
-        turn_id: &str,
-    ) -> StoreResult<TraceEvent> {
-        validate_turn_trace_binding(event, thread_id, turn_id)?;
-        Self::insert_trace(connection, event)
-    }
-
     // 在调用方事务中执行单参数存在性查询。
     pub(crate) fn exists_in_transaction(
         connection: &Connection,
@@ -1384,80 +1163,4 @@ impl SessionStore {
             Err(error) => Err(StoreError::Sqlite(error)),
         }
     }
-}
-
-fn typed_turn_start_trace(
-    event_id: impl Into<String>,
-    thread_id: &str,
-    turn_id: &str,
-    component: &str,
-    summary: &str,
-) -> TraceEvent {
-    let mut event = TraceEvent::for_turn(event_id, thread_id, turn_id, component, summary);
-    event.timestamp = Some(Timestamp::now_utc().to_string());
-    event.span_id = Some(format!("turn_span_{turn_id}"));
-    event.span_kind = Some(TraceSpanKind::Turn);
-    event.span_phase = Some(TraceSpanPhase::Start);
-    event
-}
-
-pub(crate) fn typed_turn_end_trace(
-    transaction: &Transaction<'_>,
-    event: &TraceEvent,
-    current: &Turn,
-    status: &TurnStatus,
-) -> StoreResult<TraceEvent> {
-    let start = find_trace_span_start(
-        transaction,
-        &current.thread_id,
-        &current.turn_id,
-        TraceSpanKind::Turn,
-    )?
-    .ok_or_else(|| {
-        StoreError::InvalidState(format!(
-            "turn {} is missing its persisted typed start",
-            current.turn_id
-        ))
-    })?;
-    let start_timestamp = start
-        .timestamp
-        .as_deref()
-        .and_then(|timestamp| Timestamp::parse(timestamp).ok())
-        .ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "turn {} typed start has no valid timestamp",
-                current.turn_id
-            ))
-        })?;
-    let end_timestamp = Timestamp::now_utc();
-    let start_ms = start_timestamp.unix_ms();
-    let end_ms = end_timestamp.unix_ms();
-    let duration_ms = end_ms.checked_sub(start_ms).ok_or_else(|| {
-        StoreError::InvalidState(format!(
-            "turn {} typed end timestamp precedes its persisted start",
-            current.turn_id
-        ))
-    })?;
-    let span_status = match status {
-        TurnStatus::Completed => TraceSpanStatus::Ok,
-        TurnStatus::Failed => TraceSpanStatus::Error,
-        TurnStatus::Interrupted => TraceSpanStatus::Cancelled,
-        TurnStatus::Running | TurnStatus::Paused | TurnStatus::Suspended | TurnStatus::Blocked => {
-            return Err(StoreError::InvalidState(
-                "non-terminal turn cannot produce a typed end".to_string(),
-            ));
-        }
-    };
-    let mut event = event.clone();
-    event.timestamp = Some(end_timestamp.to_string());
-    event.span_id = start.span_id;
-    event.parent_span_id = None;
-    event.span_kind = Some(TraceSpanKind::Turn);
-    event.span_phase = Some(TraceSpanPhase::End);
-    event.span_status = Some(span_status);
-    event.duration_ms = Some(duration_ms);
-    event.time_to_first_token_ms = None;
-    event.span_projection = None;
-    event.metric_samples.clear();
-    Ok(event)
 }

@@ -525,14 +525,6 @@ fn turn_started_event_failure_terminalizes_the_running_turn() {
         .read_thread_history(&persisted, None, 8)
         .expect("history");
     assert!(turns.messages.is_empty());
-    let failed = server
-        .store
-        .list_trace(&persisted)
-        .expect("trace")
-        .into_iter()
-        .find(|trace| trace.payload["status"] == AgentStatus::Failed.as_str())
-        .expect("failed terminal trace");
-    assert_eq!(failed.payload["status"], AgentStatus::Failed.as_str());
 }
 
 #[test]
@@ -622,22 +614,6 @@ fn running_turn_failure_stages_terminalize_as_failed() {
         let persisted = server.store.get_turn(&turn.turn_id).expect("failed turn");
         assert_eq!(persisted.status, TurnStatus::Failed);
         assert_eq!(persisted.agent_loop_status, AgentStatus::Failed.as_str());
-        let trace = server
-            .store
-            .list_trace(&persisted.thread_id)
-            .expect("trace")
-            .into_iter()
-            .find(|trace| {
-                trace.payload["audit_events"]
-                    .to_string()
-                    .contains(stage.as_str())
-            })
-            .expect("typed failure trace");
-        assert!(
-            trace.payload["audit_events"]
-                .to_string()
-                .contains("turn_execution")
-        );
     }
 }
 
@@ -866,19 +842,8 @@ fn app_server_preserves_safe_provider_failure_via_turn_start() {
         }
     ));
     assert!(!error.to_string().contains(provider_sentinel));
-    // turn 以 Failed 终态提交，trace 只含安全摘要。
-    let traces = server
-        .store
-        .list_trace(&thread.thread_id)
-        .expect("trace");
-    let terminal = traces
-        .iter()
-        .find(|trace| trace.payload["status"] == AgentStatus::Failed.as_str())
-        .expect("failed terminal trace");
-    assert_eq!(terminal.payload["error"], SAFE_AGENT_LOOP_FAILURE);
-    let trace_json = serde_json::to_string(&terminal).expect("trace json");
-    assert!(!trace_json.contains(provider_sentinel));
-    assert!(!trace_json.contains("validation_errors"));
+    // turn 以 Failed 终态提交，provider 错误文本不落入持久化 turn 状态。
+    assert!(error.to_string().contains("agent_loop"));
 }
 
 #[test]
@@ -1084,14 +1049,12 @@ fn partial_realtime_item_fails_without_persisting_or_completing() {
             .store
             .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
             .expect("thread");
-        let (turn, _, _) = server
+        let (turn, _) = server
             .store
-            .create_turn_with_input_and_trace(
+            .create_turn_with_input(
                 &thread.thread_id,
                 AgentStatus::Running.as_str(),
                 json!([{"type": "text", "text": "run"}]),
-                "app_server",
-                "turn started",
             )
             .expect("turn");
         let mut assistant_events =
@@ -1171,26 +1134,17 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
                 agent_loop_status: AgentStatus::Completed.as_str(),
                 assistant_item_id: Some(&assistant_item_id),
                 assistant_delta: Some("existing assistant"),
-                trace: &TraceEvent::for_turn(
-                    "trace_existing_assistant",
-                    &collision_thread.thread_id,
-                    &collision_turn.turn_id,
-                    "test",
-                    "existing assistant",
-                ),
             },
         )
         .expect("existing assistant");
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             AgentStatus::Running.as_str(),
             json!([{"type": "text", "text": "complete"}]),
-            "app_server",
-            "turn started",
         )
         .expect("turn");
     let server = app_server(store);
@@ -1332,26 +1286,6 @@ fn agent_capability_is_always_available_without_a_sandbox_gate() {
     assert!(result.agent_loop.available);
     assert!(result.agent_loop.blockers.is_empty());
     assert_eq!(result.agent_loop.status, "completed");
-}
-
-#[test]
-fn unsequenced_turn_outputs_carry_one_explicit_transport_trace_binding() {
-    let store = SessionStore::open(":memory:").expect("store");
-    let mut server = app_server(store);
-    let binding = TransportTraceBinding::for_turn("thread_trace", "turn_trace");
-    server.pending_transport_trace_binding = Some(binding.clone());
-
-    let outputs = server
-        .sequence_outputs(vec![json!({"jsonrpc": "2.0", "id": 1, "result": {}})])
-        .expect("sequence bound output");
-    assert_eq!(outputs[0].trace_binding.as_ref(), Some(&binding));
-    server.output_order.complete(outputs[0].reservation.order);
-
-    let unbound = server
-        .sequence_outputs(vec![json!({"jsonrpc": "2.0", "id": 2, "result": {}})])
-        .expect("sequence unbound output");
-    assert!(unbound[0].trace_binding.is_none());
-    server.output_order.complete(unbound[0].reservation.order);
 }
 
 /// 构造带工具调用序列的 fake provider（write 工具 → 文本收尾）。
@@ -1596,13 +1530,11 @@ fn turn_resume_reopens_session_and_runs_new_core() {
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let (turn, _, _) = store
-        .create_turn_with_input_and_trace(
+    let (turn, _) = store
+        .create_turn_with_input(
             &thread.thread_id,
             AgentStatus::Paused.as_str(),
             json!([{"type": "text", "text": "resume me"}]),
-            "app_server",
-            "turn started",
         )
         .expect("turn");
     store
@@ -1612,16 +1544,6 @@ fn turn_resume_reopens_session_and_runs_new_core() {
             AgentStatus::Paused.as_str(),
         )
         .expect("paused turn");
-    // 模拟旧链 pause 数据：Paused turn 携带 checkpoint（store 恢复逻辑对
-    // 无 checkpoint 的 Paused turn 会终态化；新链路不再产生这种状态）。
-    store
-        .save_turn_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &json!({ "checkpoint_version": 1, "legacy": true }),
-            1,
-        )
-        .expect("legacy checkpoint");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = StaticProvider {
         responses: vec![ModelTurnResponse::completed(

@@ -8,7 +8,6 @@ mod dispatch;
 mod events;
 mod lifecycle;
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -37,7 +36,7 @@ use singularity_protocol::{
     ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputDelivery, TurnInputParams,
+    TransportCapability, Turn, TurnIdParams, TurnInputDelivery, TurnInputParams,
     TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
@@ -58,7 +57,6 @@ const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
 const TURN_MONITOR_SHUTDOWN_WAIT_MS: u64 = 100;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
-const SAFE_AGENT_LOOP_FAILURE: &str = "agent loop execution failed";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
 const CANCELLATION_MONITOR_FROZEN: u8 = 0x80;
@@ -314,8 +312,7 @@ enum TurnTerminalizationResult {
 /// 一个 reservation 同时占用输出 order 和可选事件 cursor；request worker 在交给
 /// stdout queue 前先取得两者，避免事件 cursor 已分配而 worker 尚未排队时被并发 worker 越过。
 #[derive(Clone, Debug, Default)]
-pub struct OutputOrderCoordinator {
-    state: Arc<Mutex<OutputOrderState>>,
+pub struct OutputOrderCoordinator {    state: Arc<Mutex<OutputOrderState>>,
 }
 
 #[derive(Debug, Default)]
@@ -442,25 +439,6 @@ fn advance_write_order(state: &mut OutputOrderState) {
     }
 }
 
-/// stdout transport 使用的真实持久化 Turn 绑定。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransportTraceBinding {
-    /// Store trace 的 run/thread identity。
-    pub thread_id: String,
-    /// Store trace 的 session/turn identity。
-    pub turn_id: String,
-}
-
-impl TransportTraceBinding {
-    /// 从真实持久化 Turn 建立 transport trace 绑定。
-    pub fn for_turn(thread_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
-        Self {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-        }
-    }
-}
-
 /// AppServer 交给 stdout transport 的已排序消息。
 #[derive(Debug, Clone)]
 pub struct AppServerOutput {
@@ -468,8 +446,6 @@ pub struct AppServerOutput {
     pub reservation: OutputReservation,
     /// 脱敏 JSON-RPC wire value。
     pub message: Value,
-    /// 仅由真实 Turn 生产者提供；transport 不从公共 JSON 反推身份。
-    pub trace_binding: Option<TransportTraceBinding>,
 }
 
 /// 协调线程、turn、追踪和工作线程的有状态 JSON-RPC 服务。
@@ -485,7 +461,6 @@ pub struct AppServer {
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     execution_stopped: Arc<AtomicBool>,
     output_order: OutputOrderCoordinator,
-    pending_transport_trace_binding: Option<TransportTraceBinding>,
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
@@ -708,7 +683,6 @@ impl Drop for ActiveTurnGuard {
 fn sequence_output(
     coordinator: &OutputOrderCoordinator,
     mut message: Value,
-    trace_binding: Option<TransportTraceBinding>,
 ) -> AppServerResult<AppServerOutput> {
     let is_event = message
         .get("params")
@@ -750,7 +724,6 @@ fn sequence_output(
     Ok(AppServerOutput {
         reservation,
         message,
-        trace_binding,
     })
 }
 
@@ -1161,37 +1134,6 @@ fn mark_run_cancelled(status: &mut RunStatus) {
     status.status = AgentStatus::Cancelled;
     status.final_answer = None;
     status.error = None;
-}
-
-fn agent_loop_trace(turn: &Turn, status: &RunStatus) -> TraceEvent {
-    let mut event = TraceEvent::for_turn(
-        format!(
-            "trace_{}_agent_loop_{}_{}",
-            turn.turn_id,
-            status.status.as_str(),
-            status.model_turns
-        ),
-        &turn.thread_id,
-        &turn.turn_id,
-        "agent_loop",
-        "AgentLoop result translated",
-    );
-    // 新核心（Phase 3a）不再提供 context/provider attempt/provider protocol 观测；
-    // 终态 trace 只投影 AgentOutcome 能提供的字段。
-    event.payload = json!({
-        "component": "agent_loop",
-        "status": status.status.as_str(),
-        "model_turns": status.model_turns,
-        "model_turn_limit": status.model_turn_limit,
-        "model_usage": &status.model_usage,
-        "final_text": status.final_answer.as_deref().map(redact_app_server_text),
-        "audit_events": &status.audit_events,
-        "error": status
-            .error
-            .as_deref()
-            .map(|_| SAFE_AGENT_LOOP_FAILURE),
-    });
-    event
 }
 
 fn agent_completed_delta(run_status: &RunStatus) -> Option<String> {

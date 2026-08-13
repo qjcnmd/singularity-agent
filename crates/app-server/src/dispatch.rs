@@ -23,7 +23,6 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<AppServerOutput>> {
-        self.pending_transport_trace_binding = None;
         let messages = self.handle_unsequenced(message)?;
         self.sequence_outputs(messages)
     }
@@ -254,12 +253,7 @@ impl AppServer {
             Some(model) => Some(model.to_string()),
             None => self.provider_snapshot.resolved_default_selector(),
         };
-        let (thread, _trace) = self.store.create_thread_with_trace(
-            model.as_deref(),
-            Some(&cwd),
-            "app_server",
-            "thread started",
-        )?;
+        let thread = self.store.create_thread(model.as_deref(), Some(&cwd))?;
         // 线程 ↔ 会话文件绑定：`<sessions_dir>/<thread_id>.jsonl`（Phase 3a 跨轮历史通道）。
         let thread_cwd = thread.cwd.clone().unwrap_or(cwd);
         let sessions_dir = Path::new(&thread_cwd).join(".singularity").join("agent-sessions");

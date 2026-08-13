@@ -3,7 +3,7 @@
 use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
 use singularity_model::ProviderConfigSnapshot;
 #[cfg(windows)]
-use singularity_protocol::{ConversationRole, TraceMetricSampleKind};
+use singularity_protocol::ConversationRole;
 use singularity_store::{SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
@@ -240,13 +240,6 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .unwrap();
     assert_eq!(turn[0]["error"]["code"], -32602);
     assert_eq!(turn[0]["error"]["message"], "Invalid params");
-
-    let missing_trace = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"trace/list","id":6,"params":{"runId":"missing"}}"#,
-        )
-        .unwrap();
-    assert_eq!(missing_trace[0]["error"]["code"], -32601);
 
     let archived = server
         .handle_json(&format!(
@@ -751,13 +744,6 @@ fn public_agent_host_rejection_does_not_create_turn() {
 
     assert_eq!(response[0]["error"]["code"], -32602);
     assert_eq!(response[0]["error"]["message"], "Invalid params");
-    let trace = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":10}}}}"#
-        ))
-        .unwrap();
-    let serialized = serde_json::to_string(&trace).expect("serialize trace");
-    assert!(!serialized.contains("turn started"));
 }
 
 #[test]
@@ -951,28 +937,6 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
         singularity_protocol::TurnStatus::Interrupted
     );
     assert_eq!(persisted.agent_loop_status, "cancelled");
-    let traces = store.list_trace(&thread_id).expect("turn trace");
-    let terminal_trace = traces
-        .iter()
-        .find(|trace| trace.component == "agent_loop")
-        .expect("terminal agent trace");
-    assert_eq!(terminal_trace.payload["status"], "cancelled");
-    assert!(
-        !terminal_trace
-            .payload
-            .to_string()
-            .contains("late completion")
-    );
-    let writer_visible = traces
-        .iter()
-        .flat_map(|trace| trace.metric_samples.iter())
-        .filter(|sample| sample.kind == TraceMetricSampleKind::WriterVisible)
-        .map(|sample| sample.count)
-        .sum::<u64>();
-    assert!(
-        writer_visible > 0,
-        "turn-bound stdout frames were not traced"
-    );
 }
 
 #[cfg(windows)]
@@ -1028,10 +992,6 @@ fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_mess
         .expect("thread history");
     assert!(history.messages.iter().any(|message| {
         message.role == ConversationRole::Assistant && message.content == "streamed answer"
-    }));
-    let traces = store.list_trace(&thread_id).expect("provider trace");
-    assert!(traces.iter().any(|event| {
-        event.payload["status"] == "completed" && event.payload["model_turns"] == 1
     }));
 }
 
@@ -1170,14 +1130,6 @@ fn turn_status_recovers_an_unowned_running_turn() {
         response[0]["result"]["turn"]["agent_loop_status"],
         "interrupted"
     );
-    let traces = SessionStore::open(&db_path)
-        .expect("reopen store")
-        .list_trace(&thread.thread_id)
-        .expect("recovery trace");
-    assert!(traces.iter().any(|event| {
-        event.session_id == turn.turn_id
-            && event.payload["recovery_reason"] == "execution_owner_lost"
-    }));
 }
 
 #[test]

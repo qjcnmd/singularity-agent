@@ -1,6 +1,7 @@
 //! AppServer construction, turn supervision, cancellation, and shutdown.
 
 use super::*;
+use std::cell::RefCell;
 
 impl AppServer {
     /// 使用平台沙箱和已捕获的模型提供方配置快照创建未初始化的服务。
@@ -16,7 +17,6 @@ impl AppServer {
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             output_order: OutputOrderCoordinator::new(),
-            pending_transport_trace_binding: None,
             test_provider_override: None,
         }
     }
@@ -59,11 +59,6 @@ impl AppServer {
         self.output_order.clone()
     }
 
-    /// 为唯一 stdout transport 打开独立、身份校验的 SQLite trace 连接。
-    pub fn transport_trace_store(&self) -> AppServerResult<SessionStore> {
-        self.store.trusted_reopen().map_err(Into::into)
-    }
-
     /// 为请求工作线程打开独立的存储连接，同时共享停止和事件订阅状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
@@ -77,7 +72,6 @@ impl AppServer {
             steer_handles: Arc::clone(&self.steer_handles),
             execution_stopped: Arc::clone(&self.execution_stopped),
             output_order: self.output_order.clone(),
-            pending_transport_trace_binding: None,
             test_provider_override: self.test_provider_override.clone(),
         })
     }
@@ -144,14 +138,7 @@ impl AppServer {
 
     pub(super) fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
-        let trace_binding = RefCell::new(None);
-        let result = self.handle_turn_start_streaming_values(
-            message,
-            |binding| *trace_binding.borrow_mut() = Some(binding),
-            |message| messages.push(message),
-        );
-        self.pending_transport_trace_binding = trace_binding.into_inner();
-        result?;
+        self.handle_turn_start_streaming_values(message, |message| messages.push(message))?;
         Ok(messages)
     }
 
@@ -212,7 +199,6 @@ impl AppServer {
         if is_terminal_turn_status(&turn.status) {
             return json_response(message.required_id(), TurnResult { turn });
         }
-        let thread_id = turn.thread_id.clone();
         if let Some(cancellation) = self
             .active_turns
             .lock()
@@ -222,22 +208,7 @@ impl AppServer {
         {
             cancellation.cancel();
         }
-        let trace = TraceEvent {
-            payload: json!({
-                "turn_id": turn.turn_id,
-                "agent_loop_status": AgentStatus::CancelRequested.as_str(),
-            }),
-            ..TraceEvent::for_turn(
-                format!("trace_{}_pause_requested", turn.turn_id),
-                thread_id,
-                turn.turn_id.clone(),
-                "app_server",
-                "turn pause requested",
-            )
-        };
-        let turn = self
-            .store
-            .request_turn_cancellation(&params.turn_id, &trace)?;
+        let turn = self.store.request_turn_cancellation(&params.turn_id)?;
         json_response(message.required_id(), TurnResult { turn })
     }
 
@@ -245,14 +216,7 @@ impl AppServer {
     /// callers from issuing a duplicate first `ModelTurnRequest`.
     pub(super) fn turn_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
-        let trace_binding = RefCell::new(None);
-        let result = self.handle_turn_resume_streaming_values(
-            message,
-            |binding| *trace_binding.borrow_mut() = Some(binding),
-            |message| messages.push(message),
-        );
-        self.pending_transport_trace_binding = trace_binding.into_inner();
-        result?;
+        self.handle_turn_resume_streaming_values(message, |message| messages.push(message))?;
         Ok(messages)
     }
 
@@ -264,20 +228,15 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let trace_binding = RefCell::new(None);
-        let result = self.handle_turn_resume_streaming_values(
-            message,
-            |binding| *trace_binding.borrow_mut() = Some(binding),
-            |message| {
-                if sequencing_error.is_some() {
-                    return;
-                }
-                match sequence_output(&coordinator, message, trace_binding.borrow().clone()) {
-                    Ok(output) => emit(output),
-                    Err(error) => sequencing_error = Some(error),
-                }
-            },
-        );
+        let result = self.handle_turn_resume_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => emit(output),
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -287,7 +246,6 @@ impl AppServer {
     fn handle_turn_resume_streaming_values(
         &mut self,
         message: JsonRpcMessage,
-        mut bind_trace: impl FnMut(TransportTraceBinding),
         mut emit: impl FnMut(Value),
     ) -> AppServerResult<()> {
         let params: TurnIdParams = parse_params(&message)?;
@@ -328,10 +286,6 @@ impl AppServer {
             return Ok(());
         };
         let (cancellation, mut active_turn) = self.activate_turn(&current.turn_id)?;
-        bind_trace(TransportTraceBinding::for_turn(
-            thread.thread_id.clone(),
-            current.turn_id.clone(),
-        ));
         let mut assistant_events =
             AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
         active_turn.start_monitor();
@@ -517,20 +471,15 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let trace_binding = RefCell::new(None);
-        let result = self.handle_turn_start_streaming_values(
-            message,
-            |binding| *trace_binding.borrow_mut() = Some(binding),
-            |message| {
-                if sequencing_error.is_some() {
-                    return;
-                }
-                match sequence_output(&coordinator, message, trace_binding.borrow().clone()) {
-                    Ok(output) => emit(output),
-                    Err(error) => sequencing_error = Some(error),
-                }
-            },
-        );
+        let result = self.handle_turn_start_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => emit(output),
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -545,22 +494,18 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let result = self.handle_turn_start_streaming_values(
-            message,
-            |_| {},
-            |message| {
-                if sequencing_error.is_some() {
-                    return;
+        let result = self.handle_turn_start_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => {
+                    coordinator.complete(output.reservation.order);
+                    emit(output.message);
                 }
-                match sequence_output(&coordinator, message, None) {
-                    Ok(output) => {
-                        coordinator.complete(output.reservation.order);
-                        emit(output.message);
-                    }
-                    Err(error) => sequencing_error = Some(error),
-                }
-            },
-        );
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -571,7 +516,6 @@ impl AppServer {
     pub(super) fn handle_turn_start_streaming_values(
         &mut self,
         message: JsonRpcMessage,
-        mut bind_trace: impl FnMut(TransportTraceBinding),
         mut emit: impl FnMut(Value),
     ) -> AppServerResult<()> {
         if message.method_name() != Some(Method::TurnStart.as_str()) {
@@ -623,19 +567,15 @@ impl AppServer {
         let allocated_turn_id = SessionStore::allocate_turn_id();
         let (cancellation, mut active_turn) =
             self.prepare_turn_activation(allocated_turn_id.as_str())?;
-        let started = match self
-            .store
-            .create_allocated_turn_with_input_trace_and_history(
-                allocated_turn_id,
-                CreateStartedTurnParams {
-                    thread_id: &params.thread_id,
-                    agent_loop_status: AgentStatus::Running.as_str(),
-                    input: payload,
-                    component: "app_server",
-                    summary: "turn started",
-                    history_turn_limit: DEFAULT_THREAD_HISTORY_TURN_LIMIT,
-                },
-            ) {
+        let started = match self.store.create_allocated_turn_with_input_and_history(
+            allocated_turn_id,
+            CreateStartedTurnParams {
+                thread_id: &params.thread_id,
+                agent_loop_status: AgentStatus::Running.as_str(),
+                input: payload,
+                history_turn_limit: DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+            },
+        ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
                 emit_messages(
@@ -659,10 +599,6 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let turn = started.turn;
-        bind_trace(TransportTraceBinding::for_turn(
-            turn.thread_id.clone(),
-            turn.turn_id.clone(),
-        ));
         let mut assistant_events =
             AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
         active_turn.start_monitor();
@@ -961,7 +897,6 @@ impl AppServer {
         authority: TurnOutcomeAuthority,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
-        let event = agent_loop_trace(turn, run_status);
         self.store.commit_turn_outcome_with_authority(
             &turn.turn_id,
             CommitTurnOutcomeParams {
@@ -969,7 +904,6 @@ impl AppServer {
                 agent_loop_status: run_status.status.as_str(),
                 assistant_item_id: assistant_delta.as_ref().and(assistant_item_id),
                 assistant_delta: assistant_delta.as_deref(),
-                trace: &event,
             },
             authority,
         )
@@ -1000,7 +934,6 @@ impl AppServer {
                 .to_wire_value(),
             ]);
         }
-        let thread_id = turn.thread_id.clone();
         if let Some(cancellation) = self
             .active_turns
             .lock()
@@ -1010,22 +943,7 @@ impl AppServer {
         {
             cancellation.cancel();
         }
-        let trace = TraceEvent {
-            payload: json!({
-                "turn_id": turn.turn_id,
-                "agent_loop_status": AgentStatus::CancelRequested.as_str(),
-            }),
-            ..TraceEvent::for_turn(
-                format!("trace_{}_interrupt_requested", turn.turn_id),
-                thread_id,
-                turn.turn_id.clone(),
-                "app_server",
-                "turn interrupt requested",
-            )
-        };
-        let turn = self
-            .store
-            .request_turn_cancellation(&turn.turn_id, &trace)?;
+        let turn = self.store.request_turn_cancellation(&turn.turn_id)?;
         let status = if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() {
             AgentStatus::CancelRequested.as_str()
         } else {

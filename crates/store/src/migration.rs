@@ -49,11 +49,6 @@ const KNOWN_LEGACY_MIGRATIONS: [&str; 13] = [
     TURN_RESUME_CHECKPOINT_SCHEMA_MIGRATION,
 ];
 
-// Hashing was introduced during the schema-v5 lifetime, so released v1-v9
-// stores can still contain pre-hash rows. Those rows are re-sanitized during
-// migration; the v10 contract and later schemas require hash verification.
-const TRACE_PAYLOAD_HASH_REQUIRED_SCHEMA_VERSION: u32 = 10;
-
 #[derive(Debug, Clone)]
 struct LegacyThreadRow {
     thread_id: String,
@@ -83,23 +78,10 @@ struct LegacyItemRow {
 }
 
 #[derive(Debug, Clone)]
-struct LegacyTraceRow {
-    event: TraceEvent,
-    internal_payload: Option<Value>,
-}
-
-#[derive(Debug, Clone)]
-struct LegacyArtifactRow {
-    artifact: ArtifactRef,
-}
-
-#[derive(Debug, Clone)]
 struct LegacyData {
     threads: Vec<LegacyThreadRow>,
     turns: Vec<LegacyTurnRow>,
     items: Vec<LegacyItemRow>,
-    traces: Vec<LegacyTraceRow>,
-    artifacts: Vec<LegacyArtifactRow>,
 }
 
 pub(crate) fn initialize_or_validate_schema(connection: &Connection) -> StoreResult<()> {
@@ -146,7 +128,8 @@ fn create_v12_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-// 当前 schema 的 threads 定义：policy 快照列已随 approval/sandbox 消费面删除。
+// 当前 schema 的 threads 定义：policy 快照列已随 approval/sandbox 消费面删除；
+// trace/artifact 表已随 trace 全链删除（旧库迁移时直接丢弃）。
 const CURRENT_SCHEMA_SQL: &str = r#"
 create table schema_meta(
 schema_version integer not null check(schema_version = 11)
@@ -181,23 +164,6 @@ payload text not null,
 status text not null check(status in ('started', 'completed')),
 redacted integer not null check(redacted in (0, 1)),
 foreign key(turn_id) references turns(turn_id)
-);
-create table trace_events(
-event_id text primary key,
-run_id text not null,
-session_id text not null default '',
-payload text not null
-);
-create table artifact_refs(
-artifact_id text primary key,
-run_id text not null,
-item_id text,
-kind text not null,
-uri text not null,
-content_digest text not null,
-summary text not null,
-metadata text not null,
-redacted integer not null check(redacted in (0, 1))
 );
 "#;
 
@@ -305,20 +271,17 @@ create index approvals_turn_lookup on approvals(turn_id, decision_outcome, reque
 create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
 "#;
 
-// 当前 schema 的索引面：V11 指纹保留 approval 索引供旧库校验，当前库不再创建。
+// 当前 schema 的索引面：V11 指纹保留 approval/trace 索引供旧库校验，当前库不再创建。
 const CURRENT_INDEX_SQL: &str = r#"
 create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
 create unique index items_turn_sequence_unique on items(turn_id, item_sequence);
 create index turns_history_lookup on turns(thread_id, status, turn_sequence);
 create index items_history_lookup on items(turn_id, status, kind, item_sequence);
-create index trace_run_lookup on trace_events(run_id, event_id);
 "#;
 
 // Recovery tables are introduced with the current schema and must not be part
 // of the released v11 fingerprint used to validate legacy databases.
 const V13_RECOVERY_INDEX_SQL: &str = r#"
-create unique index turn_checkpoints_turn_unique on turn_checkpoints(turn_id);
-create index tool_executions_turn_state on tool_executions(turn_id, execution_state, execution_id);
 create unique index turn_inputs_item_unique on turn_inputs(item_id);
 create index turn_inputs_pending on turn_inputs(turn_id, delivery_state, delivery, item_id);
 "#;
@@ -393,12 +356,12 @@ end;
 "#;
 
 fn v12_index_sql() -> String {
-    format!("{CURRENT_INDEX_SQL}{V13_RECOVERY_INDEX_SQL}{V12_TRACE_INDEX_SQL}{V12_TRACE_TRIGGER_SQL}")
+    format!("{CURRENT_INDEX_SQL}{V13_RECOVERY_INDEX_SQL}")
 }
 
 // Reconstruct the released v12 shape so an existing v12 store can be upgraded
-// transactionally to the current v13 checkpoint schema. The only v13 additions
-// are the resumable turn states, checkpoint/execution state, and interactive input delivery.
+// transactionally to the current v13 schema. This legacy shape keeps the typed
+// trace span columns and recovery tables for fingerprint validation of old stores.
 fn canonical_v12_legacy_schema_sql(suffix: &str) -> String {
     let mut sql = legacy_v11_schema_sql(suffix);
     sql = sql.replace("schema_version = 11", "schema_version = 12");
@@ -435,6 +398,8 @@ check(parent_span_id is null or parent_span_id <> span_id)\n\
     sql.replace(&old_trace, &new_trace)
 }
 
+// Build the current schema shape from CURRENT_SCHEMA_SQL: v13 turn states,
+// pause_requested column, and the durable turn_inputs delivery table.
 fn canonical_v12_schema_sql(suffix: &str) -> String {
     let mut sql = canonical_v11_schema_sql(suffix);
     sql = sql.replace("schema_version = 11", "schema_version = 13");
@@ -448,27 +413,7 @@ fn canonical_v12_schema_sql(suffix: &str) -> String {
     );
     let table_suffix = suffix;
     sql.push_str(&format!(
-        "\ncreate table turn_checkpoints{table_suffix}(\n\
-turn_id text primary key,\n\
-thread_id text not null,\n\
-payload text not null check(json_valid(payload)),\n\
-checkpoint_version integer not null check(checkpoint_version > 0),\n\
-created_at text not null default current_timestamp,\n\
-foreign key(turn_id) references turns(turn_id),\n\
-foreign key(thread_id) references threads(thread_id)\n\
-);\n\
-create table tool_executions{table_suffix}(\n\
-execution_id text primary key,\n\
-thread_id text not null,\n\
-turn_id text not null,\n\
-tool_call_id text not null,\n\
-execution_state text not null check(execution_state in ('running', 'unknown')),\n\
-payload text not null check(json_valid(payload)),\n\
-started_at text not null default current_timestamp,\n\
-foreign key(turn_id) references turns(turn_id),\n\
-foreign key(thread_id) references threads(thread_id)\n\
-);\n\
-create table turn_inputs{table_suffix}(\n\
+        "\ncreate table turn_inputs{table_suffix}(\n\
 input_id text primary key,\n\
 turn_id text not null,\n\
 item_id text not null,\n\
@@ -482,40 +427,7 @@ foreign key(turn_id) references turns(turn_id),\n\
 foreign key(item_id) references items(item_id)\n\
 );\n"
     ));
-    let old_trace = format!(
-        "create table trace_events{suffix}(\n\
-event_id text primary key,\n\
-run_id text not null,\n\
-session_id text not null default '',\n\
-payload text not null\n\
-);"
-    );
-    let new_trace = format!(
-        "create table trace_events{suffix}(\n\
-event_id text primary key,\n\
-run_id text not null,\n\
-session_id text not null default '',\n\
-payload text not null,\n\
-span_id text\n    check(span_id is null or length(trim(span_id)) > 0),\n\
-parent_span_id text\n    check(parent_span_id is null or length(trim(parent_span_id)) > 0),\n\
-  span_kind text\n    check(span_kind in ('task', 'turn', 'prompt_assembly', 'provider_attempt', 'tool_call',\n                        'policy_decision', 'approval_wait', 'sandbox_execution',\n                        'verification', 'final_review')\n          or span_kind is null),\n\
-span_phase text\n    check(span_phase in ('start', 'end') or span_phase is null),\n\
-  span_status text\n    check(span_status in ('unset', 'ok', 'error', 'cancelled') or span_status is null),\n\
-duration_ms integer\n    check(duration_ms >= 0 or duration_ms is null),\n\
-  time_to_first_token_ms integer\n    check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),\n\
-  span_projection text\n    check(span_projection is null or json_valid(span_projection)),\n\
-  metric_samples text not null default '[]'\n    check(json_valid(metric_samples) and json_type(metric_samples) = 'array'),\n\
-  check((span_id is null and parent_span_id is null and span_kind is null\n       and span_phase is null and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and span_projection is null)\n      or (span_id is not null and span_kind is not null and span_phase is not null)),\n\
-  check((span_phase = 'start' and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and metric_samples = '[]')\n      or (span_phase = 'end' and span_status is not null and duration_ms is not null)\n      or span_phase is null),\n\
-check(time_to_first_token_ms is null or span_kind = 'provider_attempt'),\n\
-check(time_to_first_token_ms is null or duration_ms is null\n      or time_to_first_token_ms <= duration_ms),\n\
-check(parent_span_id is null or parent_span_id <> span_id)\n\
-);"
-    );
-    if !sql.contains(&old_trace) {
-        return sql;
-    }
-    sql.replace(&old_trace, &new_trace)
+    sql
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -846,15 +758,7 @@ fn canonical_v11_schema_sql(suffix: &str) -> String {
         return CURRENT_SCHEMA_SQL.to_string();
     }
     let mut sql = CURRENT_SCHEMA_SQL.to_string();
-    for table in [
-        "schema_meta",
-        "schema_migrations",
-        "trace_events",
-        "artifact_refs",
-        "threads",
-        "turns",
-        "items",
-    ] {
+    for table in ["schema_meta", "schema_migrations", "threads", "turns", "items"] {
         sql = sql.replace(table, &format!("{table}{suffix}"));
     }
     sql
@@ -1256,200 +1160,6 @@ fn read_legacy_items(connection: &Connection, legacy: bool) -> StoreResult<Vec<L
     }
     Ok(items)
 }
-
-fn read_legacy_traces(
-    connection: &Connection,
-    threads: &[LegacyThreadRow],
-    turns: &[LegacyTurnRow],
-    allow_repair: bool,
-    version: u32,
-) -> StoreResult<Vec<LegacyTraceRow>> {
-    if !table_exists(connection, "trace_events")? {
-        return Ok(Vec::new());
-    }
-    let has_session_id = table_has_column(connection, "trace_events", "session_id")?;
-    let query = if has_session_id {
-        "select event_id, run_id, session_id, payload from trace_events order by rowid"
-    } else {
-        "select event_id, run_id, null, payload from trace_events order by rowid"
-    };
-    let mut statement = connection.prepare(query)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let thread_ids = threads
-        .iter()
-        .map(|thread| thread.thread_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut turns_by_id = BTreeMap::new();
-    for turn in turns {
-        if turns_by_id.insert(turn.turn_id.as_str(), turn).is_some() {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate turn {} while resolving traces",
-                turn.turn_id
-            )));
-        }
-    }
-    let mut traces = Vec::new();
-    for row in rows {
-        let (event_id, run_id, stored_session_id, payload) = row?;
-        let mut envelope: Value = serde_json::from_str(&payload).map_err(|error| {
-            StoreError::InvalidState(format!("trace {event_id} payload is invalid: {error}"))
-        })?;
-        let internal_payload = envelope
-            .as_object_mut()
-            .and_then(|fields| fields.remove(TRACE_INTERNAL_PAYLOAD_KEY));
-        if internal_payload
-            .as_ref()
-            .is_some_and(|payload| !payload.is_object())
-        {
-            return Err(StoreError::TraceIntegrity(format!(
-                "trace {event_id} internal payload is not an object"
-            )));
-        }
-        let mut event: TraceEvent = serde_json::from_value(envelope).map_err(|error| {
-            StoreError::InvalidState(format!("trace {event_id} payload is invalid: {error}"))
-        })?;
-        if event.event_id != event_id || event.run_id != run_id {
-            return Err(StoreError::InvalidState(format!(
-                "trace {event_id} columns do not match payload"
-            )));
-        }
-        if let Some(stored_session_id) = stored_session_id.as_deref()
-            && stored_session_id != event.session_id
-            && !(allow_repair && stored_session_id.is_empty())
-        {
-            return Err(StoreError::InvalidState(format!(
-                "trace {event_id} session_id column does not match payload"
-            )));
-        }
-        let mut session_id = event.session_id.clone();
-        let mut task_id = event.task_id.clone();
-        if let Some(task_id_value) = task_id.as_deref() {
-            let turn = turns_by_id.get(task_id_value).ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "trace {event_id} task_id does not identify an existing turn"
-                ))
-            })?;
-            if turn.thread_id != event.run_id {
-                return Err(StoreError::InvalidState(format!(
-                    "trace {event_id} task_id is bound to another thread"
-                )));
-            }
-            if session_id == turn.thread_id || session_id.is_empty() {
-                if !allow_repair {
-                    return Err(StoreError::InvalidState(format!(
-                        "trace {event_id} has an unnormalized turn binding"
-                    )));
-                }
-                session_id = task_id_value.to_string();
-            } else if session_id != task_id_value {
-                return Err(StoreError::InvalidState(format!(
-                    "trace {event_id} has an ambiguous turn binding"
-                )));
-            }
-        } else if let Some(thread_id) = thread_ids.get(event.run_id.as_str()) {
-            if session_id == *thread_id {
-                // Thread-level events use the thread as their session identity.
-            } else if let Some(turn) = turns_by_id.get(session_id.as_str()) {
-                if turn.thread_id != event.run_id {
-                    return Err(StoreError::InvalidState(format!(
-                        "trace {event_id} session_id is bound to another thread"
-                    )));
-                }
-                if !allow_repair {
-                    return Err(StoreError::InvalidState(format!(
-                        "trace {event_id} is missing task_id for a turn binding"
-                    )));
-                }
-                task_id = Some(turn.turn_id.clone());
-            } else {
-                return Err(StoreError::InvalidState(format!(
-                    "trace {event_id} has an unknown turn session binding"
-                )));
-            }
-        } else if let Some(turn) = turns_by_id.get(session_id.as_str()) {
-            if turn.thread_id != event.run_id {
-                return Err(StoreError::InvalidState(format!(
-                    "trace {event_id} session_id is bound to another thread"
-                )));
-            }
-            if !allow_repair {
-                return Err(StoreError::InvalidState(format!(
-                    "trace {event_id} is missing task_id for a turn binding"
-                )));
-            }
-            task_id = Some(turn.turn_id.clone());
-        }
-        event.task_id = task_id;
-        event.session_id = session_id;
-        if let Some(turn_id) = event.task_id.as_deref() {
-            let turn = turns_by_id.get(turn_id).ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "trace {event_id} task_id does not identify an existing turn"
-                ))
-            })?;
-            event
-                .validate_turn_binding(&turn.thread_id, &turn.turn_id)
-                .map_err(|error| {
-                    StoreError::InvalidState(format!("trace {event_id} binding invalid: {error}"))
-                })?;
-        }
-        event
-            .validate_span_lifecycle()
-            .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
-        if event.redaction_applied {
-            if version < TRACE_PAYLOAD_HASH_REQUIRED_SCHEMA_VERSION && event.payload_hash.is_empty()
-            {
-                event = sanitize_trace_event(&event);
-            } else {
-                let expected_hash = if version <= 11 {
-                    trace_payload_hash(&event.payload)
-                } else {
-                    trace_envelope_hash_with_internal(&event, internal_payload.as_ref())
-                };
-                if event.payload_hash != expected_hash {
-                    return Err(StoreError::TraceIntegrity(format!(
-                        "trace envelope hash mismatch for {event_id}"
-                    )));
-                }
-                if version <= 11 {
-                    event = sanitize_trace_event(&event);
-                }
-            }
-        } else if allow_repair {
-            event = sanitize_trace_event(&event);
-        } else {
-            return Err(StoreError::TraceIntegrity(format!(
-                "stored trace {event_id} was not sanitized"
-            )));
-        }
-        traces.push(LegacyTraceRow {
-            event,
-            internal_payload,
-        });
-    }
-    Ok(traces)
-}
-fn read_legacy_artifacts(connection: &Connection) -> StoreResult<Vec<LegacyArtifactRow>> {
-    if !table_exists(connection, "artifact_refs")? {
-        return Ok(Vec::new());
-    }
-    let mut statement = connection.prepare(
-        "select artifact_id, run_id, item_id, kind, uri, content_digest,
-            summary, metadata, redacted
-     from artifact_refs order by rowid",
-    )?;
-    let rows = statement.query_map([], artifact_from_row)?;
-    rows.map(|row| Ok(LegacyArtifactRow { artifact: row? }))
-        .collect()
-}
-
 fn validate_legacy_sequences(data: &LegacyData, version: u32) -> StoreResult<()> {
     let mut thread_ids = BTreeSet::new();
     for thread in &data.threads {
@@ -1518,28 +1228,6 @@ fn validate_legacy_sequences(data: &LegacyData, version: u32) -> StoreResult<()>
             )));
         }
     }
-    let mut trace_ids = BTreeSet::new();
-    for trace in &data.traces {
-        if trace.event.event_id.trim().is_empty()
-            || !trace_ids.insert(trace.event.event_id.as_str())
-        {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate or empty trace event {}",
-                trace.event.event_id
-            )));
-        }
-    }
-    let mut artifact_ids = BTreeSet::new();
-    for artifact in &data.artifacts {
-        if artifact.artifact.artifact_id.trim().is_empty()
-            || !artifact_ids.insert(artifact.artifact.artifact_id.as_str())
-        {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate or empty artifact {}",
-                artifact.artifact.artifact_id
-            )));
-        }
-    }
     if version >= 6 {
         let has_sequence_columns = table_has_column_from_data_marker(version);
         if !has_sequence_columns {
@@ -1557,11 +1245,7 @@ const fn table_has_column_from_data_marker(version: u32) -> bool {
     version >= 6
 }
 
-fn read_legacy_data(
-    connection: &Connection,
-    version: u32,
-    allow_trace_repair: bool,
-) -> StoreResult<LegacyData> {
+fn read_legacy_data(connection: &Connection, version: u32) -> StoreResult<LegacyData> {
     require_legacy_tables(connection)?;
     if version < SCHEMA_VERSION {
         validate_legacy_schema_fingerprint(connection, version)?;
@@ -1572,34 +1256,22 @@ fn read_legacy_data(
     let threads = read_legacy_threads(connection, legacy)?;
     let turns = read_legacy_turns(connection, legacy)?;
     let items = read_legacy_items(connection, legacy)?;
-    let traces = read_legacy_traces(connection, &threads, &turns, allow_trace_repair, version)?;
-    let artifacts = read_legacy_artifacts(connection)?;
     let data = LegacyData {
         threads,
         turns,
         items,
-        traces,
-        artifacts,
     };
     validate_legacy_sequences(&data, version)?;
-    validate_trace_span_batch(
-        &data
-            .traces
-            .iter()
-            .map(|trace| trace.event.clone())
-            .collect::<Vec<_>>(),
-    )?;
     Ok(data)
 }
 
 fn migrate_legacy_schema(connection: &Connection, version: u32) -> StoreResult<()> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-    // This is deliberately the first schema/data write boundary. Enum,
-    // approval, opaque-checkpoint syntax, trace, and schema inputs are
-    // validated first.
+    // This is deliberately the first schema/data write boundary. Enum and
+    // schema inputs are validated before any write.
     // Foreign keys remain enabled: replacement rows are inserted parent-first
     // and legacy tables are removed child-first within this transaction.
-    let data = read_legacy_data(&transaction, version, true)?;
+    let data = read_legacy_data(&transaction, version)?;
     write_v12_tables(&transaction, &data)?;
     // Validate the fully rebuilt schema while the old database is still
     // recoverable by the transaction. A post-commit validation cannot
@@ -1638,85 +1310,16 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     }
     for item in &data.items {
         connection.execute(
-        "insert into items_v12(item_id, turn_id, item_sequence, kind, payload, status, redacted)
+            "insert into items_v12(item_id, turn_id, item_sequence, kind, payload, status, redacted)
          values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            item.item_id,
-            item.turn_id,
-            item.item_sequence,
-            item.kind.to_db_text(),
-            serde_json::to_string(&item.payload)?,
-            item.status.to_db_text(),
-            item.redacted,
-        ],
-    )?;
-    }
-    for trace in &data.traces {
-        let mut event = sanitize_trace_event(&trace.event);
-        if let Some(internal_payload) = trace.internal_payload.as_ref() {
-            event.payload_hash = trace_envelope_hash_with_internal(&event, Some(internal_payload));
-        }
-        let payload = encode_trace_payload(&event, trace.internal_payload.as_ref())?;
-        let span_projection = event
-            .span_projection
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let metric_samples = serde_json::to_string(&event.metric_samples)?;
-        connection.execute(
-            "insert into trace_events_v12(
-                event_id, run_id, session_id, payload, span_id, parent_span_id,
-                span_kind, span_phase, span_status, duration_ms,
-                time_to_first_token_ms, span_projection, metric_samples
-             ) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
-                event.event_id,
-                event.run_id,
-                event.session_id,
-                payload,
-                event.span_id,
-                event.parent_span_id,
-                event.span_kind.map(TraceSpanKind::as_storage_text),
-                event.span_phase.map(TraceSpanPhase::as_storage_text),
-                event.span_status.map(TraceSpanStatus::as_storage_text),
-                event
-                    .duration_ms
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        StoreError::InvalidState("trace duration exceeds SQLite range".to_string())
-                    })?,
-                event
-                    .time_to_first_token_ms
-                    .map(i64::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        StoreError::InvalidState(
-                            "trace time to first token exceeds SQLite range".to_string(),
-                        )
-                    })?,
-                span_projection,
-                metric_samples,
-            ],
-        )?;
-    }
-    for artifact in &data.artifacts {
-        let artifact = &artifact.artifact;
-        connection.execute(
-            "insert into artifact_refs_v12(
-             artifact_id, run_id, item_id, kind, uri, content_digest,
-             summary, metadata, redacted
-         ) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                artifact.artifact_id,
-                artifact.run_id,
-                artifact.item_id,
-                artifact.kind,
-                artifact.uri,
-                artifact.content_digest,
-                artifact.summary,
-                serde_json::to_string(&artifact.metadata)?,
-                artifact.redacted,
+                item.item_id,
+                item.turn_id,
+                item.item_sequence,
+                item.kind.to_db_text(),
+                serde_json::to_string(&item.payload)?,
+                item.status.to_db_text(),
+                item.redacted,
             ],
         )?;
     }
@@ -1732,7 +1335,8 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     )?;
 
     // Existing foreign-key tables are replaced only after all transformed rows
-    // have been accepted by the new schema.
+    // have been accepted by the new schema. Legacy trace/artifact/approval rows
+    // are deliberately dropped: their product surfaces no longer exist.
     connection.execute_batch(
         r#"
     drop table if exists active_sidecar_runs;
@@ -1754,10 +1358,6 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     alter table threads_v12 rename to threads;
     alter table turns_v12 rename to turns;
     alter table items_v12 rename to items;
-    alter table trace_events_v12 rename to trace_events;
-    alter table artifact_refs_v12 rename to artifact_refs;
-    alter table turn_checkpoints_v12 rename to turn_checkpoints;
-    alter table tool_executions_v12 rename to tool_executions;
     alter table turn_inputs_v12 rename to turn_inputs;
     "#,
     )?;
@@ -1767,8 +1367,7 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
 
 fn validate_v12_schema(connection: &Connection) -> StoreResult<()> {
     validate_v12_structure(connection)?;
-    read_legacy_data(connection, SCHEMA_VERSION, false)?;
-    validate_trace_span_rows(connection)?;
+    read_legacy_data(connection, SCHEMA_VERSION)?;
     fail_closed_on_foreign_key_violations(connection, "current schema validation")?;
     Ok(())
 }

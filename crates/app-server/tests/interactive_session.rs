@@ -367,64 +367,56 @@ fn thread_start_freezes_resolved_default_selector_when_model_is_omitted() {
     process.shutdown(3);
 }
 
-// 启动恢复 E2E：预置一个可归属损坏 turn（suspended 缺 checkpoint）与一个健康
-// suspended turn（有 checkpoint），同一 App Server 启动成功后坏 turn 收敛为
-// interrupted，健康 turn 保持可恢复；坏 turn 不阻断启动。
+// 启动恢复 E2E：预置两个无 checkpoint 的非终态 turn（suspended），同一 App
+// Server 启动成功后全部收敛为 interrupted，且不阻断启动（新核心无 checkpoint
+// 语义，owner 丢失的非终态 turn 统一终态化）。
 #[test]
-fn app_server_starts_with_inconsistent_turn_and_healthier_turn_survives() {
+fn app_server_startup_terminalizes_ownerless_nonterminal_turns() {
     let provider = ControlledProvider::start();
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = create_workspace(dir.path());
     let db_path = dir.path().join("sessions.sqlite3");
 
     let store = SessionStore::open(&db_path).expect("preload store");
-    let bad_thread = store.create_thread(None, None).expect("bad thread");
-    let bad_turn = store
-        .create_turn(&bad_thread.thread_id, "running")
-        .expect("bad turn");
+    let first_thread = store.create_thread(None, None).expect("first thread");
+    let first_turn = store
+        .create_turn(&first_thread.thread_id, "running")
+        .expect("first turn");
     store
-        .update_turn_state(&bad_turn.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend bad turn");
-    let healthy_thread = store.create_thread(None, None).expect("healthy thread");
-    let healthy_turn = store
-        .create_turn(&healthy_thread.thread_id, "running")
-        .expect("healthy turn");
+        .update_turn_state(&first_turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend first turn");
+    let second_thread = store.create_thread(None, None).expect("second thread");
+    let second_turn = store
+        .create_turn(&second_thread.thread_id, "running")
+        .expect("second turn");
     store
-        .save_turn_checkpoint(
-            &healthy_turn.turn_id,
-            &healthy_thread.thread_id,
-            &json!({"checkpoint_version": 1, "boundary": "initial"}),
-            1,
-        )
-        .expect("healthy checkpoint");
-    store
-        .update_turn_state(&healthy_turn.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend healthy turn");
+        .update_turn_state(&second_turn.turn_id, TurnStatus::Suspended, "suspended")
+        .expect("suspend second turn");
     drop(store);
 
     let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
     process.initialize();
 
-    process.send_request(2, "turn/status", json!({"turnId": bad_turn.turn_id}));
-    let bad_response = process.output.recv_id(2, Duration::from_secs(5));
+    process.send_request(2, "turn/status", json!({"turnId": first_turn.turn_id}));
+    let first_response = process.output.recv_id(2, Duration::from_secs(5));
     assert_eq!(
-        bad_response["result"]["turn"]["status"], "interrupted",
-        "inconsistent turn must be terminalized during startup: {bad_response}"
+        first_response["result"]["turn"]["status"], "interrupted",
+        "ownerless turn must be terminalized during startup: {first_response}"
     );
     assert_eq!(
-        bad_response["result"]["turn"]["agent_loop_status"],
+        first_response["result"]["turn"]["agent_loop_status"],
         "interrupted"
     );
 
-    process.send_request(3, "turn/status", json!({"turnId": healthy_turn.turn_id}));
-    let healthy_response = process.output.recv_id(3, Duration::from_secs(5));
+    process.send_request(3, "turn/status", json!({"turnId": second_turn.turn_id}));
+    let second_response = process.output.recv_id(3, Duration::from_secs(5));
     assert_eq!(
-        healthy_response["result"]["turn"]["status"], "suspended",
-        "healthy suspended turn must remain resumable: {healthy_response}"
+        second_response["result"]["turn"]["status"], "interrupted",
+        "all ownerless turns must be terminalized: {second_response}"
     );
     assert_eq!(
-        healthy_response["result"]["turn"]["agent_loop_status"],
-        "suspended"
+        second_response["result"]["turn"]["agent_loop_status"],
+        "interrupted"
     );
 
     process.shutdown(4);
@@ -432,6 +424,8 @@ fn app_server_starts_with_inconsistent_turn_and_healthier_turn_survives() {
 
 // 非终态 turn 错误映射：thread/archive 与 turn/start 的 JSON-RPC error message
 // 携带已确认的 turn ID 与可操作提示（保留 error code，不新增协议字段）。
+// 启动恢复会终态化遗留非终态 turn，因此非终态 turn 在服务运行期间通过独立
+// store 连接创建。
 #[test]
 fn nonterminal_turn_errors_carry_turn_id_for_actionable_cli_hint() {
     let provider = ControlledProvider::start();
@@ -439,30 +433,18 @@ fn nonterminal_turn_errors_carry_turn_id_for_actionable_cli_hint() {
     let workspace = create_workspace(dir.path());
     let db_path = dir.path().join("sessions.sqlite3");
 
-    let store = SessionStore::open(&db_path).expect("preload store");
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+
+    // 服务启动恢复完成后，经独立 store 连接创建非终态 turn（running）。
+    let store = SessionStore::open(&db_path).expect("live store");
     let thread = store
         .create_thread(None, Some(&workspace.to_string_lossy()))
         .expect("thread");
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("running turn");
-    // 保存 checkpoint 并置为 suspended：启动恢复视其为健康非终态 turn（不终态化），
-    // 从而 thread/archive 与 turn/start 触发 nonterminal-turn 错误。
-    store
-        .save_turn_checkpoint(
-            &turn.turn_id,
-            &thread.thread_id,
-            &json!({ "checkpoint_version": 1, "boundary": "initial" }),
-            1,
-        )
-        .expect("turn checkpoint");
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Suspended, "suspended")
-        .expect("suspend turn");
     drop(store);
-
-    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
-    process.initialize();
 
     // thread/archive 触发 ThreadHasNonterminalTurn：消息含 turn ID 与操作提示。
     process.send_request(2, "thread/archive", json!({ "threadId": thread.thread_id }));
