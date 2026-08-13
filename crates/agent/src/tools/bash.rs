@@ -273,14 +273,23 @@ fn shell_command(command: &str) -> (String, Vec<String>) {
         if let Some(bash) = find_bash_on_windows() {
             return (bash, vec!["-c".to_string(), command.to_string()]);
         }
-        return ("cmd".to_string(), vec!["/C".to_string(), command.to_string()]);
+        return (
+            "cmd".to_string(),
+            vec!["/C".to_string(), command.to_string()],
+        );
     }
     #[cfg(not(windows))]
     {
         if Path::new("/bin/bash").exists() {
-            return ("/bin/bash".to_string(), vec!["-c".to_string(), command.to_string()]);
+            return (
+                "/bin/bash".to_string(),
+                vec!["-c".to_string(), command.to_string()],
+            );
         }
-        return ("sh".to_string(), vec!["-c".to_string(), command.to_string()]);
+        return (
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        );
     }
 }
 
@@ -299,7 +308,9 @@ fn find_bash_on_windows() -> Option<String> {
             }
         }
     }
-    candidates.into_iter().find(|candidate| Path::new(candidate).is_file())
+    candidates
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
 }
 
 /// 杀进程树：Windows 用 `taskkill /T /F`（含子进程），随后 `child.kill()` 兜底；
@@ -498,7 +509,11 @@ mod tests {
     fn small_output_is_returned_in_full() {
         let result = run("echo hello", None);
         assert!(!result.is_error, "unexpected error: {}", result.content);
-        assert!(result.content.contains("hello"), "content: {}", result.content);
+        assert!(
+            result.content.contains("hello"),
+            "content: {}",
+            result.content
+        );
         assert!(
             !result.content.contains("[Showing"),
             "small output must not be truncated: {}",
@@ -529,7 +544,10 @@ mod tests {
         let (shell, _) = shell_command("");
         let command = dump_command(&shell, &file);
         let result = run(&command, None);
-        eprintln!("PROBE CONTENT: {:?}", &result.content[..result.content.len().min(1200)]);
+        eprintln!(
+            "PROBE CONTENT: {:?}",
+            &result.content[..result.content.len().min(1200)]
+        );
         eprintln!("PROBE LEN: {}", result.content.len());
         assert!(!result.is_error, "unexpected error: {}", result.content);
         assert!(result.content.contains("line 2500"), "tail must be kept");
@@ -537,7 +555,10 @@ mod tests {
             !result.content.lines().any(|line| line == "line 1"),
             "head must be dropped"
         );
-        assert!(result.content.starts_with("line 501"), "tail starts at first kept line");
+        assert!(
+            result.content.starts_with("line 501"),
+            "tail starts at first kept line"
+        );
         assert!(result.content.contains("[Showing lines"), "missing note");
         assert!(result.content.contains("Full output:"), "missing path");
         let start = result.content.find("Full output: ").expect("marker") + "Full output: ".len();

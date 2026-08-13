@@ -189,7 +189,10 @@ mod tests {
         let registry = ToolRegistry::new();
         for expected in ["read", "bash", "edit", "write"] {
             assert!(registry.names().contains(&expected), "missing {expected}");
-            assert!(registry.get(expected).is_some(), "missing spec for {expected}");
+            assert!(
+                registry.get(expected).is_some(),
+                "missing spec for {expected}"
+            );
         }
     }
 
@@ -217,9 +220,11 @@ mod tests {
     #[test]
     fn unknown_tool_is_err() {
         let registry = ToolRegistry::new();
-        assert!(registry
-            .execute("nope", context(json!({}), Path::new(".")))
-            .is_err());
+        assert!(
+            registry
+                .execute("nope", context(json!({}), Path::new(".")))
+                .is_err()
+        );
     }
 
     #[test]
@@ -229,7 +234,11 @@ mod tests {
             .execute("bash", context(json!({}), Path::new(".")))
             .expect("execute");
         assert!(result.is_error);
-        assert!(result.content.contains("missing required parameter \"command\""));
+        assert!(
+            result
+                .content
+                .contains("missing required parameter \"command\"")
+        );
     }
 
     #[test]
@@ -239,14 +248,21 @@ mod tests {
             .execute("bash", context(json!({ "command": 42 }), Path::new(".")))
             .expect("execute");
         assert!(result.is_error);
-        assert!(result.content.contains("parameter \"command\" must be of type string"));
+        assert!(
+            result
+                .content
+                .contains("parameter \"command\" must be of type string")
+        );
     }
 
     #[test]
     fn unknown_parameter_is_error() {
         let registry = ToolRegistry::new();
         let result = registry
-            .execute("read", context(json!({ "path": "a.txt", "bogus": 1 }), Path::new(".")))
+            .execute(
+                "read",
+                context(json!({ "path": "a.txt", "bogus": 1 }), Path::new(".")),
+            )
             .expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("unknown parameter \"bogus\""));

@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn tail_truncation_keeps_last_lines() {
-        let content = (1..=2500).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=2500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let truncation = truncate_tail(&content);
         assert!(truncation.truncated);
         assert_eq!(truncation.truncated_by, Some(TruncatedBy::Lines));
@@ -197,7 +200,10 @@ mod tests {
 
     #[test]
     fn head_truncation_keeps_first_lines() {
-        let content = (1..=2500).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=2500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let truncation = truncate_head(&content);
         assert!(truncation.truncated);
         assert!(truncation.content.starts_with("line 1"));

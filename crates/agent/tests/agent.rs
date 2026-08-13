@@ -16,7 +16,8 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelErrorCategory, ModelToolCall,
     ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, OpenAiProvider,
-    OpenAiProviderConfig, Provider, ProviderConfigSource, ProviderProtocolContract, ProviderStreamEvent,
+    OpenAiProviderConfig, Provider, ProviderConfigSource, ProviderProtocolContract,
+    ProviderStreamEvent,
 };
 use singularity_policy::{
     PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,

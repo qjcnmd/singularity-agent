@@ -87,7 +87,10 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
         ));
     }
-    let final_content = format!("{bom}{}", restore_line_endings(&new_content, original_ending));
+    let final_content = format!(
+        "{bom}{}",
+        restore_line_endings(&new_content, original_ending)
+    );
     if let Err(error) = fs::write(&full_path, final_content) {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
@@ -138,18 +141,13 @@ fn generate_patch(path: &str, old_content: &str, new_content: &str) -> String {
     let old_lines: Vec<&str> = old_content.split('\n').collect();
     let new_lines: Vec<&str> = new_content.split('\n').collect();
     let mut first = 0;
-    while first < old_lines.len()
-        && first < new_lines.len()
-        && old_lines[first] == new_lines[first]
+    while first < old_lines.len() && first < new_lines.len() && old_lines[first] == new_lines[first]
     {
         first += 1;
     }
     let mut old_end = old_lines.len();
     let mut new_end = new_lines.len();
-    while old_end > first
-        && new_end > first
-        && old_lines[old_end - 1] == new_lines[new_end - 1]
-    {
+    while old_end > first && new_end > first && old_lines[old_end - 1] == new_lines[new_end - 1] {
         old_end -= 1;
         new_end -= 1;
     }

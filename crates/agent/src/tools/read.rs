@@ -66,7 +66,10 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let (selected_content, user_limited_lines) = match limit {
         Some(limit) => {
             let end = (start_line + limit as usize).min(total_file_lines);
-            (all_lines[start_line..end].join("\n"), Some(end - start_line))
+            (
+                all_lines[start_line..end].join("\n"),
+                Some(end - start_line),
+            )
         }
         None => (all_lines[start_line..].join("\n"), None),
     };
@@ -145,7 +148,10 @@ mod tests {
         let result = ToolRegistry::new()
             .execute(
                 "read",
-                context(json!({ "path": "sample.txt", "offset": 3, "limit": 2 }), dir.path()),
+                context(
+                    json!({ "path": "sample.txt", "offset": 3, "limit": 2 }),
+                    dir.path(),
+                ),
             )
             .expect("execute");
         assert!(!result.is_error, "content: {}", result.content);
@@ -166,14 +172,21 @@ mod tests {
             )
             .expect("execute");
         assert!(result.is_error);
-        assert!(result.content.contains("Offset 10 is beyond end of file (3 lines total)"));
+        assert!(
+            result
+                .content
+                .contains("Offset 10 is beyond end of file (3 lines total)")
+        );
     }
 
     #[test]
     fn missing_file_is_error() {
         let dir = tempdir().expect("temp dir");
         let result = ToolRegistry::new()
-            .execute("read", context(json!({ "path": "missing.txt" }), dir.path()))
+            .execute(
+                "read",
+                context(json!({ "path": "missing.txt" }), dir.path()),
+            )
             .expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("Could not read file"));

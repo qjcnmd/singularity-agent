@@ -3099,10 +3099,7 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
         if !validation_errors.is_empty() {
             ModelError::new(
                 ModelErrorKind::JsonSchemaViolation,
-                format!(
-                    "provider_response_invalid: {}",
-                    validation_errors.join(",")
-                ),
+                format!("provider_response_invalid: {}", validation_errors.join(",")),
             )
             .with_provider_diagnostic(
                 "provider_response_invalid",

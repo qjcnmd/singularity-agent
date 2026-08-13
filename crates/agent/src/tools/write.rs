@@ -83,7 +83,11 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let result = execute_write(dir.path(), "out.txt", "hello");
         assert!(!result.is_error, "content: {}", result.content);
-        assert!(result.content.contains("Successfully wrote 5 bytes to out.txt"));
+        assert!(
+            result
+                .content
+                .contains("Successfully wrote 5 bytes to out.txt")
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("out.txt")).expect("read back"),
             "hello"
