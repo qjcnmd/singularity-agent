@@ -1542,39 +1542,6 @@ fn sqlite_snapshot(path: &std::path::Path) -> String {
     snapshot
 }
 
-// 一次性探针（验证后删除）
-#[test]
-fn probe_resume_commit_path() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let (turn, _) = store
-        .create_turn_with_input(
-            &thread.thread_id,
-            "paused",
-            serde_json::json!([{"type": "text", "text": "resume me"}]),
-        )
-        .expect("turn");
-    store
-        .update_turn_state(&turn.turn_id, TurnStatus::Paused, "paused")
-        .expect("paused turn");
-    let item_id = SessionStore::allocate_assistant_item_id();
-    let result = store.commit_turn_outcome_with_authority(
-        &turn.turn_id,
-        CommitTurnOutcomeParams {
-            status: TurnStatus::Completed,
-            agent_loop_status: "completed",
-            assistant_item_id: Some(&item_id),
-            assistant_delta: Some("resumed answer"),
-        },
-        TurnOutcomeAuthority::AgentLoop,
-    );
-    match result {
-        Ok(committed) => println!("PROBE commit ok: {}", committed.turn.status.as_storage_text()),
-        Err(e) => println!("PROBE commit err: {e:?}"),
-    }
-}
-
 // 验证 paused/suspended 无 owner turn 在 workspace 恢复时保持可恢复（turn/resume 依赖）。
 #[test]
 fn workspace_recovery_preserves_paused_and_suspended_turns() {
@@ -1620,3 +1587,4 @@ fn workspace_recovery_preserves_paused_and_suspended_turns() {
         TurnStatus::Suspended
     );
 }
+
