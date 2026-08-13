@@ -11,7 +11,6 @@ impl AppServer {
             initialized_acknowledged: false,
             event_filter: Arc::new(Mutex::new(EventSubscriptionState::default())),
             shutdown_requested: false,
-            sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -29,15 +28,6 @@ impl AppServer {
         provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
     ) -> Self {
         self.test_provider_override = Some(provider);
-        self
-    }
-
-    /// 替换服务使用的 sandbox backend。
-    pub fn with_sandbox_backend(
-        mut self,
-        sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
-    ) -> Self {
-        self.sandbox_backend = Arc::new(sandbox_backend);
         self
     }
 
@@ -82,7 +72,6 @@ impl AppServer {
             initialized_acknowledged: true,
             event_filter: Arc::clone(&self.event_filter),
             shutdown_requested: false,
-            sandbox_backend: Arc::clone(&self.sandbox_backend),
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             steer_handles: Arc::clone(&self.steer_handles),
@@ -472,7 +461,7 @@ impl AppServer {
         cancellation: &CancellationToken,
         assistant_events: &mut AssistantItemEventState,
         emit: &mut impl FnMut(Value),
-    ) -> AppServerResult<AgentRunStatus> {
+    ) -> AppServerResult<RunStatus> {
         let session = open_or_create_thread_session(thread)?;
         let (provider, config) = self.provider_and_config_for_thread(thread)?;
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
@@ -850,7 +839,7 @@ impl AppServer {
             && (current.agent_loop_status == AgentStatus::CancelRequested.as_str()
                 || cancellation.is_cancelled());
         let status = if user_cancelled {
-            let mut status = AgentRunStatus::failed("turn interrupted by user request");
+            let mut status = RunStatus::failed("turn interrupted by user request");
             mark_run_cancelled(&mut status);
             status
         } else {
@@ -874,8 +863,7 @@ impl AppServer {
                 } else if latest.agent_loop_status == AgentStatus::CancelRequested.as_str()
                     && monitor_outcome != Some(CancellationMonitorOutcome::InfrastructureFailure)
                 {
-                    let mut interrupted =
-                        AgentRunStatus::failed("turn interrupted by user request");
+                    let mut interrupted = RunStatus::failed("turn interrupted by user request");
                     mark_run_cancelled(&mut interrupted);
                     match self.commit_effective_turn_status(&latest, &interrupted, None) {
                         Ok(committed) => {
@@ -908,15 +896,17 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
-        let capability = agent_loop_capability(self.sandbox_backend.as_ref());
+        // Phase 3b 起无 sandbox 门禁：AgentLoop 恒可用，协议形状保持（CLI doctor 依赖）。
         json_response(
             message.required_id(),
             AgentCapabilityResult {
                 agent_loop: AgentLoopCapabilityStatus {
-                    available: capability.available,
-                    status: capability.status.as_str().to_string(),
-                    reason: capability.reason,
-                    blockers: capability.blockers,
+                    available: true,
+                    status: AgentStatus::Completed.as_str().to_string(),
+                    reason: "AgentLoop uses the headless core; sandbox backend gating is not \
+                             applied"
+                        .to_string(),
+                    blockers: Vec::new(),
                 },
                 provider_configuration: provider_configuration(&self.provider_snapshot),
             },
@@ -927,7 +917,7 @@ impl AppServer {
     pub(super) fn commit_turn_run_status(
         &self,
         turn: Turn,
-        run_status: &AgentRunStatus,
+        run_status: &RunStatus,
         assistant_item_id: Option<&AllocatedAssistantItemId>,
         cancellation: &CancellationToken,
         monitor_outcome: Option<CancellationMonitorOutcome>,
@@ -964,7 +954,7 @@ impl AppServer {
     pub(super) fn commit_effective_turn_status(
         &self,
         turn: &Turn,
-        run_status: &AgentRunStatus,
+        run_status: &RunStatus,
         assistant_item_id: Option<&AllocatedAssistantItemId>,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         self.commit_effective_turn_status_with_authority(
@@ -978,7 +968,7 @@ impl AppServer {
     pub(super) fn commit_effective_turn_status_with_authority(
         &self,
         turn: &Turn,
-        run_status: &AgentRunStatus,
+        run_status: &RunStatus,
         assistant_item_id: Option<&AllocatedAssistantItemId>,
         authority: TurnOutcomeAuthority,
     ) -> Result<CommittedTurnOutcome, StoreError> {

@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoopCapability, AgentRunStatus, AgentStatus,
     agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
     session::SessionManager,
     tools::ToolRegistry,
@@ -33,9 +32,7 @@ use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
     load_project_instructions,
 };
-use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, Provider, ProviderConfigSnapshot,
-};
+use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
 };
@@ -51,7 +48,6 @@ use singularity_protocol::{
     TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputDelivery, TurnInputParams,
     TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
-use singularity_sandbox::{SandboxBackend, WindowsSandboxBackend};
 use singularity_store::{
     AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
     CreateStartedTurnParams, SessionStore, StoreError, TurnOutcomeAuthority,
@@ -188,6 +184,72 @@ impl fmt::Display for TurnTerminalizationFailure {
             Self::StateChanged => "state_changed",
             Self::EventNotification => "event_notification",
         })
+    }
+}
+
+/// 一次 agent 运行的稳定生命周期状态（app-server 本地枚举）。
+///
+/// 字符串值保持 store `agent_loop_status` 列与 CLI 渲染兼容（Phase 3b 本地化，
+/// 替代旧链 `singularity_agent::AgentStatus`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Running,
+    Paused,
+    CancelRequested,
+    Completed,
+    Blocked,
+    Cancelled,
+    Failed,
+}
+
+impl AgentStatus {
+    /// 返回稳定的生命周期状态字符串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::CancelRequested => "cancel_requested",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// agent 运行终态（app-server 内部类型，替代旧链 `AgentRunStatus`）。
+///
+/// 只保留 app-server 实际消费的字段；`status` 的字符串值写入 store
+/// `agent_loop_status` 列，CLI 按文本渲染。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunStatus {
+    pub status: AgentStatus,
+    pub final_answer: Option<String>,
+    pub model_turns: u32,
+    pub model_usage: ModelUsage,
+    pub audit_events: Vec<Value>,
+    pub error: Option<String>,
+    pub model_turn_limit: u32,
+}
+
+impl RunStatus {
+    /// 构造普通失败状态。
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentStatus::Failed,
+            final_answer: None,
+            model_turns: 0,
+            model_usage: ModelUsage::default(),
+            audit_events: Vec::new(),
+            error: Some(message.into()),
+            model_turn_limit: 0,
+        }
+    }
+
+    /// 更新状态并保留已有字段。
+    pub fn with_status(mut self, status: AgentStatus) -> Self {
+        self.status = status;
+        self
     }
 }
 
@@ -434,7 +496,6 @@ pub struct AppServer {
     initialized_acknowledged: bool,
     event_filter: Arc<Mutex<EventSubscriptionState>>,
     shutdown_requested: bool,
-    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// 每个活动 turn 的 steer 注入句柄（turn/input 运行中注入通道）。
@@ -952,12 +1013,12 @@ fn agent_config_for_thread(
     })
 }
 
-/// 新核心 `AgentOutcome` → store/CLI 依赖的 `AgentRunStatus` 投影。
+/// 新核心 `AgentOutcome` → store/CLI 依赖的 `RunStatus` 投影。
 ///
 /// aborted 对应取消（Cancelled）；其余按 Completed 提交，final_text 为空时
 /// `agent_completed_delta` 的兜底路径会省略终态 delta（事件层 item/failed）。
-fn outcome_to_run_status(outcome: AgentOutcome) -> AgentRunStatus {
-    let mut status = AgentRunStatus::failed("agent loop did not reach a final assistant message");
+fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
+    let mut status = RunStatus::failed("agent loop did not reach a final assistant message");
     if outcome.aborted {
         mark_run_cancelled(&mut status);
     } else {
@@ -969,13 +1030,6 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> AgentRunStatus {
     status.model_turns = outcome.turns;
     status.model_usage = outcome.usage;
     status
-}
-
-fn agent_loop_capability(sandbox_backend: &dyn SandboxBackend) -> AgentLoopCapability {
-    AgentLoopCapability::available(format!(
-        "AgentLoop uses the headless core; {} sandbox backend gating is not applied",
-        sandbox_backend.name()
-    ))
 }
 
 fn provider_configuration(snapshot: &ProviderConfigSnapshot) -> ProviderConfigurationStatus {
@@ -1118,9 +1172,8 @@ fn monitor_failure_or(
     }
 }
 
-fn failed_turn_status(failure: TurnFailure) -> AgentRunStatus {
-    let mut status =
-        AgentRunStatus::failed(format!("turn execution failed during {}", failure.stage));
+fn failed_turn_status(failure: TurnFailure) -> RunStatus {
+    let mut status = RunStatus::failed(format!("turn execution failed during {}", failure.stage));
     status.audit_events.push(json!({
         "component": "app_server",
         "failure_kind": "turn_execution",
@@ -1141,15 +1194,13 @@ fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
     }
 }
 
-fn mark_run_cancelled(status: &mut AgentRunStatus) {
+fn mark_run_cancelled(status: &mut RunStatus) {
     status.status = AgentStatus::Cancelled;
     status.final_answer = None;
     status.error = None;
-    status.error_category = None;
-    status.provider_diagnostic = None;
 }
 
-fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
+fn agent_loop_trace(turn: &Turn, status: &RunStatus) -> TraceEvent {
     let mut event = TraceEvent::for_turn(
         format!(
             "trace_{}_agent_loop_{}_{}",
@@ -1180,7 +1231,7 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
     event
 }
 
-fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
+fn agent_completed_delta(run_status: &RunStatus) -> Option<String> {
     if run_status.status == AgentStatus::Completed {
         run_status
             .final_answer

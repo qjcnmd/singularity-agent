@@ -1,10 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::{
-    AgentRunStatus, project_audit_event,
-    agent::AgentOutcome,
-    session::SessionManager,
-};
+use singularity_agent::{agent::AgentOutcome, session::SessionManager};
 use singularity_model::{
     ModelError, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
@@ -12,8 +8,6 @@ use singularity_model::{
 };
 
 use singularity_protocol::{ConversationRole, TurnInputDelivery};
-use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
-use singularity_tools::{CommandRequest, CommandResult};
 
 use super::*;
 
@@ -93,64 +87,6 @@ fn event_subscription_binds_gap_cursor_to_one_output_reservation() {
     assert_eq!(outputs[1].reservation.event_cursor, None);
     assert_eq!(outputs[0].message["params"]["event"]["cursor"], 1);
     assert_eq!(outputs[1].message["result"]["cursor"], 1);
-}
-
-#[test]
-fn ordinary_and_evaluation_traces_share_safe_audit_projection_and_store_roundtrip() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
-        .expect("turn");
-    let mut status = AgentRunStatus::failed("safe failure");
-    status.audit_events.push(project_audit_event(&json!({
-            "cwd": "C:/sensitive/workspace",
-            "raw_arguments": {"command": "echo secret"},
-            "approval_reason": "operator reason",
-            "approval_request_id": "approval-secret",
-            "approval_grant_id": "grant-secret",
-            "sandbox_mode": "workspace_write",
-            "network_access": "allowed",
-            "sandbox_backend": "test_backend",
-            "sandbox_enforcement": "strict",
-            "local_process_fallback": false,
-            "command_scope_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "command_provenance": "agent_requested",
-            "approval_policy": "on-request",
-            "approval_decision": "approved",
-            "timeout_seconds": 5,
-        })));
-
-    let ordinary = agent_loop_trace(&turn, &status);
-    let evaluation = json!({"audit_events": &status.audit_events});
-    for serialized in [
-        serde_json::to_string(&ordinary).expect("ordinary trace JSON"),
-        serde_json::to_string(&evaluation).expect("evaluation trace JSON"),
-    ] {
-        for forbidden in [
-            "C:/sensitive/workspace",
-            "raw_arguments",
-            "operator reason",
-            "approval-secret",
-            "grant-secret",
-        ] {
-            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
-        }
-    }
-
-    store.append_trace(&ordinary).expect("append trace");
-    let restored = store
-        .show_trace(&ordinary.event_id)
-        .expect("roundtrip trace");
-    assert!(restored.redaction_applied);
-    assert_eq!(
-        restored.payload["audit_events"][0]["sandbox_mode"],
-        "workspace_write"
-    );
-    let restored_json = serde_json::to_string(&restored).expect("restored trace JSON");
-    assert!(!restored_json.contains("raw_arguments"));
-    assert!(!restored_json.contains("approval-secret"));
 }
 
 #[test]
@@ -400,7 +336,7 @@ fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states(
         .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
         .expect("running turn");
     let server = app_server(store);
-    let failure_status = AgentRunStatus::failed("late monitor failure");
+    let failure_status = RunStatus::failed("late monitor failure");
     assert!(matches!(
         server.commit_turn_run_status(
             turn.clone(),
@@ -447,7 +383,7 @@ fn frozen_monitor_outcome_wins_over_late_cancellation_and_preserves_safe_states(
     server
         .commit_turn_run_status(
             cancelled_turn.clone(),
-            &AgentRunStatus::failed("late user result"),
+            &RunStatus::failed("late user result"),
             None,
             &cancelled_token,
             Some(CancellationMonitorOutcome::UserCancellation),
@@ -547,7 +483,7 @@ fn turn_started_event_failure_terminalizes_the_running_turn() {
     let thread = store
         .create_thread(None, Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let mut server = app_server(store);
     let filter = Arc::clone(&server.event_filter);
     let poisoned = std::thread::spawn(move || {
         let _guard = filter.lock().expect("event filter");
@@ -620,7 +556,7 @@ fn late_turn_failure_does_not_overwrite_a_blocked_turn() {
         server
             .commit_turn_run_status(
                 turn.clone(),
-                &AgentRunStatus::failed("stale run failure"),
+                &RunStatus::failed("stale run failure"),
                 None,
                 &CancellationToken::new(),
                 None,
@@ -657,7 +593,7 @@ fn running_turn_failure_stages_terminalize_as_failed() {
     for (turn, stage) in turns {
         if stage == TurnFailureStage::TerminalOutcome {
             let invalid_commit =
-                AgentRunStatus::failed("invalid completion").with_status(AgentStatus::Completed);
+                RunStatus::failed("invalid completion").with_status(AgentStatus::Completed);
             assert!(
                 server
                     .commit_turn_run_status(
@@ -822,7 +758,7 @@ fn turn_start_monitor_failure_does_not_persist_a_running_turn() {
     let thread = store
         .create_thread(None, Some(&workspace.to_string_lossy()))
         .expect("thread");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let mut server = app_server(store);
     std::fs::hard_link(&db_path, dir.path().join("sessions-alias.sqlite3"))
         .expect("hard link store");
     let message: JsonRpcMessage = serde_json::from_value(json!({
@@ -1164,7 +1100,7 @@ fn partial_realtime_item_fails_without_persisting_or_completing() {
         let mut events = server
             .project_assistant_delta(&mut assistant_events, "partial")
             .expect("project partial");
-        let mut status = AgentRunStatus::failed(label);
+        let mut status = RunStatus::failed(label);
         if cancelled {
             status.status = AgentStatus::Cancelled;
         }
@@ -1382,70 +1318,21 @@ fn realtime_item_tracks_started_and_delta_filtering_independently() {
     }
 }
 
-struct CompletedSandboxBackend;
-
-impl SandboxBackend for CompletedSandboxBackend {
-    fn name(&self) -> &'static str {
-        "completed_test"
-    }
-
-    fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
-        singularity_tools::SandboxCapabilities::strict().with_change_detection()
-    }
-
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
-            .with_workspace_mutation(WorkspaceMutation::Unchanged)
-            .with_sandbox_execution(
-                self.name(),
-                singularity_tools::SandboxBackendEnforcement::Strict,
-            )
-    }
-
-    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
-            .with_workspace_mutation(WorkspaceMutation::Unchanged)
-            .with_sandbox_execution(
-                self.name(),
-                singularity_tools::SandboxBackendEnforcement::Strict,
-            )
-    }
-}
-
-struct UnavailableSandboxBackend;
-
-impl SandboxBackend for UnavailableSandboxBackend {
-    fn name(&self) -> &'static str {
-        "unavailable_test"
-    }
-
-    fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
-        singularity_tools::SandboxCapabilities::unavailable()
-    }
-
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::sandbox_backend_unavailable(&request.command_id)
-            .with_workspace_mutation(WorkspaceMutation::Unknown)
-    }
-
-    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        CommandResult::sandbox_backend_unavailable(&request.command_id)
-            .with_workspace_mutation(WorkspaceMutation::Unknown)
-    }
-}
-
 #[test]
-fn agent_loop_capability_is_always_available_without_a_sandbox_gate() {
-    let available = agent_loop_capability(&CompletedSandboxBackend);
-    assert!(available.available);
-    assert!(available.blockers.is_empty());
-    assert_eq!(available.status, AgentStatus::Completed);
-
-    // 无门禁语义：任何 sandbox backend（含 unavailable）都返回 ready。
-    let unavailable = agent_loop_capability(&UnavailableSandboxBackend);
-    assert!(unavailable.available);
-    assert!(unavailable.blockers.is_empty());
-    assert_eq!(unavailable.status, AgentStatus::Completed);
+fn agent_capability_is_always_available_without_a_sandbox_gate() {
+    let store = SessionStore::open(":memory:").expect("store");
+    let mut server = app_server(store);
+    let responses = server
+        .agent_capability(
+            JsonRpcMessage::request(Method::AgentCapability, 1, json!({})).expect("request"),
+        )
+        .expect("agent capability");
+    let result: AgentCapabilityResult =
+        serde_json::from_value(responses[0]["result"].clone()).expect("capability result");
+    // 无门禁语义：恒 available，协议形状保持（CLI doctor 依赖 status==completed）。
+    assert!(result.agent_loop.available);
+    assert!(result.agent_loop.blockers.is_empty());
+    assert_eq!(result.agent_loop.status, "completed");
 }
 
 #[test]
