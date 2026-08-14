@@ -10,10 +10,10 @@ use singularity_model::{
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
     ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
     ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, responses_endpoint, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
-    validate_model_turn_response, validate_provider_config,
+    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, builtin_model_cost,
+    chat_completions_endpoint, classify_model_error, estimate_cost_peak, is_peak_hour_utc8,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    validate_model_response, validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -3406,7 +3406,20 @@ fn catalog_builtin_cost_estimate_flows_into_turn_usage() {
     assert_eq!(usage.output_tokens, 1_000_000);
     assert_eq!(usage.cached_input_tokens, 1_000_000);
     let cost = usage.cost_estimate.expect("builtin cost estimate");
-    assert!((cost - 0.4228).abs() < 1e-9, "cost estimate was {cost}");
+    // 8/17 起为峰谷双价，最终估算依赖运行时刻所属的北京高峰/闲时段；与 provider 同一
+    // 逻辑重算期望值，使断言与运行时刻无关且精确。
+    let builtin = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("builtin price");
+    let expected = estimate_cost_peak(
+        1_000_000,
+        1_000_000,
+        1_000_000,
+        &builtin,
+        is_peak_hour_utc8(std::time::SystemTime::now()),
+    );
+    assert!(
+        (cost - expected).abs() < 1e-9,
+        "cost estimate was {cost} expected {expected}"
+    );
 }
 
 #[test]

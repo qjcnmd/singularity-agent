@@ -856,11 +856,15 @@ pub(super) fn finalize_provider_response(
     let mut usage = usage;
     usage.cost_estimate =
         super::builtin_models::builtin_model_cost(&config.provider_name, model_name).map(|cost| {
-            super::builtin_models::estimate_cost(
+            // 按当前北京时刻在高峰/闲时价格间择一后估算（deepseek 峰谷双价）。
+            let now = std::time::SystemTime::now();
+            let peak = super::builtin_models::is_peak_hour_utc8(now);
+            super::builtin_models::estimate_cost_peak(
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.cached_input_tokens,
                 &cost,
+                peak,
             )
         });
     let mut response = ModelTurnResponse {
