@@ -6,7 +6,7 @@
 //! - 中断信号（`CancellationToken`）到达时杀进程树并返回 "Command aborted"。
 //! - 非 0 退出码 → is_error，内容附 "Command exited with code N"。
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
@@ -540,7 +540,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let file = dir.path().join("large.txt");
-        fs::write(&file, content).expect("write fixture");
+        std::fs::write(&file, content).expect("write fixture");
         let (shell, _) = shell_command("");
         let command = dump_command(&shell, &file);
         let result = run(&command, None);
@@ -564,7 +564,7 @@ mod tests {
         let start = result.content.find("Full output: ").expect("marker") + "Full output: ".len();
         let end = result.content[start..].find(']').expect("marker end") + start;
         let full_path = &result.content[start..end];
-        let full = fs::read_to_string(full_path).expect("full output file readable");
+        let full = std::fs::read_to_string(full_path).expect("full output file readable");
         assert!(full.contains("line 1"), "full output keeps the head");
         assert!(full.contains("line 2500"), "full output keeps the tail");
         assert_eq!(full.lines().count(), 2500, "full output has all lines");
