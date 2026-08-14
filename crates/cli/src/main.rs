@@ -77,7 +77,7 @@ enum Command {
         /// Project folder path (default: current directory).
         path: Option<PathBuf>,
         /// Decision to store: trust, never, or ask (clear the record).
-        #[arg(value_enum)]
+        #[arg(short, long, value_enum)]
         decision: Option<TrustArg>,
     },
     /// Run the fixed task set against the configured model list (lightweight regression eval).

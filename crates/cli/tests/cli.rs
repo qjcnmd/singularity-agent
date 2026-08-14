@@ -1639,7 +1639,7 @@ fn cli_trust_command_sets_trusted_decision() {
     );
 
     let set = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trust", path_str(&project), "trust"])
+        .args(["trust", path_str(&project), "--decision", "trust"])
         .output()
         .expect("trust set cli");
     assert!(set.status.success(), "stderr={}", stderr(&set));
@@ -1714,7 +1714,7 @@ fn cli_trust_command_ask_resets_with_null_decision() {
     );
 
     let ask = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["trust", path_str(&project), "ask"])
+        .args(["trust", path_str(&project), "--decision", "ask"])
         .output()
         .expect("trust ask cli");
     assert!(ask.status.success(), "stderr={}", stderr(&ask));
