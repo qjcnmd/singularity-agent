@@ -322,6 +322,7 @@ impl AppServer {
                     TurnFailure {
                         stage: TurnFailureStage::TerminalOutcome,
                         cause: turn_failure_cause(&error),
+                        original: Some(error.to_string()),
                     },
                 );
             }
@@ -534,6 +535,7 @@ impl AppServer {
                     TurnFailure {
                         stage: TurnFailureStage::TerminalOutcome,
                         cause: turn_failure_cause(&error),
+                        original: Some(error.to_string()),
                     },
                 );
             }
@@ -559,7 +561,7 @@ impl AppServer {
         failure: impl Into<TurnFailure>,
     ) -> AppServerResult<()> {
         let failure = failure.into();
-        match self.terminalize_turn_failure(turn, failure) {
+        match self.terminalize_turn_failure(turn, failure.clone()) {
             Ok(TurnTerminalizationResult::Committed(committed)) => {
                 match self.committed_turn_events(&committed, assistant_events) {
                     Ok(events) => emit_messages(emit, events),
@@ -568,12 +570,14 @@ impl AppServer {
                             stage: failure.stage,
                             cause: failure.cause,
                             failure: TurnTerminalizationFailure::EventNotification,
+                            original: failure.original,
                         });
                     }
                 }
                 Err(AppServerError::TurnExecution {
                     stage: failure.stage,
                     cause: failure.cause,
+                    original: failure.original,
                 })
             }
             Ok(TurnTerminalizationResult::Preserved) => {
@@ -581,6 +585,7 @@ impl AppServer {
                 Err(AppServerError::TurnExecution {
                     stage: failure.stage,
                     cause: failure.cause,
+                    original: failure.original,
                 })
             }
             Err(cleanup_failure) => {
@@ -589,6 +594,7 @@ impl AppServer {
                     stage: failure.stage,
                     cause: failure.cause,
                     failure: cleanup_failure,
+                    original: failure.original,
                 })
             }
         }

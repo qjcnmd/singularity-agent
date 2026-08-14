@@ -271,6 +271,7 @@ fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
             TurnFailure {
                 stage: TurnFailureStage::TerminalOutcome,
                 cause: TurnFailureCause::Store,
+                original: None,
             },
         )
         .expect_err("terminalization must report its cleanup failure");
@@ -280,6 +281,7 @@ fn terminalization_failure_keeps_stage_and_redacts_cleanup_cause() {
             stage: TurnFailureStage::TerminalOutcome,
             cause: TurnFailureCause::Store,
             failure: TurnTerminalizationFailure::Store,
+            ..
         }
     ));
     assert!(!error.to_string().contains("missing-turn-with-secret-path"));
@@ -359,11 +361,21 @@ fn app_server_preserves_safe_provider_failure_via_turn_start() {
         AppServerError::TurnExecution {
             stage: TurnFailureStage::AgentLoop,
             cause: TurnFailureCause::Internal,
+            ..
         }
     ));
     assert!(!error.to_string().contains(provider_sentinel));
     // turn 以 Failed 终态提交，provider 错误文本不落入持久化 turn 状态。
     assert!(error.to_string().contains("agent_loop"));
+    // 真实失败文本经 original 字段携带到 RPC 边界（transport 层据此透出），
+    // 但持久化分类（stage/cause）仍保持粗粒度。
+    match &error {
+        AppServerError::TurnExecution { original, .. } => {
+            let original = original.as_deref().expect("original provider text carried");
+            assert!(original.contains(provider_sentinel));
+        }
+        other => panic!("expected TurnExecution, got {other}"),
+    }
 }
 
 #[test]
@@ -701,6 +713,7 @@ fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
         TurnFailure {
             stage: TurnFailureStage::TerminalOutcome,
             cause: TurnFailureCause::Store,
+            original: None,
         },
     );
 

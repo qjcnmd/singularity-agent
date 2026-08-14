@@ -14,7 +14,7 @@ use serde_json::Value;
 use singularity_app_server::{
     AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput,
 };
-use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
+use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR, contains_sensitive_text};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{
     JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
@@ -548,8 +548,21 @@ async fn write_output_queue<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn transport_error_value(id: Option<JsonRpcId>, _error: &AppServerError) -> Value {
-    internal_error_value(id, "Internal error")
+fn transport_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
+    let diagnostic = match error {
+        AppServerError::TurnExecution { original, .. }
+        | AppServerError::TurnTerminalization { original, .. } => {
+            original.clone().unwrap_or_else(|| error.to_string())
+        }
+        other => other.to_string(),
+    };
+    // 透出真实错误文本供诊断（DB/锁/provider 等）；若文本疑似含密钥则回退脱敏。
+    let diagnostic = if contains_sensitive_text(&diagnostic) {
+        "Internal error".to_string()
+    } else {
+        diagnostic
+    };
+    internal_error_value(id, diagnostic)
 }
 
 fn request_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
@@ -570,10 +583,10 @@ fn turn_slot_busy_value(id: Option<JsonRpcId>) -> Value {
     .to_wire_value()
 }
 
-fn internal_error_value(id: Option<JsonRpcId>, _diagnostic: impl Into<String>) -> Value {
+fn internal_error_value(id: Option<JsonRpcId>, diagnostic: impl Into<String>) -> Value {
     JsonRpcMessage::error(
         id,
-        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
+        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, diagnostic.into()),
     )
     .to_wire_value()
 }
@@ -754,6 +767,9 @@ fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use singularity_agent::agent::AgentError;
+    use singularity_app_server::{TurnFailureCause, TurnFailureStage};
+    use singularity_store::StoreError;
     use std::future::Future;
     use std::io;
     use std::pin::Pin;
@@ -1196,6 +1212,63 @@ mod tests {
         assert_eq!(response["error"]["code"], -32602);
         assert_eq!(response["error"]["message"], "Invalid params");
         assert!(!response.to_string().contains("secret-shaped"));
+    }
+
+    #[test]
+    fn transport_error_exposes_store_agent_and_workspace_text() {
+        let cases: Vec<(&str, AppServerError)> = vec![
+            (
+                "locked by another process",
+                AppServerError::Store(StoreError::InvalidState(
+                    "locked by another process".to_string(),
+                )),
+            ),
+            ("provider unavailable", {
+                AppServerError::Agent(AgentError::Loop("provider unavailable".to_string()))
+            }),
+            ("workspace error: write denied", {
+                AppServerError::Workspace("write denied".to_string())
+            }),
+        ];
+
+        for (expected, error) in cases {
+            let response = transport_error_value(Some(JsonRpcId::Number(7)), &error);
+            assert_eq!(response["error"]["code"], -32603, "{expected}");
+            let message = response["error"]["message"].as_str().expect("message");
+            assert_ne!(message, "Internal error", "real text must not be masked");
+            assert!(
+                message.contains(expected),
+                "expected real text {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_error_carries_original_turn_execution_text() {
+        let original = "agent loop failed: provider returned 500";
+        let response = transport_error_value(
+            Some(JsonRpcId::Number(7)),
+            &AppServerError::TurnExecution {
+                stage: TurnFailureStage::AgentLoop,
+                cause: TurnFailureCause::Internal,
+                original: Some(original.to_string()),
+            },
+        );
+
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], original);
+    }
+
+    #[test]
+    fn transport_error_redacts_sensitive_diagnostic_text() {
+        let error = AppServerError::Workspace(
+            "cannot open SINGULARITY_API_KEY=sk-shape must-not-leak".to_string(),
+        );
+        let response = transport_error_value(Some(JsonRpcId::Number(7)), &error);
+
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], "Internal error");
+        assert!(!response.to_string().contains("sk-shape"));
     }
 
     #[test]

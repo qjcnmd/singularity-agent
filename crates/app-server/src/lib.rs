@@ -76,12 +76,16 @@ pub enum AppServerError {
     TurnExecution {
         stage: TurnFailureStage,
         cause: TurnFailureCause,
+        /// 原始失败文本；仅在 RPC 边界用于透出真实原因，不参与持久化分类。
+        original: Option<String>,
     },
     #[error("turn execution failed during {stage} ({cause}); terminalization failed ({failure})")]
     TurnTerminalization {
         stage: TurnFailureStage,
         cause: TurnFailureCause,
         failure: TurnTerminalizationFailure,
+        /// 原始失败文本；仅在 RPC 边界用于透出真实原因，不参与持久化分类。
+        original: Option<String>,
     },
 }
 
@@ -226,10 +230,12 @@ impl RunStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnFailure {
     stage: TurnFailureStage,
     cause: TurnFailureCause,
+    /// 携带到 RPC 边界的原始失败文本；无原文时为 `None`（如仅用阶段分类的调用）。
+    original: Option<String>,
 }
 
 /// 将 provider 层聚合 usage 投影为协议线格式（评估工具数据源）。
@@ -249,6 +255,7 @@ impl From<TurnFailureStage> for TurnFailure {
         Self {
             stage,
             cause: TurnFailureCause::Internal,
+            original: None,
         }
     }
 }
@@ -566,10 +573,11 @@ impl AppServer {
             if let Some(test_provider) = &self.test_provider_override {
                 Arc::clone(test_provider)
             } else {
-                Arc::new(self.provider_for_thread(thread).map_err(|_| {
+                Arc::new(self.provider_for_thread(thread).map_err(|error| {
                     AppServerError::TurnExecution {
                         stage: TurnFailureStage::AgentLoop,
                         cause: TurnFailureCause::Internal,
+                        original: Some(error.to_string()),
                     }
                 })?)
             };
@@ -657,14 +665,16 @@ fn turn_failure_from_error(
     fallback_stage: TurnFailureStage,
 ) -> TurnFailure {
     match error {
-        AppServerError::TurnExecution { stage, cause }
+        AppServerError::TurnExecution { stage, cause, .. }
         | AppServerError::TurnTerminalization { stage, cause, .. } => TurnFailure {
             stage: *stage,
             cause: *cause,
+            original: Some(error.to_string()),
         },
         _ => TurnFailure {
             stage: fallback_stage,
             cause: turn_failure_cause(error),
+            original: Some(error.to_string()),
         },
     }
 }
