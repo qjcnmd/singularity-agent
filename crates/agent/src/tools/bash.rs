@@ -1,10 +1,15 @@
 //! bash 工具：进程内执行 shell 命令（对齐 Pi bash 语义）。
 //!
-//! - 无默认超时；可选 `timeout_ms`，超时后杀进程树并返回错误。
+//! - 默认超时 120 秒（`timeout_ms` 缺省时生效），超时后杀进程树并返回错误；
+//!   模型可显式传 `timeout_ms` 覆盖（长命令）。默认超时是信任边界安全网：
+//!   无界命令（如全盘 `find`）若无线索约束会永久挂起并阻塞整个 turn。
 //! - stdout+stderr 合并；输出截断到**最后** 2000 行/50KB（保留尾部），超限时把完整输出
 //!   写入系统临时目录（`bash-<uuid>.log`），内容尾部附 `[Full output: <path>]` 说明。
 //! - 中断信号（`CancellationToken`）到达时杀进程树并返回 "Command aborted"。
 //! - 非 0 退出码 → is_error，内容附 "Command exited with code N"。
+//! - Windows 上 spawn 前清除本进程 stdout/stderr 句柄的继承位：否则子进程树（含
+//!   强杀后的残留孙进程）会继承并直写本进程的 stdout 管道，非 UTF-8 字节会破坏
+//!   JSON-RPC 流（CLI 报 "stream did not contain valid UTF-8"）。
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -14,6 +19,32 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // 唯一 unsafe 模块：单次 SetHandleInformation 调用（见模块注释）。
+mod handle_inheritance {
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetHandleInformation(h_object: RawHandle, dw_mask: u32, dw_flags: u32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+    /// 清除 stdout/stderr 句柄的继承位，防止 spawn 时子进程（及孙进程）继承并
+    /// 直写本进程的 stdout/stderr 管道（见模块注释）。尽力而为：句柄无效时忽略。
+    pub(super) fn deny_inherit_std_streams() {
+        for handle in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
 
 use serde_json::{Value, json};
 
@@ -31,14 +62,16 @@ const FULL_OUTPUT_FILE_PREFIX: &str = "bash-";
 const FULL_OUTPUT_FILE_SUFFIX: &str = ".log";
 
 // 数字与 truncate::DEFAULT_MAX_LINES/DEFAULT_MAX_BYTES 保持一致（与 Pi 描述文本等价）。
-pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in milliseconds.";
+/// 命令默认超时：模型未显式传 `timeout_ms` 时的安全网，防止无界命令永久挂起。
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Commands time out after 120 seconds by default; provide timeout_ms to override.";
 
 pub(crate) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (optional, no default timeout)" },
+            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (optional, defaults to 120000)" },
         },
         "required": ["command"],
         "additionalProperties": false,
@@ -64,11 +97,17 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return error_result("missing required parameter \"command\"");
     };
-    let timeout = args.get("timeout_ms").and_then(Value::as_u64);
-    if timeout == Some(0) {
+    // 缺省时使用默认超时（信任边界安全网）；显式 0 拒绝。
+    let timeout = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout == 0 {
         return error_result("invalid timeout_ms: must be a positive number of milliseconds");
     }
     let (shell, shell_args) = shell_command(command);
+    #[cfg(windows)]
+    handle_inheritance::deny_inherit_std_streams();
     let mut child = match Command::new(&shell)
         .args(&shell_args)
         .current_dir(cwd)
@@ -92,7 +131,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     thread::spawn(move || pump_output(stderr, stderr_sender));
 
     let mut state = CaptureState::default();
-    let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let deadline = Some(Instant::now() + Duration::from_millis(timeout));
     let mut exit_status = None;
     let mut outcome = BashOutcome::Completed;
     loop {
@@ -107,7 +146,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             kill_process_tree(&mut child);
-            outcome = BashOutcome::TimedOut(timeout.expect("deadline implies a timeout"));
+            outcome = BashOutcome::TimedOut(timeout);
             exit_status = wait_for_exit(&mut child);
             break;
         }

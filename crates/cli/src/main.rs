@@ -852,8 +852,8 @@ impl AppServerClient {
 
     // 从 stdout reader 读取一条消息，并区分超时、断开与非法 JSON。
     fn read_message(&mut self, timeout: Duration) -> Result<JsonRpcMessage, String> {
-        let line =
-            match self.stdout.recv_timeout(timeout) {
+        loop {
+            let line = match self.stdout.recv_timeout(timeout) {
                 Ok(line) => line?,
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(status) = self.child.try_wait().map_err(|error| {
@@ -872,8 +872,13 @@ impl AppServerClient {
                     return Err("app-server closed stdout".to_string());
                 }
             };
-        serde_json::from_str(line.trim())
-            .map_err(|error| format!("invalid app-server json: {error}"))
+            // 防御：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节）；
+            // 跳过非 JSON 行，不因垃圾行终止协议（真正的 response 行仍会被解析）。
+            match serde_json::from_str(line.trim()) {
+                Ok(message) => return Ok(message),
+                Err(_) => continue,
+            }
+        }
     }
 
     // 分配本地递增的 JSON-RPC request id。
@@ -918,15 +923,20 @@ impl Drop for AppServerClient {
 }
 
 // 将 app-server stdout 按行转发到客户端接收队列。
+// 防御：残留子进程可能直写管道写入非 UTF-8 字节（Windows 句柄继承）；遇非法
+// 字节用 lossy 替换并继续读下一行，不让单个坏行终止整个客户端。
 fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
+            let mut bytes = Vec::new();
+            let read_result = reader.read_until(b'\n', &mut bytes);
+            match read_result {
                 Ok(0) => break,
                 Ok(_) => {
+                    // lossy：容忍行内非 UTF-8 字节（残留进程直写），避免客户端崩溃。
+                    let line = String::from_utf8_lossy(&bytes).into_owned();
                     if sender.send(Ok(line)).is_err() {
                         break;
                     }

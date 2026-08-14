@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+//! 默认禁止 unsafe 代码；唯一例外是 `tools::bash::handle_inheritance` 模块
+//! （显式 `#[allow(unsafe_code)]`）：Windows 上清除 stdout/stderr 句柄继承位，
+//! 防止强杀后的残留子进程直写本进程 stdout 管道破坏 JSON-RPC 流。
+#![deny(unsafe_code)]
 //! Singularity headless agent core（Phase 3 目标形态）。
 //!
 //! 可嵌入的 agent 核心，与具体 CLI / app-server 解耦：
