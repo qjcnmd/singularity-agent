@@ -26,7 +26,7 @@ const DEFAULT_CONFIG_PATH: &str = "evaluations/eval-config.json";
 /// 默认每 cell 超时（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// 默认并行度。
-const DEFAULT_MAX_PARALLEL: usize = 10;
+const DEFAULT_MAX_PARALLEL: usize = 5;
 
 /// `evaluations/eval-config.json` 的 schema。
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +40,9 @@ pub(crate) struct EvalConfig {
     /// 每 cell 超时秒数（可选，默认 1800）。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// 并行 cell 上限（可选，默认 5；超出部分排队等待）。
+    #[serde(default)]
+    pub max_parallel: Option<usize>,
     /// 判分使用的 bash 可执行文件（可选；默认探测 Git for Windows 安装）。
     /// 不能依赖 PATH 中的裸 `bash`：Windows 上 CreateProcess 会优先命中
     /// System32 的 WSL bash，把 Windows 路径当 Linux 路径解析。
@@ -173,7 +176,9 @@ pub(crate) fn run_eval(
         ));
     }
     let timeout = timeout_override.unwrap_or(config.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let max_parallel = max_parallel_override.unwrap_or(DEFAULT_MAX_PARALLEL);
+    let max_parallel = max_parallel_override
+        .or(config.max_parallel)
+        .unwrap_or(DEFAULT_MAX_PARALLEL);
 
     let output_root = PathBuf::from(&config.output_dir);
     fs::create_dir_all(&output_root).map_err(|error| {
