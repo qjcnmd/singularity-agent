@@ -3346,6 +3346,68 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
 }
 
 #[test]
+fn catalog_builtin_cost_estimate_flows_into_turn_usage() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000000,"completion_tokens":1000000,"total_tokens":2000000,"prompt_tokens_details":{"cached_tokens":1000000}}}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "opencode-go/deepseek-v4-flash",
+            "providers": {
+                "opencode-go": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "OPENCODE_KEY",
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "OPENCODE_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+    );
+    let provider = snapshot
+        .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
+        .expect("selected builtin provider");
+    let response = provider
+        .complete(
+            &ModelTurnRequest::new(
+                "builtin_cost_request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Chat completion with usage");
+    request_body
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured provider request");
+    let usage = response.usage;
+    assert_eq!(usage.input_tokens, 1_000_000);
+    assert_eq!(usage.output_tokens, 1_000_000);
+    assert_eq!(usage.cached_input_tokens, 1_000_000);
+    let cost = usage.cost_estimate.expect("builtin cost estimate");
+    assert!((cost - 0.4228).abs() < 1e-9, "cost estimate was {cost}");
+}
+
+#[test]
 fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",

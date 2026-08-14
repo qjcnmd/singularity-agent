@@ -851,6 +851,18 @@ pub(super) fn finalize_provider_response(
     usage: ModelUsage,
     finish_reason: Option<String>,
 ) -> Result<ModelTurnResponse, ProviderError> {
+    // Chat 与 Responses 两条解析路径都汇入此处，是 usage 聚合的单一位置；按
+    // (provider, model) 查内置表估算成本。无内置价格（含 dashscope）保持 None。
+    let mut usage = usage;
+    usage.cost_estimate =
+        super::builtin_models::builtin_model_cost(&config.provider_name, model_name).map(|cost| {
+            super::builtin_models::estimate_cost(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                &cost,
+            )
+        });
     let mut response = ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id,

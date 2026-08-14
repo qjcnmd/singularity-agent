@@ -1462,14 +1462,21 @@ fn configured_model_from_file(
 }
 
 fn configured_model_from_user_file(
+    provider_name: &str,
+    model_name: &str,
     model_file: &UserConfigModel,
 ) -> Result<ConfiguredModel, ProviderError> {
-    // 合并优先级：顶层字段 > capabilities 内嵌 > 默认值。capabilities 块是旧
-    // probe 时代 config.json 的显式声明残留，接受并投影到静态契约。
+    // 合并优先级：顶层字段 > capabilities 内嵌 > 内置模型表 > 默认值。capabilities 块
+    // 是旧 probe 时代 config.json 的显式声明残留，接受并投影到静态契约。内置表只兜
+    // 底缺省的 context_window/max_output_tokens；api_protocol 仍必须由用户声明。
     let capabilities = model_file.capabilities.clone().unwrap_or_default();
+    let builtin = super::builtin_models::builtin_model(provider_name, model_name);
     let (Some(api_protocol), Some(max_output_tokens)) = (
         model_file.api_protocol.as_deref(),
-        model_file.max_output_tokens.or(capabilities.max_output_tokens),
+        model_file
+            .max_output_tokens
+            .or(capabilities.max_output_tokens)
+            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
     ) else {
         return Err(configuration_error(
             "model override is incomplete; api_protocol and max_output_tokens are required",
@@ -1487,8 +1494,14 @@ fn configured_model_from_user_file(
         supports_reasoning: capabilities.supports_reasoning,
         max_tools_per_request: capabilities.max_tools_per_request,
         max_parallel_tool_calls: capabilities.max_parallel_tool_calls,
-        max_context_tokens: model_file.max_context_tokens.or(capabilities.max_context_tokens),
-        max_output_tokens: model_file.max_output_tokens.or(capabilities.max_output_tokens),
+        max_context_tokens: model_file
+            .max_context_tokens
+            .or(capabilities.max_context_tokens)
+            .or_else(|| builtin.map(|entry| entry.context_window)),
+        max_output_tokens: model_file
+            .max_output_tokens
+            .or(capabilities.max_output_tokens)
+            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
     };
     configured_model_from_file(
         ModelsFileModel {
@@ -1580,7 +1593,7 @@ where
                 }
                 continue;
             }
-            match configured_model_from_user_file(model_file) {
+            match configured_model_from_user_file(provider_name, model_name, model_file) {
                 Ok(model) => {
                     models.insert(model_name.clone(), model);
                 }
@@ -2604,8 +2617,12 @@ fn endpoint_fingerprint(base_url: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn user_model_override_is_selectable(model: &UserConfigModel) -> bool {
-    configured_model_from_user_file(model).is_ok()
+fn user_model_override_is_selectable(
+    provider_name: &str,
+    model_name: &str,
+    model: &UserConfigModel,
+) -> bool {
+    configured_model_from_user_file(provider_name, model_name, model).is_ok()
 }
 
 fn unix_timestamp_seconds() -> u64 {
@@ -3280,7 +3297,7 @@ fn imported_model_is_selectable(
         Some(ProviderConfigSource::UserConfigFile),
     )
     .is_err()
-        || configured_model_from_user_file(model).is_err()
+        || configured_model_from_user_file(provider_name, model_name, model).is_err()
     {
         return false;
     }
@@ -3395,7 +3412,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
                 (validate_model_id(id, "model id").is_ok()
                     && base_url_valid
                     && auth_valid
-                    && user_model_override_is_selectable(model))
+                    && user_model_override_is_selectable(provider_name, id, model))
                 .then_some(id.clone())
             })
             .collect::<std::collections::BTreeSet<_>>();
@@ -3403,7 +3420,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
             provider_file
                 .models
                 .get(id)
-                .is_some_and(|model| !user_model_override_is_selectable(model))
+                .is_some_and(|model| !user_model_override_is_selectable(provider_name, id, model))
         }) {
             diagnostics.push("one or more model overrides are incomplete or invalid".to_string());
         }
@@ -3802,6 +3819,72 @@ mod user_config_tests {
             .expect_err("missing auth must fail when selected");
         assert_eq!(error.error.kind, ModelErrorKind::AuthError);
         assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
+    }
+
+    #[test]
+    fn user_model_without_limits_falls_back_to_builtin_table() {
+        let model = UserConfigModel {
+            api_protocol: Some("responses".to_string()),
+            ..UserConfigModel::default()
+        };
+        let opencode = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
+            .expect("builtin fallback resolves missing opencode-go limits");
+        assert_eq!(opencode.max_context_tokens, Some(1_000_000));
+        assert_eq!(opencode.max_output_tokens, 384_000);
+
+        let longcat = configured_model_from_user_file("longcat", "LongCat-2.0", &model)
+            .expect("builtin fallback resolves missing longcat limits");
+        assert_eq!(longcat.max_context_tokens, Some(1_000_000));
+        assert_eq!(longcat.max_output_tokens, 131_072);
+    }
+
+    #[test]
+    fn user_declared_limits_win_over_builtin_table() {
+        let model = UserConfigModel {
+            api_protocol: Some("responses".to_string()),
+            max_context_tokens: Some(64_000),
+            max_output_tokens: Some(8_192),
+            ..UserConfigModel::default()
+        };
+        let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
+            .expect("user declaration resolves");
+        assert_eq!(resolved.max_context_tokens, Some(64_000));
+        assert_eq!(resolved.max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn capabilities_limits_take_priority_over_builtin_table() {
+        let model = UserConfigModel {
+            api_protocol: Some("responses".to_string()),
+            capabilities: Some(ProviderCapabilityDeclaration {
+                max_context_tokens: Some(32_000),
+                max_output_tokens: Some(2_048),
+                ..ProviderCapabilityDeclaration::default()
+            }),
+            ..UserConfigModel::default()
+        };
+        let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
+            .expect("capabilities declaration resolves");
+        assert_eq!(resolved.max_context_tokens, Some(32_000));
+        assert_eq!(resolved.max_output_tokens, 2_048);
+    }
+
+    #[test]
+    fn unknown_model_without_limits_still_fails_closed() {
+        let model = UserConfigModel {
+            api_protocol: Some("chat".to_string()),
+            ..UserConfigModel::default()
+        };
+        let error =
+            match configured_model_from_user_file("unknown-provider", "unknown-model", &model) {
+                Ok(_) => panic!("no builtin fallback for an unknown model"),
+                Err(error) => error,
+            };
+        assert!(error.message.contains("incomplete"));
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_configuration_invalid")
+        );
     }
 
     #[test]
