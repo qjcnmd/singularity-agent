@@ -151,6 +151,7 @@ method_registry! {
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
     TurnStatus => ("turn/status", Request, TurnIdParams, TurnResult),
+    ProjectTrust => ("project/trust", Request, ProjectTrustParams, ProjectTrustResult),
     EventSubscribe => ("event/subscribe", Request, EventSubscribeParams, EventSubscribeResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
@@ -361,6 +362,19 @@ impl JsonRpcMessage {
                 code: error.code,
                 message: error.message,
                 data: None,
+            },
+        })
+    }
+
+    /// 构造携带已脱敏 data 的 error response（data 仅允许调用方显式提供）。
+    pub fn error_with_data(id: impl Into<Option<JsonRpcId>>, error: ErrorCode, data: Value) -> Self {
+        Self::Error(JsonRpcErrorResponse {
+            jsonrpc: JsonRpcVersion::V2,
+            id: id.into().unwrap_or(JsonRpcId::Null),
+            error: JsonRpcError {
+                code: error.code,
+                message: error.message,
+                data: Some(data),
             },
         })
     }
@@ -952,6 +966,57 @@ pub struct EventSubscribeResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ServerShutdownResult {
     pub shutdown: bool,
+}
+/// 查询或设置项目信任决策的参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectTrustParams {
+    pub path: String,
+    /// 决策操作：字段缺失=查询；`true`/`false`=设置；`null`=重置为 ask（清除记录）。
+    #[serde(
+        default,
+        skip_serializing_if = "ProjectTrustDecision::is_query",
+        deserialize_with = "deserialize_project_trust_decision"
+    )]
+    pub decision: ProjectTrustDecision,
+}
+
+/// project/trust 的决策操作（wire：缺失=查询、bool=设置、null=重置为 ask）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ProjectTrustDecision {
+    Set(bool),
+    Ask,
+    #[default]
+    Query,
+}
+
+impl ProjectTrustDecision {
+    fn is_query(&self) -> bool {
+        matches!(self, Self::Query)
+    }
+}
+
+fn deserialize_project_trust_decision<'de, D>(
+    deserializer: D,
+) -> Result<ProjectTrustDecision, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // 字段存在时解析：null → Ask（重置），bool → Set；其他值类型不匹配报错。
+    match Option::<bool>::deserialize(deserializer)? {
+        Some(trusted) => Ok(ProjectTrustDecision::Set(trusted)),
+        None => Ok(ProjectTrustDecision::Ask),
+    }
+}
+
+/// project/trust 的响应：当前存储的决策（无记录时 `decision` 缺失）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTrustResult {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<bool>,
 }
 
 /// 对外广播的应用事件。

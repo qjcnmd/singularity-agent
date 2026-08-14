@@ -461,6 +461,8 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         .arg(model)
         .arg("--json")
         .current_dir(cwd)
+        // 非交互：stdin 不继承终端（否则 eval 从终端启动时子进程会误判交互并触发 trust 询问）。
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

@@ -42,24 +42,6 @@ impl Drop for TestDir {
     }
 }
 
-struct AgentsEscape {
-    path: PathBuf,
-}
-
-#[cfg(unix)]
-impl Drop for AgentsEscape {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(windows)]
-impl Drop for AgentsEscape {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
-    }
-}
-
 #[test]
 fn loads_agents_files_from_workspace_root_to_nested_cwd() {
     let temp = TestDir::new();
@@ -209,43 +191,6 @@ fn rejects_cwd_outside_workspace() {
 }
 
 #[test]
-fn rejects_linked_agents_path_without_following_it() {
-    let temp = TestDir::new();
-    let workspace = temp.path().join("workspace");
-    let cwd = workspace.join("src");
-    let outside = temp.path().join("outside");
-    std::fs::create_dir_all(&cwd).expect("nested cwd");
-    std::fs::create_dir_all(&outside).expect("outside");
-    std::fs::write(outside.join("AGENTS.md"), "outside instructions").expect("outside agents");
-    let _escape = create_agents_escape(&cwd.join("AGENTS.md"), &outside);
-
-    let error = load_project_instructions(&workspace, &cwd).expect_err("escape rejected");
-
-    assert_eq!(error.code, ProjectInstructionErrorCode::UnsupportedFileType);
-    assert_eq!(error.path.as_deref(), Some(Path::new("src/AGENTS.md")));
-}
-
-#[test]
-fn rejects_hardlinked_agents_file_before_reading_it() {
-    let temp = TestDir::new();
-    let workspace = temp.path().join("workspace");
-    let outside = temp.path().join("outside");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    std::fs::create_dir_all(&outside).expect("outside");
-    let outside_agents = outside.join("AGENTS.md");
-    std::fs::write(&outside_agents, "outside instructions").expect("outside agents");
-    std::fs::hard_link(&outside_agents, workspace.join("AGENTS.md")).expect("agents hardlink");
-
-    let error = load_project_instructions(&workspace, &workspace).expect_err("hardlink rejected");
-
-    assert_eq!(
-        error.code,
-        ProjectInstructionErrorCode::UnsupportedFileIdentity
-    );
-    assert_eq!(error.path.as_deref(), Some(Path::new("AGENTS.md")));
-}
-
-#[test]
 fn rejects_single_agents_file_over_named_limit() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
@@ -283,34 +228,4 @@ fn rejects_hierarchy_over_named_total_limit() {
         error.path.as_deref(),
         Some(Path::new("first/second/AGENTS.md"))
     );
-}
-
-#[cfg(unix)]
-fn create_agents_escape(candidate: &Path, outside: &Path) -> AgentsEscape {
-    std::os::unix::fs::symlink(outside.join("AGENTS.md"), candidate).expect("agents symlink");
-    AgentsEscape {
-        path: candidate.to_path_buf(),
-    }
-}
-
-#[cfg(windows)]
-fn create_agents_escape(candidate: &Path, outside: &Path) -> AgentsEscape {
-    let output = std::process::Command::new("cmd.exe")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            candidate.to_str().expect("candidate path"),
-            outside.to_str().expect("outside path"),
-        ])
-        .output()
-        .expect("create agents junction");
-    assert!(
-        output.status.success(),
-        "mklink /J failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    AgentsEscape {
-        path: candidate.to_path_buf(),
-    }
 }

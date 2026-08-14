@@ -1,7 +1,8 @@
 //! `sg` 的命令行入口：通过 stdio JSON-RPC 调用 app-server 并渲染结果。
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::fmt;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -9,20 +10,22 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use singularity_core::ClientInfo;
+use singularity_core::{APP_ERROR_TRUST_REQUIRED, ClientInfo};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
     ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method,
-    ProviderConfigurationStatus, RpcMethod, Thread, ThreadEventParams, ThreadIdParams,
-    ThreadStartParams, Turn, TurnEventParams, TurnIdParams, TurnInputDelivery, TurnInputParams,
-    TurnStartParams, TurnStatus, rpc_methods,
+    ProjectTrustDecision, ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus,
+    RpcMethod, Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams, Turn, TurnEventParams,
+    TurnIdParams, TurnInputDelivery, TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
 mod eval;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+/// CLI 在自身 stdin 为 TTY 时传给 app-server 的交互 UI 标记。
+const INTERACTIVE_UI_ENV: &str = "SINGULARITY_INTERACTIVE";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity CLI";
@@ -69,6 +72,14 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Query or manage the project trust decision for a folder.
+    Trust {
+        /// Project folder path (default: current directory).
+        path: Option<PathBuf>,
+        /// Decision to store: trust, never, or ask (clear the record).
+        #[arg(value_enum)]
+        decision: Option<TrustArg>,
+    },
     /// Run the fixed task set against the configured model list (lightweight regression eval).
     Eval {
         /// Path to eval-config.json (default: evaluations/eval-config.json).
@@ -87,6 +98,14 @@ enum Command {
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+// sg trust 的受控决策值。
+enum TrustArg {
+    Trust,
+    Never,
+    Ask,
 }
 
 #[derive(Debug, Subcommand)]
@@ -309,6 +328,28 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         },
+        Command::Trust { path, decision } => {
+            let mut client = AppServerClient::spawn()?;
+            client.initialize()?;
+            let cwd = match path {
+                Some(path) => canonical_directory_arg(&path)?,
+                None => canonical_current_dir()?,
+            };
+            let decision = match decision {
+                None => ProjectTrustDecision::Query,
+                Some(TrustArg::Trust) => ProjectTrustDecision::Set(true),
+                Some(TrustArg::Never) => ProjectTrustDecision::Set(false),
+                Some(TrustArg::Ask) => ProjectTrustDecision::Ask,
+            };
+            let result = client.project_trust(&cwd, decision)?;
+            let stored = match result.decision {
+                Some(true) => "trusted",
+                Some(false) => "never",
+                None => "ask",
+            };
+            println!("project trust: {} => {stored}", result.path);
+            Ok(())
+        }
         Command::Eval {
             config,
             tasks,
@@ -416,12 +457,48 @@ struct RpcReply<R> {
     notifications: Vec<JsonRpcNotification>,
 }
 
+/// app-server JSON-RPC 错误响应（保留 code/data，供 -32010 trust_required 流程使用）。
+#[derive(Debug, Clone)]
+struct AppServerRpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+impl fmt::Display for AppServerRpcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "app-server error: {}", self.message)
+    }
+}
+
+impl std::error::Error for AppServerRpcError {}
+
+impl From<String> for AppServerRpcError {
+    fn from(message: String) -> Self {
+        Self {
+            code: 0,
+            message,
+            data: None,
+        }
+    }
+}
+
+impl From<AppServerRpcError> for String {
+    fn from(error: AppServerRpcError) -> Self {
+        error.to_string()
+    }
+}
+
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
 impl AppServerClient {
     // 定位并启动 app-server，随后建立异步 stdout reader。
     fn spawn() -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
+        // 自身 stdin 为 TTY 时向 app-server 传递交互 UI 可用性（非交互如 eval 子进程不设置）。
+        if std::io::stdin().is_terminal() {
+            command.env(INTERACTIVE_UI_ENV, "1");
+        }
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
         }
@@ -488,18 +565,27 @@ impl AppServerClient {
     }
 
     // 启动 turn、渲染事件，并在必要时轮询到终态。
+    // -32010 trust_required 时先询问/写回 trust 决策，再重试一次原请求。
     fn turn_start(
         &mut self,
         thread_id: &str,
         text: &str,
         render: bool,
     ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
-        let reply = self.request::<rpc_methods::TurnStart>(&TurnStartParams {
+        let params = TurnStartParams {
             thread_id: thread_id.to_string(),
             input: vec![InputItem::Text {
                 text: text.to_string(),
             }],
-        })?;
+        };
+        let reply = match self.request::<rpc_methods::TurnStart>(&params) {
+            Ok(reply) => reply,
+            Err(error) if error.code == APP_ERROR_TRUST_REQUIRED => {
+                self.resolve_trust_for_cwd(&error)?;
+                self.request::<rpc_methods::TurnStart>(&params)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         let turn = render_and_wait_terminal(
             self,
             reply.result.turn.clone(),
@@ -507,6 +593,47 @@ impl AppServerClient {
             render,
         )?;
         Ok((turn, reply.notifications))
+    }
+
+    /// 处理 -32010：交互时提示 `Trust project folder? <cwd> [y/N]` 并写回决策；
+    /// 非交互（stdin 非 tty）直接按不信任处理（不提示）。
+    fn resolve_trust_for_cwd(&mut self, error: &AppServerRpcError) -> Result<(), String> {
+        let cwd = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("cwd"))
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or(canonical_current_dir()?);
+        if std::io::stdin().is_terminal() {
+            eprint!("Trust project folder? {cwd} [y/N] ");
+            std::io::stderr().flush().map_err(|error| {
+                format!("failed to flush trust prompt: {error}")
+            })?;
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| format!("failed to read trust decision: {error}"))?;
+            let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+            self.project_trust(&cwd, ProjectTrustDecision::Set(trusted))?;
+        } else {
+            self.project_trust(&cwd, ProjectTrustDecision::Set(false))?;
+        }
+        Ok(())
+    }
+
+    // 查询/设置项目信任决策。
+    fn project_trust(
+        &mut self,
+        path: &str,
+        decision: ProjectTrustDecision,
+    ) -> Result<ProjectTrustResult, String> {
+        let reply = self.request::<rpc_methods::ProjectTrust>(&ProjectTrustParams {
+            path: path.to_string(),
+            decision,
+        })?;
+        Ok(reply.result)
     }
 
     // 恢复暂停/挂起的 turn，从持久化 checkpoint 继续执行并渲染事件。
@@ -629,7 +756,10 @@ impl AppServerClient {
     }
 
     // 发送请求并只接收匹配 id 的响应，同时保留通知事件。
-    fn request<M: RpcMethod>(&mut self, params: &M::Params) -> Result<RpcReply<M::Result>, String> {
+    fn request<M: RpcMethod>(
+        &mut self,
+        params: &M::Params,
+    ) -> Result<RpcReply<M::Result>, AppServerRpcError> {
         let method = M::METHOD;
         let params_value = serde_json::to_value(params)
             .map_err(|error| format!("failed to serialize {} params: {error}", method.as_str()))?;
@@ -656,11 +786,15 @@ impl AppServerClient {
                     });
                 }
                 JsonRpcMessage::Error(response) if response.id == id => {
-                    return Err(format!("app-server error: {}", response.error.message));
+                    return Err(AppServerRpcError {
+                        code: response.error.code,
+                        message: response.error.message,
+                        data: response.error.data,
+                    });
                 }
                 JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_) => {}
                 JsonRpcMessage::Request(_) => {
-                    return Err("app-server emitted a request on the response channel".to_string());
+                    return Err("app-server emitted a request on the response channel".to_string().into());
                 }
             }
         }
@@ -817,6 +951,19 @@ fn canonical_current_dir() -> Result<String, String> {
     cwd.to_str()
         .map(str::to_string)
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
+}
+
+// 规范化 sg trust 的目录参数（必须存在且为目录）。
+fn canonical_directory_arg(path: &Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    canonical
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "path is not valid UTF-8".to_string())
 }
 
 // 过滤并脱敏可公开渲染的协议事件。

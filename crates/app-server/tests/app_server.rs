@@ -1,6 +1,6 @@
 //! AppServer protocol、recovery 和 sandbox 边界测试。
 
-use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
+use singularity_app_server::{AppServer, AppServerError};
 use singularity_model::ProviderConfigSnapshot;
 #[cfg(windows)]
 use singularity_protocol::ConversationRole;
@@ -31,6 +31,8 @@ fn workspace_root() -> std::path::PathBuf {
 }
 
 fn app_server(store: SessionStore) -> AppServer {
+    // 隔离 trust 存储：挂载独立临时 trust home，避免读取/写入真实用户 trust.json。
+    let trust_home = Box::leak(Box::new(tempfile::tempdir().expect("trust home")));
     AppServer::new(
         store,
         ProviderConfigSnapshot::capture(
@@ -44,6 +46,7 @@ fn app_server(store: SessionStore) -> AppServer {
             None,
         ),
     )
+    .with_trust_home(trust_home.path())
 }
 
 // Request workers must use the typed reopen of an initialized file store;
@@ -381,13 +384,8 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
             active_missing.thread_id
         ))
         .expect_err("turn start without workspace must fail");
-    assert!(matches!(
-        turn_error,
-        AppServerError::TurnExecution {
-            stage: TurnFailureStage::AgentLoop,
-            cause: TurnFailureCause::Workspace,
-        }
-    ));
+    // 信任门控前置检查在创建 turn 前即失败（比旧路径更早，不留幻影 turn 行）。
+    assert!(matches!(turn_error, AppServerError::Workspace(_)));
 
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert_eq!(

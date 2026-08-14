@@ -16,6 +16,9 @@ impl AppServer {
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
+            interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV)
+                .is_some_and(|value| value != "0"),
+            trust_home: user_singularity_home(),
             test_provider_override: None,
         }
     }
@@ -27,6 +30,20 @@ impl AppServer {
         provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
     ) -> Self {
         self.test_provider_override = Some(provider);
+        self
+    }
+
+    /// 仅测试：覆盖 trust.json 所在目录（隔离真实用户 trust 配置）。
+    #[doc(hidden)]
+    pub fn with_trust_home(mut self, home: impl AsRef<Path>) -> Self {
+        self.trust_home = Some(home.as_ref().to_path_buf());
+        self
+    }
+
+    /// 仅测试：覆盖交互 UI 可用性。
+    #[doc(hidden)]
+    pub fn with_interactive_ui(mut self, interactive: bool) -> Self {
+        self.interactive_ui = interactive;
         self
     }
 
@@ -65,6 +82,8 @@ impl AppServer {
             steer_handles: Arc::clone(&self.steer_handles),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
+            interactive_ui: self.interactive_ui,
+            trust_home: self.trust_home.clone(),
             test_provider_override: self.test_provider_override.clone(),
         })
     }
@@ -412,6 +431,13 @@ impl AppServer {
                 &mut emit,
                 invalid_state_response(message.required_id(), THREAD_ARCHIVED)?,
             );
+            return Ok(());
+        }
+        // 信任门控：ask 未决且有交互 UI 时返回 -32010 trust_required（带 cwd）
+        // 且不创建 turn；CLI 询问用户后经 project/trust 写回决策并重试。
+        if let TrustResolution::AskNeeded = self.resolve_thread_trust(&thread)? {
+            let cwd = thread.cwd.clone().unwrap_or_default();
+            emit_messages(&mut emit, trust_required_response(message.required_id(), &cwd)?);
             return Ok(());
         }
         let Some(_execution_guard) = self

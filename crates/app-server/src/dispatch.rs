@@ -106,6 +106,7 @@ impl AppServer {
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),
+            Method::ProjectTrust => self.project_trust(message),
             Method::EventSubscribe => self.event_subscribe(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
@@ -363,5 +364,41 @@ impl AppServer {
             ),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// 查询/设置/重置项目信任决策（写 `<singularity_home>/trust.json`）。
+    pub(super) fn project_trust(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ProjectTrustParams = parse_params(&message)?;
+        let path = match canonical_thread_cwd(Some(&params.path)) {
+            Ok(path) => path,
+            Err(_) => return invalid_params_response(message.required_id()),
+        };
+        let mut decisions = self.trust_decisions();
+        match params.decision {
+            ProjectTrustDecision::Set(trusted) => {
+                if decisions.set(Path::new(&path), trusted).is_err() {
+                    return invalid_state_response(
+                        message.required_id(),
+                        SAFE_WORKSPACE_FAILURE,
+                    );
+                }
+            }
+            ProjectTrustDecision::Ask => {
+                if decisions.remove(Path::new(&path)).is_err() {
+                    return invalid_state_response(
+                        message.required_id(),
+                        SAFE_WORKSPACE_FAILURE,
+                    );
+                }
+            }
+            ProjectTrustDecision::Query => {}
+        }
+        json_response(
+            message.required_id(),
+            ProjectTrustResult {
+                path: path.clone(),
+                decision: decisions.get(Path::new(&path)),
+            },
+        )
     }
 }

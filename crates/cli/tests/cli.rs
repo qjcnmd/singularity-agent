@@ -1611,3 +1611,164 @@ fn ensure_app_server_binary() {
         assert!(status.success(), "failed to build app-server binary");
     });
 }
+
+// 验证 sg trust 命令的查询/设置/重置三态与 wire 形状。
+#[test]
+fn cli_trust_command_sets_trusted_decision() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let expected_path = std::fs::canonicalize(&project)
+        .expect("canonical project")
+        .to_string_lossy()
+        .into_owned();
+    let set_params = temp.path().join("set_params.json");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "project/trust",
+                vec![
+                    capture_params(&set_params),
+                    respond(json!({"path": expected_path, "decision": true})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let set = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["trust", path_str(&project), "trust"])
+        .output()
+        .expect("trust set cli");
+    assert!(set.status.success(), "stderr={}", stderr(&set));
+    assert!(stdout(&set).contains("=> trusted"), "stdout={}", stdout(&set));
+
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&set_params).expect("set params"))
+            .expect("set params json");
+    assert_eq!(params["path"], expected_path);
+    assert_eq!(params["decision"], true);
+}
+
+#[test]
+fn cli_trust_command_queries_without_decision_field() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let expected_path = std::fs::canonicalize(&project)
+        .expect("canonical project")
+        .to_string_lossy()
+        .into_owned();
+    let query_params = temp.path().join("query_params.json");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "project/trust",
+                vec![capture_params(&query_params), respond(json!({"path": expected_path}))],
+            )
+            .shutdown(),
+    );
+
+    let query = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["trust", path_str(&project)])
+        .output()
+        .expect("trust query cli");
+    assert!(query.status.success(), "stderr={}", stderr(&query));
+    assert!(stdout(&query).contains("=> ask"), "stdout={}", stdout(&query));
+
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&query_params).expect("query params"))
+            .expect("query params json");
+    assert_eq!(params["path"], expected_path);
+    assert!(params.get("decision").is_none(), "query must omit decision");
+}
+
+#[test]
+fn cli_trust_command_ask_resets_with_null_decision() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let expected_path = std::fs::canonicalize(&project)
+        .expect("canonical project")
+        .to_string_lossy()
+        .into_owned();
+    let ask_params = temp.path().join("ask_params.json");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "project/trust",
+                vec![
+                    capture_params(&ask_params),
+                    respond(json!({"path": expected_path, "decision": null})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let ask = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["trust", path_str(&project), "ask"])
+        .output()
+        .expect("trust ask cli");
+    assert!(ask.status.success(), "stderr={}", stderr(&ask));
+    assert!(stdout(&ask).contains("=> ask"), "stdout={}", stdout(&ask));
+
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ask_params).expect("ask params"))
+            .expect("ask params json");
+    assert_eq!(params["path"], expected_path);
+    assert_eq!(params["decision"], serde_json::Value::Null);
+}
+
+// 验证非交互 stdin（如 eval 子进程）收到 -32010 时不提示、直接按不信任处理并重试。
+#[test]
+fn cli_run_auto_declines_trust_required_when_stdin_is_not_a_tty() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let thread = fake_thread("thread_trust");
+    let trust_cwd = "C:/workspace";
+    let trust_params = temp.path().join("trust_params.json");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond("thread/start", json!({"thread": thread.clone()}))
+            .interaction(
+                "turn/start",
+                vec![json!({"respond": {"jsonrpc": "2.0", "error": {"code": -32010, "message": "trust required", "data": {"cwd": trust_cwd}}}})],
+            )
+            .interaction(
+                "turn/start",
+                vec![respond(json!({"turn": fake_turn("turn_trust", "thread_trust", "completed", "completed")}))],
+            )
+            .interaction(
+                "project/trust",
+                vec![
+                    capture_params(&trust_params),
+                    respond(json!({"path": trust_cwd, "decision": false})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "write tests"])
+        .output()
+        .expect("run cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    // 非交互：不提示，写回不信任决策后重试原请求。
+    assert!(!stderr(&output).contains("Trust project folder?"));
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&trust_params).expect("trust params"))
+            .expect("trust params json");
+    assert_eq!(params["path"], trust_cwd);
+    assert_eq!(params["decision"], false);
+}

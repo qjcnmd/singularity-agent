@@ -1,6 +1,7 @@
 //! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
 
 use singularity_core::{ClientInfo, ErrorCode};
+use serde_json::json;
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ConversationMessage,
     ConversationRole, EventClass, EventDelivery, EventMetadata, EventSubscribeParams,
@@ -356,7 +357,7 @@ fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
 
 #[test]
 fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 19);
+    assert_eq!(METHOD_REGISTRY.len(), 20);
     for spec in METHOD_REGISTRY {
         assert_eq!(Method::parse(spec.name), Some(spec.method));
         assert_eq!(spec.method.as_str(), spec.name);
@@ -506,4 +507,69 @@ fn turn_model_usage_wire_is_optional_and_backward_compatible() {
     };
     let value = serde_json::to_value(&bare).unwrap();
     assert!(value.get("model_usage").is_none());
+}
+
+#[test]
+fn project_trust_params_distinguish_query_set_and_ask() {
+    use singularity_protocol::{ProjectTrustDecision, ProjectTrustParams};
+
+    // 字段缺失 = 查询。
+    let query: ProjectTrustParams =
+        serde_json::from_value(json!({ "path": "C:/workspace" })).expect("query");
+    assert_eq!(query.decision, ProjectTrustDecision::Query);
+    assert!(
+        serde_json::to_value(&query)
+            .expect("serialize query")
+            .get("decision")
+            .is_none(),
+        "query must not send a decision field"
+    );
+
+    // true/false = 设置。
+    for trusted in [true, false] {
+        let set: ProjectTrustParams = serde_json::from_value(json!({
+            "path": "C:/workspace",
+            "decision": trusted,
+        }))
+        .expect("set");
+        assert_eq!(set.decision, ProjectTrustDecision::Set(trusted));
+        let wire = serde_json::to_value(&set).expect("serialize set");
+        assert_eq!(wire["decision"], json!(trusted));
+    }
+
+    // null = 重置为 ask（清除记录）。
+    let ask: ProjectTrustParams = serde_json::from_value(json!({
+        "path": "C:/workspace",
+        "decision": null,
+    }))
+    .expect("ask");
+    assert_eq!(ask.decision, ProjectTrustDecision::Ask);
+    let wire = serde_json::to_value(&ask).expect("serialize ask");
+    assert_eq!(wire["decision"], json!(null));
+
+    // 非 bool/null 值不匹配参数合同。
+    assert!(
+        serde_json::from_value::<ProjectTrustParams>(json!({
+            "path": "C:/workspace",
+            "decision": "trust",
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn trust_required_error_carries_cwd_in_data() {
+    use singularity_core::APP_ERROR_TRUST_REQUIRED;
+
+    let message = JsonRpcMessage::error_with_data(
+        JsonRpcId::Number(1),
+        ErrorCode::new(APP_ERROR_TRUST_REQUIRED, "trust required"),
+        json!({ "cwd": "C:/workspace" }),
+    );
+    let value = message.to_wire_value();
+    assert_eq!(value["jsonrpc"], "2.0");
+    assert_eq!(value["error"]["code"], -32010);
+    assert_eq!(value["error"]["message"], "trust required");
+    assert_eq!(value["error"]["data"]["cwd"], "C:/workspace");
+    assert_eq!(Method::parse("project/trust"), Some(Method::ProjectTrust));
 }

@@ -12,6 +12,8 @@ use singularity_protocol::ConversationRole;
 use super::*;
 
 fn app_server(store: SessionStore) -> AppServer {
+    // 隔离 trust 存储：挂载独立临时 trust home，避免读取/写入真实用户 trust.json。
+    let trust_home = Box::leak(Box::new(tempfile::tempdir().expect("trust home")));
     AppServer::new(
         store,
         ProviderConfigSnapshot::capture(
@@ -25,6 +27,7 @@ fn app_server(store: SessionStore) -> AppServer {
             None,
         ),
     )
+    .with_trust_home(trust_home.path())
 }
 
 #[test]
@@ -400,7 +403,13 @@ fn agent_loop_system_prompt_loads_bounded_agents_md_from_thread_cwd() {
         )],
         seen_requests: Arc::clone(&seen_requests),
     };
-    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+    // 信任该 workspace（有 AGENTS.md 且无记录时默认 ask，非交互测试默认不加载）。
+    let trust_home = tempfile::tempdir().expect("trust home");
+    let mut decisions = singularity_core::TrustDecisions::load(trust_home.path());
+    decisions.set(&workspace, true).expect("trust workspace");
+    let mut server = app_server(store)
+        .with_trust_home(trust_home.path())
+        .with_test_provider(Arc::new(provider));
 
     let responses = server
         .turn_start(
@@ -470,7 +479,13 @@ fn agent_loop_replays_session_file_history_across_turns() {
         ],
         seen_requests: Arc::clone(&seen_requests),
     };
-    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+    // 信任该 workspace：断言依赖 developer 指令消息存在。
+    let trust_home = tempfile::tempdir().expect("trust home");
+    let mut decisions = singularity_core::TrustDecisions::load(trust_home.path());
+    decisions.set(&workspace, true).expect("trust workspace");
+    let mut server = app_server(store)
+        .with_trust_home(trust_home.path())
+        .with_test_provider(Arc::new(provider));
 
     for (id, input) in [(1, "previous user"), (2, "current user")] {
         let responses = server
@@ -1020,4 +1035,311 @@ fn turn_resume_reopens_session_and_runs_new_core() {
         })
         .collect();
     assert_eq!(texts, vec!["resume me", "resumed answer"]);
+}
+
+#[test]
+fn turn_start_requires_trust_decision_before_creating_the_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("AGENTS.md"), "project instructions").expect("agents");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "done",
+        )],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+    // ask 未决 + 有交互 UI：turn/start 返回 -32010 且不创建 turn。
+    let trust_home = tempfile::tempdir().expect("trust home");
+    let mut server = app_server(store)
+        .with_trust_home(trust_home.path())
+        .with_interactive_ui(true)
+        .with_test_provider(Arc::new(provider));
+
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
+        )
+        .expect("turn start");
+    assert_eq!(responses.len(), 1, "no events before the trust decision");
+    assert_eq!(responses[0]["error"]["code"], -32010);
+    assert_eq!(
+        responses[0]["error"]["data"]["cwd"],
+        workspace.to_string_lossy().as_ref()
+    );
+    // 未创建 turn：无会话文件、无模型请求。
+    assert!(
+        !workspace
+            .join(".singularity")
+            .join("agent-sessions")
+            .exists(),
+        "turn must not be created when trust is pending"
+    );
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+
+    // 设置决策后重试：turn 完成且加载项目指令。
+    server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                2,
+                json!({ "path": workspace.to_string_lossy(), "decision": true }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust set");
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                3,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
+        )
+        .expect("turn start retry");
+    let result: TurnStartResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 3)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
+    assert!(requests[0].messages[0].content.contains("project instructions"));
+}
+
+#[test]
+fn turn_start_skips_instructions_when_project_is_never_trusted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("AGENTS.md"), "project instructions").expect("agents");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "done",
+        )],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+    let trust_home = tempfile::tempdir().expect("trust home");
+    let mut decisions = singularity_core::TrustDecisions::load(trust_home.path());
+    decisions
+        .set(&workspace, false)
+        .expect("set never trusted");
+    let mut server = app_server(store)
+        .with_trust_home(trust_home.path())
+        .with_interactive_ui(true)
+        .with_test_provider(Arc::new(provider));
+
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
+        )
+        .expect("turn start");
+    let result: TurnStartResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    // 不信任不拒绝运行：仅不加载指令（无 developer 消息，首条为用户消息）。
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages[0].role, ModelRole::User);
+}
+
+#[test]
+fn turn_start_ask_pending_without_interactive_ui_runs_without_instructions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("AGENTS.md"), "project instructions").expect("agents");
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "done",
+        )],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+
+    let responses = server
+        .turn_start(
+            JsonRpcMessage::request(
+                Method::TurnStart,
+                1,
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "user goal"}],
+                }),
+            )
+            .expect("request"),
+        )
+        .expect("turn start");
+    let result: TurnStartResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("turn result");
+    assert_eq!(result.turn.status, TurnStatus::Completed);
+    // ask 未决 + 无交互 UI → 按不信任处理：不返回 -32010，也不加载指令。
+    assert!(responses.iter().all(|message| message.get("error").is_none()));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests[0].messages[0].role, ModelRole::User);
+}
+
+#[test]
+fn project_trust_handler_queries_sets_and_resets_decisions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    // handler 返回 canonical 路径（Windows 上为 \\?\ 前缀形式）。
+    let expected_path = std::fs::canonicalize(&workspace)
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+    let trust_home = tempfile::tempdir().expect("trust home");
+    let mut server = app_server(store).with_trust_home(trust_home.path());
+
+    // 查询：无记录 → decision 缺失。
+    let responses = server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                1,
+                json!({ "path": expected_path }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust query");
+    let result: ProjectTrustResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 1)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("trust result");
+    assert_eq!(result.path, expected_path);
+    assert_eq!(result.decision, None);
+
+    // 设置 true → 查询命中；文件落盘。
+    server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                2,
+                json!({ "path": expected_path, "decision": true }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust set");
+    let responses = server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                3,
+                json!({ "path": expected_path }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust query");
+    let result: ProjectTrustResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 3)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("trust result");
+    assert_eq!(result.decision, Some(true));
+    assert_eq!(
+        singularity_core::TrustDecisions::load(trust_home.path()).get(&workspace),
+        Some(true)
+    );
+
+    // 重置为 ask（decision: null）→ 记录清除。
+    server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                4,
+                json!({ "path": expected_path, "decision": null }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust reset");
+    let responses = server
+        .project_trust(
+            JsonRpcMessage::request(
+                Method::ProjectTrust,
+                5,
+                json!({ "path": expected_path }),
+            )
+            .expect("request"),
+        )
+        .expect("project trust query");
+    let result: ProjectTrustResult = serde_json::from_value(
+        responses
+            .iter()
+            .find(|message| message["id"] == 5)
+            .expect("response")["result"]
+            .clone(),
+    )
+    .expect("trust result");
+    assert_eq!(result.decision, None);
+    assert_eq!(
+        singularity_core::TrustDecisions::load(trust_home.path()).get(&workspace),
+        None
+    );
 }
