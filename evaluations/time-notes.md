@@ -57,3 +57,26 @@ sg eval --tasks <题> --models opencode-go/deepseek-v4-flash#max   # 单模型�
 - 修复：挂起超时不再重试（transport 层 fail-fast）+ per-cell 超时 1800→600s
 - 实测（此前超时的 2 个 cell 重跑，opencode-go）：cart-refactor 1801s→**42s 通过**、invoice-bug 1801s→**44s 通过**
 - 成本估算接线验证：cost_estimate 真实计算（$0.0088/$0.0076），非 None
+
+## 2026-08-14 晚间：601s 超时根因调查 + dashscope 切换
+
+### 调查结论（真实链路探针 + 复现）
+- **不是 provider 挂起**：mock 服务器探针证实流式请求超时（reqwest 总时长语义）2s 必触发；
+  SG_TRACE 逐轮计时证实模型调用全部正常完成（2-19s/轮）
+- **真实根因**：模型发**无界命令**（`find / -type d -name shopping` 全盘扫描），bash 工具
+  **无默认超时** → 工具永久挂起 → turn 卡死 → eval 600s 杀
+- **次生缺陷**：强杀 bash 后残留孙进程（find）因 Windows 句柄继承直写 app-server stdout
+  管道，非 UTF-8 字节破坏 JSON-RPC 流（CLI 报 "stream did not contain valid UTF-8"）
+
+### 修复（2026-08-14）
+1. bash 工具默认 120s 超时（timeout_ms 可显式覆盖），超时杀进程树返回错误
+2. Windows spawn 前清除 stdout/stderr 句柄继承位（防残留进程污染协议流）
+3. CLI 读 stdout 容错（lossy + 跳过非 JSON 行）
+4. 内置模型表加 dashscope/deepseek-v4-flash-0731（deepseek 官方价）
+5. eval 默认模型切 dashscope/deepseek-v4-flash-0731#max
+6. results.json 补 total_cost_estimate/total_tokens 汇总
+
+### dashscope eval 实测（5 题，2026-08-14）
+- run-1786709731007：**5/5 全部通过**，53s 总时长，251,130 tokens，**cost $0.0377**
+- 单 cell：28-53s（此前 opencode-go 慢时 601s 超时、手动 66s）
+- 对照（修复前 opencode-go+longcat 10 cell）：6/10 通过、4 个 601s 超时/crash、无稳定成本
