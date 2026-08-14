@@ -51,3 +51,9 @@ sg eval --tasks <题> --models opencode-go/deepseek-v4-flash#max   # 单模型�
 ## 五、已落实的改动
 
 - 2026-08-14：并行上限默认 10 → 5（`DEFAULT_MAX_PARALLEL` + eval-config.json `max_parallel: 5`），队列式并发，超出排队
+
+## 超时修复效果（2026-08-14 实测）
+
+- 修复：挂起超时不再重试（transport 层 fail-fast）+ per-cell 超时 1800→600s
+- 实测（此前超时的 2 个 cell 重跑，opencode-go）：cart-refactor 1801s→**42s 通过**、invoice-bug 1801s→**44s 通过**
+- 成本估算接线验证：cost_estimate 真实计算（$0.0088/$0.0076），非 None
