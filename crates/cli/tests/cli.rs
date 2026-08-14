@@ -15,6 +15,8 @@ use support::{
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+/// CLI 测试用 fake app-server 只讲 stdio JSON-RPC；CLI 默认走 TCP，故测试显式回退到 stdio。
+const APP_SERVER_TRANSPORT_ENV: &str = "SINGULARITY_APP_SERVER_TRANSPORT";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 const JSON_RPC_SERVER_ERROR_CODE: i64 = -32000;
@@ -1491,6 +1493,8 @@ fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Comma
     let mut command = Command::cargo_bin("sg").expect("binary");
     command.env(APP_SERVER_BIN_ENV, app_server_bin);
     command.env(APP_SERVER_DB_ENV, db_path);
+    // 测试使用 stdio fake app-server；显式选择 stdio 承载，避免默认 TCP 连接失败。
+    command.env(APP_SERVER_TRANSPORT_ENV, "stdio");
     command
 }
 

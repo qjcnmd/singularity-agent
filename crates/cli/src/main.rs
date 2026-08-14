@@ -1,9 +1,10 @@
 //! `sg` 的命令行入口：通过 stdio JSON-RPC 调用 app-server 并渲染结果。
 
 use std::fmt;
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,6 +25,9 @@ mod eval;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const APP_SERVER_TRANSPORT_ENV: &str = "SINGULARITY_APP_SERVER_TRANSPORT";
+const APP_SERVER_LISTEN_ENV: &str = "SINGULARITY_APP_SERVER_LISTEN";
+const LISTEN_ANNOUNCE_PREFIX: &str = "SINGULARITY_APP_SERVER_LISTENING ";
 /// CLI 在自身 stdin 为 TTY 时传给 app-server 的交互 UI 标记。
 const INTERACTIVE_UI_ENV: &str = "SINGULARITY_INTERACTIVE";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
@@ -33,6 +37,8 @@ const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// 等待 app-server 在 stderr 上公布 TCP 回环地址的时间上限（对齐 daemon 化规划 START_TIMEOUT）。
+const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
@@ -437,14 +443,38 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
     Ok(())
 }
 
-// 维护 app-server 子进程及其 JSON-RPC stdio 通道。
+// 维护 app-server 子进程及其 JSON-RPC 通道；承载可为 stdio 或 TCP 回环。
 struct AppServerClient {
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: Receiver<Result<String, String>>,
-    stdout_reader: Option<JoinHandle<()>>,
+    transport: AppServerTransport,
     response_timeout: Duration,
     next_id: i64,
+}
+
+/// app-server 传输承载。JSON 行读写一致，仅 I/O 来源不同：stdio 用子进程管道，
+/// TCP 用回环 `TcpStream`（入站同样由读取线程转成接收队列，与 stdio 对齐）。
+enum AppServerTransport {
+    Stdio {
+        stdin: Option<ChildStdin>,
+        stdout: Receiver<Result<String, String>>,
+        stdout_reader: Option<JoinHandle<()>>,
+    },
+    Tcp {
+        /// 写入 JSON 行并 flush 的连接；Drop 时关闭以通知服务端断开。
+        stream: Option<TcpStream>,
+        inbound: Receiver<Result<String, String>>,
+        inbound_reader: Option<JoinHandle<()>>,
+        /// 保留 stderr 读取队列的接收端，使读取线程持续排空管道，避免子进程写阻塞。
+        _stderr_rx: Receiver<Result<String, String>>,
+        stderr_reader: Option<JoinHandle<()>>,
+    },
+}
+
+/// 传输选择：`SINGULARITY_APP_SERVER_TRANSPORT` 缺省时使用 TCP（daemon 化默认），
+/// `stdio` 显式保留为可回退后备。
+enum TransportMode {
+    Tcp,
+    Stdio,
 }
 
 /// 与 typed request id 匹配的结果及其之前到达的通知。
@@ -487,8 +517,16 @@ impl From<AppServerRpcError> for String {
 
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
 impl AppServerClient {
-    // 定位并启动 app-server，随后建立异步 stdout reader。
+    // 定位并启动 app-server，随后建立读取线程；传输由环境变量决定。
     fn spawn() -> Result<Self, String> {
+        match transport_mode()? {
+            TransportMode::Tcp => Self::spawn_tcp(),
+            TransportMode::Stdio => Self::spawn_stdio(),
+        }
+    }
+
+    // 通过 stdio 管道承载：spawn 子进程并建立异步 stdout reader（原有路径）。
+    fn spawn_stdio() -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         // 自身 stdin 为 TTY 时向 app-server 传递交互 UI 可用性（非交互如 eval 子进程不设置）。
@@ -509,12 +547,62 @@ impl AppServerClient {
             .stdout
             .take()
             .ok_or_else(|| "app-server stdout unavailable".to_string())?;
-        let (stdout, stdout_reader) = spawn_stdout_reader(stdout);
+        let (stdout, stdout_reader) = spawn_line_reader(stdout);
         Ok(Self {
             child,
-            stdin: Some(stdin),
-            stdout,
-            stdout_reader: Some(stdout_reader),
+            transport: AppServerTransport::Stdio {
+                stdin: Some(stdin),
+                stdout,
+                stdout_reader: Some(stdout_reader),
+            },
+            response_timeout: RESPONSE_TIMEOUT,
+            next_id: 1,
+        })
+    }
+
+    // 通过 TCP 回环承载：spawn 子进程（SINGULARITY_APP_SERVER_LISTEN=tcp://127.0.0.1:0），
+    // 从 stderr 读取公布的实际端口并连接，入站用同一读取线程转到接收队列。
+    fn spawn_tcp() -> Result<Self, String> {
+        let mut command = ProcessCommand::new(app_server_bin()?);
+        // TCP 模式下子进程不再使用 stdin/stdout；stderr 仍捕获以读取 listen announce。
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if std::io::stdin().is_terminal() {
+            command.env(INTERACTIVE_UI_ENV, "1");
+        }
+        command.env(APP_SERVER_LISTEN_ENV, "tcp://127.0.0.1:0");
+        if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
+            command.env(APP_SERVER_DB_ENV, db);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to start app-server: {error}"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "app-server stderr unavailable".to_string())?;
+        let (stderr_rx, stderr_reader) = spawn_line_reader(stderr);
+        // 解析 stderr announce 行得到实际 SocketAddr；stderr 读取线程持续排空剩余输出。
+        let addr = read_listen_announce(&stderr_rx, &mut child, APP_SERVER_START_TIMEOUT)?;
+        let stream = TcpStream::connect(addr).map_err(|error| {
+            format!("failed to connect to app-server at {addr}: {error}")
+        })?;
+        // 同一 socket 派生读写两个方向：读取半进入 reader 线程，写入半留给 write_message。
+        let reader_stream = stream
+            .try_clone()
+            .map_err(|error| format!("failed to clone app-server connection: {error}"))?;
+        let (inbound, inbound_reader) = spawn_line_reader(reader_stream);
+        Ok(Self {
+            child,
+            transport: AppServerTransport::Tcp {
+                stream: Some(stream),
+                inbound,
+                inbound_reader: Some(inbound_reader),
+                _stderr_rx: stderr_rx,
+                stderr_reader: Some(stderr_reader),
+            },
             response_timeout: RESPONSE_TIMEOUT,
             next_id: 1,
         })
@@ -808,12 +896,10 @@ impl AppServerClient {
 
     // 序列化、写入并 flush 一条 JSON-RPC 消息。
     fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), String> {
+        let payload = message.to_wire_value();
         let write_result = {
-            let stdin = self
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "app-server stdin unavailable".to_string())?;
-            writeln!(stdin, "{}", message.to_wire_value())
+            let writer = self.write_side_mut()?;
+            writeln!(writer, "{payload}")
         };
         if let Err(error) = write_result {
             return Err(
@@ -822,11 +908,8 @@ impl AppServerClient {
         }
 
         let flush_result = {
-            let stdin = self
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "app-server stdin unavailable".to_string())?;
-            stdin.flush()
+            let writer = self.write_side_mut()?;
+            writer.flush()
         };
         if let Err(error) = flush_result {
             return Err(
@@ -834,6 +917,20 @@ impl AppServerClient {
             );
         }
         Ok(())
+    }
+
+    // 返回当前传输的可写侧（stdio stdin 或 TCP stream）。
+    fn write_side_mut(&mut self) -> Result<&mut dyn Write, String> {
+        match &mut self.transport {
+            AppServerTransport::Stdio { stdin, .. } => stdin
+                .as_mut()
+                .ok_or_else(|| "app-server stdin unavailable".to_string())
+                .map(|writer| writer as &mut dyn Write),
+            AppServerTransport::Tcp { stream, .. } => stream
+                .as_mut()
+                .ok_or_else(|| "app-server connection unavailable".to_string())
+                .map(|stream| stream as &mut dyn Write),
+        }
     }
 
     // 写端失败时先确认 app-server 是否已经退出，避免以竞争性的 Broken pipe
@@ -848,28 +945,37 @@ impl AppServerClient {
         }
     }
 
-    // 从 stdout reader 读取一条消息，并区分超时、断开与非法 JSON。
+    // 从当前传输的读取队列接收一行，并区分超时与断开（保持原 stdio 语义）。
+    fn recv_line(&mut self, timeout: Duration) -> Result<String, String> {
+        let result = match &self.transport {
+            AppServerTransport::Stdio { stdout, .. } => stdout.recv_timeout(timeout),
+            AppServerTransport::Tcp { inbound, .. } => inbound.recv_timeout(timeout),
+        };
+        match result {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(status) = self.child.try_wait().map_err(|error| {
+                    format!("failed to poll app-server process status: {error}")
+                })? {
+                    return Err(format!("app-server exited before response: {status}"));
+                }
+                Err("timed out waiting for app-server response".to_string())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(status) = self.child.try_wait().map_err(|error| {
+                    format!("failed to poll app-server process status: {error}")
+                })? {
+                    return Err(format!("app-server exited before response: {status}"));
+                }
+                Err("app-server closed stdout".to_string())
+            }
+        }
+    }
+
+    // 从读取队列读一条消息，并区分超时、断开与非法 JSON。
     fn read_message(&mut self, timeout: Duration) -> Result<JsonRpcMessage, String> {
         loop {
-            let line = match self.stdout.recv_timeout(timeout) {
-                Ok(line) => line?,
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(status) = self.child.try_wait().map_err(|error| {
-                        format!("failed to poll app-server process status: {error}")
-                    })? {
-                        return Err(format!("app-server exited before response: {status}"));
-                    }
-                    return Err("timed out waiting for app-server response".to_string());
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    if let Some(status) = self.child.try_wait().map_err(|error| {
-                        format!("failed to poll app-server process status: {error}")
-                    })? {
-                        return Err(format!("app-server exited before response: {status}"));
-                    }
-                    return Err("app-server closed stdout".to_string());
-                }
-            };
+            let line = self.recv_line(timeout)?;
             // 防御：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节）；
             // 跳过非 JSON 行，不因垃圾行终止协议（真正的 response 行仍会被解析）。
             match serde_json::from_str(line.trim()) {
@@ -891,7 +997,12 @@ impl AppServerClient {
 impl Drop for AppServerClient {
     // 先请求服务端 shutdown，再在超时后回收子进程与 reader。
     fn drop(&mut self) {
-        if self.stdin.is_some() {
+        // 先请求服务端 shutdown（stdin 存在时说明传输仍存活）。
+        let open = match &self.transport {
+            AppServerTransport::Stdio { stdin, .. } => stdin.is_some(),
+            AppServerTransport::Tcp { stream, .. } => stream.is_some(),
+        };
+        if open {
             let id = self.next_request_id();
             if let Ok(message) =
                 JsonRpcMessage::request(Method::ServerShutdown, id, EmptyParams::default())
@@ -899,7 +1010,35 @@ impl Drop for AppServerClient {
                 let _ = self.write_message(&message);
             }
         }
-        let _ = self.stdin.take();
+        // 关闭写侧并收集读取线程句柄；等子进程回收后再 join。
+        let mut reader_handles: Vec<JoinHandle<()>> = Vec::new();
+        match &mut self.transport {
+            AppServerTransport::Stdio {
+                stdin,
+                stdout_reader,
+                ..
+            } => {
+                let _ = stdin.take();
+                if let Some(handle) = stdout_reader.take() {
+                    reader_handles.push(handle);
+                }
+            }
+            AppServerTransport::Tcp {
+                stream,
+                inbound_reader,
+                stderr_reader,
+                ..
+            } => {
+                // 关闭连接通知服务端 EOF；入站/stderr 读取线程随之结束。
+                let _ = stream.take();
+                if let Some(handle) = inbound_reader.take() {
+                    reader_handles.push(handle);
+                }
+                if let Some(handle) = stderr_reader.take() {
+                    reader_handles.push(handle);
+                }
+            }
+        }
         let deadline = Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
         loop {
             match self.child.try_wait() {
@@ -914,19 +1053,21 @@ impl Drop for AppServerClient {
             }
         }
         let _ = self.child.wait();
-        if let Some(stdout_reader) = self.stdout_reader.take() {
-            let _ = stdout_reader.join();
+        for handle in reader_handles {
+            let _ = handle.join();
         }
     }
 }
 
-// 将 app-server stdout 按行转发到客户端接收队列。
+// 将任意字节流（stdio stdout / stderr / TCP 入站）按行转发到客户端接收队列。
 // 防御：残留子进程可能直写管道写入非 UTF-8 字节（Windows 句柄继承）；遇非法
 // 字节用 lossy 替换并继续读下一行，不让单个坏行终止整个客户端。
-fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
+fn spawn_line_reader(
+    reader: impl Read + Send + 'static,
+) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(reader);
         loop {
             let mut bytes = Vec::new();
             let read_result = reader.read_until(b'\n', &mut bytes);
@@ -948,6 +1089,57 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>
         }
     });
     (receiver, handle)
+}
+
+// 读取 `SINGULARITY_APP_SERVER_TRANSPORT` 选择承载；缺省为 TCP（daemon 化默认）。
+fn transport_mode() -> Result<TransportMode, String> {
+    match std::env::var(APP_SERVER_TRANSPORT_ENV).as_deref() {
+        Ok("stdio") => Ok(TransportMode::Stdio),
+        Ok("tcp") | Err(_) => Ok(TransportMode::Tcp),
+        Ok(other) => Err(format!(
+            "unsupported {APP_SERVER_TRANSPORT_ENV}: {other} (expected 'tcp' or 'stdio')"
+        )),
+    }
+}
+
+// 从 stderr 读取队列中等待并解析 listen announce 行
+// `SINGULARITY_APP_SERVER_LISTENING <addr>`，得到实际回环地址；超时或子进程
+// 提前退出时报错。
+fn read_listen_announce(
+    stderr_rx: &Receiver<Result<String, String>>,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<SocketAddr, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match stderr_rx.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
+                if let Some(addr) = line.trim().strip_prefix(LISTEN_ANNOUNCE_PREFIX) {
+                    let addr = addr.parse::<SocketAddr>().map_err(|error| {
+                        format!("invalid app-server listen announce '{line}': {error}")
+                    })?;
+                    return Ok(addr);
+                }
+                // 其他 stderr 行（如启动期告警）忽略，继续等待 announce。
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                let status = child.try_wait().map_err(|error| {
+                    format!("failed to poll app-server process status: {error}")
+                })?;
+                if let Some(status) = status {
+                    return Err(format!(
+                        "app-server exited before announcing TCP listen address: {status}"
+                    ));
+                }
+                return Err(format!(
+                    "timed out waiting for app-server to announce TCP listen address (>{:.0}s)",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 // 获取并规范化当前工作目录，作为 thread/start 的 cwd。
