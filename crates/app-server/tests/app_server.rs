@@ -1282,6 +1282,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     assert!(subscription.get("result").is_some());
 }
 
+#[cfg(windows)]
 fn start_process_thread(
     input: &mut ChildStdin,
     output: &mut JsonOutput,
