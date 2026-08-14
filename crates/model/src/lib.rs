@@ -72,11 +72,13 @@ const HTTP_STATUS_NOT_FOUND: u16 = 404;
 const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
+mod builtin_models;
 mod config;
 mod contract;
 mod openai;
 mod transport;
 
+pub use builtin_models::{builtin_model_cost, ModelCost};
 pub use config::{import_env_to_user_config, read_user_model_catalog, resolve_provider_config};
 pub use contract::{
     is_strict_tool_schema_compatible, validate_model_request,
@@ -1449,7 +1451,8 @@ mod transport_tests {
         let address = listener.local_addr().expect("provider address");
         let server = thread::spawn(move || {
             let mut streams = Vec::new();
-            for _ in 0..MAX_PROVIDER_ATTEMPTS {
+            // 超时（挂起）不再重试：只接受 1 个连接。
+            for _ in 0..1 {
                 let (stream, _) = listener.accept().expect("accept provider request");
                 let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
                 let mut line = String::new();
@@ -1495,9 +1498,10 @@ mod transport_tests {
             .provider_attempt_metadata
             .as_ref()
             .expect("timeout attempt metadata");
-        assert_eq!(metadata.attempt_count, MAX_PROVIDER_ATTEMPTS);
-        assert_eq!(metadata.retry_count, MAX_PROVIDER_ATTEMPTS - 1);
-        assert_eq!(metadata.occurrences.len(), MAX_PROVIDER_ATTEMPTS as usize);
+        // 超时（挂起）不再重试：单次 120s 超时即失败，避免 6 次重试拖 12 分钟。
+        assert_eq!(metadata.attempt_count, 1);
+        assert_eq!(metadata.retry_count, 0);
+        assert_eq!(metadata.occurrences.len(), 1);
         for (index, occurrence) in metadata.occurrences.iter().enumerate() {
             assert_eq!(occurrence.attempt_index, index as u32 + 1);
             assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
@@ -1511,10 +1515,7 @@ mod transport_tests {
                 Some("provider_request_send_failed")
             );
             assert!(occurrence.request_send_to_headers_ms.is_none());
-            assert_eq!(
-                occurrence.retry_scheduled,
-                index + 1 < MAX_PROVIDER_ATTEMPTS as usize
-            );
+            assert!(!occurrence.retry_scheduled);
         }
         let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
         for secret in ["sk-secret-value", &address.to_string(), "authorization"] {
@@ -1678,7 +1679,8 @@ mod transport_tests {
         let address = listener.local_addr().expect("timeout provider address");
         let server = thread::spawn(move || {
             let mut hanging_streams = Vec::new();
-            for _ in 0..MAX_PROVIDER_ATTEMPTS {
+            // 超时（挂起）不再重试：只接受 1 个挂起连接。
+            for _ in 0..1 {
                 let (stream, _) = listener.accept().expect("accept timed-out request");
                 read_test_provider_request(&stream);
                 hanging_streams.push(stream);
@@ -1708,7 +1710,8 @@ mod transport_tests {
                 .as_ref()
                 .expect("timeout metadata")
                 .attempt_count,
-            MAX_PROVIDER_ATTEMPTS
+            // 超时（挂起）不再重试：单次超时即失败。
+            1
         );
 
         let followup = ModelTurnRequest::new(

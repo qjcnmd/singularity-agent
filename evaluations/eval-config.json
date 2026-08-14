@@ -11,6 +11,6 @@
     "longcat/LongCat-2.0#high"
   ],
   "output_dir": "evaluations/output",
-  "timeout_secs": 1800,
+  "timeout_secs": 600,
   "max_parallel": 5
 }

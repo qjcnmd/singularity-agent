@@ -1835,13 +1835,14 @@ pub(super) fn provider_attempt_metadata(
 }
 
 pub(super) fn provider_error_is_retryable(error: &ProviderError) -> bool {
-    matches!(
-        error.error.kind,
-        ModelErrorKind::NetworkError | ModelErrorKind::Timeout
-    ) && !matches!(
-        error.error.transport_category,
-        Some(ProviderTransportCategory::Request)
-    )
+    // 只对网络层快速失败重试（连接失败/中断）。挂起超时不重试：120s 无响应后
+    // 重试大概率仍无响应，且 6 次重试 × 120s 会让单个挂起请求拖到 12 分钟
+    // （评估实测：模型请求挂起时 cell 被拖满 1800s 超时）。
+    matches!(error.error.kind, ModelErrorKind::NetworkError)
+        && !matches!(
+            error.error.transport_category,
+            Some(ProviderTransportCategory::Request)
+        )
 }
 
 pub(super) fn http_status_is_retryable(status: u16) -> bool {
