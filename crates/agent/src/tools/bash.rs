@@ -325,10 +325,10 @@ fn shell_command(command: &str) -> (String, Vec<String>) {
                 vec!["-c".to_string(), command.to_string()],
             );
         }
-        return (
+        (
             "sh".to_string(),
             vec!["-c".to_string(), command.to_string()],
-        );
+        )
     }
 }
 
