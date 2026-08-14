@@ -1,7 +1,9 @@
-//! `AppServer` 的标准输入输出（stdio）传输层。
+//! `AppServer` 的传输层：默认标准输入输出（stdio），可选 TCP 回环监听。
 //!
+//! 两种承载都走同一个 `run_with_io` 循环，只是"输入流 + 输出流"来源不同——stdio
+//! 用 `tokio::io::stdin()`/`stdout()`，TCP 用 `TcpListener` 接受的单个 `TcpStream`。
 //! 输入由 Tokio 单一 owner 读取；turn/start 与 turn/resume 由单一工作线程顺序执行
-//! （同一时刻至多一个 turn），其余请求在 stdin owner 的 blocking 任务中直接处理。
+//! （同一时刻至多一个 turn），其余请求在输入 owner 的 blocking 任务中直接处理。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
 //! 顺序性保证事件与响应天然有序，无需全局排序或 cursor/gap 机制。
 
@@ -20,7 +22,8 @@ use singularity_protocol::{
     JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
 };
 use singularity_store::SessionStore;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -42,10 +45,80 @@ impl ExecutionStop for AppServerCancellationHandle {
     }
 }
 
-/// 在单一 Tokio runtime 内运行 stdio 控制面；所有同步 AppServer 工作都跨 blocking 边界。
+/// 在单一 Tokio runtime 内运行 app-server 控制面；传输默认 stdio，可通过
+/// `SINGULARITY_APP_SERVER_LISTEN=tcp://127.0.0.1:PORT` 切换为 TCP 回环监听。
 pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
     let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
+    match app_server_listen()? {
+        ListenerConfig::Stdio => {
+            run_with_io(
+                BufReader::new(tokio::io::stdin()),
+                tokio::io::stdout(),
+                configured_db_path,
+                runtime_handle,
+            )
+            .await
+        }
+        ListenerConfig::Tcp { addr } => {
+            let listener = TcpListener::bind(addr)
+                .await
+                .map_err(|error| format!("failed to bind TCP listen address {addr}: {error}"))?;
+            let actual = listener
+                .local_addr()
+                .map_err(|error| format!("failed to read TCP listen address: {error}"))?;
+            // listen 地址含端口 0 时向 OS 申请端口，实际端口须上报给启动方/测试。
+            eprintln!("SINGULARITY_APP_SERVER_LISTENING {actual}");
+            let (stream, _peer) = listener
+                .accept()
+                .await
+                .map_err(|error| format!("failed to accept app-server client: {error}"))?;
+            let (reader, writer) = stream.into_split();
+            run_with_io(
+                BufReader::new(reader),
+                writer,
+                configured_db_path,
+                runtime_handle,
+            )
+            .await
+        }
+    }
+}
+
+/// app-server 监听模式：未设置 `SINGULARITY_APP_SERVER_LISTEN` 时保留 stdio 默认。
+enum ListenerConfig {
+    Stdio,
+    Tcp { addr: std::net::SocketAddr },
+}
+
+fn app_server_listen() -> Result<ListenerConfig, String> {
+    let spec = match std::env::var("SINGULARITY_APP_SERVER_LISTEN") {
+        Ok(spec) => spec,
+        Err(_) => return Ok(ListenerConfig::Stdio),
+    };
+    let rest = spec.strip_prefix("tcp://").ok_or_else(|| {
+        format!("unsupported SINGULARITY_APP_SERVER_LISTEN scheme (expected tcp://addr): {spec}")
+    })?;
+    let addr = rest.parse::<std::net::SocketAddr>().map_err(|error| {
+        format!("invalid SINGULARITY_APP_SERVER_LISTEN address {spec}: {error}")
+    })?;
+    Ok(ListenerConfig::Tcp { addr })
+}
+
+/// 在任意"输入流 + 输出流"对上运行 JSON-Lines 控制面；stdio 与 TCP 共用此循环。
+///
+/// `reader`/`writer` 由调用方提供：stdio 传 `stdin()`/`stdout()`，TCP 传按 `TcpStream`
+/// 拆出的读/写半。所有同步 AppServer 工作跨 blocking 边界执行。
+async fn run_with_io<R, W>(
+    reader: R,
+    writer: W,
+    configured_db_path: String,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<(), String>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let server = tokio::task::spawn_blocking(move || {
         initialize_app_server(&configured_db_path, runtime_handle)
     })
@@ -54,9 +127,9 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
     let cancellation = server.cancellation_handle();
     let (output_tx, mut output_rx) = mpsc::channel::<Value>(OUTPUT_QUEUE_CAPACITY);
     let writer_cancellation = cancellation.clone();
+    let mut output = writer;
     let mut writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        write_output_queue(&mut output_rx, &mut stdout, &writer_cancellation).await
+        write_output_queue(&mut output_rx, &mut output, &writer_cancellation).await
     });
     let mut writer_done = false;
     let mut writer_result = None;
@@ -64,7 +137,7 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
     let mut server = Some(server);
     // 单 worker 槽位：同一时刻至多一个 turn/start 或 turn/resume 执行。
     let mut turn_task: Option<JoinHandle<Result<(), String>>> = None;
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = reader.lines();
     let mut terminal_error = None;
 
     loop {

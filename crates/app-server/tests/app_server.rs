@@ -1476,8 +1476,155 @@ fn app_server_bin() -> String {
     })
 }
 
-/// 从 JSON-RPC turn/start 入口开始，经过真实 Store、Checkpoint、Approval、
-/// AgentLoop、ToolBroker 和 WorkspaceTools 的确定性 Approval Resume E2E。
+/// TCP 回环端到端：在临时目录启动 app-server（TCP 监听、端口 0），从 stderr 读回
+/// 实际端口，用 std::net::TcpStream 建立单连接并走 initialize → initialized →
+/// server/capabilities → server/shutdown；响应正确且进程成功退出。
+#[test]
+fn app_server_serves_json_lines_over_tcp_loopback() {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const LISTENING_PREFIX: &str = "SINGULARITY_APP_SERVER_LISTENING ";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let stderr_path = dir.path().join("app-server-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let mut child = Command::new(app_server_bin())
+        .current_dir(dir.path())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .env("SINGULARITY_APP_SERVER_LISTEN", "tcp://127.0.0.1:0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn app-server in TCP mode");
+
+    // 服务端在 accept 前向 stderr 上报实际绑定地址（端口 0 时由 OS 分配）。stderr 重定向到
+    // 文件（父进程不读管道），先给缓冲余量再读端口，避免对端读就绪尚未登记时首帧丢失。
+    std::thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let addr = loop {
+        let contents = std::fs::read_to_string(&stderr_path).expect("read stderr");
+        if let Some(line) = contents
+            .lines()
+            .find(|line| line.starts_with(LISTENING_PREFIX))
+        {
+            break line
+                .trim()
+                .strip_prefix(LISTENING_PREFIX)
+                .expect("listening address line")
+                .parse::<std::net::SocketAddr>()
+                .expect("listening socket address");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for listen address; stderr={contents:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        addr.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+
+    let stream = TcpStream::connect(addr).expect("connect to app-server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let mut connection = LineReader::new(stream);
+
+    // 单连接单流（不 clone）。按 id 匹配 recv_id 消费帧，因此 notification（如 initialized
+    // 无响应）、事件帧与合帧都能正确对齐，不假设"每请求恰好一帧"。
+    write_line(&mut connection.stream, br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"tcp-e2e","title":"TCP E2E","version":"0.1.0"}}}"#);
+    let init = connection.recv_id(1);
+    assert_eq!(init["result"]["platformFamily"], "local");
+
+    // initialized 是 notification，通常无响应；不读帧，直接发 capabilities。
+    write_line(
+        &mut connection.stream,
+        br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+    write_line(
+        &mut connection.stream,
+        br#"{"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}}"#,
+    );
+    let capabilities = connection.recv_id(2);
+    assert!(
+        capabilities["result"]["transports"]
+            .as_array()
+            .expect("capability transports")
+            .iter()
+            .any(|transport| transport["transport"] == "stdio" && transport["available"] == true),
+        "tcp connects to the same static capability contract: {capabilities}"
+    );
+
+    write_line(
+        &mut connection.stream,
+        br#"{"jsonrpc":"2.0","method":"server/shutdown","id":3,"params":{}}"#,
+    );
+    let shutdown = connection.recv_id(3);
+    assert_eq!(shutdown["result"]["shutdown"], true);
+
+    // 发送 shutdown 后服务端进入退出流程；连接主动关闭，进程应成功退出。
+    drop(connection);
+    let status = child.wait().expect("app-server exits cleanly");
+    assert!(status.success(), "app-server exited with {status}");
+}
+
+/// 写一条以 `\n` 结尾的 JSON-Lines 帧；`Write` 经 `std::io::Write` 提供。
+fn write_line(stream: &mut std::net::TcpStream, frame: &[u8]) {
+    std::io::Write::write_all(stream, frame).expect("write app-server frame");
+    std::io::Write::write_all(stream, b"\n").expect("terminate app-server frame");
+    std::io::Write::flush(stream).expect("flush app-server frame");
+}
+
+/// JSON-Lines 行读取器：维护跨调用累积缓冲，`\n` 处切出完整帧（空行跳过），
+/// 返回 id 匹配的响应帧；事件/notification 确认/合帧都能正确应对。
+struct LineReader {
+    stream: std::net::TcpStream,
+    pending: Vec<u8>,
+}
+
+impl LineReader {
+    fn new(stream: std::net::TcpStream) -> Self {
+        Self {
+            stream,
+            pending: Vec::new(),
+        }
+    }
+
+    /// 读下一条完整（非空）JSON-Lines 帧。
+    fn next_frame(&mut self) -> serde_json::Value {
+        loop {
+            if let Some(newline) = self.pending.iter().position(|b| *b == b'\n') {
+                if newline == 0 {
+                    self.pending.drain(..1);
+                    continue;
+                }
+                let frame: serde_json::Value =
+                    serde_json::from_slice(&self.pending[..newline]).expect("valid JSON frame");
+                self.pending.drain(..=newline);
+                return frame;
+            }
+            let mut chunk = [0u8; 1024];
+            let n = std::io::Read::read(&mut self.stream, &mut chunk)
+                .expect("read app-server frame bytes");
+            assert!(n != 0, "app-server closed the connection before a response");
+            self.pending.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// 逐帧读取直到拿到 id 匹配的响应帧；非匹配帧丢弃。
+    fn recv_id(&mut self, id: i64) -> serde_json::Value {
+        loop {
+            let frame = self.next_frame();
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+}
+
 fn result_message(messages: &[serde_json::Value]) -> &serde_json::Value {
     messages
         .iter()
