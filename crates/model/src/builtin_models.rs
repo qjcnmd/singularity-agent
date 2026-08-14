@@ -1,9 +1,10 @@
 //! 内置模型静态表（Pi 式声明）与成本估算。
 //!
-//! 只内置用户确认的 provider（opencode-go、longcat；dashscope 按用户裁决排除）。
-//! 价格是 Phase 8 规格合同的一手来源：opencode-go 取自 Pi
-//! `pi-ai/dist/providers/data/opencode-go.json`；longcat 取自 longcat.chat 官方
-//! 定价文档。单价单位为每百万 token，币种按 provider 计费币种（两者均为 USD）。
+//! 内置用户确认的 provider：opencode-go、longcat、dashscope。价格按模型官方
+//! API 价格计算、不区分供应商：opencode-go 的 deepseek-v4-flash 与 dashscope 的
+//! deepseek-v4-flash-0731（DeepSeek 官方模型版本号）均为 deepseek 官方定价
+//! （$0.14 / $0.28 / $0.0028 per M token，api-docs.deepseek.com 2026-08 核验）；
+//! longcat 取自 longcat.chat 官方定价文档。单价单位为每百万 token，币种均为 USD。
 //! 用户 config.json 显式声明始终优先；本表只在声明缺省时兜底 context window /
 //! max output tokens，并供 usage 聚合点查询成本估算。
 
@@ -46,6 +47,20 @@ pub const BUILTIN_MODELS: &[BuiltinModel] = &[
         }),
     },
     BuiltinModel {
+        provider: "dashscope",
+        model: "deepseek-v4-flash-0731",
+        api_protocol: "chat",
+        context_window: 1_000_000,
+        max_output_tokens: 384_000,
+        reasoning: true,
+        cost: Some(ModelCost {
+            input_per_mtok: 0.14,
+            output_per_mtok: 0.28,
+            cache_read_per_mtok: 0.0028,
+            currency: "USD",
+        }),
+    },
+    BuiltinModel {
         provider: "longcat",
         model: "LongCat-2.0",
         api_protocol: "responses",
@@ -68,7 +83,7 @@ pub(crate) fn builtin_model(provider: &str, model: &str) -> Option<&'static Buil
         .find(|entry| entry.provider == provider && entry.model == model)
 }
 
-/// 按 (provider, model) 查询内置价格；无内置价格的模型（含 dashscope）返回 `None`。
+/// 按 (provider, model) 查询内置价格；无内置价格的模型返回 `None`。
 pub fn builtin_model_cost(provider: &str, model: &str) -> Option<ModelCost> {
     builtin_model(provider, model).and_then(|entry| entry.cost)
 }
@@ -106,15 +121,18 @@ mod tests {
         assert_eq!(longcat.output_per_mtok, 2.95);
         assert_eq!(longcat.cache_read_per_mtok, 0.015);
         assert_eq!(longcat.currency, "USD");
+
+        // dashscope 托管 deepseek 官方模型版本 0731，按 deepseek 官方定价（不区分供应商）。
+        let dashscope =
+            builtin_model_cost("dashscope", "deepseek-v4-flash-0731").expect("dashscope price");
+        assert_eq!(dashscope.input_per_mtok, 0.14);
+        assert_eq!(dashscope.output_per_mtok, 0.28);
+        assert_eq!(dashscope.cache_read_per_mtok, 0.0028);
+        assert_eq!(dashscope.currency, "USD");
     }
 
     #[test]
     fn builtin_cost_misses_for_unknown_provider_or_model() {
-        // dashscope 按用户裁决排除在价格表之外。
-        assert_eq!(
-            builtin_model_cost("dashscope", "deepseek-v4-flash-0731"),
-            None
-        );
         assert_eq!(builtin_model_cost("opencode-go", "unknown-model"), None);
         assert_eq!(
             builtin_model_cost("unknown-provider", "deepseek-v4-flash"),

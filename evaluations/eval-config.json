@@ -7,8 +7,7 @@
     "pipeline-mislead"
   ],
   "models": [
-    "opencode-go/deepseek-v4-flash#max",
-    "longcat/LongCat-2.0#high"
+    "dashscope/deepseek-v4-flash-0731#max"
   ],
   "output_dir": "evaluations/output",
   "timeout_secs": 600,
