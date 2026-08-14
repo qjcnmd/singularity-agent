@@ -362,9 +362,9 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
     };
     let _ = fs::create_dir_all(cell_dir);
 
-    // 1) 干净 workspace 副本（临时目录）。
-    let workspace_copy = match prepare_workspace(task) {
-        Ok(path) => path,
+    // 1) 干净任务副本（临时目录）：<copy>/workspace + <copy>/checker.sh。
+    let (task_copy, workspace_copy) = match prepare_workspace(task) {
+        Ok(paths) => paths,
         Err(error) => {
             result.error = Some(error);
             result.duration_secs = cell_started.elapsed().as_secs_f64();
@@ -379,8 +379,9 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
     // 3) 复制 rollout（会话文件）到 cell 目录存档。
     let rollout = copy_rollout(&workspace_copy, cell_dir);
 
-    // 4) 独立 checker.sh 判分（exit 0 = 通过）。
-    let checker = run_checker(bash, task, &workspace_copy, &mut result.checker_output);
+    // 4) 独立 checker.sh 判分（exit 0 = 通过）：执行任务副本内的 checker.sh，
+    // 其 `dirname $0` 解析到副本根，`cd 副本根/workspace` 检查模型修改后的副本。
+    let checker = run_checker(bash, &task_copy.join("checker.sh"), &workspace_copy, &mut result.checker_output);
 
     // 5) 指标聚合。
     let usage = run.as_ref().ok().and_then(|sg| sg.turn_usage.clone());
@@ -430,7 +431,7 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
         checker.as_ref(),
         rollout.as_deref(),
     );
-    let _ = fs::remove_dir_all(&workspace_copy);
+    let _ = fs::remove_dir_all(&task_copy);
     result
 }
 
@@ -621,9 +622,9 @@ fn resolve_default_bash() -> Option<String> {
 }
 
 /// 运行 checker.sh（cwd = workspace 副本），返回退出码。
-fn run_checker(bash: &str, task: &Task, workspace: &Path, output: &mut String) -> Option<i32> {
+fn run_checker(bash: &str, checker: &Path, workspace: &Path, output: &mut String) -> Option<i32> {
     // bash 把反斜杠当转义符：Windows 路径必须转正斜杠再作为参数。
-    let checker_arg = task.checker.to_string_lossy().replace('\\', "/");
+    let checker_arg = checker.to_string_lossy().replace('\\', "/");
     let mut child = match Command::new(bash)
         .arg(&checker_arg)
         .current_dir(workspace)
@@ -811,7 +812,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// 复制任务 workspace 到独立临时目录（干净副本）。
-fn prepare_workspace(task: &Task) -> Result<PathBuf, String> {
+fn prepare_workspace(task: &Task) -> Result<(PathBuf, PathBuf), String> {
     // 不用 std::env::temp_dir()：从 git-bash 启动时它解析为 D:\Temp（MSYS 的
     // /tmp 挂载点，usertemp），agent 的 bash pwd 会显示 /tmp/... 误导文件操作。
     // 固定用 Windows 用户 Temp（bash 显示 /c/Users/...），agent 更可能用相对路径。
@@ -829,8 +830,14 @@ fn prepare_workspace(task: &Task) -> Result<PathBuf, String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    copy_dir(&task.workspace, &copy)?;
-    Ok(copy)
+    // 任务根副本：<copy>/workspace（模型工作区）+ <copy>/checker.sh（判分脚本）。
+    // checker.sh 通过 `dirname $0` 定位 workspace，必须与 workspace 同在副本内，
+    // 否则它检查的是源任务目录的原始 workspace（模型修改从未被判分）。
+    copy_dir(&task.workspace, &copy.join("workspace"))?;
+    fs::copy(&task.checker, copy.join("checker.sh"))
+        .map_err(|error| format!("failed to copy checker.sh: {error}"))?;
+    let workspace_copy = copy.join("workspace");
+    Ok((copy, workspace_copy))
 }
 
 /// 递归复制目录（跳过 `.git`；跟随符号链接的目标文件复制为普通文件）。
