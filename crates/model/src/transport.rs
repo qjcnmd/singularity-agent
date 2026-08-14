@@ -179,6 +179,9 @@ impl OpenAiProvider {
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(request_timeout_seconds))
+            // 显式 UA：部分网关（如 opencode.ai 的 Cloudflare 保护）对默认/无 UA
+            // 请求做机器人拦截（实测 HTTP 403 error 1010），自家 UA 实测可放行。
+            .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(provider_client_initialization_error)?;
         Ok(Self {
