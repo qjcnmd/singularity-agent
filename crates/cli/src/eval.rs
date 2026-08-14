@@ -242,6 +242,22 @@ pub(crate) fn run_eval(
         agg.total_tool_failures += cell.tool_failures;
     }
 
+    let mut totals = ModelAggregate::default();
+    for agg in by_model.values() {
+        totals.cells += agg.cells;
+        totals.passed += agg.passed;
+        totals.failed += agg.failed;
+        totals.partial += agg.partial;
+        totals.interrupted += agg.interrupted;
+        totals.crashed += agg.crashed;
+        totals.timed_out += agg.timed_out;
+        totals.total_duration_secs += agg.total_duration_secs;
+        totals.total_tokens += agg.total_tokens;
+        totals.total_cost_estimate += agg.total_cost_estimate;
+        totals.total_tool_calls += agg.total_tool_calls;
+        totals.total_tool_failures += agg.total_tool_failures;
+    }
+
     let results = json!({
         "run_id": run_id,
         "started_at": started_at,
@@ -255,6 +271,9 @@ pub(crate) fn run_eval(
         },
         "cells": cell_results,
         "by_model": by_model,
+        "total_duration_secs": total_secs,
+        "total_tokens": totals.total_tokens,
+        "total_cost_estimate": totals.total_cost_estimate,
     });
     let results_path = run_dir.join("results.json");
     fs::write(
@@ -266,9 +285,9 @@ pub(crate) fn run_eval(
     println!("eval {} finished in {total_secs:.1}s", run_dir.display());
     for (model, agg) in by_model {
         println!(
-            "  {model}: {} cells, passed={} failed={} partial={} interrupted={} crashed={} timed_out={} tokens={}",
+            "  {model}: {} cells, passed={} failed={} partial={} interrupted={} crashed={} timed_out={} tokens={} cost=${:.4}",
             agg.cells, agg.passed, agg.failed, agg.partial, agg.interrupted, agg.crashed,
-            agg.timed_out, agg.total_tokens
+            agg.timed_out, agg.total_tokens, agg.total_cost_estimate
         );
     }
     println!("results: {}", results_path.display());
