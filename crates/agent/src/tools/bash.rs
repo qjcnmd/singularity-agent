@@ -583,11 +583,6 @@ mod tests {
         let (shell, _) = shell_command("");
         let command = dump_command(&shell, &file);
         let result = run(&command, None);
-        eprintln!(
-            "PROBE CONTENT: {:?}",
-            &result.content[..result.content.len().min(1200)]
-        );
-        eprintln!("PROBE LEN: {}", result.content.len());
         assert!(!result.is_error, "unexpected error: {}", result.content);
         assert!(result.content.contains("line 2500"), "tail must be kept");
         assert!(
