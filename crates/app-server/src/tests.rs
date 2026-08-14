@@ -379,6 +379,37 @@ fn app_server_preserves_safe_provider_failure_via_turn_start() {
 }
 
 #[test]
+fn turn_failure_from_error_preserves_carried_original_text() {
+    // 已携带 original 的 TurnExecution（如 provider 解析失败路径）不得被
+    // turn_failure_from_error 覆盖为稳定 Display——真实原因必须保留到 RPC 边界。
+    let carried = AppServerError::TurnExecution {
+        stage: TurnFailureStage::AgentLoop,
+        cause: TurnFailureCause::Internal,
+        original: Some("real provider failure text".to_string()),
+    };
+    let failure = turn_failure_from_error(&carried, TurnFailureStage::AgentLoop);
+    assert_eq!(
+        failure.original.as_deref(),
+        Some("real provider failure text")
+    );
+
+    // 无 original 时回退稳定 Display（stage/cause 分类文本）。
+    let bare = AppServerError::TurnExecution {
+        stage: TurnFailureStage::AgentLoop,
+        cause: TurnFailureCause::Internal,
+        original: None,
+    };
+    let failure = turn_failure_from_error(&bare, TurnFailureStage::AgentLoop);
+    assert!(
+        failure
+            .original
+            .as_deref()
+            .unwrap_or_default()
+            .contains("agent_loop")
+    );
+}
+
+#[test]
 fn agent_loop_system_prompt_loads_bounded_agents_md_from_thread_cwd() {
     let temp = tempfile::tempdir().expect("temp dir");
     let ancestor = temp

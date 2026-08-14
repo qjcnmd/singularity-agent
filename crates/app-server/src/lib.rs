@@ -665,11 +665,22 @@ fn turn_failure_from_error(
     fallback_stage: TurnFailureStage,
 ) -> TurnFailure {
     match error {
-        AppServerError::TurnExecution { stage, cause, .. }
-        | AppServerError::TurnTerminalization { stage, cause, .. } => TurnFailure {
+        AppServerError::TurnExecution {
+            stage,
+            cause,
+            original,
+        }
+        | AppServerError::TurnTerminalization {
+            stage,
+            cause,
+            original,
+            ..
+        } => TurnFailure {
             stage: *stage,
             cause: *cause,
-            original: Some(error.to_string()),
+            // 保留已携带的原始失败文本（如 provider 解析失败的真实原因），
+            // 缺失时回退到稳定 Display（stage/cause 分类）。
+            original: original.clone().or_else(|| Some(error.to_string())),
         },
         _ => TurnFailure {
             stage: fallback_stage,

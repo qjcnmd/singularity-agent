@@ -535,6 +535,21 @@ fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecD
 ///   （quota/billing/insufficient_quota/usage limit/balance）、校验失败、上下文溢出等。
 ///   `ModelTurnStatus::Invalid` 不在本函数内，调用方已排除。
 fn is_retryable_run_error(error: &ModelError) -> bool {
+    // 账户限额文本守卫最先执行：任何 kind（含瞬时类 RateLimited 等）命中
+    // quota/billing 文本即不可重试——限额是账户状态，重试无意义。
+    let lower = error.message.to_lowercase();
+    if [
+        "quota",
+        "billing",
+        "insufficient_quota",
+        "usage limit",
+        "balance",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        return false;
+    }
     // 明确的不可重试类型：优先级最高，即使文本命中瞬时模式也忽略。
     match error.kind {
         ModelErrorKind::Cancelled
@@ -553,20 +568,6 @@ fn is_retryable_run_error(error: &ModelError) -> bool {
         | ModelErrorKind::ProviderOverloaded => return true,
         // 其余（如 UnknownProviderError）继续依据状态码与文本判断。
         ModelErrorKind::UnknownProviderError => {}
-    }
-    // 账户限额文本：任何 kind 命中即不可重试（非瞬时，重试无意义）。
-    let lower = error.message.to_lowercase();
-    if [
-        "quota",
-        "billing",
-        "insufficient_quota",
-        "usage limit",
-        "balance",
-    ]
-    .iter()
-    .any(|pattern| lower.contains(pattern))
-    {
-        return false;
     }
     // HTTP 429 或 5xx（类型可能已被归类为非瞬时的 UnknownProviderError 等）。
     if matches!(error.http_status, Some(429 | 500 | 502 | 503 | 504)) {
@@ -1109,6 +1110,36 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "quota must not retry"
+        );
+
+        // 瞬时 kind（RateLimited）携带 quota 文本：限额守卫优先，不重试。
+        let mixed_dir = tempfile::tempdir().unwrap();
+        let mixed_session =
+            SessionManager::create(mixed_dir.path(), &mixed_dir.path().join("sessions")).unwrap();
+        let mixed_provider = Arc::new(FailingProvider::new(
+            fake_contract(),
+            vec![FailStep::Fail(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "429 insufficient_quota: monthly usage limit reached",
+            ))],
+        ));
+        let mut mixed_agent = Agent::new(
+            mixed_provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            mixed_session,
+        )
+        .unwrap();
+        let mixed_err = mixed_agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap_err();
+        assert!(mixed_err.to_string().contains("insufficient_quota"));
+        assert_eq!(
+            mixed_provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "RateLimited kind with quota text must not retry"
         );
 
         // 校验失败（Invalid 状态）：不重试。
