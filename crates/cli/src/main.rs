@@ -14,10 +14,10 @@ use singularity_core::{APP_ERROR_TRUST_REQUIRED, ClientInfo};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
-    ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method,
-    ProjectTrustDecision, ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus,
-    RpcMethod, Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams, Turn, TurnEventParams,
-    TurnIdParams, TurnInputDelivery, TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
+    ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method, ProjectTrustDecision,
+    ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus, RpcMethod, Thread,
+    ThreadEventParams, ThreadIdParams, ThreadStartParams, Turn, TurnEventParams, TurnIdParams,
+    TurnInputDelivery, TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
 mod eval;
@@ -176,11 +176,7 @@ fn main() {
 // 按命令编排 app-server 请求和面向用户的输出。
 fn run_cli(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::Run {
-            goal,
-            model,
-            json,
-        } => {
+        Command::Run { goal, model, json } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
@@ -608,9 +604,9 @@ impl AppServerClient {
             .unwrap_or(canonical_current_dir()?);
         if std::io::stdin().is_terminal() {
             eprint!("Trust project folder? {cwd} [y/N] ");
-            std::io::stderr().flush().map_err(|error| {
-                format!("failed to flush trust prompt: {error}")
-            })?;
+            std::io::stderr()
+                .flush()
+                .map_err(|error| format!("failed to flush trust prompt: {error}"))?;
             let mut answer = String::new();
             std::io::stdin()
                 .read_line(&mut answer)
@@ -794,7 +790,9 @@ impl AppServerClient {
                 }
                 JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_) => {}
                 JsonRpcMessage::Request(_) => {
-                    return Err("app-server emitted a request on the response channel".to_string().into());
+                    return Err("app-server emitted a request on the response channel"
+                        .to_string()
+                        .into());
                 }
             }
         }

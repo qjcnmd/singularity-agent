@@ -182,15 +182,17 @@ pub(crate) fn run_eval(
 
     let output_root = PathBuf::from(&config.output_dir);
     fs::create_dir_all(&output_root).map_err(|error| {
-        format!("failed to create output dir {}: {error}", output_root.display())
+        format!(
+            "failed to create output dir {}: {error}",
+            output_root.display()
+        )
     })?;
     let run_id = format_run_id();
     let run_dir = output_root.join(&run_id);
     let started_at = run_id.clone();
     let cells_dir = run_dir.join("cells");
-    fs::create_dir_all(&cells_dir).map_err(|error| {
-        format!("failed to create run dir {}: {error}", run_dir.display())
-    })?;
+    fs::create_dir_all(&cells_dir)
+        .map_err(|error| format!("failed to create run dir {}: {error}", run_dir.display()))?;
 
     let tasks_root = path
         .parent()
@@ -209,7 +211,14 @@ pub(crate) fn run_eval(
         .clone()
         .or_else(resolve_default_bash)
         .ok_or_else(|| "no usable bash found; set eval-config.json bash_path".to_string())?;
-    let cell_results = run_cells(&tasks, &config.models, max_parallel, timeout, &bash, &cells_dir)?;
+    let cell_results = run_cells(
+        &tasks,
+        &config.models,
+        max_parallel,
+        timeout,
+        &bash,
+        &cells_dir,
+    )?;
     let total_secs = started.elapsed().as_secs_f64();
 
     let mut by_model: HashMap<String, ModelAggregate> = HashMap::new();
@@ -230,13 +239,10 @@ pub(crate) fn run_eval(
             if let Some(ratio) = cell.cache_hit_ratio {
                 agg.avg_cache_hit_ratio = Some(
                     agg.avg_cache_hit_ratio.unwrap_or(0.0)
-                        + (ratio - agg.avg_cache_hit_ratio.unwrap_or(0.0))
-                            / agg.cells as f64,
+                        + (ratio - agg.avg_cache_hit_ratio.unwrap_or(0.0)) / agg.cells as f64,
                 );
             }
-            agg.total_cost_estimate += usage["cost_estimate"]
-                .as_f64()
-                .unwrap_or(0.0);
+            agg.total_cost_estimate += usage["cost_estimate"].as_f64().unwrap_or(0.0);
         }
         agg.total_tool_calls += cell.tool_calls;
         agg.total_tool_failures += cell.tool_failures;
@@ -286,8 +292,15 @@ pub(crate) fn run_eval(
     for (model, agg) in by_model {
         println!(
             "  {model}: {} cells, passed={} failed={} partial={} interrupted={} crashed={} timed_out={} tokens={} cost=${:.4}",
-            agg.cells, agg.passed, agg.failed, agg.partial, agg.interrupted, agg.crashed,
-            agg.timed_out, agg.total_tokens, agg.total_cost_estimate
+            agg.cells,
+            agg.passed,
+            agg.failed,
+            agg.partial,
+            agg.interrupted,
+            agg.crashed,
+            agg.timed_out,
+            agg.total_tokens,
+            agg.total_cost_estimate
         );
     }
     println!("results: {}", results_path.display());
@@ -405,7 +418,12 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
 
     // 4) 独立 checker.sh 判分（exit 0 = 通过）：执行任务副本内的 checker.sh，
     // 其 `dirname $0` 解析到副本根，`cd 副本根/workspace` 检查模型修改后的副本。
-    let checker = run_checker(bash, &task_copy.join("checker.sh"), &workspace_copy, &mut result.checker_output);
+    let checker = run_checker(
+        bash,
+        &task_copy.join("checker.sh"),
+        &workspace_copy,
+        &mut result.checker_output,
+    );
 
     // 5) 指标聚合。
     let usage = run.as_ref().ok().and_then(|sg| sg.turn_usage.clone());
@@ -471,8 +489,8 @@ struct SgRun {
 
 /// 执行 `sg run <instruction> --model <selector> --json`（cwd = workspace 副本）。
 fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<SgRun, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("failed to resolve sg binary: {error}"))?;
+    let exe =
+        std::env::current_exe().map_err(|error| format!("failed to resolve sg binary: {error}"))?;
     let mut child = Command::new(&exe)
         .arg("run")
         .arg(instruction)
@@ -496,7 +514,9 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         thread::spawn(move || {
             let mut buffer = String::new();
             if out.read_to_string(&mut buffer).is_ok() {
-                *captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+                *captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
         });
     }
@@ -505,7 +525,9 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         thread::spawn(move || {
             let mut buffer = String::new();
             if err.read_to_string(&mut buffer).is_ok() {
-                *captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+                *captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
         });
     }
@@ -607,8 +629,8 @@ fn parse_sg_json(stdout: &str) -> Option<ParsedSgJson> {
         .and_then(Value::as_str)
         .unwrap_or("");
     let interrupted = status == "interrupted" || agent_loop_status == "cancelled";
-    let failed = matches!(status, "failed" | "blocked")
-        || matches!(agent_loop_status, "failed" | "blocked");
+    let failed =
+        matches!(status, "failed" | "blocked") || matches!(agent_loop_status, "failed" | "blocked");
     Some(ParsedSgJson {
         interrupted,
         failed,
@@ -779,7 +801,9 @@ fn tool_result_is_error(content: &str) -> bool {
         "missing required parameter",
         "Operation aborted",
     ];
-    FAILURE_MARKERS.iter().any(|marker| content.contains(marker))
+    FAILURE_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
 }
 
 /// 解析 ISO8601 毫秒时间戳（`2025-01-15T10:30:00.000Z`）为 unix 毫秒。
@@ -797,9 +821,7 @@ fn parse_iso_millis(text: &str) -> Option<u64> {
     let minute: u64 = parts.next()?.parse().ok()?;
     let second: u64 = parts.next()?.parse().ok()?;
     let days = days_from_civil(year, month, day)?;
-    Some(
-        (days as u64 * 86_400 + hour * 3600 + minute * 60 + second) * 1000 + millis,
-    )
+    Some((days as u64 * 86_400 + hour * 3600 + minute * 60 + second) * 1000 + millis)
 }
 
 /// 公历日数（Howard Hinnant 算法），月份/日期超界时返回 None。
@@ -817,7 +839,10 @@ fn days_from_civil(year: i64, month: u64, day: u64) -> Option<i64> {
 }
 
 fn cache_hit_ratio(usage: &Value) -> Option<f64> {
-    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = usage
         .get("cached_input_tokens")
         .and_then(Value::as_u64)
@@ -887,7 +912,11 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
             copy_dir(&src, &dst)?;
         } else {
             fs::copy(&src, &dst).map_err(|error| {
-                format!("failed to copy {} -> {}: {error}", src.display(), dst.display())
+                format!(
+                    "failed to copy {} -> {}: {error}",
+                    src.display(),
+                    dst.display()
+                )
             })?;
         }
     }
@@ -951,18 +980,28 @@ mod tests {
 
     #[test]
     fn parse_iso_millis_handles_utc_timestamps() {
-        assert_eq!(parse_iso_millis("2026-08-14T09:15:30.000Z"), Some(1_786_698_930_000));
-        assert_eq!(parse_iso_millis("2026-08-14T10:59:59.500Z"), Some(1_786_705_199_500));
+        assert_eq!(
+            parse_iso_millis("2026-08-14T09:15:30.000Z"),
+            Some(1_786_698_930_000)
+        );
+        assert_eq!(
+            parse_iso_millis("2026-08-14T10:59:59.500Z"),
+            Some(1_786_705_199_500)
+        );
         assert_eq!(parse_iso_millis("garbage"), None);
         assert_eq!(parse_iso_millis("2026-13-01T00:00:00.000Z"), None);
     }
 
     #[test]
     fn tool_result_is_error_matches_failure_markers() {
-        assert!(tool_result_is_error("Command exited with code 1\nls: no such file"));
+        assert!(tool_result_is_error(
+            "Command exited with code 1\nls: no such file"
+        ));
         assert!(tool_result_is_error("Command timed out after 5000 ms"));
         assert!(tool_result_is_error("tool execution failed: unknown tool"));
-        assert!(tool_result_is_error("Could not edit file: src/a.py. No match."));
+        assert!(tool_result_is_error(
+            "Could not edit file: src/a.py. No match."
+        ));
         assert!(tool_result_is_error("missing required parameter \"path\""));
         assert!(!tool_result_is_error("(no output)"));
         assert!(!tool_result_is_error("hello.txt created, 5 bytes"));
@@ -981,15 +1020,12 @@ mod tests {
 
     #[test]
     fn parse_sg_json_detects_interrupted_and_failed() {
-        let interrupted = parse_sg_json(
-            r#"{"turn":{"status":"interrupted","agent_loop_status":"cancelled"}}"#,
-        )
-        .expect("parseable");
+        let interrupted =
+            parse_sg_json(r#"{"turn":{"status":"interrupted","agent_loop_status":"cancelled"}}"#)
+                .expect("parseable");
         assert!(interrupted.interrupted);
-        let failed = parse_sg_json(
-            r#"{"turn":{"status":"failed","agent_loop_status":"failed"}}"#,
-        )
-        .expect("parseable");
+        let failed = parse_sg_json(r#"{"turn":{"status":"failed","agent_loop_status":"failed"}}"#)
+            .expect("parseable");
         assert!(failed.failed);
         assert!(parse_sg_json("not json").is_none());
     }

@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::{agent::AgentOutcome, session::SessionManager};
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
+    ModelError, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
     ProviderProtocolContract,
 };
 
@@ -109,12 +109,8 @@ fn cancelled_run_commits_as_interrupted_and_safe_states_are_preserved() {
     // 已终态 turn 不被失败终态化覆盖。
     let mut emitted = Vec::new();
     let mut emit = |message| emitted.push(message);
-    let result = server.finish_turn_failure(
-        &mut emit,
-        &interrupted,
-        None,
-        TurnFailureStage::AgentLoop,
-    );
+    let result =
+        server.finish_turn_failure(&mut emit, &interrupted, None, TurnFailureStage::AgentLoop);
     assert!(matches!(
         result,
         Err(AppServerError::TurnExecution {
@@ -202,8 +198,7 @@ fn running_turn_failure_stages_terminalize_as_failed() {
         }
         let mut emitted = Vec::new();
         let mut emit = |message| emitted.push(message);
-        let result =
-            server.finish_turn_failure(&mut emit, &turn, None, stage);
+        let result = server.finish_turn_failure(&mut emit, &turn, None, stage);
         assert!(matches!(
             result,
             Err(AppServerError::TurnExecution { stage: actual, .. }) if actual == stage
@@ -238,12 +233,8 @@ fn terminalization_preserves_interrupted_and_blocked_turns() {
         let mut emitted = Vec::new();
         let mut emit = |message| emitted.push(message);
 
-        let result = server.finish_turn_failure(
-            &mut emit,
-            &turn,
-            None,
-            TurnFailureStage::AgentLoop,
-        );
+        let result =
+            server.finish_turn_failure(&mut emit, &turn, None, TurnFailureStage::AgentLoop);
 
         assert!(matches!(
             result,
@@ -471,11 +462,7 @@ fn agent_loop_replays_session_file_history_across_turns() {
                 "response_1",
                 "previous assistant",
             ),
-            ModelTurnResponse::completed(
-                "model_request_turn_2_0",
-                "response_2",
-                "done",
-            ),
+            ModelTurnResponse::completed("model_request_turn_2_0", "response_2", "done"),
         ],
         seen_requests: Arc::clone(&seen_requests),
     };
@@ -559,7 +546,15 @@ fn agent_loop_replays_session_file_history_across_turns() {
             _ => None,
         })
         .collect();
-    assert_eq!(texts, vec!["previous user", "previous assistant", "current user", "done"]);
+    assert_eq!(
+        texts,
+        vec![
+            "previous user",
+            "previous assistant",
+            "current user",
+            "done"
+        ]
+    );
 }
 
 #[test]
@@ -806,9 +801,7 @@ fn agent_capability_is_always_available_without_a_sandbox_gate() {
 }
 
 /// 构造带工具调用序列的 fake provider（write 工具 → 文本收尾）。
-fn tool_using_static_provider(
-    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
-) -> StaticProvider {
+fn tool_using_static_provider(seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>) -> StaticProvider {
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     tool_response.tool_calls.push(ModelToolCall {
@@ -838,8 +831,9 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let mut server = app_server(store)
-        .with_test_provider(Arc::new(tool_using_static_provider(Arc::clone(&seen_requests))));
+    let mut server = app_server(store).with_test_provider(Arc::new(tool_using_static_provider(
+        Arc::clone(&seen_requests),
+    )));
 
     let responses = server
         .turn_start(
@@ -863,7 +857,10 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
     )
     .expect("turn result");
     assert_eq!(result.turn.status, TurnStatus::Completed);
-    assert_eq!(result.turn.agent_loop_status, AgentStatus::Completed.as_str());
+    assert_eq!(
+        result.turn.agent_loop_status,
+        AgentStatus::Completed.as_str()
+    );
     // 事件流：item/started + item/agentMessage/delta + item/completed + turn/completed。
     let methods: Vec<&str> = responses
         .iter()
@@ -907,7 +904,10 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
         })
         .collect();
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0].role, singularity_agent::message::AgentMessageRole::User);
+    assert_eq!(
+        messages[0].role,
+        singularity_agent::message::AgentMessageRole::User
+    );
     assert_eq!(messages[0].content, "write hello.txt");
     assert_eq!(
         messages[1].tool_name.as_deref(),
@@ -922,10 +922,7 @@ fn turn_start_runs_new_core_with_tools_and_session_file() {
 fn turn_input_during_run_pushes_the_registered_steer_handle() {
     let store = SessionStore::open(":memory:").expect("store");
     let mut server = app_server(store);
-    let thread = server
-        .store
-        .create_thread(None, None)
-        .expect("thread");
+    let thread = server.store.create_thread(None, None).expect("thread");
     let turn = server
         .store
         .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
@@ -1128,7 +1125,11 @@ fn turn_start_requires_trust_decision_before_creating_the_turn() {
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
-    assert!(requests[0].messages[0].content.contains("project instructions"));
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("project instructions")
+    );
 }
 
 #[test]
@@ -1152,9 +1153,7 @@ fn turn_start_skips_instructions_when_project_is_never_trusted() {
     };
     let trust_home = tempfile::tempdir().expect("trust home");
     let mut decisions = singularity_core::TrustDecisions::load(trust_home.path());
-    decisions
-        .set(&workspace, false)
-        .expect("set never trusted");
+    decisions.set(&workspace, false).expect("set never trusted");
     let mut server = app_server(store)
         .with_trust_home(trust_home.path())
         .with_interactive_ui(true)
@@ -1232,7 +1231,11 @@ fn turn_start_ask_pending_without_interactive_ui_runs_without_instructions() {
     .expect("turn result");
     assert_eq!(result.turn.status, TurnStatus::Completed);
     // ask 未决 + 无交互 UI → 按不信任处理：不返回 -32010，也不加载指令。
-    assert!(responses.iter().all(|message| message.get("error").is_none()));
+    assert!(
+        responses
+            .iter()
+            .all(|message| message.get("error").is_none())
+    );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].messages[0].role, ModelRole::User);
 }
@@ -1254,12 +1257,8 @@ fn project_trust_handler_queries_sets_and_resets_decisions() {
     // 查询：无记录 → decision 缺失。
     let responses = server
         .project_trust(
-            JsonRpcMessage::request(
-                Method::ProjectTrust,
-                1,
-                json!({ "path": expected_path }),
-            )
-            .expect("request"),
+            JsonRpcMessage::request(Method::ProjectTrust, 1, json!({ "path": expected_path }))
+                .expect("request"),
         )
         .expect("project trust query");
     let result: ProjectTrustResult = serde_json::from_value(
@@ -1286,12 +1285,8 @@ fn project_trust_handler_queries_sets_and_resets_decisions() {
         .expect("project trust set");
     let responses = server
         .project_trust(
-            JsonRpcMessage::request(
-                Method::ProjectTrust,
-                3,
-                json!({ "path": expected_path }),
-            )
-            .expect("request"),
+            JsonRpcMessage::request(Method::ProjectTrust, 3, json!({ "path": expected_path }))
+                .expect("request"),
         )
         .expect("project trust query");
     let result: ProjectTrustResult = serde_json::from_value(
@@ -1321,12 +1316,8 @@ fn project_trust_handler_queries_sets_and_resets_decisions() {
         .expect("project trust reset");
     let responses = server
         .project_trust(
-            JsonRpcMessage::request(
-                Method::ProjectTrust,
-                5,
-                json!({ "path": expected_path }),
-            )
-            .expect("request"),
+            JsonRpcMessage::request(Method::ProjectTrust, 5, json!({ "path": expected_path }))
+                .expect("request"),
         )
         .expect("project trust query");
     let result: ProjectTrustResult = serde_json::from_value(

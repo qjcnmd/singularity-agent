@@ -37,18 +37,20 @@ impl ControlledProvider {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
-            while !worker_stop.load(Ordering::SeqCst) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(_) if worker_stop.load(Ordering::SeqCst) => break,
-                    Err(error) => panic!("accept provider request: {error}"),
-                };
-                if worker_stop.load(Ordering::SeqCst) {
-                    break;
+            // 单次 accept：正常路径是 Drop 时 connect 唤醒后退出；意外请求必须失败。
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    if worker_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let request = read_http_json(&mut stream);
+                    // 静态能力声明后这些测试不再发起任何 provider 请求；意外请求必须失败。
+                    panic!(
+                        "unexpected provider request after static capability declaration: {request}"
+                    );
                 }
-                let request = read_http_json(&mut stream);
-                // 静态能力声明后这些测试不再发起任何 provider 请求；意外请求必须失败。
-                panic!("unexpected provider request after static capability declaration: {request}");
+                Err(_) if worker_stop.load(Ordering::SeqCst) => {}
+                Err(error) => panic!("accept provider request: {error}"),
             }
         });
         Self {

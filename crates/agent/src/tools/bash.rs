@@ -83,7 +83,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
-        execute: execute,
+        execute,
     }
 }
 
@@ -136,13 +136,13 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let mut outcome = BashOutcome::Completed;
     loop {
         drain(&receiver, &mut state, &mut on_update);
-        if let Some(signal) = signal {
-            if signal.is_cancelled() {
-                kill_process_tree(&mut child);
-                outcome = BashOutcome::Aborted;
-                exit_status = wait_for_exit(&mut child);
-                break;
-            }
+        if let Some(signal) = signal
+            && signal.is_cancelled()
+        {
+            kill_process_tree(&mut child);
+            outcome = BashOutcome::Aborted;
+            exit_status = wait_for_exit(&mut child);
+            break;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             kill_process_tree(&mut child);
@@ -180,10 +180,12 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         thread::sleep(Duration::from_millis(5));
     }
     // 理论不可达的兜底：已超限但临时文件尚未创建（例如极端截断路径），补建。
-    if state.capture_error.is_none() && state.is_truncated() && state.full_output_path().is_none() {
-        if let Err(error) = state.create_full_output_file() {
-            state.capture_error = Some(error);
-        }
+    if state.capture_error.is_none()
+        && state.is_truncated()
+        && state.full_output_path().is_none()
+        && let Err(error) = state.create_full_output_file()
+    {
+        state.capture_error = Some(error);
     }
 
     let progress = state.final_progress();
@@ -295,10 +297,8 @@ fn drain<'a>(
             }
         }
     }
-    if ingested {
-        if let Some(on_update) = on_update.as_mut() {
-            on_update(&state.current_output());
-        }
+    if ingested && let Some(on_update) = on_update.as_mut() {
+        on_update(&state.current_output());
     }
     readers_ended
 }
@@ -312,10 +312,10 @@ fn shell_command(command: &str) -> (String, Vec<String>) {
         if let Some(bash) = find_bash_on_windows() {
             return (bash, vec!["-c".to_string(), command.to_string()]);
         }
-        return (
+        (
             "cmd".to_string(),
             vec!["/C".to_string(), command.to_string()],
-        );
+        )
     }
     #[cfg(not(windows))]
     {

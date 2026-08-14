@@ -244,8 +244,6 @@ fn pause_request_blocks_terminal_commit_until_cleared() {
         .expect("terminal commit after pause cleared");
 }
 
-
-
 // trusted reopen 仍拒绝已初始化数据库的 marker/结构分裂。
 #[test]
 fn trusted_reopen_validates_current_markers_before_serving_rows() {
@@ -457,7 +455,6 @@ fn structure_rejects_weak_check_index_and_trigger_without_mutation() {
     }
 }
 
-
 // 验证新 schema 拒绝孤儿 thread/turn。
 #[test]
 fn missing_thread_and_turn_fail_closed() {
@@ -659,7 +656,6 @@ fn thread_delete_removes_bound_items_and_turns() {
     }
 }
 
-
 // 验证 turn user input 可供 turn/resume 读取。
 #[test]
 fn turn_user_input_can_be_read_for_resume() {
@@ -814,7 +810,6 @@ fn preallocated_assistant_item_id_cannot_be_reused() {
         TurnStatus::Running
     );
 }
-
 
 // 验证当前库缺少 migration marker 时 fail closed 且不改数据。
 #[test]
@@ -1491,7 +1486,6 @@ fn append_completed_conversation(
     turn.turn_id
 }
 
-
 fn sqlite_snapshot(path: &std::path::Path) -> String {
     let connection = rusqlite::Connection::open(path).expect("open sqlite snapshot");
     let schema = connection
@@ -1587,4 +1581,3 @@ fn workspace_recovery_preserves_paused_and_suspended_turns() {
         TurnStatus::Suspended
     );
 }
-

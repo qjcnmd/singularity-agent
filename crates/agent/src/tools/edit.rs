@@ -32,7 +32,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "edit",
         description: DESCRIPTION,
         parameters: parameters(),
-        execute: execute,
+        execute,
     }
 }
 

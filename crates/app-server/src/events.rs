@@ -143,9 +143,9 @@ impl AppServer {
         if !assistant_events.first_delta_observed {
             assistant_events.first_delta_observed = true;
             assistant_events.started_generated = true;
-            messages.push(self.event_notification(AppEvent::item_started(
-                assistant_events.item_id.as_str(),
-            ))?);
+            messages.push(
+                self.event_notification(AppEvent::item_started(assistant_events.item_id.as_str()))?,
+            );
         }
         assistant_events.delta_generated = true;
         messages.push(self.event_notification(AppEvent::item_agent_message_delta(

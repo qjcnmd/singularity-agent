@@ -289,7 +289,11 @@ impl SessionStore {
     ) -> StoreResult<()> {
         transaction.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
-            params![terminal_status.to_db_text(), terminal_agent_loop_status, turn_id],
+            params![
+                terminal_status.to_db_text(),
+                terminal_agent_loop_status,
+                turn_id
+            ],
         )?;
         Ok(())
     }

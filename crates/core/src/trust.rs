@@ -153,9 +153,12 @@ pub fn user_singularity_home() -> Option<PathBuf> {
 
 /// 项目目录是否存在信任资源（AGENTS.md 或 AGENTS.override.md）。
 pub fn has_project_trust_resource(cwd: &Path) -> bool {
-    [PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME]
-        .iter()
-        .any(|name| cwd.join(name).is_file())
+    [
+        PROJECT_INSTRUCTIONS_FILE_NAME,
+        PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME,
+    ]
+    .iter()
+    .any(|name| cwd.join(name).is_file())
 }
 
 /// 对齐 Pi `resolveProjectTrusted` 顺序解析项目信任：

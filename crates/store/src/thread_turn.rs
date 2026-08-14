@@ -216,12 +216,8 @@ impl SessionStore {
         agent_loop_status: &str,
         input: Value,
     ) -> StoreResult<(Turn, Item)> {
-        let started = self.create_turn_with_input_and_history(
-            thread_id,
-            agent_loop_status,
-            input,
-            0,
-        )?;
+        let started =
+            self.create_turn_with_input_and_history(thread_id, agent_loop_status, input, 0)?;
         Ok((started.turn, started.item))
     }
 

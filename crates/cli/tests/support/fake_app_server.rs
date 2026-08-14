@@ -147,7 +147,11 @@ fn decorate_event(
     }
     let is_progress = method == "item/agentMessage/delta";
     let class = if is_progress { "progress" } else { "state" };
-    let delivery = if is_progress { "best_effort" } else { "reliable" };
+    let delivery = if is_progress {
+        "best_effort"
+    } else {
+        "reliable"
+    };
     params.insert(
         "event".to_string(),
         json!({

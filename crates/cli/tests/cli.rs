@@ -1477,10 +1477,7 @@ fn cli_manifest_does_not_depend_on_core_runtime_crates() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = std::fs::read_to_string(manifest_path).expect("read cli manifest");
 
-    for forbidden in [
-        "singularity_agent",
-        "singularity_store",
-    ] {
+    for forbidden in ["singularity_agent", "singularity_store"] {
         assert!(
             !manifest.contains(forbidden),
             "cli must not depend directly on {forbidden}"
@@ -1643,7 +1640,11 @@ fn cli_trust_command_sets_trusted_decision() {
         .output()
         .expect("trust set cli");
     assert!(set.status.success(), "stderr={}", stderr(&set));
-    assert!(stdout(&set).contains("=> trusted"), "stdout={}", stdout(&set));
+    assert!(
+        stdout(&set).contains("=> trusted"),
+        "stdout={}",
+        stdout(&set)
+    );
 
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&set_params).expect("set params"))
@@ -1669,7 +1670,10 @@ fn cli_trust_command_queries_without_decision_field() {
             .initialized()
             .interaction(
                 "project/trust",
-                vec![capture_params(&query_params), respond(json!({"path": expected_path}))],
+                vec![
+                    capture_params(&query_params),
+                    respond(json!({"path": expected_path})),
+                ],
             )
             .shutdown(),
     );
@@ -1679,7 +1683,11 @@ fn cli_trust_command_queries_without_decision_field() {
         .output()
         .expect("trust query cli");
     assert!(query.status.success(), "stderr={}", stderr(&query));
-    assert!(stdout(&query).contains("=> ask"), "stdout={}", stdout(&query));
+    assert!(
+        stdout(&query).contains("=> ask"),
+        "stdout={}",
+        stdout(&query)
+    );
 
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&query_params).expect("query params"))

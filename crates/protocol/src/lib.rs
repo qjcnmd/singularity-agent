@@ -367,7 +367,11 @@ impl JsonRpcMessage {
     }
 
     /// 构造携带已脱敏 data 的 error response（data 仅允许调用方显式提供）。
-    pub fn error_with_data(id: impl Into<Option<JsonRpcId>>, error: ErrorCode, data: Value) -> Self {
+    pub fn error_with_data(
+        id: impl Into<Option<JsonRpcId>>,
+        error: ErrorCode,
+        data: Value,
+    ) -> Self {
         Self::Error(JsonRpcErrorResponse {
             jsonrpc: JsonRpcVersion::V2,
             id: id.into().unwrap_or(JsonRpcId::Null),

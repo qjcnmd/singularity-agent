@@ -25,7 +25,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
-        execute: execute,
+        execute,
     }
 }
 
@@ -40,14 +40,13 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         return error_result("Operation aborted");
     }
     let full_path = resolve_path(ctx.cwd, path);
-    if let Some(parent) = full_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                return error_result(format!(
-                    "Could not write file: {path}. Failed to create parent directories: {error}"
-                ));
-            }
-        }
+    if let Some(parent) = full_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        return error_result(format!(
+            "Could not write file: {path}. Failed to create parent directories: {error}"
+        ));
     }
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");

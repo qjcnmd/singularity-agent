@@ -2,9 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use singularity_core::{
-    TrustDecisions, TrustDefault, TrustResolution, resolve_project_trusted,
-};
+use singularity_core::{TrustDecisions, TrustDefault, TrustResolution, resolve_project_trusted};
 
 /// 创建带 AGENTS.md 信任资源的项目目录（无记录时走默认策略）。
 fn project_with_agents(base: &Path, name: &str) -> PathBuf {
@@ -23,9 +21,7 @@ fn project_without_trust_resource_is_directly_trusted() {
 
     // 即使有 never 记录或 never 默认，无 AGENTS.md 仍直接信任（对齐 Pi 顺序）。
     let mut decisions = decisions;
-    decisions
-        .set(&project, false)
-        .expect("write never record");
+    decisions.set(&project, false).expect("write never record");
     assert_eq!(
         resolve_project_trusted(&project, &decisions, TrustDefault::Never, false),
         TrustResolution::Trusted
@@ -129,10 +125,7 @@ fn load_accepts_manually_written_version_one_file_and_ignores_corruption() {
     )
     .expect("write trust.json");
 
-    assert_eq!(
-        TrustDecisions::load(temp.path()).get(&project),
-        Some(true)
-    );
+    assert_eq!(TrustDecisions::load(temp.path()).get(&project), Some(true));
 
     // 损坏文件 fail-soft：空决策集。
     std::fs::write(temp.path().join("trust.json"), "{not json").expect("corrupt file");

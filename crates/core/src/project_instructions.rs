@@ -195,7 +195,9 @@ pub fn load_project_instructions(
     let mut sources = Vec::new();
     let mut total_bytes = 0usize;
     for directory in instruction_directories(&workspace_root, &cwd) {
-        let override_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
+        let override_relative = directory
+            .relative_path
+            .join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
         let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let instruction_file = match read_project_instruction_file(
             &directory.dir,

@@ -23,11 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::contains_sensitive_text;
-use singularity_protocol::{
-    Item, ItemKind, ItemStatus, Thread, ThreadStatus, Turn, TurnStatus,
-};
 /// 供上层重建 conversation history 的 protocol 类型。
 pub use singularity_protocol::{ConversationMessage, ConversationRole};
+use singularity_protocol::{Item, ItemKind, ItemStatus, Thread, ThreadStatus, Turn, TurnStatus};
 use thiserror::Error;
 use uuid::Uuid;
 

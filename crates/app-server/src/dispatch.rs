@@ -252,14 +252,19 @@ impl AppServer {
         let thread = self.store.create_thread(model.as_deref(), Some(&cwd))?;
         // 线程 ↔ 会话文件绑定：`<sessions_dir>/<thread_id>.jsonl`（Phase 3a 跨轮历史通道）。
         let thread_cwd = thread.cwd.clone().unwrap_or(cwd);
-        let sessions_dir = Path::new(&thread_cwd).join(".singularity").join("agent-sessions");
-        if SessionManager::create_with_name(Path::new(&thread_cwd), &sessions_dir, &thread.thread_id)
-            .is_err()
+        let sessions_dir = Path::new(&thread_cwd)
+            .join(".singularity")
+            .join("agent-sessions");
+        if SessionManager::create_with_name(
+            Path::new(&thread_cwd),
+            &sessions_dir,
+            &thread.thread_id,
+        )
+        .is_err()
         {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
-        let mut messages = Vec::new();
-        messages.push(self.event_notification(AppEvent::thread_started(&thread))?);
+        let mut messages = vec![self.event_notification(AppEvent::thread_started(&thread))?];
         messages.push(
             JsonRpcMessage::response(
                 message.required_id(),
@@ -377,18 +382,12 @@ impl AppServer {
         match params.decision {
             ProjectTrustDecision::Set(trusted) => {
                 if decisions.set(Path::new(&path), trusted).is_err() {
-                    return invalid_state_response(
-                        message.required_id(),
-                        SAFE_WORKSPACE_FAILURE,
-                    );
+                    return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
                 }
             }
             ProjectTrustDecision::Ask => {
                 if decisions.remove(Path::new(&path)).is_err() {
-                    return invalid_state_response(
-                        message.required_id(),
-                        SAFE_WORKSPACE_FAILURE,
-                    );
+                    return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
                 }
             }
             ProjectTrustDecision::Query => {}

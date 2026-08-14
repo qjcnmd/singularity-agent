@@ -32,12 +32,15 @@ use crate::message::{AgentMessage, AgentMessageRole};
 use crate::session::{SessionError, SessionManager};
 use crate::tools::{ExecuteContext, ToolError, ToolExecution, ToolRegistry};
 
+/// 工具执行回调签名：工具名、参数原文。
+pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str);
+
 /// 核心事件回调（Pi 事件集的 Phase 2d 最小子集）。
 pub struct AgentEvents<'a> {
     /// assistant 文本增量。
     pub on_message_update: Option<&'a mut dyn FnMut(&str)>,
     /// 工具开始执行（工具名、参数原文）。
-    pub on_tool_execution_start: Option<&'a mut dyn FnMut(&str, &str)>,
+    pub on_tool_execution_start: Option<ToolExecutionCallback<'a>>,
     /// 工具执行中的流式输出增量。
     pub on_tool_execution_update: Option<&'a mut dyn FnMut(&str)>,
 }
@@ -225,8 +228,7 @@ impl Agent {
                     return Ok(outcome);
                 }
                 // 注入 steer 队列全部消息（作为 user 消息追加到本轮上下文）。
-                let steer_messages =
-                    std::mem::take(&mut *lock_queue(&self.steer_queue));
+                let steer_messages = std::mem::take(&mut *lock_queue(&self.steer_queue));
                 for text in steer_messages {
                     self.session.append_message(user_message(&text))?;
                 }
@@ -482,7 +484,9 @@ impl Agent {
 
 /// 加锁 steer/follow-up 队列；中毒时恢复（工具执行中 panic 不应使注入通道永久不可用）。
 fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecDeque<String>> {
-    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn user_message(text: &str) -> AgentMessage {
@@ -1028,7 +1032,7 @@ mod tests {
     }
 
     /// 7. compaction 触发：极小 context_window + 超过 keep_recent 的上下文
-    /// → run 中出现 CompactionEntry。
+    ///    → run 中出现 CompactionEntry。
     #[test]
     fn tiny_context_window_triggers_compaction() {
         let dir = tempfile::tempdir().unwrap();

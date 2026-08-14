@@ -141,7 +141,13 @@ fn canonical_v11_schema_sql(suffix: &str) -> String {
         return CURRENT_SCHEMA_SQL.to_string();
     }
     let mut sql = CURRENT_SCHEMA_SQL.to_string();
-    for table in ["schema_meta", "schema_migrations", "threads", "turns", "items"] {
+    for table in [
+        "schema_meta",
+        "schema_migrations",
+        "threads",
+        "turns",
+        "items",
+    ] {
         sql = sql.replace(table, &format!("{table}{suffix}"));
     }
     sql
@@ -272,9 +278,8 @@ fn require_core_tables(connection: &Connection) -> StoreResult<()> {
 }
 
 fn read_thread_rows(connection: &Connection) -> StoreResult<Vec<ThreadRow>> {
-    let mut statement = connection.prepare(
-        "select thread_id, status from threads order by rowid",
-    )?;
+    let mut statement =
+        connection.prepare("select thread_id, status from threads order by rowid")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -289,9 +294,8 @@ fn read_thread_rows(connection: &Connection) -> StoreResult<Vec<ThreadRow>> {
 }
 
 fn read_turn_rows(connection: &Connection) -> StoreResult<Vec<TurnRow>> {
-    let mut statement = connection.prepare(
-        "select turn_id, thread_id, turn_sequence, status from turns order by rowid",
-    )?;
+    let mut statement = connection
+        .prepare("select turn_id, thread_id, turn_sequence, status from turns order by rowid")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -332,8 +336,8 @@ fn read_item_rows(connection: &Connection) -> StoreResult<Vec<ItemRow>> {
     let mut items = Vec::new();
     for row in rows {
         let (item_id, turn_id, item_sequence, kind, payload, status, redacted) = row?;
-        let kind = ItemKind::from_db_text(&kind)
-            .ok_or_else(|| unknown_db_enum(ItemKind::LABEL, &kind))?;
+        let kind =
+            ItemKind::from_db_text(&kind).ok_or_else(|| unknown_db_enum(ItemKind::LABEL, &kind))?;
         ItemStatus::from_db_text(&status)
             .ok_or_else(|| unknown_db_enum(ItemStatus::LABEL, &status))?;
         let payload: Value = serde_json::from_str(&payload)?;

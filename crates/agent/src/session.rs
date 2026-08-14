@@ -467,7 +467,11 @@ impl SessionManager {
             "timestamp": timestamp,
             "cwd": normalize_cwd_string(&cwd),
         });
-        let mut handle = OpenOptions::new().write(true).create(true).open(file)?;
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
         Ok(Self {
@@ -1162,7 +1166,7 @@ mod tests {
     }
 
     /// 7. assistant 带 tool call 的消息投影为带 tool_calls 的 LLM 消息（Phase 2d 扩展，
-    /// 对齐 Pi convertToLlm：assistant 消息携带 tool call 结构进入上下文）。
+    ///    对齐 Pi convertToLlm：assistant 消息携带 tool call 结构进入上下文）。
     #[test]
     fn build_session_context_replays_assistant_tool_calls() {
         let dir = tempfile::tempdir().unwrap();
@@ -1271,7 +1275,7 @@ mod tests {
     }
 
     /// 6. build_session_context：消息顺序/role 转换正确，compaction 摘要包裹，
-    /// model/thinking 从条目提取。
+    ///    model/thinking 从条目提取。
     #[test]
     fn build_session_context_messages_and_settings() {
         let dir = tempfile::tempdir().unwrap();

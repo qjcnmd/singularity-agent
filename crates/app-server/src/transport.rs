@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde_json::Value;
-use singularity_app_server::{AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput};
+use singularity_app_server::{
+    AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput,
+};
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{
@@ -297,7 +299,8 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
             }
         } else {
             task.abort();
-            worker_error = Some("timed out waiting for the turn worker during shutdown".to_string());
+            worker_error =
+                Some("timed out waiting for the turn worker during shutdown".to_string());
         }
     }
     drop(output_tx);
@@ -353,10 +356,8 @@ fn initialize_app_server(
     store
         .recover_unowned_workspace_executions()
         .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
-    let provider_snapshot = ProviderConfigSnapshot::capture(
-        |name| std::env::var(name).ok(),
-        Some(runtime_handle),
-    );
+    let provider_snapshot =
+        ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
     Ok(AppServer::new(store, provider_snapshot))
 }
 
@@ -365,11 +366,9 @@ async fn send_output_async(
     cancellation: AppServerCancellationHandle,
     message: Value,
 ) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        send_output(&outputs, &cancellation, message)
-    })
-    .await
-    .map_err(|error| format!("output dispatch task failed: {error}"))?
+    tokio::task::spawn_blocking(move || send_output(&outputs, &cancellation, message))
+        .await
+        .map_err(|error| format!("output dispatch task failed: {error}"))?
 }
 
 /// 判断单请求是否属于独占 turn 槽位的 long-running 方法。
@@ -758,9 +757,9 @@ mod tests {
     use std::future::Future;
     use std::io;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
-    use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::thread;
     use tokio::io::AsyncWrite;
@@ -854,12 +853,14 @@ mod tests {
     fn prepared_state_paths_use_the_canonical_directory() {
         let directory = tempfile::tempdir().expect("state directory");
         let configured = directory.path().join("nested").join("sessions.sqlite3");
-        let db_path =
-            prepare_app_server_state_paths(configured.to_str().expect("configured path"))
-                .expect("prepared state path");
+        let db_path = prepare_app_server_state_paths(configured.to_str().expect("configured path"))
+            .expect("prepared state path");
         let canonical_parent = std::fs::canonicalize(configured.parent().expect("parent"))
             .expect("canonical state directory");
-        assert_eq!(Path::new(&db_path).parent(), Some(canonical_parent.as_path()));
+        assert_eq!(
+            Path::new(&db_path).parent(),
+            Some(canonical_parent.as_path())
+        );
         assert!(!Path::new(&db_path).exists());
     }
 
@@ -947,7 +948,10 @@ mod tests {
         attempted_receiver.recv().expect("send attempt");
         assert!(!sender.is_finished(), "full queue must backpressure");
         assert_eq!(cancellation.request_count(), 0);
-        assert_eq!(receiver.blocking_recv().expect("first output")["first"], true);
+        assert_eq!(
+            receiver.blocking_recv().expect("first output")["first"],
+            true
+        );
         sender.join().expect("sender");
         assert_eq!(
             receiver.blocking_recv().expect("second output")["second"],
@@ -992,8 +996,12 @@ mod tests {
         drop(outputs);
 
         let mut stdout = DisconnectedWriter;
-        let error = block_on(write_output_queue(&mut receiver, &mut stdout, &cancellation))
-            .expect_err("writer disconnect is transport-fatal");
+        let error = block_on(write_output_queue(
+            &mut receiver,
+            &mut stdout,
+            &cancellation,
+        ))
+        .expect_err("writer disconnect is transport-fatal");
 
         assert!(error.starts_with("failed to write response:"));
         assert_eq!(cancellation.request_count(), 1);
@@ -1013,8 +1021,12 @@ mod tests {
         drop(outputs);
 
         let mut stdout = VecWriter::default();
-        block_on(write_output_queue(&mut receiver, &mut stdout, &cancellation))
-            .expect("writer drains frames");
+        block_on(write_output_queue(
+            &mut receiver,
+            &mut stdout,
+            &cancellation,
+        ))
+        .expect("writer drains frames");
         let values = String::from_utf8(stdout.0)
             .expect("writer output is UTF-8")
             .lines()
@@ -1166,9 +1178,7 @@ mod tests {
         )
         .expect("dispatch empty batch");
 
-        let response = receiver
-            .try_recv()
-            .expect("invalid request response");
+        let response = receiver.try_recv().expect("invalid request response");
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], Value::Null);
         assert_eq!(response["error"]["code"], -32600);
@@ -1195,7 +1205,10 @@ mod tests {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "request-7");
         assert_eq!(response["error"]["code"], -32005);
-        assert_eq!(response["error"]["message"], "another turn is already running");
+        assert_eq!(
+            response["error"]["message"],
+            "another turn is already running"
+        );
     }
 
     #[test]

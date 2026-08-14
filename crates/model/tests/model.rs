@@ -3,13 +3,13 @@
 use schemars::schema_for;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_MODELS_CONFIG, ModelBlockerKind,
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig,
-    ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig,
-    Provider, ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata,
-    ProviderAttemptOccurrence, ProviderAttemptOperationPhase, ProviderAttemptStatus,
-    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
-    ProviderErrorStage, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
+    ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
+    ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
+    ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
+    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
     ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, responses_endpoint, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
@@ -146,7 +146,8 @@ fn responses_provider_server(
         assert!(headers.contains("authorization: Bearer sk-secret-value"));
         let body = actual_body.to_string();
         write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-        tx.send(vec![(first_line, request_body)]).expect("send Responses requests");
+        tx.send(vec![(first_line, request_body)])
+            .expect("send Responses requests");
     });
     // 静态协议选择：legacy provider 按 endpoint 后缀决定协议，显式 /v1/responses。
     (format!("http://{addr}/v1/responses"), rx)
@@ -191,7 +192,6 @@ fn responses_stream_server(
 
 /// Chat 实际响应：带 tool call 但没有 reasoning_content——在 ReplayReasoningContent
 /// 模式下这是真实的回放义务违规（有 tool call 必须回放 reasoning_content）。
-
 fn sequence_response_server(
     responses: Vec<(&'static str, &'static str)>,
 ) -> (String, Receiver<usize>) {
@@ -2981,9 +2981,11 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         ]
     );
     // 超限（> 请求上限）只产生 warning，不阻止 agent 逐个执行。
-    assert!(duplicate_result
-        .warnings
-        .contains(&"max_tool_calls_exceeded".to_string()));
+    assert!(
+        duplicate_result
+            .warnings
+            .contains(&"max_tool_calls_exceeded".to_string())
+    );
 }
 
 #[test]
@@ -4947,7 +4949,6 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
 /// 已精确覆盖 Chat 无当前 tool call 时返回 reasoning content 的失败关闭（请求无 tools）；
 /// 本测试补充“请求含 tools 但响应仅 reasoning-only 无 tool call”的变体，覆盖新谓词
 /// `disabled_mode_not_honored` 不依赖响应是否有 tool call 的路径。
-
 // SINGULARITY_HOME 环境隔离：这两个端到端测试互相串行，其他测试不读该变量。
 static USER_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -5070,4 +5071,3 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     );
     unsafe { std::env::remove_var("SINGULARITY_HOME") };
 }
-

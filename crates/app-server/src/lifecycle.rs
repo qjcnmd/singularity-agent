@@ -16,8 +16,7 @@ impl AppServer {
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV)
-                .is_some_and(|value| value != "0"),
+            interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV).is_some_and(|value| value != "0"),
             trust_home: user_singularity_home(),
             test_provider_override: None,
         }
@@ -272,7 +271,10 @@ impl AppServer {
                     &mut emit,
                     &current,
                     Some(&assistant_events),
-                    turn_failure_from_error(&AppServerError::Store(error), TurnFailureStage::AgentLoop),
+                    turn_failure_from_error(
+                        &AppServerError::Store(error),
+                        TurnFailureStage::AgentLoop,
+                    ),
                 );
             }
         };
@@ -437,7 +439,10 @@ impl AppServer {
         // 且不创建 turn；CLI 询问用户后经 project/trust 写回决策并重试。
         if let TrustResolution::AskNeeded = self.resolve_thread_trust(&thread)? {
             let cwd = thread.cwd.clone().unwrap_or_default();
-            emit_messages(&mut emit, trust_required_response(message.required_id(), &cwd)?);
+            emit_messages(
+                &mut emit,
+                trust_required_response(message.required_id(), &cwd)?,
+            );
             return Ok(());
         }
         let Some(_execution_guard) = self
@@ -455,10 +460,7 @@ impl AppServer {
         let input_text = match input_items_to_text(&payload) {
             Ok(text) => text,
             Err(_) => {
-                emit_messages(
-                    &mut emit,
-                    invalid_params_response(message.required_id())?,
-                );
+                emit_messages(&mut emit, invalid_params_response(message.required_id())?);
                 return Ok(());
             }
         };
@@ -704,11 +706,10 @@ impl AppServer {
             .into());
         }
         self.commit_effective_turn_status(&turn, &effective_status, assistant_item_id)
-            .map(|committed| {
+            .inspect(|_committed| {
                 if effective_status.model_turns > 0 {
                     self.remember_usage(&turn.turn_id, &effective_status.model_usage);
                 }
-                committed
             })
             .map_err(Into::into)
     }

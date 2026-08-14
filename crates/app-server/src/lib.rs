@@ -30,11 +30,11 @@ use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
     EventMetadata, EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult,
     Item, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProjectTrustDecision, ProjectTrustParams,
-    ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult,
-    Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TransportCapability, Turn, TurnIdParams, TurnInputParams, TurnInterruptResult, TurnResult,
-    TurnStartParams, TurnStartResult, TurnStatus,
+    ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult,
+    ServerShutdownResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
+    ThreadIdParams, ThreadListResult, ThreadReadParams, ThreadReadResult, ThreadResult,
+    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams, TurnInputParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
@@ -382,8 +382,8 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     };
     // canonicalize 保留旧语义：cwd 必须是存在的真实目录（解析符号链接）。
-    let canonical = std::fs::canonicalize(&path)
-        .map_err(|_| "failed to bind thread cwd".to_string())?;
+    let canonical =
+        std::fs::canonicalize(&path).map_err(|_| "failed to bind thread cwd".to_string())?;
     canonical
         .to_str()
         .map(str::to_string)
@@ -404,16 +404,17 @@ fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
 
 /// 线程级会话目录：workspace 根下的 `.singularity/agent-sessions/`（与旧 `sessions/` 隔离）。
 fn agent_sessions_dir(thread: &Thread) -> Result<PathBuf, String> {
-    Ok(workspace_path(thread)?.join(".singularity").join("agent-sessions"))
+    Ok(workspace_path(thread)?
+        .join(".singularity")
+        .join("agent-sessions"))
 }
 
 /// 打开线程绑定的会话文件（`<thread_id>.jsonl`）；文件不存在时创建新会话。
 ///
 /// thread ↔ 会话文件的确定性映射是跨轮历史的唯一通道（Phase 3a 起）。
 fn open_or_create_thread_session(thread: &Thread) -> AppServerResult<SessionManager> {
-    let sessions_dir = agent_sessions_dir(thread).map_err(|_| {
-        AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string())
-    })?;
+    let sessions_dir = agent_sessions_dir(thread)
+        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
     let file = sessions_dir.join(format!("{}.jsonl", thread.thread_id));
     if file.exists() {
         SessionManager::open(&file)
@@ -457,9 +458,8 @@ fn agent_config_for_thread(
     snapshot: &ProviderConfigSnapshot,
     trust: TrustResolution,
 ) -> AppServerResult<AgentConfig> {
-    let cwd = workspace_path(thread).map_err(|_| {
-        AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string())
-    })?;
+    let cwd = workspace_path(thread)
+        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
     let system_prompt = match trust {
         TrustResolution::Trusted => match load_project_instructions(&cwd, &cwd) {
             Ok(Some(instructions)) => instructions.content().to_string(),
@@ -497,9 +497,8 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
         mark_run_cancelled(&mut status);
     } else if outcome.final_text.trim().is_empty() {
         status.status = AgentStatus::Failed;
-        status.error = Some(
-            "agent loop exhausted its turn budget without a final message".to_string(),
-        );
+        status.error =
+            Some("agent loop exhausted its turn budget without a final message".to_string());
     } else {
         status.status = AgentStatus::Completed;
         status.error = None;
@@ -575,7 +574,8 @@ impl AppServer {
                 })?)
             };
         let trust = self.resolve_thread_trust(thread)?;
-        let config = agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, trust)?;
+        let config =
+            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, trust)?;
         Ok((provider, config))
     }
 
@@ -589,9 +589,8 @@ impl AppServer {
 
     /// 解析 thread 工作区的项目信任（对齐 Pi resolveProjectTrusted 顺序）。
     fn resolve_thread_trust(&self, thread: &Thread) -> AppServerResult<TrustResolution> {
-        let cwd = workspace_path(thread).map_err(|_| {
-            AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string())
-        })?;
+        let cwd = workspace_path(thread)
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
         Ok(resolve_project_trusted(
             &cwd,
             &self.trust_decisions(),

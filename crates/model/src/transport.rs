@@ -10,17 +10,16 @@ use super::openai::{
 use super::{
     HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
-    MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_RESPONSE_BODY_BYTES, ModelError, ModelErrorKind,
-    ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, OpenAiProvider,
-    OpenAiProviderConfig, PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS,
+    MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_RESPONSE_BODY_BYTES, ModelError, ModelErrorKind, ModelRole,
+    ModelTurnRequest, ModelTurnResponse, ModelUsage, OpenAiProvider, OpenAiProviderConfig,
+    PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS,
     PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_RUNTIME_WORKER_THREADS,
     PROVIDER_TIMEOUT_SECONDS, Provider, ProviderApiProtocol, ProviderAttemptEvent,
     ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStarted, ProviderAttemptStatus, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ProviderRuntime, ProviderStreamEvent,
-    ProviderStreamingCapability, ProviderToolReasoningMode, ProviderTransportCategory,
-    provider_streaming_unsupported_error, responses_endpoint, validate_model_request,
-    validate_model_request_with_capabilities,
+    ProviderAttemptStarted, ProviderAttemptStatus, ProviderError, ProviderErrorStage,
+    ProviderProtocolContract, ProviderRuntime, ProviderStreamEvent, ProviderStreamingCapability,
+    ProviderToolReasoningMode, ProviderTransportCategory, provider_streaming_unsupported_error,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
 };
 use serde_json::Value;
 use singularity_core::CancellationToken;
@@ -1203,30 +1202,36 @@ impl Provider for OpenAiProvider {
             .as_ref()
             .and_then(|selection| selection.capability_overrides.as_ref())
         {
-            contract.supports_tools =
-                overrides.supports_tools.unwrap_or(contract.supports_tools);
-            contract.supports_parallel_tool_calls =
-                overrides.supports_parallel_tool_calls.unwrap_or(contract.supports_parallel_tool_calls);
+            contract.supports_tools = overrides.supports_tools.unwrap_or(contract.supports_tools);
+            contract.supports_parallel_tool_calls = overrides
+                .supports_parallel_tool_calls
+                .unwrap_or(contract.supports_parallel_tool_calls);
             contract.supports_required_tool_choice = overrides
                 .supports_required_tool_choice
                 .unwrap_or(contract.supports_required_tool_choice);
-            contract.supports_strict_tool_schema =
-                overrides.supports_strict_tool_schema.unwrap_or(contract.supports_strict_tool_schema);
-            contract.supports_json_mode =
-                overrides.supports_json_mode.unwrap_or(contract.supports_json_mode);
-            contract.supports_system_message =
-                overrides.supports_system_message.unwrap_or(contract.supports_system_message);
-            contract.supports_developer_message =
-                overrides.supports_developer_message.unwrap_or(contract.supports_developer_message);
-            contract.max_tools_per_request =
-                overrides.max_tools_per_request.unwrap_or(contract.max_tools_per_request);
+            contract.supports_strict_tool_schema = overrides
+                .supports_strict_tool_schema
+                .unwrap_or(contract.supports_strict_tool_schema);
+            contract.supports_json_mode = overrides
+                .supports_json_mode
+                .unwrap_or(contract.supports_json_mode);
+            contract.supports_system_message = overrides
+                .supports_system_message
+                .unwrap_or(contract.supports_system_message);
+            contract.supports_developer_message = overrides
+                .supports_developer_message
+                .unwrap_or(contract.supports_developer_message);
+            contract.max_tools_per_request = overrides
+                .max_tools_per_request
+                .unwrap_or(contract.max_tools_per_request);
             contract.max_parallel_tool_calls = overrides
                 .max_parallel_tool_calls
                 .unwrap_or(contract.max_parallel_tool_calls);
             contract.max_context_tokens =
                 overrides.max_context_tokens.or(contract.max_context_tokens);
-            contract.max_output_tokens =
-                overrides.max_output_tokens.unwrap_or(contract.max_output_tokens);
+            contract.max_output_tokens = overrides
+                .max_output_tokens
+                .unwrap_or(contract.max_output_tokens);
         }
         contract
     }
@@ -1284,9 +1289,9 @@ impl Provider for OpenAiProvider {
                 request_uses_tool_protocol(&request),
                 &completion,
                 &context.capabilities,
-                self.selected_model.as_ref().is_some_and(|selection| {
-                    selection.requires_reasoning_content_for_tool_calls
-                }),
+                self.selected_model
+                    .as_ref()
+                    .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
             )
             .map(|()| completion.response)
         })
@@ -1640,7 +1645,6 @@ fn provider_response_stream_too_large_error() -> ProviderError {
         .push("provider_response_stream_too_large".to_string());
     ProviderError::from_model_error(error)
 }
-
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64

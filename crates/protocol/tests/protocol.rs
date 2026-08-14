@@ -1,7 +1,7 @@
 //! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
 
-use singularity_core::{ClientInfo, ErrorCode};
 use serde_json::json;
+use singularity_core::{ClientInfo, ErrorCode};
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ConversationMessage,
     ConversationRole, EventClass, EventDelivery, EventMetadata, EventSubscribeParams,

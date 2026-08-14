@@ -206,7 +206,11 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .expect("thread started event");
     assert_eq!(thread_started["params"]["event"]["class"], "state");
     assert_eq!(thread_started["params"]["event"]["delivery"], "reliable");
-    assert!(thread_started["params"]["event"].get("recoveryQuery").is_none());
+    assert!(
+        thread_started["params"]["event"]
+            .get("recoveryQuery")
+            .is_none()
+    );
 
     let list = server
         .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":41,"params":{}}"#)
@@ -779,10 +783,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         .handle_json(r#"{"jsonrpc":"2.0","method":"approval/request","id":3,"params":{}}"#)
         .unwrap();
     assert_eq!(unknown_method[0]["error"]["code"], -32601);
-    assert_eq!(
-        unknown_method[0]["error"]["message"],
-        "Method not found"
-    );
+    assert_eq!(unknown_method[0]["error"]["message"], "Method not found");
 
     let unknown_artifact = server
         .handle_json(
@@ -949,8 +950,7 @@ fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_mess
 
     let terminal = output.recv_id(3, Duration::from_secs(2));
     assert_eq!(
-        terminal["result"]["turn"]["status"],
-        "completed",
+        terminal["result"]["turn"]["status"], "completed",
         "turn/start terminal: {terminal}"
     );
     assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "completed");
@@ -1385,49 +1385,49 @@ fn streaming_responses_provider() -> (
             "static capability contract must issue one streaming request"
         );
         let completed = serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": "response_app_server_stream",
-                        "object": "response",
-                        "status": "completed",
-                        "output": [{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "streamed answer"}]
-                        }],
-                        "usage": {
-                            "input_tokens": 3,
-                            "output_tokens": 2,
-                            "total_tokens": 5,
-                            "input_tokens_details": {"cached_tokens": 0},
-                            "output_tokens_details": {"reasoning_tokens": 0}
-                        }
-                    }
-                });
-                write!(
+            "type": "response.completed",
+            "response": {
+                "id": "response_app_server_stream",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "streamed answer"}]
+                }],
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "total_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0}
+                }
+            }
+        });
+        write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"streamed \"}}\n\n"
                 )
                 .expect("write first streaming delta");
-                stream.flush().expect("flush first streaming delta");
-                write!(
+        stream.flush().expect("flush first streaming delta");
+        write!(
                     stream,
                     "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}}\n\n"
                 )
                 .expect("write second streaming delta");
-                stream.flush().expect("flush second streaming delta");
-                write!(stream, "event: response.completed\ndata: {completed}\n\n")
-                    .expect("write streaming completion");
-                stream.flush().expect("flush streaming completion");
-                // 保留连接直到 child 消费完 SSE 响应：若在 child 的解码回调
-                // （store 写）尚未消费完时关闭 socket，Windows 会以 RST 终止连接，
-                // child 的 body read 报 provider_response_body_read_failed。
-                // 不能阻塞等待 EOF（child 需 worker 关闭才能得到 EOF，会死锁），
-                // 因此给足解码/持久化延迟余量后再关闭。
-                thread::sleep(Duration::from_millis(750));
-                requests_tx
-                    .send(vec![request])
-                    .expect("send request sequence");
+        stream.flush().expect("flush second streaming delta");
+        write!(stream, "event: response.completed\ndata: {completed}\n\n")
+            .expect("write streaming completion");
+        stream.flush().expect("flush streaming completion");
+        // 保留连接直到 child 消费完 SSE 响应：若在 child 的解码回调
+        // （store 写）尚未消费完时关闭 socket，Windows 会以 RST 终止连接，
+        // child 的 body read 报 provider_response_body_read_failed。
+        // 不能阻塞等待 EOF（child 需 worker 关闭才能得到 EOF，会死锁），
+        // 因此给足解码/持久化延迟余量后再关闭。
+        thread::sleep(Duration::from_millis(750));
+        requests_tx
+            .send(vec![request])
+            .expect("send request sequence");
     });
     (
         format!("http://{address}/v1/responses"),

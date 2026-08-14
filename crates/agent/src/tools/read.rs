@@ -28,7 +28,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
-        execute: execute,
+        execute,
     }
 }
 
