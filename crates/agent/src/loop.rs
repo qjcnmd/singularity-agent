@@ -534,6 +534,8 @@ fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
     aggregate.reasoning_tokens += response.reasoning_tokens;
     aggregate.cost_estimate = match (aggregate.cost_estimate, response.cost_estimate) {
         (Some(left), Some(right)) => Some(left + right),
+        // 初始聚合值（None）不是缺轮；只有响应侧缺值才置 None。
+        (None, Some(right)) => Some(right),
         _ => None,
     };
 }

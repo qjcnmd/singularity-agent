@@ -5070,3 +5070,4 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     );
     unsafe { std::env::remove_var("SINGULARITY_HOME") };
 }
+
