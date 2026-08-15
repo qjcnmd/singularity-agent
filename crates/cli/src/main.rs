@@ -605,7 +605,8 @@ impl AppServerClient {
                 // wait_for_reusable_daemon）。
                 wait_for_reusable_daemon(&state)?
                     .ok_or_else(|| {
-                        format!("timed out waiting for another CLI to start the app-server daemon")
+                        "timed out waiting for another CLI to start the app-server daemon"
+                            .to_string()
                     })
                     .and_then(|addr| Self::connect_to_addr(addr, None, None, None))
             }
@@ -1228,8 +1229,9 @@ fn read_daemon_state(paths: &DaemonStatePaths) -> Result<Option<DaemonState>, St
     let Ok(contents) = std::fs::read_to_string(&paths.state_file) else {
         return Ok(None);
     };
-    Ok(serde_json::from_str(&contents)
-        .map_err(|error| format!("invalid {DAEMON_STATE_FILE_NAME}: {error}"))?)
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid {DAEMON_STATE_FILE_NAME}: {error}"))
+        .map(Some)
 }
 
 /// 原子写 daemon 状态文件（临时文件 + rename）。
@@ -1352,15 +1354,17 @@ fn wait_for_reusable_daemon(paths: &DaemonStatePaths) -> Result<Option<SocketAdd
 
 /// 拉起一个全新 daemon：spawn app-server（TCP 监听、端口 0）、从 stderr 读取实际端口、
 /// 启动 stderr 排空线程。返回 (实际地址, 子进程, stderr 队列, stderr 排空线程句柄)。
-fn spawn_new_daemon() -> Result<
-    (
-        SocketAddr,
-        Child,
-        Receiver<Result<String, String>>,
-        JoinHandle<()>,
-    ),
-    String,
-> {
+type DaemonSpawnResult = (
+    SocketAddr,
+    Child,
+    Receiver<Result<String, String>>,
+    JoinHandle<()>,
+);
+
+/// 与子进程分离后的 daemon 地址信息：地址、stderr 队列、排空线程句柄。
+type DaemonAddr = (SocketAddr, Receiver<Result<String, String>>, JoinHandle<()>);
+
+fn spawn_new_daemon() -> Result<DaemonSpawnResult, String> {
     let mut command = ProcessCommand::new(app_server_bin()?);
     // TCP 模式下 daemon 不再使用 stdin/stdout；stderr 仍捕获以读取 announce 并在常驻期排空。
     command
@@ -1378,21 +1382,20 @@ fn spawn_new_daemon() -> Result<
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start app-server daemon: {error}"))?;
-    let result =
-        (|| -> Result<(SocketAddr, Receiver<Result<String, String>>, JoinHandle<()>), String> {
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| "app-server daemon stderr unavailable".to_string())?;
-            let (stderr_rx, stderr_reader) = spawn_line_reader(stderr);
-            // 解析 stderr announce 行得到实际 SocketAddr；stderr 读取线程持续排空剩余输出。
-            let addr = read_listen_announce(&stderr_rx, &mut child, APP_SERVER_START_TIMEOUT)?;
-            // daemon 已就绪：发布自身状态（pid + 实际端口），供后续 CLI 复用。announce 与
-            // 状态写入都可能晚于 connect，因此先写状态。
-            write_daemon_state(&paths, child.id(), addr.port())
-                .map_err(|error| format!("failed to record daemon state: {error}"))?;
-            Ok((addr, stderr_rx, stderr_reader))
-        })();
+    let result = (|| -> Result<DaemonAddr, String> {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "app-server daemon stderr unavailable".to_string())?;
+        let (stderr_rx, stderr_reader) = spawn_line_reader(stderr);
+        // 解析 stderr announce 行得到实际 SocketAddr；stderr 读取线程持续排空剩余输出。
+        let addr = read_listen_announce(&stderr_rx, &mut child, APP_SERVER_START_TIMEOUT)?;
+        // daemon 已就绪：发布自身状态（pid + 实际端口），供后续 CLI 复用。announce 与
+        // 状态写入都可能晚于 connect，因此先写状态。
+        write_daemon_state(&paths, child.id(), addr.port())
+            .map_err(|error| format!("failed to record daemon state: {error}"))?;
+        Ok((addr, stderr_rx, stderr_reader))
+    })();
     match result {
         Ok((addr, stderr_rx, stderr_reader)) => Ok((addr, child, stderr_rx, stderr_reader)),
         Err(error) => {
