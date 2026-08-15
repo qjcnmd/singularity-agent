@@ -120,7 +120,7 @@ flowchart TD
 
 **执行可靠性（裁决 5，对齐 Pi，实测调整）**：
 
-- 超时：bash 默认 120s（可显式 `timeout` 覆盖）；上限保护 2^31-1 ms。
+- 超时：bash 默认 120s（可显式 `timeout` 覆盖）；显式上限 600000 ms。
 - 输出截断：保留最后 2000 行 / 50 KiB，超限写入临时文件并返回 fullOutputPath。
 - 中断：abort 信号杀死整个进程树。
 - 工作目录绑定会话/任务工作区。
@@ -134,7 +134,7 @@ flowchart TD
     C -- 是 --> D["参数校验<br/>(validateToolArguments)"]
     D --> E["hook: beforeToolCall<br/>(可 block / terminate 整批)"]
     E -- "block" --> R1
-    E -- 允许 --> F["执行（进程内）<br/>bash 默认 120s 超时(可覆盖, 上限 2^31-1 ms)<br/>中断杀进程树<br/>cwd 绑定工作区"]
+    E -- 允许 --> F["执行（进程内）<br/>bash 默认 120s 超时(可覆盖, 上限 600000 ms)<br/>中断杀进程树<br/>cwd 绑定工作区"]
     F --> G["输出截断<br/>最后 2000 行 / 50 KiB<br/>超限: 临时文件 + fullOutputPath"]
     G --> H["hook: afterToolCall<br/>(可改 content / details / usage)"]
     H --> I["toolResult 消息回传<br/>(按调用顺序, 进入下一回合)"]
@@ -289,7 +289,7 @@ flowchart LR
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
 | read | `{path, offset?, limit?}` | 读文件/图片 |
-| bash | `{command, timeout?}` | 超时默认 120s（可显式覆盖，上限 2^31-1 ms）；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树 |
+| bash | `{command, timeout?}` | 超时默认 120s（可显式覆盖，硬上限 600000 ms）；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树（Unix 独立进程组） |
 | edit | `{path, edits:[{oldText,newText}]}` | 精确文本替换，一次多编辑，串行化；结果含 diff / firstChangedLine |
 | write | `{path, content}` | 写文件 |
 | grep（可选只读） | `{pattern, path?, glob?, ignoreCase?, literal?, context?, limit?}` | 尊重 .gitignore，默认 100 匹配上限 |

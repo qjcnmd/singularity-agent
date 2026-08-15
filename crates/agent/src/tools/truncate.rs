@@ -48,62 +48,6 @@ fn split_lines(content: &str) -> Vec<&str> {
     lines
 }
 
-/// 保留头部（read 用）：前 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES` 字节，
-/// 绝不输出半行。
-pub fn truncate_head(content: &str) -> Truncation {
-    let max_lines = DEFAULT_MAX_LINES;
-    let max_bytes = DEFAULT_MAX_BYTES;
-    let total_bytes = content.len();
-    let lines = split_lines(content);
-    let total_lines = lines.len();
-    if total_lines <= max_lines && total_bytes <= max_bytes {
-        return Truncation {
-            content: content.to_string(),
-            truncated: false,
-            truncated_by: None,
-            total_lines,
-            output_lines: total_lines,
-            last_line_partial: false,
-            first_line_exceeds_limit: false,
-        };
-    }
-    if lines.first().is_some_and(|first| first.len() > max_bytes) {
-        return Truncation {
-            content: String::new(),
-            truncated: true,
-            truncated_by: Some(TruncatedBy::Bytes),
-            total_lines,
-            output_lines: 0,
-            last_line_partial: false,
-            first_line_exceeds_limit: true,
-        };
-    }
-    let mut output: Vec<&str> = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut truncated_by = TruncatedBy::Lines;
-    for (index, line) in lines.iter().take(max_lines).enumerate() {
-        let line_bytes = line.len() + usize::from(index > 0); // 行间的换行 +1
-        if output_bytes + line_bytes > max_bytes {
-            truncated_by = TruncatedBy::Bytes;
-            break;
-        }
-        output.push(*line);
-        output_bytes += line_bytes;
-    }
-    if output.len() >= max_lines && output_bytes <= max_bytes {
-        truncated_by = TruncatedBy::Lines;
-    }
-    Truncation {
-        content: output.join("\n"),
-        truncated: true,
-        truncated_by: Some(truncated_by),
-        total_lines,
-        output_lines: output.len(),
-        last_line_partial: false,
-        first_line_exceeds_limit: false,
-    }
-}
-
 /// 保留尾部（bash 用）：最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES` 字节。
 /// 末尾单行本身超限时保留其尾部（截断到 UTF-8 字符边界，`last_line_partial = true`）。
 pub fn truncate_tail(content: &str) -> Truncation {
@@ -182,6 +126,21 @@ fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_truncation_keeps_last_lines() {
+        let content = (1..=2500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncation = truncate_tail(&content);
+        assert!(truncation.truncated);
+        assert_eq!(truncation.truncated_by, Some(TruncatedBy::Lines));
+        assert_eq!(truncation.total_lines, 2500);
+        assert_eq!(truncation.output_lines, 2000);
+        assert!(truncation.content.starts_with("line 501"));
+        assert!(truncation.content.ends_with("line 2500"));
+    }
 
     #[test]
     fn tail_truncation_keeps_last_lines() {

@@ -64,6 +64,8 @@ const FULL_OUTPUT_FILE_SUFFIX: &str = ".log";
 // 数字与 truncate::DEFAULT_MAX_LINES/DEFAULT_MAX_BYTES 保持一致（与 Pi 描述文本等价）。
 /// 命令默认超时：模型未显式传 `timeout_ms` 时的安全网，防止无界命令永久挂起。
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// 命令超时硬上限：显式 `timeout_ms` 也不能让单条命令超过 10 分钟。
+pub(crate) const MAX_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Commands time out after 120 seconds by default; provide timeout_ms to override.";
 
 pub(crate) fn parameters() -> Value {
@@ -102,20 +104,27 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_MS);
-    if timeout == 0 {
-        return error_result("invalid timeout_ms: must be a positive number of milliseconds");
+    if timeout == 0 || timeout > MAX_TIMEOUT_MS {
+        return error_result(format!(
+            "invalid timeout_ms: must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
+        ));
     }
     let (shell, shell_args) = shell_command(command);
     #[cfg(windows)]
     handle_inheritance::deny_inherit_std_streams();
-    let mut child = match Command::new(&shell)
+    let mut command = Command::new(&shell);
+    command
         .args(&shell_args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return error_result(format!("failed to spawn shell {shell}: {error}"));
@@ -558,6 +567,13 @@ mod tests {
             "small output must not be truncated: {}",
             result.content
         );
+    }
+
+    #[test]
+    fn timeout_ms_above_upper_bound_is_rejected_before_spawn() {
+        let result = run("echo should-not-run", Some(MAX_TIMEOUT_MS + 1));
+        assert!(result.is_error, "content: {}", result.content);
+        assert!(result.content.contains("invalid timeout_ms"));
     }
 
     #[test]

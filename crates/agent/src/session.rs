@@ -18,8 +18,8 @@
 //! - 路径遍历带防环保护（Pi 对损坏的 parentId 环会死循环）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -39,6 +39,12 @@ use super::message::{
 
 /// 当前会话文件格式版本，对齐 Pi `CURRENT_SESSION_VERSION`。
 pub const CURRENT_SESSION_VERSION: u32 = 3;
+/// 单条 session JSONL 行（含 header）的字节硬上限。
+const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// 单次打开 session 文件允许解析的总字节上限（有界读取，超限 fail closed）。
+const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
+/// 单次打开 session 文件允许解析的条目数上限。
+const MAX_SESSION_ENTRIES: usize = 200_000;
 
 /// 会话读写错误。
 #[derive(Debug, Error)]
@@ -478,18 +484,18 @@ impl SessionManager {
     /// pi session 时报错。
     pub fn open(path: &Path) -> Result<Self> {
         let file = path.to_path_buf();
-        let content = match std::fs::read_to_string(&file) {
-            Ok(content) => content,
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Self::create_empty_at(&file);
             }
             Err(error) => return Err(error.into()),
         };
-        let mut raw_entries = parse_lines(&content);
+        if metadata.len() == 0 {
+            return Self::create_empty_at(&file);
+        }
+        let mut raw_entries = parse_session_lines(&file)?;
         if raw_entries.is_empty() {
-            if content.is_empty() {
-                return Self::create_empty_at(&file);
-            }
             return Err(SessionError::InvalidSession(format!(
                 "Session file is not a valid pi session: {}",
                 file.display()
@@ -890,14 +896,57 @@ fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
     }
 }
 
-/// 逐行解析：跳过空行、JSON 解析失败与非对象行（Pi `parseSessionEntryLine`）。
-fn parse_lines(content: &str) -> Vec<Value> {
-    content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(Value::is_object)
-        .collect()
+/// 有界逐行解析 session 文件：单行、总字节、总条目都有硬上限。
+fn parse_session_lines(file: &Path) -> Result<Vec<Value>> {
+    let path = file;
+    let handle = File::open(file)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, handle);
+    let mut entries = Vec::new();
+    let mut total_bytes = 0usize;
+    loop {
+        let mut line = Vec::new();
+        let limit = u64::try_from(MAX_SESSION_LINE_BYTES).unwrap_or(u64::MAX);
+        let read = {
+            let mut limited = reader.by_ref().take(limit.saturating_add(1));
+            limited.read_until(b'\n', &mut line)?
+        };
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") && read > limit as usize {
+            return Err(SessionError::InvalidSession(format!(
+                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes: {}",
+                path_display(path)
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        if total_bytes > MAX_SESSION_FILE_BYTES || entries.len() >= MAX_SESSION_ENTRIES {
+            return Err(SessionError::InvalidSession(format!(
+                "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
+                MAX_SESSION_FILE_BYTES
+            )));
+        }
+        if line.ends_with(b"\n") {
+            line.pop();
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        // Pi `parseSessionEntryLine`：JSON 解析失败与非对象行跳过。
+        if let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && value.is_object()
+        {
+            entries.push(value);
+        }
+    }
+    Ok(entries)
+}
+
+fn path_display(path: &Path) -> String {
+    path.display().to_string()
 }
 
 /// v1/v2→v3 迁移（Pi `migrateV1ToV2`/`migrateV2ToV3`，原地修改，仅 version < 3 时调用）。

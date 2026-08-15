@@ -1737,13 +1737,30 @@ struct UserConfigModel {
     capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserAuthFile {
     #[serde(default = "default_auth_schema_version")]
     schema_version: u32,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     providers: BTreeMap<String, UserAuthProvider>,
+}
+
+impl fmt::Debug for UserAuthFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserAuthFile")
+            .field("schema_version", &self.schema_version)
+            .field(
+                "providers",
+                &self
+                    .providers
+                    .keys()
+                    .map(|name| format!("{name}: [redacted]"))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Default for UserAuthFile {
@@ -1755,10 +1772,19 @@ impl Default for UserAuthFile {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserAuthProvider {
     api_key: String,
+}
+
+impl fmt::Debug for UserAuthProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserAuthProvider")
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
