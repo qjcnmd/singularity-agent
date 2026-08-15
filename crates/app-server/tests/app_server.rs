@@ -1476,9 +1476,10 @@ fn app_server_bin() -> String {
     })
 }
 
-/// TCP 回环端到端：在临时目录启动 app-server（TCP 监听、端口 0），从 stderr 读回
-/// 实际端口，用 std::net::TcpStream 建立单连接并走 initialize → initialized →
-/// server/capabilities → server/shutdown；响应正确且进程成功退出。
+/// TCP 回环端到端：在临时目录启动 app-server daemon（TCP 监听、端口 0），从 stderr
+/// 读回实际端口，建立单连接并走 initialize → initialized → server/capabilities →
+/// server/shutdown。daemon 语义：shutdown 结束当前连接但不退出进程（空闲自停接管），
+/// 因此测试用短空闲超时验证"断开后 daemon 在空闲窗口内自动退出"。
 #[test]
 fn app_server_serves_json_lines_over_tcp_loopback() {
     use std::net::TcpStream;
@@ -1493,35 +1494,14 @@ fn app_server_serves_json_lines_over_tcp_loopback() {
         .current_dir(dir.path())
         .env("SINGULARITY_APP_SERVER_DB", &db_path)
         .env("SINGULARITY_APP_SERVER_LISTEN", "tcp://127.0.0.1:0")
+        .env("SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS", "500")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("spawn app-server in TCP mode");
 
-    // 服务端在 accept 前向 stderr 上报实际绑定地址（端口 0 时由 OS 分配）。stderr 重定向到
-    // 文件（父进程不读管道），先给缓冲余量再读端口，避免对端读就绪尚未登记时首帧丢失。
-    std::thread::sleep(Duration::from_millis(50));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let addr = loop {
-        let contents = std::fs::read_to_string(&stderr_path).expect("read stderr");
-        if let Some(line) = contents
-            .lines()
-            .find(|line| line.starts_with(LISTENING_PREFIX))
-        {
-            break line
-                .trim()
-                .strip_prefix(LISTENING_PREFIX)
-                .expect("listening address line")
-                .parse::<std::net::SocketAddr>()
-                .expect("listening socket address");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for listen address; stderr={contents:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let addr = wait_for_listen_address(&stderr_path, LISTENING_PREFIX);
     assert_eq!(
         addr.ip(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -1565,10 +1545,209 @@ fn app_server_serves_json_lines_over_tcp_loopback() {
     let shutdown = connection.recv_id(3);
     assert_eq!(shutdown["result"]["shutdown"], true);
 
-    // 发送 shutdown 后服务端进入退出流程；连接主动关闭，进程应成功退出。
+    // shutdown 只结束当前连接；daemon 不立即退出，而是由空闲自停接手。连接关闭后，
+    // daemon 应在空闲超时（此处 500ms）后正常退出。
     drop(connection);
-    let status = child.wait().expect("app-server exits cleanly");
-    assert!(status.success(), "app-server exited with {status}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("poll app-server") {
+            Some(status) => {
+                assert!(status.success(), "app-server exited with {status}");
+                break;
+            }
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not idle-stop after connection close"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// 从 daemon 的 stderr 日志文件轮询读取 `SINGULARITY_APP_SERVER_LISTENING <addr>`
+/// announce 行，返回实际回环地址。stderr 重定向到文件（父进程不读管道），先给缓冲
+/// 余量再读端口，避免对端读就绪尚未登记时首帧丢失。
+fn wait_for_listen_address(
+    stderr_path: &std::path::Path,
+    listening_prefix: &str,
+) -> std::net::SocketAddr {
+    use std::time::Duration as StdDuration;
+    use std::time::Instant as StdInstant;
+    std::thread::sleep(StdDuration::from_millis(50));
+    let deadline = StdInstant::now() + StdDuration::from_secs(5);
+    loop {
+        let contents = std::fs::read_to_string(stderr_path).expect("read stderr");
+        if let Some(line) = contents
+            .lines()
+            .find(|line| line.starts_with(listening_prefix))
+        {
+            return line
+                .trim()
+                .strip_prefix(listening_prefix)
+                .expect("listening address line")
+                .parse::<std::net::SocketAddr>()
+                .expect("listening socket address");
+        }
+        assert!(
+            StdInstant::now() < deadline,
+            "timed out waiting for listen address; stderr={contents:?}"
+        );
+        std::thread::sleep(StdDuration::from_millis(10));
+    }
+}
+
+/// TCP daemon 多连接：同一 daemon 接受第二个连接，且每连接独立走 initialize/initialized
+/// 握手（第二个连接必须先握手才能调用受保护方法）；announce 只打一次。
+#[test]
+fn tcp_daemon_serves_second_connection_with_independent_handshake() {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    const LISTENING_PREFIX: &str = "SINGULARITY_APP_SERVER_LISTENING ";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let stderr_path = dir.path().join("app-server-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let mut child = Command::new(app_server_bin())
+        .current_dir(dir.path())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .env("SINGULARITY_APP_SERVER_LISTEN", "tcp://127.0.0.1:0")
+        .env("SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS", "60000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn app-server in TCP mode");
+    let addr = wait_for_listen_address(&stderr_path, LISTENING_PREFIX);
+
+    // 第一个连接：握手 + 访问受保护方法后断开。
+    {
+        let stream = TcpStream::connect(addr).expect("connect first");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut conn = LineReader::new(stream);
+        write_line(
+            &mut conn.stream,
+            br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"c1","title":"C1","version":"0.1.0"}}}"#,
+        );
+        assert_eq!(conn.recv_id(1)["result"]["platformFamily"], "local");
+        write_line(
+            &mut conn.stream,
+            br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        );
+        write_line(
+            &mut conn.stream,
+            br#"{"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}}"#,
+        );
+        assert!(conn.recv_id(2)["result"]["transports"].is_array());
+    }
+
+    // 第二个连接：握手是 per-connection 的，必须重新 initialize 才能访问受保护方法；
+    // 未握手时 server/capabilities 应返回 not_initialized，而不是沿用第一个连接的状态。
+    let stream = TcpStream::connect(addr).expect("connect second");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut conn = LineReader::new(stream);
+    // 未握手直接调用受保护方法 → -32002 not_initialized。
+    write_line(
+        &mut conn.stream,
+        br#"{"jsonrpc":"2.0","method":"server/capabilities","id":10,"params":{}}"#,
+    );
+    assert_eq!(conn.recv_id(10)["error"]["code"], -32002);
+    // 握手后同一方法成功。
+    write_line(
+        &mut conn.stream,
+        br#"{"jsonrpc":"2.0","method":"initialize","id":11,"params":{"clientInfo":{"name":"c2","title":"C2","version":"0.1.0"}}}"#,
+    );
+    assert_eq!(conn.recv_id(11)["result"]["platformFamily"], "local");
+    write_line(
+        &mut conn.stream,
+        br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+    write_line(
+        &mut conn.stream,
+        br#"{"jsonrpc":"2.0","method":"server/capabilities","id":12,"params":{}}"#,
+    );
+    assert!(conn.recv_id(12)["result"]["transports"].is_array());
+
+    // announce 只打一次：stderr 文件始终只有一行 announce。
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read stderr");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(LISTENING_PREFIX))
+            .count(),
+        1,
+        "daemon must announce the listen address only once"
+    );
+
+    // 关闭第二连接后显式 shutdown 进程（短 idle 已设为 60s，这里直接 kill 回收避免等待）。
+    drop(conn);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// TCP daemon 空闲自停：建立连接并断开后不立即退出，但在无新连接的空闲窗口内自动退出。
+#[test]
+fn tcp_daemon_idle_stops_once_no_connection_arrives() {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const LISTENING_PREFIX: &str = "SINGULARITY_APP_SERVER_LISTENING ";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let stderr_path = dir.path().join("app-server-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let mut child = Command::new(app_server_bin())
+        .current_dir(dir.path())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .env("SINGULARITY_APP_SERVER_LISTEN", "tcp://127.0.0.1:0")
+        .env("SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS", "400")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn app-server in TCP mode");
+    let addr = wait_for_listen_address(&stderr_path, LISTENING_PREFIX);
+
+    // 建立并立即关闭连接：daemon 回到 accept 状态，不应退出（连接被接受但不触发退出）。
+    {
+        let stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        // 不发送任何请求即关闭：run_with_io 读到 EOF 返回，daemon 回到 accept 循环。
+        drop(stream);
+    }
+
+    // 短暂断言进程仍存活（空闲窗口内不退出）。
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        child.try_wait().expect("poll").is_none(),
+        "daemon must survive within the idle window"
+    );
+
+    // 超过空闲窗口后应自动退出（exit 0），无需任何连接。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("poll app-server") {
+            Some(status) => {
+                assert!(status.success(), "idle daemon exited with {status}");
+                break;
+            }
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not idle-stop after the idle window"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// 写一条以 `\n` 结尾的 JSON-Lines 帧；`Write` 经 `std::io::Write` 提供。

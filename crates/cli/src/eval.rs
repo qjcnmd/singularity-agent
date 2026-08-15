@@ -498,6 +498,9 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         .arg(model)
         .arg("--json")
         .current_dir(cwd)
+        // 每 cell 独立 app-server 进程（stdio 承载）：保持 eval 各 cell 的隔离工作区
+        // 语义与并行等价（不共享 daemon 单 worker 槽位，与 daemon 化之前行为一致）。
+        .env("SINGULARITY_APP_SERVER_TRANSPORT", "stdio")
         // 非交互：stdin 不继承终端（否则 eval 从终端启动时子进程会误判交互并触发 trust 询问）。
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

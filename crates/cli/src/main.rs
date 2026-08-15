@@ -1,6 +1,7 @@
 //! `sg` 的命令行入口：通过 stdio JSON-RPC 调用 app-server 并渲染结果。
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use singularity_core::{APP_ERROR_TRUST_REQUIRED, ClientInfo};
+use singularity_core::{APP_ERROR_TRUST_REQUIRED, ClientInfo, user_singularity_home};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
@@ -39,6 +40,14 @@ const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 等待 app-server 在 stderr 上公布 TCP 回环地址的时间上限（对齐 daemon 化规划 START_TIMEOUT）。
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP daemon 复用判定里"能否连接/握手"的单次短超时（覆盖 dead/stale daemon 的快速回退）。
+const DAEMON_REUSE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// 另一 CLI 正在启动时，轮询其发布可复用 daemon 的总体上限（对齐规划 START_TIMEOUT）。
+const DAEMON_START_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// daemon 状态文件与启动锁文件名（放在 `user_singularity_home()` 目录下）。
+const DAEMON_STATE_FILE_NAME: &str = "app-server-daemon.json";
+const DAEMON_LOCK_FILE_NAME: &str = "app-server-daemon.lock";
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
@@ -443,9 +452,12 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
     Ok(())
 }
 
-// 维护 app-server 子进程及其 JSON-RPC 通道；承载可为 stdio 或 TCP 回环。
+// 维护 app-server（常驻 daemon 或一次性子进程）及其 JSON-RPC 通道；承载可为
+// stdio 或 TCP 回环。TCP daemon 模式下 `child` 在复用既有 daemon 时为 `None`，
+// 在本次命令负责拉起新 daemon 时为 `Some(child)`（Drop 时释放连接即可，daemon
+// 空闲自停接管退出，CLI 不与 daemon 同生共死）。
 struct AppServerClient {
-    child: Child,
+    child: Option<Child>,
     transport: AppServerTransport,
     response_timeout: Duration,
     next_id: i64,
@@ -460,12 +472,15 @@ enum AppServerTransport {
         stdout_reader: Option<JoinHandle<()>>,
     },
     Tcp {
-        /// 写入 JSON 行并 flush 的连接；Drop 时关闭以通知服务端断开。
+        /// 写入 JSON 行并 flush 的连接；Drop 时关闭以通知服务端断开（daemon 空闲自停）。
         stream: Option<TcpStream>,
         inbound: Receiver<Result<String, String>>,
         inbound_reader: Option<JoinHandle<()>>,
         /// 保留 stderr 读取队列的接收端，使读取线程持续排空管道，避免子进程写阻塞。
-        _stderr_rx: Receiver<Result<String, String>>,
+        /// 仅在本命令拉起的新 daemon 上存在；复用既有 daemon 时为 `None`。
+        _stderr_rx: Option<Receiver<Result<String, String>>>,
+        /// stderr 排空线程；Drop 时 detach（daemon 常驻期间 stderr 不会立即关闭，
+        /// join 会阻塞 CLI 直到 daemon 退出，因此不 join）。
         stderr_reader: Option<JoinHandle<()>>,
     },
 }
@@ -517,10 +532,11 @@ impl From<AppServerRpcError> for String {
 
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
 impl AppServerClient {
-    // 定位并启动 app-server，随后建立读取线程；传输由环境变量决定。
+    // 确保一个可用的 app-server 并建立连接：TCP 模式下优先复用既有 daemon（见
+    // ensure_tcp），否则拉起新 daemon；stdio 模式始终拉一次性子进程。
     fn spawn() -> Result<Self, String> {
         match transport_mode()? {
-            TransportMode::Tcp => Self::spawn_tcp(),
+            TransportMode::Tcp => Self::ensure_tcp(),
             TransportMode::Stdio => Self::spawn_stdio(),
         }
     }
@@ -549,7 +565,7 @@ impl AppServerClient {
             .ok_or_else(|| "app-server stdout unavailable".to_string())?;
         let (stdout, stdout_reader) = spawn_line_reader(stdout);
         Ok(Self {
-            child,
+            child: Some(child),
             transport: AppServerTransport::Stdio {
                 stdin: Some(stdin),
                 stdout,
@@ -562,32 +578,47 @@ impl AppServerClient {
 
     // 通过 TCP 回环承载：spawn 子进程（SINGULARITY_APP_SERVER_LISTEN=tcp://127.0.0.1:0），
     // 从 stderr 读取公布的实际端口并连接，入站用同一读取线程转到接收队列。
-    fn spawn_tcp() -> Result<Self, String> {
-        let mut command = ProcessCommand::new(app_server_bin()?);
-        // TCP 模式下子进程不再使用 stdin/stdout；stderr 仍捕获以读取 listen announce。
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        if std::io::stdin().is_terminal() {
-            command.env(INTERACTIVE_UI_ENV, "1");
+    // TCP daemon 化入口：优先复用既有 daemon（状态文件 + 连通性 + initialize 握手
+    // 校验），失败/缺失则经启动锁拉起新 daemon。返回的 client 已连上 daemon，未做
+    // initialize 握手（由命令层统一调用 `initialize()`）。
+    fn ensure_tcp() -> Result<Self, String> {
+        let state = daemon_state()?;
+        // 复用路径：状态文件指向的地址可连接且完成握手 → 复用该 daemon，不 spawn。
+        if let Some(addr) = verify_reusable_daemon(&state)? {
+            return Self::connect_to_addr(addr, None, None, None);
         }
-        command.env(APP_SERVER_LISTEN_ENV, "tcp://127.0.0.1:0");
-        if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
-            command.env(APP_SERVER_DB_ENV, db);
+        // 启动路径：取得独占启动锁后拉起新 daemon；拿不到锁说明另一 CLI 正在启动，
+        // 轮询等待它发布可直接复用的 daemon。
+        match acquire_daemon_start_lock(&state) {
+            Ok(_lock) => {
+                let (addr, child, stderr_rx, stderr_reader) = spawn_new_daemon()?;
+                let client =
+                    Self::connect_to_addr(addr, Some(child), Some(stderr_rx), Some(stderr_reader))?;
+                drop(_lock);
+                Ok(client)
+            }
+            Err(WouldBlock) => {
+                // 另一 CLI 正在启动：轮询其发布的可复用 daemon（上限见
+                // wait_for_reusable_daemon）。
+                wait_for_reusable_daemon(&state)?
+                    .ok_or_else(|| {
+                        format!("timed out waiting for another CLI to start the app-server daemon")
+                    })
+                    .and_then(|addr| Self::connect_to_addr(addr, None, None, None))
+            }
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to start app-server: {error}"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "app-server stderr unavailable".to_string())?;
-        let (stderr_rx, stderr_reader) = spawn_line_reader(stderr);
-        // 解析 stderr announce 行得到实际 SocketAddr；stderr 读取线程持续排空剩余输出。
-        let addr = read_listen_announce(&stderr_rx, &mut child, APP_SERVER_START_TIMEOUT)?;
+    }
+
+    // 连接已确定的 daemon 地址并建立读取线程；`child`/`stderr_rx`/`stderr_reader` 仅在本
+    // 命令拉起新 daemon 时存在（复用既有 daemon 时为 None）。
+    fn connect_to_addr(
+        addr: SocketAddr,
+        child: Option<Child>,
+        stderr_rx: Option<Receiver<Result<String, String>>>,
+        stderr_reader: Option<JoinHandle<()>>,
+    ) -> Result<Self, String> {
         let stream = TcpStream::connect(addr).map_err(|error| {
-            format!("failed to connect to app-server at {addr}: {error}")
+            format!("failed to connect to app-server daemon at {addr}: {error}")
         })?;
         // 同一 socket 派生读写两个方向：读取半进入 reader 线程，写入半留给 write_message。
         let reader_stream = stream
@@ -601,7 +632,7 @@ impl AppServerClient {
                 inbound,
                 inbound_reader: Some(inbound_reader),
                 _stderr_rx: stderr_rx,
-                stderr_reader: Some(stderr_reader),
+                stderr_reader,
             },
             response_timeout: RESPONSE_TIMEOUT,
             next_id: 1,
@@ -934,14 +965,18 @@ impl AppServerClient {
     }
 
     // 写端失败时先确认 app-server 是否已经退出，避免以竞争性的 Broken pipe
-    // 覆盖“响应前退出”的稳定传输错误；进程仍存活时保留真实 I/O 原因。
+    // 覆盖“响应前退出”的稳定传输错误；进程仍存活时保留真实 I/O 原因。复用既有
+    // daemon（无子进程）时只保留真实 I/O 原因。
     fn classify_transport_write_error(&mut self, operation: &str, error: std::io::Error) -> String {
-        match self.child.try_wait() {
-            Ok(Some(status)) => format!("app-server exited before response: {status}"),
-            Ok(None) => format!("{operation}: {error}"),
-            Err(status_error) => format!(
-                "{operation}: {error}; failed to poll app-server process status: {status_error}"
-            ),
+        match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => format!("app-server exited before response: {status}"),
+                Ok(None) => format!("{operation}: {error}"),
+                Err(status_error) => format!(
+                    "{operation}: {error}; failed to poll app-server process status: {status_error}"
+                ),
+            },
+            None => format!("{operation}: {error}"),
         }
     }
 
@@ -951,20 +986,26 @@ impl AppServerClient {
             AppServerTransport::Stdio { stdout, .. } => stdout.recv_timeout(timeout),
             AppServerTransport::Tcp { inbound, .. } => inbound.recv_timeout(timeout),
         };
+        let exit_status = self
+            .child
+            .as_mut()
+            .map(|child| {
+                child
+                    .try_wait()
+                    .map_err(|error| format!("failed to poll app-server process status: {error}"))
+            })
+            .transpose()?
+            .flatten();
         match result {
             Ok(line) => line,
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(status) = self.child.try_wait().map_err(|error| {
-                    format!("failed to poll app-server process status: {error}")
-                })? {
+                if let Some(status) = exit_status {
                     return Err(format!("app-server exited before response: {status}"));
                 }
                 Err("timed out waiting for app-server response".to_string())
             }
             Err(RecvTimeoutError::Disconnected) => {
-                if let Some(status) = self.child.try_wait().map_err(|error| {
-                    format!("failed to poll app-server process status: {error}")
-                })? {
+                if let Some(status) = exit_status {
                     return Err(format!("app-server exited before response: {status}"));
                 }
                 Err("app-server closed stdout".to_string())
@@ -995,14 +1036,14 @@ impl AppServerClient {
 
 // 负责 graceful shutdown 与子进程资源回收。
 impl Drop for AppServerClient {
-    // 先请求服务端 shutdown，再在超时后回收子进程与 reader。
+    // stdio 一次性子进程：请求 shutdown、回收；TCP daemon：只关闭连接，让空闲自停接管。
     fn drop(&mut self) {
-        // 先请求服务端 shutdown（stdin 存在时说明传输仍存活）。
-        let open = match &self.transport {
-            AppServerTransport::Stdio { stdin, .. } => stdin.is_some(),
-            AppServerTransport::Tcp { stream, .. } => stream.is_some(),
-        };
-        if open {
+        // stdio 请求服务端 shutdown（stdin 存在时说明传输仍存活）。
+        let stdio_open = matches!(
+            &self.transport,
+            AppServerTransport::Stdio { stdin: Some(_), .. }
+        );
+        if stdio_open {
             let id = self.next_request_id();
             if let Ok(message) =
                 JsonRpcMessage::request(Method::ServerShutdown, id, EmptyParams::default())
@@ -1010,8 +1051,6 @@ impl Drop for AppServerClient {
                 let _ = self.write_message(&message);
             }
         }
-        // 关闭写侧并收集读取线程句柄；等子进程回收后再 join。
-        let mut reader_handles: Vec<JoinHandle<()>> = Vec::new();
         match &mut self.transport {
             AppServerTransport::Stdio {
                 stdin,
@@ -1019,8 +1058,26 @@ impl Drop for AppServerClient {
                 ..
             } => {
                 let _ = stdin.take();
-                if let Some(handle) = stdout_reader.take() {
-                    reader_handles.push(handle);
+                let reader_handle = stdout_reader.take();
+                // 等待一次性子进程退出，超时则 kill。
+                if let Some(child) = self.child.as_mut() {
+                    let deadline = Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < deadline => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Ok(None) | Err(_) => {
+                                let _ = child.kill();
+                                break;
+                            }
+                        }
+                    }
+                    let _ = child.wait();
+                }
+                if let Some(handle) = reader_handle {
+                    let _ = handle.join();
                 }
             }
             AppServerTransport::Tcp {
@@ -1029,32 +1086,18 @@ impl Drop for AppServerClient {
                 stderr_reader,
                 ..
             } => {
-                // 关闭连接通知服务端 EOF；入站/stderr 读取线程随之结束。
+                // TCP daemon：不发送 shutdown、不 wait/kill 子进程（无论本命令拉起新
+                // daemon 还是复用既有 daemon）。关闭连接通知服务端 EOF，daemon 空闲自停
+                // 接管退出。显式 shutdown(Both) 让 daemon 立即读到干净 EOF（而非 RST），
+                // 从而尽快回到 accept 循环、准确开始空闲计时。入站 stderr 读取线程在
+                // CLI 进程退出时会随之关闭句柄，因此不 join（join 会等待 daemon 退出）。
+                if let Some(stream) = stream.as_ref() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
                 let _ = stream.take();
-                if let Some(handle) = inbound_reader.take() {
-                    reader_handles.push(handle);
-                }
-                if let Some(handle) = stderr_reader.take() {
-                    reader_handles.push(handle);
-                }
+                let _ = inbound_reader.take();
+                let _ = stderr_reader.take();
             }
-        }
-        let deadline = Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) | Err(_) => {
-                    let _ = self.child.kill();
-                    break;
-                }
-            }
-        }
-        let _ = self.child.wait();
-        for handle in reader_handles {
-            let _ = handle.join();
         }
     }
 }
@@ -1138,6 +1181,222 @@ fn read_listen_announce(
                     timeout.as_secs()
                 ));
             }
+        }
+    }
+}
+
+// ===== daemon 状态文件与启动锁 =====
+
+/// daemon 状态/锁文件路径（基于用户级 singularity 目录解析，CLI 与 app-server 同一逻辑）。
+struct DaemonStatePaths {
+    state_file: PathBuf,
+    lock_file: PathBuf,
+}
+
+/// 常驻 daemon 发布到状态文件的自身信息（启动方 CLI 写入）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DaemonState {
+    pid: u32,
+    port: u16,
+    started_at: String,
+}
+
+/// 独占启动锁：持有 OS 文件锁的 `File`；drop 即释放（进程崩溃由 OS 自动释放，
+/// 无需 PID 残活探测——残留空锁文件被下次 `try_lock` 直接获得并覆盖）。
+struct DaemonStartLock {
+    _file: File,
+}
+
+/// 启动锁被另一进程持有（另一 CLI 正在启动 daemon）。
+struct WouldBlock;
+
+fn daemon_state() -> Result<DaemonStatePaths, String> {
+    let dir = user_singularity_home()
+        .ok_or_else(|| "cannot resolve SINGULARITY_HOME for the app-server daemon".to_string())?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create {DAEMON_STATE_FILE_NAME} directory: {error}"))?;
+    Ok(DaemonStatePaths {
+        state_file: dir.join(DAEMON_STATE_FILE_NAME),
+        lock_file: dir.join(DAEMON_LOCK_FILE_NAME),
+    })
+}
+
+fn read_daemon_state(paths: &DaemonStatePaths) -> Result<Option<DaemonState>, String> {
+    let Ok(contents) = std::fs::read_to_string(&paths.state_file) else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid {DAEMON_STATE_FILE_NAME}: {error}"))?)
+}
+
+/// 原子写 daemon 状态文件（临时文件 + rename）。
+fn write_daemon_state(paths: &DaemonStatePaths, pid: u32, port: u16) -> Result<(), String> {
+    let state = DaemonState {
+        pid,
+        port,
+        started_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_default(),
+    };
+    let json = serde_json::to_string(&state)
+        .map_err(|error| format!("failed to serialize daemon state: {error}"))?;
+    let temporary = paths.state_file.with_extension("json.tmp");
+    std::fs::write(&temporary, json)
+        .map_err(|error| format!("failed to write daemon state: {error}"))?;
+    std::fs::rename(&temporary, &paths.state_file)
+        .map_err(|error| format!("failed to publish daemon state: {error}"))?;
+    Ok(())
+}
+
+/// 判定状态文件地址是否可直接复用：128 位回环端口能连接且能完成 app-server
+/// initialize 握手，即认为既有 daemon 健康可复用。连接/握手失败（含 stale 状态文件
+/// 指向死端口）返回 `None`，由调用方发起新 spawn。
+fn verify_reusable_daemon(paths: &DaemonStatePaths) -> Result<Option<SocketAddr>, String> {
+    let Some(state) = read_daemon_state(paths)? else {
+        return Ok(None);
+    };
+    let addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        state.port,
+    );
+    let Ok(stream) = TcpStream::connect_timeout(&addr, DAEMON_REUSE_CONNECT_TIMEOUT) else {
+        return Ok(None);
+    };
+    if probe_daemon_handshake(stream) {
+        Ok(Some(addr))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 在一条连接上完成一次最小 initialize 握手，用于确认对端是健康可用的 singularity
+/// app-server（而非某个碰巧占用同一端口的其他进程）。握手完成即关闭连接。
+fn probe_daemon_handshake(mut stream: TcpStream) -> bool {
+    use std::io::Write;
+    let _ = stream.set_read_timeout(Some(DAEMON_REUSE_CONNECT_TIMEOUT));
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {"name": CLI_CLIENT_NAME, "title": CLI_CLIENT_TITLE, "version": CLI_CLIENT_VERSION},
+            "capabilities": null,
+        },
+    });
+    if std::io::Write::write_all(
+        &mut stream,
+        &serde_json::to_vec(&initialized).unwrap_or_default(),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if Write::write_all(&mut stream, b"\n").is_err() {
+        return false;
+    }
+    let _ = Write::flush(&mut stream);
+    let Ok(clone) = stream.try_clone() else {
+        return false;
+    };
+    let mut reader = BufReader::new(clone);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return false;
+    }
+    let Ok(response) = serde_json::from_str::<Value>(&line) else {
+        return false;
+    };
+    response.get("result").is_some()
+}
+
+/// 尝试取得 daemon 启动锁；成功返回持有锁的 guard（drop 释放），被占用返回 `WouldBlock`。
+fn acquire_daemon_start_lock(paths: &DaemonStatePaths) -> Result<DaemonStartLock, WouldBlock> {
+    let file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.lock_file)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            // 锁文件打不开（如目录权限）视为不可用，返回 WouldBlock 让调用方等待。
+            let _ = error;
+            return Err(WouldBlock);
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(DaemonStartLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(WouldBlock),
+        Err(_) => Err(WouldBlock),
+    }
+}
+
+/// 另一 CLI 正在启动 daemon：轮询 `verify_reusable_daemon` 直到可复用或超时。
+fn wait_for_reusable_daemon(paths: &DaemonStatePaths) -> Result<Option<SocketAddr>, String> {
+    let deadline = Instant::now() + DAEMON_START_WAIT_TIMEOUT;
+    loop {
+        if let Some(addr) = verify_reusable_daemon(paths)? {
+            return Ok(Some(addr));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(DAEMON_START_POLL_INTERVAL);
+    }
+}
+
+/// 拉起一个全新 daemon：spawn app-server（TCP 监听、端口 0）、从 stderr 读取实际端口、
+/// 启动 stderr 排空线程。返回 (实际地址, 子进程, stderr 队列, stderr 排空线程句柄)。
+fn spawn_new_daemon() -> Result<
+    (
+        SocketAddr,
+        Child,
+        Receiver<Result<String, String>>,
+        JoinHandle<()>,
+    ),
+    String,
+> {
+    let mut command = ProcessCommand::new(app_server_bin()?);
+    // TCP 模式下 daemon 不再使用 stdin/stdout；stderr 仍捕获以读取 announce 并在常驻期排空。
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if std::io::stdin().is_terminal() {
+        command.env(INTERACTIVE_UI_ENV, "1");
+    }
+    command.env(APP_SERVER_LISTEN_ENV, "tcp://127.0.0.1:0");
+    if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
+        command.env(APP_SERVER_DB_ENV, db);
+    }
+    let paths = daemon_state()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start app-server daemon: {error}"))?;
+    let result =
+        (|| -> Result<(SocketAddr, Receiver<Result<String, String>>, JoinHandle<()>), String> {
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "app-server daemon stderr unavailable".to_string())?;
+            let (stderr_rx, stderr_reader) = spawn_line_reader(stderr);
+            // 解析 stderr announce 行得到实际 SocketAddr；stderr 读取线程持续排空剩余输出。
+            let addr = read_listen_announce(&stderr_rx, &mut child, APP_SERVER_START_TIMEOUT)?;
+            // daemon 已就绪：发布自身状态（pid + 实际端口），供后续 CLI 复用。announce 与
+            // 状态写入都可能晚于 connect，因此先写状态。
+            write_daemon_state(&paths, child.id(), addr.port())
+                .map_err(|error| format!("failed to record daemon state: {error}"))?;
+            Ok((addr, stderr_rx, stderr_reader))
+        })();
+    match result {
+        Ok((addr, stderr_rx, stderr_reader)) => Ok((addr, child, stderr_rx, stderr_reader)),
+        Err(error) => {
+            // 拉起失败：回收子进程，避免残留孤儿 daemon。
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
         }
     }
 }

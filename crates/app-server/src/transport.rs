@@ -1,7 +1,8 @@
 //! `AppServer` 的传输层：默认标准输入输出（stdio），可选 TCP 回环监听。
 //!
 //! 两种承载都走同一个 `run_with_io` 循环，只是"输入流 + 输出流"来源不同——stdio
-//! 用 `tokio::io::stdin()`/`stdout()`，TCP 用 `TcpListener` 接受的单个 `TcpStream`。
+//! 用 `tokio::io::stdin()`/`stdout()`，TCP 由 `TcpListener` 接受的一个 `TcpStream`
+//! 驱动（常驻 daemon：一次接受一个连接处理到断开，再接受下一个，空闲超时自停）。
 //! 输入由 Tokio 单一 owner 读取；turn/start 与 turn/resume 由单一工作线程顺序执行
 //! （同一时刻至多一个 turn），其余请求在输入 owner 的 blocking 任务中直接处理。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
@@ -30,6 +31,10 @@ use tokio::task::JoinHandle;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const APP_ERROR_INVALID_STATE: i64 = -32005;
+/// TCP daemon 无新连接的默认空闲自停阈值。
+const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 覆盖空闲自停阈值（毫秒）的环境变量，测试用它缩短等待。
+const DAEMON_IDLE_TIMEOUT_MS_ENV: &str = "SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS";
 const FILE_BACKED_STORE_REQUIRED: &str =
     "app-server requires a file-backed SINGULARITY_APP_SERVER_DB";
 const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
@@ -68,21 +73,65 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
                 .local_addr()
                 .map_err(|error| format!("failed to read TCP listen address: {error}"))?;
             // listen 地址含端口 0 时向 OS 申请端口，实际端口须上报给启动方/测试。
+            // 只上报一次：daemon 常驻期间后续连接不再重复 announce。
             eprintln!("SINGULARITY_APP_SERVER_LISTENING {actual}");
-            let (stream, _peer) = listener
-                .accept()
-                .await
-                .map_err(|error| format!("failed to accept app-server client: {error}"))?;
-            let (reader, writer) = stream.into_split();
-            run_with_io(
-                BufReader::new(reader),
-                writer,
-                configured_db_path,
-                runtime_handle,
-            )
-            .await
+            let idle_timeout = daemon_idle_timeout()?;
+            run_tcp_daemon(listener, configured_db_path, runtime_handle, idle_timeout).await
         }
     }
+}
+
+/// TCP daemon 主循环：接受多个连接，每连接运行独立的 `run_with_io`（因此每连接
+/// 各自走一遍 initialize/initialized 握手，旧连接的握手状态不污染新连接），连接
+/// 断开后回到 accept 等待下一个连接；无新连接持续超过 `idle_timeout` 时正常退出
+/// （空闲自停，exit 0）。单连接收到 server/shutdown 只结束该连接的处理，不退出
+/// 进程——进程退出由空闲自停接管。
+async fn run_tcp_daemon(
+    listener: TcpListener,
+    configured_db_path: String,
+    runtime_handle: tokio::runtime::Handle,
+    idle_timeout: Duration,
+) -> Result<(), String> {
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            accepted = listener.accept() => {
+                Some(accepted.map_err(|error| {
+                    format!("failed to accept app-server client: {error}")
+                })?)
+            }
+            _ = tokio::time::sleep(idle_timeout) => None,
+        };
+        let Some((stream, _peer)) = accepted else {
+            // 空闲超时：无新连接，正常退出。
+            break;
+        };
+        let (reader, writer) = stream.into_split();
+        // 单个连接的处理失败（如该连接的协议/传输错误）不结束 daemon，记入 stderr
+        // 后继续服务后续连接；idle 与后续连接照常。
+        if let Err(error) = run_with_io(
+            BufReader::new(reader),
+            writer,
+            configured_db_path.clone(),
+            runtime_handle.clone(),
+        )
+        .await
+        {
+            eprintln!("app-server connection error: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// 解析空闲自停阈值：`SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS` 覆盖默认 60s。
+fn daemon_idle_timeout() -> Result<Duration, String> {
+    let Ok(raw) = std::env::var(DAEMON_IDLE_TIMEOUT_MS_ENV) else {
+        return Ok(DAEMON_IDLE_TIMEOUT);
+    };
+    let millis = raw
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {DAEMON_IDLE_TIMEOUT_MS_ENV}: {raw}"))?;
+    Ok(Duration::from_millis(millis))
 }
 
 /// app-server 监听模式：未设置 `SINGULARITY_APP_SERVER_LISTEN` 时保留 stdio 默认。
