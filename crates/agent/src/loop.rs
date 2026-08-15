@@ -344,7 +344,11 @@ impl Agent {
                             &execution,
                         ))?;
                     }
-                    self.maybe_compact(&mut outcome.compacted, Some(&response.usage))?;
+                    self.maybe_compact(
+                        &mut outcome.compacted,
+                        Some(&response.usage),
+                        cancellation,
+                    )?;
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
@@ -357,7 +361,7 @@ impl Agent {
                     timestamp: None,
                 })?;
                 outcome.final_text = assistant_text;
-                self.maybe_compact(&mut outcome.compacted, Some(&response.usage))?;
+                self.maybe_compact(&mut outcome.compacted, Some(&response.usage), cancellation)?;
                 break;
             }
             // 代理将要停止：消费 follow-up 队列后回到内层循环。
@@ -465,17 +469,46 @@ impl Agent {
                     .complete(request, cancellation)
                     .map_err(AgentError::Provider)
             }
-            Err(error) => Err(AgentError::Provider(error)),
+            Err(error) => {
+                // 传输层重试（`MAX_PROVIDER_ATTEMPTS`）耗尽后的 `Err(ProviderError)`：
+                // 瞬时类错误转成 `Ok(ModelTurnResponse::Failed)`，交由运行级重试
+                // （loop.rs 调用方）按其既有 2s/4s/8s/16s 退避逻辑接管；不可重试
+                // 错误（取消/挂起超时/认证/限额/校验/上下文溢出等）原样传播。
+                if is_retryable_run_error(&error.error) {
+                    Ok(ModelTurnResponse {
+                        request_id: request.request_id.clone(),
+                        response_id: format!("fail-{}", Uuid::new_v4().simple()),
+                        status: ModelTurnStatus::Failed,
+                        assistant_message: None,
+                        tool_calls: Vec::new(),
+                        usage: ModelUsage::default(),
+                        finish_reason: None,
+                        validation: None,
+                        error: Some(*error.error),
+                        provider_name: None,
+                        model_name: None,
+                        provider_attempt_metadata: None,
+                        provider_reasoning_history: Vec::new(),
+                    })
+                } else {
+                    Err(AgentError::Provider(error))
+                }
+            }
         }
     }
 
     /// 每轮 provider 调用后检查 compaction：budget = context_window +
     /// Pi 默认 reserve（16384）/keep_recent（20000）；触发则生成摘要并追加
     /// CompactionEntry（后续上下文经 build_session_context 自动使用新基线）。
+    ///
+    /// 摘要生成失败（provider 瞬时错误/无效响应）**降级**为记录后继续：已完成的
+    /// assistant 结果已持久化，不应因摘要失败丢弃整轮；会话写入失败（真实存储
+    /// 错误）保持传播。
     fn maybe_compact(
         &mut self,
         compacted: &mut bool,
         last_usage: Option<&ModelUsage>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         let budget = CompactionBudget {
             context_window: self.config.context_window,
@@ -486,12 +519,18 @@ impl Agent {
         if !self.compaction.should_compact(context_tokens, &budget) {
             return Ok(());
         }
-        if matches!(
-            self.compaction
-                .compact(&mut self.session, &budget, context_tokens)?,
-            CompactionOutcome::Compacted { .. }
-        ) {
-            *compacted = true;
+        match self
+            .compaction
+            .compact(&mut self.session, &budget, context_tokens, cancellation)
+        {
+            Ok(CompactionOutcome::Compacted { .. }) => *compacted = true,
+            Ok(_) => {}
+            Err(crate::compaction::CompactionError::Session(error)) => {
+                return Err(AgentError::Session(error));
+            }
+            Err(error) => {
+                eprintln!("[singularity-agent] compaction skipped: {error}");
+            }
         }
         Ok(())
     }
@@ -923,6 +962,80 @@ mod tests {
         }
     }
 
+    /// 从 `complete_stream` 直接返回 `Err(ProviderError)` 的假 provider：
+    /// 模拟传输层重试（`MAX_PROVIDER_ATTEMPTS`）耗尽后仍失败的路径——在修复前这部分
+    /// 是死代码，`stream_completion` 直接以 `Err(AgentError::Provider)` 向外传播，
+    /// 运行级重试永远不触发。脚本按序在若干次失败后返回一次成功。
+    struct ErrReturningProvider {
+        /// 每次 `complete_stream` 弹出的结果：`Err(model_error)` 或 `Ok(text)`。
+        steps: Mutex<VecDeque<std::result::Result<String, ModelError>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        contract: ProviderProtocolContract,
+    }
+
+    impl ErrReturningProvider {
+        fn new(
+            contract: ProviderProtocolContract,
+            steps: Vec<std::result::Result<String, ModelError>>,
+        ) -> Self {
+            Self {
+                steps: Mutex::new(steps.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                contract,
+            }
+        }
+
+        fn try_respond(
+            &self,
+            request: &ModelTurnRequest,
+        ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.steps.lock().unwrap().pop_front() {
+                Some(Err(error)) => Err(ProviderError::from_model_error(error)),
+                Some(Ok(text)) => Ok(ModelTurnResponse::completed(
+                    request.request_id.clone(),
+                    format!("ok-{}", Uuid::new_v4().simple()),
+                    text,
+                )),
+                // 脚本耗尽：视作瞬时类网络错误，触发重试直至次数耗尽。
+                None => Err(ProviderError::from_model_error(ModelError::new(
+                    ModelErrorKind::NetworkError,
+                    "no scripted steps remaining",
+                ))),
+            }
+        }
+    }
+
+    impl Provider for ErrReturningProvider {
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            self.contract.clone()
+        }
+
+        fn streaming_capability(
+            &self,
+            _selected_protocol: singularity_model::ProviderApiProtocol,
+        ) -> ProviderStreamingCapability {
+            ProviderStreamingCapability::OutputTextDelta
+        }
+
+        fn complete_stream(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+            _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+            self.try_respond(request)
+        }
+
+        fn complete(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+        ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+            self.try_respond(request)
+        }
+    }
+
     /// 恒返回 `ModelTurnStatus::Invalid` 的假 provider：校验失败绝不做运行级重试。
     struct InvalidStatusProvider {
         contract: ProviderProtocolContract,
@@ -1046,6 +1159,85 @@ mod tests {
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.final_text, "recovered");
         assert!(!outcome.aborted);
+    }
+
+    /// 运行级重试经真实 provider 失败路径：`complete_stream` 直接返回
+    /// `Err(ProviderError)`（传输层重试耗尽后的形态），`stream_completion` 把瞬时类
+    /// 错误转成 `Ok(ModelTurnResponse::Failed)`，运行级重试据此接管并在退避后重试成功。
+    /// 修复前该 `Err` 路径是死代码——`stream_completion` 直接向外传播错误，这里会立即失败。
+    #[test]
+    fn retry_transient_err_provider_error_then_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let provider = Arc::new(ErrReturningProvider::new(
+            fake_contract(),
+            vec![
+                Err(ModelError::new(
+                    ModelErrorKind::NetworkError,
+                    "network flap after transport retries",
+                )),
+                Err(ModelError::new(
+                    ModelErrorKind::ProviderOverloaded,
+                    "provider overloaded",
+                )),
+                Ok("recovered".to_string()),
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let outcome = agent
+            .run("hello", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap();
+        // 3 次尝试（2 次 Err 失败重试 + 1 次成功），但只算 1 轮。
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "Err(NetworkError/ProviderOverloaded) must be converted to Ok(Failed) and retried"
+        );
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.final_text, "recovered");
+        assert!(!outcome.aborted);
+    }
+
+    /// 运行级重试经 provider 失败路径：`Err(ProviderError)` 中不可重试错误（挂起超时）
+    /// 不被转换为 `Ok(Failed)`，保持 `Err(AgentError::Provider)` 传播，agent 直接失败且一次尝试。
+    #[test]
+    fn non_retryable_err_provider_error_fails_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let provider = Arc::new(ErrReturningProvider::new(
+            fake_contract(),
+            vec![Err(ModelError::new(
+                ModelErrorKind::Timeout,
+                "request hung and timed out",
+            ))],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let err = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap_err();
+        // 不可重试错误原样传播为 Provider 错误（含原 kind 消息）。
+        assert!(
+            err.to_string().contains("request hung and timed out"),
+            "non-retryable Err must propagate as provider error, got: {}",
+            err
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Timeout Err(ProviderError) must not be retried"
+        );
     }
 
     /// 运行级重试：非瞬时类（挂起超时、账户限额、校验失败）不重试，直接失败。

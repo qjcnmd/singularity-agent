@@ -120,7 +120,12 @@ pub fn builtin_model_cost(provider: &str, model: &str) -> Option<ModelCost> {
 
 /// 按每百万 token 单价估算一次 usage 的成本（币种随单价），使用闲时价。
 ///
-/// `cost = input×in_price + output×out_price + cached×cache_read_price`，再除以 1e6。
+/// `input_tokens`（provider 的 prompt_tokens）**已包含缓存命中部分**，
+/// `cached_input_tokens`（prompt_tokens_details.cached_tokens）是其子集。
+/// 命中部分按 cache_read 价计、未命中部分按 input 价计：
+///
+/// `cost = (input - cached)×in_price + cached×cache_read_price + output×out_price`，再除以 1e6。
+/// 若 provider 返回 `cached > input`（异常），未命中部分按 0 处理，避免负成本。
 pub fn estimate_cost(
     input_tokens: u64,
     output_tokens: u64,
@@ -138,7 +143,9 @@ pub fn estimate_cost(
 
 /// 按每百万 token 单价估算一次 usage 的成本（币种随单价）。
 ///
-/// `peak=true` 使用高峰价格字段，否则使用闲时价格字段。公式与 `estimate_cost` 相同。
+/// `peak=true` 使用高峰价格字段，否则使用闲时价格字段。
+/// `input_tokens` 已含缓存命中部分（`cached_input_tokens` 是其子集），
+/// 命中部分按 cache_read 价计、未命中部分按 input 价计；`cached > input` 时未命中部分按 0。
 pub fn estimate_cost_peak(
     input_tokens: u64,
     output_tokens: u64,
@@ -159,7 +166,7 @@ pub fn estimate_cost_peak(
             cost.cache_read_per_mtok,
         )
     };
-    (input_tokens as f64 * input
+    (input_tokens.saturating_sub(cached_input_tokens) as f64 * input
         + output_tokens as f64 * output
         + cached_input_tokens as f64 * cache)
         / 1e6
@@ -250,10 +257,11 @@ mod tests {
     #[test]
     fn estimate_cost_matches_off_peak_prices() {
         let cost = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("price");
-        // 8/17 起闲时价：1M input + 1M output + 1M cache →
-        // 1.5/7.0 + 4.5/7.0 + 0.05/7.0 = (1.5+4.5+0.05)/7.0 = 6.05/7.0。
-        let estimate = estimate_cost(1_000_000, 1_000_000, 1_000_000, &cost);
-        let expected = (1.5 + 4.5 + 0.05) / 7.0;
+        // 8/17 起闲时价。input_tokens=1M、cached=0.4M：未命中 0.6M 按 input 价、
+        // 命中 0.4M 按 cache 价、output 1M 按 output 价：
+        // (0.6M*1.5 + 0.4M*0.05 + 1M*4.5)/7.0 / 1e6 = (0.6*1.5 + 0.4*0.05 + 4.5)/7.0。
+        let estimate = estimate_cost(1_000_000, 1_000_000, 400_000, &cost);
+        let expected = (0.6 * 1.5 + 0.4 * 0.05 + 4.5) / 7.0;
         assert!(
             (estimate - expected).abs() < 1e-9,
             "estimate was {estimate}"
@@ -263,11 +271,12 @@ mod tests {
     #[test]
     fn estimate_cost_peak_selects_price_by_peak_flag() {
         let cost = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("price");
+        // cached==input（全部命中）：input 未命中部分为 0，成本 = output×out + cached×cache。
+        // 高峰价 = 闲时价的 2 倍（3.0 vs 1.5、9.0 vs 4.5、0.10 vs 0.05，除以同一汇率 7.0），
+        // 故高峰估算仍恰为闲时 2 倍。
         let input = 1_000_000u64;
         let output = 1_000_000u64;
         let cached = 1_000_000u64;
-        // 高峰价 = 闲时价的 2 倍（3.0 vs 1.5、9.0 vs 4.5、0.10 vs 0.05，除以同一汇率 7.0），
-        // 故高峰估算恰为闲时 2 倍。
         let off = estimate_cost_peak(input, output, cached, &cost, false);
         let peak = estimate_cost_peak(input, output, cached, &cost, true);
         assert!((peak - 2.0 * off).abs() < 1e-12, "off={off} peak={peak}");
@@ -285,6 +294,41 @@ mod tests {
         assert!((peak - expected).abs() < 1e-12);
         // 无 token 时为零。
         assert_eq!(estimate_cost(0, 0, 0, &cost), 0.0);
+    }
+
+    #[test]
+    fn estimate_cost_no_double_count_when_all_input_cached() {
+        let cost = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("price");
+        // cached_input_tokens == input_tokens（全部命中）：input 未命中部分为 0，
+        // 成本 = output×out + input×cache，不再把命中部分按 input 全价重复计费。
+        let input = 1_000_000u64;
+        let output = 500_000u64;
+        let cached = input;
+        let estimate = estimate_cost(input, output, cached, &cost);
+        let expected = 0.5 * DS_OFF_OUTPUT + 1.0 * DS_OFF_CACHE_READ;
+        assert!(
+            (estimate - expected).abs() < 1e-12,
+            "estimate was {estimate}, expected {expected}"
+        );
+        // 对称地：一半命中时 = 0.5×input + 0.5×cache + output×1M。
+        let estimate_half = estimate_cost(input, output, 500_000, &cost);
+        let expected_half = 0.5 * DS_OFF_INPUT + 0.5 * DS_OFF_CACHE_READ + 0.5 * DS_OFF_OUTPUT;
+        assert!(
+            (estimate_half - expected_half).abs() < 1e-12,
+            "estimate_half was {estimate_half}"
+        );
+    }
+
+    #[test]
+    fn estimate_cost_clamps_when_cached_exceeds_input() {
+        let cost = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("price");
+        // provider 舍入异常 cached > input：未命中部分按 0 计（saturating_sub），成本不为负。
+        let estimate = estimate_cost(100_000, 50_000, 200_000, &cost);
+        let expected = (200_000.0 * DS_OFF_CACHE_READ + 50_000.0 * DS_OFF_OUTPUT) / 1e6;
+        assert!(
+            estimate >= 0.0 && (estimate - expected).abs() < 1e-12,
+            "estimate was {estimate}"
+        );
     }
 
     /// 构造距 UNIX_EPOCH 若干整数秒的 SystemTime，使其北京小时（=`(raw_hour+8) mod 24`）

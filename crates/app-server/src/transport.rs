@@ -1,8 +1,8 @@
 //! `AppServer` 的传输层：默认标准输入输出（stdio），可选 TCP 回环监听。
 //!
 //! 两种承载都走同一个 `run_with_io` 循环，只是"输入流 + 输出流"来源不同——stdio
-//! 用 `tokio::io::stdin()`/`stdout()`，TCP 由 `TcpListener` 接受的一个 `TcpStream`
-//! 驱动（常驻 daemon：一次接受一个连接处理到断开，再接受下一个，空闲超时自停）。
+//! 用 `tokio::io::stdin()`/`stdout()`，TCP 由 `TcpListener` 驱动的常驻 daemon 驱动：
+//! 并发接受多个连接，每连接一个独立 `run_with_io` 任务，空闲超时自停。
 //! 输入由 Tokio 单一 owner 读取；turn/start 与 turn/resume 由单一工作线程顺序执行
 //! （同一时刻至多一个 turn），其余请求在输入 owner 的 blocking 任务中直接处理。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
@@ -81,11 +81,15 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
     }
 }
 
-/// TCP daemon 主循环：接受多个连接，每连接运行独立的 `run_with_io`（因此每连接
-/// 各自走一遍 initialize/initialized 握手，旧连接的握手状态不污染新连接），连接
-/// 断开后回到 accept 等待下一个连接；无新连接持续超过 `idle_timeout` 时正常退出
-/// （空闲自停，exit 0）。单连接收到 server/shutdown 只结束该连接的处理，不退出
-/// 进程——进程退出由空闲自停接管。
+/// TCP daemon 主循环：并发接受多个连接。每收到一个连接就 `tokio::spawn` 一个独立
+/// 任务运行该连接的 `run_with_io`（因此每连接各自走 initialize/initialized 握手，
+/// 旧连接的握手状态不污染新连接），主循环立即回到 accept 等待下一个连接——单个
+/// 连接上的长 turn/请求不会阻塞其他连接被接受与握手。单个连接的处理失败（如该
+/// 连接自身的协议/传输错误）只记入 stderr，不影响 daemon 及其他连接。连接任务
+/// 是 detached：daemon 因空闲退出时正在处理的连接随 runtime 终止（可接受：空闲
+/// 自停只承诺"无新连接时不再继续服务"）。无新连接持续超过 `idle_timeout` 时正常
+/// 退出（空闲自停，exit 0）。单连接收到 server/shutdown 只结束该连接的处理，不
+/// 退出进程——进程退出由空闲自停接管。
 async fn run_tcp_daemon(
     listener: TcpListener,
     configured_db_path: String,
@@ -107,18 +111,20 @@ async fn run_tcp_daemon(
             break;
         };
         let (reader, writer) = stream.into_split();
-        // 单个连接的处理失败（如该连接的协议/传输错误）不结束 daemon，记入 stderr
-        // 后继续服务后续连接；idle 与后续连接照常。
-        if let Err(error) = run_with_io(
-            BufReader::new(reader),
-            writer,
-            configured_db_path.clone(),
-            runtime_handle.clone(),
-        )
-        .await
-        {
-            eprintln!("app-server connection error: {error}");
-        }
+        // 并发处理：每连接一个 detached 任务，主循环不阻塞，立即接受下一个连接。
+        // `reader`/`writer` 是 TcpStream 拆出的 OwnedReadHalf/OwnedWriteHalf，
+        // 满足 run_with_io 的泛型约束并 Send + 'static，可直接移入 spawn 任务。
+        // spawn 前先 clone 配置/runtime handles（它们在循环内复用，async move 会整体
+        // 移入任务，不能直接把循环变量移进闭包）。
+        let db_path = configured_db_path.clone();
+        let rt_handle = runtime_handle.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                run_with_io(BufReader::new(reader), writer, db_path, rt_handle).await
+            {
+                eprintln!("app-server connection error: {error}");
+            }
+        });
     }
     Ok(())
 }

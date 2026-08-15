@@ -310,10 +310,12 @@ impl CompactionEngine {
     /// prompt 结构对齐 Pi `generateSummaryWithUsage`：`<conversation>` 包裹对话文本，
     /// 有前次摘要时追加 `<previous-summary>` 并使用 UPDATE prompt 合并。
     /// 文件操作列表由调用方（`compact`）从消息与历史 details 中提取，本函数返回空列表。
+    /// `cancellation` 透传给摘要调用：中断时立即停止等待摘要，不阻塞整轮取消。
     pub fn generate_summary(
         &self,
         conversation: &str,
         previous: Option<&CompactionSummary>,
+        cancellation: &CancellationToken,
     ) -> Result<CompactionSummary> {
         let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
         if let Some(previous) = previous {
@@ -327,7 +329,8 @@ impl CompactionEngine {
         } else {
             SUMMARIZATION_PROMPT
         });
-        let text = self.complete_summarization(&prompt, 4, 5, "summarization failed")?;
+        let text =
+            self.complete_summarization(&prompt, 4, 5, "summarization failed", cancellation)?;
         Ok(CompactionSummary {
             text,
             read_files: Vec::new(),
@@ -340,11 +343,13 @@ impl CompactionEngine {
     /// `usage_or_estimate` 为调用方计算的上下文 token 数（触发判定与 `tokensBefore`
     /// 依据，Pi 的 `estimateContextTokens` 语义由调用方负责）。
     /// 完成后调用方负责用 `build_session_context` 重建内存上下文。
+    /// `cancellation` 透传给摘要调用（见 `generate_summary`）。
     pub fn compact(
         &mut self,
         session: &mut SessionManager,
         budget: &CompactionBudget,
         usage_or_estimate: u64,
+        cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         if !self.should_compact(usage_or_estimate, budget) {
             return Ok(CompactionOutcome::NotNeeded);
@@ -438,17 +443,20 @@ impl CompactionEngine {
                 self.generate_summary(
                     &self.serialize_conversation(&messages_to_summarize),
                     previous.as_ref(),
+                    cancellation,
                 )?
                 .text
             };
             let turn_prefix_text = self.generate_turn_prefix_summary(
                 &self.serialize_conversation(&turn_prefix_messages),
+                cancellation,
             )?;
             format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_text}")
         } else {
             self.generate_summary(
                 &self.serialize_conversation(&messages_to_summarize),
                 previous.as_ref(),
+                cancellation,
             )?
             .text
         };
@@ -530,23 +538,35 @@ impl CompactionEngine {
     }
 
     /// split turn 前缀摘要（Pi `generateTurnPrefixSummary`，预算为 reserve 的 0.5 倍）。
-    fn generate_turn_prefix_summary(&self, conversation: &str) -> Result<String> {
+    fn generate_turn_prefix_summary(
+        &self,
+        conversation: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
         let prompt = format!(
             "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
         );
-        self.complete_summarization(&prompt, 1, 2, "turn prefix summarization failed")
+        self.complete_summarization(
+            &prompt,
+            1,
+            2,
+            "turn prefix summarization failed",
+            cancellation,
+        )
     }
 
     /// 单个摘要模型调用：system prompt + 组装后的 user prompt。
     ///
     /// 输出上限取 `reserve * fraction` 与调用方模型偏好上限的较小值（Pi 再与模型
     /// `maxTokens` 取小；本边界由 provider 侧校验兜底）。
+    /// `cancellation` 透传给 provider：中断时不继续等待摘要。
     fn complete_summarization(
         &self,
         prompt_text: &str,
         fraction_numerator: u64,
         fraction_denominator: u64,
         error_prefix: &str,
+        cancellation: &CancellationToken,
     ) -> Result<String> {
         let from_reserve =
             self.reserve_tokens.saturating_mul(fraction_numerator) / fraction_denominator;
@@ -562,9 +582,7 @@ impl CompactionEngine {
             ],
         );
         request.model_preferences = preferences;
-        let response = self
-            .provider
-            .complete(&request, &CancellationToken::new())?;
+        let response = self.provider.complete(&request, cancellation)?;
         if response.status != ModelTurnStatus::Success {
             let detail = response
                 .error
@@ -1160,7 +1178,9 @@ mod tests {
 
         let (mut engine, mock) = mock_engine(vec!["## Goal\nsummary of history".to_string()]);
         let budget = budget(100_000, 4_000);
-        let outcome = engine.compact(&mut session, &budget, 90_000).unwrap();
+        let outcome = engine
+            .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+            .unwrap();
         assert_eq!(
             outcome,
             CompactionOutcome::Compacted {
@@ -1171,7 +1191,9 @@ mod tests {
 
         // 未触发 → NotNeeded。
         assert_eq!(
-            engine.compact(&mut session, &budget, 10_000).unwrap(),
+            engine
+                .compact(&mut session, &budget, 10_000, &CancellationToken::new())
+                .unwrap(),
             CompactionOutcome::NotNeeded
         );
 
@@ -1231,7 +1253,9 @@ mod tests {
             .append_message(tool_result("c3", &"i".repeat(7000)))
             .unwrap();
         let (mut engine, mock) = mock_engine(vec!["## Goal\nupdated summary".to_string()]);
-        let outcome = engine.compact(&mut session, &budget, 90_000).unwrap();
+        let outcome = engine
+            .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+            .unwrap();
         assert_eq!(
             outcome,
             CompactionOutcome::Compacted {
@@ -1296,7 +1320,9 @@ mod tests {
             "## Original Request\nprefix".to_string(),
         ]);
         let budget = budget(100_000, 2_600);
-        let outcome = engine.compact(&mut session, &budget, 90_000).unwrap();
+        let outcome = engine
+            .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+            .unwrap();
         assert_eq!(
             outcome,
             CompactionOutcome::Compacted {
@@ -1349,12 +1375,16 @@ mod tests {
         // 触发条件满足但 keep 预算极大 → 切点在起点 → 无可摘要内容。
         let cfg = budget(100_000, 1_000_000);
         assert_eq!(
-            engine.compact(&mut session, &cfg, 90_000).unwrap(),
+            engine
+                .compact(&mut session, &cfg, 90_000, &CancellationToken::new())
+                .unwrap(),
             CompactionOutcome::NotNeeded
         );
         assert!(mock.requests().is_empty(), "不应发起摘要调用");
         // 再次 compact：仍然没有新内容，不产生 compaction 条目。
-        let _ = engine.compact(&mut session, &cfg, 90_000).unwrap();
+        let _ = engine
+            .compact(&mut session, &cfg, 90_000, &CancellationToken::new())
+            .unwrap();
         let content = std::fs::read_to_string(session.path()).unwrap();
         let lines: Vec<&str> = content.lines().skip(1).collect();
         assert_eq!(lines.len(), 1, "只有一条消息，无 compaction 条目");

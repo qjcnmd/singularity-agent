@@ -1691,6 +1691,91 @@ fn tcp_daemon_serves_second_connection_with_independent_handshake() {
     let _ = child.wait();
 }
 
+/// TCP daemon 并发 accept：连接 A 保持打开（已完成握手、不发起 shutdown、不发送
+/// 关闭），证实 A 的存活/挂起不会阻塞 accept——连接 B 仍能被接受并独立完成
+/// initialize/initialized 握手。这正是修复前缺陷的反例：顺序 accept 循环在 A 的
+/// `run_with_io` 期间阻塞 accept，B 的握手等不到响应（daemon 复用 probe 读超时，
+/// 误判 stale → 拉起第二个 daemon）；并发 accept 让 B 及时拿到 initialized。
+/// B 使用短读超时，若 daemon 未并发服务则握手超时即失败。
+#[test]
+fn tcp_daemon_accepts_second_connection_while_first_stays_open() {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    const LISTENING_PREFIX: &str = "SINGULARITY_APP_SERVER_LISTENING ";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let stderr_path = dir.path().join("app-server-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let mut child = Command::new(app_server_bin())
+        .current_dir(dir.path())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .env("SINGULARITY_APP_SERVER_LISTEN", "tcp://127.0.0.1:0")
+        .env("SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS", "20000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn app-server in TCP mode");
+    let addr = wait_for_listen_address(&stderr_path, LISTENING_PREFIX);
+
+    // 连接 A：完成握手后保持打开（不断开、不 shutdown），继续占住 run_with_io(A)。
+    let connection_a = {
+        let stream = TcpStream::connect(addr).expect("connect A");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout A");
+        let mut conn = LineReader::new(stream);
+        write_line(
+            &mut conn.stream,
+            br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"a","title":"A","version":"0.1.0"}}}"#,
+        );
+        assert_eq!(conn.recv_id(1)["result"]["platformFamily"], "local");
+        write_line(
+            &mut conn.stream,
+            br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        );
+        conn
+    };
+    // A 不发送任何东西、不关闭——它还是 open 的。稍等确保 write/A 的服务器端已进入读循环。
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().expect("poll daemon").is_none(),
+        "daemon must not exit while connection A stays open"
+    );
+
+    // 连接 B：在 A 保持打开期间建立并完成独立握手，短读超时内必须拿到 initialized。
+    let stream = TcpStream::connect(addr).expect("connect B");
+    // 原顺序实现下 B 的握手永远等不到响应；短超时让修复后的并发 accept 必须及时响应。
+    stream
+        .set_read_timeout(Some(Duration::from_millis(2000)))
+        .expect("read timeout B");
+    let mut connection_b = LineReader::new(stream);
+    write_line(
+        &mut connection_b.stream,
+        br#"{"jsonrpc":"2.0","method":"initialize","id":2,"params":{"clientInfo":{"name":"b","title":"B","version":"0.1.0"}}}"#,
+    );
+    assert_eq!(
+        connection_b.recv_id(2)["result"]["platformFamily"],
+        "local",
+        "connection B must handshake while connection A stays open"
+    );
+    write_line(
+        &mut connection_b.stream,
+        br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    );
+    write_line(
+        &mut connection_b.stream,
+        br#"{"jsonrpc":"2.0","method":"server/capabilities","id":3,"params":{}}"#,
+    );
+    assert!(connection_b.recv_id(3)["result"]["transports"].is_array());
+
+    drop(connection_b);
+    drop(connection_a);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// TCP daemon 空闲自停：建立连接并断开后不立即退出，但在无新连接的空闲窗口内自动退出。
 #[test]
 fn tcp_daemon_idle_stops_once_no_connection_arrives() {

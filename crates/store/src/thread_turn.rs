@@ -368,34 +368,91 @@ impl SessionStore {
     }
 
     /// 更新 turn status，并拒绝覆盖已终态的 turn。
+    ///
+    /// 校验与写入在同一 `Immediate` 事务内执行：并发调用方不会同时通过校验
+    /// （与 `commit_turn_outcome` 的事务化终态化模式一致）。
     pub fn update_turn_status(&self, turn_id: &str, status: TurnStatus) -> StoreResult<Turn> {
-        self.ensure_turn_status_update_allowed(turn_id, &status, None)?;
-        let changed = self.connection.execute(
-            "update turns set status = ?1 where turn_id = ?2",
-            params![status.to_db_text(), turn_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!("turn {turn_id}")));
-        }
-        self.get_turn(turn_id)
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let turn = self.update_turn_status_in_transaction(&transaction, turn_id, &status, None)?;
+        transaction.commit()?;
+        Ok(turn)
     }
 
     /// 在不产生附加 item/trace 的情况下更新 turn 与 AgentLoop 状态。
+    ///
+    /// 校验与写入在同一 `Immediate` 事务内执行（与 `commit_turn_outcome` 一致）。
     pub fn update_turn_state(
         &self,
         turn_id: &str,
         status: TurnStatus,
         agent_loop_status: &str,
     ) -> StoreResult<Turn> {
-        self.ensure_turn_status_update_allowed(turn_id, &status, Some(agent_loop_status))?;
-        let changed = self.connection.execute(
-            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
-            params![status.to_db_text(), agent_loop_status, turn_id],
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let turn = self.update_turn_status_in_transaction(
+            &transaction,
+            turn_id,
+            &status,
+            Some(agent_loop_status),
         )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        transaction.commit()?;
+        Ok(turn)
+    }
+
+    // 在既有事务内校验状态迁移并更新 status/agent_loop_status。
+    fn update_turn_status_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        turn_id: &str,
+        status: &TurnStatus,
+        agent_loop_status: Option<&str>,
+    ) -> StoreResult<Turn> {
+        let current = transaction
+            .query_row(
+                "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                params![turn_id],
+                |row| self.turn_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        validate_turn_status_update(
+            &current,
+            status,
+            agent_loop_status,
+            TurnOutcomeAuthority::AgentLoop,
+        )?;
+        match agent_loop_status {
+            Some(agent_loop_status) => {
+                let changed = transaction.execute(
+                    "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
+                    params![status.to_db_text(), agent_loop_status, turn_id],
+                )?;
+                if changed == 0 {
+                    return Err(StoreError::NotFound(format!("turn {turn_id}")));
+                }
+            }
+            None => {
+                let changed = transaction.execute(
+                    "update turns set status = ?1 where turn_id = ?2",
+                    params![status.to_db_text(), turn_id],
+                )?;
+                if changed == 0 {
+                    return Err(StoreError::NotFound(format!("turn {turn_id}")));
+                }
+            }
         }
-        self.get_turn(turn_id)
+        Ok(Turn {
+            status: status.clone(),
+            agent_loop_status: agent_loop_status
+                .map(str::to_string)
+                .unwrap_or_else(|| current.agent_loop_status.clone()),
+            ..current
+        })
     }
 
     /// 在一个事务中提交 turn 状态及其持久化条目和追踪。
@@ -1036,20 +1093,6 @@ impl SessionStore {
     }
 
     // 校验 turn 状态迁移是否允许覆盖当前状态。
-    pub(crate) fn ensure_turn_status_update_allowed(
-        &self,
-        turn_id: &str,
-        next_status: &TurnStatus,
-        next_agent_loop_status: Option<&str>,
-    ) -> StoreResult<()> {
-        let current = self.get_turn(turn_id)?;
-        validate_turn_status_update(
-            &current,
-            next_status,
-            next_agent_loop_status,
-            TurnOutcomeAuthority::AgentLoop,
-        )
-    }
 
     // 构造带新 id、初始 active 状态的 Thread。
     pub(crate) fn new_thread(model: Option<&str>, cwd: Option<&str>) -> Thread {

@@ -27,6 +27,9 @@ const DEFAULT_CONFIG_PATH: &str = "evaluations/eval-config.json";
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// 默认并行度。
 const DEFAULT_MAX_PARALLEL: usize = 5;
+/// checker.sh 运行超时。checker.sh 死循环或等待输入时不能无限占用 worker 线程
+/// （per-cell 的 DEFAULT_TIMEOUT_SECS 只作用于 sg run，不作用于 checker）。
+const CHECKER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `evaluations/eval-config.json` 的 schema。
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +426,7 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
         &task_copy.join("checker.sh"),
         &workspace_copy,
         &mut result.checker_output,
+        CHECKER_TIMEOUT,
     );
 
     // 5) 指标聚合。
@@ -451,8 +455,16 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
             } else if sg.turn_interrupted {
                 result.status = "interrupted".to_string();
             } else if sg.turn_failed {
-                result.status = "crashed".to_string();
-                result.error = Some("agent loop failed (turn failed/blocked)".to_string());
+                // turn 失败（agent 循环报错）时 workspace 状态仍是客观证据：checker
+                // 通过说明任务已完成（如收尾模型调用失败但修改已落盘），判 passed；
+                // checker 未通过才是链路级失败。
+                match checker {
+                    Some(0) => result.status = "passed".to_string(),
+                    _ => {
+                        result.status = "crashed".to_string();
+                        result.error = Some("agent loop failed (turn failed/blocked)".to_string());
+                    }
+                }
             } else if let Some(exit) = checker {
                 match exit {
                     0 => result.status = "passed".to_string(),
@@ -512,27 +524,28 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
     // 会让输出大的 --json 事件流阻塞子进程，直到超时。
     let stdout = Arc::new(std::sync::Mutex::new(String::new()));
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+    let mut reader_threads = Vec::new();
     if let Some(mut out) = child.stdout.take() {
         let captured = Arc::clone(&stdout);
-        thread::spawn(move || {
+        reader_threads.push(thread::spawn(move || {
             let mut buffer = String::new();
             if out.read_to_string(&mut buffer).is_ok() {
                 *captured
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
-        });
+        }));
     }
     if let Some(mut err) = child.stderr.take() {
         let captured = Arc::clone(&stderr);
-        thread::spawn(move || {
+        reader_threads.push(thread::spawn(move || {
             let mut buffer = String::new();
             if err.read_to_string(&mut buffer).is_ok() {
                 *captured
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
-        });
+        }));
     }
 
     let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -551,6 +564,11 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
             Err(error) => return Err(format!("failed to poll sg run: {error}")),
         }
     };
+    // 子进程已退出：join 读取线程确保管道内容完整（detached 线程可能在主线程
+    // 读 Mutex 时尚未写完，导致 stdout/stderr 捕获竞态丢失，错误信息不可诊断）。
+    for reader in reader_threads {
+        let _ = reader.join();
+    }
     let read_stdout = || {
         stdout
             .lock()
@@ -684,8 +702,23 @@ fn resolve_default_bash() -> Option<String> {
     None
 }
 
-/// 运行 checker.sh（cwd = workspace 副本），返回退出码。
-fn run_checker(bash: &str, checker: &Path, workspace: &Path, output: &mut String) -> Option<i32> {
+/// 读取已由独立线程捕获的管道内容（锁失效时回退为空串）。
+fn read_captured(captured: &Arc<std::sync::Mutex<String>>) -> String {
+    captured.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// 运行 checker.sh（cwd = workspace 副本），返回退出码；超时或无退出码返回 `None`。
+///
+/// 与 `run_sg` 保持一致在超时后 kill 进程树：checker.sh 死循环/等待输入时不会无限阻塞。
+/// stdout/stderr 由独立线程边读边收（匿名管道缓冲小，同步读满会阻塞子进程），
+/// 主线程以 `timeout` 为 deadline 轮询 `try_wait`；超时则 kill 并在 `output` 记录。
+fn run_checker(
+    bash: &str,
+    checker: &Path,
+    workspace: &Path,
+    output: &mut String,
+    timeout: Duration,
+) -> Option<i32> {
     // bash 把反斜杠当转义符：Windows 路径必须转正斜杠再作为参数。
     let checker_arg = checker.to_string_lossy().replace('\\', "/");
     let mut command = Command::new(bash);
@@ -714,22 +747,64 @@ fn run_checker(bash: &str, checker: &Path, workspace: &Path, output: &mut String
             return None;
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    // 边运行边读 stdout/stderr，避免管道缓冲填满阻塞子进程（同 run_sg）。输出量小
+    // （最后 truncate 2000），无需分批；线程 detached，由进程退出自然回收。
+    let stdout = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr = Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
+        let captured = Arc::clone(&stdout);
+        thread::spawn(move || {
+            let mut buffer = String::new();
+            if out.read_to_string(&mut buffer).is_ok() {
+                *captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+            }
+        });
     }
     if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
+        let captured = Arc::clone(&stderr);
+        thread::spawn(move || {
+            let mut buffer = String::new();
+            if err.read_to_string(&mut buffer).is_ok() {
+                *captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+            }
+        });
     }
-    let status = child
-        .wait()
-        .map_err(|error| {
-            *output = format!("failed to wait checker.sh: {error}");
-        })
-        .ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(&mut child);
+                    let _ = child.wait();
+                    let stdout = read_captured(&stdout);
+                    let stderr = read_captured(&stderr);
+                    *output = truncate(
+                        &format!(
+                            "checker.sh timed out after {}s; {stdout}\n{stderr}",
+                            timeout.as_secs()
+                        ),
+                        2000,
+                    );
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => {
+                *output = format!("failed to poll checker.sh: {error}");
+                return None;
+            }
+        }
+    };
+    let stdout = read_captured(&stdout);
+    let stderr = read_captured(&stderr);
     *output = truncate(&format!("{stdout}\n{stderr}"), 2000);
-    status.code()
+    // 循环只以 `Ok(Some(status))` 退出（超时/失败均在循环内 return），此处恒为 `Some`。
+    status.map(|s| s.code().unwrap_or_default())
 }
 
 /// 解析 rollout（会话 JSONL）的工具调用统计与时间拆解。
@@ -961,7 +1036,13 @@ fn copy_rollout(workspace: &Path, cell_dir: &Path) -> Option<PathBuf> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
         }
-        let modified = entry.metadata().ok()?.modified().ok()?;
+        // 单条目元数据读取失败（如并发写入中的临时文件）跳过，不丢弃整个 rollout。
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
         if latest.as_ref().is_none_or(|(_, time)| modified > *time) {
             latest = Some((path, modified));
         }
@@ -1103,5 +1184,40 @@ mod tests {
         assert_eq!(stats.tool_calls, 3);
         // bash+ls 出现 2 次 = 1 个重复动作；read+a.txt 1 次。
         assert_eq!(stats.duplicate_actions, 1);
+    }
+
+    #[test]
+    fn run_checker_times_out_on_hanging_script() {
+        // 无可用 bash（如未装 Git for Windows）时跳过；本测试只验证超时语义。
+        let Some(bash) = resolve_default_bash() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // 死循环脚本：不退出、不读 stdin，验证 run_checker 不会无限阻塞。
+        let checker = dir.path().join("checker.sh");
+        std::fs::write(&checker, "while true; do :; done\n").unwrap();
+        let mut output = String::new();
+        let started = Instant::now();
+        let exit = run_checker(
+            &bash,
+            &checker,
+            &workspace,
+            &mut output,
+            Duration::from_secs(2),
+        );
+        // 超时返回 None（调用方据此判 failed 并置 error），而非阻塞等待。
+        assert!(exit.is_none(), "expected timeout -> None, got {exit:?}");
+        assert!(
+            output.contains("timed out after 2s"),
+            "output should mention timeout: {output}"
+        );
+        // 应尽快返回，远小于死循环的无限期。
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "run_checker took too long: {:?}",
+            started.elapsed()
+        );
     }
 }
