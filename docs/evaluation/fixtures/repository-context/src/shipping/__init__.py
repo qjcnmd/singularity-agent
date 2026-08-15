@@ -1,1 +1,0 @@
-"""Shipping support modules."""
