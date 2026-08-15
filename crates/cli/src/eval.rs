@@ -781,30 +781,60 @@ fn run_checker(
         }
     };
     // 边运行边读 stdout/stderr，避免管道缓冲填满阻塞子进程（同 run_sg）。输出量小
-    // （最后 truncate 2000），无需分批；线程 detached，由进程退出自然回收。
+    // （最后 truncate 2000），无需分批；**边读边同步**共享缓冲：孙进程继承管道写端
+    // 时 read 不 EOF（checker 的 bash → python 链），等待超时后仍能拿到已读部分，
+    // 避免 'checker exit=1 但输出为空' 的竞态误判。
     let stdout = Arc::new(std::sync::Mutex::new(String::new()));
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel::<()>();
+    let mut reader_threads = Vec::new();
     if let Some(mut out) = child.stdout.take() {
         let captured = Arc::clone(&stdout);
-        thread::spawn(move || {
-            let mut buffer = String::new();
-            if out.read_to_string(&mut buffer).is_ok() {
-                *captured
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+        let done = reader_done_tx.clone();
+        reader_threads.push(thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            let mut collected = String::new();
+            loop {
+                match out.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                        *captured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
+                    }
+                    Err(_) => break,
+                }
             }
-        });
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
+            let _ = done.send(());
+        }));
     }
     if let Some(mut err) = child.stderr.take() {
         let captured = Arc::clone(&stderr);
-        thread::spawn(move || {
-            let mut buffer = String::new();
-            if err.read_to_string(&mut buffer).is_ok() {
-                *captured
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+        let done = reader_done_tx.clone();
+        reader_threads.push(thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            let mut collected = String::new();
+            loop {
+                match err.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                        *captured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
+                    }
+                    Err(_) => break,
+                }
             }
-        });
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
+            let _ = done.send(());
+        }));
     }
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -814,16 +844,7 @@ fn run_checker(
                 if Instant::now() >= deadline {
                     kill_process_tree(&mut child);
                     let _ = child.wait();
-                    let stdout = read_captured(&stdout);
-                    let stderr = read_captured(&stderr);
-                    *output = truncate(
-                        &format!(
-                            "checker.sh timed out after {}s; {stdout}\n{stderr}",
-                            timeout.as_secs()
-                        ),
-                        2000,
-                    );
-                    return None;
+                    break None;
                 }
                 thread::sleep(Duration::from_millis(200));
             }
@@ -833,10 +854,24 @@ fn run_checker(
             }
         }
     };
+    // 子进程已退出：带超时等待读取线程收尾（孙进程持管道时 read 不 EOF，不能
+    // 无条件 join；正常情况线程在 EOF 后立即完成）。
+    for _ in &reader_threads {
+        let _ = reader_done_rx.recv_timeout(Duration::from_secs(5));
+    }
     let stdout = read_captured(&stdout);
     let stderr = read_captured(&stderr);
+    if status.is_none() {
+        *output = truncate(
+            &format!(
+                "checker.sh timed out after {}s; {stdout}\n{stderr}",
+                timeout.as_secs()
+            ),
+            2000,
+        );
+        return None;
+    }
     *output = truncate(&format!("{stdout}\n{stderr}"), 2000);
-    // 循环只以 `Ok(Some(status))` 退出（超时/失败均在循环内 return），此处恒为 `Some`。
     status.map(|s| s.code().unwrap_or_default())
 }
 

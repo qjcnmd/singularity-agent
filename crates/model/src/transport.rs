@@ -1764,6 +1764,7 @@ pub(super) fn provider_transport_error(
     } else {
         ModelErrorKind::NetworkError
     };
+    let timeout = error.is_timeout();
     let category = if error.is_timeout() {
         ProviderTransportCategory::Timeout
     } else if error.is_connect() {
@@ -1775,10 +1776,14 @@ pub(super) fn provider_transport_error(
     } else {
         ProviderTransportCategory::Unknown
     };
-    let mut model_error =
-        ModelError::new(kind, "provider transport failed").with_provider_diagnostic(code, stage);
+    // 消息带 reqwest 原因（如 connection refused / timeout），否则只剩笼统的
+    // "provider transport failed"，无法区分连接、超时还是响应体读取失败。
+    // 用 `without_url()` 去掉 URL：reqwest 错误原文含请求地址（脱敏测试要求
+    // 错误序列化不得含地址/密钥），原因本身保留。
+    let message = format!("provider transport failed: {}", error.without_url());
+    let mut model_error = ModelError::new(kind, message).with_provider_diagnostic(code, stage);
     model_error.transport_category = Some(category);
-    if error.is_timeout() {
+    if timeout {
         model_error.timeout_seconds = request_timeout_seconds;
     }
     ProviderError::from_model_error(model_error)
