@@ -1,10 +1,8 @@
-//! `AppServer` 的传输层：默认标准输入输出（stdio），可选 TCP 回环监听。
+//! `AppServer` 的传输层：stdio JSON-Lines 控制面。
 //!
-//! 两种承载都走同一个 `run_with_io` 循环，只是"输入流 + 输出流"来源不同——stdio
-//! 用 `tokio::io::stdin()`/`stdout()`，TCP 由 `TcpListener` 驱动的常驻 daemon 驱动：
-//! 并发接受多个连接，每连接一个独立 `run_with_io` 任务，空闲超时自停。
-//! 输入由 Tokio 单一 owner 读取；turn/start 与 turn/resume 由单一工作线程顺序执行
-//! （同一时刻至多一个 turn），其余请求在输入 owner 的 blocking 任务中直接处理。
+//! CLI 每次命令启动独立 app-server 子进程，经 `tokio::io::stdin()`/`stdout()` 通信；
+//! 不保留 TCP daemon、连接复用或空闲自停。输入由 Tokio 单一 owner 读取；
+//! turn/start 由单一工作线程执行，其余请求在输入 owner 的 blocking 任务中直接处理。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
 //! 顺序性保证事件与响应天然有序，无需全局排序或 cursor/gap 机制。
 
@@ -23,18 +21,17 @@ use singularity_protocol::{
     JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
 };
 use singularity_store::SessionStore;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const APP_ERROR_INVALID_STATE: i64 = -32005;
-/// TCP daemon 无新连接的默认空闲自停阈值。
-const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// 覆盖空闲自停阈值（毫秒）的环境变量，测试用它缩短等待。
-const DAEMON_IDLE_TIMEOUT_MS_ENV: &str = "SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS";
+/// 单条 JSON-Lines frame（含 JSON-RPC 请求/响应）的字节上限。
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FILE_BACKED_STORE_REQUIRED: &str =
     "app-server requires a file-backed SINGULARITY_APP_SERVER_DB";
 const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
@@ -50,120 +47,20 @@ impl ExecutionStop for AppServerCancellationHandle {
     }
 }
 
-/// 在单一 Tokio runtime 内运行 app-server 控制面；传输默认 stdio，可通过
-/// `SINGULARITY_APP_SERVER_LISTEN=tcp://127.0.0.1:PORT` 切换为 TCP 回环监听。
+/// 在单一 Tokio runtime 内运行 stdio app-server 控制面。
 pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
     let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
-    match app_server_listen()? {
-        ListenerConfig::Stdio => {
-            run_with_io(
-                BufReader::new(tokio::io::stdin()),
-                tokio::io::stdout(),
-                configured_db_path,
-                runtime_handle,
-            )
-            .await
-        }
-        ListenerConfig::Tcp { addr } => {
-            let listener = TcpListener::bind(addr)
-                .await
-                .map_err(|error| format!("failed to bind TCP listen address {addr}: {error}"))?;
-            let actual = listener
-                .local_addr()
-                .map_err(|error| format!("failed to read TCP listen address: {error}"))?;
-            // listen 地址含端口 0 时向 OS 申请端口，实际端口须上报给启动方/测试。
-            // 只上报一次：daemon 常驻期间后续连接不再重复 announce。
-            eprintln!("SINGULARITY_APP_SERVER_LISTENING {actual}");
-            let idle_timeout = daemon_idle_timeout()?;
-            run_tcp_daemon(listener, configured_db_path, runtime_handle, idle_timeout).await
-        }
-    }
+    run_with_io(
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+        configured_db_path,
+        runtime_handle,
+    )
+    .await
 }
 
-/// TCP daemon 主循环：并发接受多个连接。每收到一个连接就 `tokio::spawn` 一个独立
-/// 任务运行该连接的 `run_with_io`（因此每连接各自走 initialize/initialized 握手，
-/// 旧连接的握手状态不污染新连接），主循环立即回到 accept 等待下一个连接——单个
-/// 连接上的长 turn/请求不会阻塞其他连接被接受与握手。单个连接的处理失败（如该
-/// 连接自身的协议/传输错误）只记入 stderr，不影响 daemon 及其他连接。连接任务
-/// 是 detached：daemon 因空闲退出时正在处理的连接随 runtime 终止（可接受：空闲
-/// 自停只承诺"无新连接时不再继续服务"）。无新连接持续超过 `idle_timeout` 时正常
-/// 退出（空闲自停，exit 0）。单连接收到 server/shutdown 只结束该连接的处理，不
-/// 退出进程——进程退出由空闲自停接管。
-async fn run_tcp_daemon(
-    listener: TcpListener,
-    configured_db_path: String,
-    runtime_handle: tokio::runtime::Handle,
-    idle_timeout: Duration,
-) -> Result<(), String> {
-    loop {
-        let accepted = tokio::select! {
-            biased;
-            accepted = listener.accept() => {
-                Some(accepted.map_err(|error| {
-                    format!("failed to accept app-server client: {error}")
-                })?)
-            }
-            _ = tokio::time::sleep(idle_timeout) => None,
-        };
-        let Some((stream, _peer)) = accepted else {
-            // 空闲超时：无新连接，正常退出。
-            break;
-        };
-        let (reader, writer) = stream.into_split();
-        // 并发处理：每连接一个 detached 任务，主循环不阻塞，立即接受下一个连接。
-        // `reader`/`writer` 是 TcpStream 拆出的 OwnedReadHalf/OwnedWriteHalf，
-        // 满足 run_with_io 的泛型约束并 Send + 'static，可直接移入 spawn 任务。
-        // spawn 前先 clone 配置/runtime handles（它们在循环内复用，async move 会整体
-        // 移入任务，不能直接把循环变量移进闭包）。
-        let db_path = configured_db_path.clone();
-        let rt_handle = runtime_handle.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                run_with_io(BufReader::new(reader), writer, db_path, rt_handle).await
-            {
-                eprintln!("app-server connection error: {error}");
-            }
-        });
-    }
-    Ok(())
-}
-
-/// 解析空闲自停阈值：`SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS` 覆盖默认 60s。
-fn daemon_idle_timeout() -> Result<Duration, String> {
-    let Ok(raw) = std::env::var(DAEMON_IDLE_TIMEOUT_MS_ENV) else {
-        return Ok(DAEMON_IDLE_TIMEOUT);
-    };
-    let millis = raw
-        .parse::<u64>()
-        .map_err(|_| format!("invalid {DAEMON_IDLE_TIMEOUT_MS_ENV}: {raw}"))?;
-    Ok(Duration::from_millis(millis))
-}
-
-/// app-server 监听模式：未设置 `SINGULARITY_APP_SERVER_LISTEN` 时保留 stdio 默认。
-enum ListenerConfig {
-    Stdio,
-    Tcp { addr: std::net::SocketAddr },
-}
-
-fn app_server_listen() -> Result<ListenerConfig, String> {
-    let spec = match std::env::var("SINGULARITY_APP_SERVER_LISTEN") {
-        Ok(spec) => spec,
-        Err(_) => return Ok(ListenerConfig::Stdio),
-    };
-    let rest = spec.strip_prefix("tcp://").ok_or_else(|| {
-        format!("unsupported SINGULARITY_APP_SERVER_LISTEN scheme (expected tcp://addr): {spec}")
-    })?;
-    let addr = rest.parse::<std::net::SocketAddr>().map_err(|error| {
-        format!("invalid SINGULARITY_APP_SERVER_LISTEN address {spec}: {error}")
-    })?;
-    Ok(ListenerConfig::Tcp { addr })
-}
-
-/// 在任意"输入流 + 输出流"对上运行 JSON-Lines 控制面；stdio 与 TCP 共用此循环。
-///
-/// `reader`/`writer` 由调用方提供：stdio 传 `stdin()`/`stdout()`，TCP 传按 `TcpStream`
-/// 拆出的读/写半。所有同步 AppServer 工作跨 blocking 边界执行。
+/// 在 stdio 上运行 JSON-Lines 控制面；所有同步 AppServer 工作跨 blocking 边界执行。
 async fn run_with_io<R, W>(
     reader: R,
     writer: W,
@@ -192,7 +89,7 @@ where
     let mut server = Some(server);
     // 单 worker 槽位：同一时刻至多一个 turn/start 或 turn/resume 执行。
     let mut turn_task: Option<JoinHandle<Result<(), String>>> = None;
-    let mut lines = reader.lines();
+    let mut reader = reader;
     let mut terminal_error = None;
 
     loop {
@@ -224,7 +121,7 @@ where
                     }
                 }
             }
-            line = lines.next_line() => {
+            line = read_bounded_line(&mut reader) => {
                 let Some(line) = (match line {
                     Ok(line) => line,
                     Err(error) => {
@@ -253,39 +150,19 @@ where
                         continue;
                     }
                 };
-                if !matches!(payload, JsonRpcPayload::Single(_)) {
-                    let batch_outputs = output_tx.clone();
-                    let batch_cancellation = cancellation.clone();
-                    let current_server = server.take().expect("stdio server owner");
-                    let task = tokio::task::spawn_blocking(move || {
-                        let mut server = current_server;
-                        let result = dispatch_batch(
-                            &mut server,
-                            payload,
-                            &batch_outputs,
-                            &batch_cancellation,
-                        );
-                        (server, result)
-                    });
-                    let (next_server, result) = match task.await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            terminal_error = Some(format!("batch dispatch task failed: {error}"));
-                            break;
-                        }
-                    };
-                    server = Some(next_server);
-                    if let Err(error) = result {
+                let JsonRpcPayload::Single(item) = payload else {
+                    // JSON-RPC batch 没有 stdio 消费者；直接拒绝，避免输入批量扩容。
+                    if let Err(error) = send_output_async(
+                        output_tx.clone(),
+                        cancellation.clone(),
+                        JsonRpcMessage::invalid_request(None).to_wire_value(),
+                    )
+                    .await
+                    {
                         terminal_error = Some(error);
                         break;
                     }
-                    if server.as_ref().expect("stdio server owner").shutdown_requested() {
-                        break;
-                    }
                     continue;
-                }
-                let JsonRpcPayload::Single(item) = payload else {
-                    unreachable!("non-single JSON-RPC payload reached single dispatcher")
                 };
                 let message = match item {
                     JsonRpcBatchItem::Message(message) => message,
@@ -473,6 +350,45 @@ where
     }
 }
 
+/// 有界读取一条 JSON-Lines frame（剥离末尾 `\n` / `\r\n`）。
+///
+/// `AsyncBufReadExt::lines` 会把单条超长 frame 无界读入内存；这里用 `take` 给
+/// `read_until` 加硬上限，超限 frame 返回错误并终止连接（fail-closed）。
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<String>> {
+    read_bounded_line_with_limit(reader, MAX_FRAME_BYTES).await
+}
+
+async fn read_bounded_line_with_limit<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_frame_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = reader.take(limit);
+    let read = limited.read_until(b'\n', &mut bytes).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
+        }
+    } else if read as usize >= max_frame_bytes.saturating_add(1) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("JSON-RPC frame exceeds {max_frame_bytes} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "JSON-RPC frame is not UTF-8")
+    })
+}
+
 fn initialize_app_server(
     configured_db_path: &str,
     runtime_handle: tokio::runtime::Handle,
@@ -507,76 +423,6 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
             Some(method)
                 if method == Method::TurnStart.as_str() || method == Method::TurnResume.as_str()
         )
-}
-
-/// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生控制响应。
-///
-/// batch 与单请求同路径：无 long-worker 特殊分支，turn 方法在 batch 中顺序执行。
-fn dispatch_batch(
-    server: &mut AppServer,
-    payload: JsonRpcPayload,
-    outputs: &mpsc::Sender<Value>,
-    cancellation: &dyn ExecutionStop,
-) -> Result<(), String> {
-    let items = match payload {
-        JsonRpcPayload::EmptyBatch => {
-            return send_output(
-                outputs,
-                cancellation,
-                JsonRpcMessage::invalid_request(None).to_wire_value(),
-            )
-            .map(|_| ());
-        }
-        JsonRpcPayload::Batch(items) => items,
-        JsonRpcPayload::Single(_) => {
-            return Err("single JSON-RPC payload reached batch dispatcher".to_string());
-        }
-    };
-    let mut notifications = Vec::<AppServerOutput>::new();
-    let mut responses = Vec::new();
-    for item in items {
-        match item {
-            JsonRpcBatchItem::Invalid { id } => {
-                responses.push(JsonRpcMessage::invalid_request(id).to_wire_value());
-            }
-            JsonRpcBatchItem::Message(message) => {
-                let notification = message.is_notification();
-                let request_id = message.id().cloned();
-                match server.handle_with_output(message) {
-                    Ok(messages) => {
-                        for output in messages {
-                            match serde_json::from_value::<JsonRpcMessage>(output.clone()) {
-                                Ok(JsonRpcMessage::Notification(_)) if !notification => {
-                                    notifications.push(output);
-                                }
-                                Ok(JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_))
-                                    if !notification =>
-                                {
-                                    responses.push(output);
-                                }
-                                Ok(_) if notification => {}
-                                Ok(_) | Err(_) => {
-                                    responses.push(internal_error_value(
-                                        request_id.clone(),
-                                        "dispatcher produced an invalid response envelope",
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(error) if !notification => {
-                        responses.push(transport_error_value(request_id, &error));
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-    send_app_server_outputs(outputs, cancellation, notifications)?;
-    if responses.is_empty() {
-        return Ok(());
-    }
-    send_output(outputs, cancellation, Value::Array(responses)).map(|_| ())
 }
 
 /// 在单一 turn 工作线程内执行 turn/start 或 turn/resume，事件与最终响应顺序入队。
@@ -1183,149 +1029,43 @@ mod tests {
     }
 
     #[test]
-    fn mixed_batch_is_sequential_and_only_requests_produce_ordered_responses() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
-        let cancellation = server.cancellation_handle();
-        let (outputs, mut receiver) = test_output_channel(8);
-        let payload = parse_json_rpc_payload(
-            r#"[
-                {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
-                {"jsonrpc":"2.0","method":"initialized","params":{}},
-                {"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}},
-                {"jsonrpc":"2.0","method":"thread/read","params":{}},
-                {"jsonrpc":"2.0","method":"unknown","params":{}},
-                {"jsonrpc":"2.0","method":"unknown","id":3,"params":{}},
-                {"jsonrpc":"2.0","method":"thread/read","id":4,"params":{}}
-            ]"#,
-        )
-        .expect("batch parses");
-
-        dispatch_batch(&mut server, payload, &outputs, &cancellation).expect("dispatch batch");
-
-        let output = receiver.try_recv().expect("batch response");
-        let responses = output.as_array().expect("batch response array");
-        assert_eq!(responses.len(), 4);
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[1]["id"], 2);
-        assert_eq!(responses[2]["id"], 3);
-        assert_eq!(responses[2]["error"]["code"], -32601);
-        assert_eq!(responses[3]["id"], 4);
-        assert_eq!(responses[3]["error"]["code"], -32602);
-        assert!(
-            responses
-                .iter()
-                .all(|response| response["jsonrpc"] == "2.0")
-        );
-    }
-
-    #[test]
-    fn batch_dispatches_turn_methods_like_any_other_request() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
-        let cancellation = server.cancellation_handle();
-        let (outputs, mut receiver) = test_output_channel(16);
-        let payload = parse_json_rpc_payload(
-            r#"[
-                {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
-                {"jsonrpc":"2.0","method":"initialized","params":{}},
-                {"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}},
-                {"jsonrpc":"2.0","method":"turn/start","id":3,"params":{}},
-                {"jsonrpc":"2.0","method":"turn/resume","id":4,"params":{}},
-                {"jsonrpc":"2.0","method":"turn/start","params":{}},
-                {"jsonrpc":"2.0","method":"server/capabilities","id":6,"params":{}}
-            ]"#,
-        )
-        .expect("batch parses");
-
-        dispatch_batch(&mut server, payload, &outputs, &cancellation).expect("dispatch batch");
-
-        let output = receiver.try_recv().expect("batch response");
-        let responses = output.as_array().expect("batch response array");
-        assert_eq!(responses.len(), 5);
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[1]["id"], 2);
+    fn bounded_line_reader_strips_line_endings() {
+        let mut reader = tokio::io::BufReader::new(&b"hello\r\nworld\n"[..]);
         assert_eq!(
-            responses[1]["result"]["transports"][0]["transport"],
-            "stdio"
+            block_on(read_bounded_line_with_limit(&mut reader, 32))
+                .expect("first line")
+                .as_deref(),
+            Some("hello")
         );
-        // 无 long-worker 特殊分支：turn 方法与普通请求同路径，参数校验失败返回
-        // Invalid params，而不是 batch 拒绝。
-        for (response, id) in responses.iter().skip(2).zip([3, 4]) {
-            assert_eq!(response["id"], id);
-            assert_eq!(response["error"]["code"], -32602);
-            assert_eq!(response["error"]["message"], "Invalid params");
-        }
-        assert_eq!(responses[4]["id"], 6);
-        assert!(responses[4]["result"]["transports"].is_array());
-        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            block_on(read_bounded_line_with_limit(&mut reader, 32))
+                .expect("second line")
+                .as_deref(),
+            Some("world")
+        );
+        assert!(block_on(read_bounded_line_with_limit(&mut reader, 32))
+            .expect("eof")
+            .is_none());
     }
 
     #[test]
-    fn all_notification_batch_has_no_output_even_for_unknown_method_or_invalid_params() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
-        let cancellation = server.cancellation_handle();
-        let (outputs, mut receiver) = test_output_channel(8);
-        let payload = parse_json_rpc_payload(
-            r#"[
-                {"jsonrpc":"2.0","method":"thread/read","params":{}},
-                {"jsonrpc":"2.0","method":"unknown","params":{}}
-            ]"#,
-        )
-        .expect("notification batch parses");
-
-        dispatch_batch(&mut server, payload, &outputs, &cancellation)
-            .expect("dispatch notification batch");
-
-        assert!(receiver.try_recv().is_err());
+    fn bounded_line_reader_rejects_oversized_frames() {
+        let mut reader = tokio::io::BufReader::new(&b"123456789\n"[..]);
+        let error = block_on(read_bounded_line_with_limit(&mut reader, 4))
+            .expect_err("oversized frame must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 4 bytes"));
     }
 
     #[test]
-    fn notification_only_request_is_invalid_without_changing_batch_notification_contract() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
-        let cancellation = server.cancellation_handle();
-        let (outputs, mut receiver) = test_output_channel(2);
-        let payload = parse_json_rpc_payload(
-            r#"[
-                {"jsonrpc":"2.0","method":"initialized","id":1,"params":{}},
-                {"jsonrpc":"2.0","method":"initialized","params":{}},
-                {"jsonrpc":"2.0","method":"thread/read","params":{}}
-            ]"#,
-        )
-        .expect("mixed notification batch parses");
-
-        dispatch_batch(&mut server, payload, &outputs, &cancellation)
-            .expect("dispatch mixed notification batch");
-
-        let output = receiver.try_recv().expect("invalid request response");
-        let responses = output.as_array().expect("batch response array");
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["id"], 1);
-        assert_eq!(responses[0]["error"]["code"], -32600);
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn empty_batch_returns_standard_invalid_request() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None, None));
-        let cancellation = server.cancellation_handle();
-        let (outputs, mut receiver) = test_output_channel(1);
-
-        dispatch_batch(
-            &mut server,
-            JsonRpcPayload::EmptyBatch,
-            &outputs,
-            &cancellation,
-        )
-        .expect("dispatch empty batch");
-
-        let response = receiver.try_recv().expect("invalid request response");
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["id"], Value::Null);
-        assert_eq!(response["error"]["code"], -32600);
+    fn bounded_line_reader_accepts_frame_at_limit() {
+        let mut reader = tokio::io::BufReader::new(&b"1234\n"[..]);
+        assert_eq!(
+            block_on(read_bounded_line_with_limit(&mut reader, 4))
+                .expect("frame at limit")
+                .as_deref(),
+            Some("1234")
+        );
     }
 
     #[test]
