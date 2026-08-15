@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -527,55 +526,13 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
     // 读取线程完成信号：join 前带超时等待（见下方注释），不能无条件 join。
     let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel::<()>();
     let mut reader_threads = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let captured = Arc::clone(&stdout);
-        let done = reader_done_tx.clone();
-        reader_threads.push(thread::spawn(move || {
-            // 边读边同步共享缓冲：孙进程继承管道写端时 read 不会 EOF（join 超时后
-            // 主线程读 Mutex 也能拿到已读部分），不能只在 EOF 后一次性写入。
-            let mut buffer = [0u8; 8192];
-            let mut collected = String::new();
-            loop {
-                match out.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
-                        *captured
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
-                    }
-                    Err(_) => break,
-                }
-            }
-            *captured
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
-            let _ = done.send(());
-        }));
+    if let Some(out) = child.stdout.take() {
+        spawn_reader_capture(out, Arc::clone(&stdout), reader_done_tx.clone());
+        reader_threads.push(());
     }
-    if let Some(mut err) = child.stderr.take() {
-        let captured = Arc::clone(&stderr);
-        let done = reader_done_tx.clone();
-        reader_threads.push(thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            let mut collected = String::new();
-            loop {
-                match err.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
-                        *captured
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
-                    }
-                    Err(_) => break,
-                }
-            }
-            *captured
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
-            let _ = done.send(());
-        }));
+    if let Some(err) = child.stderr.take() {
+        spawn_reader_capture(err, Arc::clone(&stderr), reader_done_tx.clone());
+        reader_threads.push(());
     }
 
     let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -602,18 +559,6 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
     for _ in &reader_threads {
         let _ = reader_done_rx.recv_timeout(Duration::from_secs(5));
     }
-    let read_stdout = || {
-        stdout
-            .lock()
-            .map(|captured| captured.clone())
-            .unwrap_or_default()
-    };
-    let read_stderr = || {
-        stderr
-            .lock()
-            .map(|captured| captured.clone())
-            .unwrap_or_default()
-    };
     if timed_out {
         let _ = child.wait();
         return Ok(SgRun {
@@ -621,13 +566,13 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
             turn_interrupted: false,
             turn_failed: false,
             turn_usage: None,
-            stdout: read_stdout(),
-            stderr: read_stderr(),
+            stdout: read_captured(&stdout),
+            stderr: read_captured(&stderr),
         });
     }
     let status = status.ok_or_else(|| "sg run terminated without status".to_string())?;
-    let stdout_text = read_stdout();
-    let stderr_text = read_stderr();
+    let stdout_text = read_captured(&stdout);
+    let stderr_text = read_captured(&stderr);
     if !status.success() {
         // 失败时仍尝试解析 stdout 中的 JSON（json 模式失败前可能已输出）。
         let parsed = parse_sg_json(&stdout_text);
@@ -740,6 +685,39 @@ fn read_captured(captured: &Arc<std::sync::Mutex<String>>) -> String {
     captured.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
+/// 为子进程管道 spawn 一个读取线程（run_sg / run_checker 共用）。
+///
+/// **边读边同步**共享缓冲：孙进程继承管道写端时 `read` 不会 EOF（等待超时后主线程
+/// 读 Mutex 也能拿到已读部分），不能只在 EOF 后一次性写入。EOF/错误后发送完成信号，
+/// 调用方用 `recv_timeout` 带超时等待收尾（无条件 join 会永久阻塞——孙进程持管道时
+/// read 永不返回）。
+fn spawn_reader_capture(
+    mut reader: impl std::io::Read + Send + 'static,
+    captured: Arc<std::sync::Mutex<String>>,
+    done: std::sync::mpsc::Sender<()>,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        let mut collected = String::new();
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                    *captured
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
+                }
+                Err(_) => break,
+            }
+        }
+        *captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
+        let _ = done.send(());
+    });
+}
+
 /// 运行 checker.sh（cwd = workspace 副本），返回退出码；超时或无退出码返回 `None`。
 ///
 /// 与 `run_sg` 保持一致在超时后 kill 进程树：checker.sh 死循环/等待输入时不会无限阻塞。
@@ -788,53 +766,13 @@ fn run_checker(
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));
     let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel::<()>();
     let mut reader_threads = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let captured = Arc::clone(&stdout);
-        let done = reader_done_tx.clone();
-        reader_threads.push(thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            let mut collected = String::new();
-            loop {
-                match out.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
-                        *captured
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
-                    }
-                    Err(_) => break,
-                }
-            }
-            *captured
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
-            let _ = done.send(());
-        }));
+    if let Some(out) = child.stdout.take() {
+        spawn_reader_capture(out, Arc::clone(&stdout), reader_done_tx.clone());
+        reader_threads.push(());
     }
-    if let Some(mut err) = child.stderr.take() {
-        let captured = Arc::clone(&stderr);
-        let done = reader_done_tx.clone();
-        reader_threads.push(thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            let mut collected = String::new();
-            loop {
-                match err.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
-                        *captured
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
-                    }
-                    Err(_) => break,
-                }
-            }
-            *captured
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
-            let _ = done.send(());
-        }));
+    if let Some(err) = child.stderr.take() {
+        spawn_reader_capture(err, Arc::clone(&stderr), reader_done_tx.clone());
+        reader_threads.push(());
     }
     let deadline = Instant::now() + timeout;
     let status = loop {
