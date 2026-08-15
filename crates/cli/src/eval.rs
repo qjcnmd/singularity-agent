@@ -659,6 +659,18 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
 }
 
+/// 从 bash 可执行路径推导 Git for Windows 安装根（`.../Git/usr/bin/bash.exe` → `.../Git`）。
+fn git_root_for_bash(bash: &str) -> Option<String> {
+    let root = Path::new(bash)
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "usr"))?
+        .parent()?
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .replace('\\', "/");
+    Some(root)
+}
+
 /// 探测本机可用的 bash：优先 Git for Windows 的显式安装路径。
 fn resolve_default_bash() -> Option<String> {
     for candidate in [
@@ -676,13 +688,26 @@ fn resolve_default_bash() -> Option<String> {
 fn run_checker(bash: &str, checker: &Path, workspace: &Path, output: &mut String) -> Option<i32> {
     // bash 把反斜杠当转义符：Windows 路径必须转正斜杠再作为参数。
     let checker_arg = checker.to_string_lossy().replace('\\', "/");
-    let mut child = match Command::new(bash)
+    let mut command = Command::new(bash);
+    command
         .arg(&checker_arg)
         .current_dir(workspace)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // 受限 PATH 环境（如沙箱）可能不含 Git for Windows 的 MSYS 路径（/usr/bin 等），
+    // 导致 checker.sh 内 dirname/cd 等 POSIX 工具找不到（实测 dirname: command not
+    // found）。按 bash 所在 Git 安装注入 usr/bin、bin、mingw64/bin 前缀兜底。
+    if let Some(git_root) = git_root_for_bash(bash) {
+        let msys_path = [
+            format!("{git_root}/usr/bin"),
+            format!("{git_root}/bin"),
+            format!("{git_root}/mingw64/bin"),
+        ]
+        .join(";");
+        let current = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{msys_path};{current}"));
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             *output = format!("failed to spawn checker.sh: {error}");
