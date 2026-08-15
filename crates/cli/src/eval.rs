@@ -524,9 +524,12 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
     // 会让输出大的 --json 事件流阻塞子进程，直到超时。
     let stdout = Arc::new(std::sync::Mutex::new(String::new()));
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+    // 读取线程完成信号：join 前带超时等待（见下方注释），不能无条件 join。
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel::<()>();
     let mut reader_threads = Vec::new();
     if let Some(mut out) = child.stdout.take() {
         let captured = Arc::clone(&stdout);
+        let done = reader_done_tx.clone();
         reader_threads.push(thread::spawn(move || {
             let mut buffer = String::new();
             if out.read_to_string(&mut buffer).is_ok() {
@@ -534,10 +537,12 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
+            let _ = done.send(());
         }));
     }
     if let Some(mut err) = child.stderr.take() {
         let captured = Arc::clone(&stderr);
+        let done = reader_done_tx.clone();
         reader_threads.push(thread::spawn(move || {
             let mut buffer = String::new();
             if err.read_to_string(&mut buffer).is_ok() {
@@ -545,6 +550,7 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
             }
+            let _ = done.send(());
         }));
     }
 
@@ -564,10 +570,13 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
             Err(error) => return Err(format!("failed to poll sg run: {error}")),
         }
     };
-    // 子进程已退出：join 读取线程确保管道内容完整（detached 线程可能在主线程
-    // 读 Mutex 时尚未写完，导致 stdout/stderr 捕获竞态丢失，错误信息不可诊断）。
-    for reader in reader_threads {
-        let _ = reader.join();
+    // 子进程已退出：等待读取线程完成，确保 stdout/stderr 捕获完整（detached 线程
+    // 可能在主线程读 Mutex 时尚未写完，导致错误信息竞态丢失）。**带超时**：孙进程
+    // 继承管道写端时 read_to_string 不会 EOF，无条件 join 会永久阻塞整个 eval
+    // （实测：超时 kill 后孙进程持管道，cell 线程卡死 47 分钟）。每个读取线程最多
+    // 等 5s，超时则放弃（线程仍挂着，进程退出时由 OS 回收），读当前已捕获内容。
+    for _ in &reader_threads {
+        let _ = reader_done_rx.recv_timeout(Duration::from_secs(5));
     }
     let read_stdout = || {
         stdout
