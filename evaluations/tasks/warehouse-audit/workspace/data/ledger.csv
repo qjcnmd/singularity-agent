@@ -1,0 +1,6 @@
+sku,kind,qty,date,unit_price,name
+A-100,IN,10,2026-08-01,12.50,Widget
+B-200,IN,20,2026-08-01,3.00,Gadget
+A-100,IN,5,2026-8-2,12.50,Widget
+A-100,OUT,3,2026-08-02,12.50,Widget
+B-200,OUT,7,2026-8-3,3.00,Gadget

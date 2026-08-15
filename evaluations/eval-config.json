@@ -4,10 +4,13 @@
     "log-stats-feature",
     "config-diagnose",
     "cart-refactor",
-    "pipeline-mislead"
+    "pipeline-mislead",
+    "warehouse-audit",
+    "billing-calc",
+    "cache-ttl"
   ],
   "models": [
-    "dashscope/deepseek-v4-flash-0731#max"
+    "opencode-go/deepseek-v4-flash#max"
   ],
   "output_dir": "evaluations/output",
   "timeout_secs": 600,

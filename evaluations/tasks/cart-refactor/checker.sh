@@ -13,7 +13,7 @@ if [ ! -f "$money_file" ]; then
     echo "REQUIRED: shopping/money.py is missing" >&2
     exit 2
 fi
-python - "$money_file" << 'PYEOF'
+if ! python - "$money_file" << 'PYEOF'
 import importlib.util
 import sys
 
@@ -24,7 +24,7 @@ assert callable(getattr(module, "format_amount")), "money.format_amount missing"
 assert isinstance(getattr(module, "DISCOUNT_THRESHOLDS"), tuple), "money.DISCOUNT_THRESHOLDS missing"
 assert module.DISCOUNT_THRESHOLDS == ((500, 0.9), (100, 0.95)), "DISCOUNT_THRESHOLDS content mismatch"
 PYEOF
-if [ $? -ne 0 ]; then
+then
     echo "REQUIRED: money.py contract not satisfied" >&2
     exit 2
 fi
