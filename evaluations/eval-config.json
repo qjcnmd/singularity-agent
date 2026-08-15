@@ -1,18 +1,14 @@
 {
   "tasks": [
-    "invoice-bug",
-    "log-stats-feature",
-    "config-diagnose",
-    "cart-refactor",
-    "pipeline-mislead",
     "warehouse-audit",
     "billing-calc",
     "cache-ttl"
   ],
   "models": [
-    "opencode-go/deepseek-v4-flash#max"
+    "opencode-go/deepseek-v4-flash#max",
+    "longcat/LongCat-2.0#high"
   ],
   "output_dir": "evaluations/output",
   "timeout_secs": 600,
-  "max_parallel": 5
+  "max_parallel": 6
 }
