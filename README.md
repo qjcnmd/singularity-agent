@@ -8,10 +8,10 @@ Singularity 是一个由 Rust 实现的本地命令行编码代理。核心产�
 
 ```text
 sg
-  -> singularity_app_server (stdio JSON-RPC)
+  -> singularity_app_server（默认常驻 TCP 回环 daemon，空闲自停；stdio 回退）
      -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/bash/edit/write）
      -> OpenAiProvider
-     -> SQLite 状态库 + 会话 JSONL
+     -> SQLite 状态（thread/turn 锁与恢复）+ 会话 JSONL（工作区 .singularity/agent-sessions/）
 ```
 
 详细边界、对象、状态流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。
@@ -95,7 +95,7 @@ sg config models
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
-工具能力由运行时自动协商，不是用户配置项；协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](docs/singularity.md#7-model-与-provider) 为准。
+工具能力按 provider 静态能力声明（内置模型表 + 用户配置覆盖）决定，不做运行时协商；协议选择、工具 schema 与 fail-closed 边界以 [架构事实文档](docs/singularity.md#9-provider-与模型) 为准。
 
 检查配置：
 

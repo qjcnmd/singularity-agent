@@ -1,17 +1,18 @@
-# Singularity 架构（重构目标形态）
+# Singularity 架构（当前实现）
 
-> **演进状态说明**：本文档描述重构**目标架构**，依据 `outputs/arch-review/00-decision-baseline.md`（十项裁决 + 目标形态 + 重构计划）绘制；技术细节对照其中引用的 Pi v0.84.1 一手源码核查记录（`outputs/arch-review/01`、`02`）与当前源码。**重构进行中**（Phase 1–7，状态见附录 B），各 Phase 完成后本文实时更新；当前源码可能与本文不一致，以本文目标形态为准。已移除机制的细节不展开，见附录 A；历史实现由 Git 保存。
+> **本文档描述当前有效架构**，与 `origin/main` 源码一致；技术细节对照 Pi v0.84.1 一手源码核查记录（`outputs/arch-review/01`、`02`）与当前源码。已移除机制的细节不展开，见附录 A；历史实现由 Git 保存。
 >
 > **维护规则**：修改以下任一事实时同步更新本文：进程边界、协议 transport/命令/事件、会话格式、Compaction、工具面与工具语义、Provider/模型能力声明、trust 决策、配置 schema、评估工具、发布二进制。
 
 ## 1. 总览与进程架构（图 a）
 
-采用 Codex 进程模式（裁决 4）：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史 seed、输入组装、工具装配、trust 决策）全部下沉到 core。
+采用 Codex 进程模式（裁决 4）：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（JSON-RPC transport，连接级单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史 seed、输入组装、工具装配、trust 决策）全部下沉到 core。
 
 - **headless core**：AgentLoop（Pi 式 runLoop）、SessionManager（JSONL 树）、Compaction、工具注册表（ToolSpec 单一事实源）、消息与事件流、资源加载（AGENTS.md + trust 门控）、Provider 边界（trait Provider）。
-- **app-server**：stdio JSON-RPC（JSONL framing）；命令/事件协议收敛为 Pi RPC 级命令集 + 事件流；无 7 态 Turn、无 trace 合同、无 cursor/gap/背压/全局排序、无 16-worker 池。
-- **客户端**：`sg` CLI（子进程 spawn app-server + JSON-RPC）；未来 Desktop 同协议、同配置、同会话。
-- **共享事实**：`~/.singularity/config.toml`（全局配置单一事实源，CLI 与桌面端读同一文件）；`~/.singularity/sessions/`（JSONL 会话，唯一持久记录）。
+- **app-server**：JSON-RPC（JSONL framing）；命令/事件协议收敛为 Pi RPC 级命令集 + 事件流；无 7 态 Turn、无 trace 合同、无 cursor/gap/背压/全局排序、无 16-worker 池。
+- **传输（daemon 化后）**：CLI 默认连接常驻 **TCP 回环 daemon**（127.0.0.1，JSON-Lines，空闲 60s 自停，单实例启动锁 + 状态文件复用），`SINGULARITY_APP_SERVER_TRANSPORT=stdio` 或 `SINGULARITY_APP_SERVER_LISTEN` 可切回 stdio / 自定监听；eval 每 cell 强制 stdio 隔离。
+- **客户端**：`sg` CLI（默认 daemon 复用/拉起，stdio 回退）；未来 Desktop 同协议、同配置、同会话。
+- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源，CLI 与桌面端读同一文件）；`~/.singularity/auth.v1-*.json`（私有认证文件，owner-only ACL）；会话为工作区 `.singularity/agent-sessions/<thread_id>.jsonl`（JSONL，唯一持久记录）。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 不依赖 evaluation。
 
 ```mermaid
@@ -20,7 +21,7 @@ flowchart LR
         CLI["sg CLI<br/>(子进程协议客户端)"]
         Dsk["未来 Desktop"]
     end
-    Svr["app-server<br/>stdio JSON-RPC (JSONL)<br/>单 worker 顺序处理<br/>无业务状态"]
+    Svr["app-server<br/>TCP daemon / stdio JSON-RPC (JSONL)<br/>连接级单 worker 顺序处理<br/>无业务状态"]
     subgraph Core["headless core（库）"]
         Loop["AgentLoop<br/>(Pi 式 runLoop)"]
         SM["SessionManager<br/>(JSONL 树)"]
@@ -30,9 +31,9 @@ flowchart LR
         RL["资源加载<br/>(AGENTS.md + trust 门控)"]
         PV["Provider 边界<br/>(trait Provider)"]
     end
-    CFG[("~/.singularity/config.toml<br/>全局配置单一事实源")]
-    SES[("~/.singularity/sessions/<br/>JSONL 会话")]
-    CLI -->|"spawn + stdio JSON-RPC"| Svr
+    CFG[("~/.singularity/config.json<br/>全局配置单一事实源")]
+    SES[("工作区 .singularity/agent-sessions/<br/>JSONL 会话")]
+    CLI -->|"daemon 复用/拉起 (TCP) 或 spawn (stdio)"| Svr
     Dsk -->|"同一协议"| Svr
     Svr --> Core
     Loop --> SM
@@ -51,7 +52,7 @@ flowchart LR
 
 ## 2. 主调用链（图 b）
 
-`sg run <goal>` 完整链路：spawn app-server 子进程 → LSP 式握手（initialize/initialized）→ `thread/start`（记录 cwd 与模型）→ `turn/start`（goal 交给 core）→ core 加载项目指令（trust 门控）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL。`sg continue` 重开既有会话文件，走同一条链。
+`sg run <goal>` 完整链路：连接 app-server（默认复用常驻 TCP daemon；无可复用实例时拉起，stdio 回退）→ LSP 式握手（initialize/initialized）→ `thread/start`（记录 cwd 与模型）→ `turn/start`（goal 交给 core）→ core 加载项目指令（trust 门控）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL。`sg continue` 重开既有会话文件，走同一条链。
 
 ```mermaid
 sequenceDiagram
@@ -59,7 +60,7 @@ sequenceDiagram
     participant S as app-server
     participant C as headless core
     participant P as Provider (HTTP)
-    participant F as 会话 JSONL (~/.singularity/sessions/)
+    participant F as 会话 JSONL (工作区 .singularity/agent-sessions/)
     CLI->>S: spawn 子进程 + stdio JSON-RPC
     CLI->>S: initialize / initialized（握手）
     CLI->>S: thread/start {cwd, model}
@@ -114,9 +115,9 @@ flowchart TD
 
 **工具面（裁决 3，对齐 Pi）**：默认 read/bash/edit/write；可选只读 grep/find/ls。工具 schema 见第 12.2 节。
 
-**执行可靠性（裁决 5，对齐 Pi）**：
+**执行可靠性（裁决 5，对齐 Pi，实测调整）**：
 
-- 超时可选、无默认；上限保护 2^31-1 ms。
+- 超时：bash 默认 120s（可显式 `timeout` 覆盖）；上限保护 2^31-1 ms。
 - 输出截断：保留最后 2000 行 / 50 KiB，超限写入临时文件并返回 fullOutputPath。
 - 中断：abort 信号杀死整个进程树。
 - 工作目录绑定会话/任务工作区。
@@ -130,7 +131,7 @@ flowchart TD
     C -- 是 --> D["参数校验<br/>(validateToolArguments)"]
     D --> E["hook: beforeToolCall<br/>(可 block / terminate 整批)"]
     E -- "block" --> R1
-    E -- 允许 --> F["执行（进程内）<br/>可选超时(无默认, 上限 2^31-1 ms)<br/>中断杀进程树<br/>cwd 绑定工作区"]
+    E -- 允许 --> F["执行（进程内）<br/>bash 默认 120s 超时(可覆盖, 上限 2^31-1 ms)<br/>中断杀进程树<br/>cwd 绑定工作区"]
     F --> G["输出截断<br/>最后 2000 行 / 50 KiB<br/>超限: 临时文件 + fullOutputPath"]
     G --> H["hook: afterToolCall<br/>(可改 content / details / usage)"]
     H --> I["toolResult 消息回传<br/>(按调用顺序, 进入下一回合)"]
@@ -140,7 +141,7 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于 `~/.singularity/sessions/` 自管目录。**会话 JSONL 是唯一持久事实源**（裁决 1）：无 checkpoint、无 turn 级崩溃恢复；进程退出即中断，重开会话即继续。
+会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于工作区 `.singularity/agent-sessions/` 自管目录（按 thread 一个文件）。**会话 JSONL 是唯一持久事实源**（裁决 1）：无 checkpoint、无 turn 级崩溃恢复；进程退出即中断，重开会话即继续。
 
 - 落盘时机：只有终态消息（`message_end`）追加 JSONL；流式 delta 不落盘；纯 user 消息在第一条 assistant 消息之前不写盘（照 Pi 语义）。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
@@ -216,21 +217,22 @@ sequenceDiagram
 轻量回归评估工具（裁决 2），独立于产品 crate（不进入产品协议与发布包）：
 
 - **任务集**（通用格式）：task_id + `workspace/`（几百~1000 行项目，含测试）+ `instruction.md` + `checker.sh`。
-- **执行规模**：固定 5 题 × 2 模型 = 10 cell 全并行（定基线暂定模型组：opencode-go/deepseek-v4-flash@max、longcat/LongCat-2.0@high；具体模型与选题属评估配置，实施时定稿）。
-- **流程**：准备干净 workspace（复制/worktree）→ 子进程跑 `sg`（**真实产品链路，禁止 fake/mock**）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**）→ 从 rollout + usage 聚合 12 项指标。
-- **12 项指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率（cached/input）；成本估算；耗时拆解；工具调用数；工具失败数；重试数；重复动作（可选）；稳定性（多 trial，可选）。
-- 每次 harness 改动后重跑，指标按模型分组对比；前期目标 = 先跑通链路，指标好坏其次。
+- **执行规模**：3 题 × 2 模型 = 6 cell 全并行（用户裁决：一次 3 题防供应商并发限流；模型组：opencode-go/deepseek-v4-flash#max、longcat/LongCat-2.0#high；题集为高难度替换题：warehouse-audit / billing-calc / cache-ttl）。
+- **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 强制 `SINGULARITY_APP_SERVER_TRANSPORT=stdio` 隔离）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；300s 超时防挂死）→ 从 rollout + usage 聚合指标。
+- **判分语义**：turn 失败但 checker 通过时判 passed（workspace 状态是客观证据）；checker 输出经读取线程边读边同步捕获（孙进程持管道不 EOF 也能拿到已读部分）。
+- **指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率；成本估算；耗时拆解；工具调用数；工具失败数；重复动作。
+- 每次 harness 改动后重跑，指标按模型分组对比。
 
 ```mermaid
 flowchart LR
     TS["任务集<br/>task_id + workspace/（含测试）<br/>+ instruction.md + checker.sh"]
-    R["runner<br/>(独立极简二进制)"]
-    W["准备干净 workspace<br/>(复制 / worktree)"]
-    SG["sg 子进程<br/>(真实产品链路, 禁止 mock)"]
+    R["runner<br/>(sg eval 子命令)"]
+    W["准备干净 workspace 副本<br/>(含 checker.sh)"]
+    SG["sg run 子进程<br/>(真实产品链路, 禁止 mock, stdio)"]
     RO["会话文件 = rollout"]
-    CH["独立运行 checker.sh<br/>exit 0 = 通过<br/>(不信 agent 自报)"]
-    M["12 项指标<br/>(rollout + usage 聚合)"]
-    C["回归对比<br/>5 题 × 2 模型 = 10 cell 全并行"]
+    CH["独立运行 checker.sh<br/>300s 超时<br/>exit 0 = 通过<br/>(不信 agent 自报)"]
+    M["指标聚合<br/>(rollout + usage)"]
+    C["回归对比<br/>3 题 × 2 模型 = 6 cell 全并行"]
     TS --> R --> W --> SG --> RO --> CH --> M --> C
 ```
 
@@ -241,15 +243,15 @@ flowchart LR
 **静态能力声明**（裁决 8）：删除 capability probe 体系；每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；context window 未声明时保持 unknown，不做网络探测或能力协商。溢出重试兜底保留（见第 6 节）。
 
 - **Provider 边界**：`trait Provider`；保留 OpenAI-compatible 双协议 adapter（Chat Completions / Responses），同一请求对象投影两条 wire 路径，共用请求校验、重试、响应归一化；`finish_reason=length`/`content_filter` 作为未完成响应 fail closed。
-- **usage 记账**：每次调用回传 input/output/total、cached input、reasoning token 与 cost（含 cached_input_tokens/cost 字段），供评估指标与诊断使用。
-- **重试**：单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。
+- **usage 记账**：每次调用回传 input/output/total、cached input、reasoning token 与 cost（含 cached_input_tokens/cost 字段），供评估指标与诊断使用。成本按 `(input − cached)×input价 + cached×cache价 + output×output价` 计（input 已含缓存命中，命中部分按 cache 价）。
+- **重试（两层）**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。**运行级**（agent 层）在传输层耗尽后对瞬时类错误（NetworkError/RateLimited/ProviderOverloaded + 瞬时文本信号）再尝试至多 5 次（2s 指数退避 2/4/8/16s，可取消）；取消/挂起超时/认证/限额/校验/上下文溢出不重试。
 - **思考档位**：每模型显式声明 reasoning 档位；Chat 与 Responses 分别按各自 wire 合同发送对应字段。
-- **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等），不包含 API key、endpoint、原始请求/响应或原始错误文本；错误保留真实因果差异，不靠字符串匹配驱动控制流。
+- **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等）+ 脱敏后的真实错误文本（敏感内容降级为 `Internal error`，不包含 API key、endpoint 原始请求/响应）；错误保留真实因果差异，不靠字符串匹配驱动控制流。
 - **配置校验**：配置值在本地信任边界完整校验，fail closed，不静默 trim/纠正；错误不携带原始值；API key 只通过配置引用的环境变量名解析，不进入会话/日志。
 
 ## 10. 配置与信任
 
-**配置单一事实源**：`~/.singularity/config.toml`（全局）+ 项目覆盖；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。具体 schema（providers/models/默认设置）参照现有 config.json 迁移，实施时定稿（遗留事项）。
+**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件 `~/.singularity/auth.v1-*.json` 以 owner-only ACL 校验。daemon 状态/锁文件 `%USERPROFILE%\.singularity/app-server-daemon.json`（pid/port）与 `.lock`（单实例启动锁）。
 
 **trust 决策（裁决 7）**：对齐 Pi——陌生项目 ask / always / never；决策持久化到信任存储（CLI 显式覆盖 → 是否存在项目资源 → 信任存储 → 默认策略 → 交互选择）。**不信任的项目不加载项目指令、技能与扩展**。cap-std 路径硬化（nofollow capability 绑定）已删除。
 
@@ -257,9 +259,9 @@ flowchart LR
 
 ## 11. 客户端与协议
 
-**客户端**：`sg` CLI 是 app-server 子进程协议客户端（spawn + stdio JSON-RPC）；未来 Desktop 走同一协议、同一配置、同一会话。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue`（重开既有会话继续）、`sg turn`（status / interrupt / resume / pause / input，input 支持 steer / follow_up 投递到内存队列）、`sg threads`、`sg config`（模型与配置管理）。approve/approvals 与 trace 命令随对应机制移除。
+**客户端**：`sg` CLI 是 app-server 协议客户端——默认**复用常驻 TCP daemon**（读状态文件 pid/port → 握手探活 → 复用；无可用实例时经启动锁拉起新 daemon 并发布状态文件），`SINGULARITY_APP_SERVER_TRANSPORT=stdio` 时回退 spawn 子进程（eval 隔离等场景）。daemon 空闲 60s 自停（`SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS` 可调）。未来 Desktop 走同一协议、同一配置、同一会话。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue`（重开既有会话继续）、`sg turn`（status / interrupt / resume / pause / input，input 支持 steer / follow_up 投递到内存队列）、`sg threads`、`sg config`（doctor / models / import-env）、`sg eval`（轻量回归评估，见第 8 节）。approve/approvals 与 trace 命令随对应机制移除。
 
-**stdio JSON-RPC 传输合同**：
+**JSON-RPC 传输合同**（stdio 与 TCP 共用同一 framing）：
 
 - 每行一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。
 - 所有 envelope 带 `jsonrpc: "2.0"`，由互斥的 request / notification / success / error 表示；request id 只接受字符串或可精确表示的 JSON 整数，`null` 仅用于服务端无法关联合法请求时的 response/error id；error envelope 不允许省略 `id`；响应按解析后的合法 id 关联。
@@ -284,7 +286,7 @@ flowchart LR
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
 | read | `{path, offset?, limit?}` | 读文件/图片 |
-| bash | `{command, timeout?}` | 超时可选无默认（上限 2^31-1 ms）；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树 |
+| bash | `{command, timeout?}` | 超时默认 120s（可显式覆盖，上限 2^31-1 ms）；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树 |
 | edit | `{path, edits:[{oldText,newText}]}` | 精确文本替换，一次多编辑，串行化；结果含 diff / firstChangedLine |
 | write | `{path, content}` | 写文件 |
 | grep（可选只读） | `{pattern, path?, glob?, ignoreCase?, literal?, context?, limit?}` | 尊重 .gitignore，默认 100 匹配上限 |
@@ -315,7 +317,7 @@ flowchart LR
 | 机制 | 裁决 | 去向 |
 | --- | --- | --- |
 | checkpoint 体系（TurnCheckpoint / ApprovalCheckpoint、resume epoch、tool_executions unknown 归约、v5–v8 codec） | 1 | 无 checkpoint；会话 JSONL 为唯一持久事实源 |
-| SQLite SessionStore（v13 schema、11 张表、WAL、workspace execution guard） | 1/6 | 删除；换 JSONL 会话 |
+| SQLite 消息/历史存储（v13 schema 的消息表、WAL、workspace execution guard） | 1/6 | 消息事实源改为 JSONL 会话；SQLite 仅保留 thread/turn 状态、workspace 执行锁与崩溃恢复（`crates/store`） |
 | trace 体系（TraceEvent / typed span / TransportTraceSink、trace/list\|show\|tail\|metrics 方法） | 6 | 删除；会话文件即完整记录，事件流为实时输出 |
 | 16-worker 请求池、控制/事件双队列、cursor/gap、输出全局排序 | 4 | 单 worker 顺序处理 |
 | Approval / Policy 链（PolicyEngine、PermissionProfile、approval/decision 等） | 3/5/7 | 删除；trust 决策替代 |
@@ -328,7 +330,7 @@ flowchart LR
 | turn_inputs / inputId 幂等键、steer/follow_up 持久化消费关系 | 9 | 内存队列，无幂等键 |
 | artifact 体系（artifact refs、artifact/fetch） | 6 | 删除 |
 | OpenTelemetry exporter 边界（原 §12.1） | 6 | 无外部遥测；不引入 exporter |
-| config.json 环境层（SINGULARITY_MODELS_CONFIG 等旧配置入口） | 遗留事项 3 | 迁移到 config.toml |
+| config.toml 迁移（原定把 config.json 环境层迁入共享 config.toml） | 遗留事项 3（已裁决取消） | **不迁移**：`config.json` 为当前配置格式（Pi 用 JSON），环境层（`SINGULARITY_MODELS_CONFIG` 等）保留 |
 | 死表面（evaluator_only 字段、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | Phase 1 | 由 Phase 1 剥离 |
 
 ## 附录 B：重构阶段状态表
@@ -340,5 +342,6 @@ flowchart LR
 | 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | **完成**：3a 切换 turn 执行到新核心（`2df1d7fa`）；3b 删除旧 AgentLoop 链（`2a8cb079`）、approval/trace/policy 产品面（`5ba5bcbc`）、tools/policy/sandbox/windows-sandbox crate（`2f7189f1`） |
 | 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | **完成**：W4-1 store 收敛（`1af9213a`，删 checkpoint_recovery/trace_artifact 全链与 trace 表，恢复语义保持 Paused/Suspended 可恢复）；W4-2 真实链路验收（sg run 完整任务 + 会话文件校验） |
 | 5 | Provider 简化：删 capability probe 全链，静态声明 + 用户覆盖；保留双协议 adapter / 重试 / usage 记账 | **完成**：删 capability.rs 全链（probe/negotiation/缓存/fingerprint），agent loop 改调静态 `protocol_contract()`，config.json 接受旧 `capabilities` 声明块并入静态契约（顶层字段优先），supports_system/developer 默认统一 true/true；内置模型表为遗留项 |
-| 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局 config.toml | **完成**：单 worker 顺序传输（`da329bf8`，删 16-worker 池/双队列/全局排序/gap/容量错误/CancellationMonitor，interrupt 进程内直连）、CLI 去掉订阅与 cursor 校验（`353d7ba4`）、turn/input 改内存投递（裁决 9 落地）；真实链路验收含运行中 interrupt（interrupted/cancelled）；业务状态下沉 core、事件命名 Pi 式收敛、SQLite 移除为遗留 |
+| 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局配置 | **完成**：单 worker 顺序传输（`da329bf8`，删 16-worker 池/双队列/全局排序/gap/容量错误/CancellationMonitor，interrupt 进程内直连）、CLI 去掉订阅与 cursor 校验（`353d7ba4`）、turn/input 改内存投递（裁决 9 落地）；真实链路验收含运行中 interrupt（interrupted/cancelled）；业务状态下沉 core、事件命名 Pi 式收敛、**config.toml 不迁移（裁决，Pi 用 JSON）** |
 | 7 | 清理与文档：删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | **完成**：删 v1–v12 旧迁移（`b1a273ed`）、sg eval 评估工具 + 5 题任务集（`8c5de156`，10 cell 并行真实链路 + checker.sh 判分 + 12 项指标聚合，含真实 usage 数据源）、pycache 清理（`16c2e9ca`）；完成验证见 `outputs/exec/status.md` |
+| 后续演进（重构后） | 2026-08-15 批次：app-server daemon 化（TCP 回环常驻 + 空闲自停 + 单实例锁 + CLI 复用，stdio 回退）；错误文本透出（敏感脱敏）；传输级 + 运行级两层重试；DeepSeek 峰谷双价；eval 题集替换为 3 个高难度题 + 双模型 6 cell；max_output_tokens 按 provider 能力；eval 工具可靠性（checker 超时/输出竞态/挂起） | **完成**（提交 `48685e4a`..`a905d676`，CI 全绿；详情见 `outputs/exec/status.md`） |
