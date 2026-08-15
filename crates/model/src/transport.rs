@@ -1571,10 +1571,26 @@ impl<'a> ResponsesSseDecoder<'a> {
                 ));
             }
             "response.incomplete" => {
-                return Err(provider_responses_stream_terminal_error(
+                // OpenAI Responses 语义：provider 主动宣告响应未完成，最常见原因是
+                // max_output_tokens 截断（reason=max_output_tokens）。把 reason 带进
+                // 错误文本，避免诊断时只能看到笼统的 "stream was incomplete"。
+                let reason = payload
+                    .get("data")
+                    .and_then(|data| data.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let mut error = ModelError::new(
+                    ModelErrorKind::UnknownProviderError,
+                    format!("provider Responses stream was incomplete (reason: {reason})"),
+                )
+                .with_provider_diagnostic(
                     "responses_stream_incomplete",
-                    "provider Responses stream was incomplete",
-                ));
+                    ProviderErrorStage::ResponseValidation,
+                );
+                error
+                    .validation_errors
+                    .push("responses_stream_incomplete".to_string());
+                return Err(ProviderError::from_model_error(error));
             }
             _ => {}
         }

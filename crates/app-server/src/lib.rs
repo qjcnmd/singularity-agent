@@ -479,6 +479,10 @@ fn agent_config_for_thread(
         .protocol_contract()
         .max_context_tokens
         .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS) as u64;
+    // 输出上限按 provider 静态能力声明（如 deepseek-v4-flash 384k），而不是
+    // AgentConfig 默认的 4096：默认值会让长输出（reasoning + 文本）触发 provider
+    // 的 max_output_tokens 截断（response.incomplete），表现为间歇性失败。
+    let max_output_tokens = provider.protocol_contract().max_output_tokens as u64;
     Ok(AgentConfig {
         model: thread
             .model
@@ -487,6 +491,7 @@ fn agent_config_for_thread(
             .unwrap_or_default(),
         system_prompt,
         context_window,
+        max_output_tokens,
         ..AgentConfig::default()
     })
 }

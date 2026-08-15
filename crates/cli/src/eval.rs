@@ -531,12 +531,25 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         let captured = Arc::clone(&stdout);
         let done = reader_done_tx.clone();
         reader_threads.push(thread::spawn(move || {
-            let mut buffer = String::new();
-            if out.read_to_string(&mut buffer).is_ok() {
-                *captured
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+            // 边读边同步共享缓冲：孙进程继承管道写端时 read 不会 EOF（join 超时后
+            // 主线程读 Mutex 也能拿到已读部分），不能只在 EOF 后一次性写入。
+            let mut buffer = [0u8; 8192];
+            let mut collected = String::new();
+            loop {
+                match out.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                        *captured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
+                    }
+                    Err(_) => break,
+                }
             }
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
             let _ = done.send(());
         }));
     }
@@ -544,12 +557,23 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         let captured = Arc::clone(&stderr);
         let done = reader_done_tx.clone();
         reader_threads.push(thread::spawn(move || {
-            let mut buffer = String::new();
-            if err.read_to_string(&mut buffer).is_ok() {
-                *captured
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
+            let mut buffer = [0u8; 8192];
+            let mut collected = String::new();
+            loop {
+                match err.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                        *captured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected.clone();
+                    }
+                    Err(_) => break,
+                }
             }
+            *captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = collected;
             let _ = done.send(());
         }));
     }
