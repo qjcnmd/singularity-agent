@@ -40,8 +40,11 @@ const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 等待 app-server 在 stderr 上公布 TCP 回环地址的时间上限（对齐 daemon 化规划 START_TIMEOUT）。
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
-/// TCP daemon 复用判定里"能否连接/握手"的单次短超时（覆盖 dead/stale daemon 的快速回退）。
+/// TCP daemon 复用判定里"能否连接"的单次短超时（覆盖 dead/stale daemon 的快速回退）。
 const DAEMON_REUSE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// 复用判定的握手响应读超时：daemon 每连接需重新初始化（打开 DB + recover +
+/// provider 快照），响应可能超过 200ms，读超时须覆盖初始化耗时（5s 宽松上限）。
+const DAEMON_REUSE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 另一 CLI 正在启动时，轮询其发布可复用 daemon 的总体上限（对齐规划 START_TIMEOUT）。
 const DAEMON_START_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1274,7 +1277,7 @@ fn verify_reusable_daemon(paths: &DaemonStatePaths) -> Result<Option<SocketAddr>
 /// app-server（而非某个碰巧占用同一端口的其他进程）。握手完成即关闭连接。
 fn probe_daemon_handshake(mut stream: TcpStream) -> bool {
     use std::io::Write;
-    let _ = stream.set_read_timeout(Some(DAEMON_REUSE_CONNECT_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(DAEMON_REUSE_READ_TIMEOUT));
     let initialized = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "initialize",
