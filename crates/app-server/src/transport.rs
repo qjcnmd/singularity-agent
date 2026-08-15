@@ -393,16 +393,34 @@ fn initialize_app_server(
     configured_db_path: &str,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<AppServer, String> {
-    let db_path = prepare_app_server_state_paths(configured_db_path)?;
+    let paths = singularity_app_server::paths::AppPaths::resolve()?;
+    paths.prepare()?;
+    let db_path = if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
+        prepare_app_server_state_paths(configured_db_path)?
+    } else {
+        paths
+            .index_path
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?
+    };
     let store = SessionStore::open(&db_path)
-        .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
+        .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
+    paths.ensure_index_owner_only()?;
     validate_database_file(Path::new(&db_path), false)?;
-    store
-        .recover_unowned_workspace_executions()
-        .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
+    let migrated = singularity_app_server::paths::migrate_legacy_project_sessions(
+        &paths,
+        &store,
+        &cwd,
+    )?;
+    if migrated > 0 {
+        eprintln!("migrated {migrated} legacy project session(s) to {}", paths.sessions_dir.display());
+    }
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
-    Ok(AppServer::new(store, provider_snapshot))
+    Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))
 }
 
 async fn send_output_async(
@@ -420,8 +438,7 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
     !message.is_notification()
         && matches!(
             message.method_name(),
-            Some(method)
-                if method == Method::TurnStart.as_str() || method == Method::TurnResume.as_str()
+            Some(method) if method == Method::TurnStart.as_str()
         )
 }
 
@@ -449,11 +466,8 @@ fn run_turn_request(
         Some(method) if method == Method::TurnStart.as_str() => {
             worker.handle_turn_start_streaming_with_output(message, &mut emit)
         }
-        Some(method) if method == Method::TurnResume.as_str() => {
-            worker.handle_turn_resume_streaming_with_output(message, &mut emit)
-        }
         _ => Err(AppServerError::Workspace(
-            "streaming dispatch requires turn/start or turn/resume".to_string(),
+            "streaming dispatch requires turn/start".to_string(),
         )),
     };
     if let Some(error) = output_error {

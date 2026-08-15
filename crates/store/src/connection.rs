@@ -1,8 +1,8 @@
-//! SQLite connection configuration and execution-ownership coordination.
+//! SQLite connection configuration and protected file opening.
 
 use super::*;
 
-/// SQLite 存储的公开描述及其支持的模式版本。
+/// SQLite 索引的公开描述及其支持的模式版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStoreDescriptor {
     /// 存储后端名称。
@@ -13,7 +13,7 @@ pub struct SessionStoreDescriptor {
     pub schema_version: u32,
 }
 
-/// 负责 turn 生命周期、approval、追踪、产物和恢复的持久化 SQLite 存储。
+/// 只保存会话元数据索引的 SQLite store；JSONL rollout 是唯一权威正文。
 pub struct SessionStore {
     pub(crate) connection: Connection,
     pub(crate) descriptor: SessionStoreDescriptor,
@@ -21,23 +21,8 @@ pub struct SessionStore {
     pub(crate) identity_guard: Option<StoreIdentityGuard>,
 }
 
-/// 由进程持有、用于串行化线程或工作区执行的所有权保护。
-pub struct WorkspaceExecutionGuard {
-    pub(crate) execution_scope: WorkspaceExecutionScope,
-    pub(crate) store_path: PathBuf,
-    pub(crate) _lock_file: File,
-}
-
-// 执行所有权锁的粒度：优先 workspace，缺少 cwd 时使用 thread。
-pub(crate) enum WorkspaceExecutionScope {
-    // 以 canonical workspace 路径作为跨 thread 的执行锁范围。
-    Workspace(String),
-    // 无 workspace 时退化为 thread 级执行锁范围。
-    Thread(String),
-}
-
 impl SessionStore {
-    /// 打开 SQLite 存储，配置安全失败的 `pragma`，并执行模式检查/迁移。
+    /// 打开 SQLite 索引，配置安全失败的 `pragma`，并执行模式检查/初始化。
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let _initialization_lock = acquire_store_initialization_lock(path)?;
@@ -64,8 +49,8 @@ impl SessionStore {
             )?
         };
         if let Some(identity_guard) = &identity_guard {
-            // SQLite opens the already-created file read/write without CREATE.
-            // Revalidate the namespace before any pragma can create WAL state.
+            // SQLite opens the already-created file read/write without CREATE。
+            // Revalidate the namespace before any pragma can create WAL state。
             identity_guard.verify()?;
         }
         configure_connection(&connection)?;
@@ -87,11 +72,10 @@ impl SessionStore {
         Ok(store)
     }
 
-    /// 从已经初始化的 file-backed store 派生 request-worker 专用连接。
+    /// 从已经初始化的 file-backed store 派生 worker 专用连接。
     ///
-    /// 该入口不接受路径或 fast flag，只能使用当前 store 已固定的规范路径；
-    /// 它执行 schema/marker/constraint/index/FK 结构校验，实际行仍由各读写
-    /// 事务边界解码和验证。`:memory:` store 没有可安全派生的独立连接。
+    /// 该入口不接受路径，只能使用当前 store 已固定的规范路径；它执行结构校验。
+    /// `:memory:` store 没有可安全派生的独立连接。
     pub fn trusted_reopen(&self) -> StoreResult<Self> {
         let runtime_path = self.runtime_path.clone().ok_or_else(|| {
             StoreError::InvalidState(
@@ -118,7 +102,7 @@ impl SessionStore {
         original_guard.verify()?;
         configure_connection(&connection)?;
         validate_connection_pragmas(&connection, false)?;
-        migration::validate_v12_structure(&connection)?;
+        migration::validate_current_schema(&connection)?;
         identity_guard.verify()?;
         original_guard.verify()?;
         Ok(Self {
@@ -132,183 +116,6 @@ impl SessionStore {
     /// 返回存储后端及 schema 版本描述。
     pub fn descriptor(&self) -> &SessionStoreDescriptor {
         &self.descriptor
-    }
-
-    /// 尝试认领执行所有权，并在返回前恢复已遗弃的工作。
-    pub fn try_begin_workspace_execution(
-        &self,
-        thread_id: &str,
-    ) -> StoreResult<Option<WorkspaceExecutionGuard>> {
-        let thread = self.get_thread(thread_id)?;
-        let store_path = self.runtime_path.clone().ok_or_else(|| {
-            StoreError::ExecutionLock(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "workspace execution ownership requires a file-backed store",
-            ))
-        })?;
-        let execution_scope = workspace_execution_scope(&thread);
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(workspace_execution_lock_path(&store_path, &execution_scope))
-            .map_err(StoreError::ExecutionLock)?;
-        match lock_file.try_lock() {
-            Ok(()) => {
-                let guard = WorkspaceExecutionGuard {
-                    execution_scope,
-                    store_path,
-                    _lock_file: lock_file,
-                };
-                self.recover_abandoned_workspace_execution(&guard)?;
-                Ok(Some(guard))
-            }
-            Err(error) => {
-                let error = std::io::Error::from(error);
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    Ok(None)
-                } else {
-                    Err(StoreError::ExecutionLock(error))
-                }
-            }
-        }
-    }
-
-    /// 重新认领进程所有者已不存在的持久化非终态工作。
-    pub fn recover_unowned_workspace_executions(&self) -> StoreResult<()> {
-        let mut statement = self.connection.prepare(
-            "select thread_id from turns
-             where status not in (?1, ?2, ?3)
-             order by thread_id",
-        )?;
-        let thread_ids = statement
-            .query_map(
-                params![
-                    TurnStatus::Completed.to_db_text(),
-                    TurnStatus::Failed.to_db_text(),
-                    TurnStatus::Interrupted.to_db_text(),
-                ],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for thread_id in thread_ids {
-            let _guard = self.try_begin_workspace_execution(&thread_id)?;
-        }
-        Ok(())
-    }
-
-    /// 对执行保护覆盖的每个线程应用所有权丢失恢复。
-    pub(crate) fn recover_abandoned_workspace_execution(
-        &self,
-        guard: &WorkspaceExecutionGuard,
-    ) -> StoreResult<()> {
-        self.validate_workspace_execution_guard(guard)?;
-        for thread_id in self.workspace_execution_thread_ids(&guard.execution_scope)? {
-            self.recover_abandoned_thread_execution(&thread_id)?;
-        }
-        Ok(())
-    }
-
-    // 查询执行锁覆盖的 thread 集合。
-    pub(crate) fn workspace_execution_thread_ids(
-        &self,
-        execution_scope: &WorkspaceExecutionScope,
-    ) -> StoreResult<Vec<String>> {
-        match execution_scope {
-            WorkspaceExecutionScope::Workspace(workspace) => {
-                let mut statement = self
-                    .connection
-                    .prepare("select thread_id from threads where cwd = ?1 order by rowid")?;
-                let thread_ids = statement
-                    .query_map(params![workspace], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(thread_ids)
-            }
-            WorkspaceExecutionScope::Thread(thread_id) => Ok(vec![thread_id.clone()]),
-        }
-    }
-
-    // 恢复单个 thread 的 abandoned execution：无 checkpoint/工具执行可恢复，
-    // 全部非终态 turn 直接收敛为 Interrupted（新核心会话文件承载历史）。
-    pub(crate) fn recover_abandoned_thread_execution(&self, thread_id: &str) -> StoreResult<()> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        Self::recover_abandoned_turns_for_thread(&transaction, thread_id)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    // 将 thread 中遗留的非终态 turn 收敛为 Interrupted。
-    // Paused/Suspended 是刻意无 owner、可经 turn/resume 恢复的状态（resume 认领
-    // workspace guard 时不能把目标 turn 终态化），因此不参与 owner 丢失收敛。
-    pub(crate) fn recover_abandoned_turns_for_thread(
-        transaction: &Connection,
-        thread_id: &str,
-    ) -> StoreResult<Vec<String>> {
-        let mut statement = transaction.prepare(
-            "select turn_id from turns
-             where thread_id = ?1 and status not in (?2, ?3, ?4, ?5, ?6)
-             order by turn_sequence",
-        )?;
-        let turn_ids = statement
-            .query_map(
-                params![
-                    thread_id,
-                    TurnStatus::Completed.to_db_text(),
-                    TurnStatus::Failed.to_db_text(),
-                    TurnStatus::Interrupted.to_db_text(),
-                    TurnStatus::Paused.to_db_text(),
-                    TurnStatus::Suspended.to_db_text(),
-                ],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
-        let mut recovered = Vec::new();
-        for turn_id in turn_ids {
-            Self::terminalize_ownerless_turn(
-                transaction,
-                &turn_id,
-                TurnStatus::Interrupted,
-                "interrupted",
-            )?;
-            recovered.push(turn_id);
-        }
-        Ok(recovered)
-    }
-
-    // 将无 active owner 的非终态 turn 终态化为 Interrupted。
-    pub(crate) fn terminalize_ownerless_turn(
-        transaction: &Connection,
-        turn_id: &str,
-        terminal_status: TurnStatus,
-        terminal_agent_loop_status: &str,
-    ) -> StoreResult<()> {
-        transaction.execute(
-            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
-            params![
-                terminal_status.to_db_text(),
-                terminal_agent_loop_status,
-                turn_id
-            ],
-        )?;
-        Ok(())
-    }
-
-    // 确认 guard 仍属于当前 store 和正确的执行范围。
-    pub(crate) fn validate_workspace_execution_guard(
-        &self,
-        guard: &WorkspaceExecutionGuard,
-    ) -> StoreResult<()> {
-        if self.runtime_path.as_ref() != Some(&guard.store_path) {
-            return Err(StoreError::InvalidState(
-                "workspace execution guard belongs to another store".to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -357,29 +164,6 @@ pub(crate) fn validate_connection_pragmas(
     Ok(())
 }
 
-// 根据 thread cwd 选择 workspace 或 thread 级执行锁范围。
-pub(crate) fn workspace_execution_scope(thread: &Thread) -> WorkspaceExecutionScope {
-    match thread.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
-        Some(cwd) => WorkspaceExecutionScope::Workspace(cwd.to_string()),
-        None => WorkspaceExecutionScope::Thread(thread.thread_id.clone()),
-    }
-}
-
-// 生成执行所有权锁文件的稳定路径。
-pub(crate) fn workspace_execution_lock_path(
-    store_path: &Path,
-    execution_scope: &WorkspaceExecutionScope,
-) -> PathBuf {
-    let lock_identity = match execution_scope {
-        WorkspaceExecutionScope::Workspace(workspace) => format!("workspace:{workspace}"),
-        WorkspaceExecutionScope::Thread(thread_id) => format!("thread:{thread_id}"),
-    };
-    let digest = Sha256::digest(lock_identity.as_bytes());
-    let mut lock_path = store_path.as_os_str().to_os_string();
-    lock_path.push(format!(".workspace-{digest:x}.lock"));
-    PathBuf::from(lock_path)
-}
-
 // 在 schema 初始化期间以独占文件锁串行化同一数据库。
 pub(crate) fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
     if path == Path::new(":memory:") {
@@ -414,5 +198,3 @@ pub(crate) fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Opti
         }
     }
 }
-
-// 将可选 SQL sequence 安全转换为下一个 u64 sequence。

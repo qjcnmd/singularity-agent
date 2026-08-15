@@ -43,9 +43,6 @@ impl AppServer {
             };
         };
 
-        // A notification-only registry entry may not be invoked as a request.
-        // A request-only method sent without an id remains a JSON-RPC notification
-        // and therefore keeps the no-response contract.
         if method.spec().kind == MethodKind::Notification && !notification {
             return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
         }
@@ -93,19 +90,19 @@ impl AppServer {
             }
             Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
-            Method::ThreadRead => self.thread_read(message),
+            Method::ThreadRead => self.thread_read_legacy(message),
             Method::ThreadResume => self.thread_resume(message),
             Method::ThreadStart => self.thread_start(message),
-            Method::ThreadFork => self.thread_fork(message),
-            Method::ThreadArchive => self.thread_archive(message),
-            Method::ThreadDelete => self.thread_delete(message),
+            Method::ThreadFork => self.removed_thread_method(message),
+            Method::ThreadArchive => self.removed_thread_method(message),
+            Method::ThreadDelete => self.removed_thread_method(message),
             Method::TurnStart => self.turn_start(message),
-            Method::TurnInput => self.turn_input(message),
-            Method::TurnPause => self.turn_pause(message),
-            Method::TurnResume => self.turn_resume(message),
+            Method::TurnInput => self.removed_turn_method(message),
+            Method::TurnPause => self.removed_turn_method(message),
+            Method::TurnResume => self.removed_turn_method(message),
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
-            Method::TurnStatus => self.turn_status(message),
+            Method::TurnStatus => self.turn_status_legacy(message),
             Method::ProjectTrust => self.project_trust(message),
             Method::EventSubscribe => self.event_subscribe(message),
             Method::ServerShutdown => self.server_shutdown(message),
@@ -146,24 +143,22 @@ impl AppServer {
         json_response(
             message.required_id(),
             ServerCapabilitiesResult {
-                transports: vec![
-                    TransportCapability {
-                        transport: "stdio".to_string(),
-                        available: true,
-                        auth_token_required: false,
-                    },
-                    TransportCapability {
-                        transport: "websocket".to_string(),
-                        available: false,
-                        auth_token_required: true,
-                    },
-                ],
+                transports: vec![TransportCapability {
+                    transport: "stdio".to_string(),
+                    available: true,
+                    auth_token_required: false,
+                }],
             },
         )
     }
 
     pub(super) fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let threads = self.store.list_threads()?;
+        let threads = self
+            .store
+            .list_sessions()?
+            .iter()
+            .map(thread_from_record)
+            .collect::<Vec<_>>();
         Ok(vec![
             JsonRpcMessage::response(
                 message.required_id(),
@@ -173,62 +168,29 @@ impl AppServer {
         ])
     }
 
-    pub(super) fn thread_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadReadParams = parse_params(&message)?;
-        let turn_limit = match history_turn_limit(params.limit) {
-            Ok(limit) => limit,
-            Err(_) => return invalid_params_response(message.required_id()),
-        };
-        let thread = match self.store.get_thread(&params.thread_id) {
-            Ok(thread) => thread,
-            Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        match self.store.read_thread_history(
-            &params.thread_id,
-            params.before_turn_sequence,
-            turn_limit,
-        ) {
-            Ok(history) => json_response(
-                message.required_id(),
-                ThreadReadResult {
-                    thread,
-                    messages: history.messages,
-                    next_before_turn_sequence: history.next_before_turn_sequence,
-                },
-            ),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), THREAD_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub(super) fn thread_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadIdParams = parse_params(&message)?;
-        let thread = match self.store.get_thread(&params.thread_id) {
-            Ok(thread) => thread,
+        let record = match self.store.get_session(&params.thread_id) {
+            Ok(record) => record,
             Err(StoreError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
-        // 恢复线程时确保绑定会话文件存在（缺失则创建空会话；旧 SQLite 历史不迁移）。
-        if open_or_create_thread_session(&thread).is_err() {
+        let session = self.open_session_for_thread(&thread_from_record(&record))?;
+        if session.path() != Path::new(&record.rollout_path) {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
-        match self.store.update_thread_status(
-            &params.thread_id,
-            singularity_protocol::ThreadStatus::Active,
-        ) {
-            Ok(thread) => json_response(message.required_id(), ThreadResult { thread }),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), THREAD_NOT_FOUND)
-            }
-            Err(error) => Err(error.into()),
-        }
+        let thread = thread_from_record(
+            &self.store.update_session(
+                &params.thread_id,
+                SessionMetadataUpdate {
+                    status: Some(SessionStatus::Active),
+                    ..SessionMetadataUpdate::default()
+                },
+            )?,
+        );
+        json_response(message.required_id(), ThreadResult { thread })
     }
 
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -243,27 +205,34 @@ impl AppServer {
         {
             return invalid_params_response(message.required_id());
         }
-        // 无显式 model 时，若配置能无歧义解析默认 selector 则冻结到 Thread.model，
-        // 防止重启后默认配置变化静默切换 model；无法解析时保留 NULL 契约。
         let model = match params.model.as_deref() {
             Some(model) => Some(model.to_string()),
             None => self.provider_snapshot.resolved_default_selector(),
         };
-        let thread = self.store.create_thread(model.as_deref(), Some(&cwd))?;
-        // 线程 ↔ 会话文件绑定：`<sessions_dir>/<thread_id>.jsonl`（Phase 3a 跨轮历史通道）。
-        let thread_cwd = thread.cwd.clone().unwrap_or(cwd);
-        let sessions_dir = Path::new(&thread_cwd)
-            .join(".singularity")
-            .join("agent-sessions");
-        if SessionManager::create_with_name(
-            Path::new(&thread_cwd),
-            &sessions_dir,
-            &thread.thread_id,
+        let session_id = Uuid::now_v7().to_string();
+        let session = SessionManager::create_with_id(
+            Path::new(&cwd),
+            &self.sessions_dir,
+            &session_id,
         )
-        .is_err()
-        {
-            return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
-        }
+        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+        ensure_owner_only_file(session.path())
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+        let rollout_path = session.path().to_string_lossy().to_string();
+        let created_at = now_iso();
+        let record = SessionRecord {
+            session_id,
+            rollout_path,
+            cwd: cwd.clone(),
+            title: None,
+            model: model.clone(),
+            status: SessionStatus::Active,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+            token_usage: json!({}),
+        };
+        self.store.insert_session(&record)?;
+        let thread = thread_from_record(&record);
         let mut messages = vec![self.event_notification(AppEvent::thread_started(&thread))?];
         messages.push(
             JsonRpcMessage::response(
@@ -275,100 +244,6 @@ impl AppServer {
             .to_wire_value(),
         );
         Ok(messages)
-    }
-
-    pub(super) fn thread_fork(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadForkParams = parse_params(&message)?;
-        let source = match self.store.get_thread(&params.thread_id) {
-            Ok(thread) => thread,
-            Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let source_cwd = match params.cwd.as_deref().or(source.cwd.as_deref()) {
-            Some(cwd) => cwd,
-            None => {
-                return invalid_state_response(
-                    message.required_id(),
-                    "source thread does not have an absolute workspace",
-                );
-            }
-        };
-        let cwd = match canonical_thread_cwd(Some(source_cwd)) {
-            Ok(cwd) => cwd,
-            Err(_) => return invalid_params_response(message.required_id()),
-        };
-        let selected_model = params.model.as_deref().or(source.model.as_deref());
-        if self.validate_model_selector(selected_model).is_err() {
-            return invalid_params_response(message.required_id());
-        }
-        // fork 冻结源 Thread 已确定的 selector；源为 NULL 时沿用与 thread/start
-        // 相同的解析规则，不凭空写入未实际用于模型请求的值。
-        let model = match selected_model {
-            Some(model) => Some(model.to_string()),
-            None => self.provider_snapshot.resolved_default_selector(),
-        };
-        let thread = self.store.create_thread(model.as_deref(), Some(&cwd))?;
-        Ok(vec![
-            JsonRpcMessage::response(
-                message.required_id(),
-                serde_json::to_value(ThreadForkResult {
-                    source_thread_id: params.thread_id,
-                    thread,
-                })?,
-            )
-            .to_wire_value(),
-        ])
-    }
-
-    pub(super) fn thread_archive(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = parse_params(&message)?;
-        match self.store.update_thread_status(
-            &params.thread_id,
-            singularity_protocol::ThreadStatus::Archived,
-        ) {
-            Ok(thread) => json_response(message.required_id(), ThreadResult { thread }),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), THREAD_NOT_FOUND)
-            }
-            Err(StoreError::ThreadHasNonterminalTurn { turn_id, .. }) => invalid_state_response(
-                message.required_id(),
-                format!(
-                    "thread already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
-                ),
-            ),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(super) fn thread_delete(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = parse_params(&message)?;
-        match self.store.delete_thread(&params.thread_id) {
-            Ok(()) => Ok(vec![
-                JsonRpcMessage::response(
-                    message.required_id(),
-                    serde_json::to_value(ThreadDeleteResult {
-                        thread_id: params.thread_id,
-                        deleted: true,
-                    })?,
-                )
-                .to_wire_value(),
-            ]),
-            Err(StoreError::NotFound(_)) => {
-                not_found_response(message.required_id(), THREAD_NOT_FOUND)
-            }
-            Err(StoreError::ThreadHasNonterminalTurn { turn_id, .. }) => invalid_state_response(
-                message.required_id(),
-                format!(
-                    "thread already has an active or pending turn {turn_id}; use sg turn resume/pause/input {turn_id}"
-                ),
-            ),
-            Err(error) => Err(error.into()),
-        }
     }
 
     /// 查询/设置/重置项目信任决策（写 `<singularity_home>/trust.json`）。
@@ -399,5 +274,32 @@ impl AppServer {
                 decision: decisions.get(Path::new(&path)),
             },
         )
+    }
+
+    // 以下旧协议方法会在 Phase 3 从 registry 删除；此前只返回稳定拒绝，
+    // 不再触碰任何持久化状态机。
+    fn removed_thread_method(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        invalid_state_response(
+            message.required_id(),
+            "thread read/fork/archive/delete are removed; use session/read or session/delete",
+        )
+    }
+
+    fn removed_turn_method(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        invalid_state_response(
+            message.required_id(),
+            "turn status/pause/resume/input are removed; use turn/steer or turn/followUp",
+        )
+    }
+
+    fn thread_read_legacy(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        invalid_state_response(
+            message.required_id(),
+            "thread/read is removed; use session/read",
+        )
+    }
+
+    fn turn_status_legacy(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        not_found_response(message.required_id(), TURN_NOT_FOUND)
     }
 }

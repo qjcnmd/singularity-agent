@@ -1262,6 +1262,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
  "windows-sys 0.52.0",
 ]
 
@@ -1336,7 +1337,9 @@ dependencies = [
  "singularity_protocol",
  "tempfile",
  "thiserror",
+ "time",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

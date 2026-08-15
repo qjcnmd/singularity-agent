@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! 在进程边界负责 turn 准入、`AgentLoop` 执行、持久化和取消的 JSON-RPC 应用服务。
+//! 在进程边界负责 session/turn 准入、AgentLoop 执行和取消的 stdio JSON-RPC 应用服务。
 //!
-//! 服务将协议处理与工作线程执行分离，并通过 `SessionStore` 提交终态后再发出对应事件。
+//! JSONL rollout 是会话正文的唯一权威；SQLite `session_index` 只保存定位与展示元数据。
 
 mod dispatch;
 mod events;
 mod lifecycle;
+pub mod paths;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -17,40 +18,35 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use singularity_agent::{
     agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
-    session::SessionManager,
+    session::{SessionError, SessionManager},
     tools::ToolRegistry,
 };
 use singularity_core::{
     APP_ERROR_TRUST_REQUIRED, CancellationToken, DEFAULT_PROJECT_TRUST, ErrorCode,
-    ProjectInstructionError, TrustDecisions, TrustResolution, contains_sensitive_text,
+    ProjectInstructionError, TrustDecisions, TrustResolution,
     load_project_instructions, resolve_project_trusted, user_singularity_home,
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
+    AgentCapabilityResult, Method, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
     EventMetadata, EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult,
-    Item, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProjectTrustDecision, ProjectTrustParams,
+    JsonRpcId, JsonRpcMessage, MethodKind, ProjectTrustDecision, ProjectTrustParams,
     ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult,
-    ServerShutdownResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
-    ThreadIdParams, ThreadListResult, ThreadReadParams, ThreadReadResult, ThreadResult,
-    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams, TurnInputParams,
-    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    ServerShutdownResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
+    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
+    TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
-    AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
-    CreateStartedTurnParams, SessionStore, StoreError, TurnOutcomeAuthority,
+    SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
+    ensure_owner_only_file, now_iso,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
-const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a turn";
-const THREAD_ARCHIVED_CONTINUATION: &str =
-    "Thread is archived; resume it before continuing the turn";
-const WORKSPACE_EXECUTION_ACTIVE: &str = "Workspace already has an active or pending turn";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
-const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
-const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
+const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
@@ -66,6 +62,8 @@ pub enum AppServerError {
     InvalidParams(String),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("session error: {0}")]
+    Session(#[from] SessionError),
     #[error("project instructions error: {0}")]
     ProjectInstructions(#[from] ProjectInstructionError),
     #[error("agent error: {0}")]
@@ -92,7 +90,7 @@ pub enum AppServerError {
 /// `AppServer` 请求处理和生命周期操作使用的结果类型。
 pub type AppServerResult<T> = Result<T, AppServerError>;
 
-/// 已持久化 Running Turn 的失败阶段；仅暴露稳定分类，不携带底层错误文本。
+/// 已进入 Running Turn 的失败阶段；仅暴露稳定分类，不携带底层错误文本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnFailureStage {
     AgentLoop,
@@ -146,7 +144,7 @@ impl fmt::Display for TurnFailureCause {
     }
 }
 
-/// 终态补偿失败的稳定分类；不把 SQLite 路径、SQL 或原始错误带到协议边界。
+/// 终态补偿失败的稳定分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnTerminalizationFailure {
     Store,
@@ -165,16 +163,11 @@ impl fmt::Display for TurnTerminalizationFailure {
 }
 
 /// 一次 agent 运行的稳定生命周期状态（app-server 本地枚举）。
-///
-/// 字符串值保持 store `agent_loop_status` 列与 CLI 渲染兼容（Phase 3b 本地化，
-/// 替代旧链 `singularity_agent::AgentStatus`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
     Running,
-    Paused,
     CancelRequested,
     Completed,
-    Blocked,
     Cancelled,
     Failed,
 }
@@ -184,49 +177,33 @@ impl AgentStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
-            Self::Paused => "paused",
             Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
-            Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
     }
 }
 
-/// agent 运行终态（app-server 内部类型，替代旧链 `AgentRunStatus`）。
-///
-/// 只保留 app-server 实际消费的字段；`status` 的字符串值写入 store
-/// `agent_loop_status` 列，CLI 按文本渲染。
+/// agent 运行终态（app-server 内部类型）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunStatus {
     pub status: AgentStatus,
     pub final_answer: Option<String>,
     pub model_turns: u32,
     pub model_usage: ModelUsage,
-    pub audit_events: Vec<Value>,
     pub error: Option<String>,
-    pub model_turn_limit: u32,
 }
 
 impl RunStatus {
-    /// 构造普通失败状态。
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             status: AgentStatus::Failed,
             final_answer: None,
             model_turns: 0,
             model_usage: ModelUsage::default(),
-            audit_events: Vec::new(),
             error: Some(message.into()),
-            model_turn_limit: 0,
         }
-    }
-
-    /// 更新状态并保留已有字段。
-    pub fn with_status(mut self, status: AgentStatus) -> Self {
-        self.status = status;
-        self
     }
 }
 
@@ -234,12 +211,12 @@ impl RunStatus {
 struct TurnFailure {
     stage: TurnFailureStage,
     cause: TurnFailureCause,
-    /// 携带到 RPC 边界的原始失败文本；无原文时为 `None`（如仅用阶段分类的调用）。
+    /// 携带到 RPC 边界的原始失败文本；无原文时为 `None`。
     original: Option<String>,
 }
 
-/// 将 provider 层聚合 usage 投影为协议线格式（评估工具数据源）。
-fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage {
+/// 将 provider 层聚合 usage 投影为协议线格式。
+pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage {
     singularity_protocol::TurnModelUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -260,16 +237,16 @@ impl From<TurnFailureStage> for TurnFailure {
     }
 }
 
-/// 一次 AgentLoop 调用预分配的 assistant item 及实际通过订阅过滤器生成的事件状态。
-struct AssistantItemEventState {
-    item_id: AllocatedAssistantItemId,
+/// 一次 AgentLoop 调用预分配的 assistant item 事件状态（只用于实时协议事件）。
+pub struct AssistantItemEventState {
+    pub item_id: String,
     first_delta_observed: bool,
     started_generated: bool,
     delta_generated: bool,
 }
 
 impl AssistantItemEventState {
-    fn new(item_id: AllocatedAssistantItemId) -> Self {
+    pub fn new(item_id: String) -> Self {
         Self {
             item_id,
             first_delta_observed: false,
@@ -278,42 +255,39 @@ impl AssistantItemEventState {
         }
     }
 
-    fn appeared(&self) -> bool {
+    pub fn appeared(&self) -> bool {
         self.started_generated || self.delta_generated
     }
 }
 
-enum TurnTerminalizationResult {
-    Committed(Box<CommittedTurnOutcome>),
-    Preserved,
-}
-
-/// AppServer 交给 stdout transport 的消息；单 worker 传输无需全局排序。
+/// AppServer 交给 stdout transport 的消息。
 pub type AppServerOutput = Value;
 
-/// 协调线程、turn、追踪和工作线程的有状态 JSON-RPC 服务。
+/// 协调 session 索引、信任和活动 turn 的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
+    sessions_dir: PathBuf,
     initialized: bool,
     initialized_acknowledged: bool,
     shutdown_requested: bool,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// 每个活动 turn 的 steer 注入句柄（turn/input 运行中注入通道）。
+    /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化，裁决 6）。
+    follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化到索引之外）。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
-    /// 客户端是否可交互（CLI 通过 `SINGULARITY_INTERACTIVE` 传递；测试可覆盖）。
+    /// 客户端是否可交互。
     interactive_ui: bool,
-    /// trust.json 所在的用户级目录（构造时从环境解析；测试可覆盖隔离）。
+    /// trust.json 所在的用户级目录。
     trust_home: Option<PathBuf>,
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
 }
 
-/// 由请求工作线程与标准输入输出传输层共享的可克隆停止句柄。
+/// 由请求工作线程与 stdio 传输层共享的可克隆停止句柄。
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -340,6 +314,7 @@ struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
 }
 
 impl Drop for ActiveTurnGuard {
@@ -349,6 +324,9 @@ impl Drop for ActiveTurnGuard {
         }
         if let Ok(mut steer_handles) = self.steer_handles.lock() {
             steer_handles.remove(&self.turn_id);
+        }
+        if let Ok(mut follow_up_handles) = self.follow_up_handles.lock() {
+            follow_up_handles.remove(&self.turn_id);
         }
     }
 }
@@ -372,15 +350,6 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
     }
 }
 
-fn history_turn_limit(limit: Option<u32>) -> Result<usize, String> {
-    let limit = limit.unwrap_or(DEFAULT_THREAD_HISTORY_TURN_LIMIT as u32);
-    if limit == 0 || limit > MAX_THREAD_HISTORY_TURN_LIMIT as u32 {
-        return Err(format!(
-            "thread history limit must be between 1 and {MAX_THREAD_HISTORY_TURN_LIMIT}"
-        ));
-    }
-    usize::try_from(limit).map_err(|_| "thread history limit is unsupported".to_string())
-}
 fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
     let path = match cwd {
         Some(cwd) if !cwd.trim().is_empty() => Path::new(cwd).to_path_buf(),
@@ -388,7 +357,6 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
         None => std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     };
-    // canonicalize 保留旧语义：cwd 必须是存在的真实目录（解析符号链接）。
     let canonical =
         std::fs::canonicalize(&path).map_err(|_| "failed to bind thread cwd".to_string())?;
     canonical
@@ -396,6 +364,7 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
 }
+
 fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
     let cwd = thread
         .cwd
@@ -409,34 +378,16 @@ fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-/// 线程级会话目录：workspace 根下的 `.singularity/agent-sessions/`（与旧 `sessions/` 隔离）。
-fn agent_sessions_dir(thread: &Thread) -> Result<PathBuf, String> {
-    Ok(workspace_path(thread)?
-        .join(".singularity")
-        .join("agent-sessions"))
-}
-
-/// 打开线程绑定的会话文件（`<thread_id>.jsonl`）；文件不存在时创建新会话。
-///
-/// thread ↔ 会话文件的确定性映射是跨轮历史的唯一通道（Phase 3a 起）。
-fn open_or_create_thread_session(thread: &Thread) -> AppServerResult<SessionManager> {
-    let sessions_dir = agent_sessions_dir(thread)
-        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-    let file = sessions_dir.join(format!("{}.jsonl", thread.thread_id));
-    if file.exists() {
-        SessionManager::open(&file)
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))
-    } else {
-        SessionManager::create_with_name(
-            Path::new(thread.cwd.as_deref().unwrap_or_default()),
-            &sessions_dir,
-            &thread.thread_id,
-        )
-        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))
+pub fn thread_from_record(record: &SessionRecord) -> Thread {
+    Thread {
+        thread_id: record.session_id.clone(),
+        model: record.model.clone(),
+        cwd: Some(record.cwd.clone()),
+        status: singularity_protocol::ThreadStatus::Active,
     }
 }
 
-/// 将持久化的 `InputItem` 数组投影为拼接文本（Agent 输入/转向消息的本地边界）。
+/// 将持久化的 `InputItem` 数组投影为拼接文本。
 fn input_items_to_text(input: &Value) -> AppServerResult<String> {
     let items: Vec<singularity_protocol::InputItem> =
         serde_json::from_value(input.clone()).map_err(AppServerError::InvalidJson)?;
@@ -455,10 +406,17 @@ fn input_items_to_text(input: &Value) -> AppServerResult<String> {
     Ok(text)
 }
 
-/// 组装新核心 `Agent` 的配置：model 选择器、system prompt（信任的项目指令）、
-/// context window（provider 静态声明，缺省时用模型默认值）。
-///
-/// 信任门控：不信任（含 ask 无交互）不加载项目指令（Pi 语义：不拒绝运行）。
+fn title_from_input(input: &str) -> String {
+    input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_SESSION_TITLE_CHARS)
+        .collect()
+}
+
+/// 组装新核心 `Agent` 的配置。
 fn agent_config_for_thread(
     thread: &Thread,
     provider: &dyn Provider,
@@ -479,9 +437,6 @@ fn agent_config_for_thread(
         .protocol_contract()
         .max_context_tokens
         .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS) as u64;
-    // 输出上限按 provider 静态能力声明（如 deepseek-v4-flash 384k），而不是
-    // AgentConfig 默认的 4096：默认值会让长输出（reasoning + 文本）触发 provider
-    // 的 max_output_tokens 截断（response.incomplete），表现为间歇性失败。
     let max_output_tokens = provider.protocol_contract().max_output_tokens as u64;
     Ok(AgentConfig {
         model: thread
@@ -496,13 +451,7 @@ fn agent_config_for_thread(
     })
 }
 
-/// 新核心 `AgentOutcome` → store/CLI 依赖的 `RunStatus` 投影。
-///
-/// aborted 对应取消（Cancelled）；其余按 Completed 提交，final_text 为空时
-/// `agent_completed_delta` 的兜底路径会省略终态 delta（事件层 item/failed）。
-///
-/// 非取消但无最终答复（如耗尽 max_turns）时标为 Failed：store 不变量要求
-/// Completed 必须携带 assistant 消息，直接提交会以 Internal error 失败。
+/// 新核心 `AgentOutcome` → app-server `RunStatus` 投影。
 fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     let mut status = RunStatus::failed("agent loop did not reach a final assistant message");
     if outcome.aborted {
@@ -539,12 +488,136 @@ fn provider_configuration(snapshot: &ProviderConfigSnapshot) -> ProviderConfigur
 }
 
 impl AppServer {
-    /// Validate an explicit thread/fork selector against the startup snapshot
-    /// before any Store row is created.  This never performs provider I/O.
+    pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
+        let sessions_dir = user_singularity_home()
+            .map(|home| home.join(paths::SESSIONS_DIR_NAME))
+            .unwrap_or_else(|| PathBuf::from(".singularity/sessions"));
+        Self {
+            store,
+            sessions_dir,
+            initialized: false,
+            initialized_acknowledged: false,
+            shutdown_requested: false,
+            provider_snapshot,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            steer_handles: Arc::new(Mutex::new(HashMap::new())),
+            follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
+            usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
+            execution_stopped: Arc::new(AtomicBool::new(false)),
+            interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV).is_some_and(|value| value != "0"),
+            trust_home: user_singularity_home(),
+            test_provider_override: None,
+        }
+    }
+
+    /// 仅测试：覆盖会话目录。
+    #[doc(hidden)]
+    pub fn with_sessions_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.sessions_dir = dir.as_ref().to_path_buf();
+        self
+    }
+
+    /// 仅测试：注入动态 provider 覆盖。
+    #[doc(hidden)]
+    pub fn with_test_provider(
+        mut self,
+        provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
+    ) -> Self {
+        self.test_provider_override = Some(provider);
+        self
+    }
+
+    /// 仅测试：覆盖 trust.json 所在目录。
+    #[doc(hidden)]
+    pub fn with_trust_home(mut self, home: impl AsRef<Path>) -> Self {
+        self.trust_home = Some(home.as_ref().to_path_buf());
+        self
+    }
+
+    /// 仅测试：覆盖交互 UI 可用性。
+    #[doc(hidden)]
+    pub fn with_interactive_ui(mut self, interactive: bool) -> Self {
+        self.interactive_ui = interactive;
+        self
+    }
+
+    pub fn sessions_dir(&self) -> &Path {
+        &self.sessions_dir
+    }
+
+    pub fn store(&self) -> &SessionStore {
+        &self.store
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    pub fn ready_for_turn_worker(&self) -> bool {
+        self.initialized_acknowledged
+    }
+
+    pub fn request_execution_stop(&self) -> AppServerResult<()> {
+        self.cancellation_handle().request_execution_stop()
+    }
+
+    pub fn cancellation_handle(&self) -> AppServerCancellationHandle {
+        AppServerCancellationHandle {
+            active_turns: Arc::clone(&self.active_turns),
+            execution_stopped: Arc::clone(&self.execution_stopped),
+        }
+    }
+
+    /// 为单一 turn 工作线程打开独立索引连接，同时共享停止与注入状态。
+    pub fn turn_worker(&self) -> AppServerResult<Self> {
+        Ok(Self {
+            store: self.store.trusted_reopen()?,
+            sessions_dir: self.sessions_dir.clone(),
+            initialized: true,
+            initialized_acknowledged: true,
+            shutdown_requested: false,
+            provider_snapshot: self.provider_snapshot.clone(),
+            active_turns: Arc::clone(&self.active_turns),
+            steer_handles: Arc::clone(&self.steer_handles),
+            follow_up_handles: Arc::clone(&self.follow_up_handles),
+            usage_by_turn: Arc::clone(&self.usage_by_turn),
+            execution_stopped: Arc::clone(&self.execution_stopped),
+            interactive_ui: self.interactive_ui,
+            trust_home: self.trust_home.clone(),
+            test_provider_override: self.test_provider_override.clone(),
+        })
+    }
+
+    pub(crate) fn activate_turn(
+        &self,
+        turn_id: &str,
+    ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
+        let cancellation = CancellationToken::new();
+        let mut active_turns = self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        if active_turns.contains_key(turn_id) {
+            return Err(AppServerError::Workspace(format!(
+                "turn {turn_id} is already active"
+            )));
+        }
+        if self.execution_stopped.load(Ordering::SeqCst) {
+            cancellation.cancel();
+        }
+        active_turns.insert(turn_id.to_string(), cancellation.clone());
+        drop(active_turns);
+        let guard = ActiveTurnGuard {
+            turn_id: turn_id.to_string(),
+            active_turns: Arc::clone(&self.active_turns),
+            steer_handles: Arc::clone(&self.steer_handles),
+            follow_up_handles: Arc::clone(&self.follow_up_handles),
+        };
+        Ok((cancellation, guard))
+    }
+
     pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
         if let Some(selector) = selector {
-            // Legacy environment configuration historically accepted a bare model name.
-            // Composite selectors and every explicit catalog configuration remain strict.
             if self.provider_snapshot.has_explicit_model_selection()
                 || selector.contains('/')
                 || selector.contains('#')
@@ -560,7 +633,6 @@ impl AppServer {
         Ok(())
     }
 
-    /// Resolve the persisted thread selector against the one process snapshot.
     fn provider_for_thread(
         &self,
         thread: &Thread,
@@ -569,7 +641,6 @@ impl AppServer {
             .provider_for_selector(thread.model.as_deref())
     }
 
-    /// 返回解析后的 provider（测试覆盖优先），并组装新核心 Agent 配置。
     fn provider_and_config_for_thread(
         &self,
         thread: &Thread,
@@ -592,7 +663,6 @@ impl AppServer {
         Ok((provider, config))
     }
 
-    /// 加载当前 trust 决策集合（fail-soft：无 home 时为空决策集）。
     fn trust_decisions(&self) -> TrustDecisions {
         self.trust_home
             .as_deref()
@@ -600,8 +670,7 @@ impl AppServer {
             .unwrap_or_default()
     }
 
-    /// 解析 thread 工作区的项目信任（对齐 Pi resolveProjectTrusted 顺序）。
-    fn resolve_thread_trust(&self, thread: &Thread) -> AppServerResult<TrustResolution> {
+    pub(crate) fn resolve_thread_trust(&self, thread: &Thread) -> AppServerResult<TrustResolution> {
         let cwd = workspace_path(thread)
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
         Ok(resolve_project_trusted(
@@ -610,6 +679,57 @@ impl AppServer {
             DEFAULT_PROJECT_TRUST,
             self.interactive_ui,
         ))
+    }
+
+    pub(crate) fn open_session_for_thread(&self, thread: &Thread) -> AppServerResult<SessionManager> {
+        let record = self.store.get_session(&thread.thread_id)?;
+        let session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
+        if session.session_id() != record.session_id {
+            return Err(AppServerError::Store(StoreError::InvalidState(format!(
+                "rollout header id {} does not match index session id {}",
+                session.session_id(),
+                record.session_id
+            ))));
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn update_session_status_and_usage(
+        &self,
+        session_id: &str,
+        status: SessionStatus,
+        usage: &ModelUsage,
+    ) -> AppServerResult<SessionRecord> {
+        let token_usage = serde_json::to_value(usage_to_wire(usage))?;
+        Ok(self.store.update_session(
+            session_id,
+            SessionMetadataUpdate {
+                status: Some(status),
+                token_usage: Some(&token_usage),
+                ..SessionMetadataUpdate::default()
+            },
+        )?)
+    }
+
+    pub(crate) fn turn_with_usage(&self, turn: Turn) -> Turn {
+        let usage = self
+            .usage_by_turn
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&turn.turn_id).cloned());
+        match usage {
+            Some(usage) => Turn {
+                model_usage: Some(usage_to_wire(&usage)),
+                ..turn
+            },
+            None => turn,
+        }
+    }
+
+    pub(crate) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage) {
+        let _ = self.usage_by_turn.lock().map(|mut cache| {
+            cache.insert(turn_id.to_string(), usage.clone());
+        });
     }
 }
 
@@ -638,20 +758,6 @@ where
         .map_err(|_| AppServerError::InvalidParams("Invalid params".to_string()))
 }
 
-fn is_terminal_turn_status(status: &TurnStatus) -> bool {
-    matches!(
-        status,
-        TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
-    )
-}
-
-fn is_safe_turn_state(turn: &Turn) -> bool {
-    (turn.status == TurnStatus::Blocked && turn.agent_loop_status == AgentStatus::Blocked.as_str())
-        || is_terminal_turn_status(&turn.status)
-        || (turn.status == TurnStatus::Interrupted
-            && turn.agent_loop_status == AgentStatus::Cancelled.as_str())
-}
-
 fn turn_failure_cause(error: &AppServerError) -> TurnFailureCause {
     match error {
         AppServerError::Store(_) => TurnFailureCause::Store,
@@ -660,6 +766,7 @@ fn turn_failure_cause(error: &AppServerError) -> TurnFailureCause {
         AppServerError::Agent(_) => TurnFailureCause::Internal,
         AppServerError::InvalidJson(_) => TurnFailureCause::Serialization,
         AppServerError::InvalidParams(_) => TurnFailureCause::Internal,
+        AppServerError::Session(_) => TurnFailureCause::Store,
         AppServerError::TurnExecution { cause, .. }
         | AppServerError::TurnTerminalization { cause, .. } => *cause,
     }
@@ -683,8 +790,6 @@ fn turn_failure_from_error(
         } => TurnFailure {
             stage: *stage,
             cause: *cause,
-            // 保留已携带的原始失败文本（如 provider 解析失败的真实原因），
-            // 缺失时回退到稳定 Display（stage/cause 分类）。
             original: original.clone().or_else(|| Some(error.to_string())),
         },
         _ => TurnFailure {
@@ -695,25 +800,21 @@ fn turn_failure_from_error(
     }
 }
 
-fn failed_turn_status(failure: TurnFailure) -> RunStatus {
-    let mut status = RunStatus::failed(format!("turn execution failed during {}", failure.stage));
-    status.audit_events.push(json!({
-        "component": "app_server",
-        "failure_kind": "turn_execution",
-        "failure_stage": failure.stage.as_str(),
-        "failure_cause": failure.cause.as_str(),
-    }));
-    status
-}
-
 fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
     match status {
         AgentStatus::Completed => TurnStatus::Completed,
-        AgentStatus::Paused => TurnStatus::Paused,
-        AgentStatus::Blocked => TurnStatus::Blocked,
         AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
         AgentStatus::Running => TurnStatus::Running,
         AgentStatus::Failed => TurnStatus::Failed,
+    }
+}
+
+fn session_status_for_agent(status: &AgentStatus) -> SessionStatus {
+    match status {
+        AgentStatus::Completed => SessionStatus::Completed,
+        AgentStatus::CancelRequested | AgentStatus::Cancelled => SessionStatus::Interrupted,
+        AgentStatus::Running => SessionStatus::Active,
+        AgentStatus::Failed => SessionStatus::Failed,
     }
 }
 
@@ -721,26 +822,6 @@ fn mark_run_cancelled(status: &mut RunStatus) {
     status.status = AgentStatus::Cancelled;
     status.final_answer = None;
     status.error = None;
-}
-
-fn agent_completed_delta(run_status: &RunStatus) -> Option<String> {
-    if run_status.status == AgentStatus::Completed {
-        run_status
-            .final_answer
-            .as_deref()
-            .filter(|answer| !answer.trim().is_empty())
-            .map(redact_app_server_text)
-    } else {
-        None
-    }
-}
-
-fn redact_app_server_text(text: &str) -> String {
-    if contains_sensitive_text(text) {
-        "[redacted sensitive app-server output]".to_string()
-    } else {
-        text.to_string()
-    }
 }
 
 fn not_found_response(id: JsonRpcId, message: &'static str) -> AppServerResult<Vec<Value>> {
@@ -762,5 +843,6 @@ fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
     json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
 }
 
-#[cfg(test)]
-mod tests;
+fn turn_id() -> String {
+    Uuid::new_v4().to_string()
+}

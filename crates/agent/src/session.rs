@@ -343,6 +343,35 @@ impl SessionManager {
         )
     }
 
+    /// 新建会话：文件名与 header id 都是调用方指定的 UUID（架构收敛后的稳定布局）。
+    ///
+    /// 用于 `~/.singularity/sessions/<uuid>.jsonl`：会话 id 与文件名统一，不再使用
+    /// `thread_xxx` 文件名或随机 header id。
+    pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
+        Uuid::parse_str(session_id).map_err(|_| {
+            SessionError::InvalidSession(format!("session id is not a UUID: {session_id}"))
+        })?;
+        let timestamp = now_iso();
+        Self::create_with_file(
+            cwd,
+            sessions_dir,
+            format!("{session_id}.jsonl"),
+            session_id.to_string(),
+            timestamp,
+        )
+    }
+
+    /// 打开必须已存在的会话文件；缺失或损坏直接报错，不静默创建新会话。
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Err(SessionError::InvalidSession(format!(
+                "session file does not exist: {}",
+                path.display()
+            )));
+        }
+        Self::open(path)
+    }
+
     /// 共用的新建会话实现：写入 header 并打开新文件（`create_new` 语义）。
     fn create_with_file(
         cwd: &Path,
@@ -523,6 +552,11 @@ impl SessionManager {
         }
         self.leaf_id = Some(at_entry_id.to_string());
         Ok(())
+    }
+
+    /// 会话 header 中的 UUID（架构收敛后也是索引主键）。
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// 当前 leaf id；无条目时为空串（Pi 的 `null`）。

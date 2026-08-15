@@ -167,6 +167,11 @@ impl Agent {
         Arc::clone(&self.steer_queue)
     }
 
+    /// 返回 follow-up 队列的线程安全句柄；`run` 在代理准备停止时 drain。
+    pub fn follow_up_handle(&self) -> SteerHandle {
+        Arc::clone(&self.follow_up_queue)
+    }
+
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
     pub fn steer(&mut self, text: &str) {
         lock_queue(&self.steer_queue).push_back(text.to_string());
