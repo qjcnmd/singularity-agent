@@ -1,0 +1,2 @@
+# 仓库规范行尾为 LF；工作树 checkout 使用平台 native 行尾。
+* text=auto

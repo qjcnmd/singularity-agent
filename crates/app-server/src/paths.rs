@@ -30,9 +30,8 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn resolve() -> Result<Self, String> {
-        let home = user_singularity_home().ok_or_else(|| {
-            "cannot resolve SINGULARITY_HOME for session index".to_string()
-        })?;
+        let home = user_singularity_home()
+            .ok_or_else(|| "cannot resolve SINGULARITY_HOME for session index".to_string())?;
         Ok(Self {
             index_path: home.join(INDEX_FILE_NAME),
             sessions_dir: home.join(SESSIONS_DIR_NAME),
@@ -92,7 +91,8 @@ pub fn migrate_legacy_project_sessions(
     };
     let mut sources = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| format!("failed to read legacy session entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("failed to read legacy session entry: {error}"))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -128,8 +128,14 @@ pub fn migrate_legacy_project_sessions(
                 header.id
             ));
         }
-        if planned.iter().any(|(id, _, _): &(String, PathBuf, String)| id == &header.id) {
-            return Err(format!("migration conflict: duplicate session id {}", header.id));
+        if planned
+            .iter()
+            .any(|(id, _, _): &(String, PathBuf, String)| id == &header.id)
+        {
+            return Err(format!(
+                "migration conflict: duplicate session id {}",
+                header.id
+            ));
         }
         planned.push((header.id, destination, cwd));
         let _ = created_at;
@@ -152,7 +158,12 @@ pub fn migrate_legacy_project_sessions(
         let source_name = source
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("legacy session has no UTF-8 file name: {}", source.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "legacy session has no UTF-8 file name: {}",
+                    source.display()
+                )
+            })?;
         let backup = backup_dir.join(source_name);
         copy_verified(source, &backup)?;
         copy_verified(source, destination)?;
@@ -183,10 +194,17 @@ pub fn migrate_legacy_project_sessions(
 
     // 全部文件已验证并写入索引，才清理项目内旧数据。
     for source in &sources {
-        std::fs::remove_file(source)
-            .map_err(|error| format!("failed to clean legacy session {}: {error}", source.display()))?;
+        std::fs::remove_file(source).map_err(|error| {
+            format!(
+                "failed to clean legacy session {}: {error}",
+                source.display()
+            )
+        })?;
     }
-    if legacy_dir.read_dir().is_ok_and(|mut entries| entries.next().is_none()) {
+    if legacy_dir
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_none())
+    {
         let _ = std::fs::remove_dir(&legacy_dir);
     }
     for name in [
@@ -198,12 +216,18 @@ pub fn migrate_legacy_project_sessions(
         let path = project_cwd.join(".singularity").join(name);
         if path.is_file() {
             std::fs::remove_file(&path).map_err(|error| {
-                format!("failed to clean legacy project state {}: {error}", path.display())
+                format!(
+                    "failed to clean legacy project state {}: {error}",
+                    path.display()
+                )
             })?;
         }
     }
     let project_state = project_cwd.join(".singularity");
-    if project_state.read_dir().is_ok_and(|mut entries| entries.next().is_none()) {
+    if project_state
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_none())
+    {
         let _ = std::fs::remove_dir(&project_state);
     }
     Ok(migrated)
@@ -214,13 +238,16 @@ fn read_legacy_header(
     current_cwd: &Path,
 ) -> Result<(LegacyHeader, String, String), String> {
     const MAX_HEADER_BYTES: usize = 1024 * 1024;
-    let file =
-        File::open(path).map_err(|error| format!("failed to open legacy session {}: {error}", path.display()))?;
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open legacy session {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut line)
-        .map_err(|error| format!("failed to read legacy session header {}: {error}", path.display()))?;
+    let read = reader.read_until(b'\n', &mut line).map_err(|error| {
+        format!(
+            "failed to read legacy session header {}: {error}",
+            path.display()
+        )
+    })?;
     if read == 0 || read > MAX_HEADER_BYTES {
         return Err(format!(
             "unrecognized legacy session file (empty or oversized header): {}",
@@ -233,10 +260,19 @@ fn read_legacy_header(
             line.pop();
         }
     }
-    let header: LegacyHeader = serde_json::from_slice(&line)
-        .map_err(|error| format!("unrecognized legacy session header in {}: {error}", path.display()))?;
-    Uuid::parse_str(&header.id)
-        .map_err(|error| format!("unrecognized legacy session id {} in {}: {error}", header.id, path.display()))?;
+    let header: LegacyHeader = serde_json::from_slice(&line).map_err(|error| {
+        format!(
+            "unrecognized legacy session header in {}: {error}",
+            path.display()
+        )
+    })?;
+    Uuid::parse_str(&header.id).map_err(|error| {
+        format!(
+            "unrecognized legacy session id {} in {}: {error}",
+            header.id,
+            path.display()
+        )
+    })?;
     let cwd = match header
         .cwd
         .as_deref()
@@ -272,8 +308,8 @@ fn copy_verified(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn hash_file(path: &Path) -> Result<Vec<u8>, String> {
-    let mut file =
-        File::open(path).map_err(|error| format!("failed to open {} for hashing: {error}", path.display()))?;
+    let mut file = File::open(path)
+        .map_err(|error| format!("failed to open {} for hashing: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {

@@ -123,8 +123,10 @@ impl SessionStore {
         session_id: &str,
         update: SessionMetadataUpdate<'_>,
     ) -> StoreResult<SessionRecord> {
-        let transaction =
-            rusqlite::Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let current = transaction
             .query_row(
                 "select session_id, rollout_path, cwd, title, model, status,
@@ -169,9 +171,10 @@ impl SessionStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> StoreResult<()> {
-        let changed = self
-            .connection
-            .execute("delete from session_index where session_id = ?1", params![session_id])?;
+        let changed = self.connection.execute(
+            "delete from session_index where session_id = ?1",
+            params![session_id],
+        )?;
         if changed == 0 {
             return Err(StoreError::NotFound(format!("session {session_id}")));
         }

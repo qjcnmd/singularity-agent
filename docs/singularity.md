@@ -6,13 +6,13 @@
 
 ## 1. 总览与进程架构（图 a）
 
-采用 Codex 进程模式（裁决 4）：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（JSON-RPC transport，连接级单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史 seed、输入组装、工具装配、trust 决策）全部下沉到 core。
+采用 Codex 进程模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，每命令独立子进程，连接内单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史、输入组装、工具装配、trust 决策）全部下沉到 core。
 
 - **headless core**：AgentLoop（Pi 式 runLoop）、SessionManager（JSONL 树）、Compaction、工具注册表（ToolSpec 单一事实源）、消息与事件流、资源加载（AGENTS.md + trust 门控）、Provider 边界（trait Provider）。
 - **app-server**：JSON-RPC（JSONL framing）；命令/事件协议收敛为 Pi RPC 级命令集 + 事件流；无 7 态 Turn、无 trace 合同、无 cursor/gap/背压/全局排序、无 16-worker 池。
-- **传输（daemon 化后）**：CLI 默认连接常驻 **TCP 回环 daemon**（127.0.0.1，JSON-Lines，空闲 60s 自停，单实例启动锁 + 状态文件复用），`SINGULARITY_APP_SERVER_TRANSPORT=stdio` 或 `SINGULARITY_APP_SERVER_LISTEN` 可切回 stdio / 自定监听；eval 每 cell 强制 stdio 隔离。
-- **客户端**：`sg` CLI（默认 daemon 复用/拉起，stdio 回退）；未来 Desktop 同协议、同配置、同会话。
-- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源，CLI 与桌面端读同一文件）；`~/.singularity/auth.v1-*.json`（私有认证文件，owner-only ACL）；会话为工作区 `.singularity/agent-sessions/<thread_id>.jsonl`（JSONL，唯一持久记录）。
+- **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**（JSON-Lines），无 TCP daemon、无连接复用、无空闲自停；未来 Desktop 可嵌入 core 或经同一协议启动 stdio 子进程。
+- **客户端**：`sg` CLI（一次性 stdio 子进程客户端）；未来 Desktop 同协议、同配置、同会话。
+- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1-*.json`（私有认证文件，owner-only ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 不依赖 evaluation。
 
 ```mermaid
@@ -21,7 +21,7 @@ flowchart LR
         CLI["sg CLI<br/>(子进程协议客户端)"]
         Dsk["未来 Desktop"]
     end
-    Svr["app-server<br/>TCP daemon / stdio JSON-RPC (JSONL)<br/>连接级单 worker 顺序处理<br/>无业务状态"]
+    Svr["app-server<br/>stdio JSON-RPC (JSONL)<br/>每命令独立子进程<br/>无业务状态"]
     subgraph Core["headless core（库）"]
         Loop["AgentLoop<br/>(Pi 式 runLoop)"]
         SM["SessionManager<br/>(JSONL 树)"]
@@ -32,8 +32,10 @@ flowchart LR
         PV["Provider 边界<br/>(trait Provider)"]
     end
     CFG[("~/.singularity/config.json<br/>全局配置单一事实源")]
-    SES[("工作区 .singularity/agent-sessions/<br/>JSONL 会话")]
-    CLI -->|"daemon 复用/拉起 (TCP) 或 spawn (stdio)"| Svr
+    SES[("~/.singularity/sessions/<uuid>.jsonl<br/>JSONL 会话（唯一权威正文）")]
+
+    IDX[("~/.singularity/index.sqlite3<br/>会话元数据索引")]
+    CLI -->|"spawn stdio 子进程"| Svr
     Dsk -->|"同一协议"| Svr
     Svr --> Core
     Loop --> SM
@@ -44,6 +46,7 @@ flowchart LR
     Loop --> PV
     CP --> SM
     SM --> SES
+    Svr --> IDX
     RL --> CFG
     PV --> CFG
 ```
@@ -52,7 +55,7 @@ flowchart LR
 
 ## 2. 主调用链（图 b）
 
-`sg run <goal>` 完整链路：连接 app-server（默认复用常驻 TCP daemon；无可复用实例时拉起，stdio 回退）→ LSP 式握手（initialize/initialized）→ `thread/start`（记录 cwd 与模型）→ `turn/start`（goal 交给 core）→ core 加载项目指令（trust 门控）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL。`sg continue` 重开既有会话文件，走同一条链。
+`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → LSP 式握手（initialize/initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（goal 交给 core）→ core 加载项目指令（trust 门控）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL → 索引更新状态与 usage。`sg continue` 通过索引定位并重开既有会话文件，走同一条链。
 
 ```mermaid
 sequenceDiagram
@@ -60,7 +63,7 @@ sequenceDiagram
     participant S as app-server
     participant C as headless core
     participant P as Provider (HTTP)
-    participant F as 会话 JSONL (工作区 .singularity/agent-sessions/)
+    participant F as 会话 JSONL (~/.singularity/sessions/<uuid>.jsonl)
     CLI->>S: spawn 子进程 + stdio JSON-RPC
     CLI->>S: initialize / initialized（握手）
     CLI->>S: thread/start {cwd, model}
@@ -111,7 +114,7 @@ flowchart TD
 
 ## 4. 工具执行链（图 d）
 
-模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ 参数校验 → `beforeToolCall` hook（可 block；terminate 可终止整批）→ 执行（进程内，无 sandbox）→ 输出截断 → `afterToolCall` hook（可改 content/details/usage）→ toolResult 按调用顺序回传。
+模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ 参数校验 → `beforeToolCall` hook（可 block；terminate 可终止整批）→ 执行（进程内，继承进程权限，无 workspace containment）→ 输出截断 → `afterToolCall` hook（可改 content/details/usage）→ toolResult 按调用顺序回传。
 
 **工具面（裁决 3，对齐 Pi）**：默认 read/bash/edit/write；可选只读 grep/find/ls。工具 schema 见第 12.2 节。
 
@@ -141,7 +144,7 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于工作区 `.singularity/agent-sessions/` 自管目录（按 thread 一个文件）。**会话 JSONL 是唯一持久事实源**（裁决 1）：无 checkpoint、无 turn 级崩溃恢复；进程退出即中断，重开会话即继续。
+会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint、无 turn 级崩溃恢复；进程退出即中断，重开会话即继续。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
 
 - 落盘时机：只有终态消息（`message_end`）追加 JSONL；流式 delta 不落盘；纯 user 消息在第一条 assistant 消息之前不写盘（照 Pi 语义）。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
@@ -218,7 +221,7 @@ sequenceDiagram
 
 - **任务集**（通用格式）：task_id + `workspace/`（几百~1000 行项目，含测试）+ `instruction.md` + `checker.sh`。
 - **执行规模**：3 题 × 2 模型 = 6 cell 全并行（用户裁决：一次 3 题防供应商并发限流；模型组：opencode-go/deepseek-v4-flash#max、longcat/LongCat-2.0#high；题集为高难度替换题：warehouse-audit / billing-calc / cache-ttl）。
-- **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 强制 `SINGULARITY_APP_SERVER_TRANSPORT=stdio` 隔离）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；300s 超时防挂死）→ 从 rollout + usage 聚合指标。
+- **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 均为独立 stdio 子进程）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；300s 超时防挂死）→ 从 rollout + usage 聚合指标。
 - **判分语义**：turn 失败但 checker 通过时判 passed（workspace 状态是客观证据）；checker 输出经读取线程边读边同步捕获（孙进程持管道不 EOF 也能拿到已读部分）。
 - **指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率；成本估算；耗时拆解；工具调用数；工具失败数；重复动作。
 - 每次 harness 改动后重跑，指标按模型分组对比。
@@ -251,7 +254,7 @@ flowchart LR
 
 ## 10. 配置与信任
 
-**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件 `~/.singularity/auth.v1-*.json` 以 owner-only ACL 校验。daemon 状态/锁文件 `%USERPROFILE%\.singularity/app-server-daemon.json`（pid/port）与 `.lock`（单实例启动锁）。
+**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件 `~/.singularity/auth.v1-*.json` 以 owner-only ACL 校验。会话目录 `~/.singularity/sessions/`、索引 `~/.singularity/index.sqlite3` 与备份目录 `~/.singularity/backups/` 均 owner-only。
 
 **trust 决策（裁决 7）**：对齐 Pi——陌生项目 ask / always / never；决策持久化到信任存储（CLI 显式覆盖 → 是否存在项目资源 → 信任存储 → 默认策略 → 交互选择）。**不信任的项目不加载项目指令、技能与扩展**。cap-std 路径硬化（nofollow capability 绑定）已删除。
 
@@ -259,17 +262,17 @@ flowchart LR
 
 ## 11. 客户端与协议
 
-**客户端**：`sg` CLI 是 app-server 协议客户端——默认**复用常驻 TCP daemon**（读状态文件 pid/port → 握手探活 → 复用；无可用实例时经启动锁拉起新 daemon 并发布状态文件），`SINGULARITY_APP_SERVER_TRANSPORT=stdio` 时回退 spawn 子进程（eval 隔离等场景）。daemon 空闲 60s 自停（`SINGULARITY_APP_SERVER_IDLE_TIMEOUT_MS` 可调）。未来 Desktop 走同一协议、同一配置、同一会话。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue`（重开既有会话继续）、`sg turn`（status / interrupt / resume / pause / input，input 支持 steer / follow_up 投递到内存队列）、`sg threads`、`sg config`（doctor / models / import-env）、`sg eval`（轻量回归评估，见第 8 节）。approve/approvals 与 trace 命令随对应机制移除。
+**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）、`sg trust`、`sg eval`。`sg turn status/pause/resume/input` 与 `thread/read/fork/archive/delete` 已删除。未来 Desktop 嵌入 core 或走同一 stdio 协议。
 
-**JSON-RPC 传输合同**（stdio 与 TCP 共用同一 framing）：
+**JSON-RPC 传输合同**（stdio JSON-Lines framing）：
 
 - 每行一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。
 - 所有 envelope 带 `jsonrpc: "2.0"`，由互斥的 request / notification / success / error 表示；request id 只接受字符串或可精确表示的 JSON 整数，`null` 仅用于服务端无法关联合法请求时的 response/error id；error envelope 不允许省略 `id`；响应按解析后的合法 id 关联。
 - 错误码：`-32700`（解析失败）、`-32600`（无效请求）、`-32601`（未知方法）、`-32602`（无效参数）、`-32603`（内部错误）；标准错误不回显原始输入或内部诊断，`data` 仅允许显式脱敏内容。
-- batch 按输入顺序串行分发；notification 项不产生响应；batch response 保持输入顺序。
+- batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（目标形态）**：收敛为 Pi RPC 级命令集 + 事件流——initialize/initialized 握手、thread 生命周期命令（start/fork/resume 等）、turn 命令（start/input/pause/resume/interrupt/status 等）、server/shutdown；事件流为实时输出，使用 Pi 事件集（agent_start / agent_end / agent_settled、turn_start / turn_end、message_start / message_update / message_end、tool_execution_start / update / end、compaction_start / compaction_end、session_compact、session_start / session_shutdown 等），**会话文件是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、project/trust、server/shutdown。turn/steer 与 turn/followUp 是同一连接内的内存投递能力；`session/read` 默认返回摘要 + 最近片段，不返回全文。事件流为实时输出（thread/started、turn/started、item/started、item/agentMessage/delta、item/completed、item/failed、turn/completed），**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出；客户端事件投影只含安全字段，不泄露 raw payload。
 
@@ -317,17 +320,15 @@ flowchart LR
 | 机制 | 裁决 | 去向 |
 | --- | --- | --- |
 | checkpoint 体系（TurnCheckpoint / ApprovalCheckpoint、resume epoch、tool_executions unknown 归约、v5–v8 codec） | 1 | 无 checkpoint；会话 JSONL 为唯一持久事实源 |
-| SQLite 消息/历史存储（v13 schema 的消息表、WAL、workspace execution guard） | 1/6 | 消息事实源改为 JSONL 会话；SQLite 仅保留 thread/turn 状态、workspace 执行锁与崩溃恢复（`crates/store`） |
+| SQLite 消息/历史存储（v13 schema 的 threads/turns/items 表、workspace execution guard） | 1/6 | 消息事实源改为 JSONL 会话；SQLite 收敛为 `session_index` 轻量索引（`crates/store`） |
 | trace 体系（TraceEvent / typed span / TransportTraceSink、trace/list\|show\|tail\|metrics 方法） | 6 | 删除；会话文件即完整记录，事件流为实时输出 |
 | 16-worker 请求池、控制/事件双队列、cursor/gap、输出全局排序 | 4 | 单 worker 顺序处理 |
-| Approval / Policy 链（PolicyEngine、PermissionProfile、approval/decision 等） | 3/5/7 | 删除；trust 决策替代 |
-| Sandbox（sandbox / windows-sandbox crate：restricted-token、Job Object、namespace/seccomp/Landlock、elevated setup；command-runner / setup 二进制） | 5 | 命令进程内执行；crate 与二进制已随 3b 删除（`2f7189f1`） |
 | capability probe 体系（约 3236 行 negotiation + 持久化缓存） | 8 | 静态能力声明 |
-| 旧 Evaluation（task_set v6 / result v9 / evidence v4、三维 gate、sandbox preflight、source-template cache、publication） | 2 | 轻量回归工具（第 8 节） |
+| 旧 Evaluation（task_set v6 / result v9 / evidence v4、三维 gate、source-template cache、publication） | 2 | 轻量回归工具（第 8 节） |
 | 旧工具面 read/list/grep/patch/command 及 patch 原子发布 / WorkspaceContentRevision | 3 | Pi 工具面 read/bash/edit/write（+可选只读集） |
 | 项目指令 cap-std nofollow 硬化（capability 绑定、nlink / handle-relative 校验） | 7 | trust + 简单加载 |
-| 7 态 Turn 状态机（running / paused / suspended / blocked / completed / failed / cancelled 等） | 1/4 | 无 turn 状态机；进程退出即中断 |
-| turn_inputs / inputId 幂等键、steer/follow_up 持久化消费关系 | 9 | 内存队列，无幂等键 |
+| Turn 状态机（paused / suspended / blocked / turn status / pause / resume / input） | 1/4 | 删除；同一连接内保留 turn/steer、turn/followUp、turn/interrupt |
+| turn_inputs / inputId 幂等键、steer/follow_up 持久化消费关系 | 9 | 内存队列，无幂等键（turn/steer、turn/followUp） |
 | artifact 体系（artifact refs、artifact/fetch） | 6 | 删除 |
 | OpenTelemetry exporter 边界（原 §12.1） | 6 | 无外部遥测；不引入 exporter |
 | config.toml 迁移（原定把 config.json 环境层迁入共享 config.toml） | 遗留事项 3（已裁决取消） | **不迁移**：`config.json` 为当前配置格式（Pi 用 JSON），环境层（`SINGULARITY_MODELS_CONFIG` 等）保留 |
@@ -339,9 +340,8 @@ flowchart LR
 | --- | --- | --- |
 | 1 | 剥离死表面（evaluator_only、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | **完成**（提交 `8c44439b`） |
 | 2 | 新建 JSONL SessionManager + Pi 式 Agent 循环 + Compaction + 事件流（新模块，与旧机制并存不切换） | **完成**（提交 `5213e604` / `602303d` / `d2e79e0` / `da6c689`：message/session/compaction/tools/loop + 真实模型端到端） |
-| 3 | 移除 Sandbox / Policy / Approval 链；命令改为进程内执行（截断/超时/杀进程树）；删除 policy / sandbox / windows-sandbox crate | **完成**：3a 切换 turn 执行到新核心（`2df1d7fa`）；3b 删除旧 AgentLoop 链（`2a8cb079`）、approval/trace/policy 产品面（`5ba5bcbc`）、tools/policy/sandbox/windows-sandbox crate（`2f7189f1`） |
 | 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | **完成**：W4-1 store 收敛（`1af9213a`，删 checkpoint_recovery/trace_artifact 全链与 trace 表，恢复语义保持 Paused/Suspended 可恢复）；W4-2 真实链路验收（sg run 完整任务 + 会话文件校验） |
 | 5 | Provider 简化：删 capability probe 全链，静态声明 + 用户覆盖；保留双协议 adapter / 重试 / usage 记账 | **完成**：删 capability.rs 全链（probe/negotiation/缓存/fingerprint），agent loop 改调静态 `protocol_contract()`，config.json 接受旧 `capabilities` 声明块并入静态契约（顶层字段优先），supports_system/developer 默认统一 true/true；内置模型表为遗留项 |
 | 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局配置 | **完成**：单 worker 顺序传输（`da329bf8`，删 16-worker 池/双队列/全局排序/gap/容量错误/CancellationMonitor，interrupt 进程内直连）、CLI 去掉订阅与 cursor 校验（`353d7ba4`）、turn/input 改内存投递（裁决 9 落地）；真实链路验收含运行中 interrupt（interrupted/cancelled）；业务状态下沉 core、事件命名 Pi 式收敛、**config.toml 不迁移（裁决，Pi 用 JSON）** |
 | 7 | 清理与文档：删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | **完成**：删 v1–v12 旧迁移（`b1a273ed`）、sg eval 评估工具 + 5 题任务集（`8c5de156`，10 cell 并行真实链路 + checker.sh 判分 + 12 项指标聚合，含真实 usage 数据源）、pycache 清理（`16c2e9ca`）；完成验证见 `outputs/exec/status.md` |
-| 后续演进（重构后） | 2026-08-15 批次：app-server daemon 化（TCP 回环常驻 + 空闲自停 + 单实例锁 + CLI 复用，stdio 回退）；错误文本透出（敏感脱敏）；传输级 + 运行级两层重试；DeepSeek 峰谷双价；eval 题集替换为 3 个高难度题 + 双模型 6 cell；max_output_tokens 按 provider 能力；eval 工具可靠性（checker 超时/输出竞态/挂起） | **完成**（提交 `48685e4a`..`a905d676`，CI 全绿；详情见 `outputs/exec/status.md`） |
+| 后续演进（重构后） | 架构收敛：删除 TCP daemon（每命令独立 stdio 子进程）；JSONL 唯一权威 + SQLite 轻量索引；会话迁移到 `~/.singularity/sessions/`；协议/CLI 收缩 | **本计划实施中**（见 `plan/architecture-harness-remediation-1.md`） |

@@ -6,21 +6,6 @@
 use super::*;
 
 impl AppServer {
-    pub(super) fn event_subscribe(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        let params: EventSubscribeParams = parse_params(&message)?;
-        json_response(
-            message.required_id(),
-            EventSubscribeResult {
-                subscription_id: EVENT_SUBSCRIPTION_ID.to_string(),
-                event_types: params.event_types,
-                cursor: 0,
-            },
-        )
-    }
-
     /// 将应用事件包装为带类型化元数据的 JSON-RPC notification。
     pub(super) fn event_notification(&self, event: AppEvent) -> AppServerResult<Value> {
         let (class, delivery) = event_contract(&event);

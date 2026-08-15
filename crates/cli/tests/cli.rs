@@ -140,7 +140,15 @@ fn cli_requires_an_end_user_command_and_hides_protocol_debug_commands() {
         .expect("run cli help");
     assert!(help.status.success(), "stderr={}", stderr(&help));
     let help = stdout(&help);
-    for internal in ["protocol-init", "thread-start", "daemon"] {
+    for internal in [
+        "protocol-init",
+        "thread-start",
+        "daemon",
+        "turn status",
+        "turn pause",
+        "turn resume",
+        "turn input",
+    ] {
         assert!(!help.contains(internal), "help exposed {internal}: {help}");
     }
 }
@@ -267,6 +275,102 @@ fn cli_run_continue_threads_and_doctor_use_app_server_protocol() {
         .expect("doctor cli");
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
     assert!(stdout(&doctor).contains("client=protocol-only"));
+}
+
+// 验证 threads 默认展示全部会话并携带 cwd。
+#[test]
+fn cli_threads_renders_all_sessions_with_cwd() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .respond(
+                "thread/list",
+                json!({"threads": [
+                    raw_fake_thread("session-a"),
+                    raw_fake_thread("session-b")
+                ]}),
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("session-a active"));
+    assert!(stdout.contains("session-b active"));
+}
+
+// 验证 session read 只渲染摘要与最近片段，不渲染全文。
+#[test]
+fn cli_session_read_renders_summary_and_recent_entries() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .respond(
+                "session/read",
+                json!({
+                    "sessionId": "session-read",
+                    "cwd": "/tmp/work",
+                    "title": "fix tests",
+                    "model": null,
+                    "status": "active",
+                    "createdAt": "2026-08-15T00:00:00Z",
+                    "updatedAt": "2026-08-15T00:01:00Z",
+                    "tokenUsage": {},
+                    "summary": "compact summary",
+                    "recentEntries": [
+                        {"id":"entry-1","parentId":null,"type":"message"}
+                    ],
+                    "totalEntries": 2
+                }),
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["session", "read", "session-read"])
+        .output()
+        .expect("session read cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("session session-read"));
+    assert!(stdout.contains("summary compact summary"));
+    assert!(stdout.contains("total_entries 2"));
+    assert!(stdout.contains("entry-1"));
+    assert!(!stdout.contains("full rollout"));
+}
+
+// 验证 session delete 打印服务端删除确认。
+#[test]
+fn cli_session_delete_renders_deleted_confirmation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .respond(
+                "session/delete",
+                json!({"sessionId":"session-delete","deleted":true}),
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["session", "delete", "session-delete"])
+        .output()
+        .expect("session delete cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("session session-delete deleted=true"));
 }
 
 // 验证 doctor 输出脱敏的 AgentLoop 与 provider readiness。
@@ -504,36 +608,6 @@ fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
     assert_eq!(params["threadId"], "thread_agent");
 }
 
-// 验证缺少可确认的 AgentLoop 终态时拒绝 turn。
-#[test]
-fn cli_rejects_turn_without_agent_loop_terminal_status() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .agent_loop_ready()
-            .respond(
-                "thread/start",
-                json!({"thread": fake_thread("thread_agent")}),
-            )
-            .respond(
-                "turn/start",
-                json!({"turn": fake_turn("turn_agent", "thread_agent", "running", "unknown")}),
-            )
-            .shutdown(),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("error running: turn running"));
-}
-
 // 验证 JSON 模式只输出脱敏结果与允许公开的事件摘要。
 #[test]
 fn cli_run_json_outputs_turn_result_without_human_rendering() {
@@ -578,7 +652,7 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
     assert!(!stdout(&output).contains("turn turn_json completed"));
 }
 
-// 验证 JSON 模式保留 blocked 状态并以失败退出。
+// 验证 JSON 模式保留 failed 状态并以失败退出。
 #[test]
 fn cli_run_json_preserves_fail_closed_turn_status() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -594,7 +668,7 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
             )
             .respond(
                 "turn/start",
-                json!({"turn": fake_turn("turn_json", "thread_json", "blocked", "blocked")}),
+                json!({"turn": fake_turn("turn_json", "thread_json", "failed", "failed")}),
             )
             .shutdown(),
     );
@@ -606,8 +680,8 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
 
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["turn"]["status"], "blocked");
-    assert_eq!(value["turn"]["agent_loop_status"], "blocked");
+    assert_eq!(value["turn"]["status"], "failed");
+    assert_eq!(value["turn"]["agent_loop_status"], "failed");
 }
 
 // 验证部分 capability 在 blocker 清除前仍不能启动 turn。
@@ -741,309 +815,10 @@ fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
     assert!(!stdout(&output).to_lowercase().contains("raw_prompt"));
 }
 
-// 验证立即 blocked 的 turn 以非零状态退出。
-#[test]
-fn cli_exits_nonzero_for_immediate_blocked_turn() {
-    assert_immediate_terminal_turn_exits_nonzero("blocked", "blocked");
-}
-
 // 验证立即 interrupted 的 turn 以非零状态退出。
 #[test]
 fn cli_exits_nonzero_for_immediate_interrupted_turn() {
     assert_immediate_terminal_turn_exits_nonzero("interrupted", "cancelled");
-}
-
-// 验证 turn 状态与中断查询都通过 app-server 协议渲染。
-#[test]
-fn cli_turn_lifecycle_status_and_interrupt_render_agent_loop_status() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "turn/status",
-                json!({"turn": fake_turn("turn_fake", "thread_fake", "running", "running")}),
-            )
-            .respond(
-                "turn/interrupt",
-                json!({
-                    "turnId": "turn_fake",
-                    "status": "interrupted",
-                    "agent_loop_status": "cancel_requested"
-                }),
-            ),
-    );
-
-    let status = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "status", "turn_fake"])
-        .output()
-        .expect("turn status cli");
-    assert!(status.status.success(), "stderr={}", stderr(&status));
-    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=running"));
-
-    let interrupt = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "interrupt", "turn_fake"])
-        .output()
-        .expect("turn interrupt cli");
-    assert!(interrupt.status.success(), "stderr={}", stderr(&interrupt));
-    assert!(
-        stdout(&interrupt)
-            .contains("turn turn_fake interrupted agent_loop_status=cancel_requested")
-    );
-}
-
-// 验证 app-server 拒绝 turn interrupt 时 CLI 以非零退出。
-#[test]
-fn cli_turn_interrupt_error_exits_nonzero() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new().initialized().error(
-            "turn/interrupt",
-            JSON_RPC_SERVER_ERROR_CODE,
-            "cancel failed",
-        ),
-    );
-
-    let interrupt = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "interrupt", "turn_fake"])
-        .output()
-        .expect("turn interrupt cli");
-
-    assert!(!interrupt.status.success());
-    assert!(stderr(&interrupt).contains("cancel failed"));
-}
-
-// 验证 turn resume 复用 turn_start 的渲染/轮询：running 响应后轮询 turn/status
-// 到终态，退出码随终态成功，且不产生额外 turn/input。
-#[test]
-fn cli_turn_resume_renders_and_polls_to_terminal_without_extra_input() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let methods_path = temp.path().join("turn-resume-methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "turn/resume",
-                vec![respond(json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "running", "running")
-                }))],
-            )
-            .respond(
-                "turn/status",
-                json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "running", "running")
-                }),
-            )
-            .respond(
-                "turn/status",
-                json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "completed", "completed")
-                }),
-            )
-            .shutdown()
-            .trace_methods_to(&methods_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "resume", "turn_fake"])
-        .output()
-        .expect("turn resume cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    assert!(
-        stdout(&output).contains("turn turn_fake running agent_loop_status=running"),
-        "stdout={}",
-        stdout(&output)
-    );
-    assert!(
-        stdout(&output).contains("turn turn_fake completed agent_loop_status=completed"),
-        "stdout={}",
-        stdout(&output)
-    );
-    let methods = std::fs::read_to_string(&methods_path).expect("resume methods");
-    assert!(methods.contains("turn/resume\n"), "methods={methods}");
-    assert!(methods.contains("turn/status\n"), "methods={methods}");
-    assert!(
-        !methods.contains("turn/input"),
-        "resume must not synthesize input; methods={methods}"
-    );
-}
-
-// 验证 turn resume 在 interrupted 终态时以非零退出并展示状态。
-#[test]
-fn cli_turn_resume_exits_nonzero_for_interrupted_turn() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "turn/resume",
-                vec![respond(json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "running", "running")
-                }))],
-            )
-            .interaction(
-                "turn/status",
-                vec![respond(json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "interrupted", "cancelled")
-                }))],
-            )
-            .shutdown(),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "resume", "turn_fake"])
-        .output()
-        .expect("turn resume interrupted cli");
-
-    assert!(!output.status.success());
-    assert!(
-        stdout(&output).contains("turn turn_fake interrupted agent_loop_status=cancelled"),
-        "stdout={}",
-        stdout(&output)
-    );
-    assert!(stderr(&output).contains("turn turn_fake interrupted"));
-}
-
-// 验证 turn pause 是短请求：打印 paused 状态、不轮询 turn/status。
-#[test]
-fn cli_turn_pause_renders_paused_without_polling() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let methods_path = temp.path().join("turn-pause-methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "turn/pause",
-                json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "paused", "paused")
-                }),
-            )
-            .shutdown()
-            .trace_methods_to(&methods_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["turn", "pause", "turn_fake"])
-        .output()
-        .expect("turn pause cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    assert!(
-        stdout(&output).contains("turn turn_fake paused agent_loop_status=paused"),
-        "stdout={}",
-        stdout(&output)
-    );
-    let methods = std::fs::read_to_string(&methods_path).expect("pause methods");
-    assert!(
-        !methods.contains("turn/status"),
-        "pause must not poll; methods={methods}"
-    );
-    assert!(methods.contains("turn/pause\n"), "methods={methods}");
-}
-
-// 验证 turn input 精确映射协议参数（turnId/inputId/delivery/文本），
-// running 结果复用与 turn_start 相同的轮询 helper。
-#[test]
-fn cli_turn_input_maps_protocol_params_and_polls_running_result() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let params_path = temp.path().join("turn-input-params.json");
-    let methods_path = temp.path().join("turn-input-methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "turn/input",
-                vec![
-                    capture_params(&params_path),
-                    respond(json!({
-                        "turn": fake_turn("turn_fake", "thread_fake", "running", "running")
-                    })),
-                ],
-            )
-            .respond(
-                "turn/status",
-                json!({
-                    "turn": fake_turn("turn_fake", "thread_fake", "completed", "completed")
-                }),
-            )
-            .shutdown()
-            .trace_methods_to(&methods_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args([
-            "turn",
-            "input",
-            "turn_fake",
-            "add more tests",
-            "--input-id",
-            "cli_input_1",
-            "--delivery",
-            "follow-up",
-        ])
-        .output()
-        .expect("turn input cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    let params: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&params_path).expect("input params"))
-            .expect("input params json");
-    assert_eq!(
-        params,
-        json!({
-            "turnId": "turn_fake",
-            "inputId": "cli_input_1",
-            "delivery": "follow_up",
-            "input": [{"type": "text", "text": "add more tests"}],
-        })
-    );
-    let methods = std::fs::read_to_string(&methods_path).expect("input methods");
-    assert!(methods.contains("turn/input\n"), "methods={methods}");
-    assert!(methods.contains("turn/status\n"), "methods={methods}");
-}
-
-// 验证 turn input 缺少显式幂等键时在 CLI 解析阶段失败，且不会启动 app-server。
-#[test]
-fn cli_turn_input_requires_input_id_without_starting_app_server() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let startup_marker = temp.path().join("app-server-started");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new().startup(vec![write_text(&startup_marker, "started")]),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args([
-            "turn",
-            "input",
-            "turn_fake",
-            "add more tests",
-            "--delivery",
-            "follow-up",
-        ])
-        .output()
-        .expect("turn input cli");
-
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("--input-id <INPUT_ID>"));
-    assert!(
-        !startup_marker.exists(),
-        "app-server must not start when CLI parsing fails"
-    );
 }
 
 // 验证 continue 遇到非终态 turn 时展示服务端可操作提示（含 turn ID），
@@ -1280,76 +1055,6 @@ fn cli_run_does_not_wait_for_post_response_messages() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     assert!(stdout(&output).contains("thread thread_fake"));
-}
-
-// 验证 running turn 在关闭 app-server 前轮询到终态。
-#[test]
-fn cli_run_polls_running_turn_before_shutdown() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .agent_loop_ready()
-            .respond(
-                "thread/start",
-                json!({"thread": fake_thread("thread_fake")}),
-            )
-            .respond(
-                "turn/start",
-                json!({"turn": fake_turn("turn_active", "thread_fake", "running", "running")}),
-            )
-            .respond(
-                "turn/status",
-                json!({"turn": fake_turn("turn_active", "thread_fake", "running", "running")}),
-            )
-            .respond(
-                "turn/status",
-                json!({"turn": fake_turn("turn_active", "thread_fake", "completed", "completed")}),
-            )
-            .shutdown(),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    assert!(stdout(&output).contains("turn turn_active completed agent_loop_status=completed"));
-}
-
-// 验证轮询期间进入 interrupted 的 turn 以非零退出。
-#[test]
-fn cli_run_polling_exits_nonzero_for_interrupted_turn() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .agent_loop_ready()
-            .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
-            .respond(
-                "turn/start",
-                json!({"turn": fake_turn("turn_active", "thread_fake", "running", "running")}),
-            )
-            .respond(
-                "turn/status",
-                json!({"turn": fake_turn("turn_active", "thread_fake", "interrupted", "cancelled")}),
-            )
-            .shutdown(),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(!output.status.success());
-    assert!(stdout(&output).contains("turn turn_active interrupted agent_loop_status=cancelled"));
-    assert!(stderr(&output).contains("turn turn_active interrupted"));
 }
 
 // 验证 JSON-RPC error 不被吞掉并传递到 CLI stderr。

@@ -9,7 +9,10 @@ pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            StoreError::InvalidState(format!("cannot inspect owner-only dir {}: {error}", path.display()))
+            StoreError::InvalidState(format!(
+                "cannot inspect owner-only dir {}: {error}",
+                path.display()
+            ))
         })?;
         if !metadata.is_dir() {
             return Err(StoreError::InvalidState(format!(
@@ -45,7 +48,10 @@ pub fn ensure_owner_only_file(path: &Path) -> StoreResult<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            StoreError::InvalidState(format!("cannot inspect owner-only file {}: {error}", path.display()))
+            StoreError::InvalidState(format!(
+                "cannot inspect owner-only file {}: {error}",
+                path.display()
+            ))
         })?;
         if !metadata.is_file() {
             return Err(StoreError::InvalidState(format!(
@@ -100,8 +106,7 @@ mod windows_owner_only {
     };
     use windows_sys::Win32::Storage_FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
-        WRITE_OWNER,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -169,8 +174,9 @@ mod windows_owner_only {
             return Err(invalid_state("owner-only ACL could not be created"));
         }
         let handle = file.as_raw_handle() as HANDLE;
-        let security_information =
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
+        let security_information = DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION
+            | OWNER_SECURITY_INFORMATION;
         let status = unsafe {
             SetSecurityInfo(
                 handle,

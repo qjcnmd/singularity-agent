@@ -15,9 +15,10 @@ use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
     ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method, ProjectTrustDecision,
-    ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus, RpcMethod, Thread,
-    ThreadEventParams, ThreadIdParams, ThreadStartParams, Turn, TurnEventParams, TurnIdParams,
-    TurnInputDelivery, TurnInputParams, TurnStartParams, TurnStatus, rpc_methods,
+    ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus, RpcMethod,
+    SessionDeleteResult, SessionIdParams, SessionReadParams, SessionReadResult, Thread,
+    ThreadEventParams, ThreadIdParams, ThreadStartParams, Turn, TurnEventParams, TurnStartParams,
+    TurnStatus, rpc_methods,
 };
 
 mod eval;
@@ -33,7 +34,6 @@ const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -60,12 +60,12 @@ enum Command {
         thread_id: String,
         instruction: String,
     },
-    /// Inspect or interrupt a turn through the app-server protocol.
-    Turn {
+    /// Read or delete a session (JSONL rollout + SQLite index).
+    Session {
         #[command(subcommand)]
-        command: TurnCommand,
+        command: SessionCommand,
     },
-    /// List persisted threads through the app-server protocol.
+    /// List persisted sessions through the app-server protocol.
     Threads,
     /// Configuration and runtime diagnostics.
     Config {
@@ -126,43 +126,17 @@ enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
-// turn 查询、中断与同一 Turn 操作命令。
-enum TurnCommand {
-    /// Print the current turn status.
-    Status { turn_id: String },
-    /// Interrupt a running turn.
-    Interrupt { turn_id: String },
-    /// Resume a suspended or paused turn from its durable checkpoint.
-    Resume { turn_id: String },
-    /// Pause a running turn without terminating its checkpoint.
-    Pause { turn_id: String },
-    /// Append a real user input to a non-terminal turn.
-    Input {
-        turn_id: String,
-        text: String,
-        /// Explicit idempotency key for the appended input.
+// 会话查看/删除命令。
+enum SessionCommand {
+    /// Print session summary + recent rollout entries (not the full file).
+    Read {
+        session_id: String,
+        /// Recent leaf entries to return (default 20, max 200).
         #[arg(long)]
-        input_id: String,
-        /// Delivery semantics: steer consumes at the next boundary, follow-up waits for the turn end.
-        #[arg(long, value_enum)]
-        delivery: Option<TurnDeliveryArg>,
+        limit: Option<u32>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-// turn/input 的受控投递枚举表示。
-enum TurnDeliveryArg {
-    Steer,
-    FollowUp,
-}
-
-impl TurnDeliveryArg {
-    fn protocol_value(self) -> TurnInputDelivery {
-        match self {
-            Self::Steer => TurnInputDelivery::Steer,
-            Self::FollowUp => TurnInputDelivery::FollowUp,
-        }
-    }
+    /// Delete the JSONL rollout and its SQLite index row.
+    Delete { session_id: String },
 }
 
 // 解析命令、驱动 app-server 客户端，并将错误转换为进程失败。
@@ -215,39 +189,20 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             fail_for_failed_turn(&turn)?;
             Ok(())
         }
-        Command::Turn { command } => {
-            let mut client = AppServerClient::spawn()?;
-            client.initialize()?;
-            match command {
-                TurnCommand::Status { turn_id } => client.turn_status(&turn_id),
-                TurnCommand::Interrupt { turn_id } => client.turn_interrupt(&turn_id),
-                TurnCommand::Resume { turn_id } => {
-                    client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
-                    let turn = client.turn_resume(&turn_id, true)?;
-                    fail_for_failed_turn(&turn)?;
-                    Ok(())
-                }
-                TurnCommand::Pause { turn_id } => {
-                    let turn = client.turn_pause(&turn_id)?;
-                    render_turn(&turn);
-                    Ok(())
-                }
-                TurnCommand::Input {
-                    turn_id,
-                    text,
-                    input_id,
-                    delivery,
-                } => {
-                    client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
-                    let delivery = delivery.map_or(TurnInputDelivery::FollowUp, |delivery| {
-                        delivery.protocol_value()
-                    });
-                    let turn = client.turn_input(&turn_id, &text, &input_id, delivery, true)?;
-                    fail_for_failed_turn(&turn)?;
-                    Ok(())
-                }
+        Command::Session { command } => match command {
+            SessionCommand::Read { session_id, limit } => {
+                let mut client = AppServerClient::spawn()?;
+                client.initialize()?;
+                client.session_read(&session_id, limit)?;
+                Ok(())
             }
-        }
+            SessionCommand::Delete { session_id } => {
+                let mut client = AppServerClient::spawn()?;
+                client.initialize()?;
+                client.session_delete(&session_id)?;
+                Ok(())
+            }
+        },
         Command::Threads => {
             let mut client = AppServerClient::spawn()?;
             client.initialize()?;
@@ -486,6 +441,21 @@ impl From<AppServerRpcError> for String {
     }
 }
 
+// 渲染 turn 通知并打印终态行。turn/start 的响应始终在 AgentLoop 完成后返回，
+// 不再有跨进程 turn/status 轮询。
+fn render_and_wait_terminal(
+    _client: &mut AppServerClient,
+    turn: Turn,
+    notifications: Vec<JsonRpcNotification>,
+    render: bool,
+) -> Result<Turn, String> {
+    if render {
+        render_messages(&notifications, should_render_assistant_summary(&turn));
+        render_turn(&turn);
+    }
+    Ok(turn)
+}
+
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
 impl AppServerClient {
     // 每次命令启动一个独立 stdio app-server 子进程。
@@ -633,122 +603,58 @@ impl AppServerClient {
         Ok(reply.result)
     }
 
-    // 恢复暂停/挂起的 turn，从持久化 checkpoint 继续执行并渲染事件。
-    fn turn_resume(&mut self, turn_id: &str, render: bool) -> Result<Turn, String> {
-        let reply = self.request::<rpc_methods::TurnResume>(&TurnIdParams {
-            turn_id: turn_id.to_string(),
+    // 读取会话摘要 + 最近片段，按稳定文本渲染。
+    fn session_read(&mut self, session_id: &str, limit: Option<u32>) -> Result<(), String> {
+        let reply = self.request::<rpc_methods::SessionRead>(&SessionReadParams {
+            session_id: session_id.to_string(),
+            recent_limit: limit.unwrap_or(20),
         })?;
-        render_and_wait_terminal(self, reply.result.turn, reply.notifications, render)
-    }
-
-    // 暂停 running turn；短请求，不自动轮询。
-    fn turn_pause(&mut self, turn_id: &str) -> Result<Turn, String> {
-        let reply = self.request::<rpc_methods::TurnPause>(&TurnIdParams {
-            turn_id: turn_id.to_string(),
-        })?;
-        Ok(reply.result.turn)
-    }
-
-    // 向非终态 turn 追加真实用户输入，并按 turn_start 相同规则渲染/轮询。
-    fn turn_input(
-        &mut self,
-        turn_id: &str,
-        text: &str,
-        input_id: &str,
-        delivery: TurnInputDelivery,
-        render: bool,
-    ) -> Result<Turn, String> {
-        let reply = self.request::<rpc_methods::TurnInput>(&TurnInputParams {
-            turn_id: turn_id.to_string(),
-            input_id: input_id.to_string(),
-            delivery,
-            input: vec![InputItem::Text {
-                text: text.to_string(),
-            }],
-        })?;
-        render_and_wait_terminal(self, reply.result.turn, reply.notifications, render)
-    }
-}
-
-// 渲染 turn 通知、打印状态行，并在 running 时轮询到终态。
-// turn_start / turn_resume / turn_input 共享同一渲染与轮询规则。
-fn render_and_wait_terminal(
-    client: &mut AppServerClient,
-    mut turn: Turn,
-    notifications: Vec<JsonRpcNotification>,
-    render: bool,
-) -> Result<Turn, String> {
-    if render {
-        render_messages(&notifications, should_render_assistant_summary(&turn));
-        render_turn(&turn);
-    }
-    if should_poll_running_turn(&turn) {
-        turn = wait_for_turn_terminal(client, &turn.turn_id, render)?;
-    }
-    Ok(turn)
-}
-
-// 按固定间隔查询 running turn，直到出现终态。
-fn wait_for_turn_terminal(
-    client: &mut AppServerClient,
-    turn_id: &str,
-    render: bool,
-) -> Result<Turn, String> {
-    loop {
-        thread::sleep(TURN_STATUS_POLL_INTERVAL);
-        let turn = client.fetch_turn_status(turn_id)?;
-        if turn.status != TurnStatus::Running {
-            if render {
-                println!(
-                    "turn {} {} agent_loop_status={}",
-                    turn.turn_id,
-                    turn.status.as_storage_text(),
-                    turn.agent_loop_status,
-                );
-            }
-            return Ok(turn);
+        let result: SessionReadResult = reply.result;
+        println!("session {}", result.session_id);
+        println!("cwd {}", result.cwd);
+        println!("status {}", result.status);
+        if let Some(title) = result.title {
+            println!("title {title}");
         }
+        if let Some(model) = result.model {
+            println!("model {model}");
+        }
+        println!("created_at {}", result.created_at);
+        println!("updated_at {}", result.updated_at);
+        println!("total_entries {}", result.total_entries);
+        match result.summary {
+            Some(summary) => println!("summary {summary}"),
+            None => println!("summary none"),
+        }
+        println!(
+            "recent_entries {}",
+            serde_json::to_string_pretty(&result.recent_entries)
+                .map_err(|error| format!("failed to render session entries: {error}"))?
+        );
+        Ok(())
     }
-}
 
-impl AppServerClient {
-    // 将 turn/status 响应投影为 CLI 所需的最小视图。
-    fn fetch_turn_status(&mut self, turn_id: &str) -> Result<Turn, String> {
-        let reply = self.request::<rpc_methods::TurnStatus>(&TurnIdParams {
-            turn_id: turn_id.to_string(),
+    // 删除 JSONL rollout 与 SQLite 索引行。
+    fn session_delete(&mut self, session_id: &str) -> Result<(), String> {
+        let reply = self.request::<rpc_methods::SessionDelete>(&SessionIdParams {
+            session_id: session_id.to_string(),
         })?;
-        Ok(reply.result.turn)
+        let result: SessionDeleteResult = reply.result;
+        println!("session {} deleted={}", result.session_id, result.deleted);
+        Ok(())
     }
 
-    // 请求并打印持久化 thread 列表。
+    // 请求并打印持久化 session 列表（所有项目 + cwd）。
     fn thread_list(&mut self) -> Result<(), String> {
         let reply = self.request::<rpc_methods::ThreadList>(&EmptyParams::default())?;
         for thread in &reply.result.threads {
-            println!("{} {}", thread.thread_id, thread.status.as_storage_text());
+            println!(
+                "{} {} {}",
+                thread.thread_id,
+                thread.status.as_storage_text(),
+                thread.cwd.as_deref().unwrap_or("")
+            );
         }
-        Ok(())
-    }
-
-    // 请求并渲染单个 turn 的状态。
-    fn turn_status(&mut self, turn_id: &str) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::TurnStatus>(&TurnIdParams {
-            turn_id: turn_id.to_string(),
-        })?;
-        render_turn(&reply.result.turn);
-        Ok(())
-    }
-
-    // 请求中断 turn，并打印服务端返回的状态。
-    fn turn_interrupt(&mut self, turn_id: &str) -> Result<(), String> {
-        let reply = self.request::<rpc_methods::TurnInterrupt>(&TurnIdParams {
-            turn_id: turn_id.to_string(),
-        })?;
-        println!(
-            "turn {} {}{}",
-            reply.result.turn_id,
-            reply.result.status,
-            agent_loop_status_suffix(reply.result.agent_loop_status.as_deref())
-        );
         Ok(())
     }
 
@@ -1088,15 +994,6 @@ fn should_render_assistant_summary(turn: &Turn) -> bool {
     turn.status == TurnStatus::Completed && turn.agent_loop_status == "completed"
 }
 
-// 判断 running turn 是否仍可通过轮询等待终态。
-fn should_poll_running_turn(turn: &Turn) -> bool {
-    turn.status == TurnStatus::Running
-        && matches!(
-            turn.agent_loop_status.as_str(),
-            "running" | "cancel_requested"
-        )
-}
-
 // 渲染 turn 的稳定状态行。
 fn render_turn(turn: &Turn) {
     if turn.turn_id.is_empty() {
@@ -1110,25 +1007,12 @@ fn render_turn(turn: &Turn) {
     );
 }
 
-// 从响应对象提取可选的 AgentLoop 状态后缀。
-fn agent_loop_status_suffix(status: Option<&str>) -> String {
-    status
-        .map(|status| format!(" agent_loop_status={status}"))
-        .unwrap_or_default()
-}
-
 // 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。
 fn fail_for_failed_turn(turn: &Turn) -> Result<(), String> {
     let status = turn.status.as_storage_text();
     let agent_loop_status = turn.agent_loop_status.as_str();
-    let non_terminal_running =
-        turn.status == TurnStatus::Running && !should_poll_running_turn(turn);
-    if non_terminal_running
-        || matches!(
-            turn.status,
-            TurnStatus::Failed | TurnStatus::Blocked | TurnStatus::Interrupted
-        )
-        || matches!(agent_loop_status, "failed" | "blocked" | "cancelled")
+    if matches!(turn.status, TurnStatus::Failed | TurnStatus::Interrupted)
+        || matches!(agent_loop_status, "failed" | "cancelled")
     {
         if turn.turn_id.is_empty() {
             return Err(format!("error {status}: turn {status}"));
@@ -1157,8 +1041,12 @@ fn app_server_bin() -> Result<String, String> {
 
 // 返回诊断输出使用的 app-server 数据库路径。
 fn app_server_db_display() -> String {
-    std::env::var(APP_SERVER_DB_ENV)
-        .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string())
+    if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
+        return db;
+    }
+    singularity_core::user_singularity_home()
+        .map(|home| home.join("index.sqlite3").to_string_lossy().to_string())
+        .unwrap_or_else(|| "~/.singularity/index.sqlite3".to_string())
 }
 
 // 查找与当前 CLI 可执行文件同目录的 app-server。

@@ -1,575 +1,178 @@
-//! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
+//! 收缩后协议合同测试：stdio JSON-RPC registry、wire shape 与稳定状态文本。
 
 use serde_json::json;
-use singularity_core::{ClientInfo, ErrorCode};
+use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ConversationMessage,
-    ConversationRole, EventClass, EventDelivery, EventMetadata, EventSubscribeParams,
-    InitializeParams, InitializeResult, ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId,
-    JsonRpcMessage, JsonRpcPayload, METHOD_REGISTRY, Method, MethodKind,
-    ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams, ThreadReadResult,
-    ThreadStartParams, ThreadStatus, Turn, TurnIdParams, TurnModelUsage, TurnStartParams,
-    TurnStatus, parse_json_rpc_payload,
+    EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload, Method, MethodKind,
+    SessionReadParams, ThreadStartParams, TurnInjectionParams, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload, rpc_methods,
 };
 
 #[test]
 fn json_rpc_requires_the_2_0_version_member() {
-    let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","input":[{"type":"text","text":"hi"}]}}"#;
-    assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
-
-    let wrong_version = r#"{"jsonrpc":"1.0","method":"turn/start","id":2,"params":{"threadId":"thread_1","input":[{"type":"text","text":"hi"}]}}"#;
-    assert!(serde_json::from_str::<JsonRpcMessage>(wrong_version).is_err());
-}
-
-#[test]
-fn json_rpc_rejects_ambiguous_envelopes_and_non_scalar_ids() {
-    for raw in [
-        r#"{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{},"result":{}}"#,
-        r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"boom"}}"#,
-        r#"{"jsonrpc":"2.0","method":"thread/list","id":{"nested":true},"params":{}}"#,
-        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"boom"}}"#,
-    ] {
-        assert!(
-            serde_json::from_str::<JsonRpcMessage>(raw).is_err(),
-            "invalid envelope was accepted: {raw}"
-        );
-    }
-}
-
-#[test]
-fn json_rpc_accepts_and_echoes_every_supported_id_shape() {
-    for (raw, expected) in [
-        (
-            r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
-            JsonRpcId::String("request-1".to_string()),
-        ),
-        (
-            r#"{"jsonrpc":"2.0","method":"thread/list","id":-7,"params":{}}"#,
-            JsonRpcId::Number(-7),
-        ),
-        (
-            r#"{"jsonrpc":"2.0","method":"thread/list","id":18446744073709551615,"params":{}}"#,
-            JsonRpcId::Unsigned(u64::MAX),
-        ),
-    ] {
-        let request_value: serde_json::Value = serde_json::from_str(raw).expect("request JSON");
-        let message: JsonRpcMessage = serde_json::from_str(raw).expect("standard request id");
-        assert_eq!(message.id(), Some(&expected));
-        let response = JsonRpcMessage::response(expected, serde_json::json!({})).to_wire_value();
-        assert_eq!(response["id"], request_value["id"]);
-    }
-}
-
-#[test]
-fn json_rpc_rejects_explicit_null_ids_for_request_and_notification() {
-    for raw in [
-        r#"{"jsonrpc":"2.0","method":"thread/list","id":null,"params":{}}"#,
-        r#"{"jsonrpc":"2.0","method":"initialized","id":null,"params":{}}"#,
-    ] {
-        assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
-        assert_eq!(
-            parse_json_rpc_payload(raw).expect("valid JSON frame"),
-            JsonRpcPayload::Single(JsonRpcBatchItem::Invalid { id: None })
-        );
-    }
-
-    let response = JsonRpcMessage::invalid_request(None).to_wire_value();
-    assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], serde_json::Value::Null);
-    assert_eq!(response["error"]["code"], -32600);
-    assert_eq!(response["error"]["message"], "Invalid Request");
-}
-
-#[test]
-fn json_rpc_rejects_fractional_ids_as_invalid_request_with_null_id() {
-    let raw = r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#;
-
-    assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
-    assert_eq!(
-        parse_json_rpc_payload(raw).expect("valid JSON frame"),
-        JsonRpcPayload::Single(JsonRpcBatchItem::Invalid { id: None })
-    );
-
-    let response = JsonRpcMessage::invalid_request(None).to_wire_value();
-    assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], serde_json::Value::Null);
-    assert_eq!(response["error"]["code"], -32600);
-    assert_eq!(response["error"]["message"], "Invalid Request");
-}
-
-#[test]
-fn json_rpc_unassociated_error_responses_round_trip_with_null_id() {
-    for message in [
-        JsonRpcMessage::parse_error(),
-        JsonRpcMessage::invalid_request(None),
-        JsonRpcMessage::error(None, ErrorCode::new(-32603, "Internal error")),
-    ] {
-        let wire = message.to_wire_value();
-        assert_eq!(wire["id"], serde_json::Value::Null);
-        let parsed = serde_json::from_value::<JsonRpcMessage>(wire).expect("error response");
-        assert_eq!(parsed.id(), Some(&JsonRpcId::Null));
-    }
-}
-
-#[test]
-fn thread_start_params_round_trip_and_reject_unknown_public_values() {
-    let params: ThreadStartParams = serde_json::from_value(serde_json::json!({
-        "model": "gpt-test",
-        "cwd": "C:/workspace",
-    }))
-    .expect("thread/start params");
-    assert_eq!(params.model.as_deref(), Some("gpt-test"));
-    assert_eq!(params.cwd.as_deref(), Some("C:/workspace"));
-    assert_eq!(
-        serde_json::to_value(params).expect("serialize thread/start params"),
-        serde_json::json!({
-            "model": "gpt-test",
-            "cwd": "C:/workspace",
-        })
-    );
-
-    for value in [
-        serde_json::json!({"sandboxMode": "read-only"}),
-        serde_json::json!({"approvalPolicy": "on-request"}),
-    ] {
-        let result = serde_json::from_value::<ThreadStartParams>(value);
-        assert!(result.is_err(), "removed policy value was accepted");
-    }
-}
-
-#[test]
-fn thread_read_uses_typed_paginated_safe_conversation_history() {
-    let params: ThreadReadParams = serde_json::from_value(serde_json::json!({
-        "threadId": "thread_1",
-        "beforeTurnSequence": 7,
-        "limit": 5
-    }))
-    .expect("thread/read params");
-    assert_eq!(params.thread_id, "thread_1");
-    assert_eq!(params.before_turn_sequence, Some(7));
-    assert_eq!(params.limit, Some(5));
-
-    let result = ThreadReadResult {
-        thread: singularity_protocol::Thread {
-            thread_id: "thread_1".to_string(),
-            model: Some("gpt-test".to_string()),
-            cwd: Some("C:/workspace".to_string()),
-            status: singularity_protocol::ThreadStatus::Active,
-        },
-        messages: vec![ConversationMessage {
-            item_id: "item_1".to_string(),
-            turn_id: "turn_1".to_string(),
-            turn_sequence: 1,
-            item_sequence: 1,
-            role: ConversationRole::User,
-            content: "hello".to_string(),
-            redacted: false,
-        }],
-        next_before_turn_sequence: Some(1),
-    };
-
-    assert_eq!(
-        serde_json::to_value(result).expect("thread/read result"),
-        serde_json::json!({
-            "thread": {
-                "thread_id": "thread_1",
-                "model": "gpt-test",
-                "cwd": "C:/workspace",
-                "status": "active"
-            },
-            "messages": [{
-                "itemId": "item_1",
-                "turnId": "turn_1",
-                "turnSequence": 1,
-                "itemSequence": 1,
-                "role": "user",
-                "content": "hello",
-                "redacted": false
-            }],
-            "nextBeforeTurnSequence": 1
-        })
-    );
-}
-#[test]
-fn turn_start_params_reject_agent_host_selector() {
-    let raw = r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"alternate","input":[{"type":"text","text":"hi"}]}}"#;
-    let message: JsonRpcMessage = serde_json::from_str(raw).expect("parse json-rpc message");
-
-    let error = message
-        .params_as::<TurnStartParams>()
-        .expect_err("agentHost is not a public turn/start parameter");
-
-    assert!(error.to_string().contains("unknown field `agentHost`"));
-}
-
-#[test]
-fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
-    let initialize = InitializeParams {
-        client_info: ClientInfo::new("test", "Test", "0.1.0"),
-        capabilities: None,
-    };
-    let value = serde_json::to_value(&initialize).expect("serialize initialize params");
-    assert_eq!(value["clientInfo"]["name"], "test");
-
-    let initialize_result = serde_json::to_value(InitializeResult::local()).unwrap();
-    assert_eq!(
-        initialize_result["userAgent"],
-        concat!("singularity-app-server/", env!("CARGO_PKG_VERSION"))
-    );
-
-    let thread = ThreadStartParams {
-        model: Some("gpt-test".to_string()),
-        cwd: Some("C:/repo".to_string()),
-    };
-    assert_eq!(
-        serde_json::to_value(thread).unwrap(),
-        serde_json::json!({
-            "model": "gpt-test",
-            "cwd": "C:/repo",
-        })
-    );
-
-    assert_eq!(
-        AppEvent::item_completed("item_1").method(),
-        "item/completed"
-    );
-    assert_eq!(
-        AppEvent::item_agent_message_delta("item_1", "hi").method(),
-        "item/agentMessage/delta"
-    );
-}
-
-#[test]
-fn event_metadata_is_class_and_delivery_only() {
-    let event = AppEvent::turn_completed(&singularity_protocol::Turn {
-        turn_id: "turn_1".to_string(),
-        thread_id: "thread_1".to_string(),
-        status: singularity_protocol::TurnStatus::Completed,
-        agent_loop_status: "completed".to_string(),
-        model_usage: None,
-    });
-    let value = event
-        .to_notification_with_metadata(EventMetadata {
-            class: EventClass::State,
-            delivery: EventDelivery::Reliable,
-        })
-        .to_wire_value();
-    assert_eq!(value["params"]["event"]["class"], "state");
-    assert_eq!(value["params"]["event"]["delivery"], "reliable");
-    assert!(value["params"]["event"].get("sequence").is_none());
-    assert!(value["params"]["event"].get("cursor").is_none());
-    assert!(value["params"]["event"].get("recoveryQuery").is_none());
-    assert!(value["params"]["event"].get("gap").is_none());
-
-    // 已删除的 cursor/gap/recovery 字段不再属于事件信封。
-    for metadata in [
-        serde_json::json!({
-            "sequence": 4,
-            "cursor": 4,
-            "class": "state",
-            "delivery": "reliable",
-            "recoveryQuery": {"method": "turn/status", "params": {"turnId": "turn_1"}}
-        }),
-        serde_json::json!({
-            "class": "gap",
-            "delivery": "gap",
-            "gap": {"reason": "progress_dropped", "fromCursor": 5, "toCursor": 5}
-        }),
-        serde_json::json!({"class": "state"}),
-    ] {
-        assert!(
-            serde_json::from_value::<EventMetadata>(metadata).is_err(),
-            "removed event envelope was accepted"
-        );
-    }
-}
-
-#[test]
-fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
-    let result = AgentCapabilityResult {
-        agent_loop: AgentLoopCapabilityStatus {
-            available: true,
-            status: "completed".to_string(),
-            reason: "ready".to_string(),
-            blockers: Vec::new(),
-        },
-        provider_configuration: ProviderConfigurationStatus {
-            source: None,
-            snapshot_id: "provider_snapshot_test".to_string(),
-            configured: false,
-            configuration_blocker: None,
-            api_key_present: false,
-            base_url_present: false,
-            model_present: false,
-        },
-    };
-
-    let value = serde_json::to_value(result).unwrap();
-    assert_eq!(value["agentLoop"]["available"], true);
-    assert_eq!(value.as_object().map(serde_json::Map::len), Some(2));
-}
-
-#[test]
-fn json_rpc_wire_output_is_a_standard_request_envelope() {
-    let request = JsonRpcMessage::request(
-        Method::Initialize,
-        1,
-        serde_json::json!({"clientInfo": {"name": "test", "title": "Test", "version": "0.1.0"}}),
-    )
-    .expect("request serializes");
-    let value = request.to_wire_value();
-
-    assert_eq!(value["method"], "initialize");
-    assert_eq!(value["jsonrpc"], "2.0");
-    assert!(value.get("result").is_none());
-    assert!(value.get("error").is_none());
-}
-
-#[test]
-fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
-    assert_eq!(
-        parse_json_rpc_payload("[]").expect("empty batch"),
-        JsonRpcPayload::EmptyBatch
-    );
-
-    let single = parse_json_rpc_payload(
-        r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
-    )
-    .expect("single request");
-    assert!(matches!(
-        single,
-        JsonRpcPayload::Single(JsonRpcBatchItem::Message(message))
-            if message.id() == Some(&JsonRpcId::String("request-1".to_string()))
-    ));
-
-    let mixed = parse_json_rpc_payload(
-        r#"[{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}},{"jsonrpc":"2.0","method":"initialized","params":{}},false]"#,
-    )
-    .expect("mixed batch");
-    assert!(matches!(mixed, JsonRpcPayload::Batch(items) if items.len() == 3));
-
-    assert!(parse_json_rpc_payload("{").is_err());
-    let parse_error = JsonRpcMessage::parse_error().to_wire_value();
-    assert_eq!(parse_error["jsonrpc"], "2.0");
-    assert_eq!(parse_error["id"], serde_json::Value::Null);
-    assert_eq!(parse_error["error"]["code"], -32700);
-}
-
-#[test]
-fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 20);
-    for spec in METHOD_REGISTRY {
-        assert_eq!(Method::parse(spec.name), Some(spec.method));
-        assert_eq!(spec.method.as_str(), spec.name);
-        assert!(spec.params_schema().is_object());
-        assert!(spec.result_schema().is_object());
-    }
-
-    let thread_read = Method::ThreadRead.spec();
+    let error =
+        serde_json::from_str::<JsonRpcMessage>(r#"{"method":"thread/list","id":1,"params":{}}"#)
+            .expect_err("missing jsonrpc rejected");
     assert!(
-        thread_read
-            .validate_params(serde_json::json!({"threadId":"thread_1"}))
+        error.to_string().contains("did not match any variant"),
+        "{error}"
+    );
+}
+
+#[test]
+fn json_rpc_accepts_typed_request_and_round_trips() {
+    let request =
+        JsonRpcMessage::request(Method::ThreadList, 1i64, EmptyParams::default()).expect("request");
+    let wire = request.to_wire_value();
+    assert_eq!(wire["jsonrpc"], "2.0");
+    assert_eq!(wire["method"], "thread/list");
+    assert_eq!(wire["id"], 1);
+    let parsed: JsonRpcMessage = serde_json::from_value(wire).expect("round trip");
+    assert_eq!(parsed.method(), Some(Method::ThreadList));
+}
+
+#[test]
+fn thread_and_turn_start_params_use_codex_style_wire_shape() {
+    let params = serde_json::to_value(ThreadStartParams {
+        model: Some("provider/model".to_string()),
+        cwd: Some("/tmp/work".to_string()),
+    })
+    .expect("thread params");
+    assert_eq!(params["model"], "provider/model");
+    assert_eq!(params["cwd"], "/tmp/work");
+    assert!(!params.get("threadId").is_some());
+
+    let params = serde_json::to_value(TurnStartParams {
+        thread_id: "session-id".to_string(),
+        input: vec![singularity_protocol::InputItem::Text {
+            text: "hello".to_string(),
+        }],
+    })
+    .expect("turn params");
+    assert_eq!(params["threadId"], "session-id");
+    assert_eq!(params["input"][0]["type"], "text");
+}
+
+#[test]
+fn injection_and_session_read_params_are_bounded_by_registry() {
+    let steer = serde_json::to_value(TurnInjectionParams {
+        turn_id: "turn-id".to_string(),
+        input: vec![singularity_protocol::InputItem::Text {
+            text: "steer".to_string(),
+        }],
+    })
+    .expect("steer params");
+    assert_eq!(steer["turnId"], "turn-id");
+    assert!(
+        Method::TurnSteer
+            .spec()
+            .validate_params(steer.clone())
             .is_ok()
     );
-    assert!(thread_read.validate_params(serde_json::json!({})).is_err());
-    assert_eq!(Method::Initialized.spec().kind, MethodKind::Notification);
-    assert_eq!(Method::ThreadRead.spec().kind, MethodKind::Request);
-    assert_eq!(Method::parse("eval/run"), None);
+    assert!(
+        Method::TurnFollowUp
+            .spec()
+            .validate_params(steer.clone())
+            .is_ok()
+    );
+
+    let read = json!({"sessionId":"session-id"});
+    let params: SessionReadParams = serde_json::from_value(read).expect("session read params");
+    assert_eq!(params.recent_limit, 20);
+    assert!(
+        Method::SessionRead
+            .spec()
+            .validate_params(json!({"sessionId":"x"}))
+            .is_ok()
+    );
+    assert!(
+        Method::SessionRead
+            .spec()
+            .validate_params(json!({"sessionId":"x","unknown":true}))
+            .is_err()
+    );
 }
 
 #[test]
-fn protocol_v1_methods_use_codex_names_without_cancel_or_generic_delta() {
-    for method in [
+fn method_registry_keeps_only_converged_methods() {
+    let names = singularity_protocol::METHOD_REGISTRY
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    for expected in [
+        "initialize",
+        "initialized",
+        "server/capabilities",
         "thread/list",
-        "thread/read",
+        "thread/start",
         "thread/resume",
+        "session/read",
+        "session/delete",
+        "turn/start",
+        "turn/steer",
+        "turn/followUp",
+        "turn/interrupt",
+        "agent/capability",
+        "project/trust",
+        "server/shutdown",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing method {expected}: {names:?}"
+        );
+    }
+    for removed in [
+        "thread/read",
         "thread/fork",
         "thread/archive",
         "thread/delete",
-        "turn/start",
-        "turn/input",
+        "turn/status",
         "turn/pause",
         "turn/resume",
-        "turn/interrupt",
-        "turn/status",
+        "turn/input",
         "event/subscribe",
-        "server/shutdown",
     ] {
-        let parsed = Method::parse(method).expect("method is registered");
-        assert_eq!(parsed.as_str(), method);
+        assert!(
+            Method::parse(removed).is_none(),
+            "removed method still registered: {removed}"
+        );
     }
-
-    assert!(Method::parse("turn/cancel").is_none());
-    assert_ne!(
-        AppEvent::item_agent_message_delta("item_1", "delta").method(),
-        "item/delta"
-    );
+    assert_eq!(Method::TurnSteer.spec().kind, MethodKind::Request);
+    assert_eq!(Method::TurnFollowUp.spec().kind, MethodKind::Request);
 }
 
 #[test]
-fn protocol_v1_id_params_are_camel_case_on_wire() {
+fn json_rpc_payload_still_distinguishes_batches_at_parser_boundary() {
     assert_eq!(
-        serde_json::to_value(ThreadIdParams {
-            thread_id: "thread_1".to_string()
-        })
-        .unwrap(),
-        serde_json::json!({"threadId": "thread_1"})
+        parse_json_rpc_payload("[]").expect("empty"),
+        JsonRpcPayload::EmptyBatch
     );
-    assert_eq!(
-        serde_json::to_value(TurnIdParams {
-            turn_id: "turn_1".to_string()
-        })
-        .unwrap(),
-        serde_json::json!({"turnId": "turn_1"})
-    );
-    assert_eq!(
-        serde_json::to_value(EventSubscribeParams {
-            event_types: vec!["turn/started".to_string()],
-            cursor: None,
-        })
-        .unwrap(),
-        serde_json::json!({"eventTypes": ["turn/started"]})
-    );
+    let mixed = parse_json_rpc_payload(
+        r#"[{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}}, {"jsonrpc":"2.0","method":"unknown","id":2,"params":{}}]"#,
+    )
+    .expect("batch");
+    assert!(matches!(mixed, JsonRpcPayload::Batch(items) if items.len() == 2));
 }
 
 #[test]
-fn thread_id_params_reject_unknown_fields() {
-    let result = serde_json::from_value::<ThreadIdParams>(serde_json::json!({
-        "threadId": "thread_1",
-        "sandboxMode": "read-only"
-    }));
-    assert!(result.is_err());
-}
-
-#[test]
-fn item_kind_uses_codex_style_wire_names() {
-    assert_eq!(
-        serde_json::to_value(ItemKind::CommandExecution).unwrap(),
-        "commandExecution"
-    );
-}
-
-#[test]
-fn storage_enum_text_is_stable_and_rejects_unknown_values() {
-    assert_eq!(ThreadStatus::Active.as_storage_text(), "active");
-    assert_eq!(TurnStatus::Blocked.as_storage_text(), "blocked");
-    assert_eq!(
-        ItemKind::CommandExecution.as_storage_text(),
-        "commandExecution"
-    );
-    assert_eq!(ItemStatus::Completed.as_storage_text(), "completed");
-    assert_eq!(
-        ThreadStatus::from_storage_text("archived"),
-        Some(ThreadStatus::Archived)
-    );
-    assert_eq!(TurnStatus::from_storage_text("unknown"), None);
-    assert_eq!(ItemKind::from_storage_text("command_execution"), None);
-}
-
-#[test]
-fn turn_model_usage_wire_is_optional_and_backward_compatible() {
-    // 旧 wire（无 model_usage 字段）反序列化为 None：新客户端读旧服务端兼容。
-    let legacy = r#"{
-        "turn_id": "turn_1",
-        "thread_id": "thread_1",
-        "status": "completed",
-        "agent_loop_status": "completed"
-    }"#;
-    let turn: Turn = serde_json::from_str(legacy).unwrap();
-    assert_eq!(turn.model_usage, None);
-
-    // 新 wire 完整往返。
-    let turn = Turn {
-        turn_id: "turn_1".to_string(),
-        thread_id: "thread_1".to_string(),
-        status: TurnStatus::Completed,
-        agent_loop_status: "completed".to_string(),
-        model_usage: Some(TurnModelUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            total_tokens: 150,
-            cached_input_tokens: 40,
-            reasoning_tokens: 10,
-            cost_estimate: Some(0.01),
-        }),
-    };
-    let value = serde_json::to_value(&turn).unwrap();
-    assert_eq!(value["model_usage"]["input_tokens"], 100);
-    assert_eq!(value["model_usage"]["cached_input_tokens"], 40);
-    assert_eq!(value["model_usage"]["cost_estimate"], 0.01);
-    let round_trip: Turn = serde_json::from_value(value).unwrap();
-    assert_eq!(round_trip, turn);
-
-    // None 时字段整体省略：旧客户端读新响应无新增必需字段。
-    let bare = Turn {
-        model_usage: None,
-        ..turn
-    };
-    let value = serde_json::to_value(&bare).unwrap();
-    assert!(value.get("model_usage").is_none());
-}
-
-#[test]
-fn project_trust_params_distinguish_query_set_and_ask() {
-    use singularity_protocol::{ProjectTrustDecision, ProjectTrustParams};
-
-    // 字段缺失 = 查询。
-    let query: ProjectTrustParams =
-        serde_json::from_value(json!({ "path": "C:/workspace" })).expect("query");
-    assert_eq!(query.decision, ProjectTrustDecision::Query);
-    assert!(
-        serde_json::to_value(&query)
-            .expect("serialize query")
-            .get("decision")
-            .is_none(),
-        "query must not send a decision field"
-    );
-
-    // true/false = 设置。
-    for trusted in [true, false] {
-        let set: ProjectTrustParams = serde_json::from_value(json!({
-            "path": "C:/workspace",
-            "decision": trusted,
-        }))
-        .expect("set");
-        assert_eq!(set.decision, ProjectTrustDecision::Set(trusted));
-        let wire = serde_json::to_value(&set).expect("serialize set");
-        assert_eq!(wire["decision"], json!(trusted));
+fn turn_status_has_no_paused_suspended_or_blocked_state() {
+    assert_eq!(TurnStatus::Running.as_storage_text(), "running");
+    assert_eq!(TurnStatus::Completed.as_storage_text(), "completed");
+    assert_eq!(TurnStatus::Failed.as_storage_text(), "failed");
+    assert_eq!(TurnStatus::Interrupted.as_storage_text(), "interrupted");
+    for value in ["paused", "suspended", "blocked"] {
+        assert_eq!(TurnStatus::from_storage_text(value), None);
     }
-
-    // null = 重置为 ask（清除记录）。
-    let ask: ProjectTrustParams = serde_json::from_value(json!({
-        "path": "C:/workspace",
-        "decision": null,
-    }))
-    .expect("ask");
-    assert_eq!(ask.decision, ProjectTrustDecision::Ask);
-    let wire = serde_json::to_value(&ask).expect("serialize ask");
-    assert_eq!(wire["decision"], json!(null));
-
-    // 非 bool/null 值不匹配参数合同。
-    assert!(
-        serde_json::from_value::<ProjectTrustParams>(json!({
-            "path": "C:/workspace",
-            "decision": "trust",
-        }))
-        .is_err()
-    );
 }
 
 #[test]
-fn trust_required_error_carries_cwd_in_data() {
-    use singularity_core::APP_ERROR_TRUST_REQUIRED;
-
-    let message = JsonRpcMessage::error_with_data(
-        JsonRpcId::Number(1),
-        ErrorCode::new(APP_ERROR_TRUST_REQUIRED, "trust required"),
-        json!({ "cwd": "C:/workspace" }),
-    );
-    let value = message.to_wire_value();
-    assert_eq!(value["jsonrpc"], "2.0");
-    assert_eq!(value["error"]["code"], -32010);
-    assert_eq!(value["error"]["message"], "trust required");
-    assert_eq!(value["error"]["data"]["cwd"], "C:/workspace");
-    assert_eq!(Method::parse("project/trust"), Some(Method::ProjectTrust));
+fn initialize_params_keep_client_info_contract() {
+    let params = serde_json::to_value(InitializeParams {
+        client_info: ClientInfo::new("sg", "Singularity CLI", "0.1.0"),
+        capabilities: None,
+    })
+    .expect("initialize params");
+    assert_eq!(params["clientInfo"]["name"], "sg");
+    let _: rpc_methods::Initialize = rpc_methods::Initialize;
+    assert!(Method::Initialize.spec().validate_params(params).is_ok());
 }

@@ -620,6 +620,32 @@ impl SessionManager {
         Ok(context)
     }
 
+    /// 当前 leaf 路径上最近一次 compaction 摘要（session/read 的默认摘要）。
+    pub fn summary(&self) -> Option<String> {
+        let path = self.session_path();
+        path.iter()
+            .rev()
+            .find_map(|&index| match &self.entries[index].entry_type {
+                SessionEntryType::Compaction(entry) => Some(entry.summary.clone()),
+                _ => None,
+            })
+    }
+
+    /// 会话文件中的条目总数（不含 header）。
+    pub fn total_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 当前 leaf 路径上的最近 `limit` 条会话条目（旧→新；`limit=0` 返回空）。
+    pub fn recent_entries(&self, limit: usize) -> Vec<SessionEntry> {
+        let path = self.session_path();
+        let start = path.len().saturating_sub(limit);
+        path[start..]
+            .iter()
+            .map(|&index| self.entries[index].clone())
+            .collect()
+    }
+
     /// 构建发送给 LLM 的会话上下文（Pi `buildSessionContext`）。
     ///
     /// 从完整 leaf 路径提取 model/thinking 设置；消息序列由 `build_context_entries`

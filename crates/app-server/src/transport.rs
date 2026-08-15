@@ -385,7 +385,10 @@ async fn read_bounded_line_with_limit<R: AsyncBufRead + Unpin>(
         ));
     }
     String::from_utf8(bytes).map(Some).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "JSON-RPC frame is not UTF-8")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "JSON-RPC frame is not UTF-8",
+        )
     })
 }
 
@@ -410,13 +413,13 @@ fn initialize_app_server(
     validate_database_file(Path::new(&db_path), false)?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
-    let migrated = singularity_app_server::paths::migrate_legacy_project_sessions(
-        &paths,
-        &store,
-        &cwd,
-    )?;
+    let migrated =
+        singularity_app_server::paths::migrate_legacy_project_sessions(&paths, &store, &cwd)?;
     if migrated > 0 {
-        eprintln!("migrated {migrated} legacy project session(s) to {}", paths.sessions_dir.display());
+        eprintln!(
+            "migrated {migrated} legacy project session(s) to {}",
+            paths.sessions_dir.display()
+        );
     }
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
@@ -1057,9 +1060,11 @@ mod tests {
                 .as_deref(),
             Some("world")
         );
-        assert!(block_on(read_bounded_line_with_limit(&mut reader, 32))
-            .expect("eof")
-            .is_none());
+        assert!(
+            block_on(read_bounded_line_with_limit(&mut reader, 32))
+                .expect("eof")
+                .is_none()
+        );
     }
 
     #[test]

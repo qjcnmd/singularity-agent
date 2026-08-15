@@ -1,24 +1,35 @@
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use serde_json::Value;
 
 pub fn app_server_bin() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_singularity_app_server") {
         let binary = PathBuf::from(path);
-        assert!(binary.is_file(), "app-server binary missing: {}", binary.display());
+        assert!(
+            binary.is_file(),
+            "app-server binary missing: {}",
+            binary.display()
+        );
         return binary;
     }
     let current_exe = std::env::current_exe().expect("current test binary");
-    let profile_dir = current_exe.parent().and_then(Path::parent).expect("profile dir");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("profile dir");
     let binary = profile_dir.join(format!(
         "singularity_app_server{}",
         std::env::consts::EXE_SUFFIX
     ));
-    assert!(binary.is_file(), "app-server binary missing: {}", binary.display());
+    assert!(
+        binary.is_file(),
+        "app-server binary missing: {}",
+        binary.display()
+    );
     binary
 }
 
@@ -41,9 +52,15 @@ impl JsonOutput {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .expect("timed out waiting for app-server output");
-            let message = self.receiver.recv_timeout(remaining).unwrap_or_else(|error| {
-                panic!("app-server output message: {error}; buffered: {:?}", self.buffered)
-            });
+            let message = self
+                .receiver
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "app-server output message: {error}; buffered: {:?}",
+                        self.buffered
+                    )
+                });
             if predicate(&message) {
                 return message;
             }
@@ -122,7 +139,10 @@ impl AppServerProcess {
                 }
             }),
         );
-        assert_eq!(self.output.recv_id(1, Duration::from_secs(5))["result"]["platformFamily"], "local");
+        assert_eq!(
+            self.output.recv_id(1, Duration::from_secs(5))["result"]["platformFamily"],
+            "local"
+        );
         send_json(
             &mut self.input,
             serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
@@ -151,7 +171,12 @@ impl AppServerProcess {
 
 impl Drop for AppServerProcess {
     fn drop(&mut self) {
-        if self.child.try_wait().map(|status| status.is_none()).unwrap_or(false) {
+        if self
+            .child
+            .try_wait()
+            .map(|status| status.is_none())
+            .unwrap_or(false)
+        {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

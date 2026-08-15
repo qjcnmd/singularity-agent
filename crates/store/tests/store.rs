@@ -1,7 +1,9 @@
 //! Session index integration tests: schema, WAL, validation, CRUD.
 
 use serde_json::json;
-use singularity_store::{SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError};
+use singularity_store::{
+    SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
+};
 
 fn record(id: &str, path: &std::path::Path) -> SessionRecord {
     SessionRecord {
@@ -80,7 +82,10 @@ fn sqlite_store_rejects_legacy_turn_schema() {
     };
     assert!(matches!(
         error,
-        StoreError::UnsupportedSchema { found: 13, supported: 1 }
+        StoreError::UnsupportedSchema {
+            found: 13,
+            supported: 1
+        }
     ));
 }
 

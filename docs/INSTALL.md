@@ -158,29 +158,11 @@ OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wi
 
 `thinking_wire_format` 只在 Chat Completions 模型上生效：`thinking_type` 使用 `thinking: {"type": ...}`，`enable_thinking` 使用供应商明确规定的顶层 `enable_thinking` 布尔字段。Responses 仍固定使用其 `reasoning` 对象。上下文窗口未知时保留 `unknown`，不猜测或填入默认值；Agent 会跳过本地窗口上限检查，但仍遵守显式输出上限。
 
-## Windows sandbox 首次运行
-
-用户不需要选择 backend 或维护 sandbox 配置文件。AgentLoop 的命令工具固定经过 `WindowsSandboxBackend`：
-
-1. 启动时自动选择当前平台可用的严格 sandbox；用户不需要选择 backend 或维护安全配置文件。
-2. 首次需要平台初始化时，应用自动完成必要准备并在确需提升权限时显示系统提示。
-3. 越界写入、网络请求和受保护路径由 Policy/Approval 处理；不能在当前平台安全执行时明确失败，不降级为本地进程。
-4. 命令工具接受 `command` 字符串以及可选 `cwd`、`timeout_seconds`；PATH、shell 方言和可信内部参数转换由平台 adapter 处理。
-5. 运行时统一提供取消、超时、进程树终止和有界输出；这些实现细节不会进入模型工具 schema。
-
-默认 sandbox home 是 `%USERPROFILE%\.singularity`。确实需要把其状态放到其他盘时，可在启动 `sg` 前设置绝对路径：
-
-```powershell
-$env:SINGULARITY_HOME = "D:\SingularityHome"
-```
-
-该变量是位置覆盖，不是安全模式开关。
-
 ## 从源码构建
 
 前置条件：
 
-- Git（2.49 或更高版本使用 `git clone --revision` 的固定 commit 快速路径；较旧版本使用严格 sandbox 内的 no-checkout clone、detached checkout 和精确校验）
+- Git（2.49 或更高版本使用 `git clone --revision` 的固定 commit 快速路径；较旧版本使用 no-checkout clone、detached checkout 和精确校验）
 - Rust 1.96.0（MSVC 工具链）
 - Visual Studio Build Tools 的 Desktop development with C++ 组件
 - PowerShell 7
@@ -214,7 +196,7 @@ sg run "检查当前项目并修复一个明确问题"
 
 更新时退出正在运行的任务，用新 release 的两个 binary 一起替换旧目录。
 
-卸载时删除安装目录并从 `PATH` 移除该目录。工作区中的 `.singularity` 是用户状态，不会由解压式安装自动删除；确认不再需要历史后再手动清理。
+卸载时删除安装目录并从 `PATH` 移除该目录。用户状态集中在 `%USERPROFILE%\.singularity\`（会话、索引、备份、配置与认证），不会由解压式安装自动删除；确认不再需要历史后再手动清理。
 
 ## 完整验证
 

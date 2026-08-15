@@ -60,7 +60,7 @@ impl AppServer {
             }
         };
         let turn_id = turn_id();
-        let (cancellation, _active_turn) = self.activate_turn(&turn_id)?;
+        let (cancellation, _active_turn) = self.activate_turn(&turn_id, &record.session_id)?;
         let title = title_from_input(&input_text);
         if record.title.is_none() && !title.is_empty() {
             self.store.update_session(
@@ -216,6 +216,68 @@ impl AppServer {
         ])
     }
 
+    /// 同一连接内 steer：把输入注入下一轮开始的 steer 队列。
+    pub(super) fn turn_steer(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, false)
+    }
+
+    /// 同一连接内 follow-up：把输入注入“代理准备停止时继续一轮”的队列。
+    pub(super) fn turn_follow_up(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, true)
+    }
+
+    fn inject_turn_input(
+        &self,
+        message: JsonRpcMessage,
+        follow_up: bool,
+    ) -> AppServerResult<Vec<Value>> {
+        let params: TurnInjectionParams = parse_params(&message)?;
+        let payload = serde_json::to_value(&params.input)?;
+        let text = input_items_to_text(&payload)?;
+        let handle = if follow_up {
+            self.follow_up_handles
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                .get(&params.turn_id)
+                .cloned()
+        } else {
+            self.steer_handles
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                .get(&params.turn_id)
+                .cloned()
+        }
+        .ok_or_else(|| {
+            AppServerError::Store(StoreError::NotFound(format!("turn {}", params.turn_id)))
+        })?;
+        handle
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .push_back(text);
+        let thread_id = self
+            .turn_threads
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(&params.turn_id)
+            .cloned()
+            .unwrap_or_default();
+        json_response(
+            message.required_id(),
+            TurnResult {
+                turn: Turn {
+                    turn_id: params.turn_id,
+                    thread_id,
+                    status: TurnStatus::Running,
+                    agent_loop_status: AgentStatus::Running.as_str().to_string(),
+                    model_usage: None,
+                },
+            },
+        )
+    }
+
     pub(super) fn agent_capability(
         &mut self,
         message: JsonRpcMessage,
@@ -226,8 +288,9 @@ impl AppServer {
                 agent_loop: AgentLoopCapabilityStatus {
                     available: true,
                     status: AgentStatus::Completed.as_str().to_string(),
-                    reason: "AgentLoop uses the headless core; sandbox backend gating is not applied"
-                        .to_string(),
+                    reason:
+                        "AgentLoop uses the headless core; sandbox backend gating is not applied"
+                            .to_string(),
                     blockers: Vec::new(),
                 },
                 provider_configuration: provider_configuration(&self.provider_snapshot),

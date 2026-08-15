@@ -90,21 +90,16 @@ impl AppServer {
             }
             Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
-            Method::ThreadRead => self.thread_read_legacy(message),
             Method::ThreadResume => self.thread_resume(message),
             Method::ThreadStart => self.thread_start(message),
-            Method::ThreadFork => self.removed_thread_method(message),
-            Method::ThreadArchive => self.removed_thread_method(message),
-            Method::ThreadDelete => self.removed_thread_method(message),
+            Method::SessionRead => self.session_read(message),
+            Method::SessionDelete => self.session_delete(message),
             Method::TurnStart => self.turn_start(message),
-            Method::TurnInput => self.removed_turn_method(message),
-            Method::TurnPause => self.removed_turn_method(message),
-            Method::TurnResume => self.removed_turn_method(message),
+            Method::TurnSteer => self.turn_steer(message),
+            Method::TurnFollowUp => self.turn_follow_up(message),
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
-            Method::TurnStatus => self.turn_status_legacy(message),
             Method::ProjectTrust => self.project_trust(message),
-            Method::EventSubscribe => self.event_subscribe(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
         if notification {
@@ -181,15 +176,13 @@ impl AppServer {
         if session.path() != Path::new(&record.rollout_path) {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
-        let thread = thread_from_record(
-            &self.store.update_session(
-                &params.thread_id,
-                SessionMetadataUpdate {
-                    status: Some(SessionStatus::Active),
-                    ..SessionMetadataUpdate::default()
-                },
-            )?,
-        );
+        let thread = thread_from_record(&self.store.update_session(
+            &params.thread_id,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Active),
+                ..SessionMetadataUpdate::default()
+            },
+        )?);
         json_response(message.required_id(), ThreadResult { thread })
     }
 
@@ -210,12 +203,9 @@ impl AppServer {
             None => self.provider_snapshot.resolved_default_selector(),
         };
         let session_id = Uuid::now_v7().to_string();
-        let session = SessionManager::create_with_id(
-            Path::new(&cwd),
-            &self.sessions_dir,
-            &session_id,
-        )
-        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+        let session =
+            SessionManager::create_with_id(Path::new(&cwd), &self.sessions_dir, &session_id)
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
         ensure_owner_only_file(session.path())
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
         let rollout_path = session.path().to_string_lossy().to_string();
@@ -246,6 +236,73 @@ impl AppServer {
         Ok(messages)
     }
 
+    pub(super) fn session_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: SessionReadParams = parse_params(&message)?;
+        if !(1..=200).contains(&params.recent_limit) {
+            return invalid_params_response(message.required_id());
+        }
+        let record = match self.store.get_session(&params.session_id) {
+            Ok(record) => record,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let session = self.open_session_for_thread(&thread_from_record(&record))?;
+        let recent_entries = session
+            .recent_entries(params.recent_limit as usize)
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        json_response(
+            message.required_id(),
+            SessionReadResult {
+                session_id: record.session_id,
+                cwd: record.cwd,
+                title: record.title,
+                model: record.model,
+                status: record.status.as_storage_text().to_string(),
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+                token_usage: record.token_usage,
+                summary: session.summary(),
+                recent_entries,
+                total_entries: session.total_entries(),
+            },
+        )
+    }
+
+    pub(super) fn session_delete(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        let params: SessionIdParams = parse_params(&message)?;
+        let record = match self.store.get_session(&params.session_id) {
+            Ok(record) => record,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let rollout = Path::new(&record.rollout_path);
+        if rollout.exists() {
+            std::fs::remove_file(rollout).map_err(|error| {
+                AppServerError::Workspace(format!(
+                    "failed to delete session rollout {}: {error}",
+                    rollout.display()
+                ))
+            })?;
+        }
+        self.store.delete_session(&params.session_id)?;
+        json_response(
+            message.required_id(),
+            SessionDeleteResult {
+                session_id: params.session_id,
+                deleted: true,
+            },
+        )
+    }
+
     /// 查询/设置/重置项目信任决策（写 `<singularity_home>/trust.json`）。
     pub(super) fn project_trust(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ProjectTrustParams = parse_params(&message)?;
@@ -274,32 +331,5 @@ impl AppServer {
                 decision: decisions.get(Path::new(&path)),
             },
         )
-    }
-
-    // 以下旧协议方法会在 Phase 3 从 registry 删除；此前只返回稳定拒绝，
-    // 不再触碰任何持久化状态机。
-    fn removed_thread_method(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        invalid_state_response(
-            message.required_id(),
-            "thread read/fork/archive/delete are removed; use session/read or session/delete",
-        )
-    }
-
-    fn removed_turn_method(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        invalid_state_response(
-            message.required_id(),
-            "turn status/pause/resume/input are removed; use turn/steer or turn/followUp",
-        )
-    }
-
-    fn thread_read_legacy(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        invalid_state_response(
-            message.required_id(),
-            "thread/read is removed; use session/read",
-        )
-    }
-
-    fn turn_status_legacy(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        not_found_response(message.required_id(), TURN_NOT_FOUND)
     }
 }

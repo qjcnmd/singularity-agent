@@ -138,21 +138,16 @@ method_registry! {
     Initialized => ("initialized", Notification, EmptyParams, EmptyResult),
     ServerCapabilities => ("server/capabilities", Request, EmptyParams, ServerCapabilitiesResult),
     ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
-    ThreadRead => ("thread/read", Request, ThreadReadParams, ThreadReadResult),
     ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
     ThreadResume => ("thread/resume", Request, ThreadIdParams, ThreadResult),
-    ThreadFork => ("thread/fork", Request, ThreadForkParams, ThreadForkResult),
-    ThreadArchive => ("thread/archive", Request, ThreadIdParams, ThreadResult),
-    ThreadDelete => ("thread/delete", Request, ThreadIdParams, ThreadDeleteResult),
+    SessionRead => ("session/read", Request, SessionReadParams, SessionReadResult),
+    SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
-    TurnInput => ("turn/input", Request, TurnInputParams, TurnResult),
-    TurnPause => ("turn/pause", Request, TurnIdParams, TurnResult),
-    TurnResume => ("turn/resume", Request, TurnIdParams, TurnResult),
+    TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnResult),
+    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams, TurnResult),
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
-    TurnStatus => ("turn/status", Request, TurnIdParams, TurnResult),
     ProjectTrust => ("project/trust", Request, ProjectTrustParams, ProjectTrustResult),
-    EventSubscribe => ("event/subscribe", Request, EventSubscribeParams, EventSubscribeResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
 
@@ -569,23 +564,54 @@ pub struct ThreadIdParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 读取 thread 历史的参数。
-pub struct ThreadReadParams {
-    pub thread_id: String,
-    pub before_turn_sequence: Option<u64>,
-    pub limit: Option<u32>,
+/// 只包含 session id 的请求参数。
+pub struct SessionIdParams {
+    pub session_id: String,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// fork thread 的参数。
-pub struct ThreadForkParams {
-    pub thread_id: String,
-    pub model: Option<String>,
-    pub cwd: Option<String>,
+
+fn default_session_recent_limit() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// 持久化 thread 的公开摘要。
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// 查看会话的参数：默认返回摘要 + 最近片段，不返回全文。
+pub struct SessionReadParams {
+    pub session_id: String,
+    #[serde(default = "default_session_recent_limit")]
+    pub recent_limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// session/read 的响应：摘要 + 最近片段（不携带完整 rollout）。
+pub struct SessionReadResult {
+    pub session_id: String,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub token_usage: Value,
+    /// 最近一次 compaction 摘要；无 compaction 时为 None。
+    pub summary: Option<String>,
+    /// 当前 leaf 路径上最近 `recent_limit` 条会话条目。
+    pub recent_entries: Vec<Value>,
+    /// 会话文件中的条目总数（不含 header）。
+    pub total_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// session/delete 的响应。
+pub struct SessionDeleteResult {
+    pub session_id: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// 持久化 thread（session）的公开摘要。
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
@@ -593,28 +619,21 @@ pub struct Thread {
     pub status: ThreadStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-/// thread 的生命周期状态。
+/// thread/session 的生命周期状态；归档命令已删除，当前只存在 Active。
 pub enum ThreadStatus {
     Active,
-    Archived,
 }
 
 impl ThreadStatus {
-    /// 返回 SQLite 使用的稳定文本值。
     pub const fn as_storage_text(&self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Archived => "archived",
-        }
+        "active"
     }
 
-    /// 从 SQLite 的稳定文本值恢复状态；未知值返回 `None`。
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
             "active" => Some(Self::Active),
-            "archived" => Some(Self::Archived),
             _ => None,
         }
     }
@@ -638,52 +657,6 @@ pub struct ThreadResult {
     pub thread: Thread,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-/// 对话消息角色。
-pub enum ConversationRole {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-/// thread 历史中的一条对话消息。
-pub struct ConversationMessage {
-    pub item_id: String,
-    pub turn_id: String,
-    pub turn_sequence: u64,
-    pub item_sequence: u64,
-    pub role: ConversationRole,
-    pub content: String,
-    pub redacted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-/// thread/read 的响应。
-pub struct ThreadReadResult {
-    pub thread: Thread,
-    pub messages: Vec<ConversationMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_before_turn_sequence: Option<u64>,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// thread/fork 的响应。
-pub struct ThreadForkResult {
-    #[serde(rename = "sourceThreadId")]
-    pub source_thread_id: String,
-    pub thread: Thread,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// thread/delete 的响应。
-pub struct ThreadDeleteResult {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    pub deleted: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// 启动 turn 的参数。
@@ -700,42 +673,11 @@ pub enum InputItem {
     Text { text: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-/// 运行中用户输入的投递时机。
-pub enum TurnInputDelivery {
-    /// 在下一个安全边界改变当前执行方向。
-    Steer,
-    /// 在当前工作准备最终化时继续同一个 turn。
-    FollowUp,
-}
-
-impl TurnInputDelivery {
-    /// 返回 SQLite 和 JSON 投影共用的稳定文本。
-    pub const fn as_storage_text(self) -> &'static str {
-        match self {
-            Self::Steer => "steer",
-            Self::FollowUp => "follow_up",
-        }
-    }
-
-    /// 从稳定文本恢复投递语义。
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "steer" => Some(Self::Steer),
-            "follow_up" => Some(Self::FollowUp),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 向非终态 turn 持久化追加真实用户输入。
-pub struct TurnInputParams {
+/// 向同一连接内运行中的 turn 注入用户输入（turn/steer、turn/followUp）。
+pub struct TurnInjectionParams {
     pub turn_id: String,
-    pub input_id: String,
-    pub delivery: TurnInputDelivery,
     pub input: Vec<InputItem>,
 }
 
@@ -769,44 +711,30 @@ pub struct TurnModelUsage {
     pub cost_estimate: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-/// turn 的生命周期状态。
+/// turn 的生命周期状态；暂停/挂起状态机已删除。
 pub enum TurnStatus {
     Running,
-    /// 用户显式暂停；非终态，可通过显式 turn/resume 继续。
-    Paused,
-    /// The owner exited while the turn was not terminal. This is resumable only through
-    /// an explicit turn/resume request and is not a terminal outcome.
-    Suspended,
     Completed,
-    Blocked,
     Failed,
     Interrupted,
 }
 
 impl TurnStatus {
-    /// 返回 SQLite 使用的稳定文本值。
-    pub const fn as_storage_text(&self) -> &'static str {
+    pub const fn as_storage_text(self) -> &'static str {
         match self {
             Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Suspended => "suspended",
             Self::Completed => "completed",
-            Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
         }
     }
 
-    /// 从 SQLite 的稳定文本值恢复状态；未知值返回 `None`。
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
             "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
-            "suspended" => Some(Self::Suspended),
             "completed" => Some(Self::Completed),
-            "blocked" => Some(Self::Blocked),
             "failed" => Some(Self::Failed),
             "interrupted" => Some(Self::Interrupted),
             _ => None,
@@ -819,79 +747,6 @@ impl TurnStatus {
 pub struct TurnIdParams {
     #[serde(rename = "turnId")]
     pub turn_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-/// turn 输出 item 的类型。
-pub enum ItemKind {
-    UserMessage,
-    AgentMessage,
-    Reasoning,
-    CommandExecution,
-    FileChange,
-}
-
-impl ItemKind {
-    /// 返回 SQLite 使用的稳定文本值。
-    pub const fn as_storage_text(&self) -> &'static str {
-        match self {
-            Self::UserMessage => "userMessage",
-            Self::AgentMessage => "agentMessage",
-            Self::Reasoning => "reasoning",
-            Self::CommandExecution => "commandExecution",
-            Self::FileChange => "fileChange",
-        }
-    }
-
-    /// 从 SQLite 的稳定文本值恢复 item 类型；未知值返回 `None`。
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "userMessage" => Some(Self::UserMessage),
-            "agentMessage" => Some(Self::AgentMessage),
-            "reasoning" => Some(Self::Reasoning),
-            "commandExecution" => Some(Self::CommandExecution),
-            "fileChange" => Some(Self::FileChange),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// turn 输出中的一条 item。
-pub struct Item {
-    pub item_id: String,
-    pub turn_id: String,
-    pub kind: ItemKind,
-    pub payload: Value,
-    pub status: ItemStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-/// item 的生命周期状态。
-pub enum ItemStatus {
-    Started,
-    Completed,
-}
-
-impl ItemStatus {
-    /// 返回 SQLite 使用的稳定文本值。
-    pub const fn as_storage_text(&self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Completed => "completed",
-        }
-    }
-
-    /// 从 SQLite 的稳定文本值恢复 item 状态；未知值返回 `None`。
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "started" => Some(Self::Started),
-            "completed" => Some(Self::Completed),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -945,25 +800,6 @@ pub struct AgentLoopCapabilityStatus {
     pub status: String,
     pub reason: String,
     pub blockers: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 事件订阅请求参数；cursor 只用于声明客户端已观察到的边界。
-pub struct EventSubscribeParams {
-    pub event_types: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// 事件订阅建立后的摘要。
-pub struct EventSubscribeResult {
-    #[serde(rename = "subscriptionId")]
-    pub subscription_id: String,
-    #[serde(rename = "eventTypes")]
-    pub event_types: Vec<String>,
-    pub cursor: u64,
 }
 
 /// server/shutdown 的类型化响应。

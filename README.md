@@ -8,10 +8,11 @@ Singularity 是一个由 Rust 实现的本地命令行编码代理。核心产�
 
 ```text
 sg
-  -> singularity_app_server（默认常驻 TCP 回环 daemon，空闲自停；stdio 回退）
+  -> singularity_app_server（每命令独立 stdio 子进程）
      -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/bash/edit/write）
      -> OpenAiProvider
-     -> SQLite 状态（thread/turn 锁与恢复）+ 会话 JSONL（工作区 .singularity/agent-sessions/）
+     -> 会话 JSONL（~/.singularity/sessions/<uuid>.jsonl，唯一权威正文）
+     -> SQLite 轻量索引（~/.singularity/index.sqlite3）
 ```
 
 详细边界、对象、状态流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。
@@ -119,31 +120,21 @@ sg threads
 sg continue <thread-id> "继续完成剩余修改"
 ```
 
-`continue` 始终创建新 Turn（新任务回合）：
+查看与删除会话：
 
 ```powershell
-sg turn status <turn-id>
-sg turn resume <turn-id>          # 从持久化存档点恢复暂停/挂起的同一 Turn
-sg turn pause <turn-id>           # 暂停正在运行的 Turn，不终止其存档
-sg turn input <turn-id> "补充要求" --input-id <id> --delivery follow-up   # 向非终态 Turn 追加真实用户输入
+sg threads                          # 列出全部会话（含 cwd）
+sg session read <session-id>        # 摘要 + 最近片段，不加载全文
+sg session delete <session-id>      # 同时删除 JSONL 与 SQLite 索引
 ```
 
-`turn input` 的 `--input-id` 必须显式提供并作为幂等键；`--delivery steer|follow-up` 控制投递时机（steer 在下一安全边界消费，follow-up 排队到 Turn 收尾）。
-
-状态和取消：
-
-```powershell
-sg turn status <turn-id>
-sg turn interrupt <turn-id>
-```
-
-默认状态库位于当前工作目录的 `.singularity/rust-app-server.sqlite3`；开发和自动化场景可以通过 `SINGULARITY_APP_SERVER_DB` 指向另一个数据库文件。
+会话正文位于 `~/.singularity/sessions/<uuid>.jsonl`，索引位于 `~/.singularity/index.sqlite3`；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
 ## 安全边界
 
-- 工作区写入前进行规范化路径检查；符号链接、junction 和 `..` 不能绕过根目录边界。
-- `.git`、`.singularity`、环境文件、密钥和其他受保护路径默认拒绝模型写入。
-- 命令在进程内执行；超时、取消、进程树终止和输出上限由运行时统一处理。
+- 命令在进程内执行并继承进程权限；不做 workspace containment，但内部状态（会话、索引、备份、配置）位于 `~/.singularity`，与工作区隔离。
+- `.git`、环境文件、密钥和其他受保护路径默认拒绝模型写入。
+- 超时、取消、进程树终止和输出上限由运行时统一处理；read 为有界读取。
 - provider 原始响应、密钥、原始工具参数和内部审计字段不会投影到公共工具结果。
 
 ## 从源码验证

@@ -23,18 +23,19 @@ use singularity_agent::{
 };
 use singularity_core::{
     APP_ERROR_TRUST_REQUIRED, CancellationToken, DEFAULT_PROJECT_TRUST, ErrorCode,
-    ProjectInstructionError, TrustDecisions, TrustResolution,
-    load_project_instructions, resolve_project_trusted, user_singularity_home,
+    ProjectInstructionError, TrustDecisions, TrustResolution, load_project_instructions,
+    resolve_project_trusted, user_singularity_home,
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, Method, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
-    EventMetadata, EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult,
-    JsonRpcId, JsonRpcMessage, MethodKind, ProjectTrustDecision, ProjectTrustParams,
-    ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult,
-    ServerShutdownResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
-    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
-    TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
+    EventMetadata, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
+    MethodKind, ProjectTrustDecision, ProjectTrustParams, ProjectTrustResult,
+    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult,
+    SessionDeleteResult, SessionIdParams, SessionReadParams, SessionReadResult, Thread,
+    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
+    TransportCapability, Turn, TurnIdParams, TurnInjectionParams, TurnInterruptResult, TurnResult,
+    TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
@@ -45,7 +46,6 @@ use uuid::Uuid;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
 const TURN_NOT_FOUND: &str = "Turn not found";
-const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
@@ -272,6 +272,8 @@ pub struct AppServer {
     shutdown_requested: bool,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// turn id -> session id（同一连接内 turn/steer、turn/followUp 响应需要）。
+    turn_threads: Arc<Mutex<HashMap<String, String>>>,
     /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
@@ -313,6 +315,7 @@ impl AppServerCancellationHandle {
 struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    turn_threads: Arc<Mutex<HashMap<String, String>>>,
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
 }
@@ -321,6 +324,9 @@ impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
+        }
+        if let Ok(mut turn_threads) = self.turn_threads.lock() {
+            turn_threads.remove(&self.turn_id);
         }
         if let Ok(mut steer_handles) = self.steer_handles.lock() {
             steer_handles.remove(&self.turn_id);
@@ -500,6 +506,7 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_threads: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
@@ -578,6 +585,7 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
+            turn_threads: Arc::clone(&self.turn_threads),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
@@ -591,6 +599,7 @@ impl AppServer {
     pub(crate) fn activate_turn(
         &self,
         turn_id: &str,
+        thread_id: &str,
     ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
         let cancellation = CancellationToken::new();
         let mut active_turns = self
@@ -607,9 +616,14 @@ impl AppServer {
         }
         active_turns.insert(turn_id.to_string(), cancellation.clone());
         drop(active_turns);
+        self.turn_threads
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .insert(turn_id.to_string(), thread_id.to_string());
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
+            turn_threads: Arc::clone(&self.turn_threads),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
         };
@@ -681,7 +695,10 @@ impl AppServer {
         ))
     }
 
-    pub(crate) fn open_session_for_thread(&self, thread: &Thread) -> AppServerResult<SessionManager> {
+    pub(crate) fn open_session_for_thread(
+        &self,
+        thread: &Thread,
+    ) -> AppServerResult<SessionManager> {
         let record = self.store.get_session(&thread.thread_id)?;
         let session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         if session.session_id() != record.session_id {
@@ -846,3 +863,6 @@ fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
 fn turn_id() -> String {
     Uuid::new_v4().to_string()
 }
+
+#[cfg(test)]
+mod tests;
