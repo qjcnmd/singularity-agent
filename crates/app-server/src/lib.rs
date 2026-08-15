@@ -633,18 +633,15 @@ impl AppServer {
     }
 
     pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
-        if let Some(selector) = selector {
-            if self.provider_snapshot.has_explicit_model_selection()
+        if let Some(selector) = selector
+            && (self.provider_snapshot.has_explicit_model_selection()
                 || selector.contains('/')
-                || selector.contains('#')
-            {
-                self.provider_snapshot
-                    .provider_for_selector(Some(selector))
-                    .map(|_| ())
-                    .map_err(|_| {
-                        AppServerError::InvalidParams("invalid model selector".to_string())
-                    })?;
-            }
+                || selector.contains('#'))
+        {
+            self.provider_snapshot
+                .provider_for_selector(Some(selector))
+                .map(|_| ())
+                .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))?;
         }
         Ok(())
     }

@@ -40,7 +40,7 @@ fn thread_and_turn_start_params_use_codex_style_wire_shape() {
     .expect("thread params");
     assert_eq!(params["model"], "provider/model");
     assert_eq!(params["cwd"], "/tmp/work");
-    assert!(!params.get("threadId").is_some());
+    assert!(params.get("threadId").is_none());
 
     let params = serde_json::to_value(TurnStartParams {
         thread_id: "session-id".to_string(),
