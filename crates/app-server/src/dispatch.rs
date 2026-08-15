@@ -241,6 +241,12 @@ impl AppServer {
         if !(1..=200).contains(&params.recent_limit) {
             return invalid_params_response(message.required_id());
         }
+        let filter = match params.entry_types.as_slice() {
+            [] => SessionEntryFilter::All,
+            [kind] if kind == "message" => SessionEntryFilter::Messages,
+            [kind] if kind == "compaction" => SessionEntryFilter::Compactions,
+            _ => return invalid_params_response(message.required_id()),
+        };
         let record = match self.store.get_session(&params.session_id) {
             Ok(record) => record,
             Err(StoreError::NotFound(_)) => {
@@ -248,9 +254,23 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let session = self.open_session_for_thread(&thread_from_record(&record))?;
-        let recent_entries = session
-            .recent_entries(params.recent_limit as usize)
+        let range = params.offset.map(|offset| {
+            let start = offset as usize;
+            (start, start.saturating_add(params.recent_limit as usize))
+        });
+        let repository = SessionRepository::new(self.sessions_dir.clone());
+        let read = repository
+            .read(
+                &record.session_id,
+                &SessionReadOptions {
+                    recent_limit: params.recent_limit as usize,
+                    filter,
+                    range,
+                },
+            )
+            .map_err(AppServerError::Session)?;
+        let recent_entries = read
+            .entries
             .iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
@@ -265,9 +285,9 @@ impl AppServer {
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 token_usage: record.token_usage,
-                summary: session.summary(),
+                summary: read.summary,
                 recent_entries,
-                total_entries: session.total_entries(),
+                total_entries: read.total_entries,
             },
         )
     }

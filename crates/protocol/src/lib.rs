@@ -580,6 +580,12 @@ pub struct SessionReadParams {
     pub session_id: String,
     #[serde(default = "default_session_recent_limit")]
     pub recent_limit: u32,
+    /// 过滤后的路径条目起始偏移（默认从 0 开始）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    /// 条目类型过滤；空数组 = 全部，只接受 `message` / `compaction`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

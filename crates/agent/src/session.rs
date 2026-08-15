@@ -56,6 +56,71 @@ pub enum SessionError {
 /// 会话操作结果。
 pub type Result<T> = std::result::Result<T, SessionError>;
 
+/// session/read 的条目类型过滤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionEntryFilter {
+    #[default]
+    All,
+    Messages,
+    Compactions,
+}
+
+/// `SessionRepository::read` 的有界读取选项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReadOptions {
+    /// 返回当前 leaf 路径上的最近 N 条（0 = 只读摘要）。
+    pub recent_limit: usize,
+    pub filter: SessionEntryFilter,
+    /// 在过滤后的路径条目上应用的半开范围（`[start, end)`）。
+    pub range: Option<(usize, usize)>,
+}
+
+impl Default for SessionReadOptions {
+    fn default() -> Self {
+        Self {
+            recent_limit: 20,
+            filter: SessionEntryFilter::All,
+            range: None,
+        }
+    }
+}
+
+/// 一次有界会话读取的结果：摘要 + 最近片段，不返回全文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRead {
+    pub summary: Option<String>,
+    pub entries: Vec<SessionEntry>,
+    /// 会话文件中的条目总数（不含 header）。
+    pub total_entries: usize,
+}
+
+/// 按 `~/.singularity/sessions/<session_id>.jsonl` 布局读取会话的仓储入口。
+#[derive(Debug, Clone)]
+pub struct SessionRepository {
+    sessions_dir: PathBuf,
+}
+
+impl SessionRepository {
+    pub fn new(sessions_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            sessions_dir: sessions_dir.into(),
+        }
+    }
+
+    /// 有界读取会话：按 id 定位 rollout，校验 header id，返回摘要 + 最近片段。
+    pub fn read(&self, session_id: &str, options: &SessionReadOptions) -> Result<SessionRead> {
+        let path = self.sessions_dir.join(format!("{session_id}.jsonl"));
+        let session = SessionManager::open_existing(&path)?;
+        if session.session_id() != session_id {
+            return Err(SessionError::InvalidSession(format!(
+                "rollout header id {} does not match requested session id {session_id}",
+                session.session_id()
+            )));
+        }
+        Ok(session.read_entries(options))
+    }
+}
+
 /// compaction 条目 payload，字段对齐 Pi `CompactionEntry`。
 ///
 /// `previous_summary` 是 Singularity 扩展字段（Pi 0.84.1 无此字段），
@@ -644,6 +709,44 @@ impl SessionManager {
             .iter()
             .map(|&index| self.entries[index].clone())
             .collect()
+    }
+
+    /// 按 filter/range/recent_limit 有界读取 leaf 路径条目（`SessionRepository::read`）。
+    pub fn read_entries(&self, options: &SessionReadOptions) -> SessionRead {
+        let path = self.session_path();
+        let filtered = path
+            .iter()
+            .filter(|&&index| match options.filter {
+                SessionEntryFilter::All => true,
+                SessionEntryFilter::Messages => {
+                    matches!(self.entries[index].entry_type, SessionEntryType::Message(_))
+                }
+                SessionEntryFilter::Compactions => {
+                    matches!(
+                        self.entries[index].entry_type,
+                        SessionEntryType::Compaction(_)
+                    )
+                }
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let (start, end) = options.range.unwrap_or((0, filtered.len()));
+        let start = start.min(filtered.len());
+        let end = end.min(filtered.len());
+        let selected = if start >= end {
+            &filtered[..0]
+        } else {
+            &filtered[start..end]
+        };
+        let start = selected.len().saturating_sub(options.recent_limit);
+        SessionRead {
+            summary: self.summary(),
+            entries: selected[start..]
+                .iter()
+                .map(|&index| self.entries[index].clone())
+                .collect(),
+            total_entries: self.entries.len(),
+        }
     }
 
     /// 构建发送给 LLM 的会话上下文（Pi `buildSessionContext`）。
@@ -1371,6 +1474,49 @@ mod tests {
             ctx.messages[0].content,
             format!("{COMPACTION_SUMMARY_PREFIX}earlier stuff{COMPACTION_SUMMARY_SUFFIX}")
         );
+    }
+
+    /// session/read 仓储入口：只返回摘要 + 最近片段，filter/range 有界。
+    #[test]
+    fn repository_read_is_bounded_and_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let cwd = dir.path().join("project");
+        let session_id = "64e9177f-ef7e-42af-910d-bd0b94b99230";
+        let mut manager = SessionManager::create_with_id(&cwd, &sessions, session_id).unwrap();
+        let id1 = manager.append_message(user("one")).unwrap();
+        let id2 = manager.append_message(assistant("two")).unwrap();
+        manager
+            .append_compaction(compaction("summary", Some(id1.clone())))
+            .unwrap();
+        let id4 = manager.append_message(user("three")).unwrap();
+        drop(manager);
+
+        let repository = SessionRepository::new(&sessions);
+        let read = repository
+            .read(
+                session_id,
+                &SessionReadOptions {
+                    recent_limit: 1,
+                    ..SessionReadOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(read.summary.as_deref(), Some("summary"));
+        assert_eq!(read.total_entries, 4);
+        assert_eq!(entry_ids(&read.entries), vec![id4.clone()]);
+
+        let messages = repository
+            .read(
+                session_id,
+                &SessionReadOptions {
+                    filter: SessionEntryFilter::Messages,
+                    range: Some((1, 3)),
+                    recent_limit: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(entry_ids(&messages.entries), vec![id2.clone(), id4.clone()]);
     }
 
     #[test]

@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use singularity_agent::{
     agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
-    session::{SessionError, SessionManager},
+    session::{
+        SessionEntryFilter, SessionError, SessionManager, SessionReadOptions, SessionRepository,
+    },
     tools::ToolRegistry,
 };
 use singularity_core::{

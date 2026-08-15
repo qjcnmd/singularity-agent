@@ -154,6 +154,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
+            let goal = prepare_goal_with_session_context(&mut client, &goal)?;
             ensure_agent_loop_available(&mut client)?;
             let (thread, thread_events) = client.thread_start(model, !json)?;
             if !json {
@@ -316,6 +317,30 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         ),
     }
 }
+// 识别 "查看会话 <ID>" / "session:<ID>"：自动调用 session/read，把摘要 + 最近片段
+// 注入本次 turn 上下文，不全量加载会话文件。
+fn prepare_goal_with_session_context(
+    client: &mut AppServerClient,
+    goal: &str,
+) -> Result<String, String> {
+    let session_id = goal
+        .trim()
+        .strip_prefix("查看会话 ")
+        .or_else(|| goal.trim().strip_prefix("session:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string);
+    let Some(session_id) = session_id else {
+        return Ok(goal.to_string());
+    };
+    let read = client.fetch_session_read(&session_id, None)?;
+    let summary = read.summary.as_deref().unwrap_or("(无 compaction 摘要)");
+    let recent = serde_json::to_string_pretty(&read.recent_entries)
+        .map_err(|error| format!("failed to render session context: {error}"))?;
+    Ok(format!(
+        "[会话摘要 {session_id}]\n{summary}\n\n[最近片段]\n{recent}\n\n{goal}"
+    ))
+}
+
 fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
     let capability = client.agent_capability()?;
     let blockers = agent_loop_blockers(&capability.agent_loop.blockers);
@@ -603,13 +628,24 @@ impl AppServerClient {
         Ok(reply.result)
     }
 
-    // 读取会话摘要 + 最近片段，按稳定文本渲染。
-    fn session_read(&mut self, session_id: &str, limit: Option<u32>) -> Result<(), String> {
+    // 请求 session/read 并返回服务端结果。
+    fn fetch_session_read(
+        &mut self,
+        session_id: &str,
+        limit: Option<u32>,
+    ) -> Result<SessionReadResult, String> {
         let reply = self.request::<rpc_methods::SessionRead>(&SessionReadParams {
             session_id: session_id.to_string(),
             recent_limit: limit.unwrap_or(20),
+            offset: None,
+            entry_types: Vec::new(),
         })?;
-        let result: SessionReadResult = reply.result;
+        Ok(reply.result)
+    }
+
+    // 读取会话摘要 + 最近片段，按稳定文本渲染。
+    fn session_read(&mut self, session_id: &str, limit: Option<u32>) -> Result<(), String> {
+        let result = self.fetch_session_read(session_id, limit)?;
         println!("session {}", result.session_id);
         println!("cwd {}", result.cwd);
         println!("status {}", result.status);

@@ -373,6 +373,62 @@ fn cli_session_delete_renders_deleted_confirmation() {
     assert!(stdout(&output).contains("session session-delete deleted=true"));
 }
 
+// 验证 run 识别 "查看会话 <ID>"，自动注入 session/read 摘要+最近片段。
+#[test]
+fn cli_run_view_session_injects_summary_and_recent_entries() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let turn_params_path = temp.path().join("turn_params.json");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .respond(
+                "session/read",
+                json!({
+                    "sessionId": "session-context",
+                    "cwd": "/tmp/work",
+                    "title": null,
+                    "model": null,
+                    "status": "active",
+                    "createdAt": "2026-08-15T00:00:00Z",
+                    "updatedAt": "2026-08-15T00:01:00Z",
+                    "tokenUsage": {},
+                    "summary": "之前修好了计费 bug",
+                    "recentEntries": [{"id":"e1","type":"message"}],
+                    "totalEntries": 2
+                }),
+            )
+            .agent_loop_ready()
+            .respond("thread/start", json!({"thread": fake_thread("thread-context")}))
+            .interaction(
+                "turn/start",
+                vec![
+                    capture_params(&turn_params_path),
+                    respond(json!({"turn": fake_turn("turn_context", "thread-context", "completed", "completed")})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "查看会话 session-context 分析下一步"])
+        .output()
+        .expect("run view session cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(turn_params_path).expect("turn params"))
+            .expect("turn params json");
+    let text = params["input"][0]["text"].as_str().expect("goal text");
+    assert!(text.contains("[会话摘要 session-context]"), "{text}");
+    assert!(text.contains("之前修好了计费 bug"), "{text}");
+    assert!(text.contains("[最近片段]"), "{text}");
+    assert!(
+        text.contains("查看会话 session-context 分析下一步"),
+        "{text}"
+    );
+}
+
 // 验证 doctor 输出脱敏的 AgentLoop 与 provider readiness。
 #[test]
 fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
