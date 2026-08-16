@@ -249,10 +249,10 @@ impl AppServer {
                 .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
                 .get(&params.turn_id)
                 .cloned()
-        }
-        .ok_or_else(|| {
-            AppServerError::Store(StoreError::NotFound(format!("turn {}", params.turn_id)))
-        })?;
+        };
+        let Some(handle) = handle else {
+            return not_found_response(message.required_id(), TURN_NOT_FOUND);
+        };
         handle
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
