@@ -385,8 +385,13 @@ fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let pid = child.id();
+        // taskkill 自身绝不能向 app-server 的 stdio JSON-RPC 流写任何输出：
+        // stdout/stderr 全部指向 null，避免中断时污染协议帧。
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
     let _ = child.kill();
