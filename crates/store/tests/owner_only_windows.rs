@@ -72,3 +72,20 @@ fn unreachable_path_fails_closed_instead_of_silently_passing() {
     drop(holder);
     ensure_owner_only_file(&path).expect("repair succeeds after release");
 }
+
+#[test]
+fn owner_only_file_grants_delete_for_session_rollout_rename() {
+    // session/delete 的两阶段删除依赖 `fs::rename`；Windows 上 FILE_GENERIC_WRITE
+    // 不包含 DELETE，owner-only ACE 必须显式授予该权限，否则 rename 返回拒绝访问。
+    let dir = tempfile::tempdir().expect("temp dir");
+    ensure_owner_only_dir(dir.path()).expect("tighten parent dir");
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, "{}").expect("write rollout");
+    ensure_owner_only_file(&path).expect("owner-only rollout");
+
+    let tombstone = dir.path().join(".session.jsonl.deleted.tombstone");
+    std::fs::rename(&path, &tombstone).expect("owner-only rollout must be renameable");
+    assert!(!path.exists());
+    assert!(tombstone.is_file());
+    std::fs::remove_file(&tombstone).expect("owner-only tombstone must be removable");
+}

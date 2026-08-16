@@ -25,7 +25,7 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+    CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     WRITE_OWNER,
@@ -86,7 +86,12 @@ pub fn create_owner_only_file(path: &Path) -> io::Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            FILE_GENERIC_READ
+                | FILE_GENERIC_WRITE
+                | DELETE
+                | READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             CREATE_NEW,
@@ -171,8 +176,11 @@ fn apply_owner_only_security(file: &File, set_owner: bool) -> io::Result<()> {
         ptstrName: owner_sid as *mut u16,
     };
     let entry = EXPLICIT_ACCESS_W {
+        // DELETE 是 session/delete 与备份清理所需：Windows rename/remove 需要
+        // 目标文件 ACL 显式授予 DELETE；FILE_GENERIC_WRITE 并不包含该权限。
         grfAccessPermissions: FILE_GENERIC_READ
             | FILE_GENERIC_WRITE
+            | DELETE
             | READ_CONTROL
             | WRITE_DAC
             | WRITE_OWNER,
@@ -287,10 +295,11 @@ fn inspect_descriptor(
         GenericAll: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
     };
     unsafe { windows_sys::Win32::Security::MapGenericMask(&mut mask, &mapping) };
-    if (mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE)) != (FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+    if (mask & (FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE))
+        != (FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
     {
         return Err(io::Error::other(
-            "path DACL ACE does not grant the required read/write access",
+            "path DACL ACE does not grant the required read/write/delete access",
         ));
     }
     Ok(())
