@@ -34,7 +34,10 @@ mod session_index;
 pub use connection::{SessionStore, SessionStoreDescriptor};
 pub use error::{StoreError, StoreResult};
 pub use owner_only::{ensure_owner_only_dir, ensure_owner_only_file};
-pub use session_index::{SessionMetadataUpdate, SessionRecord, SessionStatus, now_iso};
+pub use session_index::{
+    LegacySqliteReport, SessionMetadataUpdate, SessionRecord, SessionStatus, inspect_legacy_sqlite,
+    now_iso,
+};
 
 pub(crate) use file_identity::StoreIdentityGuard;
 

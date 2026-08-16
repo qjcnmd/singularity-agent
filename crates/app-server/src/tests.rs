@@ -291,6 +291,212 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     );
 }
 
+fn legacy_project(temp: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    let workspace = temp.join("workspace");
+    let legacy = workspace.join(".singularity").join("agent-sessions");
+    std::fs::create_dir_all(&legacy).expect("legacy dir");
+    let source = legacy.join("thread_old.jsonl");
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": "2026-08-15T00:00:00Z",
+        "cwd": workspace
+    });
+    std::fs::write(&source, format!("{header}\n")).expect("legacy jsonl");
+    workspace
+}
+
+#[test]
+fn migration_refuses_non_empty_legacy_sqlite() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "8512c2a8-0e0c-49cd-a799-4d8a2096349a";
+    let workspace = legacy_project(temp.path(), session_id);
+    let sqlite = workspace
+        .join(".singularity")
+        .join("rust-app-server.sqlite3");
+    let connection = rusqlite::Connection::open(&sqlite).expect("legacy sqlite");
+    connection
+        .execute_batch(
+            "create table threads(thread_id text primary key);
+             insert into threads values ('legacy-thread');",
+        )
+        .expect("legacy data");
+    drop(connection);
+
+    let paths = crate::paths::AppPaths {
+        home_dir: temp.path().to_path_buf(),
+        index_path: temp.path().join("index.sqlite3"),
+        sessions_dir: temp.path().join("sessions"),
+        backups_dir: temp.path().join("backups"),
+    };
+    paths.prepare().expect("paths");
+    let store = SessionStore::open(&paths.index_path).expect("store");
+    let error = crate::paths::migrate_legacy_project_sessions(&paths, &store, &workspace)
+        .expect_err("non-empty legacy sqlite must stop migration");
+    assert!(error.contains("user data row"), "{error}");
+    assert!(
+        workspace
+            .join(".singularity")
+            .join("agent-sessions")
+            .join("thread_old.jsonl")
+            .is_file()
+    );
+    assert!(sqlite.is_file());
+}
+
+#[test]
+fn migration_is_idempotent_when_destination_or_index_already_exists() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "2e22c5fa-92ba-483c-b245-20a3e6d19e05";
+    let workspace = legacy_project(temp.path(), session_id);
+    let source = workspace
+        .join(".singularity")
+        .join("agent-sessions")
+        .join("thread_old.jsonl");
+    let legacy_sqlite = workspace
+        .join(".singularity")
+        .join("rust-app-server.sqlite3");
+    let connection = rusqlite::Connection::open(&legacy_sqlite).expect("empty legacy sqlite");
+    connection
+        .execute_batch("create table schema_meta(schema_version integer);")
+        .expect("empty schema");
+    drop(connection);
+
+    let paths = crate::paths::AppPaths {
+        home_dir: temp.path().to_path_buf(),
+        index_path: temp.path().join("index.sqlite3"),
+        sessions_dir: temp.path().join("sessions"),
+        backups_dir: temp.path().join("backups"),
+    };
+    paths.prepare().expect("paths");
+    let store = SessionStore::open(&paths.index_path).expect("store");
+
+    // 第一次完整迁移，备份含旧 SQLite 与 manifest。
+    assert_eq!(
+        crate::paths::migrate_legacy_project_sessions(&paths, &store, &workspace).expect("migrate"),
+        1
+    );
+    assert!(!source.exists());
+    assert!(!legacy_sqlite.exists());
+    let backup = std::fs::read_dir(&paths.backups_dir)
+        .expect("backups")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("backup dir")
+        .path();
+    assert!(backup.join("rust-app-server.sqlite3").is_file());
+    assert!(backup.join("manifest.json").is_file());
+
+    // 完整迁移后再次运行：无旧对象，幂等返回 0。
+    assert_eq!(
+        crate::paths::migrate_legacy_project_sessions(&paths, &store, &workspace).expect("rerun"),
+        0
+    );
+
+    // 部分失败续跑：destination 已复制但索引不存在（模拟上次插入前失败）。
+    let workspace2 = legacy_project(&temp.path().join("partial"), session_id);
+    let paths2 = crate::paths::AppPaths {
+        home_dir: temp.path().join("partial-home"),
+        index_path: temp.path().join("partial-home").join("index.sqlite3"),
+        sessions_dir: temp.path().join("partial-home").join("sessions"),
+        backups_dir: temp.path().join("partial-home").join("backups"),
+    };
+    paths2.prepare().expect("paths2");
+    let store2 = SessionStore::open(&paths2.index_path).expect("store2");
+    let destination = paths2.sessions_dir.join(format!("{session_id}.jsonl"));
+    std::fs::create_dir_all(&paths2.sessions_dir).expect("sessions");
+    std::fs::copy(
+        workspace2
+            .join(".singularity")
+            .join("agent-sessions")
+            .join("thread_old.jsonl"),
+        &destination,
+    )
+    .expect("simulate partial copy");
+    assert_eq!(
+        crate::paths::migrate_legacy_project_sessions(&paths2, &store2, &workspace2)
+            .expect("resume partial"),
+        1
+    );
+    assert!(store2.get_session(session_id).is_ok());
+    assert!(destination.is_file());
+    assert!(
+        !workspace2
+            .join(".singularity")
+            .join("agent-sessions")
+            .join("thread_old.jsonl")
+            .exists()
+    );
+}
+
+#[test]
+fn session_delete_faults_roll_back_or_leave_recognizable_tombstone() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let server = app_server(store, &sessions_dir);
+    let session_id = "cff25e0f-60b8-44dd-97eb-5f2bb4fda847";
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    let rollout = sessions_dir.join(format!("{session_id}.jsonl"));
+    let record = server.store().get_session(session_id).expect("record");
+
+    // rename 失败：原文件与索引都不动。
+    let error = crate::delete::delete_session_with_faults(
+        &record,
+        server.store(),
+        crate::delete::DeleteFaults {
+            fail_rename: true,
+            ..crate::delete::DeleteFaults::default()
+        },
+    )
+    .expect_err("rename failure");
+    assert!(error.to_string().contains("rename failure"));
+    assert!(rollout.is_file());
+    assert!(server.store().get_session(session_id).is_ok());
+
+    // 索引删除失败：rollout 必须从 tombstone 恢复。
+    let error = crate::delete::delete_session_with_faults(
+        &record,
+        server.store(),
+        crate::delete::DeleteFaults {
+            fail_index_delete: true,
+            ..crate::delete::DeleteFaults::default()
+        },
+    )
+    .expect_err("index delete failure");
+    assert!(error.to_string().contains("index delete failure"));
+    assert!(rollout.is_file());
+    assert!(server.store().get_session(session_id).is_ok());
+
+    // 最终清理失败：索引与可见 rollout 已删，只留下可识别 tombstone。
+    let tombstone = crate::delete::delete_session_with_faults(
+        &record,
+        server.store(),
+        crate::delete::DeleteFaults {
+            leave_tombstone: true,
+            ..crate::delete::DeleteFaults::default()
+        },
+    )
+    .expect("logical delete")
+    .expect("tombstone path");
+    assert!(!rollout.exists());
+    assert!(matches!(
+        server.store().get_session(session_id),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(tombstone.is_file());
+    assert!(
+        tombstone
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".tombstone")
+    );
+}
+
 #[test]
 fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
     let temp = tempfile::tempdir().expect("temp dir");

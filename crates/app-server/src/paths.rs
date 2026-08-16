@@ -10,8 +10,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::user_singularity_home;
 use singularity_store::{
-    SessionRecord, SessionStatus, SessionStore, ensure_owner_only_dir, ensure_owner_only_file,
-    now_iso,
+    SessionRecord, SessionStatus, SessionStore, StoreError, ensure_owner_only_dir,
+    ensure_owner_only_file, now_iso,
 };
 use uuid::Uuid;
 
@@ -70,44 +70,69 @@ struct LegacyHeader {
 
 /// 将 `<cwd>/.singularity/agent-sessions/*.jsonl` 迁移到用户会话目录。
 ///
-/// 安全顺序：全部 header/destination 预检 → 复制到 backups 并校验 → 复制为
-/// `<uuid>.jsonl` 并校验 → 写入索引 → 全部成功后才删除旧项目文件。任何冲突或
-/// 无法识别的文件都立即停止，不覆盖、不清理。
+/// 顺序：完整 preflight（header/destination/index/旧 SQLite 数据）→ 备份所有
+/// 将清理的旧对象并写 manifest → 复制 `<uuid>.jsonl` 并写索引 → 全部成功后才
+/// 清理旧项目文件。destination 与索引已存在时只接受“内容 hash 一致”的续跑；
+/// 同 UUID 不同内容、旧 SQLite 含数据、未知对象都 fail closed，绝不覆盖。
 pub fn migrate_legacy_project_sessions(
     paths: &AppPaths,
     store: &SessionStore,
     project_cwd: &Path,
 ) -> Result<usize, String> {
-    let legacy_dir = project_cwd.join(".singularity").join("agent-sessions");
-    let entries = match std::fs::read_dir(&legacy_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect legacy session directory {}: {error}",
-                legacy_dir.display()
-            ));
-        }
-    };
+    let legacy_state_dir = project_cwd.join(".singularity");
+    let legacy_dir = legacy_state_dir.join("agent-sessions");
     let mut sources = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("failed to read legacy session entry: {error}"))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("failed to read legacy session entry: {error}"))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            sources.push(path);
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-            continue;
-        }
-        sources.push(path);
+    } else if legacy_dir.exists() {
+        return Err(format!(
+            "legacy session directory is not readable: {}",
+            legacy_dir.display()
+        ));
     }
     sources.sort();
-    if sources.is_empty() {
+
+    let mut legacy_objects = sources.clone();
+    for name in LEGACY_SQLITE_OBJECTS {
+        let path = legacy_state_dir.join(name);
+        if path.is_file() {
+            legacy_objects.push(path);
+        }
+    }
+    legacy_objects.sort();
+    if legacy_objects.is_empty() {
         return Ok(0);
     }
 
-    // 预检所有文件，全部可识别且无冲突后才开始复制。
+    // 旧 SQLite 若含任何用户行，立即停止；lock/WAL/SHM 只随主库整体备份。
+    let main_sqlite = legacy_state_dir.join("rust-app-server.sqlite3");
+    if main_sqlite.is_file() {
+        let report = singularity_store::inspect_legacy_sqlite(&main_sqlite).map_err(|error| {
+            format!(
+                "cannot inspect legacy SQLite {}; stopping without changes: {error}",
+                main_sqlite.display()
+            )
+        })?;
+        if report.user_rows != 0 {
+            return Err(format!(
+                "legacy SQLite {} contains {} user data row(s); stopping without changes",
+                main_sqlite.display(),
+                report.user_rows
+            ));
+        }
+    }
+
     let current_cwd = project_cwd
         .canonicalize()
         .unwrap_or_else(|_| project_cwd.to_path_buf());
@@ -115,90 +140,155 @@ pub fn migrate_legacy_project_sessions(
     for source in &sources {
         let (header, cwd, created_at) = read_legacy_header(source, &current_cwd)?;
         let destination = paths.sessions_dir.join(format!("{}.jsonl", header.id));
-        if destination.exists() {
-            return Err(format!(
-                "migration conflict: destination already exists for {} ({})",
-                source.display(),
-                destination.display()
-            ));
-        }
-        if store.get_session(&header.id).is_ok() {
-            return Err(format!(
-                "migration conflict: session index already contains {}",
-                header.id
-            ));
-        }
         if planned
             .iter()
-            .any(|(id, _, _): &(String, PathBuf, String)| id == &header.id)
+            .any(|plan: &PlannedSession| plan.session_id == header.id)
         {
             return Err(format!(
                 "migration conflict: duplicate session id {}",
                 header.id
             ));
         }
-        planned.push((header.id, destination, cwd));
-        let _ = created_at;
+        if destination.exists() && hash_file(&destination)? != hash_file(source)? {
+            return Err(format!(
+                "migration conflict: destination exists with different content for {} ({})",
+                source.display(),
+                destination.display()
+            ));
+        }
+        planned.push(PlannedSession {
+            session_id: header.id,
+            source: source.clone(),
+            destination,
+            cwd,
+            created_at,
+        });
+    }
+
+    // preflight 索引：不存在则稍后插入；存在则必须指向同一 rollout 内容。
+    let mut indexed = Vec::new();
+    for plan in &planned {
+        match store.get_session(&plan.session_id) {
+            Ok(record) => {
+                let record_path = Path::new(&record.rollout_path);
+                if record_path != plan.destination {
+                    return Err(format!(
+                        "migration conflict: session index {} points to {} instead of {}",
+                        plan.session_id,
+                        record.rollout_path,
+                        plan.destination.display()
+                    ));
+                }
+                if hash_file(record_path)? != hash_file(&plan.destination)? {
+                    return Err(format!(
+                        "migration conflict: indexed rollout content differs for {}",
+                        plan.session_id
+                    ));
+                }
+                indexed.push(plan.session_id.clone());
+            }
+            Err(StoreError::NotFound(_)) => {}
+            Err(error) => return Err(format!("migration index preflight failed: {error}")),
+        }
     }
 
     let backup_dir = paths
         .backups_dir
         .join(format!("pre-migration-{}", now_iso_safe()));
     create_owner_only_dir(&backup_dir)?;
+    let mut manifest = MigrationManifest {
+        entries: Vec::new(),
+    };
 
-    let mut migrated = 0usize;
-    for ((source, (session_id, destination, cwd)), (header, _, created_at)) in
-        sources.iter().zip(planned.iter()).zip(
-            sources
-                .iter()
-                .map(|source| read_legacy_header(source, &current_cwd))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    {
-        let source_name = source
+    // 先备份所有将被清理的旧对象；任一失败都不会删除任何旧文件。
+    for object in &legacy_objects {
+        let source_name = object
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
+            .ok_or_else(|| format!("legacy object has no UTF-8 name: {}", object.display()))?;
+        let backup = backup_dir.join(source_name);
+        let hash = copy_verified(object, &backup)?;
+        ensure_owner_only_file(&backup).map_err(|error| error.to_string())?;
+        manifest.entries.push(MigrationManifestEntry {
+            source_name: source_name.to_string(),
+            sha256: hash,
+            destination: None,
+            session_id: None,
+        });
+    }
+
+    let mut migrated = 0usize;
+    for plan in &planned {
+        let already_indexed = indexed.contains(&plan.session_id);
+        let (hash, copied) = if plan.destination.exists() {
+            (hash_file(&plan.destination)?, false)
+        } else {
+            let hash = copy_verified(&plan.source, &plan.destination)?;
+            ensure_owner_only_file(&plan.destination).map_err(|error| error.to_string())?;
+            (hash, true)
+        };
+        if !already_indexed {
+            let rollout_path = plan
+                .destination
+                .canonicalize()
+                .unwrap_or_else(|_| plan.destination.clone())
+                .to_string_lossy()
+                .to_string();
+            let record = SessionRecord {
+                session_id: plan.session_id.clone(),
+                rollout_path,
+                cwd: plan.cwd.clone(),
+                title: None,
+                model: None,
+                status: SessionStatus::Active,
+                created_at: plan.created_at.clone(),
+                updated_at: plan.created_at.clone(),
+                token_usage: Value::Object(serde_json::Map::new()),
+            };
+            store.insert_session(&record).map_err(|error| {
                 format!(
-                    "legacy session has no UTF-8 file name: {}",
-                    source.display()
+                    "failed to index migrated session {}: {error}",
+                    plan.session_id
                 )
             })?;
-        let backup = backup_dir.join(source_name);
-        copy_verified(source, &backup)?;
-        ensure_owner_only_file(&backup).map_err(|error| error.to_string())?;
-        copy_verified(source, destination)?;
-        ensure_owner_only_file(destination).map_err(|error| error.to_string())?;
-
-        let rollout_path = destination
-            .canonicalize()
-            .unwrap_or_else(|_| destination.clone())
-            .to_string_lossy()
-            .to_string();
-        let record = SessionRecord {
-            session_id: session_id.clone(),
-            rollout_path,
-            cwd: cwd.clone(),
-            title: None,
-            model: None,
-            status: SessionStatus::Active,
-            created_at: created_at.clone(),
-            updated_at: created_at.clone(),
-            token_usage: Value::Object(serde_json::Map::new()),
-        };
-        store
-            .insert_session(&record)
-            .map_err(|error| format!("failed to index migrated session {session_id}: {error}"))?;
-        let _ = header;
+        }
+        if copied {
+            let source_name = plan
+                .destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("destination has file name");
+            manifest.entries.push(MigrationManifestEntry {
+                source_name: source_name.to_string(),
+                sha256: hash,
+                destination: Some(plan.destination.to_string_lossy().to_string()),
+                session_id: Some(plan.session_id.clone()),
+            });
+        }
         migrated += 1;
     }
 
-    // 全部文件已验证并写入索引，才清理项目内旧数据。
-    for source in &sources {
-        std::fs::remove_file(source).map_err(|error| {
+    let manifest_path = backup_dir.join("manifest.json");
+    let mut manifest_file = singularity_core::create_owner_only_file(&manifest_path)
+        .map_err(|error| format!("failed to create migration manifest: {error}"))?;
+    manifest_file
+        .write_all(
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|error| format!("failed to serialize migration manifest: {error}"))?
+                .as_bytes(),
+        )
+        .map_err(|error| format!("failed to write migration manifest: {error}"))?;
+    manifest_file
+        .flush()
+        .map_err(|error| format!("failed to flush migration manifest: {error}"))?;
+    drop(manifest_file);
+
+    // 全部对象已备份、全部会话已复制/校验并写入索引，才清理旧项目对象。
+    for object in &legacy_objects {
+        std::fs::remove_file(object).map_err(|error| {
             format!(
-                "failed to clean legacy session {}: {error}",
-                source.display()
+                "failed to clean legacy project object {}: {error}",
+                object.display()
             )
         })?;
     }
@@ -208,31 +298,44 @@ pub fn migrate_legacy_project_sessions(
     {
         let _ = std::fs::remove_dir(&legacy_dir);
     }
-    for name in [
-        "rust-app-server.sqlite3",
-        "rust-app-server.sqlite3-wal",
-        "rust-app-server.sqlite3-shm",
-        "rust-app-server.sqlite3.init.lock",
-    ] {
-        let path = project_cwd.join(".singularity").join(name);
-        if path.is_file() {
-            std::fs::remove_file(&path).map_err(|error| {
-                format!(
-                    "failed to clean legacy project state {}: {error}",
-                    path.display()
-                )
-            })?;
-        }
-    }
-    let project_state = project_cwd.join(".singularity");
-    if project_state
+    if legacy_state_dir
         .read_dir()
         .is_ok_and(|mut entries| entries.next().is_none())
     {
-        let _ = std::fs::remove_dir(&project_state);
+        let _ = std::fs::remove_dir(&legacy_state_dir);
     }
     Ok(migrated)
 }
+
+struct PlannedSession {
+    session_id: String,
+    source: PathBuf,
+    destination: PathBuf,
+    cwd: String,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct MigrationManifest {
+    entries: Vec<MigrationManifestEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct MigrationManifestEntry {
+    source_name: String,
+    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+}
+
+const LEGACY_SQLITE_OBJECTS: &[&str] = &[
+    "rust-app-server.sqlite3",
+    "rust-app-server.sqlite3-wal",
+    "rust-app-server.sqlite3-shm",
+    "rust-app-server.sqlite3.init.lock",
+];
 
 fn read_legacy_header(
     path: &Path,
@@ -288,7 +391,7 @@ fn read_legacy_header(
     Ok((header, cwd, created_at))
 }
 
-fn copy_verified(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_verified(source: &Path, destination: &Path) -> Result<String, String> {
     let mut source_file = File::open(source)
         .map_err(|error| format!("failed to open copy source {}: {error}", source.display()))?;
     let mut destination_file =
@@ -318,10 +421,10 @@ fn copy_verified(source: &Path, destination: &Path) -> Result<(), String> {
             destination.display()
         ));
     }
-    Ok(())
+    Ok(destination_hash)
 }
 
-fn hash_file(path: &Path) -> Result<Vec<u8>, String> {
+fn hash_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path)
         .map_err(|error| format!("failed to open {} for hashing: {error}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -335,7 +438,11 @@ fn hash_file(path: &Path) -> Result<Vec<u8>, String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_vec())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn now_iso_safe() -> String {

@@ -303,16 +303,13 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let rollout = Path::new(&record.rollout_path);
-        if rollout.exists() {
-            std::fs::remove_file(rollout).map_err(|error| {
-                AppServerError::Workspace(format!(
-                    "failed to delete session rollout {}: {error}",
-                    rollout.display()
-                ))
-            })?;
-        }
-        self.store.delete_session(&params.session_id)?;
+        // 打开并校验 rollout header 后再进入可恢复删除；不能先永久删 JSONL。
+        let _session = self.open_session_for_thread(&thread_from_record(&record))?;
+        let _left_tombstone = crate::delete::delete_session_with_faults(
+            &record,
+            &self.store,
+            crate::delete::DeleteFaults::default(),
+        )?;
         json_response(
             message.required_id(),
             SessionDeleteResult {

@@ -4,6 +4,7 @@
 //!
 //! JSONL rollout 是会话正文的唯一权威；SQLite `session_index` 只保存定位与展示元数据。
 
+mod delete;
 mod dispatch;
 mod events;
 mod lifecycle;
