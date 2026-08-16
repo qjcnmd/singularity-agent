@@ -10,8 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::user_singularity_home;
 use singularity_store::{
-    SessionRecord, SessionStatus, SessionStore, StoreError, ensure_owner_only_dir,
-    ensure_owner_only_file, now_iso,
+    SessionRecord, SessionStore, StoreError, ensure_owner_only_dir, ensure_owner_only_file, now_iso,
 };
 use uuid::Uuid;
 
@@ -240,9 +239,9 @@ pub fn migrate_legacy_project_sessions(
                 cwd: plan.cwd.clone(),
                 title: None,
                 model: None,
-                // 迁移行无法从旧索引得知最近 turn 终态；按「尚无可展示 turn」入库，
-                // 不得伪装成运行中。
-                status: SessionStatus::Idle,
+                // 迁移行无法从旧索引得知最近 turn 终态；按「尚无可展示 turn」
+                // 以 null 入库，不得伪装成运行中或任何终态。
+                status: None,
                 created_at: plan.created_at.clone(),
                 updated_at: plan.created_at.clone(),
                 token_usage: Value::Object(serde_json::Map::new()),

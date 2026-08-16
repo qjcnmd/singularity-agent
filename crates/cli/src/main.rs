@@ -765,7 +765,10 @@ impl AppServerClient {
         let result = self.fetch_session_read(session_id, limit)?;
         println!("session {}", result.session_id);
         println!("cwd {}", result.cwd);
-        println!("status {}", result.status);
+        match result.status.as_deref() {
+            Some(status) => println!("status {status}"),
+            None => println!("status none"),
+        }
         if let Some(title) = result.title {
             println!("title {title}");
         }
@@ -1228,7 +1231,7 @@ mod tests {
             cwd: "/tmp/work".to_string(),
             title: None,
             model: None,
-            status: "completed".to_string(),
+            status: Some("completed".to_string()),
             created_at: "2026-08-15T00:00:00Z".to_string(),
             updated_at: "2026-08-15T00:01:00Z".to_string(),
             token_usage: json!({}),

@@ -12,7 +12,7 @@ fn record(id: &str, path: &std::path::Path) -> SessionRecord {
         cwd: path.parent().expect("parent").to_string_lossy().to_string(),
         title: None,
         model: None,
-        status: SessionStatus::Active,
+        status: Some(SessionStatus::Active),
         created_at: "2026-08-15T00:00:00Z".to_string(),
         updated_at: "2026-08-15T00:00:00Z".to_string(),
         token_usage: json!({}),
@@ -47,7 +47,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("index.sqlite3");
     let store = SessionStore::open(&db).expect("open store");
-    assert_eq!(store.descriptor().schema_version, 2);
+    assert_eq!(store.descriptor().schema_version, 1);
     store
         .insert_session(&record("wal-probe", &dir.path().join("wal.jsonl")))
         .expect("write session");
@@ -84,7 +84,7 @@ fn sqlite_store_rejects_legacy_turn_schema() {
         error,
         StoreError::UnsupportedSchema {
             found: 13,
-            supported: 2
+            supported: 1
         }
     ));
 }

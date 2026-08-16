@@ -49,7 +49,7 @@ fn insert_session(server: &AppServer, sessions_dir: &Path, session_id: &str, cwd
             cwd: cwd.to_string_lossy().to_string(),
             title: None,
             model: Some("gpt-test".to_string()),
-            status: SessionStatus::Active,
+            status: None,
             created_at,
             updated_at: now_iso(),
             token_usage: json!({}),
@@ -139,7 +139,7 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     let rollout = sessions_dir.join(format!("{session_id}.jsonl"));
     assert!(rollout.is_file());
     let record = server.store().get_session(session_id).expect("indexed");
-    assert_eq!(record.status, SessionStatus::Completed);
+    assert_eq!(record.status, Some(SessionStatus::Completed));
     assert_eq!(record.title.as_deref(), Some("write hello.txt"));
     let session = SessionManager::open_existing(&rollout).expect("session");
     assert_eq!(session.session_id(), session_id);
@@ -193,7 +193,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .as_str()
         .expect("session id")
         .to_string();
-    // 尚无 turn：lastTurnStatus 为空，索引行为 idle，不伪装成 active。
+    // 尚无 turn：lastTurnStatus 为 null，索引行 status 也是 null，不伪装成 active。
     assert_eq!(
         started[1]["result"]["thread"]["lastTurnStatus"],
         serde_json::Value::Null
@@ -204,7 +204,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Idle
+        None
     );
 
     // completed → continue 必须保持 completed，不提前置 active。
@@ -223,7 +223,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Completed
+        Some(SessionStatus::Completed)
     );
     let resumed = server
         .handle_json(&format!(
@@ -240,7 +240,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Completed
+        Some(SessionStatus::Completed)
     );
 
     // 失败 turn 把展示状态变为 failed；随后仍可 continue。
@@ -259,7 +259,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Failed
+        Some(SessionStatus::Failed)
     );
     let resumed = server
         .handle_json(&format!(
@@ -340,6 +340,25 @@ fn last_turn_status_reports_running_only_with_live_turn() {
             .clone()
     }
 
+    fn read_status(server: &mut AppServer, id: i64, session_id: &str) -> serde_json::Value {
+        server
+            .handle_json(&format!(
+                r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{{"sessionId":"{session_id}","recentLimit":5}}}}"#
+            ))
+            .expect("session read")[0]["result"]["status"]
+            .clone()
+    }
+
+    // 尚无 turn：三个读取接口一致投影为 null。
+    assert_eq!(
+        listed_status(&mut server, 3, &session_id),
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        read_status(&mut server, 4, &session_id),
+        serde_json::Value::Null
+    );
+
     // 模拟崩溃遗留：索引行停在 active，但本进程没有该会话的存活 turn。
     server
         .store()
@@ -352,13 +371,17 @@ fn last_turn_status_reports_running_only_with_live_turn() {
         )
         .expect("force active row");
     assert_eq!(
-        listed_status(&mut server, 3, &session_id),
+        listed_status(&mut server, 5, &session_id),
         json!("interrupted"),
         "crash-leftover active must not masquerade as running"
     );
+    assert_eq!(
+        read_status(&mut server, 6, &session_id),
+        json!("interrupted")
+    );
     let resumed = server
         .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":4,"params":{{"threadId":"{session_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":7,"params":{{"threadId":"{session_id}"}}}}"#
         ))
         .expect("resume");
     assert_eq!(
@@ -371,7 +394,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Active,
+        Some(SessionStatus::Active),
         "resume must not rewrite the stored status"
     );
 
@@ -379,10 +402,15 @@ fn last_turn_status_reports_running_only_with_live_turn() {
     let (_cancellation, guard) = server
         .activate_turn("turn_live_1", &session_id)
         .expect("activate turn");
-    assert_eq!(listed_status(&mut server, 5, &session_id), json!("active"));
+    assert_eq!(listed_status(&mut server, 8, &session_id), json!("active"));
+    assert_eq!(read_status(&mut server, 9, &session_id), json!("active"));
     drop(guard);
     assert_eq!(
-        listed_status(&mut server, 6, &session_id),
+        listed_status(&mut server, 10, &session_id),
+        json!("interrupted")
+    );
+    assert_eq!(
+        read_status(&mut server, 11, &session_id),
         json!("interrupted")
     );
 }

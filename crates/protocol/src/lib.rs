@@ -596,7 +596,10 @@ pub struct SessionReadResult {
     pub cwd: String,
     pub title: Option<String>,
     pub model: Option<String>,
-    pub status: String,
+    /// 最近一次 turn 状态的投影，与 thread/list、thread/resume 的
+    /// `lastTurnStatus` 来自同一投影：尚无 turn 为 None，运行中 active，
+    /// 终态 completed/failed/interrupted。
+    pub status: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub token_usage: Value,

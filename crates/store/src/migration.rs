@@ -5,11 +5,11 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(crate) const EXPECTED_MIGRATIONS: &[&str] = &["0001_session_index", "0002_session_status_idle"];
+pub(crate) const EXPECTED_MIGRATIONS: &[&str] = &["0001_session_index"];
 
 pub(crate) const CURRENT_SCHEMA_SQL: &str = r#"
 create table schema_meta(
-schema_version integer not null check(schema_version = 2)
+schema_version integer not null check(schema_version = 1)
 );
 create table schema_migrations(
 migration_id text primary key,
@@ -21,40 +21,12 @@ rollout_path text not null,
 cwd text not null,
 title text,
 model text,
-status text not null
-    check(status in ('idle', 'active', 'completed', 'failed', 'interrupted')),
+status text
+    check(status in ('active', 'completed', 'failed', 'interrupted')),
 created_at text not null,
 updated_at text not null,
 token_usage text not null
 );
-"#;
-
-/// 0001 → 0002：SQLite 无法修改列级 CHECK，重建 `session_index` 以接受
-/// `idle`（尚无 turn），并把 `schema_meta` 的版本 CHECK 抬到 2。行数据原样保留。
-const UPGRADE_1_TO_2_SQL: &str = r#"
-create table session_index_upgrade(
-session_id text primary key,
-rollout_path text not null,
-cwd text not null,
-title text,
-model text,
-status text not null
-    check(status in ('idle', 'active', 'completed', 'failed', 'interrupted')),
-created_at text not null,
-updated_at text not null,
-token_usage text not null
-);
-insert into session_index_upgrade
-    select session_id, rollout_path, cwd, title, model, status,
-           created_at, updated_at, token_usage
-    from session_index;
-drop table session_index;
-alter table session_index_upgrade rename to session_index;
-create table schema_meta_upgrade(schema_version integer not null check(schema_version = 2));
-drop table schema_meta;
-alter table schema_meta_upgrade rename to schema_meta;
-insert into schema_meta(schema_version) values(2);
-insert into schema_migrations(migration_id) values('0002_session_status_idle');
 "#;
 
 pub(crate) const CURRENT_INDEX_SQL: &str = r#"
@@ -68,19 +40,8 @@ pub(crate) fn initialize_or_validate_schema(connection: &Connection) -> StoreRes
         create_current_schema(connection)?;
         return Ok(());
     }
-    let version = schema_meta_version(connection)?;
-    match version {
+    match schema_meta_version(connection)? {
         Some(SCHEMA_VERSION) => {}
-        Some(1) => {
-            let transaction = rusqlite::Transaction::new_unchecked(
-                connection,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            transaction.execute_batch(UPGRADE_1_TO_2_SQL)?;
-            transaction.execute_batch(CURRENT_INDEX_SQL)?;
-            validate_current_schema(&transaction)?;
-            transaction.commit()?;
-        }
         found => {
             return Err(StoreError::UnsupportedSchema {
                 found: found.unwrap_or(0),

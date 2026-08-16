@@ -4,13 +4,12 @@ use super::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// 会话索引状态：最近一次 turn 的状态。`Idle` 表示尚无 turn 可展示（新会话，
-/// 或迁移时终态未知）；`Active` 仅在 turn 真正运行期间写入，读取侧需要结合
-/// 存活 turn 判定，崩溃遗留的 `Active` 由消费方投影为终态而不是回写索引。
+/// 会话索引状态：最近一次 turn 的状态。`None` 表示尚无 turn（新会话或迁移
+/// 时终态未知）；`Active` 仅在 turn 真正运行期间写入，读取侧需要结合存活
+/// turn 判定，崩溃遗留的 `Active` 由消费方投影为终态而不是回写索引。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
-    Idle,
     Active,
     Completed,
     Failed,
@@ -20,7 +19,6 @@ pub enum SessionStatus {
 impl SessionStatus {
     pub const fn as_storage_text(self) -> &'static str {
         match self {
-            Self::Idle => "idle",
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -30,7 +28,6 @@ impl SessionStatus {
 
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
-            "idle" => Some(Self::Idle),
             "active" => Some(Self::Active),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
@@ -48,7 +45,7 @@ pub struct SessionRecord {
     pub cwd: String,
     pub title: Option<String>,
     pub model: Option<String>,
-    pub status: SessionStatus,
+    pub status: Option<SessionStatus>,
     pub created_at: String,
     pub updated_at: String,
     pub token_usage: Value,
@@ -76,7 +73,7 @@ impl SessionStore {
                 record.cwd,
                 record.title,
                 record.model,
-                record.status.as_storage_text(),
+                record.status.map(|status| status.as_storage_text()),
                 record.created_at,
                 record.updated_at,
                 serde_json::to_string(&record.token_usage)?,
@@ -154,7 +151,7 @@ impl SessionStore {
             Some(model) => model,
             None => current.model.as_deref(),
         };
-        let status = update.status.unwrap_or(current.status);
+        let status = update.status.or(current.status);
         let token_usage = update.token_usage.unwrap_or(&current.token_usage);
         let updated_at = now_iso();
         transaction.execute(
@@ -165,7 +162,7 @@ impl SessionStore {
             params![
                 title,
                 model,
-                status.as_storage_text(),
+                status.map(|status| status.as_storage_text()),
                 updated_at,
                 serde_json::to_string(token_usage)?,
                 session_id,
@@ -187,17 +184,20 @@ impl SessionStore {
     }
 
     fn session_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-        let status: String = row.get(5)?;
+        let status: Option<String> = row.get(5)?;
         let token_usage: String = row.get(8)?;
-        let status = SessionStatus::from_storage_text(&status).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(StoreError::InvalidState(format!(
-                    "unknown session status database value {status:?}"
-                ))),
-            )
-        })?;
+        let status = match status.as_deref() {
+            None => None,
+            Some(value) => Some(SessionStatus::from_storage_text(value).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(StoreError::InvalidState(format!(
+                        "unknown session status database value {value:?}"
+                    ))),
+                )
+            })?),
+        };
         Ok(SessionRecord {
             session_id: row.get(0)?,
             rollout_path: row.get(1)?,

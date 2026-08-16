@@ -46,7 +46,8 @@ fn session_index_crud_round_trips_metadata() {
         cwd: dir.path().to_string_lossy().to_string(),
         title: Some("first task".to_string()),
         model: Some("provider/model".to_string()),
-        status: SessionStatus::Completed,
+        // 尚无 turn：null status 必须原样往返，不伪装成任何持久化状态。
+        status: None,
         created_at: "2026-08-15T00:00:00Z".to_string(),
         updated_at: "2026-08-15T00:01:00Z".to_string(),
         token_usage: serde_json::json!({"input_tokens": 12, "output_tokens": 3}),
@@ -66,7 +67,7 @@ fn session_index_crud_round_trips_metadata() {
             },
         )
         .expect("update session");
-    assert_eq!(updated.status, SessionStatus::Failed);
+    assert_eq!(updated.status, Some(SessionStatus::Failed));
     assert_eq!(updated.title.as_deref(), Some("renamed"));
 
     store
@@ -130,68 +131,4 @@ fn windows_file_identity_rejects_hard_links() {
         error,
         StoreError::InvalidState(message) if message.contains("hard links")
     ));
-}
-
-#[test]
-fn v1_session_index_upgrades_in_place_and_accepts_idle() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("index.sqlite3");
-    {
-        let legacy = rusqlite::Connection::open(&path).expect("create v1 store");
-        legacy
-            .execute_batch(
-                r#"
-                create table schema_meta(schema_version integer not null check(schema_version = 1));
-                create table schema_migrations(migration_id text primary key, applied_at text not null default current_timestamp);
-                create table session_index(
-                    session_id text primary key,
-                    rollout_path text not null,
-                    cwd text not null,
-                    title text,
-                    model text,
-                    status text not null check(status in ('active', 'completed', 'failed', 'interrupted')),
-                    created_at text not null,
-                    updated_at text not null,
-                    token_usage text not null
-                );
-                create index session_index_updated_at on session_index(updated_at);
-                create index session_index_cwd on session_index(cwd);
-                insert into schema_meta(schema_version) values(1);
-                insert into schema_migrations(migration_id) values('0001_session_index');
-                insert into session_index values(
-                    'legacy-session', 'rollout.jsonl', 'cwd', 'legacy title', null,
-                    'completed', '2026-08-15T00:00:00Z', '2026-08-15T00:01:00Z', '{}');
-                "#,
-            )
-            .expect("seed v1 schema");
-    }
-    let store = SessionStore::open(&path).expect("open and upgrade v1 store");
-
-    let legacy = store
-        .get_session("legacy-session")
-        .expect("legacy row survives upgrade");
-    assert_eq!(legacy.status, SessionStatus::Completed);
-    assert_eq!(legacy.title.as_deref(), Some("legacy title"));
-
-    let idle = SessionRecord {
-        session_id: "idle-session".to_string(),
-        rollout_path: "rollout-idle.jsonl".to_string(),
-        cwd: dir.path().to_string_lossy().to_string(),
-        title: None,
-        model: None,
-        status: SessionStatus::Idle,
-        created_at: now_iso(),
-        updated_at: now_iso(),
-        token_usage: serde_json::json!({}),
-    };
-    store
-        .insert_session(&idle)
-        .expect("idle inserts after upgrade");
-    assert_eq!(
-        store.get_session("idle-session").expect("read idle").status,
-        SessionStatus::Idle
-    );
-    // 升级幂等：重开已升级库不再触发迁移路径。
-    drop(store);
-    SessionStore::open(&path).expect("reopen upgraded store");
 }

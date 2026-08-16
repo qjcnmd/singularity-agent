@@ -215,7 +215,8 @@ impl AppServer {
             cwd: cwd.clone(),
             title: None,
             model: model.clone(),
-            status: SessionStatus::Idle,
+            // 尚无 turn：status 为 null，首个 turn 真正开始时才写入。
+            status: None,
             created_at: created_at.clone(),
             updated_at: created_at,
             token_usage: json!({}),
@@ -273,6 +274,12 @@ impl AppServer {
             .iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
+        // 与 thread/list、thread/resume 复用同一 last-turn 投影，
+        // 三个读取接口不得显示互相矛盾的状态。
+        let status = self
+            .project_thread(&record)
+            .last_turn_status
+            .map(|status| status.as_storage_text().to_string());
         json_response(
             message.required_id(),
             SessionReadResult {
@@ -280,7 +287,7 @@ impl AppServer {
                 cwd: record.cwd,
                 title: record.title,
                 model: record.model,
-                status: record.status.as_storage_text().to_string(),
+                status,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 token_usage: record.token_usage,

@@ -151,7 +151,7 @@ flowchart TD
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
 - 恢复：重开文件 → 逐行解析 + 版本迁移 → `repair_orphaned_tool_calls`（有 tool_call_id 但无后续 ToolResult 的 assistant 条目，追加 synthetic failed ToolResult：`[previous execution outcome unknown; do not retry]`；不重写/删除原条目、绝不重新执行工具）→ `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
 - 事件条目不进 context（custom / label / model_change / thinking_level_change / session_info 只作树内记录）。
-- `session_index.status` 只表示 turn 状态：尚无 turn 时为 `idle`（协议投影为 null），turn 运行中为 active，终态为 completed/failed/interrupted；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。崩溃遗留的 active 行在读取侧投影为 interrupted（仅当本进程存在该会话的存活 turn 时才报告 active），读取不回写索引。
+- `session_index.status` 只表示 turn 状态：尚无 turn 时为 null（缺失值），turn 运行中为 active，终态为 completed/failed/interrupted；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。崩溃遗留的 active 行在读取侧投影为 interrupted（仅当本进程存在该会话的存活 turn 时才报告 active），读取不回写索引；`thread/list`、`thread/resume`、`session/read` 复用同一投影，不显示互相矛盾的状态。
 
 ```mermaid
 flowchart TD

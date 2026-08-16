@@ -395,11 +395,13 @@ pub fn thread_from_record(record: &SessionRecord) -> Thread {
         model: record.model.clone(),
         cwd: Some(record.cwd.clone()),
         last_turn_status: match record.status {
-            SessionStatus::Idle => None,
-            SessionStatus::Active => Some(singularity_protocol::ThreadStatus::Active),
-            SessionStatus::Completed => Some(singularity_protocol::ThreadStatus::Completed),
-            SessionStatus::Failed => Some(singularity_protocol::ThreadStatus::Failed),
-            SessionStatus::Interrupted => Some(singularity_protocol::ThreadStatus::Interrupted),
+            None => None,
+            Some(SessionStatus::Active) => Some(singularity_protocol::ThreadStatus::Active),
+            Some(SessionStatus::Completed) => Some(singularity_protocol::ThreadStatus::Completed),
+            Some(SessionStatus::Failed) => Some(singularity_protocol::ThreadStatus::Failed),
+            Some(SessionStatus::Interrupted) => {
+                Some(singularity_protocol::ThreadStatus::Interrupted)
+            }
         },
     }
 }
