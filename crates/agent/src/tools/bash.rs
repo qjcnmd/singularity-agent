@@ -73,7 +73,12 @@ pub(crate) fn parameters() -> Value {
         "type": "object",
         "properties": {
             "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (optional, defaults to 120000)" },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600000,
+                "description": "Timeout in milliseconds (optional, defaults to 120000)"
+            },
         },
         "required": ["command"],
         "additionalProperties": false,
@@ -99,11 +104,24 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return error_result("missing required parameter \"command\"");
     };
-    // 缺省时使用默认超时（信任边界安全网）；显式 0 拒绝。
-    let timeout = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    // 只有字段缺失才使用 DEFAULT_TIMEOUT_MS；字段存在但类型错误/越界
+    // 必须返回 typed argument error，不能静默回退默认值。
+    let timeout = match args.get("timeout_ms") {
+        None => DEFAULT_TIMEOUT_MS,
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(timeout) => timeout,
+            None => {
+                return error_result(format!(
+                    "invalid timeout_ms: must be an integer between 1 and {MAX_TIMEOUT_MS}"
+                ));
+            }
+        },
+        Some(_) => {
+            return error_result(format!(
+                "invalid timeout_ms: must be an integer between 1 and {MAX_TIMEOUT_MS}"
+            ));
+        }
+    };
     if timeout == 0 || timeout > MAX_TIMEOUT_MS {
         return error_result(format!(
             "invalid timeout_ms: must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
@@ -567,6 +585,51 @@ mod tests {
             "small output must not be truncated: {}",
             result.content
         );
+    }
+
+    #[test]
+    fn timeout_ms_lower_bound_is_accepted() {
+        let result = run("sleep 0.01", Some(1));
+        assert!(result.is_error, "1ms should time out");
+        assert!(
+            result.content.contains("timed out"),
+            "content: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn timeout_ms_upper_bound_is_accepted() {
+        let result = run("echo ok", Some(MAX_TIMEOUT_MS));
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(result.content.contains("ok"));
+    }
+
+    #[test]
+    fn timeout_ms_wrong_types_are_typed_errors() {
+        let dir = tempdir().expect("temp dir");
+        for bad in [
+            json!("120000"),
+            json!(1.5),
+            json!(-1),
+            json!(null),
+            json!(true),
+            json!({"ms": 1}),
+        ] {
+            let args = json!({"command": "echo should-not-run", "timeout_ms": bad});
+            let result = ToolRegistry::new()
+                .execute("bash", context(args, dir.path()))
+                .expect("execute");
+            assert!(result.is_error, "bad timeout {bad:?} was accepted");
+            assert!(
+                result.content.contains("timeout_ms")
+                    && (result.content.contains("invalid timeout_ms")
+                        || result.content.contains("must be of type integer")
+                        || result.content.contains("must be >= 1")),
+                "content: {}",
+                result.content
+            );
+        }
     }
 
     #[test]
