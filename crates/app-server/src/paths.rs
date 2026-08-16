@@ -2,7 +2,7 @@
 //! one-shot migration from legacy project-local `.singularity/agent-sessions/`.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -166,6 +166,7 @@ pub fn migrate_legacy_project_sessions(
             })?;
         let backup = backup_dir.join(source_name);
         copy_verified(source, &backup)?;
+        ensure_owner_only_file(&backup).map_err(|error| error.to_string())?;
         copy_verified(source, destination)?;
         ensure_owner_only_file(destination).map_err(|error| error.to_string())?;
 
@@ -288,13 +289,26 @@ fn read_legacy_header(
 }
 
 fn copy_verified(source: &Path, destination: &Path) -> Result<(), String> {
-    std::fs::copy(source, destination).map_err(|error| {
+    let mut source_file = File::open(source)
+        .map_err(|error| format!("failed to open copy source {}: {error}", source.display()))?;
+    let mut destination_file =
+        singularity_core::create_owner_only_file(destination).map_err(|error| {
+            format!(
+                "failed to create owner-only copy destination {}: {error}",
+                destination.display()
+            )
+        })?;
+    std::io::copy(&mut source_file, &mut destination_file).map_err(|error| {
         format!(
             "failed to copy {} to {}: {error}",
             source.display(),
             destination.display()
         )
     })?;
+    destination_file
+        .flush()
+        .map_err(|error| format!("failed to flush {}: {error}", destination.display()))?;
+    drop(destination_file);
     let source_hash = hash_file(source)?;
     let destination_hash = hash_file(destination)?;
     if source_hash != destination_hash {

@@ -461,10 +461,7 @@ impl SessionManager {
             "timestamp": timestamp,
             "cwd": normalize_cwd_string(&cwd),
         });
-        let mut handle = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)?;
+        let mut handle = singularity_core::create_owner_only_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
         Ok(Self {

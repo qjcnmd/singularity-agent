@@ -69,7 +69,9 @@ fn session_index_crud_round_trips_metadata() {
     assert_eq!(updated.status, SessionStatus::Failed);
     assert_eq!(updated.title.as_deref(), Some("renamed"));
 
-    store.delete_session(&record.session_id).expect("delete session");
+    store
+        .delete_session(&record.session_id)
+        .expect("delete session");
     assert!(matches!(
         store.get_session(&record.session_id),
         Err(StoreError::NotFound(_))

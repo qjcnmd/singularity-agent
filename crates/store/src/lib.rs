@@ -37,3 +37,6 @@ pub use owner_only::{ensure_owner_only_dir, ensure_owner_only_file};
 pub use session_index::{SessionMetadataUpdate, SessionRecord, SessionStatus, now_iso};
 
 pub(crate) use file_identity::StoreIdentityGuard;
+
+#[cfg(test)]
+mod tests;

@@ -118,7 +118,11 @@ fn store_open_rejects_parent_symlinks() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&target, &link).expect("symlink");
+    match std::os::windows::fs::symlink_dir(&target, &link) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(1314) => return,
+        Err(error) => panic!("symlink: {error}"),
+    }
 
     let error = match SessionStore::open(link.join("index.sqlite3")) {
         Err(error) => error,

@@ -1,10 +1,14 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! 跨 crate 共享的 JSON-RPC 基础类型、敏感信息检测和 workspace 规则。
 
 mod cancellation;
 mod project_instructions;
 mod trust;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_owner_only;
 
 pub use cancellation::CancellationToken;
 pub use project_instructions::{
@@ -16,6 +20,26 @@ pub use project_instructions::{
 pub use trust::{
     DEFAULT_PROJECT_TRUST, TrustDecisions, TrustDefault, TrustResolution,
     has_project_trust_resource, resolve_project_trusted, user_singularity_home,
+};
+
+#[cfg(not(windows))]
+pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub use windows_owner_only::{
+    create_owner_only_file, ensure_owner_only_dir, ensure_owner_only_file,
+    ensure_owner_only_handle, set_owner_only_dacl_handle, set_owner_only_handle,
 };
 
 use std::fmt::{Display, Formatter};
