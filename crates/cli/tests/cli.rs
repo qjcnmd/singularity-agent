@@ -661,6 +661,9 @@ fn cli_prefers_sibling_app_server_over_path_lookup() {
         .env_remove(APP_SERVER_BIN_ENV)
         .env(APP_SERVER_DB_ENV, &db_path)
         .env("PATH", path)
+        // 真实 app-server 即使使用显式 DB，启动时仍会 resolve/prepare
+        // SINGULARITY_HOME；测试必须隔离，绝不能触碰真实用户凭据/索引。
+        .env("SINGULARITY_HOME", temp.path().join("home"))
         .output()
         .expect("doctor cli");
 

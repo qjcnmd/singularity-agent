@@ -179,10 +179,15 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     initialize(&mut server);
 
     let started = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{{"cwd":"{0}"}}}}"#,
-            workspace.to_string_lossy()
-        ))
+        .handle_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "thread/start",
+                "id": 2,
+                "params": {"cwd": workspace},
+            })
+            .to_string(),
+        )
         .expect("thread start");
     let session_id = started[1]["result"]["thread"]["thread_id"]
         .as_str()
@@ -324,11 +329,14 @@ fn migration_refuses_non_empty_legacy_sqlite() {
         .expect("legacy data");
     drop(connection);
 
+    // AppPaths home 必须与 workspace 分离：Windows owner-only 收紧会把 home
+    // 目录 ACL 改为显式单 ACE，若复用同一临时根目录会影响测试 workspace 读取。
+    let home = temp.path().join("home");
     let paths = crate::paths::AppPaths {
-        home_dir: temp.path().to_path_buf(),
-        index_path: temp.path().join("index.sqlite3"),
-        sessions_dir: temp.path().join("sessions"),
-        backups_dir: temp.path().join("backups"),
+        home_dir: home.clone(),
+        index_path: home.join("index.sqlite3"),
+        sessions_dir: home.join("sessions"),
+        backups_dir: home.join("backups"),
     };
     paths.prepare().expect("paths");
     let store = SessionStore::open(&paths.index_path).expect("store");
@@ -363,11 +371,13 @@ fn migration_is_idempotent_when_destination_or_index_already_exists() {
         .expect("empty schema");
     drop(connection);
 
+    // AppPaths home 与 workspace 分离（Windows owner-only ACL 收紧，理由同上）。
+    let home = temp.path().join("home");
     let paths = crate::paths::AppPaths {
-        home_dir: temp.path().to_path_buf(),
-        index_path: temp.path().join("index.sqlite3"),
-        sessions_dir: temp.path().join("sessions"),
-        backups_dir: temp.path().join("backups"),
+        home_dir: home.clone(),
+        index_path: home.join("index.sqlite3"),
+        sessions_dir: home.join("sessions"),
+        backups_dir: home.join("backups"),
     };
     paths.prepare().expect("paths");
     let store = SessionStore::open(&paths.index_path).expect("store");
