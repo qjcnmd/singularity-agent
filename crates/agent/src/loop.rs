@@ -484,17 +484,31 @@ impl Agent {
         tools: &[ModelToolSchema],
         max_output_tokens: u32,
     ) -> Result<u64> {
+        let estimate = |text: &str| self.compaction.estimate_tokens(text);
         let instruction_tokens = instruction_message(capabilities, &self.config.system_prompt)
-            .map(|message| self.compaction.estimate_tokens(&message.content))
+            .map(|message| estimate(&message.content))
             .unwrap_or(0);
         let messages = self.session.build_session_context()?.messages;
+        // 预算必须覆盖最终 wire 请求：除 content 外，provider 还会重放每条
+        // tool 消息的 tool_call_id 与 assistant tool_calls 的 id/name/raw_arguments。
         let message_tokens = messages
             .iter()
-            .map(|message| self.compaction.estimate_tokens(&message.content))
+            .map(|message| {
+                let mut tokens = estimate(&message.content);
+                if let Some(tool_call_id) = &message.tool_call_id {
+                    tokens = tokens.saturating_add(estimate(tool_call_id));
+                }
+                for call in &message.tool_calls {
+                    tokens = tokens
+                        .saturating_add(estimate(&call.tool_call_id))
+                        .saturating_add(estimate(&call.tool_name))
+                        .saturating_add(estimate(&call.raw_arguments));
+                }
+                tokens
+            })
             .sum::<u64>();
-        let tool_tokens = self
-            .compaction
-            .estimate_tokens(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        let tool_tokens =
+            estimate(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
         Ok(instruction_tokens
             .saturating_add(message_tokens)
             .saturating_add(tool_tokens)
@@ -2233,6 +2247,72 @@ mod tests {
                 .iter()
                 .all(|request| request.request_id.starts_with("compaction-")),
             "no normal turn request may be sent: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_budgets_historical_tool_call_raw_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        // 历史 tool call：content 很小，raw_arguments 巨大。content-only 预算
+        // 看不见它，但 provider 会按 wire 重放 id/name/raw_arguments。
+        let big_arguments = "x".repeat(20_000);
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "call write".to_string(),
+                tool_call_id: Some("call_big_1".to_string()),
+                tool_name: Some("write".to_string()),
+                args: Some(json!({ "path": "big.txt", "content": big_arguments })),
+                timestamp: None,
+            })
+            .unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::ToolResult,
+                content: "wrote".to_string(),
+                tool_call_id: Some("call_big_1".to_string()),
+                tool_name: Some("write".to_string()),
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let provider = Arc::new(FakeProvider::new(
+            fake_contract(),
+            vec![
+                FakeStep {
+                    text: "summary".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(0, 0),
+                },
+                FakeStep {
+                    text: "never sent".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(0, 0),
+                },
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig {
+                context_window: 3000,
+                max_output_tokens: 1,
+                ..AgentConfig::default()
+            },
+            session,
+        )
+        .unwrap();
+        let error = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .expect_err("large tool-call arguments must be budgeted before the request");
+        assert!(error.to_string().contains("still exceeds window"));
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.request_id.starts_with("compaction-")),
+            "no normal turn request may carry un-budgeted tool arguments: {requests:?}"
         );
     }
 
