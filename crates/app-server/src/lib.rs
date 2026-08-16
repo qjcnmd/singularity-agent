@@ -391,7 +391,12 @@ pub fn thread_from_record(record: &SessionRecord) -> Thread {
         thread_id: record.session_id.clone(),
         model: record.model.clone(),
         cwd: Some(record.cwd.clone()),
-        status: singularity_protocol::ThreadStatus::Active,
+        last_turn_status: match record.status {
+            SessionStatus::Active => singularity_protocol::ThreadStatus::Active,
+            SessionStatus::Completed => singularity_protocol::ThreadStatus::Completed,
+            SessionStatus::Failed => singularity_protocol::ThreadStatus::Failed,
+            SessionStatus::Interrupted => singularity_protocol::ThreadStatus::Interrupted,
+        },
     }
 }
 

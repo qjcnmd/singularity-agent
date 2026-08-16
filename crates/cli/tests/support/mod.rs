@@ -222,7 +222,7 @@ pub fn agent_loop_capability(
 
 /// 构造测试用 thread 对象。
 pub fn thread(thread_id: &str) -> Value {
-    json!({"thread_id": thread_id, "model": null, "cwd": null, "status": "active"})
+    json!({"thread_id": thread_id, "model": null, "cwd": null, "lastTurnStatus": "active"})
 }
 
 /// 构造测试用 turn 对象。

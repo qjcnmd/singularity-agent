@@ -616,30 +616,44 @@ pub struct SessionDeleteResult {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// 持久化 thread（session）的公开摘要。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: Option<String>,
-    pub status: ThreadStatus,
+    /// 最近一次/当前一次 turn 的展示元数据，来自 `session_index.status`。
+    /// `sg continue` 不受此字段限制。
+    #[serde(rename = "lastTurnStatus")]
+    pub last_turn_status: ThreadStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-/// thread/session 的生命周期状态；归档命令已删除，当前只存在 Active。
+/// `session_index.status` 的协议投影：最近一次/当前一次 turn 的状态。
 pub enum ThreadStatus {
     Active,
+    Completed,
+    Failed,
+    Interrupted,
 }
 
 impl ThreadStatus {
     pub const fn as_storage_text(&self) -> &'static str {
-        "active"
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
     }
 
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
             "active" => Some(Self::Active),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
             _ => None,
         }
     }

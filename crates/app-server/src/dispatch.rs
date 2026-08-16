@@ -176,14 +176,13 @@ impl AppServer {
         if session.path() != Path::new(&record.rollout_path) {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
-        let thread = thread_from_record(&self.store.update_session(
-            &params.thread_id,
-            SessionMetadataUpdate {
-                status: Some(SessionStatus::Active),
-                ..SessionMetadataUpdate::default()
+        // resume 只打开并校验会话；status 只由 turn 真正开始/终止时修改。
+        json_response(
+            message.required_id(),
+            ThreadResult {
+                thread: thread_from_record(&record),
             },
-        )?);
-        json_response(message.required_id(), ThreadResult { thread })
+        )
     }
 
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {

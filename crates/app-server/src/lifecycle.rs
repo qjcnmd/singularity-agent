@@ -62,15 +62,15 @@ impl AppServer {
         let turn_id = turn_id();
         let (cancellation, _active_turn) = self.activate_turn(&turn_id, &record.session_id)?;
         let title = title_from_input(&input_text);
+        let mut metadata = SessionMetadataUpdate {
+            status: Some(SessionStatus::Active),
+            ..SessionMetadataUpdate::default()
+        };
         if record.title.is_none() && !title.is_empty() {
-            self.store.update_session(
-                &record.session_id,
-                SessionMetadataUpdate {
-                    title: Some(Some(&title)),
-                    ..SessionMetadataUpdate::default()
-                },
-            )?;
+            metadata.title = Some(Some(&title));
         }
+        // turn 真正开始后才把索引切到 active；resume 不提前制造 active。
+        self.store.update_session(&record.session_id, metadata)?;
         let turn = Turn {
             turn_id: turn_id.clone(),
             thread_id: record.session_id.clone(),

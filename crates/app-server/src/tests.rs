@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use singularity_agent::session::SessionManager;
 use singularity_model::{
-    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderError, ProviderProtocolContract,
+    ModelError, ModelErrorKind, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
+    ModelTurnResponse, ModelTurnStatus, Provider, ProviderError, ProviderProtocolContract,
 };
 
 fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
@@ -143,6 +143,152 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     assert_eq!(record.title.as_deref(), Some("write hello.txt"));
     let session = SessionManager::open_existing(&rollout).expect("session");
     assert_eq!(session.session_id(), session_id);
+}
+
+fn failed_response() -> ModelTurnResponse {
+    let mut response = ModelTurnResponse::completed("failed_request", "failed_response", "unused");
+    response.status = ModelTurnStatus::Failed;
+    response.assistant_message = None;
+    response.error = Some(ModelError::new(
+        ModelErrorKind::UnknownProviderError,
+        "synthetic failure",
+    ));
+    response
+}
+
+fn completed_response(id: &str) -> ModelTurnResponse {
+    ModelTurnResponse::completed(id, id, "done")
+}
+
+#[test]
+fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let provider = StaticProvider {
+        responses: vec![
+            completed_response("first"),
+            failed_response(),
+            completed_response("third"),
+        ],
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+
+    let started = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{{"cwd":"{0}"}}}}"#,
+            workspace.to_string_lossy()
+        ))
+        .expect("thread start");
+    let session_id = started[1]["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert_eq!(started[1]["result"]["thread"]["lastTurnStatus"], "active");
+    assert_eq!(
+        server
+            .store()
+            .get_session(&session_id)
+            .expect("record")
+            .status,
+        SessionStatus::Active
+    );
+
+    // completed → continue 必须保持 completed，不提前置 active。
+    let first = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"first"}}]}}}}"#
+        ))
+        .expect("first turn");
+    assert_eq!(
+        first.iter().find(|m| m["id"] == 3).expect("response")["result"]["turn"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        server
+            .store()
+            .get_session(&session_id)
+            .expect("record")
+            .status,
+        SessionStatus::Completed
+    );
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":4,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume completed");
+    assert_eq!(
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "completed"
+    );
+    assert_eq!(
+        server
+            .store()
+            .get_session(&session_id)
+            .expect("record")
+            .status,
+        SessionStatus::Completed
+    );
+
+    // 失败 turn 把展示状态变为 failed；随后仍可 continue。
+    let failed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"fail"}}]}}}}"#
+        ))
+        .expect_err("failed turn");
+    assert!(matches!(
+        &failed,
+        AppServerError::TurnExecution { original: Some(text), .. } if text.contains("synthetic failure")
+    ));
+    assert_eq!(
+        server
+            .store()
+            .get_session(&session_id)
+            .expect("record")
+            .status,
+        SessionStatus::Failed
+    );
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":6,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume failed");
+    assert_eq!(resumed[0]["result"]["thread"]["lastTurnStatus"], "failed");
+
+    let third = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":7,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"third"}}]}}}}"#
+        ))
+        .expect("third turn");
+    assert_eq!(
+        third.iter().find(|m| m["id"] == 7).expect("response")["result"]["turn"]["status"],
+        "completed"
+    );
+
+    // interrupted 也是纯展示状态，continue 不受限制。
+    server
+        .store()
+        .update_session(
+            &session_id,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Interrupted),
+                ..SessionMetadataUpdate::default()
+            },
+        )
+        .expect("set interrupted");
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":8,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume interrupted");
+    assert_eq!(
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "interrupted"
+    );
 }
 
 #[test]

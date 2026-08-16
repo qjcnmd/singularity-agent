@@ -687,7 +687,7 @@ impl AppServerClient {
             println!(
                 "{} {} {}",
                 thread.thread_id,
-                thread.status.as_storage_text(),
+                thread.last_turn_status.as_storage_text(),
                 thread.cwd.as_deref().unwrap_or("")
             );
         }

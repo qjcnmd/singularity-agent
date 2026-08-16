@@ -4,8 +4,8 @@ use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
     EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload, Method, MethodKind,
-    SessionReadParams, ThreadStartParams, TurnInjectionParams, TurnStartParams, TurnStatus,
-    parse_json_rpc_payload, rpc_methods,
+    SessionReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
+    TurnStatus, parse_json_rpc_payload, rpc_methods,
 };
 
 #[test]
@@ -152,6 +152,31 @@ fn json_rpc_payload_still_distinguishes_batches_at_parser_boundary() {
     )
     .expect("batch");
     assert!(matches!(mixed, JsonRpcPayload::Batch(items) if items.len() == 2));
+}
+
+#[test]
+fn thread_status_projects_last_turn_metadata_not_lifecycle() {
+    let thread = singularity_protocol::Thread {
+        thread_id: "session-1".to_string(),
+        model: None,
+        cwd: Some("/tmp/work".to_string()),
+        last_turn_status: ThreadStatus::Completed,
+    };
+    let wire = serde_json::to_value(&thread).expect("thread wire");
+    assert_eq!(wire["thread_id"], "session-1");
+    assert_eq!(wire["lastTurnStatus"], "completed");
+    for status in [
+        ThreadStatus::Active,
+        ThreadStatus::Completed,
+        ThreadStatus::Failed,
+        ThreadStatus::Interrupted,
+    ] {
+        assert_eq!(
+            ThreadStatus::from_storage_text(status.as_storage_text()),
+            Some(status)
+        );
+    }
+    assert_eq!(ThreadStatus::from_storage_text("archived"), None);
 }
 
 #[test]
