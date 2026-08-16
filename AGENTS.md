@@ -2,7 +2,7 @@
 
 ## 项目目标与设计基线
 
-Singularity 是一个可实际使用、可持续演进的 coding agent harness，当前以 CLI 为主要产品形态，后续计划支持桌面端。
+Singularity 的首要产品目标是成为一个像 Pi 一样能让模型可靠完成 coding task 的最小 harness；当前以 CLI 为主要产品形态，后续计划支持桌面端。
 
 当前核心架构与默认行为优先参考维护活跃、经过实际使用验证的主流 coding agent，主要以 Pi 的小核心、Agent Loop、Session、Context Compaction、Tool、Extension 和可嵌入能力作为基线；Codex CLI 等项目可作为辅助参考。
 
@@ -10,7 +10,9 @@ Singularity 是一个可实际使用、可持续演进的 coding agent harness�
 
 当 Singularity 没有明确的当前需求要求不同设计时，优先采用参考实现中更简单、成熟的方案。
 
-任何比参考基线明显更复杂的核心机制，都必须有当前真实消费者和明确必要性。未来可能需要的模型路由、多 Agent、任务图、自定义 Context 策略、额外工具、Sandbox、权限控制、插件或桌面能力，不作为提前增加核心复杂度的理由。
+可自定义性只要求当前的 Context Compaction、Tool、Context 组装、Provider 和事件机制各自保留一个职责清晰的可替换接缝，以及一个可工作的默认实现。没有第二个当前实现或真实消费者时，不增加策略层、通用插件协议、多实现注册框架、兼容包装或额外状态；需求出现后沿现有接缝替换或深化，而不是提前并列多套机制。
+
+任何比 Pi 基线明显更复杂的核心机制，都必须有当前真实消费者和明确必要性；“以后可自定义”本身不算当前消费者。未来可能需要的模型路由、多 Agent、任务图、自定义 Context 策略、额外工具、Sandbox、权限控制、插件或桌面能力，不作为提前增加核心复杂度的理由。
 
 核心能力保持 headless，并与具体 CLI、TUI 或未来 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。当前实现采用 headless core 库 + 薄 app-server（stdio JSON-RPC）+ 客户端经同一协议连接，配置为共享全局文件、会话为统一 JSONL 格式；这是当前事实，不是永久架构合同，改变进程边界需以当前证据和用户裁决为依据。
 
