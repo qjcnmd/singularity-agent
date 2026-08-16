@@ -21,15 +21,21 @@ use support::AppServerProcess;
 ///
 /// 正常路径逐个 accept 并写响应；app-server 出错或测试提前结束时没有
 /// 后续连接，worker 通过 stop 标志轮询有界退出，Drop 永不阻塞在 accept
-/// 或 join 上。worker 内部错误记录到 `errors` 保留原始原因，供测试断言。
+/// 或 join 上。accepted 连接带读写超时：客户端连接后不发或只发半个
+/// 请求时，worker 从阻塞读中有界脱出，不会把 Drop 卡死在 join 上。
+/// worker 内部错误记录到 `errors` 保留原始原因，供测试断言。
 struct ScriptedProvider {
     base_url: String,
+    address: std::net::SocketAddr,
     served: Receiver<usize>,
     requests: Arc<Mutex<Vec<Value>>>,
     errors: Arc<Mutex<Vec<String>>>,
     worker: Option<thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
+
+/// accepted 连接的单次读写时限。
+const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ScriptedProvider {
     fn start(responses: Vec<Value>) -> Self {
@@ -57,6 +63,7 @@ impl ScriptedProvider {
         });
         Self {
             base_url: format!("http://{address}/v1/responses"),
+            address,
             served: served_rx,
             requests,
             errors,
@@ -115,6 +122,15 @@ fn serve_script(
                 }
             }
         };
+        // 半个 header/body 后停住的客户端不能把 worker 永久卡在读/写里。
+        if let Err(error) = stream.set_read_timeout(Some(STREAM_TIMEOUT)) {
+            record_error(&errors, format!("set read timeout {index}"), error);
+            return;
+        }
+        if let Err(error) = stream.set_write_timeout(Some(STREAM_TIMEOUT)) {
+            record_error(&errors, format!("set write timeout {index}"), error);
+            return;
+        }
         let request = match read_http_json(&mut stream) {
             Ok(request) => request,
             Err(error) => {
@@ -275,7 +291,20 @@ fn assert_drop_is_bounded(provider: ScriptedProvider) {
 #[test]
 fn scripted_provider_drop_returns_without_any_connection() {
     assert_drop_is_bounded(ScriptedProvider::start(steer_responses()));
-    assert_drop_is_bounded(ScriptedProvider::start(interrupt_responses()));
+}
+
+/// 回归：客户端连接后只发送半个请求并停住；stop 标志无法中断阻塞读，
+/// worker 必须靠读写超时有界退出，Drop 的 join 不得永久等待。
+#[test]
+fn scripted_provider_drop_returns_after_half_request() {
+    let provider = ScriptedProvider::start(steer_responses());
+    let mut stream = TcpStream::connect(provider.address).expect("connect half request");
+    stream
+        .write_all(b"POST /v1/responses HTTP/1.1\r\ncontent-le")
+        .expect("half header");
+    stream.flush().expect("flush half header");
+    // 连接保持打开但不完成 header/body。
+    assert_drop_is_bounded(provider);
 }
 
 #[test]
