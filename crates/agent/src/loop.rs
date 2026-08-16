@@ -130,6 +130,26 @@ pub struct AgentOutcome {
 /// （app-server turn/input）在 `run` 期间向队列注入消息；`run` 每轮开始时 drain。
 pub type SteerHandle = Arc<Mutex<VecDeque<String>>>;
 
+/// 按 provider 声明把系统/开发者指令投影为请求首条消息。
+///
+/// compaction 与普通请求共用同一 seam：supports developer → Developer；
+/// 否则 supports system → System；两者都不支持时投影为 user 前缀。
+pub(crate) fn instruction_message(
+    capabilities: &ProviderProtocolContract,
+    instruction: &str,
+) -> Option<ModelMessage> {
+    if instruction.is_empty() {
+        return None;
+    }
+    if capabilities.supports_developer_message {
+        Some(ModelMessage::text(ModelRole::Developer, instruction))
+    } else if capabilities.supports_system_message {
+        Some(ModelMessage::text(ModelRole::System, instruction))
+    } else {
+        Some(ModelMessage::text(ModelRole::User, instruction))
+    }
+}
+
 /// 新 headless core 的 Agent：会话 + compaction + 工具注册表 + 模型提供方。
 pub struct Agent {
     session: SessionManager,
@@ -201,6 +221,7 @@ impl Agent {
         };
         // 本轮失败的瞬时类重试计数；成功时（`outcome.turns += 1` 处）归零，重试不递增 turns。
         let mut attempts = 0u32;
+        let mut context_overflow_retried = false;
         self.session.append_message(user_message(input))?;
 
         let mut preferences = ModelPreferences::default();
@@ -248,6 +269,12 @@ impl Agent {
                 for text in steer_messages {
                     self.session.append_message(user_message(&text))?;
                 }
+                self.compact_before_request(
+                    &capabilities,
+                    &tools,
+                    max_output_tokens,
+                    cancellation,
+                )?;
                 let request = self.build_request(
                     &preferences,
                     &capabilities,
@@ -256,7 +283,18 @@ impl Agent {
                     max_output_tokens,
                     outcome.turns,
                 )?;
-                let response = self.stream_completion(&request, events, cancellation)?;
+                let response = match self.stream_completion(&request, events, cancellation) {
+                    Ok(response) => response,
+                    Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
+                        if context_overflow_retried {
+                            return Err(AgentError::Provider(error));
+                        }
+                        context_overflow_retried = true;
+                        self.force_compact(cancellation)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 // 模型调用整体失败（传输层重试已耗尽）：按瞬时类做运行级重试。
                 // 重试是同一轮模型的重新请求，不递增 outcome.turns，也不计入 usage。
                 if response.status != ModelTurnStatus::Success {
@@ -266,6 +304,17 @@ impl Agent {
                             "unknown provider error",
                         )
                     });
+                    if is_context_overflow_error(&model_error) {
+                        if context_overflow_retried {
+                            return Err(AgentError::Loop(format!(
+                                "model turn failed: {}",
+                                model_error.message
+                            )));
+                        }
+                        context_overflow_retried = true;
+                        self.force_compact(cancellation)?;
+                        continue;
+                    }
                     // 仅 `Failed` 状态且判定为瞬时类才重试；`Invalid`（校验失败）不重试。
                     let retryable = response.status == ModelTurnStatus::Failed
                         && is_retryable_run_error(&model_error);
@@ -291,6 +340,7 @@ impl Agent {
                 }
                 outcome.turns += 1;
                 attempts = 0;
+                context_overflow_retried = false;
                 aggregate_usage(&mut outcome.usage, &response.usage);
                 let assistant_text = response
                     .assistant_message
@@ -380,6 +430,78 @@ impl Agent {
         }
     }
 
+    /// 每轮模型请求前的 compaction preflight：把 system/developer 指令、会话
+    /// 消息、tool schema 和 max output reserve 都计入预算；超窗则先强制 compact。
+    fn compact_before_request(
+        &mut self,
+        capabilities: &ProviderProtocolContract,
+        tools: &[ModelToolSchema],
+        max_output_tokens: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let estimated = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
+        if estimated <= self.config.context_window {
+            return Ok(());
+        }
+        let budget = CompactionBudget {
+            context_window: self.config.context_window,
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+        };
+        let context_tokens = self.estimate_context_tokens(None)?;
+        self.compaction
+            .compact(&mut self.session, &budget, context_tokens, cancellation)?;
+        let after = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
+        if after > self.config.context_window {
+            return Err(AgentError::Loop(format!(
+                "request context still exceeds window after compaction (estimated {after} > {})",
+                self.config.context_window
+            )));
+        }
+        Ok(())
+    }
+
+    /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
+    ///
+    /// overflow 时不能保留正常 20000-token 近期窗口；强制路径把 keep/recent
+    /// reserve 都压到 0，只保留绝对必要的最近安全边界（toolResult 永不切）。
+    fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<()> {
+        let budget = CompactionBudget {
+            context_window: self.config.context_window,
+            reserve_tokens: 0,
+            keep_recent_tokens: 0,
+        };
+        // 强制路径不受 should_compact 的窗口判定限制；usage_or_estimate 传
+        // u64::MAX 使 compact 进入真正的摘要/切点流程。
+        self.compaction
+            .compact(&mut self.session, &budget, u64::MAX, cancellation)?;
+        Ok(())
+    }
+
+    fn estimated_request_tokens(
+        &self,
+        capabilities: &ProviderProtocolContract,
+        tools: &[ModelToolSchema],
+        max_output_tokens: u32,
+    ) -> Result<u64> {
+        let instruction_tokens = instruction_message(capabilities, &self.config.system_prompt)
+            .map(|message| self.compaction.estimate_tokens(&message.content))
+            .unwrap_or(0);
+        let messages = self.session.build_session_context()?.messages;
+        let message_tokens = messages
+            .iter()
+            .map(|message| self.compaction.estimate_tokens(&message.content))
+            .sum::<u64>();
+        let tool_tokens = self
+            .compaction
+            .estimate_tokens(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        Ok(instruction_tokens
+            .saturating_add(message_tokens)
+            .saturating_add(tool_tokens)
+            .saturating_add(max_output_tokens as u64)
+            .saturating_add(32))
+    }
+
     /// 组装单轮 provider 请求：system prompt（按能力选择 developer/system 角色，
     /// 均不支持时以 user 前缀注入）+ 会话历史（compaction 感知）。
     fn build_request(
@@ -391,25 +513,9 @@ impl Agent {
         max_output_tokens: u32,
         turn: u32,
     ) -> Result<ModelTurnRequest> {
-        let system_prompt_role = if capabilities.supports_developer_message {
-            Some(ModelRole::Developer)
-        } else if capabilities.supports_system_message {
-            Some(ModelRole::System)
-        } else {
-            None
-        };
         let mut messages = Vec::new();
-        match system_prompt_role {
-            Some(role) if !self.config.system_prompt.is_empty() => {
-                messages.push(ModelMessage::text(role, self.config.system_prompt.clone()));
-            }
-            None if !self.config.system_prompt.is_empty() => {
-                messages.push(ModelMessage::text(
-                    ModelRole::User,
-                    self.config.system_prompt.clone(),
-                ));
-            }
-            _ => {}
+        if let Some(instruction) = instruction_message(capabilities, &self.config.system_prompt) {
+            messages.push(instruction);
         }
         messages.extend(self.session.build_session_context()?.messages);
         let mut request = ModelTurnRequest::new(
@@ -567,6 +673,10 @@ fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecD
     queue
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn is_context_overflow_error(error: &ModelError) -> bool {
+    error.kind == ModelErrorKind::ContextLengthExceeded
 }
 
 /// 判断一次失败的模型 turn（`ModelTurnStatus::Failed`）是否应做运行级重试。
@@ -1792,9 +1902,9 @@ mod tests {
                         json!({ "path": "out.txt", "content": "x" }),
                     )],
                     usage: ModelUsage {
-                        input_tokens: 900,
-                        output_tokens: 100,
-                        total_tokens: 1000,
+                        input_tokens: 19_000,
+                        output_tokens: 1_000,
+                        total_tokens: 20_000,
                         cached_input_tokens: 0,
                         reasoning_tokens: 0,
                         cost_estimate: None,
@@ -1818,7 +1928,8 @@ mod tests {
             provider.clone(),
             ToolRegistry::new(),
             AgentConfig {
-                context_window: 100,
+                context_window: 30_000,
+                max_output_tokens: 1,
                 ..AgentConfig::default()
             },
             session,
@@ -1848,6 +1959,280 @@ mod tests {
             context.messages[0]
                 .content
                 .starts_with(crate::message::COMPACTION_SUMMARY_PREFIX)
+        );
+    }
+
+    #[test]
+    fn instruction_message_adapts_to_provider_roles() {
+        let developer = ProviderProtocolContract {
+            supports_developer_message: true,
+            supports_system_message: true,
+            ..ProviderProtocolContract::default()
+        };
+        let system = ProviderProtocolContract {
+            supports_developer_message: false,
+            supports_system_message: true,
+            ..ProviderProtocolContract::default()
+        };
+        let neither = ProviderProtocolContract {
+            supports_developer_message: false,
+            supports_system_message: false,
+            ..ProviderProtocolContract::default()
+        };
+        assert_eq!(
+            instruction_message(&developer, "x").unwrap().role,
+            ModelRole::Developer
+        );
+        assert_eq!(
+            instruction_message(&system, "x").unwrap().role,
+            ModelRole::System
+        );
+        assert_eq!(
+            instruction_message(&neither, "x").unwrap().role,
+            ModelRole::User
+        );
+        assert!(instruction_message(&developer, "").is_none());
+    }
+
+    struct OverflowProvider {
+        stream_calls: std::sync::atomic::AtomicUsize,
+        complete_calls: std::sync::atomic::AtomicUsize,
+        overflow_times: usize,
+        contract: ProviderProtocolContract,
+    }
+
+    impl Provider for OverflowProvider {
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            self.contract.clone()
+        }
+
+        fn streaming_capability(
+            &self,
+            _selected_protocol: singularity_model::ProviderApiProtocol,
+        ) -> ProviderStreamingCapability {
+            ProviderStreamingCapability::OutputTextDelta
+        }
+
+        fn complete_stream(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+            _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+            let call = self
+                .stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.overflow_times {
+                return Err(ProviderError::from_model_error(ModelError::new(
+                    ModelErrorKind::ContextLengthExceeded,
+                    "context window overflow",
+                )));
+            }
+            let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+            assistant.content = "done after compact".to_string();
+            Ok(ModelTurnResponse {
+                request_id: request.request_id.clone(),
+                response_id: "overflow-ok".to_string(),
+                status: ModelTurnStatus::Success,
+                assistant_message: Some(assistant),
+                tool_calls: Vec::new(),
+                usage: ModelUsage::default(),
+                finish_reason: Some("stop".to_string()),
+                validation: None,
+                error: None,
+                provider_name: Some("overflow".to_string()),
+                model_name: Some("overflow-model".to_string()),
+                provider_attempt_metadata: None,
+                provider_reasoning_history: Vec::new(),
+            })
+        }
+
+        fn complete(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+        ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+            self.complete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+            assistant.content = "## Goal\ncompacted".to_string();
+            Ok(ModelTurnResponse {
+                request_id: request.request_id.clone(),
+                response_id: "compaction-ok".to_string(),
+                status: ModelTurnStatus::Success,
+                assistant_message: Some(assistant),
+                tool_calls: Vec::new(),
+                usage: ModelUsage::default(),
+                finish_reason: Some("stop".to_string()),
+                validation: None,
+                error: None,
+                provider_name: Some("overflow".to_string()),
+                model_name: Some("overflow-model".to_string()),
+                provider_attempt_metadata: None,
+                provider_reasoning_history: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn context_overflow_forces_one_compaction_retry_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::User,
+                content: "old user".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "old assistant".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let provider = Arc::new(OverflowProvider {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            complete_calls: std::sync::atomic::AtomicUsize::new(0),
+            overflow_times: 1,
+            contract: fake_contract(),
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let outcome = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.final_text, "done after compact");
+        assert_eq!(
+            provider
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            provider
+                .complete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            agent
+                .session
+                .build_context_entries()
+                .unwrap()
+                .iter()
+                .any(|entry| matches!(entry.entry_type, SessionEntryType::Compaction(_)))
+        );
+    }
+
+    #[test]
+    fn second_context_overflow_fails_without_retrying_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::User,
+                content: "old user".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "old assistant".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let provider = Arc::new(OverflowProvider {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            complete_calls: std::sync::atomic::AtomicUsize::new(0),
+            overflow_times: 2,
+            contract: fake_contract(),
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let error = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .expect_err("second overflow fails");
+        assert!(error.to_string().contains("context window overflow"));
+        assert_eq!(
+            provider
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            provider
+                .complete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn preflight_compacts_before_first_normal_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let provider = Arc::new(FakeProvider::new(
+            fake_contract(),
+            vec![
+                FakeStep {
+                    text: "summary".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(0, 0),
+                },
+                FakeStep {
+                    text: "never sent".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(0, 0),
+                },
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig {
+                context_window: 500,
+                max_output_tokens: 1,
+                ..AgentConfig::default()
+            },
+            session,
+        )
+        .unwrap();
+        let error = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .expect_err("request does not fit even after compaction");
+        assert!(error.to_string().contains("still exceeds window"));
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.request_id.starts_with("compaction-")),
+            "no normal turn request may be sent: {requests:?}"
         );
     }
 

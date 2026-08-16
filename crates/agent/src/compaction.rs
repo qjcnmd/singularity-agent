@@ -555,7 +555,7 @@ impl CompactionEngine {
         )
     }
 
-    /// 单个摘要模型调用：system prompt + 组装后的 user prompt。
+    /// 单个摘要模型调用：与普通请求共用 role adaptation seam。
     ///
     /// 输出上限取 `reserve * fraction` 与调用方模型偏好上限的较小值（Pi 再与模型
     /// `maxTokens` 取小；本边界由 provider 侧校验兜底）。
@@ -576,10 +576,16 @@ impl CompactionEngine {
             Some(u32::try_from(from_reserve.min(cap)).unwrap_or(u32::MAX));
         let mut request = ModelTurnRequest::new(
             format!("compaction-{}", Uuid::now_v7()),
-            vec![
-                ModelMessage::text(ModelRole::System, SUMMARIZATION_SYSTEM_PROMPT),
-                ModelMessage::text(ModelRole::User, prompt_text),
-            ],
+            crate::agent::instruction_message(
+                &self.provider.protocol_contract(),
+                SUMMARIZATION_SYSTEM_PROMPT,
+            )
+            .into_iter()
+            .chain(std::iter::once(ModelMessage::text(
+                ModelRole::User,
+                prompt_text,
+            )))
+            .collect(),
         );
         request.model_preferences = preferences;
         let response = self.provider.complete(&request, cancellation)?;
@@ -1197,7 +1203,8 @@ mod tests {
             CompactionOutcome::NotNeeded
         );
 
-        // 摘要请求：1 次，system + user prompt，含 <conversation> 与初始 prompt，无 previous。
+        // 摘要请求：1 次，developer + user prompt（ProviderProtocolContract 默认支持
+        // developer），含 <conversation> 与初始 prompt，无 previous。
         let requests = mock.requests();
         assert_eq!(requests.len(), 1);
         let roles: Vec<ModelRole> = requests[0]
@@ -1205,7 +1212,7 @@ mod tests {
             .iter()
             .map(|m| m.role.clone())
             .collect();
-        assert_eq!(roles, vec![ModelRole::System, ModelRole::User]);
+        assert_eq!(roles, vec![ModelRole::Developer, ModelRole::User]);
         let prompt = &requests[0].messages[1].content;
         assert!(prompt.contains("<conversation>\n"));
         assert!(prompt.contains("Use this EXACT format:"));
