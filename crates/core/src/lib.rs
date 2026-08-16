@@ -39,7 +39,7 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
 #[cfg(windows)]
 pub use windows_owner_only::{
     create_owner_only_file, ensure_owner_only_dir, ensure_owner_only_file,
-    ensure_owner_only_handle, set_owner_only_dacl_handle, set_owner_only_handle,
+    ensure_owner_only_handle, set_owner_only_handle,
 };
 
 use std::fmt::{Display, Formatter};

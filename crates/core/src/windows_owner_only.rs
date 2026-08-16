@@ -3,6 +3,13 @@
 //! This is the single repository implementation for the model/store security
 //! layers. It pins one object by handle, verifies the current-user owner and a
 //! protected single-ACE DACL, and applies the same contract when repair is safe.
+//!
+//! The owner of an object is implicitly granted READ_CONTROL and WRITE_DAC by
+//! the access check even when the DACL does not name it, so tightening only
+//! ever writes the protected DACL through handles opened with those rights.
+//! WRITE_OWNER is never requested: the current user must already be the owner
+//! (it created the object), otherwise tightening fails closed instead of
+//! taking ownership of a foreign object.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -65,19 +72,14 @@ pub fn ensure_owner_only_handle(file: &File) -> io::Result<()> {
     result
 }
 
-/// Apply owner + protected owner-only DACL through the handle, then verify it.
+/// Apply the protected owner-only DACL through the handle, then verify it.
 ///
-/// The caller must open the handle with `WRITE_OWNER` and `WRITE_DAC`; the
-/// function itself never silently retries with another handle.
+/// The owner is never rewritten: the caller must have created the object (and
+/// therefore already owns it), and the handle must be opened with
+/// `READ_CONTROL|WRITE_DAC`, which the implicit owner rights always grant.
 pub fn set_owner_only_handle(file: &File) -> io::Result<()> {
-    apply_owner_only_security(file, true)?;
+    apply_owner_only_security(file)?;
     ensure_owner_only_handle(file)
-}
-
-/// Apply only the protected owner-only DACL; owner repair is done by the caller
-/// with a handle opened for owner access.
-pub fn set_owner_only_dacl_handle(file: &File) -> io::Result<()> {
-    apply_owner_only_security(file, false)
 }
 
 /// Create a new file already restricted to the owner-only contract.
@@ -86,12 +88,7 @@ pub fn create_owner_only_file(path: &Path) -> io::Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_GENERIC_READ
-                | FILE_GENERIC_WRITE
-                | DELETE
-                | READ_CONTROL
-                | WRITE_DAC
-                | WRITE_OWNER,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             CREATE_NEW,
@@ -107,51 +104,60 @@ pub fn create_owner_only_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Verify a file path, repairing an inherited/incorrect DACL when the current
-/// process can open the same object with `READ_CONTROL|WRITE_DAC|WRITE_OWNER`.
+/// Verify a file path, repairing an inherited/incorrect DACL in place.
+///
+/// Repair only touches the DACL and only when the object is already owned by
+/// the current user; a foreign-owned path fails closed.
 pub fn ensure_owner_only_file(path: &Path) -> io::Result<()> {
-    let verify = File::open(path)?;
+    ensure_owner_only_path(path, false)
+}
+
+/// Verify a directory path, repairing under the same owner contract as files.
+pub fn ensure_owner_only_dir(path: &Path) -> io::Result<()> {
+    ensure_owner_only_path(path, true)
+}
+
+fn ensure_owner_only_path(path: &Path, directory: bool) -> io::Result<()> {
+    // 先用读类权限验证：与旧实现的 File::open 语义一致，被独占持有
+    // （share_mode(0)）的路径在验证阶段即 fail closed。
+    let verify = open_security_path(path, directory, FILE_GENERIC_READ)
+        .map_err(|error| io::Error::other(format!("verify {path:?}: {error}")))?;
     if ensure_owner_only_handle(&verify).is_ok() {
         return Ok(());
     }
-    let repair = open_owner_repair_path(path, false).map_err(|error| {
-        io::Error::other(format!(
-            "open owner repair handle for {}: {error}",
+    let repair =
+        open_security_path(path, directory, READ_CONTROL | WRITE_DAC).map_err(|error| {
+            io::Error::other(format!(
+                "open owner repair handle for {}: {error}",
+                path.display()
+            ))
+        })?;
+    if !handle_owner_is_current_user(&verify)? {
+        return Err(io::Error::other(format!(
+            "path {} is owned by another user; refusing to tighten",
             path.display()
-        ))
-    })?;
+        )));
+    }
     set_owner_only_handle(&repair).map_err(|error| {
         io::Error::other(format!("set owner-only ACL on {}: {error}", path.display()))
-    })
-}
-
-/// Verify a directory path, repairing when the process can open the directory
-/// with the required security access.
-pub fn ensure_owner_only_dir(path: &Path) -> io::Result<()> {
-    let dir = open_owner_repair_path(path, true).map_err(|error| {
-        io::Error::other(format!(
-            "open owner repair handle for {}: {error}",
-            path.display()
-        ))
     })?;
-    if ensure_owner_only_handle(&dir).is_ok() {
-        return Ok(());
-    }
-    set_owner_only_handle(&dir).map_err(|error| {
-        io::Error::other(format!("set owner-only ACL on {}: {error}", path.display()))
-    })
+    ensure_owner_only_handle(&verify)
+        .map_err(|error| io::Error::other(format!("reverify {path:?}: {error}")))
 }
 
-fn open_owner_repair_path(path: &Path, directory: bool) -> io::Result<File> {
+/// Open the object pinned by `path` for security inspection/repair. The flags
+/// pin reparse points themselves instead of following them.
+fn open_security_path(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
-    if directory {
-        flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
-    }
+    let flags = if directory {
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    } else {
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+    };
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             OPEN_EXISTING,
@@ -165,7 +171,7 @@ fn open_owner_repair_path(path: &Path, directory: bool) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 
-fn apply_owner_only_security(file: &File, set_owner: bool) -> io::Result<()> {
+fn apply_owner_only_security(file: &File) -> io::Result<()> {
     let mut sid = current_user_sid()?;
     let owner_sid = sid.as_mut_ptr() as *mut c_void;
     let trustee = TRUSTEE_W {
@@ -197,19 +203,12 @@ fn apply_owner_only_security(file: &File, set_owner: bool) -> io::Result<()> {
         return Err(io::Error::other("owner-only ACL could not be created"));
     }
     let handle = file.as_raw_handle() as HANDLE;
-    let mut security_information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-    let owner = if set_owner {
-        security_information |= OWNER_SECURITY_INFORMATION;
-        owner_sid
-    } else {
-        null_mut()
-    };
     let status = unsafe {
         SetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
-            security_information,
-            owner,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
             null_mut(),
             dacl,
             null_mut(),
@@ -220,6 +219,35 @@ fn apply_owner_only_security(file: &File, set_owner: bool) -> io::Result<()> {
         return Err(io::Error::other("owner-only ACL could not be applied"));
     }
     Ok(())
+}
+
+/// 读取 handle 固定对象的 owner SID 并与当前进程用户比较。
+fn handle_owner_is_current_user(file: &File) -> io::Result<bool> {
+    let current_sid = current_user_sid()?;
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor as HLOCAL) };
+        }
+        return Err(io::Error::other("owner-only ACL could not be checked"));
+    }
+    let matches = unsafe { EqualSid(owner, current_sid.as_ptr() as *mut c_void) } != 0;
+    unsafe { LocalFree(descriptor as HLOCAL) };
+    Ok(matches)
 }
 
 fn inspect_descriptor(
@@ -350,4 +378,134 @@ fn current_user_sid_from_token(token: HANDLE) -> io::Result<Vec<u8>> {
             std::slice::from_raw_parts(token_user.User.Sid as *const u8, sid_length).to_vec()
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // accctrl.h 的 INHERIT_FLAGS 值；windows-sys 0.52 未导出，测试内固定。
+    const SUB_OBJECTS_INHERIT: u32 = 0x1;
+    const SUB_CONTAINERS_INHERIT: u32 = 0x2;
+
+    /// 用「当前用户仅 Modify（无 WRITE_DAC/WRITE_OWNER）」的 protected DACL 重现
+    /// 共享 TEMP 目录（如 D:\Temp）的默认继承结果。
+    fn apply_modify_only_dacl(file: &File, inheritable: bool) {
+        let mut sid = current_user_sid().expect("current user sid");
+        let owner_sid = sid.as_mut_ptr() as *mut c_void;
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: owner_sid as *mut u16,
+        };
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_GENERIC_READ
+                | FILE_GENERIC_WRITE
+                | FILE_GENERIC_EXECUTE
+                | DELETE,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: if inheritable {
+                SUB_CONTAINERS_INHERIT | SUB_OBJECTS_INHERIT
+            } else {
+                0
+            },
+            Trustee: trustee,
+        };
+        let mut dacl: *mut ACL = null_mut();
+        let status = unsafe { SetEntriesInAclW(1, &entry, null(), &mut dacl) };
+        assert_eq!(status, ERROR_SUCCESS, "build modify-only DACL");
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        unsafe { LocalFree(dacl as HLOCAL) };
+        assert_eq!(status, ERROR_SUCCESS, "apply modify-only DACL");
+    }
+
+    #[test]
+    fn modify_only_owned_file_is_tightened_without_write_owner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("modify-only.jsonl");
+        std::fs::write(&path, "{}").expect("write file");
+        let handle =
+            open_security_path(&path, false, READ_CONTROL | WRITE_DAC).expect("open for fixture");
+        apply_modify_only_dacl(&handle, false);
+        drop(handle);
+
+        ensure_owner_only_file(&path)
+            .expect("owner-implied WRITE_DAC must tighten a modify-only DACL");
+        let verify = File::open(&path).expect("reopen");
+        ensure_owner_only_handle(&verify).expect("owner + protected DACL verification");
+    }
+
+    #[test]
+    fn modify_only_owned_dir_is_tightened_without_write_owner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).expect("create dir");
+        let handle = open_security_path(&sessions, true, READ_CONTROL | WRITE_DAC)
+            .expect("open dir for fixture");
+        apply_modify_only_dacl(&handle, false);
+        drop(handle);
+
+        ensure_owner_only_dir(&sessions)
+            .expect("owner-implied WRITE_DAC must tighten a modify-only dir");
+        ensure_owner_only_dir(&sessions).expect("tightened dir reopens clean");
+    }
+
+    #[test]
+    fn create_owner_only_file_works_under_modify_only_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let handle = open_security_path(dir.path(), true, READ_CONTROL | WRITE_DAC)
+            .expect("open parent for fixture");
+        apply_modify_only_dacl(&handle, true);
+        drop(handle);
+
+        let rollout = dir.path().join("session.jsonl");
+        let file = create_owner_only_file(&rollout)
+            .expect("session rollout creation under a modify-only parent");
+        ensure_owner_only_handle(&file).expect("new rollout is owner-only");
+    }
+
+    #[test]
+    fn foreign_owned_path_fails_closed() {
+        // 系统文件 owner 是 TrustedInstaller/Administrators 而非当前用户：
+        // 非提升时修复句柄打开即被拒，提升时走 owner 不匹配分支；两条路径都
+        // 必须失败且绝不改写系统对象的 ACL。
+        let system = Path::new(r"C:\Windows\System32\kernel32.dll");
+        if std::fs::symlink_metadata(system).is_ok() {
+            assert!(
+                ensure_owner_only_file(system).is_err(),
+                "foreign-owned path must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn compliant_path_passes_while_another_handle_denies_write_sharing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("held.jsonl");
+        std::fs::write(&path, "{}").expect("write file");
+        ensure_owner_only_file(&path).expect("tighten first");
+
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .expect("hold without write sharing");
+        ensure_owner_only_file(&path)
+            .expect("already-compliant path must not need a write-class handle");
+        drop(holder);
+    }
 }
