@@ -23,6 +23,8 @@ jobs:
   windows-x86_64:
     needs: gates
     runs-on: windows-latest
+    # Release 全仓优化编译正常 ~10 分钟级；45 分钟封顶防挂起阻塞 publish。
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
@@ -148,6 +150,7 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [gates, windows-x86_64]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
