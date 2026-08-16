@@ -39,7 +39,8 @@ impl AppPaths {
         })
     }
 
-    /// 创建并收紧会话目录、备份目录权限；索引文件在 store 打开后收紧。
+    /// 创建会话目录、备份目录与索引所在目录；Unix 上收紧为 0700，
+    /// Windows 按 Pi 策略不做额外 ACL 管理（由目录 ACL 决定）。
     pub fn prepare(&self) -> Result<(), String> {
         create_owner_only_dir(&self.home_dir)?;
         create_owner_only_dir(&self.sessions_dir)?;

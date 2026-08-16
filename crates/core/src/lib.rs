@@ -6,10 +6,6 @@ mod cancellation;
 mod project_instructions;
 mod trust;
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_owner_only;
-
 pub use cancellation::CancellationToken;
 pub use project_instructions::{
     PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
@@ -22,25 +18,25 @@ pub use trust::{
     has_project_trust_resource, resolve_project_trusted, user_singularity_home,
 };
 
-#[cfg(not(windows))]
+/// 创建仅属主可访问的新文件：Unix 上以 0600 创建并收紧；Windows 上按
+/// Pi 策略不做额外 ACL 管理，继承所在目录的 ACL。
 pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(file)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
 }
-
-#[cfg(windows)]
-pub use windows_owner_only::{
-    create_owner_only_file, ensure_owner_only_dir, ensure_owner_only_file,
-    ensure_owner_only_handle, set_owner_only_handle,
-};
 
 use std::fmt::{Display, Formatter};
 

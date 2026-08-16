@@ -1,7 +1,7 @@
 //! Owner-only permission enforcement for session directories and index/backup files.
 //!
-//! Unix uses mode 0700/0600; Windows delegates to the shared repository ACL
-//! primitive in `singularity_core`.
+//! Unix uses mode 0700/0600; Windows follows the Pi strategy of no additional
+//! ACL management (access is governed by the directory ACL).
 
 use super::*;
 
@@ -35,12 +35,9 @@ pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
     }
     #[cfg(windows)]
     {
-        singularity_core::ensure_owner_only_dir(path).map_err(|error| {
-            StoreError::InvalidState(format!(
-                "cannot enforce owner-only dir {}: {error}",
-                path.display()
-            ))
-        })
+        // Pi 策略：Windows 不做 owner-only ACL 管理，访问由目录 ACL 决定。
+        let _ = path;
+        Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -79,12 +76,9 @@ pub fn ensure_owner_only_file(path: &Path) -> StoreResult<()> {
     }
     #[cfg(windows)]
     {
-        singularity_core::ensure_owner_only_file(path).map_err(|error| {
-            StoreError::InvalidState(format!(
-                "cannot enforce owner-only file {}: {error}",
-                path.display()
-            ))
-        })
+        // Pi 策略：Windows 不做 owner-only ACL 管理，访问由目录 ACL 决定。
+        let _ = path;
+        Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {

@@ -2091,7 +2091,7 @@ fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     Ok(auth)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
     let file = open_user_config_file(path, true)?;
     ensure_private_secret_handle(&file)
@@ -2114,10 +2114,9 @@ fn open_user_config_file(path: &Path, private: bool) -> Result<std::fs::File, Pr
         use cap_std::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            READ_CONTROL,
         };
         options
-            .access_mode(FILE_GENERIC_READ | if private { READ_CONTROL } else { 0 })
+            .access_mode(FILE_GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -2170,8 +2169,6 @@ fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), ProviderErro
             ));
         }
     }
-    #[cfg(windows)]
-    windows_auth_acl::ensure_owner_only_handle(file)?;
     Ok(())
 }
 
@@ -2186,22 +2183,6 @@ fn create_private_secret_file(path: &Path) -> Result<std::fs::File, ProviderErro
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options
-            .access_mode(
-                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
-                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
-            )
-            .share_mode(
-                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
-                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-            )
-            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options
         .open(path)
@@ -2259,24 +2240,6 @@ mod windows_file_identity {
         // returned nonzero.
         let information = unsafe { information.assume_init() };
         Ok((information.file_attributes, information.number_of_links))
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_auth_acl {
-    use std::fs::File;
-
-    use super::{ProviderError, user_config_error};
-
-    pub(super) fn set_owner_only_handle(file: &File) -> Result<(), ProviderError> {
-        singularity_core::set_owner_only_handle(file)
-            .map_err(|_| user_config_error("user provider auth permissions could not be set"))
-    }
-
-    pub(super) fn ensure_owner_only_handle(file: &File) -> Result<(), ProviderError> {
-        singularity_core::ensure_owner_only_handle(file)
-            .map_err(|_| user_config_error("user provider auth file is not owner-only"))
     }
 }
 
@@ -2534,8 +2497,6 @@ fn write_json_file(path: &Path, contents: &str, secret: bool) -> Result<(), Prov
     let result = (|| {
         let mut file = if secret {
             let file = create_private_secret_file(&temporary)?;
-            #[cfg(windows)]
-            windows_auth_acl::set_owner_only_handle(&file)?;
             ensure_private_secret_handle(&file)?;
             file
         } else {
@@ -2614,14 +2575,13 @@ struct ConfigWriterLock {
 fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, ProviderError> {
     ensure_no_reparse_components(directory, false)?;
     let path = directory.join(".config.lock");
-    let (file, _created) = match config_writer_lock_options(true).open(&path) {
-        Ok(file) => (file, true),
+    let file = match config_writer_lock_options(true).open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_no_reparse_components(&path, false)?;
-            let file = config_writer_lock_options(false).open(&path).map_err(|_| {
+            config_writer_lock_options(false).open(&path).map_err(|_| {
                 user_config_error("provider config writer lock could not be acquired")
-            })?;
-            (file, false)
+            })?
         }
         Err(_) => {
             return Err(user_config_error(
@@ -2632,8 +2592,6 @@ fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, Prov
     ensure_config_writer_lock_identity(&file)?;
     #[cfg(unix)]
     ensure_private_lock_handle(&file)?;
-    #[cfg(windows)]
-    let acl_needs_repair = windows_auth_acl::ensure_owner_only_handle(&file).is_err();
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -2646,12 +2604,6 @@ fn acquire_config_writer_lock(directory: &Path) -> Result<ConfigWriterLock, Prov
                 "provider config writer lock could not be acquired",
             ));
         }
-    }
-    #[cfg(windows)]
-    if _created || acl_needs_repair {
-        // 收紧只写 protected DACL，且通过已固定的 `file` 句柄完成：owner
-        // 隐式持有 WRITE_DAC，无需 WRITE_OWNER，也不再按路径重开修复句柄。
-        windows_auth_acl::set_owner_only_handle(&file)?;
     }
     ensure_private_lock_handle(&file)?;
     Ok(ConfigWriterLock { _file: file })
@@ -2671,9 +2623,7 @@ fn config_writer_lock_options(create_new: bool) -> std::fs::OpenOptions {
         options
             .access_mode(
                 windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
-                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
-                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE,
             )
             .share_mode(
                 windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
@@ -2746,8 +2696,6 @@ fn ensure_private_lock_handle(file: &std::fs::File) -> Result<(), ProviderError>
             ));
         }
     }
-    #[cfg(windows)]
-    windows_auth_acl::ensure_owner_only_handle(file)?;
     Ok(())
 }
 
@@ -2768,8 +2716,6 @@ fn write_new_auth_generation(
     let mut file = create_private_secret_file(&path)?;
     let created = true;
     let result = (|| {
-        #[cfg(windows)]
-        windows_auth_acl::set_owner_only_handle(&file)?;
         ensure_private_secret_handle(&file)?;
         use std::io::Write;
         file.write_all(contents.as_bytes())
@@ -3934,57 +3880,6 @@ mod user_config_tests {
         assert!(directory.path().join(".config.lock").exists());
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn config_writer_lock_rejects_preexisting_hardlink_without_mutating_target_acl() {
-        let directory = tempfile::tempdir().expect("writer lock directory");
-        let target = directory.path().join("target.txt");
-        let lock_path = directory.path().join(".config.lock");
-        std::fs::write(&target, b"target").expect("target file");
-        let target_file = std::fs::File::open(&target).expect("open target file");
-        assert!(
-            windows_auth_acl::ensure_owner_only_handle(&target_file).is_err(),
-            "the inherited target ACL must not already be owner-only"
-        );
-        std::fs::hard_link(&target, &lock_path).expect("create target hard link");
-
-        let error = match acquire_config_writer_lock(directory.path()) {
-            Ok(_) => panic!("a pre-existing lock hard link must fail closed"),
-            Err(error) => error,
-        };
-        assert!(error.message.contains("writer lock"));
-        assert_eq!(std::fs::read(&target).expect("read target file"), b"target");
-        assert!(
-            windows_auth_acl::ensure_owner_only_handle(&target_file).is_err(),
-            "rejecting a pre-existing hard link must not change its target ACL"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn config_writer_lock_repairs_an_unfinished_single_link_lock() {
-        let directory = tempfile::tempdir().expect("writer lock directory");
-        let lock_path = directory.path().join(".config.lock");
-        std::fs::write(&lock_path, b"").expect("reserve lock path");
-        let unfinished = std::fs::File::open(&lock_path).expect("open unfinished lock");
-        assert!(
-            windows_auth_acl::ensure_owner_only_handle(&unfinished).is_err(),
-            "unfinished lock must start with the inherited ACL"
-        );
-        drop(unfinished);
-
-        let lock = acquire_config_writer_lock(directory.path())
-            .expect("a single-link unfinished lock can be repaired after identity checks");
-        windows_auth_acl::ensure_owner_only_handle(&lock._file)
-            .expect("repaired lock must have an owner-only ACL");
-        drop(lock);
-        let repaired = std::fs::File::open(&lock_path).expect("open repaired lock");
-        windows_auth_acl::ensure_owner_only_handle(&repaired)
-            .expect("repaired lock must retain an owner-only ACL after release");
-        assert_eq!(std::fs::read(&lock_path).expect("read repaired lock"), b"");
-        assert!(lock_path.exists());
-    }
-
     #[test]
     fn config_json_write_is_atomic() {
         let directory = tempfile::tempdir().expect("temporary user config directory");
@@ -4017,15 +3912,6 @@ mod user_config_tests {
         write_json_file(&path, r#"{"providers":{}}"#, true).expect("write auth file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("make auth file group-readable");
-        assert!(ensure_private_secret_file(&path).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn inherited_auth_permissions_fail_closed() {
-        let directory = tempfile::tempdir().expect("temporary user config directory");
-        let path = directory.path().join("auth.json");
-        std::fs::write(&path, r#"{"providers":{}}"#).expect("write auth file");
         assert!(ensure_private_secret_file(&path).is_err());
     }
 }

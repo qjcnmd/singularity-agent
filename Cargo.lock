@@ -1292,7 +1292,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "time",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1335,13 +1334,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "singularity_core",
  "singularity_protocol",
  "tempfile",
  "thiserror",
  "time",
  "uuid",
- "windows-sys 0.52.0",
 ]
 
 [[package]]

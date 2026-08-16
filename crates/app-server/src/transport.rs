@@ -411,8 +411,8 @@ fn initialize_app_server(
     };
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
-    // 收紧的是本次实际打开并创建的索引文件：显式 SINGULARITY_APP_SERVER_DB
-    // 指向的路径也必须 owner-only，不能只收紧默认 home/index.sqlite3。
+    // 收紧本次实际打开并创建的索引文件（Unix 0700 语义；Windows 按 Pi 策略
+    // 由目录 ACL 决定）：显式 SINGULARITY_APP_SERVER_DB 指向的路径同样处理。
     if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
         singularity_store::ensure_owner_only_file(Path::new(&db_path)).map_err(|error| {
             format!("failed to enforce owner-only app-server index {db_path}: {error}")

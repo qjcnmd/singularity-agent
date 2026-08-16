@@ -106,7 +106,7 @@ sg config import-env
 # 或：sg config import-env --file C:\path\to\.env
 ```
 
-该命令把地址、默认 selector 和 `auth_generation` 提交点写入 `%USERPROFILE%\.singularity\config.json`，把 API key 写入同目录不可预测且权限受限的版本化 `auth.v1-<随机值>.json`；读取时先读取 config，再按其中引用读取同一 auth generation，因此不会观察到新 config 配旧 auth。命令最后输出 `selectable=true|false`：只有已有完整、有效的协议、token 限制、reasoning/thinking/tool/role 能力覆盖且认证存在时才为 `true`。新模型或缺少能力字段的模型只写入不可选择的 ID skeleton，不会从 URL、模型名或路径猜测协议、上下文或输出上限；包含 `#variant` 的 selector 只有在该模型已有显式 variant 时才允许导入。密钥不会出现在命令行参数、模型目录、缓存、诊断或 Git 中。运行时解析优先级为进程环境 > 用户目录配置，因此临时进程设置仍可覆盖用户默认值。
+该命令把地址、默认 selector 和 `auth_generation` 提交点写入 `%USERPROFILE%\.singularity\config.json`，把 API key 写入同目录不可预测的版本化 `auth.v1-<随机值>.json`（Unix 上以 0600 创建；Windows 按 Pi 策略继承目录 ACL，不做额外 ACL 管理）；读取时先读取 config，再按其中引用读取同一 auth generation，因此不会观察到新 config 配旧 auth。命令最后输出 `selectable=true|false`：只有已有完整、有效的协议、token 限制、reasoning/thinking/tool/role 能力覆盖且认证存在时才为 `true`。新模型或缺少能力字段的模型只写入不可选择的 ID skeleton，不会从 URL、模型名或路径猜测协议、上下文或输出上限；包含 `#variant` 的 selector 只有在该模型已有显式 variant 时才允许导入。密钥不会出现在命令行参数、模型目录、缓存、诊断或 Git 中。运行时解析优先级为进程环境 > 用户目录配置，因此临时进程设置仍可覆盖用户默认值。
 
 Provider 地址必须是非空的绝对 `http`/`https` URL，且必须带 host；不得包含用户名、密码、query 或 fragment。原始合法 path 会保留，地址不会被静默 trim 或修正。Provider ID 和 reasoning variant 不得包含 `/` 或 `#`；模型 ID 可以在 selector 的第一个 `/` 之后包含内部 `/`，但不得包含空白、控制字符或 `#`，并受长度上限约束。
 

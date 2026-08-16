@@ -448,8 +448,7 @@ fn migration_refuses_non_empty_legacy_sqlite() {
         .expect("legacy data");
     drop(connection);
 
-    // AppPaths home 必须与 workspace 分离：Windows owner-only 收紧会把 home
-    // 目录 ACL 改为显式单 ACE，若复用同一临时根目录会影响测试 workspace 读取。
+    // AppPaths home 与 workspace 分离，避免共享同一临时根目录。
     let home = temp.path().join("home");
     let paths = crate::paths::AppPaths {
         home_dir: home.clone(),
@@ -490,7 +489,7 @@ fn migration_is_idempotent_when_destination_or_index_already_exists() {
         .expect("empty schema");
     drop(connection);
 
-    // AppPaths home 与 workspace 分离（Windows owner-only ACL 收紧，理由同上）。
+    // AppPaths home 与 workspace 分离，避免共享同一临时根目录。
     let home = temp.path().join("home");
     let paths = crate::paths::AppPaths {
         home_dir: home.clone(),
