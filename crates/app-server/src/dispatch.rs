@@ -152,7 +152,7 @@ impl AppServer {
             .store
             .list_sessions()?
             .iter()
-            .map(thread_from_record)
+            .map(|record| self.project_thread(record))
             .collect::<Vec<_>>();
         Ok(vec![
             JsonRpcMessage::response(
@@ -180,7 +180,7 @@ impl AppServer {
         json_response(
             message.required_id(),
             ThreadResult {
-                thread: thread_from_record(&record),
+                thread: self.project_thread(&record),
             },
         )
     }
@@ -215,13 +215,13 @@ impl AppServer {
             cwd: cwd.clone(),
             title: None,
             model: model.clone(),
-            status: SessionStatus::Active,
+            status: SessionStatus::Idle,
             created_at: created_at.clone(),
             updated_at: created_at,
             token_usage: json!({}),
         };
         self.store.insert_session(&record)?;
-        let thread = thread_from_record(&record);
+        let thread = self.project_thread(&record);
         let mut messages = vec![self.event_notification(AppEvent::thread_started(&thread))?];
         messages.push(
             JsonRpcMessage::response(

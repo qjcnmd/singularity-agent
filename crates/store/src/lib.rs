@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";

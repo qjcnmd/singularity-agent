@@ -801,10 +801,14 @@ impl AppServerClient {
     fn thread_list(&mut self) -> Result<(), String> {
         let reply = self.request::<rpc_methods::ThreadList>(&EmptyParams::default())?;
         for thread in &reply.result.threads {
+            let last_turn_status = thread
+                .last_turn_status
+                .map(|status| status.as_storage_text())
+                .unwrap_or("");
             println!(
                 "{} {} {}",
                 thread.thread_id,
-                thread.last_turn_status.as_storage_text(),
+                last_turn_status,
                 thread.cwd.as_deref().unwrap_or("")
             );
         }

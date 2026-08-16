@@ -387,16 +387,19 @@ fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
+/// 持久化状态的原始投影：仅供内部（打开会话、provider 配置）使用；
+/// wire 可见的 thread 摘要必须经过 [`AppServer::project_thread`]。
 pub fn thread_from_record(record: &SessionRecord) -> Thread {
     Thread {
         thread_id: record.session_id.clone(),
         model: record.model.clone(),
         cwd: Some(record.cwd.clone()),
         last_turn_status: match record.status {
-            SessionStatus::Active => singularity_protocol::ThreadStatus::Active,
-            SessionStatus::Completed => singularity_protocol::ThreadStatus::Completed,
-            SessionStatus::Failed => singularity_protocol::ThreadStatus::Failed,
-            SessionStatus::Interrupted => singularity_protocol::ThreadStatus::Interrupted,
+            SessionStatus::Idle => None,
+            SessionStatus::Active => Some(singularity_protocol::ThreadStatus::Active),
+            SessionStatus::Completed => Some(singularity_protocol::ThreadStatus::Completed),
+            SessionStatus::Failed => Some(singularity_protocol::ThreadStatus::Failed),
+            SessionStatus::Interrupted => Some(singularity_protocol::ThreadStatus::Interrupted),
         },
     }
 }
@@ -731,6 +734,31 @@ impl AppServer {
                 ..SessionMetadataUpdate::default()
             },
         )?)
+    }
+
+    /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
+    /// 存活 turn 时才成立；崩溃遗留的 `Active` 投影为 `interrupted`，读取
+    /// 不回写索引（终态只能由 turn 的真实结束写入）。
+    pub(crate) fn project_thread(&self, record: &SessionRecord) -> Thread {
+        let mut thread = thread_from_record(record);
+        if thread.last_turn_status == Some(singularity_protocol::ThreadStatus::Active)
+            && !self.thread_has_live_turn(&record.session_id)
+        {
+            thread.last_turn_status = Some(singularity_protocol::ThreadStatus::Interrupted);
+        }
+        thread
+    }
+
+    fn thread_has_live_turn(&self, session_id: &str) -> bool {
+        self.turn_threads
+            .lock()
+            .map(|turn_threads| {
+                turn_threads
+                    .values()
+                    .any(|thread_id| thread_id == session_id)
+            })
+            // 锁中毒视为没有存活 turn：宁可投影为终态也不伪装运行中。
+            .unwrap_or(false)
     }
 
     pub(crate) fn turn_with_usage(&self, turn: Turn) -> Turn {

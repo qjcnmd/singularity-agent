@@ -622,10 +622,11 @@ pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: Option<String>,
-    /// 最近一次/当前一次 turn 的展示元数据，来自 `session_index.status`。
-    /// `sg continue` 不受此字段限制。
+    /// 最近一次/当前一次 turn 的展示元数据，来自 `session_index.status`：
+    /// 尚无 turn 时为 `None`（wire 上为 null），运行中为 active，终态为
+    /// completed/failed/interrupted。`sg continue` 不受此字段限制。
     #[serde(rename = "lastTurnStatus")]
-    pub last_turn_status: ThreadStatus,
+    pub last_turn_status: Option<ThreadStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

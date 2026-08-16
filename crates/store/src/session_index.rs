@@ -4,10 +4,13 @@ use super::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// 会话索引状态：只表示最近一次 turn 的终态；继续会话不依赖它做状态机。
+/// 会话索引状态：最近一次 turn 的状态。`Idle` 表示尚无 turn 可展示（新会话，
+/// 或迁移时终态未知）；`Active` 仅在 turn 真正运行期间写入，读取侧需要结合
+/// 存活 turn 判定，崩溃遗留的 `Active` 由消费方投影为终态而不是回写索引。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
+    Idle,
     Active,
     Completed,
     Failed,
@@ -17,6 +20,7 @@ pub enum SessionStatus {
 impl SessionStatus {
     pub const fn as_storage_text(self) -> &'static str {
         match self {
+            Self::Idle => "idle",
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -26,6 +30,7 @@ impl SessionStatus {
 
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
+            "idle" => Some(Self::Idle),
             "active" => Some(Self::Active),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),

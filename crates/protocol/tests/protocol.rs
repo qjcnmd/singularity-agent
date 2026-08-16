@@ -160,11 +160,20 @@ fn thread_status_projects_last_turn_metadata_not_lifecycle() {
         thread_id: "session-1".to_string(),
         model: None,
         cwd: Some("/tmp/work".to_string()),
-        last_turn_status: ThreadStatus::Completed,
+        last_turn_status: Some(ThreadStatus::Completed),
     };
     let wire = serde_json::to_value(&thread).expect("thread wire");
     assert_eq!(wire["thread_id"], "session-1");
     assert_eq!(wire["lastTurnStatus"], "completed");
+    // 尚无 turn：wire 上为 null，而不是伪装成 active。
+    let no_turn = singularity_protocol::Thread {
+        thread_id: "session-2".to_string(),
+        model: None,
+        cwd: None,
+        last_turn_status: None,
+    };
+    let wire = serde_json::to_value(&no_turn).expect("thread wire");
+    assert_eq!(wire["lastTurnStatus"], serde_json::Value::Null);
     for status in [
         ThreadStatus::Active,
         ThreadStatus::Completed,

@@ -151,7 +151,7 @@ flowchart TD
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
 - 恢复：重开文件 → 逐行解析 + 版本迁移 → `repair_orphaned_tool_calls`（有 tool_call_id 但无后续 ToolResult 的 assistant 条目，追加 synthetic failed ToolResult：`[previous execution outcome unknown; do not retry]`；不重写/删除原条目、绝不重新执行工具）→ `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
 - 事件条目不进 context（custom / label / model_change / thinking_level_change / session_info 只作树内记录）。
-- `session_index.status` 只表示最近一次 turn 的展示状态（active/completed/failed/interrupted）；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。
+- `session_index.status` 只表示 turn 状态：尚无 turn 时为 `idle`（协议投影为 null），turn 运行中为 active，终态为 completed/failed/interrupted；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。崩溃遗留的 active 行在读取侧投影为 interrupted（仅当本进程存在该会话的存活 turn 时才报告 active），读取不回写索引。
 
 ```mermaid
 flowchart TD
@@ -173,7 +173,7 @@ flowchart TD
 
 对齐 Pi 算法（裁决 10 目标数据流），并叠加 Phase F 的 preflight 与显式 overflow 兜底：
 
-- **触发**：每次模型请求前先做 preflight：估算 `系统/开发者指令 + 会话消息 + tool schema + max_output_tokens + 32 token 开销`，超过 context window 则先压缩并在压缩后仍超窗时 fail closed。每次成功的模型响应后，`maybe_compact` 用 `contextWindow − reserveTokens(16384)` 判定；contextTokens 取最近有效 assistant usage 的 totalTokens + 其后的消息估算，无可用 usage 时全量估算（字符 UTF-16 长度/4）。
+- **触发**：每次模型请求前先做 preflight：估算 `系统/开发者指令 + 会话消息（含历史 tool call 的 id/name/raw_arguments 与 tool 消息的 tool_call_id）+ tool schema + max_output_tokens + 32 token 开销`，超过 context window 则先压缩并在压缩后仍超窗时 fail closed。每次成功的模型响应后，`maybe_compact` 用 `contextWindow − reserveTokens(16384)` 判定；contextTokens 取最近有效 assistant usage 的 totalTokens + 其后的消息估算，无可用 usage 时全量估算（字符 UTF-16 长度/4）。
 - **显式溢出兜底**（裁决 8）：provider 以 `ContextLengthExceeded` 显式报溢出（流式错误或 Failed 响应）时，强制 compaction 一次（`keepRecentTokens=0` / `reserveTokens=0`，toolResult 仍不切）并重试同一轮；第二次溢出按原错误返回，不无限压缩。失败请求未持久化 assistant/error/length 消息，因此无需移除尾部消息。
 - **切点**：`findCutPoint` 从最新往回累积估计 token 直到达到 keepRecentTokens(20000)，取其后最近合法切点；合法切点 = 非 toolResult 的 message（user / assistant / bashExecution / custom / branchSummary / compactionSummary），**toolResult 永不切**（必须跟随其 tool call）；split turn 时摘要范围回到该 turn 起点。
 - **摘要**：结构化摘要 prompt（serializeConversation 序列化，tool result 截断 2000 字符）；摘要系统指令与普通请求共用 developer→system→user role adaptation seam；有 previousSummary 时用 UPDATE prompt 合并更新；文件操作（read/modified 列表）跨多次压缩累积；摘要调用是一次性 prompt，不写缓存，provider 传输层重试负责可重试网络错误。

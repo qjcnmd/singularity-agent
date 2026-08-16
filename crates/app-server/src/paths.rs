@@ -240,7 +240,9 @@ pub fn migrate_legacy_project_sessions(
                 cwd: plan.cwd.clone(),
                 title: None,
                 model: None,
-                status: SessionStatus::Active,
+                // 迁移行无法从旧索引得知最近 turn 终态；按「尚无可展示 turn」入库，
+                // 不得伪装成运行中。
+                status: SessionStatus::Idle,
                 created_at: plan.created_at.clone(),
                 updated_at: plan.created_at.clone(),
                 token_usage: Value::Object(serde_json::Map::new()),

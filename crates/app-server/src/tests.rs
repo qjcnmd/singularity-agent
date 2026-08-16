@@ -193,14 +193,18 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .as_str()
         .expect("session id")
         .to_string();
-    assert_eq!(started[1]["result"]["thread"]["lastTurnStatus"], "active");
+    // 尚无 turn：lastTurnStatus 为空，索引行为 idle，不伪装成 active。
+    assert_eq!(
+        started[1]["result"]["thread"]["lastTurnStatus"],
+        serde_json::Value::Null
+    );
     assert_eq!(
         server
             .store()
             .get_session(&session_id)
             .expect("record")
             .status,
-        SessionStatus::Active
+        SessionStatus::Idle
     );
 
     // completed → continue 必须保持 completed，不提前置 active。
@@ -293,6 +297,93 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     assert_eq!(
         resumed[0]["result"]["thread"]["lastTurnStatus"],
         "interrupted"
+    );
+}
+
+#[test]
+fn last_turn_status_reports_running_only_with_live_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+
+    let started = server
+        .handle_json(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "thread/start",
+                "id": 2,
+                "params": {"cwd": workspace},
+            })
+            .to_string(),
+        )
+        .expect("thread start");
+    let session_id = started[1]["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    fn listed_status(server: &mut AppServer, id: i64, session_id: &str) -> serde_json::Value {
+        server
+            .handle_json(&format!(
+                r#"{{"jsonrpc":"2.0","method":"thread/list","id":{id}}}"#
+            ))
+            .expect("thread list")[0]["result"]["threads"]
+            .as_array()
+            .expect("threads")
+            .iter()
+            .find(|thread| thread["thread_id"] == session_id)
+            .expect("session row")["lastTurnStatus"]
+            .clone()
+    }
+
+    // 模拟崩溃遗留：索引行停在 active，但本进程没有该会话的存活 turn。
+    server
+        .store()
+        .update_session(
+            &session_id,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Active),
+                ..SessionMetadataUpdate::default()
+            },
+        )
+        .expect("force active row");
+    assert_eq!(
+        listed_status(&mut server, 3, &session_id),
+        json!("interrupted"),
+        "crash-leftover active must not masquerade as running"
+    );
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":4,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume");
+    assert_eq!(
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "interrupted"
+    );
+    assert_eq!(
+        server
+            .store()
+            .get_session(&session_id)
+            .expect("record")
+            .status,
+        SessionStatus::Active,
+        "resume must not rewrite the stored status"
+    );
+
+    // 真正运行中的 turn：存活 guard 期间投影为 active，结束后回到崩溃遗留投影。
+    let (_cancellation, guard) = server
+        .activate_turn("turn_live_1", &session_id)
+        .expect("activate turn");
+    assert_eq!(listed_status(&mut server, 5, &session_id), json!("active"));
+    drop(guard);
+    assert_eq!(
+        listed_status(&mut server, 6, &session_id),
+        json!("interrupted")
     );
 }
 
