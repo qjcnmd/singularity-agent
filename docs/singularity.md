@@ -85,42 +85,45 @@ sequenceDiagram
 
 ## 3. AgentLoop 循环（图 c）
 
-Pi 式双层循环（裁决 4/9）。内层每轮迭代：drain steer 队列注入消息 → 模型调用（流式 assistant 消息）→ 有 toolCall 则执行工具并把 toolResult 按序回传 → 进入下一轮；`stopReason` 为 error/aborted 立即收尾，length 时不执行任何工具（全部标记失败）。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则 `agent_end` 收尾。
+Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
 - **steer / followUp 是内存队列**（裁决 9）：纯内存投递，进程退出即丢；不持久化、无幂等键。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
-- 回合结束后的处理（照 Pi 语义）：可重试错误自动重试（有上限）；compaction 检查（见第 6 节）；队列中仍有消息则继续。
-- 停止条件：`stop`（无工具调用、正常完成）、`length`（输出截断，工具不执行）、`toolUse`（继续执行工具）、`error`/`aborted`（立即终止）。
+- **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed` 且为瞬时类错误做运行级重试（首次 + 最多 4 次，2s/4s/8s/16s 退避）；`Invalid` 直接失败。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
+- 停止条件：无工具调用的成功 assistant 响应；外部取消（aborted，不视为模型错误）；达到 `max_turns` 上限；模型错误或会话错误直接返回。
 
 ```mermaid
 flowchart TD
-    A(["prompt / continue"]) --> B{"内层循环:<br/>有 toolCall 或 pending 消息?"}
-    B -- 是 --> C["注入 steer<br/>(内存队列 drain)"]
-    C --> D["模型调用<br/>(流式 assistant 消息)"]
-    D --> E{"stopReason?"}
-    E -- "toolUse" --> F["执行工具调用<br/>(见工具执行链)"]
-    F --> G["toolResult 按序回传"]
-    G --> B
-    E -- "length" --> F2["全部 toolCall 标记失败<br/>(不执行任何工具)"]
-    F2 --> B
-    E -- "stop" --> H["turn_end<br/>(shouldStopAfterTurn 检查)"]
-    E -- "error / aborted" --> Z["立即 turn_end + agent_end"]
-    H --> I{"外层:<br/>followUp 队列有消息?"}
-    I -- 是 --> B
-    I -- 否 --> J(["agent_end<br/>终态消息落盘, 检查 compaction"])
-    Z --> J
+    A(["prompt / continue"]) --> B{"内层循环:<br/>取消? / 达到轮数上限?"}
+    B -- 是 --> Z(["返回终态<br/>aborted / 轮数上限"])
+    B -- 否 --> C["注入 steer<br/>(内存队列 drain)"]
+    C --> D["compaction preflight<br/>(见第 6 节)"]
+    D --> E["模型调用<br/>(流式 assistant 消息)"]
+    E --> F{"response.status?"}
+    F -- "Success + toolCalls" --> G["按序执行工具"]
+    G --> H["toolResult 按序回传"]
+    H --> B
+    F -- "Success + stop" --> I["终态 assistant 落盘"]
+    F -- "overflow" --> J["强制 compact 一次<br/>同轮重试；二次失败原样返回"]
+    J --> B
+    F -- "瞬时 Failed" --> K["运行级退避重试"]
+    K --> B
+    F -- "Invalid / 不可重试" --> Z
+    I --> L{"外层:<br/>followUp 队列有消息?"}
+    L -- 是 --> B
+    L -- 否 --> M(["返回 AgentOutcome<br/>compaction 已在每轮检查"])
 ```
 
 （图 c：AgentLoop 循环）
 
 ## 4. 工具执行链（图 d）
 
-模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ 参数校验 → `beforeToolCall` hook（可 block；terminate 可终止整批）→ 执行（进程内，继承进程权限，无 workspace containment）→ 输出截断 → `afterToolCall` hook（可改 content/details/usage）→ toolResult 按调用顺序回传。
+模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ JSON Schema 参数校验 → 执行（进程内，继承进程权限，无 workspace containment）→ 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按调用顺序回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
 
-**工具面（裁决 3，对齐 Pi）**：默认 read/bash/edit/write；可选只读 grep/find/ls。工具 schema 见第 12.2 节。
+**工具面（裁决 3，对齐 Pi）**：`ToolRegistry::new()` 只注册 read/bash/edit/write；文档不再声明未注册的 grep/find/ls。工具 schema 见第 12.2 节。
 
 **执行可靠性（裁决 5，对齐 Pi，实测调整）**：
 
-- 超时：bash 默认 120s（可显式 `timeout_ms` 覆盖）；显式上限 600000 ms。
+- 超时：bash 缺少 `timeout_ms` 时使用 120000 ms；显式值必须是 integer 1..=600000，上限 600000 ms。
 - 输出截断：保留最后 2000 行 / 50 KiB，超限写入临时文件并返回 fullOutputPath。
 - 中断：abort 信号杀死整个进程树。
 - 工作目录绑定会话/任务工作区。
@@ -129,27 +132,26 @@ flowchart TD
 ```mermaid
 flowchart TD
     A(["模型 toolCall"]) --> B["注册表查找<br/>(ToolSpec 单一事实源)"]
-    B --> C{"工具存在?<br/>参数合法?"}
-    C -- 否 --> R1["immediate error ToolResult<br/>(不执行, 不猜测不改写)"]
-    C -- 是 --> D["参数校验<br/>(validateToolArguments)"]
-    D --> E["hook: beforeToolCall<br/>(可 block / terminate 整批)"]
-    E -- "block" --> R1
-    E -- 允许 --> F["执行（进程内）<br/>bash 默认 120s 超时(可覆盖, 上限 600000 ms)<br/>中断杀进程树<br/>cwd 绑定工作区"]
-    F --> G["输出截断<br/>最后 2000 行 / 50 KiB<br/>超限: 临时文件 + fullOutputPath"]
-    G --> H["hook: afterToolCall<br/>(可改 content / details / usage)"]
-    H --> I["toolResult 消息回传<br/>(按调用顺序, 进入下一回合)"]
+    B --> C{"工具存在?"}
+    C -- 否 --> R1["registry error → loop 写失败 toolResult<br/>(不执行, 不猜测不改写)"]
+    C -- 是 --> D["JSON Schema 参数校验"]
+    D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
+    D -- "合法" --> F["执行（进程内）<br/>bash: timeout_ms 默认 120000 / 上限 600000<br/>中断杀进程树<br/>cwd 绑定工作区"]
+    F --> G["工具自身输出截断<br/>read/bash: 最后 2000 行 / 50 KiB<br/>超限: 临时文件 + fullOutputPath"]
+    G --> I["toolResult 消息回传<br/>(content + is_error, 按调用顺序, 进入下一回合)"]
 ```
 
 （图 d：工具执行链）
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint、无 turn 级崩溃恢复；进程退出即中断，重开会话即继续。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
+会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint；进程退出即中断，重开会话即继续，可写重开时对崩溃遗留的孤立 tool call 补 synthetic failed ToolResult（不重新执行工具）。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
 
-- 落盘时机：只有终态消息（`message_end`）追加 JSONL；流式 delta 不落盘；纯 user 消息在第一条 assistant 消息之前不写盘（照 Pi 语义）。
+- 落盘时机：turn 启动先把当前 user 消息追加 JSONL；随后只有终态 assistant/toolResult/compaction 消息追加 JSONL，流式 delta 不落盘。进程崩溃时已追加的 user/assistant tool-call 条目保留，不存在的回合不写入状态。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
-- 恢复：重开文件 → 逐行解析 + 版本迁移 → `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
+- 恢复：重开文件 → 逐行解析 + 版本迁移 → `repair_orphaned_tool_calls`（有 tool_call_id 但无后续 ToolResult 的 assistant 条目，追加 synthetic failed ToolResult：`[previous execution outcome unknown; do not retry]`；不重写/删除原条目、绝不重新执行工具）→ `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
 - 事件条目不进 context（custom / label / model_change / thinking_level_change / session_info 只作树内记录）。
+- `session_index.status` 只表示最近一次 turn 的展示状态（active/completed/failed/interrupted）；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。
 
 ```mermaid
 flowchart TD
@@ -158,7 +160,8 @@ flowchart TD
     C --> D["进程退出<br/>(回合中断, 无 checkpoint)"]
     D --> E["重开会话文件<br/>(sg continue / 恢复)"]
     E --> F["逐行解析 + 版本迁移<br/>(v1/v2 到 v3, 打开时重写)"]
-    F --> G["buildContextEntries<br/>[compaction 摘要] + [firstKeptEntryId 起条目]"]
+    F --> F2["repair_orphaned_tool_calls<br/>孤立 tool call → synthetic failed ToolResult<br/>(unknown / do not retry, 不重新执行)"]
+    F2 --> G["buildContextEntries<br/>[compaction 摘要] + [firstKeptEntryId 起条目]"]
     G --> H["buildSessionContext<br/>entry 转 LLM 消息"]
     H --> I["继续回合"]
     B -. "branch(entryId): 只移动 leaf 指针,<br/>不删除/改写既有条目" .-> C
@@ -168,34 +171,43 @@ flowchart TD
 
 ## 6. Compaction（图 f）
 
-对齐 Pi 算法（裁决 10 目标数据流）：
+对齐 Pi 算法（裁决 10 目标数据流），并叠加 Phase F 的 preflight 与显式 overflow 兜底：
 
-- **触发**：`agent_end` 后（及新 prompt 前）检查；`contextTokens` 超过 `contextWindow − reserveTokens(16384)` 时压缩；contextTokens 取最近有效 assistant usage 的 totalTokens（无可用 usage 时按消息估算：字符数/4，图片按 4800 字符）。溢出场景（error 文本 pattern / 静默溢出 stop+input 超 window / length+output=0+input≥0.99·window）同样触发。
-- **切点**：`findCutPoint` 从最新往回累积估计 token 直到达到 keepRecentTokens(20000)，取其后最近合法切点；合法切点 = user / assistant / bashExecution / custom / summary 类消息，**toolResult 永不切**（必须跟随其 tool call）；split turn 时摘要范围回到该 turn 起点。
-- **摘要**：结构化摘要 prompt（serializeConversation 序列化，tool result 截断 2000 字符）；有 previousSummary 时用 UPDATE prompt 合并更新；文件操作（read/modified 列表）跨多次压缩累积；摘要调用是一次性 prompt，不写缓存，可重试。
-- **落盘与重建**：追加 CompactionEntry（summary + firstKeptEntryId + tokensBefore + 文件操作 details）→ 内存重建：agent 消息状态替换为 `buildSessionContext()` 结果 → **原始历史保留**（JSONL 与文件条目不变）。
-- **二次压缩**：从上一次 compaction 的 firstKeptEntryId 起，之前保留的消息再次进入总结范围；previousSummary 走 UPDATE 合并；最后一条 entry 已是 compaction 时不重复压缩（两次压缩之间必须有新消息）。
-- **溢出重试兜底**（裁决 8）：overflow 场景压缩成功后移除尾部 error/length assistant 消息并重试被打断的回合，只重试一次。
+- **触发**：每次模型请求前先做 preflight：估算 `系统/开发者指令 + 会话消息 + tool schema + max_output_tokens + 32 token 开销`，超过 context window 则先压缩并在压缩后仍超窗时 fail closed。每次成功的模型响应后，`maybe_compact` 用 `contextWindow − reserveTokens(16384)` 判定；contextTokens 取最近有效 assistant usage 的 totalTokens + 其后的消息估算，无可用 usage 时全量估算（字符 UTF-16 长度/4）。
+- **显式溢出兜底**（裁决 8）：provider 以 `ContextLengthExceeded` 显式报溢出（流式错误或 Failed 响应）时，强制 compaction 一次（`keepRecentTokens=0` / `reserveTokens=0`，toolResult 仍不切）并重试同一轮；第二次溢出按原错误返回，不无限压缩。失败请求未持久化 assistant/error/length 消息，因此无需移除尾部消息。
+- **切点**：`findCutPoint` 从最新往回累积估计 token 直到达到 keepRecentTokens(20000)，取其后最近合法切点；合法切点 = 非 toolResult 的 message（user / assistant / bashExecution / custom / branchSummary / compactionSummary），**toolResult 永不切**（必须跟随其 tool call）；split turn 时摘要范围回到该 turn 起点。
+- **摘要**：结构化摘要 prompt（serializeConversation 序列化，tool result 截断 2000 字符）；摘要系统指令与普通请求共用 developer→system→user role adaptation seam；有 previousSummary 时用 UPDATE prompt 合并更新；文件操作（read/modified 列表）跨多次压缩累积；摘要调用是一次性 prompt，不写缓存，provider 传输层重试负责可重试网络错误。
+- **落盘与重建**：追加 CompactionEntry（summary + firstKeptEntryId + tokensBefore + previousSummary + 文件操作 details）→ 每次请求通过 `buildSessionContext()` 重建消息，session 内存态不保留旧上下文 → **原始历史保留**（JSONL 与文件条目不变）。
+- **降级**：post-response compaction 的摘要生成失败（provider/无效响应）记录后跳过，不丢弃已完成轮次；会话写入错误仍传播。
+- **二次压缩**：从上一次 compaction 的 firstKeptEntryId 起，之前保留的消息再次进入总结范围；previousSummary 走 UPDATE 合并；最新 context 条目已是 compaction 时不重复压缩（两次压缩之间必须有新消息）。
 
 ```mermaid
 flowchart TD
-    A(["触发检查<br/>agent_end 后 / 新 prompt 前"]) --> B{"contextTokens 超过<br/>window - reserveTokens(16384)?"}
-    B -- 否 --> N1(["不压缩"])
-    B -- 是 / overflow 场景 --> C["prepareCompaction<br/>(上一次 firstKeptEntryId 起)"]
-    C --> D["findCutPoint<br/>往回累积到 keepRecentTokens(20000)<br/>合法切点: user / assistant / bashExecution /<br/>custom / summary<br/>(toolResult 永不切, split turn 处理)"]
-    D --> E["结构化摘要 prompt<br/>serializeConversation<br/>toolResult 截断 2000 字符<br/>previousSummary 用 UPDATE 合并<br/>文件操作跨压缩累积"]
-    E --> F["LLM 摘要调用<br/>(一次性 prompt, 不写缓存, 可重试)"]
-    F --> G["追加 CompactionEntry<br/>(summary + firstKeptEntryId)"]
-    G --> H["内存重建<br/>agent 消息 = buildSessionContext()"]
+    A(["每次模型请求前"]) --> B{"preflight 估算<br/>(指令 + 会话 + tool schema +<br/>max output + 开销) > window?"}
+    B -- 否 --> P["发送请求"]
+    B -- 是 --> C["prepareCompaction<br/>(上一次 firstKeptEntryId 起)"]
+    C --> C2{"压缩后 preflight 仍超窗?"}
+    C2 -- 是 --> FAIL(["fail closed"])
+    C2 -- 否 --> P
+    P --> Q{"provider 显式<br/>ContextLengthExceeded?"}
+    Q -- 是 --> O1{"本次 turn 已强制压缩过?"}
+    O1 -- 否 --> O2["force compact<br/>keepRecent=0 / reserve=0<br/>(toolResult 永不切)"]
+    O2 --> P
+    O1 -- 是 --> FAIL2(["原样返回 overflow 错误"])
+    Q -- 否 --> R["成功响应后 maybe_compact<br/>window - reserveTokens(16384)"]
+    R --> D["findCutPoint<br/>往回累积到 keepRecentTokens(20000)<br/>非 toolResult message 为合法切点<br/>(split turn 处理)"]
+    D --> E["结构化摘要 prompt<br/>serializeConversation<br/>toolResult 截断 2000 字符<br/>previousSummary UPDATE 合并<br/>文件操作跨压缩累积"]
+    E --> F["LLM 摘要调用<br/>(role adaptation seam)"]
+    F --> G["追加 CompactionEntry<br/>(summary + firstKeptEntryId +<br/>tokensBefore + details)"]
+    G --> H["后续请求用 buildSessionContext() 重建"]
     H --> I["原始历史保留<br/>(JSONL 不变)"]
-    I --> J["overflow: 移除尾部 error/length 消息,<br/>重试一次"]
 ```
 
 （图 f：Compaction 数据流）
 
 ## 7. 取消/中断传播（图 g）
 
-`turn/interrupt` → app-server → core `abort()` → 取消进行中的 provider HTTP 请求 + 杀死工具子进程树 → 回合以 aborted 终态收尾（终态消息落盘）。中断前工具已产生的 workspace 副作用不回滚（照 Pi：取消不宣称回滚副作用）。
+`turn/interrupt` → app-server → core `abort()` → 取消进行中的 provider HTTP 请求 + 杀死工具子进程树 → 回合以 aborted 终态收尾（已落盘条目保留，运行中未完成的工具不补成功结果）。中断前工具已产生的 workspace 副作用不回滚（照 Pi：取消不宣称回滚副作用）。
 
 ```mermaid
 sequenceDiagram
@@ -243,11 +255,11 @@ flowchart LR
 
 ## 9. Provider 与模型
 
-**静态能力声明**（裁决 8）：删除 capability probe 体系；每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；context window 未声明时保持 unknown，不做网络探测或能力协商。溢出重试兜底保留（见第 6 节）。
+**静态能力声明**（裁决 8）：删除 capability probe 体系；每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；不做网络探测或能力协商。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。显式溢出重试兜底见第 6 节。
 
 - **Provider 边界**：`trait Provider`；保留 OpenAI-compatible 双协议 adapter（Chat Completions / Responses），同一请求对象投影两条 wire 路径，共用请求校验、重试、响应归一化；`finish_reason=length`/`content_filter` 作为未完成响应 fail closed。
 - **usage 记账**：每次调用回传 input/output/total、cached input、reasoning token 与 cost（含 cached_input_tokens/cost 字段），供评估指标与诊断使用。成本按 `(input − cached)×input价 + cached×cache价 + output×output价` 计（input 已含缓存命中，命中部分按 cache 价）。
-- **重试（两层）**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。**运行级**（agent 层）在传输层耗尽后对瞬时类错误（NetworkError/RateLimited/ProviderOverloaded + 瞬时文本信号）再尝试至多 5 次（2s 指数退避 2/4/8/16s，可取消）；取消/挂起超时/认证/限额/校验/上下文溢出不重试。
+- **重试（两层）**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。**运行级**（agent 层）在传输层耗尽后对瞬时类错误（NetworkError/RateLimited/ProviderOverloaded + 瞬时文本信号）整轮至多 5 次尝试（首次 + 4 次重试，2s 指数退避 2/4/8/16s，可取消）；取消/挂起超时/认证/限额/校验/上下文溢出不重试。
 - **思考档位**：每模型显式声明 reasoning 档位；Chat 与 Responses 分别按各自 wire 合同发送对应字段。
 - **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等）+ 脱敏后的真实错误文本（敏感内容降级为 `Internal error`，不包含 API key、endpoint 原始请求/响应）；错误保留真实因果差异，不靠字符串匹配驱动控制流。
 - **配置校验**：配置值在本地信任边界完整校验，fail closed，不静默 trim/纠正；错误不携带原始值；API key 只通过配置引用的环境变量名解析，不进入会话/日志。
@@ -258,7 +270,7 @@ flowchart LR
 
 **trust 决策（裁决 7）**：对齐 Pi——陌生项目 ask / always / never；决策持久化到信任存储（CLI 显式覆盖 → 是否存在项目资源 → 信任存储 → 默认策略 → 交互选择）。**不信任的项目不加载项目指令、技能与扩展**。cap-std 路径硬化（nofollow capability 绑定）已删除。
 
-**资源加载**：按 root→cwd 顺序逐层收集项目指令文件（每层优先 AGENTS.override.md，否则 AGENTS.md），合并后作为 developer message 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB；来源与 aggregate SHA-256 作为内部校验事实。
+**资源加载**：按 root→cwd 顺序逐层收集项目指令文件（每层优先 AGENTS.override.md，否则 AGENTS.md），合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB；来源与 aggregate SHA-256 作为内部校验事实。
 
 ## 11. 客户端与协议
 
@@ -272,7 +284,7 @@ flowchart LR
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、project/trust、server/shutdown。turn/steer 与 turn/followUp 是同一连接内的内存投递能力；`session/read` 默认返回摘要 + 最近片段，不返回全文。事件流为实时输出（thread/started、turn/started、item/started、item/agentMessage/delta、item/completed、item/failed、turn/completed），**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、project/trust、server/shutdown。turn/steer 与 turn/followUp 只作用于运行中的 turn，投递时无活动 turn 或 turn 已终态返回 not found。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 的 `查看会话 <id>`/`session:<id>` 只把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出；客户端事件投影只含安全字段，不泄露 raw payload。
 
@@ -280,26 +292,25 @@ flowchart LR
 
 ### 12.1 脱敏与工具输出合同
 
-- core 维护敏感文本检测（敏感词表 + secret 形状检测：sk- / ghp_ / AKIA / AIza / JWT / bearer / flag 等）与保护路径规则（`.git` / `.agents` / `.singularity` 等元数据名）。
-- 工具输出先经过统一敏感检查与大小边界，再投影为 `ToolResult`：安全、未截断且在上限内的 JSON 保持结构化 `content`；文本摘要、敏感结果、超限与截断结果降级为有界且脱敏的 `preview`；`content` 与 `preview` 互斥。
-- 发送给模型的 tool result 只包含 ok、工具/调用标识、稳定 error_code、截断标记与已过滤的安全内容；不包含 raw arguments、路径、密钥或内部审计元数据；失败路径不回显 raw arguments 或错误原文。
+- 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id）；没有结构化 `ToolResult`/`preview` 投影层。
+- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），并按 tail 规则截断（最后 2000 行 / 50 KiB）；read 单行 ≤ 4 MiB、单次扫描 ≤ 64 MiB 且同样按 tail 规则截断。超限内容写入工作区临时文件并通过 `fullOutputPath` 文本标记返回，不向模型发送原文件内容。
+- 工具结果文本不包含 provider 原始响应；raw tool arguments 只存在于会话 assistant 条目的 `args` 字段，用于重建合法的 assistant tool_calls 续接，不进入错误正文。保护路径与密钥边界由 write/edit/read 的路径拒绝规则与 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
 
 ### 12.2 工具 schema（对齐 Pi）
 
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
-| read | `{path, offset?, limit?}` | 读文件/图片 |
-| bash | `{command, timeout_ms?}` | 超时默认 120s（可显式覆盖（schema: integer 1..=600000），硬上限 600000 ms）；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树（Unix 独立进程组） |
-| edit | `{path, edits:[{oldText,newText}]}` | 精确文本替换，一次多编辑，串行化；结果含 diff / firstChangedLine |
-| write | `{path, content}` | 写文件 |
-| grep（可选只读） | `{pattern, path?, glob?, ignoreCase?, literal?, context?, limit?}` | 尊重 .gitignore，默认 100 匹配上限 |
-| find（可选只读） | `{pattern, path?, limit?}` | 默认 1000 结果上限 |
-| ls（可选只读） | `{path?, limit?}` | 默认 500 条目上限 |
+| read | `{path, offset?, limit?}` | 文本文件有界读取（非图片）；单行 ≤ 4 MiB，单次扫描 ≤ 64 MiB；输出 tail 截断 2000 行 / 50 KiB，超限写临时文件并返回 fullOutputPath；offset 1-indexed，limit 自动 clamp 到 2000 |
+| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 使用 120000；显式 schema 为 integer `1..=600000`，负数/浮点/字符串/null/溢出为 typed 参数错误；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树（Unix 独立进程组） |
+| edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；保留行尾风格；结果含 diff / firstChangedLine |
+| write | `{path, content}` | 写文件（新建或覆盖） |
+| grep / find / ls | 不实现 | 当前 `ToolRegistry::new()` 只注册 read/bash/edit/write；可选只读工具面未注册 |
 
-### 12.3 会话落盘细节（照 Pi）
+### 12.3 会话落盘细节
 
-- 流式期间的消息 delta 不落盘；只有 `message_end` 的终态消息追加一行。
-- 纯 user 消息在第一条 assistant 消息之前不写盘（进程崩溃即丢失）。
+- 流式期间的消息 delta 不落盘；终态 user/assistant/toolResult/compaction 消息各追加一行。
+- turn 启动时当前 user 消息立即写盘（先于第一次模型请求），进程崩溃后重开会话可看到该 user 消息。
+- assistant tool-call 消息与其 toolResult 配对写盘；崩溃造成孤立 tool call 时，可写恢复路径先补 synthetic failed ToolResult（unknown / do not retry），不重写原条目、不重新执行工具。
 
 ### 12.4 错误码与错误合同
 

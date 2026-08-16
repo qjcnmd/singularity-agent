@@ -1,7 +1,7 @@
 //! Event delivery metadata and lifecycle event projection.
 //!
-//! stdio 单连接传输下事件全量发送；`event/subscribe` 在 Phase 3 从协议移除前保持
-//! 兼容响应，事件本身不依赖订阅。
+//! stdio 单连接传输下事件随请求响应全量发送；协议中不存在 `event/subscribe`
+//! 或订阅状态，客户端把 matching response 之前的 notification 关联到本次请求。
 
 use super::*;
 

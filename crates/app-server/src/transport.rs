@@ -49,8 +49,10 @@ impl ExecutionStop for AppServerCancellationHandle {
 
 /// 在单一 Tokio runtime 内运行 stdio app-server 控制面。
 pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
-    let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
-        .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
+    // 未设置 SINGULARITY_APP_SERVER_DB 时由 initialize_app_server 使用
+    // AppPaths::resolve() 的用户目录 index.sqlite3；这里不再保留旧的
+    // 项目目录 `.singularity/rust-app-server.sqlite3` 默认路径。
+    let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB").unwrap_or_default();
     run_with_io(
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),

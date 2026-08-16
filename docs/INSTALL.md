@@ -97,7 +97,7 @@ Provider 私有 reasoning/output items 为 approval、重启和跨 turn 的官�
 
 Provider 配置值不会被静默 trim 或纠正。进程环境和显式导入文件中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；导入文件的标准 `CRLF` 行尾仍会正常解析。
 
-工具选择及通用工具能力由运行时自动协商；模型专属的消息角色和 reasoning history 则必须通过下面的模型字段显式声明。协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#7-model-与-provider) 为准。
+工具面是 headless core 的静态 `ToolRegistry`（当前注册 read/bash/edit/write），不随模型名或 provider 动态协商；工具并行数、消息角色等能力由 provider 静态能力声明决定。模型专属的 reasoning history 则必须通过下面的模型字段显式声明。协议选择、能力声明、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#9-provider-与模型) 为准。
 
 需要跨仓库、跨 worktree 共用同一 provider 时，运行一次：
 
@@ -117,9 +117,9 @@ sg config models
 sg config models --refresh
 ```
 
-`/models` 响应只提供模型 ID，不提供协议、上下文窗口或 reasoning 能力。模型 ID 会进入用户目录的非敏感缓存；缓存读取有 1 MiB 上限，并校验 schema、endpoint hash、记录数量和每个 ID，非法或超大缓存只报告 `invalid`/`read_failed`，不会阻断已配置运行，也不会把控制字符或换行 ID 打印到 CLI。发现结果仍明确标记 `fresh`、`stale`、`unavailable` 或 `not_configured`。只有 `config.json` 中声明 `api_protocol`、`max_output_tokens` 以及需要的 `reasoning_variants`，并且完整模型校验、合法地址和认证都通过时才会标记为可选择。`max_context_tokens` 可选；省略时运行时保留 `unknown`，不猜测窗口或写入默认值，Agent 的上下文预算会显式处理未知状态。未知能力不会从模型名、URL 或 OpenAI-compatible 适配器推断。
+`/models` 响应只提供模型 ID，不提供协议、上下文窗口或 reasoning 能力。模型 ID 会进入用户目录的非敏感缓存；缓存读取有 1 MiB 上限，并校验 schema、endpoint hash、记录数量和每个 ID，非法或超大缓存只报告 `invalid`/`read_failed`，不会阻断已配置运行，也不会把控制字符或换行 ID 打印到 CLI。发现结果仍明确标记 `fresh`、`stale`、`unavailable` 或 `not_configured`。只有 `config.json` 中声明 `api_protocol`、`max_output_tokens` 以及需要的 `reasoning_variants`，并且完整模型校验、合法地址和认证都通过时才会标记为可选择。`max_context_tokens` 可选；省略时元数据保留 `unknown`（不写入默认声明），执行时本地 compaction 预算以默认 128000 兜底。未知能力不会从模型名、URL 或 OpenAI-compatible 适配器推断。
 
-OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wire 是否原生接受 `developer` 消息角色；设为 `false` 时，内部 developer 消息会在发送前投影为 `system`，不改变内部消息语义。省略时保持兼容默认值 `true`；provider 不接受 `developer` 角色时应显式写入 `false`。
+OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wire 是否原生接受 `developer` 消息角色；设为 `false` 时，内部指令在发送前经统一 role adaptation seam 投影：优先 `developer`，不可用则 `system`，两者都不可用时投影为带前缀的 `user` 消息，不改变内部消息语义。省略时保持兼容默认值 `true`；provider 不接受 `developer` 角色时应显式写入 `false`。
 
 模型若在带工具调用的续接中返回 provider reasoning，必须显式设置 `tool_reasoning_history`：`disabled`（省略时的默认值）表示不回放历史 reasoning；`reasoning_content` 只适用于 `api_protocol: "chat"`，在 assistant tool-call 续接中原样回放 Chat Completions 的 `reasoning_content`；`responses_items` 只适用于 `api_protocol: "responses"`，在实际返回 reasoning output item 时按原序列原样回放并绑定对应的 function-call IDs；Responses 合法 tool-call 响应未返回 reasoning item 时不合成 replay，也不因缺失而拒绝。启用非 `disabled` 值时，必须同时声明启用的 `reasoning_variants` 和匹配的 `default_variant`。取值应依据供应商官方协议说明或实际 wire 证据填写，不能从 `/models` 返回的模型 ID、模型名、URL 或 OpenAI-compatible 适配器推断。
 
@@ -156,7 +156,7 @@ OpenAI-compatible 模型可以设置 `supports_developer_role` 来声明 Chat wi
 }
 ```
 
-`thinking_wire_format` 只在 Chat Completions 模型上生效：`thinking_type` 使用 `thinking: {"type": ...}`，`enable_thinking` 使用供应商明确规定的顶层 `enable_thinking` 布尔字段。Responses 仍固定使用其 `reasoning` 对象。上下文窗口未知时保留 `unknown`，不猜测或填入默认值；Agent 会跳过本地窗口上限检查，但仍遵守显式输出上限。
+`thinking_wire_format` 只在 Chat Completions 模型上生效：`thinking_type` 使用 `thinking: {"type": ...}`，`enable_thinking` 使用供应商明确规定的顶层 `enable_thinking` 布尔字段。Responses 仍固定使用其 `reasoning` 对象。上下文窗口未知时保留 `unknown`；执行时本地 compaction 预算按默认 128000 上下文窗口兜底，且始终遵守显式输出上限。
 
 ## 从源码构建
 
@@ -184,13 +184,13 @@ cargo build --release --locked --package singularity_cli --package singularity_a
 sg run "检查当前项目并修复一个明确问题"
 ```
 
-默认 app-server SQLite 位于命令启动目录下：
+默认 app-server 会话索引位于用户目录：
 
 ```text
-.singularity/rust-app-server.sqlite3
+%USERPROFILE%\.singularity\index.sqlite3
 ```
 
-开发和自动化场景可以通过 `SINGULARITY_APP_SERVER_DB` 指向另一个数据库文件；普通安装不需要设置。
+会话正文位于同目录 `sessions\<uuid>.jsonl`。开发和自动化场景可以通过 `SINGULARITY_APP_SERVER_DB` 指向另一个 file-backed SQLite 文件；普通安装不需要设置。
 
 ## 更新与卸载
 
