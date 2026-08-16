@@ -4,6 +4,7 @@ target/
 work/
 
 # Local tool output and task evidence.
+.mimosa/
 .playwright-mcp/
 .qoder-cn/
 outputs/
