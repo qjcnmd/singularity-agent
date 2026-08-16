@@ -4,13 +4,6 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      run_self_hosted_windows:
-        description: Also run the manually requested self-hosted Windows native gates
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -29,14 +22,3 @@ jobs:
     uses: ./.github/workflows/rust-gates.yml
     permissions:
       contents: read
-
-  self-hosted-windows:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_self_hosted_windows }}
-    name: Manual Windows self-hosted native gates
-    uses: ./.github/workflows/rust-gates.yml
-    permissions:
-      contents: read
-    with:
-      rust_runner_matrix: >-
-        {"include":[{"name":"Windows self-hosted","runs_on":"[\"self-hosted\",\"windows\",\"x64\",\"singularity\"]","test_scope":"full"}]}
-      run_supply_chain: false

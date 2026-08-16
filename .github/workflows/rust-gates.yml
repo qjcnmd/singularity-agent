@@ -2,22 +2,6 @@ name: Rust gates
 
 on:
   workflow_call:
-    inputs:
-      rust_runner_matrix:
-        description: JSON matrix whose runs_on values are JSON-encoded runner selectors and whose test_scope values select full or hosted_linux tests
-        required: false
-        type: string
-        default: '{"include":[{"name":"Linux hosted contracts","runs_on":"\"ubuntu-latest\"","test_scope":"hosted_linux"},{"name":"Windows","runs_on":"\"windows-latest\"","test_scope":"full"}]}'
-      supply_chain_runner:
-        description: JSON-encoded runner selector for the supply-chain job
-        required: false
-        type: string
-        default: '"ubuntu-latest"'
-      run_supply_chain:
-        description: Whether to run the supply-chain policy job
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -28,9 +12,8 @@ defaults:
 
 jobs:
   supply-chain:
-    if: ${{ inputs.run_supply_chain }}
     name: Supply-chain policy
-    runs-on: ${{ fromJSON(inputs.supply_chain_runner) }}
+    runs-on: ubuntu-latest
 
     steps:
       - name: Configure isolated job environment
@@ -109,23 +92,19 @@ jobs:
       - name: Check locked dependency policy
         run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
 
-      - name: Clean self-hosted workspace
-        if: ${{ always() && runner.environment == 'self-hosted' }}
-        run: |
-          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/')
-          $repository = [IO.Path]::GetFullPath((git rev-parse --show-toplevel)).TrimEnd('\', '/')
-          if (-not $repository.Equals($workspace, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "refusing to clean outside the runner workspace"
-          }
-          git reset --hard HEAD
-          git clean -ffdx
-
   rust:
     name: Rust (${{ matrix.name }})
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.rust_runner_matrix) }}
+      matrix:
+        include:
+          - name: Linux hosted contracts
+            runs_on: ubuntu-latest
+            test_scope: hosted_linux
+          - name: Windows
+            runs_on: windows-latest
+            test_scope: full
 
     steps:
       - name: Configure isolated job environment
@@ -186,14 +165,3 @@ jobs:
 
       - name: Check repository diff
         run: git diff --check
-
-      - name: Clean self-hosted workspace
-        if: ${{ always() && runner.environment == 'self-hosted' }}
-        run: |
-          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/')
-          $repository = [IO.Path]::GetFullPath((git rev-parse --show-toplevel)).TrimEnd('\', '/')
-          if (-not $repository.Equals($workspace, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "refusing to clean outside the runner workspace"
-          }
-          git reset --hard HEAD
-          git clean -ffdx
