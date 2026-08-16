@@ -150,6 +150,13 @@ pub(crate) fn instruction_message(
     }
 }
 
+/// 有效输出上限 = min(配置值, provider 静态能力声明)；正常请求与
+/// compaction 摘要请求共用，避免摘要派生出超过模型上限的 max_tokens。
+fn effective_max_output_tokens(provider: &dyn Provider, configured: u64) -> u32 {
+    u32::try_from(configured.min(provider.protocol_contract().max_output_tokens as u64))
+        .unwrap_or(u32::MAX)
+}
+
 /// 新 headless core 的 Agent：会话 + compaction + 工具注册表 + 模型提供方。
 pub struct Agent {
     session: SessionManager,
@@ -170,7 +177,19 @@ impl Agent {
         config: AgentConfig,
         session: SessionManager,
     ) -> Result<Self> {
-        let compaction = CompactionEngine::new(Arc::clone(&provider));
+        // 摘要请求与正常请求使用同一模型偏好：不绑定时 max_output_tokens 缺省
+        // 会让摘要按 reserve 推导出超过模型输出上限的 max_tokens（真实链路已被
+        // Provider HTTP 400 拒绝），模型选择也会回落到 provider 默认。
+        let mut compaction_preferences = ModelPreferences::default();
+        if !config.model.is_empty() {
+            compaction_preferences.model_name = Some(config.model.clone());
+        }
+        compaction_preferences.max_output_tokens = Some(effective_max_output_tokens(
+            provider.as_ref(),
+            config.max_output_tokens,
+        ));
+        let compaction = CompactionEngine::new(Arc::clone(&provider))
+            .with_model_preferences(compaction_preferences);
         Ok(Self {
             session,
             compaction,
@@ -230,12 +249,8 @@ impl Agent {
         }
         // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略（旧 AgentLoop 同款）。
         let capabilities = self.provider.protocol_contract();
-        let max_output_tokens = u32::try_from(
-            self.config
-                .max_output_tokens
-                .min(capabilities.max_output_tokens as u64),
-        )
-        .unwrap_or(u32::MAX);
+        let max_output_tokens =
+            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
         let tools = self.tool_schemas(&capabilities);
         let tool_choice = ToolChoicePolicy {
             mode: ToolChoiceMode::Auto,
@@ -1973,6 +1988,72 @@ mod tests {
             context.messages[0]
                 .content
                 .starts_with(crate::message::COMPACTION_SUMMARY_PREFIX)
+        );
+    }
+
+    /// 7b. compaction 摘要请求必须继承有效输出上限：不绑定时会按 reserve
+    ///     派生超过模型 max_output_tokens 的请求（真实链路被 Provider 400 拒绝）。
+    #[test]
+    fn compaction_summarization_respects_model_output_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let big_text = "x".repeat(100_000);
+        let provider = Arc::new(FakeProvider::new(
+            fake_contract(),
+            vec![
+                FakeStep {
+                    text: big_text,
+                    tool_calls: vec![tool_call(
+                        "call_1",
+                        "write",
+                        json!({ "path": "out.txt", "content": "x" }),
+                    )],
+                    usage: ModelUsage {
+                        input_tokens: 19_000,
+                        output_tokens: 1_000,
+                        total_tokens: 20_000,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                        cost_estimate: None,
+                    },
+                },
+                FakeStep {
+                    text: "## Goal\nsummary".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage::default(),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(0, 0),
+                },
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig {
+                // 配置远大于 fake_contract 的 4096：有效上限必须取两者较小值。
+                context_window: 30_000,
+                max_output_tokens: 1_000_000,
+                ..AgentConfig::default()
+            },
+            session,
+        )
+        .unwrap();
+        let outcome = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap();
+        assert!(outcome.compacted);
+        let requests = provider.requests.lock().unwrap();
+        let summarization = requests
+            .iter()
+            .find(|request| request.request_id.starts_with("compaction-"))
+            .expect("summarization request recorded");
+        assert_eq!(
+            summarization.model_preferences.max_output_tokens,
+            Some(4_096),
+            "summarization output limit must be capped by the model capability"
         );
     }
 
