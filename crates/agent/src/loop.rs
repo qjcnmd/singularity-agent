@@ -2236,6 +2236,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orphaned_tool_call_reopens_without_executing_tool_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let target = workspace.join("should-not-exist.txt");
+        let mut session = SessionManager::create(&workspace, &dir.path().join("sessions")).unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "calling write".to_string(),
+                tool_call_id: Some("orphan_write_1".to_string()),
+                tool_name: Some("write".to_string()),
+                args: Some(json!({"path": target, "content": "must not be written"})),
+                timestamp: None,
+            })
+            .unwrap();
+        drop(session);
+        let file = dir.path().join("sessions").join(
+            std::fs::read_dir(dir.path().join("sessions"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        );
+        let mut session = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(session.repair_orphaned_tool_calls().unwrap(), 1);
+        let provider = Arc::new(FakeProvider::new(
+            fake_contract(),
+            vec![FakeStep {
+                text: "final".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(0, 0),
+            }],
+        ));
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let outcome = agent
+            .run("resume", &mut AgentEvents::new(), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(outcome.final_text, "final");
+        assert!(
+            !target.exists(),
+            "reopen repair must not execute the orphaned tool"
+        );
+        let entries = agent.session.build_context_entries().unwrap();
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                &entry.entry_type,
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::ToolResult
+                        && message.tool_call_id.as_deref() == Some("orphan_write_1")
+                        && message.content.contains("do not retry")
+            )
+        }));
+    }
+
     /// 8. 中断：取消令牌 → 终止并返回已完成的文本（aborted 语义，不报错）。
     #[test]
     fn cancelled_run_returns_aborted_outcome() {

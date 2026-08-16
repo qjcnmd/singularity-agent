@@ -688,6 +688,56 @@ impl SessionManager {
         Ok(context)
     }
 
+    /// 修复活动路径中崩溃遗留的孤立 assistant tool call。
+    ///
+    /// 对每个没有后续 ToolResult 配对的 tool_call_id，追加一条 synthetic failed
+    /// ToolResult（保留原 call id，明确 unknown/禁止自动重试）；不修改或删除
+    /// 原始 assistant entry，也不执行任何工具。
+    pub fn repair_orphaned_tool_calls(&mut self) -> Result<usize> {
+        let path = self.session_path();
+        let mut repaired = 0usize;
+        for &entry_index in &path {
+            let tool_call_id = match &self.entries[entry_index].entry_type {
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::Assistant =>
+                {
+                    message.tool_call_id.clone()
+                }
+                _ => None,
+            };
+            let Some(tool_call_id) = tool_call_id else {
+                continue;
+            };
+            let paired = path[path
+                .iter()
+                .position(|&index| index == entry_index)
+                .expect("path index")
+                + 1..]
+                .iter()
+                .any(|&later_index| {
+                    matches!(
+                        &self.entries[later_index].entry_type,
+                        SessionEntryType::Message(message)
+                            if message.role == AgentMessageRole::ToolResult
+                                && message.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                    )
+                });
+            if paired {
+                continue;
+            }
+            self.append_entry(SessionEntryType::Message(AgentMessage {
+                role: AgentMessageRole::ToolResult,
+                content: "[previous execution outcome unknown; do not retry]".to_string(),
+                tool_call_id: Some(tool_call_id),
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            }))?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
     /// 当前 leaf 路径上最近一次 compaction 摘要（session/read 的默认摘要）。
     pub fn summary(&self) -> Option<String> {
         let path = self.session_path();
@@ -1563,6 +1613,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry_ids(&messages.entries), vec![id2.clone(), id4.clone()]);
+    }
+
+    #[test]
+    fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let cwd = dir.path().join("project");
+        let session_id = "2e2c9e30-3f70-4b6c-a1de-46d55e4b9119";
+        let mut manager = SessionManager::create_with_id(&cwd, &sessions, session_id).unwrap();
+        manager
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: "calling tool".to_string(),
+                tool_call_id: Some("orphan_call_1".to_string()),
+                tool_name: Some("bash".to_string()),
+                args: Some(json!({"command": "echo should-not-run"})),
+                timestamp: None,
+            })
+            .unwrap();
+        let file = manager.path().to_path_buf();
+        drop(manager);
+
+        let mut reopened = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened.repair_orphaned_tool_calls().unwrap(), 1);
+        drop(reopened);
+
+        let reopened = SessionManager::open_existing(&file).unwrap();
+        let entries = reopened.build_context_entries().unwrap();
+        let tool_results = entries
+            .iter()
+            .filter_map(|entry| match &entry.entry_type {
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::ToolResult =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(
+            tool_results[0].tool_call_id.as_deref(),
+            Some("orphan_call_1")
+        );
+        assert!(
+            tool_results[0]
+                .content
+                .contains("previous execution outcome unknown")
+        );
+        assert!(tool_results[0].content.contains("do not retry"));
+
+        // 第二次打开不再追加：幂等。
+        let mut reopened = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened.repair_orphaned_tool_calls().unwrap(), 0);
     }
 
     #[test]

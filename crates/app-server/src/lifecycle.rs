@@ -144,7 +144,10 @@ impl AppServer {
         assistant_events: &mut AssistantItemEventState,
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<RunStatus> {
-        let session = self.open_session_for_thread(thread)?;
+        let mut session = self.open_session_for_thread(thread)?;
+        session
+            .repair_orphaned_tool_calls()
+            .map_err(AppServerError::Session)?;
         let (provider, config) = self.provider_and_config_for_thread(thread)?;
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
         let steer_handle = agent.steer_handle();
