@@ -1,15 +1,18 @@
 //! Windows owner-only ACL primitive.
 //!
 //! This is the single repository implementation for the model/store security
-//! layers. It pins one object by handle, verifies the current-user owner and a
-//! protected single-ACE DACL, and applies the same contract when repair is safe.
+//! layers. It pins one object by handle, verifies the current principal's
+//! ownership and a protected single-ACE DACL, and applies the same contract
+//! when repair is safe.
 //!
 //! The owner of an object is implicitly granted READ_CONTROL and WRITE_DAC by
 //! the access check even when the DACL does not name it, so tightening only
 //! ever writes the protected DACL through handles opened with those rights.
-//! WRITE_OWNER is never requested: the current user must already be the owner
-//! (it created the object), otherwise tightening fails closed instead of
-//! taking ownership of a foreign object.
+//! WRITE_OWNER is never requested: ownership follows the Windows rule that the
+//! object owner must be an enabled SID of the current token (the user, or an
+//! enabled group such as Administrators for elevated processes, whose created
+//! objects default to the group as owner). Anything else fails closed instead
+//! of taking ownership of a foreign object.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -29,7 +32,7 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING, GetAce, GetAclInformation, GetLengthSid,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-    TOKEN_QUERY, TOKEN_USER, TokenUser,
+    SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
@@ -40,10 +43,12 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const MAX_TOKEN_INFORMATION_BYTES: usize = 64 * 1024;
+/// winnt.h 的 SE_GROUP_ENABLED；windows-sys 0.52 未导出，就地固定。
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
 /// Verify that the exact object pinned by `file` has the owner-only contract.
 pub fn ensure_owner_only_handle(file: &File) -> io::Result<()> {
-    let current_sid = current_user_sid()?;
+    let principal = current_token_principal()?;
     let handle = file.as_raw_handle() as HANDLE;
     let mut owner = null_mut();
     let mut dacl = null_mut();
@@ -66,7 +71,7 @@ pub fn ensure_owner_only_handle(file: &File) -> io::Result<()> {
         }
         return Err(io::Error::other("owner-only ACL could not be checked"));
     }
-    let result = inspect_descriptor(descriptor, owner, dacl, &current_sid);
+    let result = inspect_descriptor(descriptor, owner, dacl, &principal);
     unsafe { LocalFree(descriptor as HLOCAL) };
     result
 }
@@ -133,7 +138,7 @@ fn ensure_owner_only_path(path: &Path, directory: bool) -> io::Result<()> {
                 path.display()
             ))
         })?;
-    if !handle_owner_is_current_user(&repair)? {
+    if !handle_owner_in_current_token(&repair)? {
         return Err(io::Error::other(format!(
             "path {} is owned by another user; refusing to tighten",
             path.display()
@@ -219,9 +224,9 @@ fn apply_owner_only_security(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// 读取 handle 固定对象的 owner SID 并与当前进程用户比较。
-fn handle_owner_is_current_user(file: &File) -> io::Result<bool> {
-    let current_sid = current_user_sid()?;
+/// 读取 handle 固定对象的 owner SID，判断其是否属于当前令牌的启用主体。
+fn handle_owner_in_current_token(file: &File) -> io::Result<bool> {
+    let principal = current_token_principal()?;
     let handle = file.as_raw_handle() as HANDLE;
     let mut owner = null_mut();
     let mut descriptor = null_mut();
@@ -243,7 +248,10 @@ fn handle_owner_is_current_user(file: &File) -> io::Result<bool> {
         }
         return Err(io::Error::other("owner-only ACL could not be checked"));
     }
-    let matches = unsafe { EqualSid(owner, current_sid.as_ptr() as *mut c_void) } != 0;
+    let matches = principal
+        .owner_sids
+        .iter()
+        .any(|sid| unsafe { EqualSid(owner, sid.as_ptr() as *mut c_void) } != 0);
     unsafe { LocalFree(descriptor as HLOCAL) };
     Ok(matches)
 }
@@ -252,13 +260,19 @@ fn inspect_descriptor(
     descriptor: *mut c_void,
     owner: *mut c_void,
     dacl: *mut ACL,
-    current_sid: &[u8],
+    principal: &TokenPrincipal,
 ) -> io::Result<()> {
-    if owner.is_null() || current_sid.is_empty() {
+    if owner.is_null() || principal.owner_sids.is_empty() {
         return Err(io::Error::other("path is not owner-only"));
     }
-    let current_sid = current_sid.as_ptr() as *mut c_void;
-    if unsafe { EqualSid(owner, current_sid) } == 0 || dacl.is_null() {
+    // owner 必须是当前令牌的启用主体（用户或启用组）：提升的管理员进程创建
+    // 的对象 owner 默认是 Administrators 组，Windows 按同一规则授予隐式
+    // READ_CONTROL/WRITE_DAC。
+    let owned_by_token = principal
+        .owner_sids
+        .iter()
+        .any(|sid| unsafe { EqualSid(owner, sid.as_ptr() as *mut c_void) } != 0);
+    if !owned_by_token || dacl.is_null() {
         return Err(io::Error::other("path is not owner-only"));
     }
     let mut control = 0u16;
@@ -310,7 +324,7 @@ fn inspect_descriptor(
     }
     let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
     let sid = &allowed.SidStart as *const u32 as *mut c_void;
-    if unsafe { EqualSid(sid, current_sid) } == 0 {
+    if unsafe { EqualSid(sid, principal.user_sid.as_ptr() as *mut c_void) } == 0 {
         return Err(io::Error::other("path DACL ACE is not the current user"));
     }
     let mut mask = allowed.Mask;
@@ -339,6 +353,78 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
     let result = current_user_sid_from_token(token);
     unsafe { CloseHandle(token) };
     result
+}
+
+/// 当前令牌的主体身份。
+struct TokenPrincipal {
+    /// 令牌用户 SID：写 ACE 的 trustee，也是单 ACE 校验的对象。
+    user_sid: Vec<u8>,
+    /// 判定对象所有权时视为"本进程主体"的 SID 集合（用户 + 启用组）。
+    owner_sids: Vec<Vec<u8>>,
+}
+
+fn current_token_principal() -> io::Result<TokenPrincipal> {
+    let mut token: HANDLE = 0;
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::other("owner-only ACL could not be checked"));
+    }
+    let result = current_token_principal_from_token(token);
+    unsafe { CloseHandle(token) };
+    result
+}
+
+fn current_token_principal_from_token(token: HANDLE) -> io::Result<TokenPrincipal> {
+    let user_sid = current_user_sid_from_token(token)?;
+    let mut owner_sids = vec![user_sid.clone()];
+    let mut length = 0;
+    let _ = unsafe { GetTokenInformation(token, TokenGroups, null_mut(), 0, &mut length) };
+    let length = usize::try_from(length)
+        .map_err(|_| io::Error::other("owner-only ACL could not be checked"))?;
+    if length == 0 || length > MAX_TOKEN_INFORMATION_BYTES {
+        return Err(io::Error::other("owner-only ACL could not be checked"));
+    }
+    let mut buffer = vec![0u8; length];
+    let mut return_length = length as u32;
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            buffer.as_mut_ptr() as *mut c_void,
+            length as u32,
+            &mut return_length,
+        )
+    } == 0
+    {
+        return Err(io::Error::other("owner-only ACL could not be checked"));
+    }
+    // TOKEN_GROUPS 是变长结构（Groups 只有 1 个元素的内联数组）：不能整块
+    // 拷贝到栈再切片，必须直接在缓冲区上读取 GroupCount 与条目数组。
+    let group_count = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const u32) } as usize;
+    let entries_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    let entries_ptr = unsafe { buffer.as_ptr().add(entries_offset) } as *const SID_AND_ATTRIBUTES;
+    let max_entries = (length - entries_offset) / std::mem::size_of::<SID_AND_ATTRIBUTES>();
+    let count = group_count.min(max_entries);
+    let entries = if count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(entries_ptr, count) }
+    };
+    for entry in entries {
+        if entry.Attributes & SE_GROUP_ENABLED == 0 || entry.Sid.is_null() {
+            continue;
+        }
+        let sid_length = unsafe { GetLengthSid(entry.Sid) } as usize;
+        if sid_length == 0 {
+            continue;
+        }
+        owner_sids.push(unsafe {
+            std::slice::from_raw_parts(entry.Sid as *const u8, sid_length).to_vec()
+        });
+    }
+    Ok(TokenPrincipal {
+        user_sid,
+        owner_sids,
+    })
 }
 
 fn current_user_sid_from_token(token: HANDLE) -> io::Result<Vec<u8>> {
