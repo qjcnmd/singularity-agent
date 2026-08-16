@@ -3280,6 +3280,46 @@ fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_pro
 }
 
 #[test]
+fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model() {
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"env_chat_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_BASE_URL" => Some(base_url.clone()),
+            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+    );
+    let provider = snapshot.provider().expect("env provider");
+    let request = ModelTurnRequest::new(
+        "env_developer_role_request",
+        vec![
+            ModelMessage::text(ModelRole::Developer, "instruction"),
+            ModelMessage::text(ModelRole::User, "hello"),
+        ],
+    );
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("env chat request");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let payload: serde_json::Value = serde_json::from_str(
+        &request_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured env chat request"),
+    )
+    .expect("env chat payload JSON");
+    let messages = payload["messages"].as_array().expect("env chat messages");
+    // env 路径没有 per-model 声明：chat wire 必须用通用的 system role，
+    // 不得发送 OpenAI 兼容端点普遍不接受的 developer（dashscope 实测 400）。
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
 fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinking_object() {
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",

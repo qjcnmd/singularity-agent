@@ -912,9 +912,13 @@ impl OpenAiProvider {
                         .as_ref()
                         .map(|selection| selection.thinking_wire_format)
                         .unwrap_or(super::ThinkingWireFormat::ThinkingType),
+                    // 无 selected_model（env 配置路径）时按 false 处理：OpenAI
+                    // 兼容 chat 端点对 developer role 的支持并不通用（dashscope
+                    // compatible-mode 实测 HTTP 400），wire 统一投影为 system；
+                    // 显式声明的模型保持用户配置的投影行为。
                     self.selected_model
                         .as_ref()
-                        .is_none_or(|selection| selection.supports_developer_role),
+                        .is_some_and(|selection| selection.supports_developer_role),
                     self.selected_model
                         .as_ref()
                         .is_none_or(|selection| selection.supports_tool_choice),
