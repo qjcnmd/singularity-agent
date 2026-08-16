@@ -35,7 +35,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
-    WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -118,13 +117,15 @@ pub fn ensure_owner_only_dir(path: &Path) -> io::Result<()> {
 }
 
 fn ensure_owner_only_path(path: &Path, directory: bool) -> io::Result<()> {
-    // 先用读类权限验证：与旧实现的 File::open 语义一致，被独占持有
-    // （share_mode(0)）的路径在验证阶段即 fail closed。
+    // 先用读类权限验证：已合规路径（包括被其他句柄以无写共享方式持有）不需要
+    // 写类句柄，与 File::open 语义一致；不合规才进入修复。
     let verify = open_security_path(path, directory, FILE_GENERIC_READ)
         .map_err(|error| io::Error::other(format!("verify {path:?}: {error}")))?;
     if ensure_owner_only_handle(&verify).is_ok() {
         return Ok(());
     }
+    // 修复序列（owner 预检查 → 写 protected DACL → 写后复核）在同一个句柄上
+    // 执行，钉住同一对象：外部 owner 在任何 ACL 修改前 fail closed。
     let repair =
         open_security_path(path, directory, READ_CONTROL | WRITE_DAC).map_err(|error| {
             io::Error::other(format!(
@@ -132,7 +133,7 @@ fn ensure_owner_only_path(path: &Path, directory: bool) -> io::Result<()> {
                 path.display()
             ))
         })?;
-    if !handle_owner_is_current_user(&verify)? {
+    if !handle_owner_is_current_user(&repair)? {
         return Err(io::Error::other(format!(
             "path {} is owned by another user; refusing to tighten",
             path.display()
@@ -140,9 +141,7 @@ fn ensure_owner_only_path(path: &Path, directory: bool) -> io::Result<()> {
     }
     set_owner_only_handle(&repair).map_err(|error| {
         io::Error::other(format!("set owner-only ACL on {}: {error}", path.display()))
-    })?;
-    ensure_owner_only_handle(&verify)
-        .map_err(|error| io::Error::other(format!("reverify {path:?}: {error}")))
+    })
 }
 
 /// Open the object pinned by `path` for security inspection/repair. The flags
@@ -188,8 +187,7 @@ fn apply_owner_only_security(file: &File) -> io::Result<()> {
             | FILE_GENERIC_WRITE
             | DELETE
             | READ_CONTROL
-            | WRITE_DAC
-            | WRITE_OWNER,
+            | WRITE_DAC,
         grfAccessMode: SET_ACCESS,
         grfInheritance: 0,
         Trustee: trustee,
