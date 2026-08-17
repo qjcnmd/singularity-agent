@@ -528,7 +528,7 @@ impl SessionManager {
         let (session_id, version, header_cwd) = validate_header(header)?;
         let migrated = version < CURRENT_SESSION_VERSION;
         if migrated {
-            migrate_entries(&mut parsed.entries, version);
+            migrate_entries(&mut parsed.entries, version)?;
         }
         let entries = validate_entries(&parsed.entries, &parsed.lines)?;
         if migrated || !matches!(parsed.repair, TailRepair::None) {
@@ -1250,16 +1250,17 @@ fn strict_entry_from_value(value: &Value) -> std::result::Result<SessionEntry, S
 
 /// v1/v2/v3→v4 迁移（Pi `migrateV1ToV2`/`migrateV2ToV3` + v3→v4 内容块化，
 /// 原地修改，仅 version < 4 时调用）。
-fn migrate_entries(entries: &mut [Value], version: u32) {
+fn migrate_entries(entries: &mut Vec<Value>, version: u32) -> Result<()> {
     if version < 2 {
-        migrate_v1_to_v2(entries);
+        migrate_v1_to_v2(entries.as_mut_slice());
     }
     if version < 3 {
-        migrate_v2_to_v3(entries);
+        migrate_v2_to_v3(entries.as_mut_slice());
     }
     if version < 4 {
-        migrate_v3_to_v4(entries);
+        migrate_v3_to_v4(entries, version == 3)?;
     }
+    Ok(())
 }
 
 /// v1 → v2：为每条 entry 分配 8 位十六进制 id 与 parentId 链；compaction 的
@@ -1340,7 +1341,12 @@ fn migrate_v2_to_v3(entries: &mut [Value]) {
 ///   文本块（非空时）+ `{"type":"tool_call","id":...,"name":...,"args":...}`，
 ///   并删除消息级 `toolCallId`/`toolName`/`args` 字段；
 /// - `toolResult` 保留 `toolCallId`/`toolName`（关联 assistant tool call）。
-fn migrate_v3_to_v4(entries: &mut [Value]) {
+///   对同一响应的多个工具调用，只有在连续 assistant 条目、同序 toolResult 条目、
+///   parent 链和引用关系都完整匹配时才合并；歧义布局直接失败并保留原文件。
+fn migrate_v3_to_v4(entries: &mut Vec<Value>, merge_tool_batches: bool) -> Result<()> {
+    if merge_tool_batches {
+        validate_v3_tool_call_batches(entries)?;
+    }
     for entry in entries.iter_mut() {
         let Some(object) = entry.as_object_mut() else {
             continue;
@@ -1367,7 +1373,6 @@ fn migrate_v3_to_v4(entries: &mut [Value]) {
                 if !text.is_empty() {
                     blocks.push(json!({"type": "text", "text": text}));
                 }
-                // v3 assistant 工具调用消息：单调用字段迁移为 tool_call 块。
                 if role == "assistant"
                     && let (Some(id), Some(name), args) = (
                         message.get("toolCallId").and_then(Value::as_str),
@@ -1390,6 +1395,225 @@ fn migrate_v3_to_v4(entries: &mut [Value]) {
             _ => {}
         }
     }
+    if merge_tool_batches {
+        merge_v3_tool_call_batches(entries)?;
+    }
+    Ok(())
+}
+
+fn ambiguous_v3_batch(reason: impl Into<String>) -> SessionError {
+    SessionError::InvalidStructure(format!("ambiguous v3 multi-tool batch: {}", reason.into()))
+}
+
+fn message_role(value: &Value) -> Option<&str> {
+    value
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+}
+
+fn message_tool_call_id(value: &Value) -> Option<&str> {
+    value
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("toolCallId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn message_content_non_empty(value: &Value) -> bool {
+    value
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.is_empty())
+}
+
+fn entry_id(value: &Value) -> Option<&str> {
+    value.get("id").and_then(Value::as_str)
+}
+
+fn entry_parent_id(value: &Value) -> Option<&str> {
+    value.get("parentId").and_then(Value::as_str)
+}
+
+fn entry_first_kept_id(value: &Value) -> Option<&str> {
+    value.get("firstKeptEntryId").and_then(Value::as_str)
+}
+
+fn validate_v3_tool_call_batches(entries: &[Value]) -> Result<()> {
+    let mut index = 1usize;
+    while index < entries.len() {
+        if message_role(&entries[index]) != Some("assistant") {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < entries.len() && message_role(&entries[index]) == Some("assistant") {
+            index += 1;
+        }
+        let end = index;
+        let count = end - start;
+        let tool_count = (start..end)
+            .filter(|&position| message_tool_call_id(&entries[position]).is_some())
+            .count();
+        if tool_count == 0 {
+            continue;
+        }
+        if tool_count != count {
+            return Err(ambiguous_v3_batch(
+                "consecutive assistant entries mix tool calls and plain messages",
+            ));
+        }
+        if count == 1 {
+            continue;
+        }
+        if end.saturating_add(count) > entries.len() {
+            return Err(ambiguous_v3_batch("toolResult run is incomplete"));
+        }
+
+        let mut call_ids = Vec::with_capacity(count);
+        let mut seen_call_ids = HashSet::with_capacity(count);
+        for position in start..end {
+            let message = entries[position]
+                .get("message")
+                .and_then(Value::as_object)
+                .ok_or_else(|| ambiguous_v3_batch("assistant message payload is missing"))?;
+            let call_id = message_tool_call_id(&entries[position])
+                .ok_or_else(|| ambiguous_v3_batch("assistant tool call id is missing"))?;
+            if message
+                .get("toolName")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name.is_empty())
+                || !message.contains_key("args")
+            {
+                return Err(ambiguous_v3_batch(
+                    "assistant tool call name or args is missing",
+                ));
+            }
+            if position > start {
+                if message_content_non_empty(&entries[position]) {
+                    return Err(ambiguous_v3_batch(
+                        "non-first assistant entry contains text",
+                    ));
+                }
+                let previous_id = entry_id(&entries[position - 1])
+                    .ok_or_else(|| ambiguous_v3_batch("assistant entry id is missing"))?;
+                if entry_parent_id(&entries[position]) != Some(previous_id) {
+                    return Err(ambiguous_v3_batch("assistant parent chain is not linear"));
+                }
+            }
+            if !seen_call_ids.insert(call_id) {
+                return Err(ambiguous_v3_batch("assistant tool call ids are duplicated"));
+            }
+            call_ids.push(call_id.to_string());
+        }
+
+        for offset in 0..count {
+            let result = &entries[end + offset];
+            if message_role(result) != Some("toolResult")
+                || message_tool_call_id(result) != Some(call_ids[offset].as_str())
+            {
+                return Err(ambiguous_v3_batch(
+                    "toolResult ids or order do not match assistant calls",
+                ));
+            }
+            let expected_parent = if offset == 0 {
+                entry_id(&entries[end - 1])
+            } else {
+                entry_id(&entries[end + offset - 1])
+            };
+            if entry_parent_id(result) != expected_parent {
+                return Err(ambiguous_v3_batch("toolResult parent chain is not linear"));
+            }
+        }
+
+        let dropped_ids: HashSet<&str> = (start + 1..end)
+            .filter_map(|position| entry_id(&entries[position]))
+            .collect();
+        for (position, entry) in entries.iter().enumerate() {
+            if (start..end + count).contains(&position) {
+                continue;
+            }
+            if entry_parent_id(entry).is_some_and(|id| dropped_ids.contains(id))
+                || entry_first_kept_id(entry).is_some_and(|id| dropped_ids.contains(id))
+            {
+                return Err(ambiguous_v3_batch(
+                    "another entry references an assistant id that would be removed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn single_converted_tool_call(value: &Value) -> Option<Value> {
+    if message_role(value) != Some("assistant") {
+        return None;
+    }
+    let blocks = value
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)?;
+    let calls: Vec<Value> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_call"))
+        .cloned()
+        .collect();
+    (calls.len() == 1).then(|| calls.into_iter().next().expect("one call exists"))
+}
+
+fn merge_v3_tool_call_batches(entries: &mut Vec<Value>) -> Result<()> {
+    let mut index = 1usize;
+    while index < entries.len() {
+        if single_converted_tool_call(&entries[index]).is_none() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < entries.len() && single_converted_tool_call(&entries[index]).is_some() {
+            index += 1;
+        }
+        let end = index;
+        let count = end - start;
+        if count < 2 {
+            continue;
+        }
+        if end.saturating_add(count) > entries.len() {
+            return Err(ambiguous_v3_batch("converted toolResult run is incomplete"));
+        }
+        let mut merged_content = entries[start]
+            .get("message")
+            .and_then(Value::as_object)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| ambiguous_v3_batch("converted assistant content is missing"))?;
+        for entry in entries.iter().take(end).skip(start + 1) {
+            merged_content.push(
+                single_converted_tool_call(entry)
+                    .ok_or_else(|| ambiguous_v3_batch("converted tool call is missing"))?,
+            );
+        }
+        let assistant_id = entry_id(&entries[start])
+            .ok_or_else(|| ambiguous_v3_batch("merged assistant entry id is missing"))?
+            .to_string();
+        entries[start]
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ambiguous_v3_batch("merged assistant message is missing"))?
+            .insert("content".to_string(), Value::Array(merged_content));
+        entries[end]
+            .as_object_mut()
+            .ok_or_else(|| ambiguous_v3_batch("first toolResult entry is missing"))?
+            .insert("parentId".to_string(), Value::String(assistant_id));
+        entries.drain(start + 1..end);
+        index = start + 1 + count;
+    }
+    Ok(())
 }
 
 fn lock_append(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
@@ -1824,7 +2048,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(matches!(&entries[1].entry_type,
             SessionEntryType::Message(m) if m.role == AgentMessageRole::Custom && m.content_text() == "injected"));
-        // 文件已重写为 v3，hookMessage → custom。
+        // 文件已重写为 v4，hookMessage → custom。
         let rewritten: Vec<Value> = std::fs::read_to_string(&file)
             .unwrap()
             .lines()
@@ -1882,6 +2106,101 @@ mod tests {
         assert_eq!(assistant["content"][1]["name"], "write");
         assert!(assistant.get("toolCallId").is_none());
         assert!(assistant.get("args").is_none());
+    }
+
+    #[test]
+    fn open_migrates_v3_multi_tool_batch_to_one_assistant_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("v3-multi.jsonl");
+        let lines = [
+            r#"{"type":"session","version":3,"id":"v3-multi-session","timestamp":"2024-01-01T00:00:00.000Z","cwd":"C:/work"}"#,
+            r#"{"type":"message","id":"user0001","parentId":null,"timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":"fix both"}}"#,
+            r#"{"type":"message","id":"assist001","parentId":"user0001","timestamp":"2024-01-01T00:00:02.000Z","message":{"role":"assistant","content":"calling both","toolCallId":"call_1","toolName":"write","args":{"path":"a.txt","content":"a"}}}"#,
+            r#"{"type":"message","id":"assist002","parentId":"assist001","timestamp":"2024-01-01T00:00:02.001Z","message":{"role":"assistant","content":"","toolCallId":"call_2","toolName":"write","args":{"path":"b.txt","content":"b"}}}"#,
+            r#"{"type":"message","id":"result001","parentId":"assist002","timestamp":"2024-01-01T00:00:03.000Z","message":{"role":"toolResult","content":"wrote a","toolCallId":"call_1","toolName":"write"}}"#,
+            r#"{"type":"message","id":"result002","parentId":"result001","timestamp":"2024-01-01T00:00:04.000Z","message":{"role":"toolResult","content":"wrote b","toolCallId":"call_2","toolName":"write"}}"#,
+        ];
+        std::fs::write(&file, lines.join("\n")).unwrap();
+
+        let manager = SessionManager::open(&file).unwrap();
+        let entries = manager.build_context_entries().unwrap();
+        assert_eq!(entries.len(), 4);
+        let assistant = match &entries[1].entry_type {
+            SessionEntryType::Message(message) => message,
+            other => panic!("expected merged assistant message, got {other:?}"),
+        };
+        assert_eq!(assistant.role, AgentMessageRole::Assistant);
+        assert_eq!(assistant.content_text(), "calling both");
+        let calls = assistant.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(
+            calls[0],
+            ContentBlock::ToolCall { id, name, args }
+                if id == "call_1"
+                    && name == "write"
+                    && args == &serde_json::json!({"path":"a.txt","content":"a"})
+        ));
+        assert!(matches!(
+            calls[1],
+            ContentBlock::ToolCall { id, name, args }
+                if id == "call_2"
+                    && name == "write"
+                    && args == &serde_json::json!({"path":"b.txt","content":"b"})
+        ));
+        let context = manager.build_session_context().unwrap();
+        assert_eq!(context.messages[1].tool_calls.len(), 2);
+        assert_eq!(context.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(context.messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert!(matches!(
+            &entries[2].entry_type,
+            SessionEntryType::Message(message)
+                if message.role == AgentMessageRole::ToolResult
+                    && message.tool_call_id.as_deref() == Some("call_1")
+        ));
+        assert!(matches!(
+            &entries[3].entry_type,
+            SessionEntryType::Message(message)
+                if message.role == AgentMessageRole::ToolResult
+                    && message.tool_call_id.as_deref() == Some("call_2")
+        ));
+
+        let rewritten: Vec<Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(rewritten.len(), 5);
+        assert_eq!(rewritten[0]["version"], 4);
+        assert_eq!(
+            rewritten[2]["message"]["content"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(rewritten[2]["message"]["content"][1]["id"], "call_1");
+        assert_eq!(rewritten[2]["message"]["content"][2]["id"], "call_2");
+        assert!(rewritten[2]["message"].get("toolCallId").is_none());
+        assert_eq!(rewritten[3]["parentId"], "assist001");
+    }
+
+    #[test]
+    fn open_rejects_ambiguous_v3_multi_tool_batch_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("v3-ambiguous.jsonl");
+        let lines = [
+            r#"{"type":"session","version":3,"id":"v3-ambiguous-session","timestamp":"2024-01-01T00:00:00.000Z","cwd":"C:/work"}"#,
+            r#"{"type":"message","id":"user0001","parentId":null,"timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":"fix both"}}"#,
+            r#"{"type":"message","id":"assist001","parentId":"user0001","timestamp":"2024-01-01T00:00:02.000Z","message":{"role":"assistant","content":"calling both","toolCallId":"call_1","toolName":"write","args":{"path":"a.txt","content":"a"}}}"#,
+            r#"{"type":"message","id":"assist002","parentId":"assist001","timestamp":"2024-01-01T00:00:02.001Z","message":{"role":"assistant","content":"","toolCallId":"call_2","toolName":"write","args":{"path":"b.txt","content":"b"}}}"#,
+            r#"{"type":"message","id":"result001","parentId":"assist002","timestamp":"2024-01-01T00:00:03.000Z","message":{"role":"toolResult","content":"wrote unknown","toolCallId":"call_unknown","toolName":"write"}}"#,
+        ];
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let original = std::fs::read(&file).unwrap();
+
+        let error = match SessionManager::open(&file) {
+            Ok(_) => panic!("ambiguous v3 batch must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SessionError::InvalidStructure(_)));
+        assert_eq!(std::fs::read(&file).unwrap(), original);
     }
 
     /// 7. assistant 带 tool call 的消息投影为带 tool_calls 的 LLM 消息（Phase 2d 扩展，
