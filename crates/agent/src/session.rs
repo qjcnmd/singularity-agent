@@ -9,18 +9,18 @@
 //! - `SessionEntryType` 在契约三个变体之外增加 `ModelChange`/`ThinkingLevelChange`
 //!   （build_session_context 提取 model/thinking 所需）与 `Other(Value)`（未建模条目
 //!   原样保留，迁移重写不丢数据）。
-//! - 消息 `content` 为字符串：读取真实 Pi 文件中 content block 数组的消息时，该条目
-//!   原样保留（`Other`）但不进入 LLM 上下文；assistant 消息的 provider/model 因此
-//!   也无法参与 model 提取（Pi 从 assistant 消息读 provider/model，我们只从
-//!   `model_change` 条目提取）。
+//! - 消息 `content` 使用 `Vec<ContentBlock>`，并在 assistant 条目中持久化
+//!   provider-private continuation state（例如 Responses opaque output items）；
+//!   该私有状态原样重放到 provider boundary，不进入公开 Debug 文本。
 //! - `append_message` 立即写盘（Pi 延迟到首个 assistant 消息才建文件，规格明确要求
 //!   立即写盘）。
 //! - 路径遍历带防环保护（Pi 对损坏的 parentId 环会死循环）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::de::DeserializeOwned;
 use serde::ser::Error as _;
@@ -54,6 +54,22 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("session json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("session header is invalid: {0}")]
+    InvalidHeader(String),
+    #[error("session line {line} is malformed: {cause}")]
+    MalformedLine { line: usize, cause: String },
+    #[error("session entry at line {line} is invalid: {cause}")]
+    InvalidEntry { line: usize, cause: String },
+    #[error("session entry id is duplicated: {0}")]
+    DuplicateId(String),
+    #[error("session entry {entry_id} refers to missing parent {parent_id}")]
+    MissingParent { entry_id: String, parent_id: String },
+    #[error("session parent cycle detected at entry {0}")]
+    ParentCycle(String),
+    #[error("session entry structure is invalid: {0}")]
+    InvalidStructure(String),
+    #[error("session repair failed: {0}")]
+    Repair(String),
     #[error("{0}")]
     InvalidSession(String),
     #[error("entry {0} not found")]
@@ -252,7 +268,8 @@ impl SessionEntry {
     }
 }
 
-/// 已知类型 payload 解析失败时降级为 `Other`（原样保留，Pi 对 payload 深度校验同样宽松）。
+/// `SessionEntry` 的通用反序列化保留未知/旧 payload；严格 reopen 路径使用
+/// `strict_entry_from_value`，不会把已知 schema 错误降级为 `Other`。
 fn typed_or_other<T: DeserializeOwned>(
     value: &Value,
     build: impl FnOnce(T) -> SessionEntryType,
@@ -378,6 +395,8 @@ pub struct SessionManager {
     /// 会话 id（header 字段与文件名来源）。Phase 2a 无读取方，契约保留。
     #[allow(dead_code)]
     session_id: String,
+    /// 同一 session 的 append 必须串行化；锁只保护 durable append 窗口。
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
@@ -472,10 +491,11 @@ impl SessionManager {
             by_id: HashMap::new(),
             leaf_id: None,
             session_id,
+            append_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    /// 打开会话文件：逐行解析，v1/v2 文件按 Pi `session-manager.js` 迁移逻辑升级为 v3，
+    /// 打开会话文件：逐行解析，v1/v2/v3 文件按 Pi `session-manager.js` 迁移逻辑升级为 v4，
     /// 发生迁移时重写文件（Pi `_setSessionFile` 行为）。
     ///
     /// 文件不存在或为空时按 Pi 语义创建新会话并写入 header；非空但无法解析为合法
@@ -497,57 +517,33 @@ impl SessionManager {
                 file.display()
             )));
         }
-        let mut raw_entries = parse_session_lines(&file)?;
-        if raw_entries.is_empty() {
+        let mut parsed = parse_session_lines(&file)?;
+        if parsed.entries.is_empty() {
             return Err(SessionError::InvalidSession(format!(
                 "Session file is not a valid pi session: {}",
                 file.display()
             )));
         }
-        let header = &raw_entries[0];
-        if header.get("type").and_then(Value::as_str) != Some("session")
-            || header.get("id").and_then(Value::as_str).is_none()
-        {
-            return Err(SessionError::InvalidSession(format!(
-                "Session file is not a valid pi session: {}",
-                file.display()
-            )));
+        let header = &parsed.entries[0];
+        let (session_id, version, header_cwd) = validate_header(header)?;
+        let migrated = version < CURRENT_SESSION_VERSION;
+        if migrated {
+            migrate_entries(&mut parsed.entries, version);
         }
-        let version = header.get("version").and_then(Value::as_u64).unwrap_or(1) as u32;
-        // 迁移会原地修改 raw_entries（含 header 的 version 字段），先取出不变的字段。
-        let session_id = header
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let header_cwd = header
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if version < CURRENT_SESSION_VERSION {
-            migrate_entries(&mut raw_entries, version);
-            rewrite_file(&file, &raw_entries)?;
+        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
+        if migrated || !matches!(parsed.repair, TailRepair::None) {
+            rewrite_file(&file, &parsed.entries)?;
         }
+        // header 的 cwd 已在迁移前取出；迁移只改变持久化 JSON，不改变会话身份。
         let cwd = header_cwd
             .map(|cwd| normalize_abs_path(Path::new(&cwd)))
             .transpose()?
             .unwrap_or(std::env::current_dir()?);
-        let mut entries = Vec::new();
         let mut by_id = HashMap::new();
         let mut leaf_id: Option<String> = None;
-        for raw in raw_entries.into_iter().skip(1) {
-            // Pi 的 getEntries() 过滤 header；中段 session 行同样不属于树。
-            if raw.get("type").and_then(Value::as_str) == Some("session") {
-                continue;
-            }
-            let Ok(entry) = SessionEntry::from_value(&raw) else {
-                // 迁移后仍无法解析的行跳过（Pi 对垃圾行同样容忍）。
-                continue;
-            };
-            let id = entry.id.clone();
-            by_id.insert(id.clone(), entries.len());
-            leaf_id = Some(id);
-            entries.push(entry);
+        for (index, entry) in entries.iter().enumerate() {
+            by_id.insert(entry.id.clone(), index);
+            leaf_id = Some(entry.id.clone());
         }
         Ok(Self {
             file,
@@ -556,6 +552,7 @@ impl SessionManager {
             by_id,
             leaf_id,
             session_id,
+            append_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -584,6 +581,7 @@ impl SessionManager {
             by_id: HashMap::new(),
             leaf_id: None,
             session_id,
+            append_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -598,20 +596,26 @@ impl SessionManager {
     }
 
     fn append_entry(&mut self, entry_type: SessionEntryType) -> Result<String> {
-        let id = generate_id(|candidate| self.by_id.contains_key(candidate));
-        let entry = SessionEntry {
-            id: id.clone(),
-            parent_id: self.leaf_id.clone().unwrap_or_default(),
-            timestamp: Some(now_iso()),
-            entry_type,
+        let (id, entry) = {
+            let _guard = lock_append(&self.append_lock);
+            let id = generate_id(|candidate| self.by_id.contains_key(candidate));
+            let entry = SessionEntry {
+                id: id.clone(),
+                parent_id: self.leaf_id.clone().unwrap_or_default(),
+                timestamp: Some(now_iso()),
+                entry_type,
+            };
+            let serialized = serde_json::to_string(&entry)?;
+            let mut handle = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.file)?;
+            handle.write_all(serialized.as_bytes())?;
+            handle.write_all(b"\n")?;
+            handle.flush()?;
+            (id, entry)
         };
-        // Pi appendFileSync 语义：append + write + flush，无事务、无锁。
-        let mut handle = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file)?;
-        writeln!(handle, "{}", serde_json::to_string(&entry)?)?;
-        handle.flush()?;
+        // 只有 durable append 完成后才推进内存索引。
         self.by_id.insert(id.clone(), self.entries.len());
         self.entries.push(entry);
         self.leaf_id = Some(id.clone());
@@ -965,57 +969,283 @@ fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
     }
 }
 
-/// 有界逐行解析 session 文件：单行、总字节、总条目都有硬上限。
-fn parse_session_lines(file: &Path) -> Result<Vec<Value>> {
-    let path = file;
-    let handle = File::open(file)?;
-    let mut reader = BufReader::with_capacity(64 * 1024, handle);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailRepair {
+    None,
+    RemoveTornTail,
+    AddFinalNewline,
+}
+
+struct ParsedSessionLines {
+    entries: Vec<Value>,
+    lines: Vec<usize>,
+    repair: TailRepair,
+}
+
+/// 有界逐行解析 session 文件：中间坏行 fail closed，只有最后物理行明确是
+/// 未完成的 JSON/UTF-8 append 才允许丢弃并原子修复。
+fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
+    let bytes = std::fs::read(file)?;
+    if bytes.len() > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::InvalidSession(format!(
+            "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
+            MAX_SESSION_FILE_BYTES
+        )));
+    }
+
     let mut entries = Vec::new();
-    let mut total_bytes = 0usize;
-    loop {
-        let mut line = Vec::new();
-        let limit = u64::try_from(MAX_SESSION_LINE_BYTES).unwrap_or(u64::MAX);
-        let read = {
-            let mut limited = reader.by_ref().take(limit.saturating_add(1));
-            limited.read_until(b'\n', &mut line)?
+    let mut lines = Vec::new();
+    let mut repair = TailRepair::None;
+    let mut start = 0usize;
+    let mut line_number = 1usize;
+    while start < bytes.len() {
+        let newline = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset);
+        let (end, has_newline) = match newline {
+            Some(end) => (end, true),
+            None => (bytes.len(), false),
         };
-        if read == 0 {
-            break;
+        let mut line = &bytes[start..end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
         }
-        if !line.ends_with(b"\n") && read > limit as usize {
+        if line.len() > MAX_SESSION_LINE_BYTES {
             return Err(SessionError::InvalidSession(format!(
-                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes: {}",
-                path_display(path)
+                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes at line {line_number}"
             )));
         }
-        total_bytes = total_bytes.saturating_add(read);
-        if total_bytes > MAX_SESSION_FILE_BYTES || entries.len() >= MAX_SESSION_ENTRIES {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            if !has_newline {
+                break;
+            }
+            start = end + 1;
+            line_number += 1;
+            continue;
+        }
+
+        let text = match std::str::from_utf8(line) {
+            Ok(text) => text,
+            Err(error) if !has_newline && error.error_len().is_none() => {
+                repair = TailRepair::RemoveTornTail;
+                break;
+            }
+            Err(error) => {
+                return Err(SessionError::MalformedLine {
+                    line: line_number,
+                    cause: format!("invalid UTF-8: {error}"),
+                });
+            }
+        };
+        let value = match serde_json::from_str::<Value>(text) {
+            Ok(value) => value,
+            Err(error) if !has_newline && error.is_eof() => {
+                repair = TailRepair::RemoveTornTail;
+                break;
+            }
+            Err(error) => {
+                return Err(SessionError::MalformedLine {
+                    line: line_number,
+                    cause: error.to_string(),
+                });
+            }
+        };
+        if !value.is_object() {
+            return Err(SessionError::InvalidEntry {
+                line: line_number,
+                cause: "session entry is not a JSON object".to_string(),
+            });
+        }
+        if entries.len() >= MAX_SESSION_ENTRIES {
             return Err(SessionError::InvalidSession(format!(
                 "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
                 MAX_SESSION_FILE_BYTES
             )));
         }
-        if line.ends_with(b"\n") {
-            line.pop();
-            if line.ends_with(b"\r") {
-                line.pop();
-            }
+        entries.push(value);
+        lines.push(line_number);
+        if !has_newline {
+            repair = TailRepair::AddFinalNewline;
+            break;
         }
-        if line.iter().all(u8::is_ascii_whitespace) {
+        start = end + 1;
+        line_number += 1;
+    }
+    Ok(ParsedSessionLines {
+        entries,
+        lines,
+        repair,
+    })
+}
+
+fn validate_header(value: &Value) -> Result<(String, u32, Option<String>)> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| SessionError::InvalidHeader("header is not a JSON object".into()))?;
+    if object.get("type").and_then(Value::as_str) != Some("session") {
+        return Err(SessionError::InvalidHeader(
+            "first entry is not a session header".into(),
+        ));
+    }
+    let session_id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| SessionError::InvalidHeader("header id must be a non-empty string".into()))?
+        .to_string();
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .filter(|version| (1..=CURRENT_SESSION_VERSION).contains(version))
+        .ok_or_else(|| {
+            SessionError::InvalidHeader(format!(
+                "header version must be an integer in 1..={CURRENT_SESSION_VERSION}"
+            ))
+        })?;
+    let cwd = match object.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cwd)) => Some(cwd.clone()),
+        Some(_) => {
+            return Err(SessionError::InvalidHeader(
+                "header cwd must be a string".into(),
+            ));
+        }
+    };
+    Ok((session_id, version, cwd))
+}
+
+fn validate_entries(raw_entries: &[Value], lines: &[usize]) -> Result<Vec<SessionEntry>> {
+    let mut entries = Vec::with_capacity(raw_entries.len().saturating_sub(1));
+    let mut ids = HashSet::new();
+    for (index, raw) in raw_entries.iter().enumerate().skip(1) {
+        let line = lines.get(index).copied().unwrap_or(index + 1);
+        if raw.get("type").and_then(Value::as_str) == Some("session") {
+            return Err(SessionError::InvalidStructure(format!(
+                "intermediate session header at line {line}"
+            )));
+        }
+        let entry = strict_entry_from_value(raw)
+            .map_err(|cause| SessionError::InvalidEntry { line, cause })?;
+        if !ids.insert(entry.id.clone()) {
+            return Err(SessionError::DuplicateId(entry.id));
+        }
+        entries.push(entry);
+    }
+
+    let parent_by_id: HashMap<String, String> = entries
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.parent_id.clone()))
+        .collect();
+    let roots = entries
+        .iter()
+        .filter(|entry| entry.parent_id.is_empty())
+        .count();
+    if roots > 1 {
+        return Err(SessionError::InvalidStructure(format!(
+            "session tree has {roots} roots; at most one is allowed"
+        )));
+    }
+    for entry in &entries {
+        if !entry.parent_id.is_empty() && !parent_by_id.contains_key(&entry.parent_id) {
+            return Err(SessionError::MissingParent {
+                entry_id: entry.id.clone(),
+                parent_id: entry.parent_id.clone(),
+            });
+        }
+    }
+    // 每个节点至多沿 parent 链走一次，避免 200k 条目线性链退化为 O(n²)。
+    let mut resolved = HashSet::new();
+    for entry in &entries {
+        if resolved.contains(&entry.id) {
             continue;
         }
-        // Pi `parseSessionEntryLine`：JSON 解析失败与非对象行跳过。
-        if let Ok(value) = serde_json::from_slice::<Value>(&line)
-            && value.is_object()
-        {
-            entries.push(value);
+        let mut cursor = entry.id.clone();
+        let mut path = Vec::new();
+        let mut path_set = HashSet::new();
+        loop {
+            if resolved.contains(&cursor) {
+                break;
+            }
+            if !path_set.insert(cursor.clone()) {
+                return Err(SessionError::ParentCycle(cursor));
+            }
+            path.push(cursor.clone());
+            let parent = parent_by_id
+                .get(&cursor)
+                .expect("entry ids were collected before parent traversal");
+            if parent.is_empty() {
+                break;
+            }
+            cursor = parent.clone();
         }
+        resolved.extend(path);
     }
     Ok(entries)
 }
 
-fn path_display(path: &Path) -> String {
-    path.display().to_string()
+fn strict_entry_from_value(value: &Value) -> std::result::Result<SessionEntry, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "session entry is not a JSON object".to_string())?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "session entry id must be a non-empty string".to_string())?
+        .to_string();
+    let parent_id = match object.get("parentId") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(parent)) => parent.clone(),
+        Some(_) => return Err("session entry parentId is not a string".into()),
+    };
+    let timestamp = object
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let entry_type = match object.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let message = value
+                .get("message")
+                .ok_or_else(|| "message entry has no message payload".to_string())?;
+            SessionEntryType::Message(
+                serde_json::from_value(message.clone())
+                    .map_err(|error| format!("invalid message payload: {error}"))?,
+            )
+        }
+        Some("compaction") => SessionEntryType::Compaction(
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid compaction payload: {error}"))?,
+        ),
+        Some("custom") => SessionEntryType::Custom(
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid custom payload: {error}"))?,
+        ),
+        Some("model_change") => {
+            let wire: ModelChangeWire = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid model_change payload: {error}"))?;
+            SessionEntryType::ModelChange {
+                provider: wire.provider,
+                model_id: wire.model_id,
+            }
+        }
+        Some("thinking_level_change") => {
+            let wire: ThinkingLevelChangeWire = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid thinking_level_change payload: {error}"))?;
+            SessionEntryType::ThinkingLevelChange {
+                thinking_level: wire.thinking_level,
+            }
+        }
+        Some(_) => SessionEntryType::Other(value.clone()),
+        None => return Err("session entry has no type".into()),
+    };
+    Ok(SessionEntry {
+        id,
+        parent_id,
+        timestamp,
+        entry_type,
+    })
 }
 
 /// v1/v2/v3→v4 迁移（Pi `migrateV1ToV2`/`migrateV2ToV3` + v3→v4 内容块化，
@@ -1162,14 +1392,82 @@ fn migrate_v3_to_v4(entries: &mut [Value]) {
     }
 }
 
-/// 迁移后重写整个文件（Pi `_rewriteFile`）。
-fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
-    let mut handle = OpenOptions::new().write(true).truncate(true).open(file)?;
-    for entry in entries {
-        writeln!(handle, "{}", serde_json::to_string(entry)?)?;
+fn lock_append(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
-    handle.flush()?;
+}
+
+/// 迁移或尾部修复后原子重写整个文件。原文件只在临时文件完整 flush/sync
+/// 且 replace 成功后才会被替换。
+fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
+    let serialized: Vec<String> = entries
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<_, _>>()?;
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.jsonl");
+    let temporary = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4().simple()));
+    let mut handle = singularity_core::create_owner_only_file(&temporary).map_err(|error| {
+        SessionError::Repair(format!("could not create temporary session file: {error}"))
+    })?;
+    let write_result = (|| -> std::io::Result<()> {
+        for line in &serialized {
+            handle.write_all(line.as_bytes())?;
+            handle.write_all(b"\n")?;
+        }
+        handle.flush()?;
+        handle.sync_all()?;
+        Ok(())
+    })();
+    drop(handle);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(SessionError::Repair(format!(
+            "could not write temporary session file: {error}"
+        )));
+    }
+    if let Err(error) = atomic_replace_file(&temporary, file) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(SessionError::Repair(format!(
+            "could not atomically replace session file: {error}"
+        )));
+    }
     Ok(())
+}
+
+#[cfg_attr(windows, allow(unsafe_code))]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let mut from_wide = from.as_os_str().encode_wide().collect::<Vec<_>>();
+        from_wide.push(0);
+        let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
+        to_wide.push(0);
+        if unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
 }
 
 /// Pi `generateId`：8 位十六进制（`randomUUID().slice(0, 8)`），冲突检查后重试，
@@ -1939,5 +2237,177 @@ mod tests {
             reopened.build_session_context().unwrap().messages[0].content,
             ""
         );
+    }
+
+    fn session_header(id: &str) -> String {
+        format!(
+            r#"{{"type":"session","version":4,"id":"{id}","timestamp":"2024-01-01T00:00:00.000Z","cwd":"C:/work"}}"#
+        )
+    }
+
+    fn session_message(id: &str, parent: Option<&str>, text: &str) -> String {
+        let parent = parent.map_or_else(|| "null".to_string(), |value| format!("\"{value}\""));
+        format!(
+            r#"{{"type":"message","id":"{id}","parentId":{parent},"timestamp":"2024-01-01T00:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn strict_open_rejects_intermediate_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("broken-middle.jsonl");
+        let content = format!(
+            "{}\n{}\nnot-json\n{}\n",
+            session_header("strict-middle"),
+            session_message("entry-1", None, "one"),
+            session_message("entry-2", Some("entry-1"), "two"),
+        );
+        std::fs::write(&file, content).unwrap();
+        let error = SessionManager::open_existing(&file)
+            .err()
+            .expect("malformed middle line must be rejected");
+        assert!(matches!(error, SessionError::MalformedLine { line: 3, .. }));
+    }
+
+    #[test]
+    fn strict_open_repairs_torn_tail_and_missing_final_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("torn-tail.jsonl");
+        let prefix = format!(
+            "{}\n{}\n",
+            session_header("strict-tail"),
+            session_message("entry-1", None, "one")
+        );
+        std::fs::write(&file, format!("{prefix}{{\"type\":\"message\",\"id\":\"")).unwrap();
+        let opened = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(opened.build_context_entries().unwrap().len(), 1);
+        assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
+        drop(opened);
+        let mut reopened = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened.build_context_entries().unwrap().len(), 1);
+        reopened.append_message(user("after repair")).unwrap();
+        let reopened_again = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened_again.build_context_entries().unwrap().len(), 2);
+
+        let missing_newline = dir.path().join("missing-newline.jsonl");
+        std::fs::write(
+            &missing_newline,
+            format!(
+                "{}\n{}",
+                session_header("strict-newline"),
+                session_message("entry-1", None, "one")
+            ),
+        )
+        .unwrap();
+        let opened = SessionManager::open_existing(&missing_newline).unwrap();
+        assert_eq!(opened.build_context_entries().unwrap().len(), 1);
+        assert!(std::fs::read(&missing_newline).unwrap().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn strict_open_rejects_duplicate_missing_parent_and_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "duplicate",
+                format!(
+                    "{}\n{}\n{}\n",
+                    session_header("duplicate"),
+                    session_message("same", None, "one"),
+                    session_message("same", Some("same"), "two")
+                ),
+                "duplicate",
+            ),
+            (
+                "missing-parent",
+                format!(
+                    "{}\n{}\n",
+                    session_header("missing"),
+                    session_message("entry-1", Some("no-parent"), "one")
+                ),
+                "missing parent",
+            ),
+            (
+                "cycle",
+                format!(
+                    "{}\n{}\n{}\n",
+                    session_header("cycle"),
+                    session_message("a", Some("b"), "one"),
+                    session_message("b", Some("a"), "two")
+                ),
+                "cycle",
+            ),
+        ];
+        for (name, content, expected) in cases {
+            let file = dir.path().join(format!("{name}.jsonl"));
+            std::fs::write(&file, content).unwrap();
+            let error = SessionManager::open_existing(&file)
+                .err()
+                .expect("invalid session structure must be rejected");
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn strict_open_rejects_complete_invalid_final_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("invalid-final.jsonl");
+        std::fs::write(&file, format!("{}\n[]", session_header("invalid-final"))).unwrap();
+        let error = SessionManager::open_existing(&file)
+            .err()
+            .expect("complete invalid final entry must be rejected");
+        assert!(matches!(error, SessionError::InvalidEntry { line: 2, .. }));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{}\n[]", session_header("invalid-final"))
+        );
+    }
+
+    #[test]
+    fn strict_open_rejects_invalid_header_and_known_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_version = dir.path().join("missing-version.jsonl");
+        std::fs::write(
+            &missing_version,
+            format!("{}\n", r#"{"type":"session","id":"missing-version"}"#),
+        )
+        .unwrap();
+        let error = SessionManager::open_existing(&missing_version)
+            .err()
+            .expect("missing header version must be rejected");
+        assert!(matches!(error, SessionError::InvalidHeader(_)));
+
+        let malformed_message = dir.path().join("malformed-message.jsonl");
+        let content = format!(
+            "{}\n{{\"type\":\"message\",\"id\":\"bad\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"not-blocks\"}}}}\n",
+            session_header("malformed-message")
+        );
+        std::fs::write(&malformed_message, content).unwrap();
+        let error = SessionManager::open_existing(&malformed_message)
+            .err()
+            .expect("known message schema errors must be rejected");
+        assert!(matches!(error, SessionError::InvalidEntry { line: 2, .. }));
+    }
+
+    #[test]
+    fn append_io_failure_does_not_advance_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let before = manager.build_context_entries().unwrap();
+        manager.file = dir.path().to_path_buf();
+        assert!(manager.append_message(user("must fail")).is_err());
+        assert_eq!(manager.build_context_entries().unwrap(), before);
+        assert!(manager.leaf_id().is_empty());
+    }
+
+    #[test]
+    fn atomic_publish_failure_preserves_original_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("session.jsonl");
+        std::fs::write(&original, b"original\n").unwrap();
+        let missing_temporary = dir.path().join("missing.tmp");
+        let error = atomic_replace_file(&missing_temporary, &original).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(std::fs::read(&original).unwrap(), b"original\n");
     }
 }
