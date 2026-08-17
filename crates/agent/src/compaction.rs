@@ -829,6 +829,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: None,
@@ -841,6 +842,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: None,
@@ -853,6 +855,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
             timestamp: None,
@@ -867,6 +870,7 @@ mod tests {
                 name: tool_name.to_string(),
                 args: json!({"path": path}),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: None,
@@ -1108,6 +1112,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "ran a command".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -1117,6 +1122,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "earlier summary".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,

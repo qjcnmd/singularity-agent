@@ -538,32 +538,18 @@ impl Agent {
         Ok(request)
     }
 
-    /// N2：从会话上下文中最后一条带 thinking 块的 assistant 消息投影 provider
-    /// reasoning replay（跨重启随会话 JSONL 恢复；同轮内工具续接同样覆盖）。
+    /// 从 durable assistant entries 恢复 provider-private continuation。
     ///
-    /// 仅 Chat 协议（`ReplayReasoningContent`）可忠实重建——replay 绑定
-    /// （provider/model/variant）由模型选择器解析，thinking 文本即
-    /// `reasoning_content`；Responses 协议需要原始 opaque output items，
-    /// 无法从文本块重建（记录的限制，同轮续接仍由适配器响应侧 replay 承担
-    /// 仅限同一 provider 实例的进程内路径）。选择器不可解析时安全跳过
-    /// （空 history 被 transport 接受）。
+    /// Responses replay 必须直接使用 JSONL 中保存的 opaque output items；
+    /// reasoning summary 只作为可见投影，绝不用于重建 Responses state。
+    /// Chat 旧条目若没有 private replay，仍可从 thinking block 重建
+    /// `reasoning_content`，以保持已存在会话的兼容性。
     fn reasoning_history_for_request(&self) -> Vec<ProviderReasoningReplay> {
-        if self.provider.protocol_contract().tool_reasoning_mode
-            != ProviderToolReasoningMode::ReplayReasoningContent
-        {
-            return Vec::new();
-        }
+        let tool_reasoning_mode = self.provider.protocol_contract().tool_reasoning_mode;
         let Ok(context) = self.session.build_context_entries() else {
             return Vec::new();
         };
-        // 每条带 thinking 块与工具调用的 assistant 消息各投影一个 replay：
-        // transport 校验要求每条工具消息都有绑定 replay（防丢 reasoning 续接，
-        // 与 DeepSeek 要求每条 tool_calls 消息携带 reasoning_content 一致），
-        // 只投影最后一条会在多轮工具后校验失败。
-        let Some((provider_name, model_name, variant)) = parse_model_selector(&self.config.model)
-        else {
-            return Vec::new();
-        };
+        let selector = parse_model_selector(&self.config.model);
         let mut replays = Vec::new();
         for entry in &context {
             let SessionEntryType::Message(message) = &entry.entry_type else {
@@ -572,6 +558,18 @@ impl Agent {
             if message.role != AgentMessageRole::Assistant || !message.has_tool_calls() {
                 continue;
             }
+            if let Some(replay) = &message.provider_reasoning_replay {
+                // Keep a malformed or mismatched private replay in the request so the
+                // provider boundary can reject it fail-closed with its typed error.
+                replays.push(replay.clone());
+                continue;
+            }
+            if tool_reasoning_mode != ProviderToolReasoningMode::ReplayReasoningContent {
+                continue;
+            }
+            let Some((provider_name, model_name, variant)) = selector else {
+                continue;
+            };
             let thinking = message
                 .thinking_blocks()
                 .into_iter()
@@ -2108,6 +2106,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "old user".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -2119,6 +2118,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "old assistant".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -2175,6 +2175,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "old user".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -2186,6 +2187,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "old assistant".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -2233,6 +2235,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "old user".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -2335,6 +2338,7 @@ mod tests {
                 ],
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
+                provider_reasoning_replay: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2344,6 +2348,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "wrote".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
                 timestamp: None,
@@ -2389,6 +2394,59 @@ mod tests {
     }
 
     #[test]
+    fn responses_replay_is_recovered_from_durable_assistant_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut contract = fake_contract();
+        contract.tool_reasoning_mode = ProviderToolReasoningMode::ReplayResponsesItems;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(0, 0),
+            }],
+        ));
+        let replay = ProviderReasoningReplay::Responses {
+            provider_name: "provider".to_string(),
+            model_name: "model".to_string(),
+            reasoning_effort: "high".to_string(),
+            tool_call_ids: vec!["call_1".to_string()],
+            items: vec![
+                json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}),
+                json!({"type": "function_call", "call_id": "call_1", "name": "write", "arguments": "{}"}),
+            ],
+        };
+        let mut session =
+            SessionManager::create(&dir.path().join("project"), &dir.path().join("sessions"))
+                .unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    args: json!({"path": "out.txt", "content": "x"}),
+                }],
+                provider_reasoning_replay: Some(replay.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "provider/model#high".to_string(),
+                ..AgentConfig::default()
+            },
+            session,
+        )
+        .unwrap();
+        assert_eq!(agent.reasoning_history_for_request(), vec![replay]);
+    }
+
+    #[test]
     fn orphaned_tool_call_reopens_without_executing_tool_again() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -2410,6 +2468,7 @@ mod tests {
                 ],
                 tool_call_id: Some("orphan_write_1".to_string()),
                 tool_name: Some("write".to_string()),
+                provider_reasoning_replay: None,
                 timestamp: None,
             })
             .unwrap();

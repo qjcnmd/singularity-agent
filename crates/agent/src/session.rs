@@ -742,6 +742,7 @@ impl SessionManager {
                     content: vec![ContentBlock::Text {
                         text: "[previous execution outcome unknown; do not retry]".to_string(),
                     }],
+                    provider_reasoning_replay: None,
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     timestamp: None,
@@ -1210,7 +1211,7 @@ fn normalize_cwd_string(cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use singularity_model::ModelRole;
+    use singularity_model::{ModelRole, ProviderReasoningReplay};
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage {
@@ -1218,6 +1219,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: Some(1_700_000_000_000),
@@ -1230,6 +1232,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: Some(1_700_000_000_001),
@@ -1242,6 +1245,7 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
             timestamp: Some(1_700_000_000_002),
@@ -1599,6 +1603,7 @@ mod tests {
                         "content": "hello",
                     }),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -1646,6 +1651,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "text".to_string(),
                 }],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -1797,6 +1803,7 @@ mod tests {
                         args: json!({"command": "echo should-not-run"}),
                     },
                 ],
+                provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
                 timestamp: None,
@@ -1860,5 +1867,77 @@ mod tests {
         assert_eq!(roles, vec![ModelRole::User, ModelRole::Assistant]);
         assert_eq!(ctx.messages[0].content, "hello");
         assert_eq!(ctx.messages[1].content, "reply");
+    }
+
+    #[test]
+    fn responses_private_replay_round_trips_exactly_through_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let cwd = dir.path().join("project");
+        let replay = ProviderReasoningReplay::Responses {
+            provider_name: "provider".to_string(),
+            model_name: "model".to_string(),
+            reasoning_effort: "high".to_string(),
+            tool_call_ids: vec!["call_1".to_string()],
+            items: vec![
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-secret"
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "write",
+                    "arguments": "{\"path\":\"out.txt\"}"
+                }),
+            ],
+        };
+        let mut manager =
+            SessionManager::create_with_id(&cwd, &sessions, "f7be8e2a-6f7f-4b55-b1cf-ef6d00c4d8f8")
+                .unwrap();
+        manager
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "summary projection".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "write".to_string(),
+                        args: json!({"path": "out.txt"}),
+                    },
+                ],
+                provider_reasoning_replay: Some(replay.clone()),
+                tool_call_id: None,
+                tool_name: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let path = manager.path().to_path_buf();
+        drop(manager);
+
+        let reopened = SessionManager::open_existing(&path).unwrap();
+        let entries = reopened.build_context_entries().unwrap();
+        let message = match &entries[0].entry_type {
+            SessionEntryType::Message(message) => message,
+            other => panic!("expected assistant message, got {other:?}"),
+        };
+        assert_eq!(message.provider_reasoning_replay.as_ref(), Some(&replay));
+        assert_eq!(message.thinking_blocks().len(), 1);
+        let debug = format!("{message:?}");
+        assert!(!debug.contains("opaque-secret"));
+        assert!(debug.contains("output_item_count"));
+        let wire = serde_json::to_value(message).unwrap();
+        assert_eq!(
+            wire["providerReasoningReplay"]["items"][0]["encrypted_content"],
+            "opaque-secret"
+        );
+        assert_eq!(
+            reopened.build_session_context().unwrap().messages[0].content,
+            ""
+        );
     }
 }

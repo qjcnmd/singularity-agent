@@ -67,6 +67,13 @@ pub enum ContentBlock {
 pub struct AgentMessage {
     pub role: AgentMessageRole,
     pub content: Vec<ContentBlock>,
+    /// Provider-private continuation captured with an assistant tool-call response.
+    ///
+    /// This field is durable session state, not a user-visible content block.  The
+    /// provider adapter owns its wire interpretation; the agent only carries it
+    /// across reopen and request construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reasoning_replay: Option<ProviderReasoningReplay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +91,7 @@ impl AgentMessage {
             content: vec![ContentBlock::Text {
                 text: content.into(),
             }],
+            provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
             timestamp: None,
@@ -144,6 +152,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
+        provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,
         timestamp: None,
@@ -180,6 +189,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     AgentMessage {
         role: AgentMessageRole::Assistant,
         content,
+        provider_reasoning_replay: response.provider_reasoning_history.first().cloned(),
         tool_call_id: None,
         tool_name: None,
         timestamp: None,
@@ -226,6 +236,7 @@ pub(crate) fn tool_result_message(
         content: vec![ContentBlock::Text {
             text: execution.content.clone(),
         }],
+        provider_reasoning_replay: None,
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         timestamp: None,
