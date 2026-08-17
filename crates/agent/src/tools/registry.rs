@@ -608,6 +608,38 @@ mod tests {
         assert_eq!(registry.mutation_queue.entry_count(), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mutation_queue_serializes_symlink_aliases() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("target.txt"), "original").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("alias.txt"))
+            .expect("file symlink");
+
+        let registry = ToolRegistry::new();
+        let lease = registry
+            .mutation_queue
+            .lock(dir.path(), "target.txt")
+            .expect("target path lease");
+        let (sender, receiver) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = registry.mutation_queue.lock(dir.path(), "alias.txt");
+                sender.send(result.map(|_| ())).unwrap();
+            });
+            assert!(
+                receiver.recv_timeout(Duration::from_millis(50)).is_err(),
+                "symlink alias must wait for the target path lease"
+            );
+            drop(lease);
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink alias lease")
+                .expect("symlink alias path lock");
+        });
+        assert_eq!(registry.mutation_queue.entry_count(), 0);
+    }
+
     #[test]
     fn edit_holds_mutation_lease_across_read_and_write() {
         let dir = tempdir().unwrap();
