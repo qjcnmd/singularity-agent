@@ -145,7 +145,7 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式语义对齐 Pi（裁决 10）：JSONL 树（v3），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2→v3 迁移（迁移即重写文件）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint；进程退出即中断，重开会话即继续，可写重开时对崩溃遗留的孤立 tool call 补 synthetic failed ToolResult（不重新执行工具）。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
+会话格式语义对齐 Pi（裁决 10）：JSONL 树（v4），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2/v3→v4 迁移（迁移即重写文件）。v4 起消息 `content` 为内容块数组（`text` / `thinking` / `tool_call`），一次模型响应 = 一条 assistant 消息（对齐 Pi `AssistantMessage.content`）；工具结果按 `toolCallId` 关联的独立 toolResult 消息回写；thinking 块随会话持久化，续接时从最后一条 assistant 消息投影 provider reasoning replay（N2）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint；进程退出即中断，重开会话即继续，可写重开时对崩溃遗留的孤立 tool call 补 synthetic failed ToolResult（不重新执行工具）。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
 
 - 落盘时机：turn 启动先把当前 user 消息追加 JSONL；随后只有终态 assistant/toolResult/compaction 消息追加 JSONL，流式 delta 不落盘。进程崩溃时已追加的 user/assistant tool-call 条目保留，不存在的回合不写入状态。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
@@ -159,7 +159,7 @@ flowchart TD
     B --> C["leaf 指向新条目"]
     C --> D["进程退出<br/>(回合中断, 无 checkpoint)"]
     D --> E["重开会话文件<br/>(sg continue / 恢复)"]
-    E --> F["逐行解析 + 版本迁移<br/>(v1/v2 到 v3, 打开时重写)"]
+    E --> F["逐行解析 + 版本迁移<br/>(v1/v2/v3 到 v4, 打开时重写)"]
     F --> F2["repair_orphaned_tool_calls<br/>孤立 tool call → synthetic failed ToolResult<br/>(unknown / do not retry, 不重新执行)"]
     F2 --> G["buildContextEntries<br/>[compaction 摘要] + [firstKeptEntryId 起条目]"]
     G --> H["buildSessionContext<br/>entry 转 LLM 消息"]

@@ -362,8 +362,9 @@ fn project_session_reference(read: &SessionReadResult) -> String {
     reference
 }
 
-/// 逐条投影 transcript；只接受 string content 的 message 条目，其余角色
-/// （bashExecution / custom / summary 等）和所有其他字段不进入参考材料。
+/// 逐条投影 transcript；只接受 message 条目，其余角色（bashExecution / custom /
+/// summary 等）和所有其他字段不进入参考材料。v4 起 content 为内容块数组，只取
+/// text 块（thinking 与 tool_call 块不进入参考材料）。
 fn reference_transcript_line(entry: &Value) -> Option<String> {
     let object = entry.as_object()?;
     if object.get("type").and_then(Value::as_str) != Some("message") {
@@ -374,8 +375,25 @@ fn reference_transcript_line(entry: &Value) -> Option<String> {
     if !matches!(role, "user" | "assistant" | "toolResult") {
         return None;
     }
-    let content = message.get("content").and_then(Value::as_str)?;
-    Some(format!("{role}: {}", collapse_reference_lines(content)))
+    let content = match message.get("content") {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    block.get("text").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::String(text)) => text.clone(),
+        _ => return None,
+    };
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{role}: {}", collapse_reference_lines(&content)))
 }
 
 /// 折叠换行：旧会话 content 中即使嵌入 `CURRENT REQUEST` 等标记，也会留在

@@ -34,11 +34,12 @@ use uuid::Uuid;
 
 use super::message::{
     AgentMessage, AgentMessageRole, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, LlmMessage,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock, LlmMessage,
 };
 
-/// 当前会话文件格式版本，对齐 Pi `CURRENT_SESSION_VERSION`。
-pub const CURRENT_SESSION_VERSION: u32 = 3;
+/// 当前会话文件格式版本，对齐 Pi `CURRENT_SESSION_VERSION`（v4：消息 content
+/// 内容块化，见 `message.rs`）。
+pub const CURRENT_SESSION_VERSION: u32 = 4;
 /// 单条 session JSONL 行（含 header）的字节硬上限。
 const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// 单次打开 session 文件允许解析的总字节上限（有界读取，超限 fail closed）。
@@ -382,7 +383,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// 新建会话：生成 Pi 风格文件名 `<ts>_<uuid>.jsonl` 并立即写入 header。
     ///
-    /// header：`{"type":"session","version":3,"id":...,"timestamp":...,"cwd":...}`，
+    /// header：`{"type":"session","version":4,"id":...,"timestamp":...,"cwd":...}`，
     /// 无父会话时省略 `parentSession`。`cwd` 取绝对路径（无需已存在）。
     pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
         let session_id = Uuid::now_v7().to_string();
@@ -695,50 +696,58 @@ impl SessionManager {
 
     /// 修复活动路径中崩溃遗留的孤立 assistant tool call。
     ///
-    /// 对每个没有后续 ToolResult 配对的 tool_call_id，追加一条 synthetic failed
+    /// 对每个没有后续 ToolResult 配对的 tool_call 块 id，追加一条 synthetic failed
     /// ToolResult（保留原 call id，明确 unknown/禁止自动重试）；不修改或删除
     /// 原始 assistant entry，也不执行任何工具。
     pub fn repair_orphaned_tool_calls(&mut self) -> Result<usize> {
         let path = self.session_path();
         let mut repaired = 0usize;
         for &entry_index in &path {
-            let tool_call_id = match &self.entries[entry_index].entry_type {
+            let tool_call_ids: Vec<String> = match &self.entries[entry_index].entry_type {
                 SessionEntryType::Message(message)
                     if message.role == AgentMessageRole::Assistant =>
                 {
-                    message.tool_call_id.clone()
+                    message
+                        .tool_calls()
+                        .into_iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect()
                 }
-                _ => None,
+                _ => Vec::new(),
             };
-            let Some(tool_call_id) = tool_call_id else {
-                continue;
-            };
-            let paired = path[path
-                .iter()
-                .position(|&index| index == entry_index)
-                .expect("path index")
-                + 1..]
-                .iter()
-                .any(|&later_index| {
-                    matches!(
-                        &self.entries[later_index].entry_type,
-                        SessionEntryType::Message(message)
-                            if message.role == AgentMessageRole::ToolResult
-                                && message.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-                    )
-                });
-            if paired {
-                continue;
+            for tool_call_id in tool_call_ids {
+                let paired = path[path
+                    .iter()
+                    .position(|&index| index == entry_index)
+                    .expect("path index")
+                    + 1..]
+                    .iter()
+                    .any(|&later_index| {
+                        matches!(
+                            &self.entries[later_index].entry_type,
+                            SessionEntryType::Message(message)
+                                if message.role == AgentMessageRole::ToolResult
+                                    && message.tool_call_id.as_deref()
+                                        == Some(tool_call_id.as_str())
+                        )
+                    });
+                if paired {
+                    continue;
+                }
+                self.append_entry(SessionEntryType::Message(AgentMessage {
+                    role: AgentMessageRole::ToolResult,
+                    content: vec![ContentBlock::Text {
+                        text: "[previous execution outcome unknown; do not retry]".to_string(),
+                    }],
+                    tool_call_id: Some(tool_call_id),
+                    tool_name: None,
+                    timestamp: None,
+                }))?;
+                repaired += 1;
             }
-            self.append_entry(SessionEntryType::Message(AgentMessage {
-                role: AgentMessageRole::ToolResult,
-                content: "[previous execution outcome unknown; do not retry]".to_string(),
-                tool_call_id: Some(tool_call_id),
-                tool_name: None,
-                args: None,
-                timestamp: None,
-            }))?;
-            repaired += 1;
         }
         Ok(repaired)
     }
@@ -873,64 +882,71 @@ impl SessionManager {
 }
 
 /// 把单条 context entry 投影为 LLM 消息（Pi `sessionEntryToContextMessages` +
-/// `convertToLlm` 的 Phase 2a 简化）。
+/// `convertToLlm`；v4 内容块形态）。
 fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
     match &entry.entry_type {
         SessionEntryType::Message(message) => match message.role {
             AgentMessageRole::User => {
-                vec![ModelMessage::text(ModelRole::User, message.content.clone())]
+                vec![ModelMessage::text(ModelRole::User, message.content_text())]
             }
             AgentMessageRole::Assistant => {
-                // 带工具调用的 assistant 消息必须重放 tool_calls（对齐 Pi convertToLlm：
+                // 带工具调用块的 assistant 消息必须重放 tool_calls（对齐 Pi convertToLlm：
                 // assistant 消息原样进入 LLM 上下文）。真实 provider 拒绝孤立 tool_call_id
                 // 的 tool 消息（无对应 assistant tool_calls 的历史，实测 HTTP 400）。
-                // raw_arguments 由 args 重新序列化（Phase 2a 会话 schema 不存原始文本）。
-                let (Some(tool_name), Some(args)) = (&message.tool_name, &message.args) else {
+                let tool_calls = message
+                    .tool_calls()
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall { id, name, args } => {
+                            if id.trim().is_empty() || name.trim().is_empty() {
+                                return None;
+                            }
+                            Some(ModelToolCall {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                arguments: args.clone(),
+                                raw_arguments: serde_json::to_string(args).unwrap_or_default(),
+                                parse_status: ModelToolParseStatus::Valid,
+                                validation_errors: Vec::new(),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if tool_calls.is_empty() {
                     return vec![ModelMessage::text(
                         ModelRole::Assistant,
-                        message.content.clone(),
+                        message.content_text(),
                     )];
-                };
-                let Some(tool_call_id) = &message.tool_call_id else {
-                    // 缺 call id 无法构造合法工具调用历史；退化为纯文本，不伪造 id。
-                    return vec![ModelMessage::text(
-                        ModelRole::Assistant,
-                        message.content.clone(),
-                    )];
-                };
-                let mut llm = ModelMessage::assistant_tool_calls(vec![ModelToolCall {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    arguments: args.clone(),
-                    raw_arguments: serde_json::to_string(args).unwrap_or_default(),
-                    parse_status: ModelToolParseStatus::Valid,
-                    validation_errors: Vec::new(),
-                }]);
-                llm.content = message.content.clone();
+                }
+                // thinking 块不进入 ModelMessage（N2：续接时由 build_request 投影为
+                // provider reasoning replay）。
+                let mut llm = ModelMessage::assistant_tool_calls(tool_calls);
+                llm.content = message.content_text();
                 vec![llm]
             }
             AgentMessageRole::ToolResult => {
-                let mut llm = ModelMessage::text(ModelRole::Tool, message.content.clone());
+                let mut llm = ModelMessage::text(ModelRole::Tool, message.content_text());
                 llm.tool_call_id = message.tool_call_id.clone();
                 vec![llm]
             }
-            // Pi 用 bashExecutionToText 拼接 command/output；Phase 2a 消息模型只有
-            // 单个 content 字符串，直接作为 user 文本。
+            // Pi 用 bashExecutionToText 拼接 command/output；v4 消息模型 content 为
+            // 文本块，直接作为 user 文本。
             AgentMessageRole::BashExecution | AgentMessageRole::Custom => {
-                vec![ModelMessage::text(ModelRole::User, message.content.clone())]
+                vec![ModelMessage::text(ModelRole::User, message.content_text())]
             }
             AgentMessageRole::BranchSummary => vec![ModelMessage::text(
                 ModelRole::User,
                 format!(
                     "{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}",
-                    message.content
+                    message.content_text()
                 ),
             )],
             AgentMessageRole::CompactionSummary => vec![ModelMessage::text(
                 ModelRole::User,
                 format!(
                     "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
-                    message.content
+                    message.content_text()
                 ),
             )],
         },
@@ -1001,13 +1017,17 @@ fn path_display(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// v1/v2→v3 迁移（Pi `migrateV1ToV2`/`migrateV2ToV3`，原地修改，仅 version < 3 时调用）。
+/// v1/v2/v3→v4 迁移（Pi `migrateV1ToV2`/`migrateV2ToV3` + v3→v4 内容块化，
+/// 原地修改，仅 version < 4 时调用）。
 fn migrate_entries(entries: &mut [Value], version: u32) {
     if version < 2 {
         migrate_v1_to_v2(entries);
     }
     if version < 3 {
         migrate_v2_to_v3(entries);
+    }
+    if version < 4 {
+        migrate_v3_to_v4(entries);
     }
 }
 
@@ -1082,6 +1102,65 @@ fn migrate_v2_to_v3(entries: &mut [Value]) {
     }
 }
 
+/// v3 → v4：header version 升为 4；消息 `content` 字符串改写为 content block 数组：
+///
+/// - 全部角色：`"content": "..."` → `[{"type":"text","text":"..."}]`；
+/// - v3 assistant 单工具调用消息（携带 `toolCallId`/`toolName`/`args`）：
+///   文本块（非空时）+ `{"type":"tool_call","id":...,"name":...,"args":...}`，
+///   并删除消息级 `toolCallId`/`toolName`/`args` 字段；
+/// - `toolResult` 保留 `toolCallId`/`toolName`（关联 assistant tool call）。
+fn migrate_v3_to_v4(entries: &mut [Value]) {
+    for entry in entries.iter_mut() {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                object.insert("version".to_string(), json!(4));
+            }
+            Some("message") => {
+                let Some(Value::Object(message)) = object.get_mut("message") else {
+                    continue;
+                };
+                let role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let text = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut blocks: Vec<Value> = Vec::new();
+                if !text.is_empty() {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+                // v3 assistant 工具调用消息：单调用字段迁移为 tool_call 块。
+                if role == "assistant"
+                    && let (Some(id), Some(name), args) = (
+                        message.get("toolCallId").and_then(Value::as_str),
+                        message.get("toolName").and_then(Value::as_str),
+                        message.get("args").cloned(),
+                    )
+                {
+                    blocks.push(json!({
+                        "type": "tool_call",
+                        "id": id,
+                        "name": name,
+                        "args": args.unwrap_or(Value::Null),
+                    }));
+                    message.remove("toolCallId");
+                    message.remove("toolName");
+                    message.remove("args");
+                }
+                message.insert("content".to_string(), Value::Array(blocks));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// 迁移后重写整个文件（Pi `_rewriteFile`）。
 fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
     let mut handle = OpenOptions::new().write(true).truncate(true).open(file)?;
@@ -1136,10 +1215,11 @@ mod tests {
     fn user(text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::User,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: None,
             tool_name: None,
-            args: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -1147,10 +1227,11 @@ mod tests {
     fn assistant(text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::Assistant,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: None,
             tool_name: None,
-            args: None,
             timestamp: Some(1_700_000_000_001),
         }
     }
@@ -1158,10 +1239,11 @@ mod tests {
     fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::ToolResult,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
-            args: None,
             timestamp: Some(1_700_000_000_002),
         }
     }
@@ -1203,7 +1285,7 @@ mod tests {
         let content = std::fs::read_to_string(&file).unwrap();
         let first_line: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(first_line["type"], "session");
-        assert_eq!(first_line["version"], 3);
+        assert_eq!(first_line["version"], 4);
         assert_eq!(
             first_line["cwd"],
             normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
@@ -1229,9 +1311,9 @@ mod tests {
             assert!(entry.id.chars().all(|c| c.is_ascii_hexdigit()));
         }
         assert!(matches!(&entries[0].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content == "hello"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content_text() == "hello"));
         assert!(matches!(&entries[1].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant && m.content == "hi there"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant && m.content_text() == "hi there"));
         assert!(matches!(&entries[2].entry_type,
             SessionEntryType::Message(m) if m.role == AgentMessageRole::ToolResult
                 && m.tool_call_id.as_deref() == Some("call_1")
@@ -1339,7 +1421,7 @@ mod tests {
 
     /// 4. 迁移：手工构造 v1 与 v2 样例 → open → 内容与 v3 语义一致，文件被重写。
     #[test]
-    fn open_migrates_v1_file_to_v3() {
+    fn open_migrates_v1_file_to_v4() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("v1.jsonl");
         let lines = [
@@ -1366,11 +1448,11 @@ mod tests {
             SessionEntryType::Compaction(_)
         ));
         assert!(matches!(&entries[1].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content == "a"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content_text() == "a"));
         assert!(matches!(&entries[2].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant && m.content == "b"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant && m.content_text() == "b"));
         assert!(matches!(&entries[3].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content == "c"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content_text() == "c"));
         // parent 链（按原文件顺序）：msg_a 为根；msg_b/comp/msg_c/label 各自挂接。
         assert_eq!(entries[1].parent_id, "");
         assert_eq!(entries[2].parent_id, entries[1].id);
@@ -1401,14 +1483,14 @@ mod tests {
             .map(|entry| entry.id)
             .collect();
         assert_eq!(context_ids, entry_ids(&entries));
-        // 文件已重写为 v3：header version 3，条目带 id/parentId，索引已转 id。
+        // 文件已重写为 v4：header version 4，条目带 id/parentId，索引已转 id。
         let rewritten: Vec<Value> = std::fs::read_to_string(&file)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect();
         assert_eq!(rewritten.len(), 6);
-        assert_eq!(rewritten[0]["version"], 3);
+        assert_eq!(rewritten[0]["version"], 4);
         for entry in &rewritten[1..] {
             assert!(entry.get("id").is_some());
             assert!(entry.get("parentId").is_some());
@@ -1425,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_v2_hook_message_role() {
+    fn open_migrates_v2_hook_message_role_to_v4() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("v2.jsonl");
         let lines = [
@@ -1439,15 +1521,65 @@ mod tests {
         let entries = manager.build_context_entries().unwrap();
         assert_eq!(entries.len(), 2);
         assert!(matches!(&entries[1].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::Custom && m.content == "injected"));
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::Custom && m.content_text() == "injected"));
         // 文件已重写为 v3，hookMessage → custom。
         let rewritten: Vec<Value> = std::fs::read_to_string(&file)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect();
-        assert_eq!(rewritten[0]["version"], 3);
+        assert_eq!(rewritten[0]["version"], 4);
         assert_eq!(rewritten[2]["message"]["role"], "custom");
+    }
+
+    /// hookMessage → custom；v3 → v4 内容块化：user/assistant 消息 content 字符串
+    /// 改写为 text 块数组，assistant 单工具调用字段迁移为 tool_call 块。
+    #[test]
+    fn open_migrates_v3_content_blocks_to_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("v3.jsonl");
+        let lines = [
+            r#"{"type":"session","version":3,"id":"v3-session","timestamp":"2024-01-01T00:00:00.000Z","cwd":"C:/work"}"#,
+            r#"{"type":"message","id":"aaaa1111","parentId":null,"timestamp":"2024-01-01T00:00:01.000Z","message":{"role":"user","content":"fix it"}}"#,
+            r#"{"type":"message","id":"bbbb2222","parentId":"aaaa1111","timestamp":"2024-01-01T00:00:02.000Z","message":{"role":"assistant","content":"calling tool","toolCallId":"c1","toolName":"write","args":{"path":"out.txt","content":"x"}}}"#,
+            r#"{"type":"message","id":"cccc3333","parentId":"bbbb2222","timestamp":"2024-01-01T00:00:03.000Z","message":{"role":"toolResult","content":"wrote c1","toolCallId":"c1","toolName":"write"}}"#,
+        ];
+        std::fs::write(&file, lines.join("\n")).unwrap();
+
+        let manager = SessionManager::open(&file).unwrap();
+        let entries = manager.build_context_entries().unwrap();
+        assert!(matches!(&entries[0].entry_type,
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::User
+                && m.content_text() == "fix it"));
+        assert!(matches!(&entries[1].entry_type,
+        SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant
+            && m.content_text() == "calling tool"
+            && m.tool_calls().len() == 1
+            && matches!(
+                m.tool_calls()[0],
+                ContentBlock::ToolCall { id, name, args }
+                    if id == "c1"
+                        && name == "write"
+                        && args == &serde_json::json!({"path": "out.txt", "content": "x"})
+            )));
+        assert!(matches!(&entries[2].entry_type,
+            SessionEntryType::Message(m) if m.role == AgentMessageRole::ToolResult
+                && m.tool_call_id.as_deref() == Some("c1")));
+        // 文件已重写为 v4：header version 4，content 为数组，toolCallId 已移除。
+        let rewritten: Vec<Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(rewritten[0]["version"], 4);
+        let assistant = &rewritten[2]["message"];
+        assert!(assistant["content"].is_array());
+        assert_eq!(assistant["content"][0]["type"], "text");
+        assert_eq!(assistant["content"][1]["type"], "tool_call");
+        assert_eq!(assistant["content"][1]["id"], "c1");
+        assert_eq!(assistant["content"][1]["name"], "write");
+        assert!(assistant.get("toolCallId").is_none());
+        assert!(assistant.get("args").is_none());
     }
 
     /// 7. assistant 带 tool call 的消息投影为带 tool_calls 的 LLM 消息（Phase 2d 扩展，
@@ -1459,13 +1591,16 @@ mod tests {
         manager
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: String::new(),
-                tool_call_id: Some("call_1".to_string()),
-                tool_name: Some("write".to_string()),
-                args: Some(serde_json::json!({
-                    "path": "hello.txt",
-                    "content": "hello",
-                })),
+                content: vec![ContentBlock::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    args: serde_json::json!({
+                        "path": "hello.txt",
+                        "content": "hello",
+                    }),
+                }],
+                tool_call_id: None,
+                tool_name: None,
                 timestamp: None,
             })
             .unwrap();
@@ -1508,10 +1643,11 @@ mod tests {
         missing_id
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "text".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "text".to_string(),
+                }],
                 tool_call_id: None,
-                tool_name: Some("write".to_string()),
-                args: Some(serde_json::json!({})),
+                tool_name: None,
                 timestamp: None,
             })
             .unwrap();
@@ -1651,10 +1787,18 @@ mod tests {
         manager
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "calling tool".to_string(),
-                tool_call_id: Some("orphan_call_1".to_string()),
-                tool_name: Some("bash".to_string()),
-                args: Some(json!({"command": "echo should-not-run"})),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "calling tool".to_string(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "orphan_call_1".to_string(),
+                        name: "bash".to_string(),
+                        args: json!({"command": "echo should-not-run"}),
+                    },
+                ],
+                tool_call_id: None,
+                tool_name: None,
                 timestamp: None,
             })
             .unwrap();
@@ -1685,10 +1829,10 @@ mod tests {
         );
         assert!(
             tool_results[0]
-                .content
+                .content_text()
                 .contains("previous execution outcome unknown")
         );
-        assert!(tool_results[0].content.contains("do not retry"));
+        assert!(tool_results[0].content_text().contains("do not retry"));
 
         // 第二次打开不再追加：幂等。
         let mut reopened = SessionManager::open_existing(&file).unwrap();

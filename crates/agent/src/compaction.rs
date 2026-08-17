@@ -9,8 +9,8 @@
 //! 摘要后内存重建由调用方（Phase 2d loop）用已实现的 `build_session_context` 完成。
 //!
 //! 与 Pi 的已知差异（本模块简化，见主代理确认）：
-//! - `AgentMessage` 无 content block 数组（无 thinking/图片块）：序列化只有文本与
-//!   tool call 两类；估算不含 `ESTIMATED_IMAGE_CHARS`。
+//! - 消息 content 为内容块数组（v4）：序列化只取文本块与 tool_call 块，
+//!   thinking 块不进入摘要正文；估算不含 `ESTIMATED_IMAGE_CHARS`。
 //! - token 估算按 UTF-16 code unit 计数（对齐 JS `String.length`），`ceil(chars/4)`。
 //! - Pi 的 usage 加权估算（`estimateContextTokens`）由调用方（Phase 2d loop）计算后
 //!   以 `usage_or_estimate` 传入 `compact`，本模块不重复实现。
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::message::{
     AgentMessage, AgentMessageRole, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
 };
 use crate::session::{
     CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionManager,
@@ -261,43 +261,44 @@ impl CompactionEngine {
     pub fn serialize_conversation(&self, messages: &[AgentMessage]) -> String {
         let mut parts = Vec::new();
         for message in messages {
+            let text = message.content_text();
             match message.role {
                 AgentMessageRole::User
                 | AgentMessageRole::BashExecution
                 | AgentMessageRole::Custom => {
-                    if !message.content.is_empty() {
-                        parts.push(format!("[User]: {}", message.content));
+                    if !text.is_empty() {
+                        parts.push(format!("[User]: {text}"));
                     }
                 }
                 AgentMessageRole::Assistant => {
-                    if !message.content.is_empty() {
-                        parts.push(format!("[Assistant]: {}", message.content));
+                    if !text.is_empty() {
+                        parts.push(format!("[Assistant]: {text}"));
                     }
-                    if let (Some(name), Some(args)) = (&message.tool_name, &message.args) {
-                        parts.push(format!(
-                            "[Assistant tool calls]: {name}({})",
-                            format_tool_call_args(args)
-                        ));
+                    for block in message.tool_calls() {
+                        if let ContentBlock::ToolCall { name, args, .. } = block {
+                            parts.push(format!(
+                                "[Assistant tool calls]: {name}({})",
+                                format_tool_call_args(args)
+                            ));
+                        }
                     }
                 }
                 AgentMessageRole::ToolResult => {
-                    if !message.content.is_empty() {
+                    if !text.is_empty() {
                         parts.push(format!(
                             "[Tool result]: {}",
-                            truncate_for_summary(&message.content, TOOL_RESULT_MAX_CHARS)
+                            truncate_for_summary(&text, TOOL_RESULT_MAX_CHARS)
                         ));
                     }
                 }
                 AgentMessageRole::BranchSummary => {
                     parts.push(format!(
-                        "[User]: {BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}",
-                        message.content
+                        "[User]: {BRANCH_SUMMARY_PREFIX}{text}{BRANCH_SUMMARY_SUFFIX}"
                     ));
                 }
                 AgentMessageRole::CompactionSummary => {
                     parts.push(format!(
-                        "[User]: {COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
-                        message.content
+                        "[User]: {COMPACTION_SUMMARY_PREFIX}{text}{COMPACTION_SUMMARY_SUFFIX}"
                     ));
                 }
             }
@@ -620,7 +621,7 @@ fn estimate_tokens_of(text: &str) -> u64 {
 /// compaction 条目按其 summary 文本估算，非消息条目为 0）。
 fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match &entry.entry_type {
-        SessionEntryType::Message(message) => estimate_tokens_of(&message.content),
+        SessionEntryType::Message(message) => estimate_tokens_of(&message.content_text()),
         SessionEntryType::Compaction(compaction) => estimate_tokens_of(&compaction.summary),
         _ => 0,
     }
@@ -720,29 +721,31 @@ struct FileOps {
     edited: BTreeSet<String>,
 }
 
-/// 从 assistant 消息的 tool call 提取文件操作（Pi `extractFileOpsFromMessage`）：
+/// 从 assistant 消息的 tool_call 块提取文件操作（Pi `extractFileOpsFromMessage`）：
 /// `read`/`write`/`edit` 且 `args.path` 为字符串。
 fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps) {
     if message.role != AgentMessageRole::Assistant {
         return;
     }
-    let (Some(tool_name), Some(args)) = (&message.tool_name, &message.args) else {
-        return;
-    };
-    let Some(path) = args.get("path").and_then(Value::as_str) else {
-        return;
-    };
-    match tool_name.as_str() {
-        "read" => {
-            file_ops.read.insert(path.to_string());
+    for block in message.tool_calls() {
+        let ContentBlock::ToolCall { name, args, .. } = block else {
+            continue;
+        };
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        match name.as_str() {
+            "read" => {
+                file_ops.read.insert(path.to_string());
+            }
+            "write" => {
+                file_ops.written.insert(path.to_string());
+            }
+            "edit" => {
+                file_ops.edited.insert(path.to_string());
+            }
+            _ => {}
         }
-        "write" => {
-            file_ops.written.insert(path.to_string());
-        }
-        "edit" => {
-            file_ops.edited.insert(path.to_string());
-        }
-        _ => {}
     }
 }
 
@@ -823,10 +826,11 @@ mod tests {
     fn user(text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::User,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: None,
             tool_name: None,
-            args: None,
             timestamp: None,
         }
     }
@@ -834,10 +838,11 @@ mod tests {
     fn assistant(text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::Assistant,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: None,
             tool_name: None,
-            args: None,
             timestamp: None,
         }
     }
@@ -845,10 +850,11 @@ mod tests {
     fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::ToolResult,
-            content: text.to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
-            args: None,
             timestamp: None,
         }
     }
@@ -856,10 +862,13 @@ mod tests {
     fn file_call(tool_name: &str, path: &str) -> AgentMessage {
         AgentMessage {
             role: AgentMessageRole::Assistant,
-            content: String::new(),
+            content: vec![ContentBlock::ToolCall {
+                id: "call_file".to_string(),
+                name: tool_name.to_string(),
+                args: json!({"path": path}),
+            }],
             tool_call_id: None,
-            tool_name: Some(tool_name.to_string()),
-            args: Some(json!({ "path": path })),
+            tool_name: None,
             timestamp: None,
         }
     }
@@ -1096,18 +1105,20 @@ mod tests {
             tool_result("c1", &long_output),
             AgentMessage {
                 role: AgentMessageRole::BashExecution,
-                content: "ran a command".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "ran a command".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             },
             AgentMessage {
                 role: AgentMessageRole::CompactionSummary,
-                content: "earlier summary".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "earlier summary".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             },
             user(""),

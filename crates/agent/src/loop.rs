@@ -19,7 +19,8 @@ use singularity_model::{
     ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
     PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderError, ProviderProtocolContract,
-    ProviderStreamEvent, ToolChoiceMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
+    ProviderReasoningReplay, ProviderStreamEvent, ProviderToolReasoningMode, ToolChoiceMode,
+    ToolChoicePolicy, is_strict_tool_schema_compatible,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -28,8 +29,10 @@ use crate::compaction::{
     CompactionBudget, CompactionEngine, CompactionOutcome, DEFAULT_KEEP_RECENT_TOKENS,
     DEFAULT_RESERVE_TOKENS,
 };
-use crate::message::{AgentMessage, AgentMessageRole};
-use crate::session::{SessionError, SessionManager};
+use crate::message::{
+    AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message, user_message,
+};
+use crate::session::{SessionEntryType, SessionError, SessionManager};
 use crate::tools::{ExecuteContext, ToolError, ToolExecution, ToolRegistry};
 
 /// 工具执行回调签名：工具名、参数原文。
@@ -327,18 +330,11 @@ impl Agent {
                     .unwrap_or_default();
                 let tool_calls = response.tool_calls.clone();
                 if !tool_calls.is_empty() {
-                    // 每个 tool call 一条 assistant 消息（Phase 2a 会话 schema 单调用），
-                    // 文本只挂在第一条上；随后逐个执行并把结果写回会话。
-                    for (index, call) in tool_calls.iter().enumerate() {
-                        self.session.append_message(assistant_tool_call_message(
-                            if index == 0 {
-                                assistant_text.clone()
-                            } else {
-                                String::new()
-                            },
-                            call,
-                        ))?;
-                    }
+                    // 一次模型响应 = 一条 assistant 消息（v4 内容块：thinking +
+                    // 文本 + 全部 tool_call 块，对齐 Pi AssistantMessage.content 数组）；
+                    // 随后逐个顺序执行并把结果按 toolCallId 写回会话。
+                    self.session
+                        .append_message(assistant_response_message(&response))?;
                     for call in &tool_calls {
                         if let Some(on_start) = events.on_tool_execution_start.as_deref_mut() {
                             on_start(&call.tool_name, &call.raw_arguments);
@@ -385,14 +381,8 @@ impl Agent {
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
-                self.session.append_message(AgentMessage {
-                    role: AgentMessageRole::Assistant,
-                    content: assistant_text.clone(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    args: None,
-                    timestamp: None,
-                })?;
+                self.session
+                    .append_message(assistant_response_message(&response))?;
                 outcome.final_text = assistant_text;
                 self.maybe_compact(&mut outcome.compacted, Some(&response.usage), cancellation)?;
                 break;
@@ -516,12 +506,81 @@ impl Agent {
         );
         request.tools = tools.to_vec();
         request.tool_choice = tool_choice.clone();
+        request.provider_reasoning_history = self.reasoning_history_for_request();
         request.model_preferences = ModelPreferences {
             model_name: preferences.model_name.clone(),
             max_output_tokens: Some(max_output_tokens),
             ..ModelPreferences::default()
         };
         Ok(request)
+    }
+
+    /// N2：从会话上下文中最后一条带 thinking 块的 assistant 消息投影 provider
+    /// reasoning replay（跨重启随会话 JSONL 恢复；同轮内工具续接同样覆盖）。
+    ///
+    /// 仅 Chat 协议（`ReplayReasoningContent`）可忠实重建——replay 绑定
+    /// （provider/model/variant）由模型选择器解析，thinking 文本即
+    /// `reasoning_content`；Responses 协议需要原始 opaque output items，
+    /// 无法从文本块重建（记录的限制，同轮续接仍由适配器响应侧 replay 承担
+    /// 仅限同一 provider 实例的进程内路径）。选择器不可解析时安全跳过
+    /// （空 history 被 transport 接受）。
+    fn reasoning_history_for_request(&self) -> Vec<ProviderReasoningReplay> {
+        if self.provider.protocol_contract().tool_reasoning_mode
+            != ProviderToolReasoningMode::ReplayReasoningContent
+        {
+            return Vec::new();
+        }
+        let Ok(context) = self.session.build_context_entries() else {
+            return Vec::new();
+        };
+        let Some(message) = context
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry_type {
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::Assistant =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+        else {
+            return Vec::new();
+        };
+        let thinking = message
+            .thinking_blocks()
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if thinking.is_empty() {
+            return Vec::new();
+        }
+        let tool_call_ids: Vec<String> = message
+            .tool_calls()
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if tool_call_ids.is_empty() {
+            return Vec::new();
+        }
+        let Some((provider_name, model_name, variant)) = parse_model_selector(&self.config.model)
+        else {
+            return Vec::new();
+        };
+        vec![ProviderReasoningReplay::Chat {
+            provider_name: provider_name.to_string(),
+            model_name: model_name.to_string(),
+            reasoning_effort: variant.to_string(),
+            tool_call_ids,
+            reasoning_content: thinking,
+        }]
     }
 
     /// 注册表工具 → 模型可见 schema（不超过 provider 单请求上限）。
@@ -651,44 +710,19 @@ fn is_context_overflow_error(error: &ModelError) -> bool {
     error.kind == ModelErrorKind::ContextLengthExceeded
 }
 
-fn user_message(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::User,
-        content: text.to_string(),
-        tool_call_id: None,
-        tool_name: None,
-        args: None,
-        timestamp: None,
+/// 解析 `provider/model#variant` 模型选择器。仅当 provider/model/variant 三段
+/// 都显式存在时返回（transport 对 reasoning replay 做绑定校验，缺 variant 时
+/// 无法可靠重建绑定，安全跳过投影）。
+fn parse_model_selector(selector: &str) -> Option<(&str, &str, &str)> {
+    let (provider_name, model_and_effort) = selector.split_once('/')?;
+    if provider_name.is_empty() || model_and_effort.is_empty() {
+        return None;
     }
-}
-
-fn assistant_tool_call_message(
-    content: String,
-    call: &singularity_model::ModelToolCall,
-) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::Assistant,
-        content,
-        tool_call_id: Some(call.tool_call_id.clone()),
-        tool_name: Some(call.tool_name.clone()),
-        args: Some(call.arguments.clone()),
-        timestamp: None,
+    let (model_name, variant) = model_and_effort.rsplit_once('#')?;
+    if model_name.is_empty() || variant.is_empty() {
+        return None;
     }
-}
-
-fn tool_result_message(
-    tool_call_id: &str,
-    tool_name: &str,
-    execution: &ToolExecution,
-) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::ToolResult,
-        content: execution.content.clone(),
-        tool_call_id: Some(tool_call_id.to_string()),
-        tool_name: Some(tool_name.to_string()),
-        args: None,
-        timestamp: None,
-    }
+    Some((provider_name, model_name, variant))
 }
 
 /// 逐轮聚合 usage；cost_estimate 仅当所有轮都提供时求和。
@@ -710,6 +744,7 @@ fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::AgentMessage;
     use crate::session::{CompactionEntry, SessionEntryType};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1617,19 +1652,21 @@ mod tests {
             .collect();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, AgentMessageRole::User);
-        assert_eq!(messages[0].content, "task");
+        assert_eq!(messages[0].content_text(), "task");
         assert_eq!(messages[1].role, AgentMessageRole::Assistant);
-        assert_eq!(messages[1].tool_name.as_deref(), Some("write"));
-        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(
-            messages[1].args,
-            Some(json!({ "path": "out.txt", "content": "x" }))
-        );
+        let ContentBlock::ToolCall { id, name, args } =
+            messages[1].tool_calls().first().expect("tool call block")
+        else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "write");
+        assert_eq!(*args, json!({ "path": "out.txt", "content": "x" }));
         assert_eq!(messages[2].role, AgentMessageRole::ToolResult);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
-        assert!(messages[2].content.contains("Successfully wrote"));
+        assert!(messages[2].content_text().contains("Successfully wrote"));
         assert_eq!(messages[3].role, AgentMessageRole::Assistant);
-        assert_eq!(messages[3].content, "finished");
+        assert_eq!(messages[3].content_text(), "finished");
         // 树链：每条 parent = 前一条 id，首条为根。
         for (index, entry) in entries.iter().enumerate() {
             if index == 0 {
@@ -1916,20 +1953,22 @@ mod tests {
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::User,
-                content: "old user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "old user".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             })
             .unwrap();
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "old assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "old assistant".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             })
             .unwrap();
@@ -1981,20 +2020,22 @@ mod tests {
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::User,
-                content: "old user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "old user".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             })
             .unwrap();
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "old assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "old assistant".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2037,10 +2078,11 @@ mod tests {
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::User,
-                content: "old user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "old user".to_string(),
+                }],
                 tool_call_id: None,
                 tool_name: None,
-                args: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2129,20 +2171,29 @@ mod tests {
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "call write".to_string(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "call write".to_string(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_big_1".to_string(),
+                        name: "write".to_string(),
+                        args: json!({ "path": "big.txt", "content": big_arguments }),
+                    },
+                ],
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
-                args: Some(json!({ "path": "big.txt", "content": big_arguments })),
                 timestamp: None,
             })
             .unwrap();
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::ToolResult,
-                content: "wrote".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "wrote".to_string(),
+                }],
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
-                args: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2195,10 +2246,18 @@ mod tests {
         session
             .append_message(AgentMessage {
                 role: AgentMessageRole::Assistant,
-                content: "calling write".to_string(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "calling write".to_string(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "orphan_write_1".to_string(),
+                        name: "write".to_string(),
+                        args: json!({"path": target, "content": "must not be written"}),
+                    },
+                ],
                 tool_call_id: Some("orphan_write_1".to_string()),
                 tool_name: Some("write".to_string()),
-                args: Some(json!({"path": target, "content": "must not be written"})),
                 timestamp: None,
             })
             .unwrap();
@@ -2243,7 +2302,7 @@ mod tests {
                 SessionEntryType::Message(message)
                     if message.role == AgentMessageRole::ToolResult
                         && message.tool_call_id.as_deref() == Some("orphan_write_1")
-                        && message.content.contains("do not retry")
+                        && message.content_text().contains("do not retry")
             )
         }));
     }

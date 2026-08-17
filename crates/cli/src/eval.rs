@@ -898,18 +898,56 @@ fn parse_rollout(path: &Path) -> RolloutStats {
         prev_kind = role.to_string();
         match role {
             "assistant" => {
-                if message.get("toolName").is_some() {
+                // v4：工具调用是 content block 数组中的 tool_call 块；
+                // 兼容 v3 消息级 toolName/args 字段。
+                let calls: Vec<(String, Value)> = match message.get("content") {
+                    Some(Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter_map(|block| {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_call") {
+                                return None;
+                            }
+                            Some((
+                                block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                block.get("args").cloned().unwrap_or(Value::Null),
+                            ))
+                        })
+                        .collect(),
+                    _ => message
+                        .get("toolName")
+                        .map(|name| {
+                            vec![(
+                                name.as_str().unwrap_or("").to_string(),
+                                message.get("args").cloned().unwrap_or(Value::Null),
+                            )]
+                        })
+                        .unwrap_or_default(),
+                };
+                for (tool, args) in calls {
                     tool_calls += 1;
-                    let action = json!({
-                        "tool": message.get("toolName").and_then(Value::as_str).unwrap_or(""),
-                        "args": message.get("args").cloned().unwrap_or(Value::Null),
-                    });
+                    let action = json!({ "tool": tool, "args": args });
                     let key = action.to_string();
                     *action_seen.entry(key).or_insert(0) += 1;
                 }
             }
             "toolResult" => {
-                let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+                let content = message
+                    .get("content")
+                    .and_then(|content| match content {
+                        Value::Array(blocks) => blocks.iter().find_map(|block| {
+                            if block.get("type").and_then(Value::as_str) == Some("text") {
+                                block.get("text").and_then(Value::as_str)
+                            } else {
+                                None
+                            }
+                        }),
+                        _ => content.as_str(),
+                    })
+                    .unwrap_or("");
                 if tool_result_is_error(content) {
                     tool_failures += 1;
                 }
@@ -1231,6 +1269,25 @@ mod tests {
         assert_eq!(stats.duplicate_actions, 0);
         // 差值按前一条类型归属：user->assistant 1s（other）；assistant->toolResult 3s（model）；
         // toolResult->assistant 2s（tool）。
+        assert_eq!(stats.breakdown.model_ms, 3000);
+        assert_eq!(stats.breakdown.tool_ms, 2000);
+    }
+
+    #[test]
+    fn parse_rollout_counts_v4_content_block_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-08-14T09:00:00.000Z"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-08-14T09:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"fix it"}]}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-14T09:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_call","id":"c1","name":"bash","args":{"command":"ls"}}]}}"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-08-14T09:00:05.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"Command exited with code 1"}],"toolCallId":"c1","toolName":"bash"}}"#,
+            r#"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-08-14T09:00:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let stats = parse_rollout(&path);
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.tool_failures, 1);
         assert_eq!(stats.breakdown.model_ms, 3000);
         assert_eq!(stats.breakdown.tool_ms, 2000);
     }
