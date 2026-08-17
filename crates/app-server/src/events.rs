@@ -8,6 +8,13 @@ use super::*;
 impl AppServer {
     /// 将应用事件包装为带类型化元数据的 JSON-RPC notification。
     pub(super) fn event_notification(&self, event: AppEvent) -> AppServerResult<Value> {
+        if self.consume_terminal_event_failure(&event.method) {
+            return Err(AppServerError::TurnExecution {
+                stage: TurnFailureStage::EventNotification,
+                cause: TurnFailureCause::Internal,
+                original: Some(format!("injected terminal event failure: {}", event.method)),
+            });
+        }
         let (class, delivery) = event_contract(&event);
         Ok(event
             .to_notification_with_metadata(EventMetadata { class, delivery })
@@ -27,20 +34,6 @@ impl AppServer {
             SAFE_ASSISTANT_ITEM_FAILURE,
         ))
         .map(Some)
-    }
-
-    /// 向当前有序输出路径追加可见 realtime item 的可靠失败终态。
-    pub(super) fn emit_realtime_item_failure(
-        &self,
-        emit: &mut impl FnMut(Value),
-        assistant_events: Option<&AssistantItemEventState>,
-    ) -> AppServerResult<()> {
-        if let Some(assistant_events) = assistant_events
-            && let Some(event) = self.realtime_item_failed_event(assistant_events)?
-        {
-            emit(event);
-        }
-        Ok(())
     }
 
     /// 把 assistant response 的 delta 投影到同一预分配 item，并记录实际生成的部分。

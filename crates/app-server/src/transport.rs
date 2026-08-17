@@ -828,6 +828,7 @@ fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use singularity_agent::agent::AgentError;
     use singularity_app_server::{TurnFailureCause, TurnFailureStage};
     use singularity_store::StoreError;
@@ -1237,6 +1238,106 @@ mod tests {
 
         assert_eq!(response["error"]["code"], -32603);
         assert_eq!(response["error"]["message"], original);
+    }
+
+    #[test]
+    fn transport_error_carries_original_terminalization_text() {
+        let original = "terminal metadata write failed: database locked";
+        let response = transport_error_value(
+            Some(JsonRpcId::Number(7)),
+            &AppServerError::TurnTerminalization {
+                stage: TurnFailureStage::TerminalOutcome,
+                cause: TurnFailureCause::Store,
+                failure: singularity_app_server::TurnTerminalizationFailure::Store,
+                original: Some(original.to_string()),
+            },
+        );
+
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], original);
+    }
+
+    #[test]
+    fn turn_failure_events_are_queued_before_rpc_error_response() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            vec![b'x'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
+        )
+        .expect("oversize AGENTS.md");
+        let sessions_dir = temp.path().join("sessions");
+        let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+        let snapshot = ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            None,
+        );
+        let mut server = AppServer::new(store, snapshot).with_sessions_dir(&sessions_dir);
+        server
+            .handle_json(
+                r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+            )
+            .expect("initialize");
+        server
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+            .expect("initialized");
+        let started = server
+            .handle_json(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "thread/start",
+                    "id": 2,
+                    "params": {"cwd": workspace},
+                })
+                .to_string(),
+            )
+            .expect("thread/start");
+        let session_id = started[1]["result"]["thread"]["thread_id"]
+            .as_str()
+            .expect("thread id")
+            .to_string();
+        let message: JsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": session_id,
+                "input": [{"type": "text", "text": "run"}],
+            }
+        }))
+        .expect("turn/start");
+        let cancellation = server.cancellation_handle();
+        let (outputs, mut receiver) = mpsc::channel(16);
+        run_turn_request(server, message, outputs, cancellation).expect("turn worker");
+        let mut values = Vec::new();
+        while let Some(value) = receiver.blocking_recv() {
+            values.push(value);
+        }
+        let turn_error = values
+            .iter()
+            .position(|value| value["method"] == "turn/error")
+            .expect("turn/error event");
+        let rpc_error = values
+            .iter()
+            .position(|value| value["id"] == 3 && value["error"].is_object())
+            .expect("RPC error response");
+        assert!(
+            turn_error < rpc_error,
+            "events must precede RPC: {values:?}"
+        );
+        assert_eq!(values[rpc_error]["error"]["code"], -32603);
+        assert!(
+            values[rpc_error]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("project_instruction_file_too_large"))
+        );
     }
 
     #[test]

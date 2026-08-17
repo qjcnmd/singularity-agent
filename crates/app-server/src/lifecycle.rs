@@ -79,38 +79,37 @@ impl AppServer {
             &mut assistant_events,
             &mut emit,
         ) {
-            Ok(status) => status,
-            Err(error) => {
-                self.emit_realtime_item_failure(&mut emit, Some(&assistant_events))?;
-                let failure = turn_failure_from_error(&error, TurnFailureStage::AgentLoop);
-                let _ = self.store.update_session(
-                    &record.session_id,
-                    SessionMetadataUpdate {
-                        status: Some(SessionStatus::Failed),
-                        ..SessionMetadataUpdate::default()
-                    },
-                );
-                // M1/H4：失败 turn 发出 turn 级终态错误事件（typed cause + 重试
-                // 状态，对齐 Codex ErrorNotification）；消息按传输边界同样脱敏。
-                let message = failure.original.clone().unwrap_or_default();
-                let message = if singularity_core::contains_sensitive_text(&message) {
-                    "Internal error".to_string()
-                } else {
-                    message
-                };
-                emit(self.event_notification(AppEvent::turn_error(
+            Ok(status)
+                if matches!(
+                    status.status,
+                    AgentStatus::Completed | AgentStatus::Cancelled
+                ) =>
+            {
+                status
+            }
+            Ok(status) => {
+                let error =
+                    AppServerError::Agent(AgentError::Loop(status.error.clone().unwrap_or_else(
+                        || "agent loop did not reach a terminal result".to_string(),
+                    )));
+                return self.finish_agent_failure(
+                    &record,
                     &turn_id,
-                    &record.session_id,
-                    failure.stage.as_str(),
-                    failure.cause.as_str(),
-                    &message,
-                    false,
-                ))?);
-                return Err(AppServerError::TurnExecution {
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    original: failure.original,
-                });
+                    &assistant_events,
+                    &error,
+                    &status.model_usage,
+                    &mut emit,
+                );
+            }
+            Err(error) => {
+                return self.finish_agent_failure(
+                    &record,
+                    &turn_id,
+                    &assistant_events,
+                    &error,
+                    &ModelUsage::default(),
+                    &mut emit,
+                );
             }
         };
         let terminal_turn = Turn {
@@ -120,14 +119,61 @@ impl AppServer {
             agent_loop_status: status.status.as_str().to_string(),
             model_usage: None,
         };
-        self.remember_usage(&turn_id, &status.model_usage);
-        let terminal_turn = self.turn_with_usage(terminal_turn);
-        self.update_session_status_and_usage(
+        if let Err(error) = self.update_session_status_and_usage(
             &record.session_id,
             session_status_for_agent(&status.status),
             &status.model_usage,
-        )?;
-        emit(self.event_notification(AppEvent::turn_completed(&terminal_turn))?);
+        ) {
+            let failure = TurnFailure {
+                stage: TurnFailureStage::TerminalOutcome,
+                cause: TurnFailureCause::Store,
+                original: Some(error.to_string()),
+            };
+            // durable terminal metadata is authoritative. If the intended status
+            // cannot be written, converge to failed/interrupted before exposing
+            // any terminal event, then report the metadata failure to the client.
+            let _ = self.persist_failure_state(&record.session_id, &status.model_usage);
+            let _event_failure = self.emit_failure_terminal_events(
+                &turn_id,
+                &record.session_id,
+                &assistant_events,
+                &failure,
+                &mut emit,
+            );
+            return Err(AppServerError::TurnTerminalization {
+                stage: failure.stage,
+                cause: failure.cause,
+                failure: TurnTerminalizationFailure::Store,
+                original: failure.original,
+            });
+        }
+        // Publication order: durable metadata first, then the in-process usage
+        // projection used by the terminal event and RPC response.
+        self.remember_usage(&turn_id, &status.model_usage);
+        let terminal_turn = self.turn_with_usage(terminal_turn);
+        let completion = self.event_notification(AppEvent::turn_completed(&terminal_turn));
+        match completion {
+            Ok(event) => emit(event),
+            Err(error) => {
+                let failure = turn_failure_from_error(&error, TurnFailureStage::EventNotification);
+                // A failed completion notification must not leave clients without a
+                // terminal event; best-effort turn/error is emitted before the RPC
+                // error response is produced by the transport.
+                let _ = self.emit_failure_terminal_events(
+                    &turn_id,
+                    &record.session_id,
+                    &assistant_events,
+                    &failure,
+                    &mut emit,
+                );
+                return Err(AppServerError::TurnTerminalization {
+                    stage: failure.stage,
+                    cause: failure.cause,
+                    failure: TurnTerminalizationFailure::EventNotification,
+                    original: failure.original,
+                });
+            }
+        }
         emit(
             JsonRpcMessage::response(
                 message.required_id(),
@@ -138,6 +184,134 @@ impl AppServer {
             .to_wire_value(),
         );
         Ok(())
+    }
+
+    /// 将 AgentLoop 错误收敛为唯一终态：先写 durable failure，再发 item/failed
+    /// 与 turn/error，最后由调用方/transport 产生 RPC error response。
+    fn finish_agent_failure(
+        &self,
+        record: &SessionRecord,
+        turn_id: &str,
+        assistant_events: &AssistantItemEventState,
+        error: &AppServerError,
+        usage: &ModelUsage,
+        emit: &mut impl FnMut(Value),
+    ) -> AppServerResult<()> {
+        let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
+        let (metadata_error, _durable) = self.persist_failure_state(&record.session_id, usage);
+        let event_failure = self.emit_failure_terminal_events(
+            turn_id,
+            &record.session_id,
+            assistant_events,
+            &failure,
+            emit,
+        );
+        if metadata_error.is_some() {
+            return Err(AppServerError::TurnTerminalization {
+                stage: failure.stage,
+                cause: failure.cause,
+                failure: TurnTerminalizationFailure::Store,
+                original: failure.original,
+            });
+        }
+        if let Some(event_failure) = event_failure {
+            return Err(AppServerError::TurnTerminalization {
+                stage: event_failure.stage,
+                cause: event_failure.cause,
+                failure: TurnTerminalizationFailure::EventNotification,
+                original: event_failure.original,
+            });
+        }
+        Err(AppServerError::TurnExecution {
+            stage: failure.stage,
+            cause: failure.cause,
+            original: failure.original,
+        })
+    }
+
+    /// 首次失败记录后最多重试一次，并在必要时降级为 interrupted；返回首次
+    /// durable 写失败文本，供 typed terminalization error 保留真实原因。
+    fn persist_failure_state(
+        &self,
+        session_id: &str,
+        usage: &ModelUsage,
+    ) -> (Option<String>, bool) {
+        let first_error =
+            match self.update_session_status_and_usage(session_id, SessionStatus::Failed, usage) {
+                Ok(_) => return (None, true),
+                Err(error) => error.to_string(),
+            };
+        if self
+            .update_session_status_and_usage(session_id, SessionStatus::Failed, usage)
+            .is_ok()
+        {
+            return (Some(first_error), true);
+        }
+        let token_usage = match serde_json::to_value(usage_to_wire(usage)) {
+            Ok(value) => value,
+            Err(_) => return (Some(first_error), false),
+        };
+        let fallback = self.store.update_session(
+            session_id,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Interrupted),
+                token_usage: Some(&token_usage),
+                ..SessionMetadataUpdate::default()
+            },
+        );
+        (Some(first_error), fallback.is_ok())
+    }
+
+    /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个事件，
+    /// 返回首个 notification failure 供 RPC 错误分类。
+    fn emit_failure_terminal_events(
+        &self,
+        turn_id: &str,
+        thread_id: &str,
+        assistant_events: &AssistantItemEventState,
+        failure: &TurnFailure,
+        emit: &mut impl FnMut(Value),
+    ) -> Option<TurnFailure> {
+        let mut first_failure = None;
+        if assistant_events.appeared() {
+            match self.realtime_item_failed_event(assistant_events) {
+                Ok(Some(event)) => emit(event),
+                Ok(None) => {}
+                Err(error) => {
+                    first_failure = Some(turn_failure_from_error(
+                        &error,
+                        TurnFailureStage::EventNotification,
+                    ));
+                }
+            }
+        }
+        let message = failure
+            .original
+            .clone()
+            .unwrap_or_else(|| format!("turn failed during {} ({})", failure.stage, failure.cause));
+        let message = if singularity_core::contains_sensitive_text(&message) {
+            "Internal error".to_string()
+        } else {
+            message
+        };
+        match self.event_notification(AppEvent::turn_error(
+            turn_id,
+            thread_id,
+            failure.stage.as_str(),
+            failure.cause.as_str(),
+            &message,
+            false,
+        )) {
+            Ok(event) => emit(event),
+            Err(error) if first_failure.is_none() => {
+                first_failure = Some(turn_failure_from_error(
+                    &error,
+                    TurnFailureStage::EventNotification,
+                ));
+            }
+            Err(_) => {}
+        }
+        first_failure
     }
 
     /// 用 headless core 执行一个 turn：会话文件 open/create 已在 thread/start 完成，

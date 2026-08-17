@@ -975,3 +975,244 @@ fn turn_failure_emits_typed_error_event_with_provider_cause() {
     assert_eq!(error_event["params"]["threadId"], session_id);
     assert!(error_event["params"]["turnId"].is_string());
 }
+
+fn turn_start_message(id: i64, session_id: &str) -> JsonRpcMessage {
+    serde_json::from_value(json!({
+        "jsonrpc": "2.0",
+        "method": "turn/start",
+        "id": id,
+        "params": {
+            "threadId": session_id,
+            "input": [{"type": "text", "text": "run the task"}]
+        }
+    }))
+    .expect("turn/start message")
+}
+
+#[test]
+fn project_instruction_errors_fail_closed_before_provider_call() {
+    for name in [
+        "oversize",
+        "invalid_utf8",
+        "unsupported_type",
+        "cwd_unavailable",
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        match name {
+            "oversize" => {
+                std::fs::write(
+                    workspace.join("AGENTS.md"),
+                    vec![b'x'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
+                )
+                .expect("oversize AGENTS.md");
+            }
+            "invalid_utf8" => {
+                std::fs::write(workspace.join("AGENTS.md"), [0xff, 0xfe, 0xfd])
+                    .expect("invalid UTF-8 AGENTS.md");
+            }
+            "unsupported_type" => {
+                std::fs::create_dir(workspace.join("AGENTS.md")).expect("directory AGENTS.md");
+            }
+            "cwd_unavailable" => {}
+            _ => unreachable!("known project instruction case"),
+        }
+        let sessions_dir = temp.path().join("sessions");
+        let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![completed_response("must_not_run")],
+            seen_requests: Arc::clone(&seen),
+        };
+        let session_id = match name {
+            "oversize" => "9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
+            "invalid_utf8" => "8f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
+            "unsupported_type" => "7f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
+            "cwd_unavailable" => "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
+            _ => unreachable!("known project instruction case"),
+        };
+        let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+        initialize(&mut server);
+        insert_session(&server, &sessions_dir, session_id, &workspace);
+        if name == "cwd_unavailable" {
+            std::fs::remove_dir_all(&workspace).expect("remove workspace for read failure");
+        }
+
+        let mut events = Vec::new();
+        let error = server
+            .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+                events.push(value);
+            })
+            .expect_err("project instruction failure");
+        assert!(
+            matches!(
+                error,
+                AppServerError::TurnExecution {
+                    cause: TurnFailureCause::ProjectInstructions,
+                    ..
+                }
+            ),
+            "{name}: {error:?}"
+        );
+        assert_eq!(seen.lock().expect("seen requests").len(), 0, "{name}");
+        assert_eq!(
+            server
+                .store()
+                .get_session(session_id)
+                .expect("session record")
+                .status,
+            Some(SessionStatus::Failed),
+            "{name}: instruction failure must not leave Active"
+        );
+        assert!(
+            events.iter().any(|value| value["method"] == "turn/error"),
+            "{name}: missing turn/error: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|value| value["method"] == "turn/completed")
+        );
+    }
+}
+
+#[test]
+fn terminal_metadata_failure_emits_error_and_never_completion() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "8f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("completed")],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    server.inject_terminalization_faults(1, 0);
+
+    let mut events = Vec::new();
+    let error = server
+        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+            events.push(value);
+        })
+        .expect_err("terminal metadata failure");
+    assert!(
+        matches!(
+            error,
+            AppServerError::TurnTerminalization {
+                stage: TurnFailureStage::TerminalOutcome,
+                failure: TurnTerminalizationFailure::Store,
+                ..
+            }
+        ),
+        "unexpected terminal metadata error: {error:?}"
+    );
+    let status = server
+        .store()
+        .get_session(session_id)
+        .expect("record")
+        .status;
+    assert_ne!(status, Some(SessionStatus::Active));
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/completed")
+    );
+    assert!(events.iter().any(|value| value["method"] == "turn/error"));
+}
+
+#[test]
+fn agent_failure_status_write_failure_still_converges_and_reports_terminalization() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "7f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![failed_response()],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    server.inject_terminalization_faults(1, 0);
+
+    let mut events = Vec::new();
+    let error = server
+        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+            events.push(value);
+        })
+        .expect_err("agent failure");
+    assert!(
+        matches!(
+            error,
+            AppServerError::TurnTerminalization {
+                failure: TurnTerminalizationFailure::Store,
+                ..
+            }
+        ),
+        "unexpected agent terminalization error: {error:?}"
+    );
+    let status = server
+        .store()
+        .get_session(session_id)
+        .expect("record")
+        .status;
+    assert_ne!(status, Some(SessionStatus::Active));
+    assert!(events.iter().any(|value| value["method"] == "turn/error"));
+}
+
+#[test]
+fn terminal_event_failure_emits_fallback_error_and_reports_event_stage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("completed")],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    server.inject_terminalization_faults(0, 1);
+
+    let mut events = Vec::new();
+    let error = server
+        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+            events.push(value);
+        })
+        .expect_err("terminal event failure");
+    assert!(
+        matches!(
+            error,
+            AppServerError::TurnTerminalization {
+                stage: TurnFailureStage::EventNotification,
+                failure: TurnTerminalizationFailure::EventNotification,
+                ..
+            }
+        ),
+        "unexpected event terminalization error: {error:?}"
+    );
+    assert_eq!(
+        server
+            .store()
+            .get_session(session_id)
+            .expect("record")
+            .status,
+        Some(SessionStatus::Completed)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/completed")
+    );
+    assert!(events.iter().any(|value| value["method"] == "turn/error"));
+}

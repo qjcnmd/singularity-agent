@@ -315,9 +315,18 @@ pub struct AppServer {
     /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化到索引之外）。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
+    #[cfg(test)]
+    terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TerminalizationFaults {
+    metadata_failures_remaining: usize,
+    event_failures_remaining: usize,
 }
 
 /// 由请求工作线程与 stdio 传输层共享的可克隆停止句柄。
@@ -473,7 +482,7 @@ fn agent_config_for_thread(
     let system_prompt = match load_project_instructions_from_cwd(&cwd) {
         Ok(Some(instructions)) => instructions.content().to_string(),
         Ok(None) => String::new(),
-        Err(_) => String::new(),
+        Err(error) => return Err(AppServerError::ProjectInstructions(error)),
     };
     let context_window = provider
         .protocol_contract()
@@ -549,6 +558,8 @@ impl AppServer {
             thread_follow_up_pending: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
             test_provider_override: None,
         }
     }
@@ -568,6 +579,55 @@ impl AppServer {
     ) -> Self {
         self.test_provider_override = Some(provider);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_terminalization_faults(
+        &self,
+        metadata_failures: usize,
+        event_failures: usize,
+    ) {
+        if let Ok(mut faults) = self.terminalization_faults.lock() {
+            faults.metadata_failures_remaining = metadata_failures;
+            faults.event_failures_remaining = event_failures;
+        }
+    }
+
+    #[cfg(test)]
+    fn consume_terminal_metadata_failure(&self) -> bool {
+        let Ok(mut faults) = self.terminalization_faults.lock() else {
+            return false;
+        };
+        if faults.metadata_failures_remaining == 0 {
+            return false;
+        }
+        faults.metadata_failures_remaining -= 1;
+        true
+    }
+
+    #[cfg(not(test))]
+    fn consume_terminal_metadata_failure(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consume_terminal_event_failure(&self, method: &str) -> bool {
+        if !matches!(method, "turn/completed" | "turn/error" | "item/failed") {
+            return false;
+        }
+        let Ok(mut faults) = self.terminalization_faults.lock() else {
+            return false;
+        };
+        if faults.event_failures_remaining == 0 {
+            return false;
+        }
+        faults.event_failures_remaining -= 1;
+        true
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn consume_terminal_event_failure(&self, _method: &str) -> bool {
+        false
     }
 
     pub fn sessions_dir(&self) -> &Path {
@@ -614,6 +674,8 @@ impl AppServer {
             thread_follow_up_pending: Arc::clone(&self.thread_follow_up_pending),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
+            #[cfg(test)]
+            terminalization_faults: Arc::clone(&self.terminalization_faults),
             test_provider_override: self.test_provider_override.clone(),
         })
     }
@@ -715,6 +777,15 @@ impl AppServer {
         status: SessionStatus,
         usage: &ModelUsage,
     ) -> AppServerResult<SessionRecord> {
+        if matches!(
+            status,
+            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Interrupted
+        ) && self.consume_terminal_metadata_failure()
+        {
+            return Err(AppServerError::Store(StoreError::InvalidState(
+                "injected terminal metadata failure".to_string(),
+            )));
+        }
         let token_usage = serde_json::to_value(usage_to_wire(usage))?;
         Ok(self.store.update_session(
             session_id,
