@@ -415,8 +415,12 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
     // 2) 子进程跑真实 sg run 链路。
     let run = run_sg(&task.instruction, model, &workspace_copy, timeout);
 
-    // 3) 复制 rollout（会话文件）到 cell 目录存档。
-    let rollout = copy_rollout(&workspace_copy, cell_dir);
+    // 3) 按 thread_id 精确复制 rollout（会话 JSONL）到 cell 目录存档；子进程继承
+    //    本进程环境，会话写入 `user_singularity_home()/sessions/<id>.jsonl` 同一路径。
+    let sessions_dir = singularity_core::user_singularity_home()
+        .unwrap_or_default()
+        .join("sessions");
+    let rollout = copy_rollout(run.as_ref().ok(), &sessions_dir, cell_dir);
 
     // 4) 独立 checker.sh 判分（exit 0 = 通过）：执行任务副本内的 checker.sh，
     // 其 `dirname $0` 解析到副本根，`cd 副本根/workspace` 检查模型修改后的副本。
@@ -494,6 +498,8 @@ struct SgRun {
     turn_interrupted: bool,
     turn_failed: bool,
     turn_usage: Option<Value>,
+    /// `sg run --json` 输出中的 thread_id（会话精确采集路径）。
+    thread_id: Option<String>,
     stdout: String,
     stderr: String,
 }
@@ -502,7 +508,8 @@ struct SgRun {
 fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<SgRun, String> {
     let exe =
         std::env::current_exe().map_err(|error| format!("failed to resolve sg binary: {error}"))?;
-    let mut child = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg("run")
         .arg(instruction)
         .arg("--model")
@@ -513,7 +520,14 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         // 非交互：stdin 不继承终端（否则 eval 从终端启动时子进程会误判交互并触发 trust 询问）。
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Unix 下把 sg 放入独立进程组，超时 kill 才能整树回收（sg 会再 spawn app-server）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn sg run: {error}"))?;
 
@@ -564,6 +578,7 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
             turn_interrupted: false,
             turn_failed: false,
             turn_usage: None,
+            thread_id: None,
             stdout: read_captured(&stdout),
             stderr: read_captured(&stderr),
         });
@@ -580,6 +595,7 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
                 turn_interrupted: parsed.interrupted,
                 turn_failed: parsed.failed,
                 turn_usage: parsed.usage,
+                thread_id: parsed.thread_id,
                 stdout: stdout_text,
                 stderr: stderr_text,
             });
@@ -605,6 +621,7 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         turn_interrupted: parsed.interrupted,
         turn_failed: parsed.failed,
         turn_usage: parsed.usage,
+        thread_id: parsed.thread_id,
         stdout: stdout_text,
         stderr: stderr_text,
     })
@@ -615,6 +632,7 @@ struct ParsedSgJson {
     interrupted: bool,
     failed: bool,
     usage: Option<Value>,
+    thread_id: Option<String>,
 }
 
 fn parse_sg_json(stdout: &str) -> Option<ParsedSgJson> {
@@ -632,10 +650,16 @@ fn parse_sg_json(stdout: &str) -> Option<ParsedSgJson> {
         interrupted,
         failed,
         usage: turn.get("model_usage").cloned(),
+        thread_id: value
+            .get("thread")
+            .and_then(|thread| thread.get("thread_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
-/// 超时 kill：Windows 用 taskkill 杀进程树；其他平台 kill 直接子进程。
+/// 超时 kill：Windows 用 taskkill 杀进程树；Unix 杀 sg 所在进程组
+/// （run_sg 以 `process_group(0)` 创建独立组，孙进程也被回收）。
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
@@ -649,6 +673,13 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
     #[cfg(not(windows))]
     {
+        let pid = child.id();
+        // 先整组 TERM（组 id = 组长 pid），再兜底杀直接子进程。
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = child.kill();
     }
 }
@@ -1030,28 +1061,17 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 将会话文件（rollout）从 workspace 副本复制到 cell 目录，返回存档路径。
-fn copy_rollout(workspace: &Path, cell_dir: &Path) -> Option<PathBuf> {
-    let sessions = workspace.join(".singularity").join("agent-sessions");
-    let entries = fs::read_dir(&sessions).ok()?;
-    let mut latest: Option<(PathBuf, SystemTime)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
-        // 单条目元数据读取失败（如并发写入中的临时文件）跳过，不丢弃整个 rollout。
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        if latest.as_ref().is_none_or(|(_, time)| modified > *time) {
-            latest = Some((path, modified));
-        }
+/// 将会话文件（rollout）按 thread_id 精确路径从用户会话目录复制到 cell 目录。
+/// 无 thread_id（超时/链路崩溃/解析失败）或会话文件不存在时返回 None，不猜测文件。
+fn copy_rollout(run: Option<&SgRun>, sessions_dir: &Path, cell_dir: &Path) -> Option<PathBuf> {
+    let session_id = run?.thread_id.as_deref()?.trim();
+    if session_id.is_empty() {
+        return None;
     }
-    let (source, _) = latest?;
+    let source = sessions_dir.join(format!("{session_id}.jsonl"));
+    if !source.is_file() {
+        return None;
+    }
     let target = cell_dir.join("rollout.jsonl");
     fs::copy(&source, &target).ok()?;
     Some(target)
@@ -1126,9 +1146,51 @@ mod tests {
         let parsed = parse_sg_json(stdout).expect("parseable");
         assert!(!parsed.interrupted);
         assert!(!parsed.failed);
+        assert_eq!(parsed.thread_id.as_deref(), Some("t1"));
         let usage = parsed.usage.expect("usage present");
         assert_eq!(usage["total_tokens"], 150);
         assert_eq!(usage["cached_input_tokens"], 40);
+    }
+
+    #[test]
+    fn copy_rollout_uses_exact_thread_id_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cell = dir.path().join("cell");
+        std::fs::create_dir_all(&cell).unwrap();
+        let make_run = |thread_id: Option<String>| SgRun {
+            timed_out: false,
+            turn_interrupted: false,
+            turn_failed: false,
+            turn_usage: None,
+            thread_id,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let run = make_run(Some("c0ffee00-0000-4000-8000-000000000000".to_string()));
+        let source = sessions.join("c0ffee00-0000-4000-8000-000000000000.jsonl");
+        std::fs::write(&source, r#"{"type":"session","version":3}"#).unwrap();
+        let copied = copy_rollout(Some(&run), &sessions, &cell).expect("copied");
+        assert_eq!(
+            std::fs::read_to_string(&copied).unwrap(),
+            r#"{"type":"session","version":3}"#
+        );
+        // 无 thread_id → None（不猜测旧路径）。
+        assert!(copy_rollout(Some(&make_run(None)), &sessions, &cell).is_none());
+        // 有 thread_id 但文件不存在 → None。
+        assert!(
+            copy_rollout(
+                Some(&make_run(Some(
+                    "00000000-0000-4000-8000-000000000000".to_string()
+                ))),
+                &sessions,
+                &cell
+            )
+            .is_none()
+        );
+        // 运行失败（Err 语义）→ None。
+        assert!(copy_rollout(None, &sessions, &cell).is_none());
     }
 
     #[test]

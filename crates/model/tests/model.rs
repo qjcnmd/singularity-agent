@@ -3475,6 +3475,75 @@ fn catalog_builtin_cost_estimate_flows_into_turn_usage() {
 }
 
 #[test]
+fn missing_provider_usage_is_never_misrepresented_as_zero_cost() {
+    // 内置价格模型但响应缺 usage：不得伪装成零消费（usage_present=false、
+    // cost_estimate=None），也不再触发上限校验错误。
+    let (base_url, request_body) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"no_usage_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let directory = tempdir().expect("catalog directory");
+    let config_path = directory.path().join("models.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "default_model": "opencode-go/deepseek-v4-flash",
+            "providers": {
+                "opencode-go": {
+                    "adapter": "openai_compatible",
+                    "base_url": base_url,
+                    "api_key_env": "OPENCODE_KEY",
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 1000000,
+                            "max_output_tokens": 384000
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write catalog");
+    let path = config_path.to_string_lossy().to_string();
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            ENV_MODELS_CONFIG => Some(path.clone()),
+            "OPENCODE_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        },
+        None,
+    );
+    let provider = snapshot
+        .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
+        .expect("selected builtin provider");
+    let response = provider
+        .complete(
+            &ModelTurnRequest::new(
+                "missing_usage_request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Chat completion without usage");
+    request_body
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured provider request");
+    let usage = response.usage;
+    assert!(!usage.usage_present, "missing usage must be marked absent");
+    assert!(usage.cost_estimate.is_none(), "no zero-cost masquerade");
+    let validation = response.validation.expect("validation present");
+    assert!(
+        !validation
+            .errors
+            .iter()
+            .any(|error| error == "response_output_tokens_exceed_provider_limit"),
+        "upper-limit check must not fire on absent usage"
+    );
+}
+
+#[test]
 fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",

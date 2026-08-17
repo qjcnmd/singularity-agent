@@ -318,12 +318,23 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
-        let turn_active = self
-            .turn_threads
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?
-            .values()
-            .any(|session_id| session_id == &params.session_id);
+        // 只统计仍持有取消令牌的活跃 turn；turn_threads 保留历史映射
+        // （M2 thread 级队列寻址用），不能直接当活跃判定。
+        let turn_active = {
+            let active_turns = self
+                .active_turns
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+            let turn_threads = self
+                .turn_threads
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+            active_turns.keys().any(|turn_id| {
+                turn_threads
+                    .get(turn_id)
+                    .is_some_and(|sid| sid == &params.session_id)
+            })
+        };
         if turn_active {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }

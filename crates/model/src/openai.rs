@@ -727,6 +727,7 @@ pub(super) fn parse_openai_responses_usage(usage: Option<&Value>) -> ModelUsage 
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         cost_estimate: None,
+        usage_present: true,
     }
 }
 
@@ -852,9 +853,10 @@ pub(super) fn finalize_provider_response(
     finish_reason: Option<String>,
 ) -> Result<ModelTurnResponse, ProviderError> {
     // Chat 与 Responses 两条解析路径都汇入此处，是 usage 聚合的单一位置；按
-    // (provider, model) 查内置表估算成本；无内置价格的模型保持 None。
+    // (provider, model) 查内置表估算成本；无内置价格或原始 usage 缺失的模型
+    // 保持 None（缺失不伪装成零消费）。
     let mut usage = usage;
-    usage.cost_estimate =
+    usage.cost_estimate = if usage.usage_present {
         super::builtin_models::builtin_model_cost(&config.provider_name, model_name).map(|cost| {
             // 按当前北京时刻在高峰/闲时价格间择一后估算（deepseek 峰谷双价）。
             let now = std::time::SystemTime::now();
@@ -866,7 +868,10 @@ pub(super) fn finalize_provider_response(
                 &cost,
                 peak,
             )
-        });
+        })
+    } else {
+        None
+    };
     let mut response = ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id,
@@ -1187,5 +1192,6 @@ pub(super) fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         cost_estimate: None,
+        usage_present: true,
     }
 }

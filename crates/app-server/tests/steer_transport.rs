@@ -498,7 +498,8 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
         "followUp must trigger an extra round: {third}"
     );
 
-    // turn 结束后同方法必须返回 not found，而不是接受后丢弃。
+    // turn 结束后同方法不再 not found：按 M2 裁决入 thread 级待办队列，
+    // 下一次 turn/start 取走（Pi 式 thread 队列）。
     process.send_request(
         8,
         "turn/steer",
@@ -506,8 +507,8 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     );
     let late = process.output.recv_id(8, Duration::from_secs(5));
     assert_eq!(
-        late["error"]["code"], -32004,
-        "late steer must be not found: {late}"
+        late["result"]["turn"]["status"], "running",
+        "late steer must be accepted into the thread queue: {late}"
     );
 
     assert!(

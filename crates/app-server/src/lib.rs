@@ -10,7 +10,7 @@ mod events;
 mod lifecycle;
 pub mod paths;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,14 +31,13 @@ use singularity_core::{
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, EventClass, EventDelivery,
-    EventMetadata, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
-    MethodKind, ProjectTrustDecision, ProjectTrustParams, ProjectTrustResult,
-    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult,
-    SessionDeleteResult, SessionIdParams, SessionReadParams, SessionReadResult, Thread,
-    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TransportCapability, Turn, TurnIdParams, TurnInjectionParams, TurnInterruptResult, TurnResult,
-    TurnStartParams, TurnStartResult, TurnStatus,
+    AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, InitializeParams,
+    InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProjectTrustDecision,
+    ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult,
+    ServerShutdownResult, SessionDeleteResult, SessionIdParams, SessionReadParams,
+    SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams,
+    ThreadStartResult, TransportCapability, Turn, TurnIdParams, TurnInjectionParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
@@ -229,6 +228,7 @@ pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage
         cached_input_tokens: usage.cached_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         cost_estimate: usage.cost_estimate,
+        usage_present: usage.usage_present,
     }
 }
 
@@ -282,6 +282,10 @@ pub struct AppServer {
     /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    /// turn 已终态后到达的 steer 输入按 thread（session）排队，下一次 turn/start 取走
+    /// （Pi 式 thread 级队列；M2 裁决方案 B）。
+    thread_steer_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    thread_follow_up_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化到索引之外）。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
@@ -320,7 +324,6 @@ impl AppServerCancellationHandle {
 struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    turn_threads: Arc<Mutex<HashMap<String, String>>>,
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
 }
@@ -330,9 +333,8 @@ impl Drop for ActiveTurnGuard {
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
         }
-        if let Ok(mut turn_threads) = self.turn_threads.lock() {
-            turn_threads.remove(&self.turn_id);
-        }
+        // turn_threads 保留 turn→thread 历史映射（M2：终态后 steer/followUp 仍
+        // 需要按 turn_id 解析 thread 入待办队列）；活跃判定只看 active_turns。
         if let Ok(mut steer_handles) = self.steer_handles.lock() {
             steer_handles.remove(&self.turn_id);
         }
@@ -524,6 +526,8 @@ impl AppServer {
             turn_threads: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
+            thread_steer_pending: Arc::new(Mutex::new(HashMap::new())),
+            thread_follow_up_pending: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV).is_some_and(|value| value != "0"),
@@ -603,6 +607,8 @@ impl AppServer {
             turn_threads: Arc::clone(&self.turn_threads),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
+            thread_steer_pending: Arc::clone(&self.thread_steer_pending),
+            thread_follow_up_pending: Arc::clone(&self.thread_follow_up_pending),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
             interactive_ui: self.interactive_ui,
@@ -638,7 +644,6 @@ impl AppServer {
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
-            turn_threads: Arc::clone(&self.turn_threads),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
         };
@@ -754,15 +759,19 @@ impl AppServer {
     }
 
     fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        self.turn_threads
-            .lock()
-            .map(|turn_threads| {
+        // turn_threads 保留历史映射（M2 队列寻址），存活判定只看仍持有取消
+        // 令牌的 turn（active_turns ∩ turn_threads）。
+        let active = self.active_turns.lock();
+        let threads = self.turn_threads.lock();
+        match (active, threads) {
+            (Ok(active), Ok(turn_threads)) => active.keys().any(|turn_id| {
                 turn_threads
-                    .values()
-                    .any(|thread_id| thread_id == session_id)
-            })
+                    .get(turn_id)
+                    .is_some_and(|sid| sid == session_id)
+            }),
             // 锁中毒视为没有存活 turn：宁可投影为终态也不伪装运行中。
-            .unwrap_or(false)
+            _ => false,
+        }
     }
 
     pub(crate) fn turn_with_usage(&self, turn: Turn) -> Turn {

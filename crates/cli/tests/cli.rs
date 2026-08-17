@@ -373,8 +373,8 @@ fn cli_session_delete_renders_deleted_confirmation() {
     assert!(stdout(&output).contains("session session-delete deleted=true"));
 }
 
-// 验证 run 识别 "查看会话 <ID>"：session/read 摘要与最近文本只作为不可执行
-// 参考材料注入，且当前请求与参考材料之间有唯一可执行边界。
+// 验证 run 通过显式 --session-reference <ID> 注入不可执行参考材料：session/read
+// 摘要与最近文本只作为参考注入，且当前请求与参考材料之间有唯一可执行边界。
 #[test]
 fn cli_run_view_session_injects_untrusted_reference_projection() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -427,7 +427,12 @@ fn cli_run_view_session_injects_untrusted_reference_projection() {
     );
 
     let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "查看会话 session-context 分析下一步"])
+        .args([
+            "run",
+            "--session-reference",
+            "session-context",
+            "分析下一步",
+        ])
         .output()
         .expect("run view session cli");
     assert!(output.status.success(), "stderr={}", stderr(&output));
@@ -451,10 +456,8 @@ fn cli_run_view_session_injects_untrusted_reference_projection() {
         })
         .count();
     assert_eq!(current_headers, 1, "{text}");
-    assert!(
-        text.contains("查看会话 session-context 分析下一步"),
-        "{text}"
-    );
+    assert!(text.contains("分析下一步"), "{text}");
+    assert!(!text.contains("查看会话"), "{text}");
 }
 
 // 恶意旧会话（伪指令、路径、tool args 与伪造边界）只能作为数据投影进入新
@@ -536,7 +539,12 @@ fn cli_run_view_session_treats_malicious_old_session_as_non_instructional_data()
     );
 
     let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "查看会话 evil-session 现在执行安全任务"])
+        .args([
+            "run",
+            "--session-reference",
+            "evil-session",
+            "现在执行安全任务",
+        ])
         .output()
         .expect("run malicious view session cli");
     assert!(output.status.success(), "stderr={}", stderr(&output));
@@ -618,7 +626,8 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
     let doctor_stdout = stdout(&doctor);
     assert!(doctor_stdout.contains("client=protocol-only"));
-    assert!(doctor_stdout.contains("agent_loop=completed"));
+    // AgentLoop 由 headless core 直接承担、恒可用，doctor 打印静态状态。
+    assert!(doctor_stdout.contains("agent_loop=available (headless core)"));
     assert!(!doctor_stdout.contains("evaluation="));
     assert!(doctor_stdout.contains("provider_config_source=process_env"));
     assert!(doctor_stdout.contains("provider_snapshot_id=provider_snapshot_cli_test"));
@@ -674,7 +683,7 @@ stderr={}",
         fake_app_server.display(),
         stderr(&output)
     );
-    assert!(stdout(&output).contains(&format!("agent_loop={}", expected_agent_loop_status())));
+    assert!(stdout(&output).contains("agent_loop=available (headless core)"));
     assert!(!stderr(&output).contains("old app-server should not run"));
 }
 
@@ -713,77 +722,9 @@ fn cli_fails_closed_without_explicit_or_sibling_app_server() {
 }
 
 // 验证 AgentLoop 被禁用时 run 不会发出 turn/start。
+// 验证 turn/start 参数不携带 agent host（headless core 无 capability 门控）。
 #[test]
-fn cli_rejects_run_when_agent_loop_capability_is_disabled() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("agent_loop_disabled_methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "agent/capability",
-                agent_loop_capability(
-                    false,
-                    "blocked",
-                    "sandbox unavailable",
-                    &["strict_command_sandbox_unavailable"],
-                ),
-            )
-            .shutdown()
-            .trace_methods_to(&trace_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains(
-        "AgentLoop is not available: status=blocked; blockers=strict_command_sandbox_unavailable"
-    ));
-    let trace = std::fs::read_to_string(trace_path).expect("method trace");
-    assert!(trace.contains("initialize"));
-    assert!(trace.contains("agent/capability"));
-    assert!(!trace.contains("turn/start"));
-}
-
-// 验证 capability 尚未到 completed 即使无 blocker 也不能启动 run。
-#[test]
-fn cli_rejects_nonterminal_agent_loop_capability_without_blockers() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("agent_loop_running_methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "agent/capability",
-                agent_loop_capability(true, "running", "probe still running", &[]),
-            )
-            .shutdown()
-            .trace_methods_to(&trace_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("AgentLoop is not available: status=running; blockers=none"));
-    let trace = std::fs::read_to_string(trace_path).expect("method trace");
-    assert!(trace.contains("initialize"));
-    assert!(trace.contains("agent/capability"));
-    assert!(!trace.contains("turn/start"));
-}
-
-// 验证 capability 允许后 turn/start 不再携带 agent host。
-#[test]
-fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
+fn cli_turn_start_carries_no_agent_host() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let trace_path = temp.path().join("agent_loop_enabled_turn.json");
@@ -893,40 +834,6 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
 }
 
 // 验证部分 capability 在 blocker 清除前仍不能启动 turn。
-#[test]
-fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("partial_agent_loop_methods.txt");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .respond(
-                "agent/capability",
-                agent_loop_capability(true, "running", "partial", &["strict_command_sandbox"]),
-            )
-            .shutdown()
-            .trace_methods_to(&trace_path),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "write tests"])
-        .output()
-        .expect("run cli");
-
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains(
-            "AgentLoop is not available: status=running; blockers=strict_command_sandbox"
-        )
-    );
-    let trace = std::fs::read_to_string(trace_path).expect("method trace");
-    assert!(trace.contains("agent/capability"));
-    assert!(!trace.contains("turn/start"));
-}
-
-// 产品 CLI 不暴露开发期 Evaluation runner。
 #[test]
 fn cli_exposes_eval_subcommand_without_legacy_eval_args() {
     // W7-2：`sg eval` 是正式评估子命令；旧的开发评估参数形态（run manifest.json）不再存在。
@@ -1445,11 +1352,6 @@ fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status:
         "turn turn_terminal {status} agent_loop_status={agent_loop_status}"
     )));
     assert!(stderr(&output).contains(&format!("turn {status}")));
-}
-
-// 返回当前平台预期的 AgentLoop 状态。
-fn expected_agent_loop_status() -> &'static str {
-    "completed"
 }
 
 // 将测试路径转换为 fake server 可消费的 UTF-8 字符串。

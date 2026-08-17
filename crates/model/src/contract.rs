@@ -309,6 +309,7 @@ pub fn validate_model_turn_response(
             .push("successful_response_has_error".to_string());
     }
     if let Some(capabilities) = capabilities
+        && response.usage.usage_present
         && response.usage.output_tokens > u64::from(capabilities.max_output_tokens)
     {
         result

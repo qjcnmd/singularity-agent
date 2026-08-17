@@ -733,6 +733,14 @@ pub struct TurnModelUsage {
     pub reasoning_tokens: u64,
     /// 各轮均提供时才有成本估算；否则为 None。
     pub cost_estimate: Option<f64>,
+    /// 原始 usage 对象是否存在；缺失时各计数为 0（不伪装成零消费）。
+    /// 旧服务端数据无此字段时按存在解释。
+    #[serde(default = "default_usage_present_protocol")]
+    pub usage_present: bool,
+}
+
+fn default_usage_present_protocol() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -793,10 +801,9 @@ pub struct ProviderConfigurationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// agent capability 查询的响应。
+/// agent capability 查询的响应（仅保留 provider 就绪报告；AgentLoop 恒可用，
+/// 由 headless core 直接承担，不再作为 capability 门控）。
 pub struct AgentCapabilityResult {
-    #[serde(rename = "agentLoop")]
-    pub agent_loop: AgentLoopCapabilityStatus,
     #[serde(rename = "providerConfiguration")]
     pub provider_configuration: ProviderConfigurationStatus,
 }
@@ -815,15 +822,6 @@ pub struct TurnInterruptResult {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_loop_status: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// CLI 所需的脱敏 AgentLoop capability 投影。
-pub struct AgentLoopCapabilityStatus {
-    pub available: bool,
-    pub status: String,
-    pub reason: String,
-    pub blockers: Vec<String>,
 }
 
 /// server/shutdown 的类型化响应。

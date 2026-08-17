@@ -847,6 +847,7 @@ fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
     aggregate.total_tokens += response.total_tokens;
     aggregate.cached_input_tokens += response.cached_input_tokens;
     aggregate.reasoning_tokens += response.reasoning_tokens;
+    aggregate.usage_present |= response.usage_present;
     aggregate.cost_estimate = match (aggregate.cost_estimate, response.cost_estimate) {
         (Some(left), Some(right)) => Some(left + right),
         // 初始聚合值（None）不是缺轮；只有响应侧缺值才置 None。
@@ -998,6 +999,7 @@ mod tests {
             cached_input_tokens: 0,
             reasoning_tokens: 0,
             cost_estimate: None,
+            usage_present: true,
         }
     }
 
@@ -1948,6 +1950,7 @@ mod tests {
                         cached_input_tokens: 0,
                         reasoning_tokens: 0,
                         cost_estimate: None,
+                        usage_present: true,
                     },
                 },
                 // compaction 摘要调用（CompactionEngine 走 complete）。
@@ -2026,6 +2029,7 @@ mod tests {
                         cached_input_tokens: 0,
                         reasoning_tokens: 0,
                         cost_estimate: None,
+                        usage_present: true,
                     },
                 },
                 FakeStep {

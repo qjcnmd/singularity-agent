@@ -740,6 +740,15 @@ pub struct ModelUsage {
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_estimate: Option<f64>,
+    /// 原始 usage 对象是否存在；缺失时各计数为 0 且 `cost_estimate` 必须为
+    /// None——不把"缺失"伪装成"零消费"。旧序列化数据（无此字段）按存在处理。
+    #[serde(default = "default_usage_present")]
+    pub usage_present: bool,
+}
+
+/// 旧版序列化数据无 `usage_present` 字段时按"存在"解释（保持历史语义）。
+fn default_usage_present() -> bool {
+    true
 }
 
 /// 模型侧请求或响应的校验错误和非致命警告。

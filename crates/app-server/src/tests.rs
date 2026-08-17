@@ -776,3 +776,100 @@ fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+#[test]
+fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "7d1e2f3a-4b5c-4d6e-8f90-1a2b3c4d5e6f";
+    let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![
+            completed_response("turn_one"),
+            completed_response("turn_two"),
+        ],
+        seen_requests: Arc::clone(&requests),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    // turn 1 正常完成。
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"first"}}]}}}}"#
+        ))
+        .expect("turn one");
+    let turn_one = responses
+        .iter()
+        .find(|message| message["id"] == 2)
+        .expect("turn one response");
+    let turn_id = turn_one["result"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn id")
+        .to_string();
+    assert_eq!(turn_one["result"]["turn"]["status"], "completed");
+
+    // turn 已终态：steer / followUp 不再 not found，入 thread 级待办队列。
+    for (method, text) in [
+        ("turn/steer", "change direction"),
+        ("turn/followUp", "keep going"),
+    ] {
+        let responses = server
+            .handle_json(&format!(
+                r#"{{"jsonrpc":"2.0","method":"{method}","id":3,"params":{{"turnId":"{turn_id}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
+            ))
+            .expect("post-terminal inject");
+        assert!(
+            responses[0]["result"].is_object(),
+            "{method} after completion must be queued, got: {responses:?}"
+        );
+    }
+    assert_eq!(
+        server
+            .thread_steer_pending
+            .lock()
+            .expect("steer pending")
+            .get(session_id)
+            .map(VecDeque::len),
+        Some(1)
+    );
+    assert_eq!(
+        server
+            .thread_follow_up_pending
+            .lock()
+            .expect("follow up pending")
+            .get(session_id)
+            .map(VecDeque::len),
+        Some(1)
+    );
+
+    // turn 2 在同一 thread 开始：取走待办并注入，请求消息包含纸条文本。
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":4,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"second"}}]}}}}"#
+        ))
+        .expect("turn two");
+    assert_eq!(
+        responses.iter().find(|m| m["id"] == 4).expect("turn two")["result"]["turn"]["status"],
+        "completed"
+    );
+    let seen = requests.lock().expect("seen requests");
+    let last = seen.last().expect("second provider call");
+    assert!(
+        seen.iter().any(|request| request
+            .messages
+            .iter()
+            .any(|m| m.content == "change direction")),
+        "second request must carry the queued steer text"
+    );
+    assert!(
+        seen.iter()
+            .any(|request| request.messages.iter().any(|m| m.content == "keep going")),
+        "second request must carry the queued followUp text"
+    );
+    let _ = last;
+}

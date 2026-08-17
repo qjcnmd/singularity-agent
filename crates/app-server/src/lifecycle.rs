@@ -152,6 +152,25 @@ impl AppServer {
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
         let steer_handle = agent.steer_handle();
         let follow_up_handle = agent.follow_up_handle();
+        // M2：把上一 turn 终态后到达的 thread 级待办（steer/followUp）取走注入本次
+        // turn；无待办时为空操作。
+        let thread_id = thread.thread_id.clone();
+        for (pending, handle) in [
+            (&self.thread_steer_pending, &steer_handle),
+            (&self.thread_follow_up_pending, &follow_up_handle),
+        ] {
+            let queued = pending
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                .remove(&thread_id)
+                .unwrap_or_default();
+            for text in queued {
+                handle
+                    .lock()
+                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                    .push_back(text);
+            }
+        }
         self.steer_handles
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
@@ -253,13 +272,39 @@ impl AppServer {
                 .get(&params.turn_id)
                 .cloned()
         };
-        let Some(handle) = handle else {
-            return not_found_response(message.required_id(), TURN_NOT_FOUND);
-        };
-        handle
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .push_back(text);
+        match handle {
+            // 有 turn 在跑：实时注入。
+            Some(handle) => {
+                handle
+                    .lock()
+                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                    .push_back(text);
+            }
+            // turn 已终态（句柄已摘除）：按 turn→thread 历史映射入 thread 级待办
+            // 队列，下一次 turn/start 取走；不再返回 not found（Pi 式 thread 队列）。
+            None => {
+                let thread_id = self
+                    .turn_threads
+                    .lock()
+                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                    .get(&params.turn_id)
+                    .cloned();
+                let Some(thread_id) = thread_id else {
+                    return not_found_response(message.required_id(), TURN_NOT_FOUND);
+                };
+                let queue = if follow_up {
+                    &self.thread_follow_up_pending
+                } else {
+                    &self.thread_steer_pending
+                };
+                queue
+                    .lock()
+                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                    .entry(thread_id)
+                    .or_default()
+                    .push_back(text);
+            }
+        }
         let thread_id = self
             .turn_threads
             .lock()
@@ -288,14 +333,6 @@ impl AppServer {
         json_response(
             message.required_id(),
             AgentCapabilityResult {
-                agent_loop: AgentLoopCapabilityStatus {
-                    available: true,
-                    status: AgentStatus::Completed.as_str().to_string(),
-                    reason:
-                        "AgentLoop uses the headless core; sandbox backend gating is not applied"
-                            .to_string(),
-                    blockers: Vec::new(),
-                },
                 provider_configuration: provider_configuration(&self.provider_snapshot),
             },
         )

@@ -87,7 +87,7 @@ sequenceDiagram
 
 Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
-- **steer / followUp 是内存队列**（裁决 9）：纯内存投递，进程退出即丢；不持久化、无幂等键。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
+- **steer / followUp 是 thread 级内存队列**（裁决 9/M2）：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入；turn 已终态时按 turn→thread 历史映射入 thread 待办队列，下一次 `turn/start` 取走注入（不再返回 not found）。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
 - **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed` 且为瞬时类错误做运行级重试（首次 + 最多 4 次，2s/4s/8s/16s 退避）；`Invalid` 直接失败。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
 - 停止条件：无工具调用的成功 assistant 响应；外部取消（aborted，不视为模型错误）；达到 `max_turns` 上限；模型错误或会话错误直接返回。
 
@@ -284,7 +284,7 @@ flowchart LR
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、project/trust、server/shutdown。turn/steer 与 turn/followUp 只作用于运行中的 turn，投递时无活动 turn 或 turn 已终态返回 not found。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 的 `查看会话 <id>`/`session:<id>` 只把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、project/trust、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入，turn 已终态则入 thread 待办、下次 `turn/start` 取走（Pi 式，不拒绝）。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出；客户端事件投影只含安全字段，不泄露 raw payload。
 
