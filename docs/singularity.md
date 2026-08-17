@@ -85,7 +85,7 @@ sequenceDiagram
 
 ## 3. AgentLoop 循环（图 c）
 
-Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
+Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。一个 assistant response 的工具批次先按 source order 完成查找、参数校验和执行模式 preflight；无 `Sequential` 工具时实际并行执行，有任一 `Sequential` 工具时整批顺序执行。生命周期事件按实际完成/回调到达顺序交付，durable ToolResult 始终按 assistant source order 写入并用于下一次请求；取消会传播给批次内所有工具并等待其终态结果收敛。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
 - **steer / followUp 是 thread 级内存队列**（裁决 9/M2）：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入并返回 outcome=active；turn 已终态时按 turn→thread 历史映射入 thread 待办队列并返回 outcome=queued，下一次 `turn/start` 取走注入；未知 turn 返回 not found。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
 - **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed`/`Invalid` 直接以 typed provider 错误结束，不在 AgentLoop 层做整轮重试。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
@@ -99,8 +99,12 @@ flowchart TD
     C --> D["compaction preflight<br/>(见第 6 节)"]
     D --> E["模型调用<br/>(流式 assistant 消息)"]
     E --> F{"response.status?"}
-    F -- "Success + toolCalls" --> G["按序执行工具"]
-    G --> H["toolResult 按序回传"]
+    F -- "Success + toolCalls" --> G["source-order preflight"]
+    G --> G2{"存在 Sequential?"}
+    G2 -- 否 --> G3["批次内并行执行"]
+    G2 -- 是 --> G4["整批顺序执行"]
+    G3 --> H["toolResult 按 assistant source order 回传"]
+    G4 --> H
     H --> B
     F -- "Success + stop" --> I["终态 assistant 落盘"]
     F -- "overflow" --> J["强制 compact 一次<br/>同轮重试；二次失败原样返回"]
@@ -115,7 +119,7 @@ flowchart TD
 
 ## 4. 工具执行链（图 d）
 
-模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ JSON Schema 参数校验 → 执行（进程内，继承进程权限，无 workspace containment）→ 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按调用顺序回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
+模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验与 preflight → 按 `ToolExecutionMode` 执行（默认 `Parallel`；任一 `Sequential` 时整批顺序）→ 进程内工具继承宿主权限执行 → 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
 
 **工具面（裁决 3，对齐 Pi）**：`ToolRegistry::new()` 只注册 read/bash/edit/write；文档不再声明未注册的 grep/find/ls。工具 schema 见第 12.2 节。
 
@@ -125,7 +129,7 @@ flowchart TD
 - 输出截断：bash 保留最后 2000 行 / 50 KiB，超限写入系统临时文件并返回 `fullOutputPath`；read 仅返回尾部与 `offset` 续读提示，不写临时文件。
 - 中断：abort 信号杀死整个进程树。
 - 工作目录绑定会话/任务工作区。
-- 不实现并发修改检测（Pi 没有；遇到真实覆盖冲突场景再按需加）。
+- `write`/`edit` 的完整文件修改窗口由小型 per-path mutation queue 串行化：key 是规范化执行环境身份（canonical cwd）与 canonical absolute path；已有路径通过 `canonicalize` 解析，缺失路径按最近存在祖先规范化，路径别名/符号链接指向同一目标时共享 key。目录准备、读—匹配—计算—写入均在临界区；不同文件仍可并行，lease 释放后无消费者 entry 从 map 清除。
 
 ```mermaid
 flowchart TD
@@ -134,9 +138,14 @@ flowchart TD
     C -- 否 --> R1["registry error → loop 写失败 toolResult<br/>(不执行, 不猜测不改写)"]
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
-    D -- "合法" --> F["执行（进程内）<br/>bash: timeout_ms 默认 120000 / 上限 600000<br/>中断杀进程树<br/>cwd 绑定工作区"]
-    F --> G["工具自身输出截断<br/>read: offset 续读；bash: 临时文件 + fullOutputPath"]
-    G --> I["toolResult 消息回传<br/>(content + is_error, 按调用顺序, 进入下一回合)"]
+    D -- "合法" --> E2["ToolExecutionMode 判定"]
+    E2 -- "Parallel 且无 Sequential" --> F1["批次内并行执行"]
+    E2 -- "存在 Sequential" --> F2["整批顺序执行"]
+    F1 --> F["进程内执行<br/>bash: timeout_ms 默认 120000 / 上限 600000<br/>中断杀进程树<br/>cwd 绑定工作区"]
+    F2 --> F
+    F --> G["write/edit: per-path mutation queue<br/>同文件完整窗口串行，不同文件并行"]
+    G --> H["工具自身输出截断<br/>read: offset 续读；bash: 临时文件 + fullOutputPath"]
+    H --> I["toolResult 消息回传<br/>(content + is_error, assistant source order, 进入下一回合)"]
 ```
 
 （图 d：工具执行链）

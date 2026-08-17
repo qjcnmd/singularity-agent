@@ -204,6 +204,7 @@ fn execute_prepared_tool(
             cwd,
             signal: Some(cancellation),
             on_update: Some(&mut update),
+            mutation_queue: None,
         },
     ) {
         Ok(execution) => execution,
@@ -2213,6 +2214,67 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tool_results, vec!["cancel_a", "cancel_b"]);
+    }
+
+    #[test]
+    fn same_file_edits_are_serialized_and_preserve_both_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "a\nb").unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let mut contract = fake_contract();
+        contract.max_parallel_tool_calls = 8;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![
+                FakeStep {
+                    text: String::new(),
+                    tool_calls: vec![
+                        tool_call(
+                            "edit_a",
+                            "edit",
+                            json!({
+                                "path": "shared.txt",
+                                "oldString": "a",
+                                "newString": "A"
+                            }),
+                        ),
+                        tool_call(
+                            "edit_b",
+                            "edit",
+                            json!({
+                                "path": "shared.txt",
+                                "oldString": "b",
+                                "newString": "B"
+                            }),
+                        ),
+                    ],
+                    usage: usage(50, 10),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(100, 20),
+                },
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        agent
+            .run(
+                "edit both lines",
+                &mut AgentEvents::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "A\nB"
+        );
     }
 
     /// 3. steer 注入：运行前队列注入 → 会话上下文持久化 → 后续轮次上下文中出现。

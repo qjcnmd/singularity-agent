@@ -51,6 +51,13 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         return error_result("Operation aborted");
     }
     let full_path = resolve_path(ctx.cwd, path);
+    let Some(queue) = ctx.mutation_queue.as_ref() else {
+        return error_result("file mutation queue is unavailable");
+    };
+    let _mutation_lease = match queue.lock(ctx.cwd, path) {
+        Ok(lease) => lease,
+        Err(error) => return error_result(format!("Could not edit file: {path}. {error}")),
+    };
     let content = match fs::read_to_string(&full_path) {
         Ok(content) => content,
         Err(error) => {

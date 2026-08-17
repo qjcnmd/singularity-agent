@@ -101,6 +101,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         cwd,
         signal,
         mut on_update,
+        mutation_queue: _,
     } = ctx;
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return error_result("missing required parameter \"command\"");
