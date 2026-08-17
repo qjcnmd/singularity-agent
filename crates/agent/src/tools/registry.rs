@@ -19,6 +19,33 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
+/// Whether calls from one assistant response may run concurrently.
+///
+/// The default is [`Parallel`](Self::Parallel); a tool opts into `Sequential`
+/// only when its own side effects require whole-call serialization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    #[default]
+    Parallel,
+    Sequential,
+}
+
+/// Result of the lookup and argument-validation preflight performed before a
+/// tool batch starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTool {
+    pub(crate) name: &'static str,
+    pub(crate) mode: ToolExecutionMode,
+}
+
+/// Preflight either produces an executable tool or a model-visible rejection.
+/// Unknown names remain registry errors so callers can preserve that boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPreflight {
+    Ready(PreparedTool),
+    Rejected(ToolExecution),
+}
+
 /// 注册表/内部层错误（如未知工具名）。工具自身的失败一律走 `ToolExecution::is_error`，
 /// 不进入该错误通道。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +73,7 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
+    pub execution_mode: ToolExecutionMode,
     pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
@@ -90,16 +118,41 @@ impl ToolRegistry {
         name: &str,
         ctx: ExecuteContext<'a>,
     ) -> Result<ToolExecution, ToolError> {
+        match self.preflight(name, &ctx.args)? {
+            ToolPreflight::Ready(prepared) => self.execute_prepared(prepared, ctx),
+            ToolPreflight::Rejected(execution) => Ok(execution),
+        }
+    }
+
+    /// Lookup and validate a call without executing it. Agent batches use this
+    /// before deciding whether the whole response can run in parallel.
+    pub fn preflight(&self, name: &str, args: &Value) -> Result<ToolPreflight, ToolError> {
         let spec = self
             .tools
             .get(name)
             .ok_or_else(|| ToolError(format!("unknown tool: {name}")))?;
-        if let Err(message) = validate_arguments(&spec.parameters, &ctx.args) {
-            return Ok(ToolExecution {
+        if let Err(message) = validate_arguments(&spec.parameters, args) {
+            return Ok(ToolPreflight::Rejected(ToolExecution {
                 content: format!("tool arguments failed validation: {message}"),
                 is_error: true,
-            });
+            }));
         }
+        Ok(ToolPreflight::Ready(PreparedTool {
+            name: spec.name,
+            mode: spec.execution_mode,
+        }))
+    }
+
+    /// Execute a call that has already passed [`Self::preflight`].
+    pub fn execute_prepared<'a>(
+        &self,
+        prepared: PreparedTool,
+        ctx: ExecuteContext<'a>,
+    ) -> Result<ToolExecution, ToolError> {
+        let spec = self
+            .tools
+            .get(prepared.name)
+            .ok_or_else(|| ToolError(format!("unknown tool: {}", prepared.name)))?;
         (spec.execute)(ctx)
     }
 }
@@ -180,6 +233,7 @@ mod tests {
             name: "ping",
             description: "custom test tool",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+            execution_mode: ToolExecutionMode::Parallel,
             execute: ping_execute,
         }
     }

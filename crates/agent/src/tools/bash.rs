@@ -90,6 +90,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
+        execution_mode: super::registry::ToolExecutionMode::Parallel,
         execute,
     }
 }

@@ -12,7 +12,10 @@ pub mod write;
 
 mod truncate;
 
-pub use registry::{ExecuteContext, ToolError, ToolExecution, ToolRegistry, ToolSpec};
+pub use registry::{
+    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolExecutionMode, ToolPreflight,
+    ToolRegistry, ToolSpec,
+};
 
 #[cfg(test)]
 pub(crate) mod test_support {

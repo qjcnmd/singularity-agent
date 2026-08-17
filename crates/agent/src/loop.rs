@@ -12,7 +12,10 @@
 //! - 中断：外部 `CancellationToken` 取消时终止并返回已完成的文本（`aborted=true`）。
 
 use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use serde_json::Value;
 use singularity_core::CancellationToken;
@@ -34,7 +37,10 @@ use crate::message::{
     AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message, user_message,
 };
 use crate::session::{SessionEntryType, SessionError, SessionManager};
-use crate::tools::{ExecuteContext, ToolError, ToolExecution, ToolRegistry};
+use crate::tools::{
+    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolExecutionMode, ToolPreflight,
+    ToolRegistry,
+};
 
 /// 工具开始回调签名：工具名、tool call id、结构化参数。
 pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value);
@@ -131,6 +137,185 @@ pub struct AgentOutcome {
 /// steer 注入的线程安全句柄：`Agent::steer_handle` 的返回类型，供进程边界
 /// （app-server turn/input）在 `run` 期间向队列注入消息；`run` 每轮开始时 drain。
 pub type SteerHandle = Arc<Mutex<VecDeque<String>>>;
+
+struct PreparedToolCall {
+    call: singularity_model::ModelToolCall,
+    prepared: Option<PreparedTool>,
+    preflight_execution: Option<ToolExecution>,
+}
+
+enum ToolRuntimeEvent {
+    Update {
+        index: usize,
+        text: String,
+    },
+    End {
+        index: usize,
+        execution: ToolExecution,
+    },
+}
+
+fn emit_tool_start(events: &mut AgentEvents<'_>, call: &singularity_model::ModelToolCall) {
+    if let Some(callback) = events.on_tool_execution_start.as_deref_mut() {
+        callback(&call.tool_name, &call.tool_call_id, &call.arguments);
+    }
+}
+
+fn emit_tool_update(
+    events: &mut AgentEvents<'_>,
+    call: &singularity_model::ModelToolCall,
+    text: &str,
+) {
+    if let Some(callback) = events.on_tool_execution_update.as_deref_mut() {
+        callback(&call.tool_name, &call.tool_call_id, &call.arguments, text);
+    }
+}
+
+fn emit_tool_end(
+    events: &mut AgentEvents<'_>,
+    call: &singularity_model::ModelToolCall,
+    execution: &ToolExecution,
+) {
+    if let Some(callback) = events.on_tool_execution_end.as_deref_mut() {
+        callback(&call.tool_name, &call.tool_call_id, execution);
+    }
+}
+
+fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecution {
+    ToolExecution {
+        content: format!("tool execution failed: {error}"),
+        is_error: true,
+    }
+}
+
+fn execute_prepared_tool(
+    registry: &ToolRegistry,
+    prepared: PreparedTool,
+    call: &singularity_model::ModelToolCall,
+    cwd: &Path,
+    cancellation: &CancellationToken,
+    mut on_update: impl FnMut(&str),
+) -> ToolExecution {
+    let mut update = |text: &str| on_update(text);
+    match registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            args: call.arguments.clone(),
+            cwd,
+            signal: Some(cancellation),
+            on_update: Some(&mut update),
+        },
+    ) {
+        Ok(execution) => execution,
+        Err(error) => tool_error_execution(error),
+    }
+}
+
+fn execute_tool_batch_sequential(
+    registry: &ToolRegistry,
+    calls: &[PreparedToolCall],
+    cwd: &Path,
+    cancellation: &CancellationToken,
+    events: &mut AgentEvents<'_>,
+) -> Vec<ToolExecution> {
+    calls
+        .iter()
+        .map(|item| {
+            let execution = if let Some(execution) = &item.preflight_execution {
+                execution.clone()
+            } else {
+                let prepared = item
+                    .prepared
+                    .expect("prepared tool call must have a preflight result");
+                execute_prepared_tool(registry, prepared, &item.call, cwd, cancellation, |text| {
+                    emit_tool_update(events, &item.call, text);
+                })
+            };
+            emit_tool_end(events, &item.call, &execution);
+            execution
+        })
+        .collect()
+}
+
+fn execute_tool_batch_parallel(
+    registry: &ToolRegistry,
+    calls: &[PreparedToolCall],
+    cwd: &Path,
+    cancellation: &CancellationToken,
+    events: &mut AgentEvents<'_>,
+) -> Vec<ToolExecution> {
+    let (sender, receiver): (Sender<ToolRuntimeEvent>, Receiver<ToolRuntimeEvent>) =
+        mpsc::channel();
+    let mut results = vec![None; calls.len()];
+    let worker_count = calls
+        .iter()
+        .filter(|item| item.preflight_execution.is_none())
+        .count();
+
+    // Preflight rejections are already complete and do not enter a worker.
+    for (index, item) in calls.iter().enumerate() {
+        if let Some(execution) = &item.preflight_execution {
+            emit_tool_end(events, &item.call, execution);
+            results[index] = Some(execution.clone());
+        }
+    }
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for (index, item) in calls.iter().enumerate() {
+            let Some(prepared) = item.prepared else {
+                continue;
+            };
+            let sender = sender.clone();
+            let call = item.call.clone();
+            handles.push(scope.spawn(move || {
+                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
+                        let _ = sender.send(ToolRuntimeEvent::Update {
+                            index,
+                            text: text.to_string(),
+                        });
+                    })
+                }))
+                .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
+                let _ = sender.send(ToolRuntimeEvent::End { index, execution });
+            }));
+        }
+        drop(sender);
+
+        let mut finished = 0usize;
+        while finished < worker_count {
+            match receiver.recv() {
+                Ok(ToolRuntimeEvent::Update { index, text }) => {
+                    emit_tool_update(events, &calls[index].call, &text);
+                }
+                Ok(ToolRuntimeEvent::End { index, execution }) => {
+                    emit_tool_end(events, &calls[index].call, &execution);
+                    results[index] = Some(execution);
+                    finished += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+
+    // A worker must always send End, but preserve a fail-closed result if a
+    // thread or channel failure violates that invariant.
+    for (index, result) in results.iter_mut().enumerate() {
+        if result.is_none() {
+            let execution = tool_error_execution("tool worker did not produce a result");
+            emit_tool_end(events, &calls[index].call, &execution);
+            *result = Some(execution);
+        }
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("tool batch result must be present"))
+        .collect()
+}
 
 /// 按 provider 声明把系统/开发者指令投影为请求首条消息。
 ///
@@ -344,57 +529,65 @@ impl Agent {
                 let tool_calls = response.tool_calls.clone();
                 if !tool_calls.is_empty() {
                     // 一次模型响应 = 一条 assistant 消息（v4 内容块：thinking +
-                    // 文本 + 全部 tool_call 块，对齐 Pi AssistantMessage.content 数组）；
-                    // 随后逐个顺序执行并把结果按 toolCallId 写回会话。
+                    // 文本 + 全部 tool_call 块，对齐 Pi AssistantMessage.content 数组）。
                     self.session
                         .append_message(assistant_response_message(&response))?;
-                    for call in &tool_calls {
-                        if let Some(on_start) = events.on_tool_execution_start.as_deref_mut() {
-                            on_start(&call.tool_name, &call.tool_call_id, &call.arguments);
-                        }
-                        // 用短生命周期闭包包装 update 回调：`&mut dyn FnMut` 的 reborrow
-                        // 会保留原对象生命周期，直接传入会把 ExecuteContext 的 cwd 借用
-                        // 绑到回调生命周期上，导致与后续 session 写冲突。
-                        let mut on_update = |text: &str| {
-                            if let Some(callback) = events.on_tool_execution_update.as_deref_mut() {
-                                callback(
-                                    &call.tool_name,
-                                    &call.tool_call_id,
-                                    &call.arguments,
-                                    text,
-                                );
+                    // 查找、参数校验和执行模式判定先按 source order 完成；
+                    // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
+                    let prepared_calls = tool_calls
+                        .iter()
+                        .map(|call| {
+                            let (prepared, preflight_execution) = match self
+                                .registry
+                                .preflight(&call.tool_name, &call.arguments)
+                            {
+                                Ok(ToolPreflight::Ready(prepared)) => (Some(prepared), None),
+                                Ok(ToolPreflight::Rejected(execution)) => (None, Some(execution)),
+                                Err(error) => (None, Some(tool_error_execution(error))),
+                            };
+                            PreparedToolCall {
+                                call: call.clone(),
+                                prepared,
+                                preflight_execution,
                             }
-                        };
-                        let execution = match self.registry.execute(
-                            &call.tool_name,
-                            ExecuteContext {
-                                args: call.arguments.clone(),
-                                cwd: self.session.cwd(),
-                                signal: Some(cancellation),
-                                on_update: Some(&mut on_update),
-                            },
-                        ) {
-                            Ok(execution) => execution,
-                            // 未知工具/注册层错误按工具失败写入结果，不终止循环。
-                            Err(error) => ToolExecution {
-                                content: format!("tool execution failed: {error}"),
-                                is_error: true,
-                            },
-                        };
-                        if let Some(on_end) = events.on_tool_execution_end.as_deref_mut() {
-                            on_end(&call.tool_name, &call.tool_call_id, &execution);
-                        }
+                        })
+                        .collect::<Vec<_>>();
+                    for item in &prepared_calls {
+                        emit_tool_start(events, &item.call);
+                    }
+                    let sequential = prepared_calls.iter().any(|item| {
+                        item.prepared
+                            .is_some_and(|prepared| prepared.mode == ToolExecutionMode::Sequential)
+                    });
+                    let executions = if sequential {
+                        execute_tool_batch_sequential(
+                            &self.registry,
+                            &prepared_calls,
+                            self.session.cwd(),
+                            cancellation,
+                            events,
+                        )
+                    } else {
+                        execute_tool_batch_parallel(
+                            &self.registry,
+                            &prepared_calls,
+                            self.session.cwd(),
+                            cancellation,
+                            events,
+                        )
+                    };
+                    // Durable toolResult entries are always appended in assistant source order,
+                    // regardless of completion/event order.
+                    for (call, execution) in tool_calls.iter().zip(executions.iter()) {
                         self.session.append_message(tool_result_message(
                             &call.tool_call_id,
                             &call.tool_name,
-                            &execution,
+                            execution,
                         ))?;
-                        // 与 Pi 顺序一致：已开始的工具先发 end 并写入 toolResult，
-                        // 再收敛取消；后续工具不再执行。
-                        if cancellation.is_cancelled() {
-                            outcome.aborted = true;
-                            return Ok(outcome);
-                        }
+                    }
+                    if cancellation.is_cancelled() {
+                        outcome.aborted = true;
+                        return Ok(outcome);
                     }
                     self.maybe_compact(
                         &mut outcome.compacted,
@@ -773,11 +966,144 @@ mod tests {
     use super::*;
     use crate::message::AgentMessage;
     use crate::session::{CompactionEntry, SessionEntryType};
+    use crate::tools::{ToolExecutionMode, ToolSpec};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
     use singularity_model::{ModelToolCall, ModelToolParseStatus, ProviderStreamingCapability};
+
+    static PARALLEL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static PARALLEL_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static SEQUENTIAL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static SEQUENTIAL_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_max(maximum: &AtomicUsize, value: usize) {
+        let mut current = maximum.load(Ordering::SeqCst);
+        while value > current {
+            match maximum.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn delay_parameters() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "delay_ms": { "type": "integer" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn delay_execute(mut ctx: ExecuteContext<'_>) -> std::result::Result<ToolExecution, ToolError> {
+        let id = ctx
+            .args
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if let Some(update) = ctx.on_update.as_deref_mut() {
+            update(&format!("partial:{id}"));
+        }
+        let delay = ctx
+            .args
+            .get("delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        std::thread::sleep(Duration::from_millis(delay));
+        Ok(ToolExecution {
+            content: id.to_string(),
+            is_error: false,
+        })
+    }
+
+    fn barrier_execute(
+        mut ctx: ExecuteContext<'_>,
+    ) -> std::result::Result<ToolExecution, ToolError> {
+        let id = ctx
+            .args
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let active = PARALLEL_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        record_max(&PARALLEL_MAX_ACTIVE, active);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while PARALLEL_ACTIVE.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if let Some(update) = ctx.on_update.as_deref_mut() {
+            update(&format!("partial:{id}"));
+        }
+        PARALLEL_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolExecution {
+            content: id.to_string(),
+            is_error: false,
+        })
+    }
+
+    fn sequential_execute(
+        ctx: ExecuteContext<'_>,
+    ) -> std::result::Result<ToolExecution, ToolError> {
+        let id = ctx
+            .args
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let active = SEQUENTIAL_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        record_max(&SEQUENTIAL_MAX_ACTIVE, active);
+        std::thread::sleep(Duration::from_millis(25));
+        SEQUENTIAL_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolExecution {
+            content: id.to_string(),
+            is_error: false,
+        })
+    }
+
+    fn failure_execute(_ctx: ExecuteContext<'_>) -> std::result::Result<ToolExecution, ToolError> {
+        Ok(ToolExecution {
+            content: "intentional tool failure".to_string(),
+            is_error: true,
+        })
+    }
+
+    fn cancellation_execute(
+        ctx: ExecuteContext<'_>,
+    ) -> std::result::Result<ToolExecution, ToolError> {
+        for _ in 0..200 {
+            if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
+                return Ok(ToolExecution {
+                    content: "Operation aborted".to_string(),
+                    is_error: true,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(ToolExecution {
+            content: "cancellation was not observed".to_string(),
+            is_error: true,
+        })
+    }
+
+    fn custom_spec(
+        name: &'static str,
+        mode: ToolExecutionMode,
+        execute: for<'a> fn(ExecuteContext<'a>) -> std::result::Result<ToolExecution, ToolError>,
+        parameters: Value,
+    ) -> ToolSpec {
+        ToolSpec {
+            name,
+            description: "phase 5 test tool",
+            parameters,
+            execution_mode: mode,
+            execute,
+        }
+    }
 
     /// 脚本化 FakeProvider：按脚本顺序弹出响应；`complete_stream` 以单次文本增量
     /// 投递 assistant 文本（覆盖流式路径），`complete` 无增量（覆盖回退/compaction 路径）。
@@ -1604,6 +1930,289 @@ mod tests {
         assert_eq!(ends[0].1, "call_bash");
         assert!(!ends[0].3);
         assert!(ends[0].2.contains("hi"));
+    }
+
+    #[test]
+    fn parallel_tool_batch_overlaps_and_preserves_source_order() {
+        PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
+        PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(custom_spec(
+            "overlap",
+            ToolExecutionMode::Parallel,
+            barrier_execute,
+            delay_parameters(),
+        ));
+        let mut contract = fake_contract();
+        contract.max_parallel_tool_calls = 8;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![
+                FakeStep {
+                    text: String::new(),
+                    tool_calls: vec![
+                        tool_call("call_a", "overlap", json!({ "id": "a" })),
+                        tool_call("call_b", "overlap", json!({ "id": "b" })),
+                    ],
+                    usage: usage(50, 10),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(100, 20),
+                },
+            ],
+        ));
+        let mut agent =
+            Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
+        let mut events = AgentEvents::new();
+        let mut starts = Vec::new();
+        let mut updates = Vec::new();
+        let mut ends = Vec::new();
+        let mut on_start = |name: &str, id: &str, args: &Value| {
+            starts.push((name.to_string(), id.to_string(), args.clone()));
+        };
+        let mut on_update = |name: &str, id: &str, args: &Value, partial: &str| {
+            updates.push((
+                name.to_string(),
+                id.to_string(),
+                args.clone(),
+                partial.to_string(),
+            ));
+        };
+        let mut on_end = |name: &str, id: &str, result: &ToolExecution| {
+            ends.push((
+                name.to_string(),
+                id.to_string(),
+                result.content.clone(),
+                result.is_error,
+            ));
+        };
+        events.on_tool_execution_start = Some(&mut on_start);
+        events.on_tool_execution_update = Some(&mut on_update);
+        events.on_tool_execution_end = Some(&mut on_end);
+        let outcome = agent
+            .run("parallel", &mut events, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+        assert!(
+            PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst) >= 2,
+            "parallel tools did not overlap"
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .map(|(_, id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_a", "call_b"]
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(ends.len(), 2);
+        assert!(ends.iter().all(|(_, _, _, is_error)| !is_error));
+        let requests = provider.requests.lock().unwrap();
+        let tool_results = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::Tool)
+            .map(|message| {
+                (
+                    message.tool_call_id.clone().unwrap(),
+                    message.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_results
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_a", "call_b"]
+        );
+        assert_eq!(tool_results[0].1, "a");
+        assert_eq!(tool_results[1].1, "b");
+    }
+
+    #[test]
+    fn sequential_tool_forces_the_whole_batch_to_run_in_order() {
+        SEQUENTIAL_ACTIVE.store(0, Ordering::SeqCst);
+        SEQUENTIAL_MAX_ACTIVE.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(custom_spec(
+            "serial",
+            ToolExecutionMode::Sequential,
+            sequential_execute,
+            delay_parameters(),
+        ));
+        let mut contract = fake_contract();
+        contract.max_parallel_tool_calls = 8;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![
+                FakeStep {
+                    text: String::new(),
+                    tool_calls: vec![
+                        tool_call("serial_a", "serial", json!({ "id": "a" })),
+                        tool_call("serial_b", "serial", json!({ "id": "b" })),
+                    ],
+                    usage: usage(50, 10),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(100, 20),
+                },
+            ],
+        ));
+        let mut agent =
+            Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
+        let mut ends = Vec::new();
+        let mut on_end = |_: &str, id: &str, _: &ToolExecution| ends.push(id.to_string());
+        let mut events = AgentEvents::new();
+        events.on_tool_execution_end = Some(&mut on_end);
+        agent
+            .run("sequential", &mut events, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(SEQUENTIAL_MAX_ACTIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(ends, vec!["serial_a", "serial_b"]);
+        let requests = provider.requests.lock().unwrap();
+        let ids = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::Tool)
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["serial_a", "serial_b"]);
+    }
+
+    #[test]
+    fn tool_failure_does_not_drop_other_parallel_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(custom_spec(
+            "fail",
+            ToolExecutionMode::Parallel,
+            failure_execute,
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        ));
+        registry.register(custom_spec(
+            "delay",
+            ToolExecutionMode::Parallel,
+            delay_execute,
+            delay_parameters(),
+        ));
+        let mut contract = fake_contract();
+        contract.max_parallel_tool_calls = 8;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![
+                FakeStep {
+                    text: String::new(),
+                    tool_calls: vec![
+                        tool_call("fail_call", "fail", json!({})),
+                        tool_call("ok_call", "delay", json!({ "id": "ok" })),
+                    ],
+                    usage: usage(50, 10),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(100, 20),
+                },
+            ],
+        ));
+        let mut agent =
+            Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
+        let outcome = agent
+            .run(
+                "failure",
+                &mut AgentEvents::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+        let requests = provider.requests.lock().unwrap();
+        let results = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::Tool)
+            .map(|message| {
+                (
+                    message.tool_call_id.clone().unwrap(),
+                    message.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results[0].0, "fail_call");
+        assert!(results[0].1.contains("intentional tool failure"));
+        assert_eq!(results[1], ("ok_call".to_string(), "ok".to_string()));
+    }
+
+    #[test]
+    fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(custom_spec(
+            "cancel_wait",
+            ToolExecutionMode::Parallel,
+            cancellation_execute,
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        ));
+        let mut contract = fake_contract();
+        contract.max_parallel_tool_calls = 8;
+        let provider = Arc::new(FakeProvider::new(
+            contract,
+            vec![FakeStep {
+                text: String::new(),
+                tool_calls: vec![
+                    tool_call("cancel_a", "cancel_wait", json!({})),
+                    tool_call("cancel_b", "cancel_wait", json!({})),
+                ],
+                usage: usage(50, 10),
+            }],
+        ));
+        let mut agent =
+            Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let cancellation_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            canceller.cancel();
+        });
+        let outcome = agent
+            .run("cancel", &mut AgentEvents::new(), &cancellation)
+            .unwrap();
+        cancellation_thread.join().unwrap();
+        assert!(outcome.aborted);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        let entries = agent.session.build_context_entries().unwrap();
+        let tool_results = entries
+            .iter()
+            .filter_map(|entry| match &entry.entry_type {
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::ToolResult =>
+                {
+                    Some(message.tool_call_id.clone().unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results, vec!["cancel_a", "cancel_b"]);
     }
 
     /// 3. steer 注入：运行前队列注入 → 会话上下文持久化 → 后续轮次上下文中出现。
