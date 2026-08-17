@@ -35,8 +35,8 @@ use singularity_protocol::{
     ServerCapabilitiesResult, ServerShutdownResult, SessionDeleteResult, SessionIdParams,
     SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
     ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
-    TurnInjectionParams, TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult,
-    TurnStatus,
+    TurnInjectionOutcome, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
+    TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
@@ -303,8 +303,8 @@ pub struct AppServer {
     shutdown_requested: bool,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// turn id -> session id（同一连接内 turn/steer、turn/followUp 响应需要）。
-    turn_threads: Arc<Mutex<HashMap<String, String>>>,
+    /// turn id -> thread 与最后已知生命周期（终态 steer 需要返回真实状态）。
+    turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
     /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
@@ -320,6 +320,13 @@ pub struct AppServer {
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
+}
+
+#[derive(Debug, Clone)]
+struct TurnReference {
+    thread_id: String,
+    status: TurnStatus,
+    agent_loop_status: String,
 }
 
 #[cfg(test)]
@@ -703,7 +710,14 @@ impl AppServer {
         self.turn_threads
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(turn_id.to_string(), thread_id.to_string());
+            .insert(
+                turn_id.to_string(),
+                TurnReference {
+                    thread_id: thread_id.to_string(),
+                    status: TurnStatus::Running,
+                    agent_loop_status: AgentStatus::Running.as_str().to_string(),
+                },
+            );
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
@@ -819,7 +833,7 @@ impl AppServer {
             (Ok(active), Ok(turn_threads)) => active.keys().any(|turn_id| {
                 turn_threads
                     .get(turn_id)
-                    .is_some_and(|sid| sid == session_id)
+                    .is_some_and(|reference| reference.thread_id == session_id)
             }),
             // 锁中毒视为没有存活 turn：宁可投影为终态也不伪装运行中。
             _ => false,
@@ -845,6 +859,67 @@ impl AppServer {
         let _ = self.usage_by_turn.lock().map(|mut cache| {
             cache.insert(turn_id.to_string(), usage.clone());
         });
+    }
+
+    pub(crate) fn remember_turn_status(
+        &self,
+        turn_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+    ) {
+        let _ = self.turn_threads.lock().map(|mut references| {
+            if let Some(reference) = references.get_mut(turn_id) {
+                reference.status = status;
+                reference.agent_loop_status = agent_loop_status.to_string();
+            }
+        });
+    }
+
+    /// 关闭已结束 turn 的实时注入窗口，并把窗口关闭前已到达但尚未被
+    /// AgentLoop drain 的输入转移到对应 thread 的下一轮队列。句柄表锁与
+    /// 注入路径保持同一锁顺序，避免 turn 结束竞态丢失输入。
+    pub(crate) fn close_turn_inputs(
+        &self,
+        turn_id: &str,
+        thread_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+    ) {
+        let Ok(mut references) = self.turn_threads.lock() else {
+            return;
+        };
+        let Some(reference) = references.get_mut(turn_id) else {
+            return;
+        };
+        reference.status = status;
+        reference.agent_loop_status = agent_loop_status.to_string();
+        for (handles, pending) in [
+            (&self.steer_handles, &self.thread_steer_pending),
+            (&self.follow_up_handles, &self.thread_follow_up_pending),
+        ] {
+            let handle = handles
+                .lock()
+                .ok()
+                .and_then(|mut entries| entries.remove(turn_id));
+            let Some(handle) = handle else {
+                continue;
+            };
+            let residual = handle
+                .lock()
+                .ok()
+                .map(|mut queue| std::mem::take(&mut *queue))
+                .unwrap_or_default();
+            if residual.is_empty() {
+                continue;
+            }
+            if let Ok(mut queues) = pending.lock() {
+                queues
+                    .entry(thread_id.to_string())
+                    .or_default()
+                    .extend(residual);
+            }
+        }
+        drop(references);
     }
 }
 

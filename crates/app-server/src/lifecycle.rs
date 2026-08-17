@@ -71,14 +71,31 @@ impl AppServer {
         };
         let mut assistant_events = AssistantItemEventState::new(format!("{turn_id}_assistant"));
         emit(self.event_notification(AppEvent::turn_started(&turn))?);
-        let status = match self.run_agent_core(
+        let run_result = self.run_agent_core(
             &thread,
             &turn_id,
             &input_text,
             &cancellation,
             &mut assistant_events,
             &mut emit,
-        ) {
+        );
+        // AgentLoop 已停止后立即关闭实时注入窗口；窗口关闭前已经到达的
+        // 输入由 close_turn_inputs 转移到 thread 队列，避免终态化期间丢失。
+        // 状态和句柄在同一 turn_threads 锁下线性化，旧 turn 不会再暴露 running。
+        let (closed_status, closed_agent_loop_status) = match &run_result {
+            Ok(status) => (
+                turn_status_for_agent(&status.status),
+                status.status.as_str(),
+            ),
+            Err(_) => (TurnStatus::Failed, AgentStatus::Failed.as_str()),
+        };
+        self.close_turn_inputs(
+            &turn_id,
+            &record.session_id,
+            closed_status,
+            closed_agent_loop_status,
+        );
+        let status = match run_result {
             Ok(status)
                 if matches!(
                     status.status,
@@ -133,6 +150,7 @@ impl AppServer {
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
             let _ = self.persist_failure_state(&record.session_id, &status.model_usage);
+            self.remember_turn_status(&turn_id, TurnStatus::Failed, AgentStatus::Failed.as_str());
             let _event_failure = self.emit_failure_terminal_events(
                 &turn_id,
                 &record.session_id,
@@ -150,6 +168,11 @@ impl AppServer {
         // Publication order: durable metadata first, then the in-process usage
         // projection used by the terminal event and RPC response.
         self.remember_usage(&turn_id, &status.model_usage);
+        self.remember_turn_status(
+            &turn_id,
+            terminal_turn.status,
+            &terminal_turn.agent_loop_status,
+        );
         let terminal_turn = self.turn_with_usage(terminal_turn);
         let completion = self.event_notification(AppEvent::turn_completed(&terminal_turn));
         match completion {
@@ -199,6 +222,7 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
         let (metadata_error, _durable) = self.persist_failure_state(&record.session_id, usage);
+        self.remember_turn_status(turn_id, TurnStatus::Failed, AgentStatus::Failed.as_str());
         let event_failure = self.emit_failure_terminal_events(
             turn_id,
             &record.session_id,
@@ -488,69 +512,70 @@ impl AppServer {
         let params: TurnInjectionParams = parse_params(&message)?;
         let payload = serde_json::to_value(&params.input)?;
         let text = input_items_to_text(&payload)?;
-        let handle = if follow_up {
-            self.follow_up_handles
+        // turn_threads 是状态转换的同步锁：终态化先更新 reference 再摘除句柄，
+        // 注入请求不会在终态窗口中重新观察到 running。
+        let (reference, outcome) = {
+            let references = self
+                .turn_threads
                 .lock()
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                .get(&params.turn_id)
-                .cloned()
-        } else {
-            self.steer_handles
-                .lock()
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                .get(&params.turn_id)
-                .cloned()
-        };
-        match handle {
-            // 有 turn 在跑：实时注入。
-            Some(handle) => {
-                handle
-                    .lock()
-                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                    .push_back(text);
-            }
-            // turn 已终态（句柄已摘除）：按 turn→thread 历史映射入 thread 级待办
-            // 队列，下一次 turn/start 取走；不再返回 not found（Pi 式 thread 队列）。
-            None => {
-                let thread_id = self
-                    .turn_threads
-                    .lock()
-                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                    .get(&params.turn_id)
-                    .cloned();
-                let Some(thread_id) = thread_id else {
-                    return not_found_response(message.required_id(), TURN_NOT_FOUND);
-                };
-                let queue = if follow_up {
-                    &self.thread_follow_up_pending
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+            let Some(reference) = references.get(&params.turn_id).cloned() else {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            };
+            let active = if reference.status == TurnStatus::Running {
+                let handles = if follow_up {
+                    &self.follow_up_handles
                 } else {
-                    &self.thread_steer_pending
+                    &self.steer_handles
                 };
-                queue
+                let handles = handles
                     .lock()
-                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-                    .entry(thread_id)
-                    .or_default()
-                    .push_back(text);
-            }
+                    .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+                if let Some(handle) = handles.get(&params.turn_id).cloned() {
+                    handle
+                        .lock()
+                        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                        .push_back(text.clone());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            (
+                reference,
+                if active {
+                    TurnInjectionOutcome::Active
+                } else {
+                    TurnInjectionOutcome::Queued
+                },
+            )
+        };
+        if outcome == TurnInjectionOutcome::Queued {
+            let queue = if follow_up {
+                &self.thread_follow_up_pending
+            } else {
+                &self.thread_steer_pending
+            };
+            queue
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                .entry(reference.thread_id.clone())
+                .or_default()
+                .push_back(text);
         }
-        let thread_id = self
-            .turn_threads
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(&params.turn_id)
-            .cloned()
-            .unwrap_or_default();
         json_response(
             message.required_id(),
-            TurnResult {
+            TurnInjectionResult {
                 turn: Turn {
                     turn_id: params.turn_id,
-                    thread_id,
-                    status: TurnStatus::Running,
-                    agent_loop_status: AgentStatus::Running.as_str().to_string(),
+                    thread_id: reference.thread_id,
+                    status: reference.status,
+                    agent_loop_status: reference.agent_loop_status,
                     model_usage: None,
                 },
+                outcome,
             },
         )
     }

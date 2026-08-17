@@ -651,16 +651,20 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
         .expect("follow up handles")
         .insert("turn_live".to_string(), Arc::clone(&follow_up));
 
-    server
+    let steer_response = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{"turnId":"turn_live","input":[{"type":"text","text":"change direction"}]}}"#,
         )
         .expect("turn steer");
-    server
+    assert_eq!(steer_response[0]["result"]["outcome"], "active");
+    assert_eq!(steer_response[0]["result"]["turn"]["status"], "running");
+    let follow_up_response = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"turn/followUp","id":4,"params":{"turnId":"turn_live","input":[{"type":"text","text":"keep going"}]}}"#,
         )
         .expect("turn followUp");
+    assert_eq!(follow_up_response[0]["result"]["outcome"], "active");
+    assert_eq!(follow_up_response[0]["result"]["turn"]["status"], "running");
 
     let steer = steer.lock().expect("steer queue");
     let follow_up = follow_up.lock().expect("follow up queue");
@@ -824,6 +828,8 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
             responses[0]["result"].is_object(),
             "{method} after completion must be queued, got: {responses:?}"
         );
+        assert_eq!(responses[0]["result"]["outcome"], "queued");
+        assert_eq!(responses[0]["result"]["turn"]["status"], "completed");
     }
     assert_eq!(
         server
@@ -869,6 +875,111 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
         "second request must carry the queued followUp text"
     );
     let _ = last;
+}
+
+#[test]
+fn terminal_turn_queue_is_thread_scoped_and_consumed_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace_a = temp.path().join("workspace-a");
+    let workspace_b = temp.path().join("workspace-b");
+    std::fs::create_dir_all(&workspace_a).expect("workspace a");
+    std::fs::create_dir_all(&workspace_b).expect("workspace b");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_a = "a1e2d3c4-1111-4222-8333-444455556666";
+    let session_b = "b1e2d3c4-7777-4888-8999-000011112222";
+    let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![completed_response("queued_once")],
+        seen_requests: Arc::clone(&requests),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_a, &workspace_a);
+    insert_session(&server, &sessions_dir, session_b, &workspace_b);
+
+    let first = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"first-a"}}]}}}}"#
+        ))
+        .expect("turn a");
+    let turn_a = first
+        .iter()
+        .find(|message| message["id"] == 2)
+        .and_then(|message| message["result"]["turn"]["turn_id"].as_str())
+        .expect("turn a id")
+        .to_string();
+
+    let queued = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{{"turnId":"{turn_a}","input":[{{"type":"text","text":"only-a"}}]}}}}"#
+        ))
+        .expect("queue a");
+    assert_eq!(queued[0]["result"]["outcome"], "queued");
+
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":4,"params":{{"threadId":"{session_b}","input":[{{"type":"text","text":"first-b"}}]}}}}"#
+        ))
+        .expect("turn b");
+    let requests_after_b = requests.lock().expect("requests after b");
+    assert!(
+        !requests_after_b[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "only-a")
+    );
+    drop(requests_after_b);
+
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"second-a"}}]}}}}"#
+        ))
+        .expect("turn a queued");
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":6,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"third-a"}}]}}}}"#
+        ))
+        .expect("turn a without duplicate queue");
+
+    let requests = requests.lock().expect("requests");
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(|message| message.content == "only-a")
+    );
+    assert_eq!(
+        requests[3]
+            .messages
+            .iter()
+            .filter(|message| message.content == "only-a")
+            .count(),
+        1,
+        "consumed queue text must remain in history without being injected again"
+    );
+}
+
+#[test]
+fn turn_injection_unknown_turn_is_not_found() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "c1e2d3f4-3333-4555-8666-777788889999";
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    for method in ["turn/steer", "turn/followUp"] {
+        let responses = server
+            .handle_json(&format!(
+                r#"{{"jsonrpc":"2.0","method":"{method}","id":2,"params":{{"turnId":"unknown","input":[{{"type":"text","text":"ignored"}}]}}}}"#
+            ))
+            .expect("unknown turn response");
+        assert_eq!(responses[0]["error"]["code"], -32004, "{method}");
+    }
 }
 
 #[test]

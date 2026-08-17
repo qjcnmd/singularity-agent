@@ -419,6 +419,8 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
         "turn/steer",
         json!({"turnId": "unknown-will-be-replaced", "input": [{"type": "text", "text": "ignored"}]}),
     );
+    let unknown = process.output.recv_id(5, Duration::from_secs(5));
+    assert_eq!(unknown["error"]["code"], -32004);
     // 用事件里的真实 turn id 重发：从 turn/started 通知中读取。
     let turn_id = process
         .output
@@ -506,8 +508,9 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
         json!({"turnId": turn_id, "input": [{"type": "text", "text": "late"}]}),
     );
     let late = process.output.recv_id(8, Duration::from_secs(5));
+    assert_eq!(late["result"]["outcome"], "queued");
     assert_eq!(
-        late["result"]["turn"]["status"], "running",
+        late["result"]["turn"]["status"], "completed",
         "late steer must be accepted into the thread queue: {late}"
     );
 

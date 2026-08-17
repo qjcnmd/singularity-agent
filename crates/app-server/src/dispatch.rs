@@ -331,7 +331,7 @@ impl AppServer {
             active_turns.keys().any(|turn_id| {
                 turn_threads
                     .get(turn_id)
-                    .is_some_and(|sid| sid == &params.session_id)
+                    .is_some_and(|reference| reference.thread_id == params.session_id)
             })
         };
         if turn_active {

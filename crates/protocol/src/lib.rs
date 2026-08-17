@@ -143,8 +143,8 @@ method_registry! {
     SessionRead => ("session/read", Request, SessionReadParams, SessionReadResult),
     SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
-    TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnResult),
-    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams, TurnResult),
+    TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnInjectionResult),
+    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams, TurnInjectionResult),
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
@@ -698,7 +698,8 @@ pub enum InputItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 向同一连接内运行中的 turn 注入用户输入（turn/steer、turn/followUp）。
+/// 向活动 turn 注入输入，或将输入排入已终态 turn 所属 thread 的下一轮队列。
+/// 未知 turn id 返回 not found；turn/steer 与 turn/followUp 共用此参数。
 pub struct TurnInjectionParams {
     pub turn_id: String,
     pub input: Vec<InputItem>,
@@ -807,10 +808,21 @@ pub struct AgentCapabilityResult {
     pub provider_configuration: ProviderConfigurationStatus,
 }
 
+/// turn/steer 或 turn/followUp 的交付结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnInjectionOutcome {
+    /// 输入已注入仍在执行的 turn。
+    Active,
+    /// 输入已排入 thread 的下一轮队列。
+    Queued,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// turn/status 的响应。
-pub struct TurnResult {
+/// turn/steer 或 turn/followUp 的响应。
+pub struct TurnInjectionResult {
     pub turn: Turn,
+    pub outcome: TurnInjectionOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

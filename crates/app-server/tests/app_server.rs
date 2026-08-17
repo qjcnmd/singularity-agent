@@ -165,12 +165,12 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
         .expect("open rollout");
     writeln!(
         file,
-        "{{\"id\":\"e1\",\"parentId\":null,\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"one\"}}}}"
+        "{{\"id\":\"e1\",\"parentId\":null,\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"one\"}}]}}}}"
     )
     .expect("append entry");
     writeln!(
         file,
-        "{{\"id\":\"e2\",\"parentId\":\"e1\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":\"two\"}}}}"
+        "{{\"id\":\"e2\",\"parentId\":\"e1\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"two\"}}]}}}}"
     )
     .expect("append entry");
     drop(file);
