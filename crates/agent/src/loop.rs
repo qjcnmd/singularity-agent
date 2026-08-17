@@ -1099,7 +1099,7 @@ mod tests {
     ) -> ToolSpec {
         ToolSpec {
             name,
-            description: "phase 5 test tool",
+            description: "parallelism test tool",
             parameters,
             execution_mode: mode,
             execute,

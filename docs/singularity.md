@@ -85,9 +85,9 @@ sequenceDiagram
 
 ## 3. AgentLoop 循环（图 c）
 
-Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。一个 assistant response 的工具批次先按 source order 完成查找、参数校验和执行模式 preflight；无 `Sequential` 工具时实际并行执行，有任一 `Sequential` 工具时整批顺序执行。生命周期事件按实际完成/回调到达顺序交付，durable ToolResult 始终按 assistant source order 写入并用于下一次请求；取消会传播给批次内所有工具并等待其终态结果收敛。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
+Pi 式双层循环。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。一个 assistant response 的工具批次先按 source order 完成查找、参数校验和执行模式 preflight；无 `Sequential` 工具时实际并行执行，有任一 `Sequential` 工具时整批顺序执行。生命周期事件按实际完成/回调到达顺序交付，durable ToolResult 始终按 assistant source order 写入并用于下一次请求；取消会传播给批次内所有工具并等待其终态结果收敛。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
-- **steer / followUp 是 thread 级内存队列**（裁决 9/M2）：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入并返回 outcome=active；turn 已终态时按 turn→thread 历史映射入 thread 待办队列并返回 outcome=queued，下一次 `turn/start` 取走注入；未知 turn 返回 not found。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
+- **steer / followUp 是 thread 级内存队列**：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入并返回 outcome=active；turn 已终态时按 turn→thread 历史映射入 thread 待办队列并返回 outcome=queued，下一次 `turn/start` 取走注入；未知 turn 返回 not found。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
 - **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed`/`Invalid` 直接以 typed provider 错误结束，不在 AgentLoop 层做整轮重试。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
 - 停止条件：无工具调用的成功 assistant 响应；外部取消（aborted，不视为模型错误）；达到 `max_turns` 上限；模型错误或会话错误直接返回。
 
@@ -178,7 +178,7 @@ flowchart TD
 
 ## 6. Compaction（图 f）
 
-对齐 Pi 算法（裁决 10 目标数据流），并叠加 Phase F 的 preflight 与显式 overflow 兜底：
+对齐 Pi 算法，并叠加 preflight 与显式 overflow 兜底：
 
 - **触发**：每次模型请求前先做 preflight：估算 `系统/开发者指令 + 会话消息（含历史 tool call 的 id/name/raw_arguments 与 tool 消息的 tool_call_id）+ tool schema + max_output_tokens + 32 token 开销`，超过 context window 则先压缩并在压缩后仍超窗时 fail closed。每次成功的模型响应后，`maybe_compact` 用 `contextWindow − reserveTokens(16384)` 判定；contextTokens 取最近有效 assistant usage 的 totalTokens + 其后的消息估算，无可用 usage 时全量估算（字符 UTF-16 长度/4）。
 - **显式溢出兜底**（裁决 8）：provider 以 `ContextLengthExceeded` 显式报溢出（流式错误或 Failed 响应）时，强制 compaction 一次（`keepRecentTokens=0` / `reserveTokens=0`，toolResult 仍不切）并重试同一轮；第二次溢出按原错误返回，不无限压缩。失败请求未持久化 assistant/error/length 消息，因此无需移除尾部消息。
@@ -320,7 +320,7 @@ flowchart LR
 ### 12.4 错误码与错误合同
 
 - JSON-RPC 标准错误码（`-32700` / `-32600` / `-32601` / `-32602` / `-32603`）与"不回显原始输入"合同见第 11 节。
-- 项目级错误码由 core 定义（`ErrorCode`），具体清单随协议收敛（Phase 2/6）定稿。
+- 项目级错误码由 core 定义（`ErrorCode`），具体清单以协议层当前类型和错误映射为准。
 
 ### 12.5 维护规则与验证
 
@@ -350,14 +350,8 @@ flowchart LR
 | config.toml 迁移（原定把 config.json 环境层迁入共享 config.toml） | 遗留事项 3（已裁决取消） | **不迁移**：`config.json` 为当前配置格式（Pi 用 JSON），环境层（`SINGULARITY_MODELS_CONFIG` 等）保留 |
 | 死表面（evaluator_only 字段、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | Phase 1 | 由 Phase 1 剥离 |
 
-## 附录 B：重构阶段状态表
+## 附录 B：当前维护边界
 
-| Phase | 内容 | 状态 |
-| --- | --- | --- |
-| 1 | 剥离死表面（evaluator_only、ItemKind::Plan、turn_diff_updated、CLI 死订阅、docs/audits 空目录） | **完成**（提交 `8c44439b`） |
-| 2 | 新建 JSONL SessionManager + Pi 式 Agent 循环 + Compaction + 事件流（新模块，与旧机制并存不切换） | **完成**（提交 `5213e604` / `602303d` / `d2e79e0` / `da6c689`：message/session/compaction/tools/loop + 真实模型端到端） |
-| 4 | 删除 Store / Checkpoint 体系，切换会话事实源；删除 trace 存储与指标体系 | **完成**：W4-1 store 收敛（`1af9213a`，删 checkpoint_recovery/trace_artifact 全链与 trace 表，恢复语义保持 Paused/Suspended 可恢复）；W4-2 真实链路验收（sg run 完整任务 + 会话文件校验） |
-| 5 | Provider 简化：删 capability probe 全链，静态声明 + 用户覆盖；保留双协议 adapter / 重试 / usage 记账 | **完成**：删 capability.rs 全链（probe/negotiation/缓存/fingerprint），agent loop 改调静态 `protocol_contract()`，config.json 接受旧 `capabilities` 声明块并入静态契约（顶层字段优先），supports_system/developer 默认统一 true/true；内置模型表为遗留项 |
-| 6 | 客户端收敛：app-server 瘦身为单 worker stdio transport、业务状态下沉 core、CLI 改协议客户端、配置改共享全局配置 | **完成**：单 worker 顺序传输（`da329bf8`，删 16-worker 池/双队列/全局排序/gap/容量错误/CancellationMonitor，interrupt 进程内直连）、CLI 去掉订阅与 cursor 校验（`353d7ba4`）、turn/input 改内存投递（裁决 9 落地）；真实链路验收含运行中 interrupt（interrupted/cancelled）；业务状态下沉 core、事件命名 Pi 式收敛、**config.toml 不迁移（裁决，Pi 用 JSON）** |
-| 7 | 清理与文档：删除旧迁移、重写本文档、项目指令 trust 化（删 cap-std） | **完成**：删 v1–v12 旧迁移（`b1a273ed`）、sg eval 评估工具 + 3 题任务集（`8c5de156`，3 题 × 2 模型 = 6 cell 真实链路 + checker.sh 判分 + 12 项指标聚合，含真实 usage 数据源）、pycache 清理（`16c2e9ca`）；完成验证见 `outputs/exec/status.md` |
-| 后续演进（重构后） | 架构收敛：删除 TCP daemon（每命令独立 stdio 子进程）；JSONL 唯一权威 + SQLite 轻量索引；会话迁移到 `~/.singularity/sessions/`；协议/CLI 收缩 | **本计划实施中**（见 `plan/architecture-harness-remediation-1.md`） |
+- 本文只描述当前有效的进程边界、协议、会话格式、AgentLoop、Compaction、工具语义、Provider 能力声明、配置和评估入口。
+- 已移除机制的当前结果见附录 A；迁移过程、阶段状态和历史提交由 Git 保存，不在架构事实源中维护。
+- 修改上述任一事实时，必须同步更新对应章节并运行受影响的静态、定向和真实链路验证。
