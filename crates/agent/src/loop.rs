@@ -82,7 +82,7 @@ pub struct AgentConfig {
     /// 模型静态声明的 context window（compaction 触发预算依据）。
     pub context_window: u64,
     pub max_output_tokens: u64,
-    /// 最大模型轮数（旧实现基线，防失控）。
+    /// 单次任务允许的最大模型轮数；达到后以轮数预算耗尽结束。
     pub max_turns: u32,
 }
 
@@ -93,7 +93,7 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             context_window: 128_000,
             max_output_tokens: 4_096,
-            max_turns: 16,
+            max_turns: 50,
         }
     }
 }
@@ -1726,6 +1726,11 @@ mod tests {
     }
 
     /// 5. max_turns 上限：达到后终止，不再发起 provider 调用。
+    #[test]
+    fn default_max_turns_is_fifty() {
+        assert_eq!(AgentConfig::default().max_turns, 50);
+    }
+
     #[test]
     fn max_turns_stops_the_loop() {
         let (mut agent, _dir, provider) = setup(vec![

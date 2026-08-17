@@ -1736,6 +1736,90 @@ mod transport_tests {
     }
 
     #[test]
+    fn streaming_response_timeout_is_idle_not_total() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow streaming provider");
+        let address = listener
+            .local_addr()
+            .expect("slow streaming provider address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept streaming request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone streaming stream"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).expect("read streaming request");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+            )
+            .expect("write streaming headers");
+            let events = [
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"do\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ne\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+            ];
+            for (index, event) in events.iter().enumerate() {
+                if index > 0 {
+                    thread::sleep(Duration::from_millis(400));
+                }
+                write!(stream, "{:X}\r\n{}\r\n", event.len(), event)
+                    .expect("write streaming event");
+                stream.flush().expect("flush streaming event");
+            }
+            write!(stream, "0\r\n\r\n").expect("write streaming terminator");
+        });
+
+        let provider = OpenAiProvider::new_with_request_timeout(
+            test_provider_config(format!("http://{address}/v1")),
+            1,
+        )
+        .expect("provider")
+        .with_selected_model(SelectedModel {
+            model_name: "gpt-test".to_string(),
+            api_protocol: ProviderApiProtocol::OpenAiResponses,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
+            thinking_wire_format: ThinkingWireFormat::ThinkingType,
+            tool_reasoning_mode: ProviderToolReasoningMode::DisabledForToolCalls,
+            supports_developer_role: true,
+            supports_tool_choice: true,
+            requires_reasoning_content_for_tool_calls: false,
+            requires_assistant_content_for_tool_calls: false,
+            capability_overrides: None,
+        });
+        let request = ModelTurnRequest::new(
+            "slow_streaming_response",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+
+        let mut events = Vec::new();
+        let response = provider
+            .complete_stream(&request, &CancellationToken::new(), &mut |event| {
+                events.push(event);
+            })
+            .expect("streaming response must survive a total duration above the idle timeout");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            response
+                .assistant_message
+                .as_ref()
+                .expect("assistant message")
+                .content,
+            "done"
+        );
+        server.join().expect("join slow streaming provider");
+    }
+
+    #[test]
     fn runtime_initialization_failure_maps_to_a_stable_provider_blocker() {
         let error = provider_runtime_error(std::io::Error::other(
             "synthetic runtime initialization failure",

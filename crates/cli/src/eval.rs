@@ -1034,7 +1034,13 @@ fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         text.to_string()
     } else {
-        format!("{}... ({} bytes total)", &text[..max], text.len())
+        let boundary = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}... ({} bytes total)", &text[..boundary], text.len())
     }
 }
 
@@ -1249,6 +1255,16 @@ mod tests {
         assert_eq!(cache_hit_ratio(&usage), Some(0.25));
         let zero_input = json!({"input_tokens": 0, "cached_input_tokens": 0});
         assert_eq!(cache_hit_ratio(&zero_input), None);
+    }
+
+    #[test]
+    fn truncate_preserves_utf8_boundaries() {
+        let text = "界".repeat(700);
+        let expected_prefix = "界".repeat(666);
+        assert_eq!(
+            truncate(&text, 2_000),
+            format!("{expected_prefix}... (2100 bytes total)")
+        );
     }
 
     #[test]
