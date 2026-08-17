@@ -802,34 +802,40 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             "error",
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"secret raw failure\"}}\n\n",
             "responses_stream_error",
+            "",
         ),
         (
             "failed",
             "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
             "responses_stream_failed",
+            "",
         ),
         (
             "incomplete",
-            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
             "responses_stream_incomplete",
+            "max_output_tokens",
         ),
         (
             "missing_terminal",
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
             "responses_stream_terminal_missing",
+            "",
         ),
         (
             "malformed",
             "event: response.output_text.delta\ndata: {not-json}\n\n",
             "responses_stream_malformed",
+            "",
         ),
         (
             "business_event_after_terminal",
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n",
             "responses_stream_malformed",
+            "",
         ),
     ];
-    for (name, body, expected_code) in cases {
+    for (name, body, expected_code, expected_fragment) in cases {
         let chunks = body
             .as_bytes()
             .chunks(2)
@@ -851,6 +857,12 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             .expect_err("stream must fail closed");
         assert_eq!(error.error.code.as_deref(), Some(expected_code), "{name}");
         assert!(!error.error.message.contains("secret raw failure"));
+        if !expected_fragment.is_empty() {
+            assert!(
+                error.error.message.contains(expected_fragment),
+                "{name}: message must carry the incomplete reason"
+            );
+        }
         let metadata = error
             .provider_attempt_metadata
             .as_ref()

@@ -1576,11 +1576,15 @@ impl<'a> ResponsesSseDecoder<'a> {
             }
             "response.incomplete" => {
                 // OpenAI Responses 语义：provider 主动宣告响应未完成，最常见原因是
-                // max_output_tokens 截断（reason=max_output_tokens）。把 reason 带进
-                // 错误文本，避免诊断时只能看到笼统的 "stream was incomplete"。
+                // max_output_tokens 截断。事件 data 是完整 Response 对象，原因在
+                // `response.incomplete_details.reason`（openai-python
+                // `ResponseIncompleteEvent.response: Response` + vLLM E2E 同构）。
+                // 把 reason 带进错误文本，避免诊断时只能看到笼统的
+                // "stream was incomplete"。
                 let reason = payload
-                    .get("data")
-                    .and_then(|data| data.get("reason"))
+                    .get("response")
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 let mut error = ModelError::new(

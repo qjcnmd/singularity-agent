@@ -671,3 +671,108 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
     assert_eq!(follow_up.len(), 1);
     assert_eq!(follow_up[0], "keep going");
 }
+
+#[test]
+fn request_methods_as_notifications_are_rejected_without_side_effects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "0b0c1d2e-3f40-4152-8263-9474a5b6c7d8";
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    // 每个 Request 方法以 notification（无 id）提交 → -32600 且不执行任何副作用。
+    for (method, params) in [
+        (
+            "initialize",
+            r#"{"clientInfo":{"name":"t","title":"T","version":"0"}}"#,
+        ),
+        ("thread/start", r#"{"cwd":"/tmp"}"#),
+        ("thread/resume", r#"{"threadId":"<session>"}"#),
+        ("session/read", r#"{"sessionId":"<session>"}"#),
+        ("session/delete", r#"{"sessionId":"<session>"}"#),
+        (
+            "turn/start",
+            r#"{"threadId":"<session>","input":[{"type":"text","text":"x"}]}"#,
+        ),
+        (
+            "turn/steer",
+            r#"{"turnId":"t","input":[{"type":"text","text":"x"}]}"#,
+        ),
+        (
+            "turn/followUp",
+            r#"{"turnId":"t","input":[{"type":"text","text":"x"}]}"#,
+        ),
+        ("agent/capability", r#"{}"#),
+        ("turn/interrupt", r#"{"turnId":"t"}"#),
+        ("project/trust", r#"{"path":"/tmp","decision":"query"}"#),
+        ("server/shutdown", r#"{}"#),
+    ] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"{method}","params":{}}}"#,
+            params.replace("<session>", session_id)
+        );
+        let responses = server.handle_json(&body).expect("notification handled");
+        assert_eq!(responses.len(), 1, "{method}");
+        assert_eq!(responses[0]["error"]["code"], -32600, "{method}");
+        assert!(responses[0]["error"]["message"].is_string(), "{method}");
+    }
+
+    // 副作用检查：会话仍存在、thread/start 未创建任何 thread、服务器未关闭。
+    assert!(server.store().get_session(session_id).is_ok());
+    assert!(!server.shutdown_requested);
+    let responses = server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":10,"params":{}}"#)
+        .expect("thread list");
+    let threads = responses
+        .iter()
+        .find(|message| message["id"] == 10)
+        .expect("thread list response");
+    assert_eq!(
+        threads["result"]["threads"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "c14e4e8b-9b4a-4c1d-8f0a-2d5e6f7a8b9c";
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    let (_, guard) = server
+        .activate_turn("turn_live", session_id)
+        .expect("activate turn");
+
+    // 活跃 turn 期间删除 → invalid state 拒绝，索引与 rollout 都不动。
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/delete","id":2,"params":{{"sessionId":"{session_id}"}}}}"#
+        ))
+        .expect("delete rejected");
+    assert_eq!(responses[0]["error"]["code"], -32005);
+    assert!(server.store().get_session(session_id).is_ok());
+    assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());
+
+    // turn 结束后删除成功。
+    drop(guard);
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/delete","id":3,"params":{{"sessionId":"{session_id}"}}}}"#
+        ))
+        .expect("delete after turn");
+    assert_eq!(responses[0]["result"]["deleted"], true);
+    assert!(matches!(
+        server.store().get_session(session_id),
+        Err(StoreError::NotFound(_))
+    ));
+}

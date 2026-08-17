@@ -191,7 +191,7 @@ pub(crate) fn run_eval(
     })?;
     let run_id = format_run_id();
     let run_dir = output_root.join(&run_id);
-    let started_at = run_id.clone();
+    let started_at = singularity_core::Timestamp::now_utc().to_string();
     let cells_dir = run_dir.join("cells");
     fs::create_dir_all(&cells_dir)
         .map_err(|error| format!("failed to create run dir {}: {error}", run_dir.display()))?;

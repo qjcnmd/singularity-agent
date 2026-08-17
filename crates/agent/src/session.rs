@@ -488,8 +488,13 @@ impl SessionManager {
             }
             Err(error) => return Err(error.into()),
         };
+        // 文件已存在但为空：fail closed，不静默重写为新随机 UUID 的新会话
+        // （空文件不可能是合法 pi session；重写会掩盖身份丢失）。
         if metadata.len() == 0 {
-            return Self::create_empty_at(&file);
+            return Err(SessionError::InvalidSession(format!(
+                "Session file is empty and cannot be opened: {}",
+                file.display()
+            )));
         }
         let mut raw_entries = parse_session_lines(&file)?;
         if raw_entries.is_empty() {
@@ -1259,6 +1264,27 @@ mod tests {
             first_line["cwd"],
             normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
         );
+    }
+
+    /// 1c. 已存在但为空的 session 文件 fail closed：不静默重写为新随机 UUID。
+    #[test]
+    fn empty_existing_session_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.jsonl");
+        std::fs::write(&file, b"").unwrap();
+
+        let error = SessionManager::open(&file)
+            .err()
+            .expect("empty session file must fail closed");
+        assert!(matches!(error, SessionError::InvalidSession(_)));
+        assert!(error.to_string().contains("empty"));
+        // 文件保持原样，未被重写为 header（身份不得静默丢失）。
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+
+        // 缺失文件仍按 Pi 语义创建新会话（不回归）。
+        let missing = dir.path().join("missing.jsonl");
+        let created = SessionManager::open(&missing).unwrap();
+        assert!(created.path().is_file());
     }
 
     /// 2. 追加顺序：每条 parent = 前一条 id，首条为根（磁盘上 parentId 为 null）。

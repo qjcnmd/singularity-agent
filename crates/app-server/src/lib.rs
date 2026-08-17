@@ -49,6 +49,8 @@ use uuid::Uuid;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
 const TURN_NOT_FOUND: &str = "Turn not found";
+const SESSION_DELETE_TURN_ACTIVE: &str =
+    "session/delete rejected: a turn is still active for this session";
 const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";

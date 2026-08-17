@@ -78,7 +78,6 @@ fn loads_agents_files_from_workspace_root_to_nested_cwd() {
             .all(|source| source.content_digest.starts_with("sha256:")
                 && source.content_digest.len() == "sha256:".len() + 64)
     );
-    assert!(loaded.aggregate_digest().starts_with("sha256:"));
     assert_eq!(
         loaded.content(),
         "root instructions\n\ncrate instructions\n\nagent instructions"
@@ -151,7 +150,7 @@ fn override_file_wins_once_per_hierarchy_layer() {
 }
 
 #[test]
-fn source_and_aggregate_digests_change_when_instruction_content_changes() {
+fn source_digests_change_when_instruction_content_changes() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let cwd = workspace.join("src");
@@ -171,7 +170,6 @@ fn source_and_aggregate_digests_change_when_instruction_content_changes() {
         first.sources()[0].content_digest,
         second.sources()[0].content_digest
     );
-    assert_ne!(first.aggregate_digest(), second.aggregate_digest());
 }
 
 #[test]

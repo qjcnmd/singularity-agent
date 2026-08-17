@@ -37,8 +37,6 @@ pub struct ProjectInstructions {
     content: String,
     /// 按正文合并顺序排列的来源 provenance。
     sources: Vec<ProjectInstructionSource>,
-    /// 对合并正文和有序 `sources` 列表计算的稳定 SHA-256 摘要。
-    aggregate_digest: String,
 }
 
 impl ProjectInstructions {
@@ -50,16 +48,6 @@ impl ProjectInstructions {
     /// Returns the ordered workspace-relative provenance records.
     pub fn sources(&self) -> &[ProjectInstructionSource] {
         &self.sources
-    }
-
-    /// Returns the aggregate digest that binds content and provenance.
-    pub fn aggregate_digest(&self) -> &str {
-        &self.aggregate_digest
-    }
-
-    /// Consumes the verified aggregate into the model text and its binding digest.
-    pub fn into_snapshot(self) -> (String, String) {
-        (self.content, self.aggregate_digest)
     }
 }
 
@@ -244,15 +232,7 @@ pub fn load_project_instructions(
     if sources.is_empty() {
         Ok(None)
     } else {
-        let aggregate_digest = sha256_digest(
-            &serde_json::to_vec(&(content.as_str(), &sources))
-                .expect("project instruction aggregate serialize"),
-        );
-        Ok(Some(ProjectInstructions {
-            content,
-            sources,
-            aggregate_digest,
-        }))
+        Ok(Some(ProjectInstructions { content, sources }))
     }
 }
 
@@ -374,7 +354,8 @@ fn canonicalize_directory(
     Ok(canonical)
 }
 
-fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
+/// 从 cwd 向上查找 workspace 根（以 `.git` 标记），找不到时以 cwd 为边界。
+pub fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
     for ancestor in cwd.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(PROJECT_ROOT_MARKER)) {
             Ok(_) => return Ok(ancestor.to_path_buf()),

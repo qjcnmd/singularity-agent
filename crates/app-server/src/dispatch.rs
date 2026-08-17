@@ -47,6 +47,12 @@ impl AppServer {
             return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
         }
 
+        // Request 方法以 notification（无 id）提交：按 JSON-RPC 方法表契约对称拒绝，
+        // 不执行任何副作用（thread/start 不得创建、turn/start 不得进槽位）。
+        if method.spec().kind == MethodKind::Request && notification {
+            return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
+        }
+
         if method
             .spec()
             .validate_params(message.params().cloned().unwrap_or_else(|| json!({})))
@@ -310,6 +316,17 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
+        // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
+        let turn_active = self
+            .turn_threads
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?
+            .values()
+            .any(|session_id| session_id == &params.session_id);
+        if turn_active {
+            return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
+        }
         // 打开并校验 rollout header 后再进入可恢复删除；不能先永久删 JSONL。
         let _session = self.open_session_for_thread(&thread_from_record(&record))?;
         let _left_tombstone = crate::delete::delete_session_with_faults(

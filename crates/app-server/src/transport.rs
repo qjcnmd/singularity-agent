@@ -394,10 +394,70 @@ async fn read_bounded_line_with_limit<R: AsyncBufRead + Unpin>(
     })
 }
 
+/// 校验 SINGULARITY_HOME 不在当前仓库内（仓库边界以 `.git` 标记查找，找不到时
+/// 以 cwd 为边界）。`home` 可能尚不存在：先对已存在前缀做 canonicalize 再比较。
+fn ensure_home_outside_current_repo(home: &std::path::Path) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
+    ensure_home_outside_repo(home, &cwd)
+}
+
+fn ensure_home_outside_repo(home: &std::path::Path, cwd: &std::path::Path) -> Result<(), String> {
+    let root = singularity_core::find_workspace_root(cwd)
+        .map_err(|error| format!("failed to locate repository boundary: {error}"))?;
+    let canonical_home = canonicalize_existing_prefix(home)?;
+    let canonical_root = canonicalize_existing_prefix(&root)?;
+    if canonical_home.starts_with(&canonical_root) {
+        return Err("SINGULARITY_HOME must not be inside the current repository".to_string());
+    }
+    Ok(())
+}
+
+/// 对路径的已存在前缀做 canonicalize，缺失的尾部组件原样保留（用于尚不存在的目录）。
+fn canonicalize_existing_prefix(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = current.file_name().ok_or_else(|| {
+                    format!("cannot canonicalize path prefix: {}", path.display())
+                })?;
+                missing.push(component.to_os_string());
+                if !current.pop() {
+                    return Err(format!(
+                        "cannot canonicalize path prefix: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "cannot canonicalize path prefix: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
 fn initialize_app_server(
     configured_db_path: &str,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<AppServer, String> {
+    // 显式 SINGULARITY_HOME 时，先于任何目录创建校验其不在当前仓库内
+    // （model 层配置校验的启动期第一道防线；违规 fail closed）。
+    if std::env::var_os("SINGULARITY_HOME").is_some() {
+        let home = singularity_core::user_singularity_home()
+            .ok_or_else(|| "cannot resolve SINGULARITY_HOME for session index".to_string())?;
+        ensure_home_outside_current_repo(&home)?;
+    }
     let paths = singularity_app_server::paths::AppPaths::resolve()?;
     paths.prepare()?;
     let db_path = if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
@@ -846,6 +906,29 @@ mod tests {
         )
         .expect("progress event")
         .to_wire_value()
+    }
+
+    #[test]
+    fn home_inside_current_repository_is_rejected_before_state_preparation() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let repo = directory.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git marker");
+        let inside = repo.join("nested").join("home");
+        let outside = directory.path().join("elsewhere").join("home");
+        let nested_cwd = repo.join("src").join("nested");
+        std::fs::create_dir_all(&nested_cwd).expect("nested cwd");
+
+        // home 位于仓库边界内（含尚不存在的尾部组件）→ 拒绝。
+        let error = ensure_home_outside_repo(&inside, &nested_cwd).expect_err("inside rejected");
+        assert!(error.contains("must not be inside"), "{error}");
+        // 仓库外 home → 通过。
+        ensure_home_outside_repo(&outside, &nested_cwd).expect("outside accepted");
+        // 无 `.git` 边界时以 cwd 为边界：cwd 内 home 拒绝、cwd 外通过。
+        let plain = directory.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain cwd");
+        let error = ensure_home_outside_repo(&plain.join("home"), &plain).expect_err("cwd inside");
+        assert!(error.contains("must not be inside"), "{error}");
+        ensure_home_outside_repo(&outside, &plain).expect("outside cwd accepted");
     }
 
     #[test]

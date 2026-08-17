@@ -11,7 +11,8 @@ pub use project_instructions::{
     PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
     PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES, PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME,
     ProjectInstructionError, ProjectInstructionErrorCode, ProjectInstructionSource,
-    ProjectInstructions, load_project_instructions, load_project_instructions_from_cwd,
+    ProjectInstructions, find_workspace_root, load_project_instructions,
+    load_project_instructions_from_cwd,
 };
 pub use trust::{
     DEFAULT_PROJECT_TRUST, TrustDecisions, TrustDefault, TrustResolution,

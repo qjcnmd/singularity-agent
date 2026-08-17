@@ -305,7 +305,11 @@ impl Agent {
                             return Err(AgentError::Provider(error));
                         }
                         context_overflow_retried = true;
-                        self.force_compact(cancellation)?;
+                        // 强制压缩失败时返回原始上下文溢出错误（保留真实因果，
+                        // 与 H4 typed 错误语义一致），不掩盖为压缩错误。
+                        if self.force_compact(cancellation).is_err() {
+                            return Err(AgentError::Provider(error));
+                        }
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -327,7 +331,14 @@ impl Agent {
                             )));
                         }
                         context_overflow_retried = true;
-                        self.force_compact(cancellation)?;
+                        // 强制压缩失败时返回原始溢出错误（保留真实因果），
+                        // 不掩盖为压缩错误。
+                        if self.force_compact(cancellation).is_err() {
+                            return Err(AgentError::Loop(format!(
+                                "model turn failed: {}",
+                                model_error.message
+                            )));
+                        }
                         continue;
                     }
                     // 仅 `Failed` 状态且判定为瞬时类才重试；`Invalid`（校验失败）不重试。
@@ -2093,6 +2104,8 @@ mod tests {
         stream_calls: std::sync::atomic::AtomicUsize,
         complete_calls: std::sync::atomic::AtomicUsize,
         overflow_times: usize,
+        /// true 时摘要生成（`complete`）直接失败，用于验证强制压缩失败的降级路径。
+        fail_summary: bool,
         contract: ProviderProtocolContract,
     }
 
@@ -2149,6 +2162,12 @@ mod tests {
         ) -> std::result::Result<ModelTurnResponse, ProviderError> {
             self.complete_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_summary {
+                return Err(ProviderError::from_model_error(ModelError::new(
+                    ModelErrorKind::UnknownProviderError,
+                    "summary generation failed",
+                )));
+            }
             let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
             assistant.content = "## Goal\ncompacted".to_string();
             Ok(ModelTurnResponse {
@@ -2197,6 +2216,7 @@ mod tests {
             stream_calls: std::sync::atomic::AtomicUsize::new(0),
             complete_calls: std::sync::atomic::AtomicUsize::new(0),
             overflow_times: 1,
+            fail_summary: false,
             contract: fake_contract(),
         });
         let mut agent = Agent::new(
@@ -2261,6 +2281,7 @@ mod tests {
             stream_calls: std::sync::atomic::AtomicUsize::new(0),
             complete_calls: std::sync::atomic::AtomicUsize::new(0),
             overflow_times: 2,
+            fail_summary: false,
             contract: fake_contract(),
         });
         let mut agent = Agent::new(
@@ -2280,6 +2301,52 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+        assert_eq!(
+            provider
+                .complete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_force_compaction_returns_original_overflow_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::User,
+                content: "old user".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                args: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let provider = Arc::new(OverflowProvider {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            complete_calls: std::sync::atomic::AtomicUsize::new(0),
+            overflow_times: 1,
+            // 强制压缩的摘要生成失败：应保留原始上下文溢出错误（真实因果），
+            // 不得把失败掩盖为压缩错误。
+            fail_summary: true,
+            contract: fake_contract(),
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let error = agent
+            .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+            .expect_err("overflow with failed compaction must fail");
+        assert!(
+            matches!(error, AgentError::Provider(_)),
+            "original overflow error must be preserved, got: {error:?}"
+        );
+        assert!(error.to_string().contains("context window overflow"));
         assert_eq!(
             provider
                 .complete_calls
