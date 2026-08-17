@@ -1749,4 +1749,33 @@ mod transport_tests {
             Some(ModelBlockerKind::ProviderRuntimeUnavailable)
         );
     }
+
+    /// 契约透传：选中模型的 tool_reasoning_mode 必须反映到 protocol_contract()
+    /// （修复前硬编码 Unspecified，agent 侧续接投影永远被跳过）。
+    #[test]
+    fn protocol_contract_exposes_selected_tool_reasoning_mode() {
+        let config = test_provider_config("http://127.0.0.1:1/v1".to_string());
+        let provider = OpenAiProvider::new(config)
+            .expect("provider")
+            .with_selected_model(SelectedModel {
+                model_name: "gpt-test".to_string(),
+                api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_variant: Some("on".to_string()),
+                reasoning_enabled: true,
+                wire_reasoning_effort: None,
+                thinking_wire_format: ThinkingWireFormat::ThinkingType,
+                tool_reasoning_mode: ProviderToolReasoningMode::ReplayReasoningContent,
+                supports_developer_role: true,
+                supports_tool_choice: true,
+                requires_reasoning_content_for_tool_calls: true,
+                requires_assistant_content_for_tool_calls: false,
+                capability_overrides: None,
+            });
+        assert_eq!(
+            provider.protocol_contract().tool_reasoning_mode,
+            ProviderToolReasoningMode::ReplayReasoningContent
+        );
+    }
 }

@@ -552,9 +552,13 @@ impl OpenAiProvider {
                 .iter()
                 .filter(|replay| replay.matches_tool_call_ids(&ids))
                 .count();
-            if bound_replay_count > 1
-                || (selection.requires_reasoning_content_for_tool_calls && bound_replay_count != 1)
-            {
+            // 只拒绝重复绑定（同一工具消息被多个 replay 绑定必然是错误）。
+            // 消息无绑定 replay 是合法形态：DeepSeek/Kimi 的 400 约束是"有
+            // reasoning 历史的工具消息必须回传自己的 reasoning_content"
+            // （opencode issues #24190/#24722），旧会话（v3 迁移）中本无
+            // reasoning 的工具消息不需要 replay；"有 thinking 的消息必有
+            // replay"由 agent 侧投影保证。
+            if bound_replay_count > 1 {
                 return Err(provider_tool_reasoning_history_error(
                     &ModelTurnResponse::completed(
                         request.request_id.clone(),
@@ -1201,6 +1205,13 @@ impl Provider for OpenAiProvider {
         let mut contract = self.config.protocol_contract();
         // Catalog 克隆：用户显式能力声明（config.json `capabilities` 块）叠加到静态基线；
         // 顶层字段优先的合并已在配置解析时完成，这里只做声明 → 契约投影。
+        // reasoning 变体关闭时 selection.tool_reasoning_mode 已收敛为
+        // DisabledForToolCalls（config.rs 选择器解析），契约直接透传。
+        contract.tool_reasoning_mode = self
+            .selected_model
+            .as_ref()
+            .map(|selection| selection.tool_reasoning_mode)
+            .unwrap_or(ProviderToolReasoningMode::Unspecified);
         if let Some(overrides) = self
             .selected_model
             .as_ref()
@@ -2016,4 +2027,110 @@ pub(super) fn provider_response_json_error() -> ModelError {
         "provider_response_json_decode_failed",
         ProviderErrorStage::ResponseJsonDecode,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelRole,
+        ModelToolCall, ModelToolParseStatus, ModelTurnRequest, OpenAiProvider,
+        OpenAiProviderConfig, ProviderApiProtocol, ProviderConfigSource, ProviderReasoningReplay,
+        ProviderToolReasoningMode, SelectedModel, ThinkingWireFormat,
+    };
+
+    fn tool_result_message(call_id: &str, text: &str) -> ModelMessage {
+        let mut message = ModelMessage::text(ModelRole::Tool, text);
+        message.tool_call_id = Some(call_id.to_string());
+        message
+    }
+
+    fn selected_provider() -> OpenAiProvider {
+        let config = OpenAiProviderConfig {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "gpt-test".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: "sk-secret-value".to_string(),
+            source: ProviderConfigSource::ProcessEnvironment,
+            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        };
+        OpenAiProvider::new(config)
+            .expect("provider")
+            .with_selected_model(SelectedModel {
+                model_name: "gpt-test".to_string(),
+                api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_variant: Some("on".to_string()),
+                reasoning_enabled: true,
+                wire_reasoning_effort: None,
+                thinking_wire_format: ThinkingWireFormat::ThinkingType,
+                tool_reasoning_mode: ProviderToolReasoningMode::ReplayReasoningContent,
+                supports_developer_role: true,
+                supports_tool_choice: true,
+                requires_reasoning_content_for_tool_calls: true,
+                requires_assistant_content_for_tool_calls: false,
+                capability_overrides: None,
+            })
+    }
+
+    /// 请求侧校验：无 reasoning 历史的旧工具消息（如 v3 迁移）允许无绑定 replay；
+    /// 只有重复绑定才拒绝（对齐 Pi：无 thinking 块的消息原样发送，不伪造 replay）。
+    #[test]
+    fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
+        let provider = selected_provider();
+        let mut legacy = ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+            tool_call_id: "legacy_call".to_string(),
+            tool_name: "read".to_string(),
+            arguments: serde_json::json!({"path": "x"}),
+            raw_arguments: "{\"path\":\"x\"}".to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        }]);
+        legacy.content = "legacy".to_string();
+        let mut fresh = ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+            tool_call_id: "fresh_call".to_string(),
+            tool_name: "read".to_string(),
+            arguments: serde_json::json!({"path": "y"}),
+            raw_arguments: "{\"path\":\"y\"}".to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        }]);
+        fresh.content = "fresh".to_string();
+        let mut request = ModelTurnRequest::new(
+            "validate_unbound",
+            vec![
+                ModelMessage::text(ModelRole::User, "hi"),
+                legacy,
+                tool_result_message("legacy_call", "legacy result"),
+                fresh,
+                tool_result_message("fresh_call", "fresh result"),
+            ],
+        );
+        request.model_preferences.model_name = Some("provider/model#on".to_string());
+        request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "gpt-test".to_string(),
+            reasoning_effort: "on".to_string(),
+            tool_call_ids: vec!["fresh_call".to_string()],
+            reasoning_content: "reasoning for fresh".to_string(),
+        }];
+        // legacy_call 无绑定 replay 是合法形态（v3 迁移兼容）。
+        provider
+            .validate_reasoning_history(&request)
+            .expect("legacy tool message without replay must be accepted");
+        // 重复绑定必须拒绝。
+        let mut duplicated = request.clone();
+        duplicated.provider_reasoning_history = vec![
+            request.provider_reasoning_history[0].clone(),
+            ProviderReasoningReplay::Chat {
+                provider_name: "openai_compatible".to_string(),
+                model_name: "gpt-test".to_string(),
+                reasoning_effort: "on".to_string(),
+                tool_call_ids: vec!["fresh_call".to_string()],
+                reasoning_content: "another replay for fresh".to_string(),
+            },
+        ];
+        assert!(provider.validate_reasoning_history(&duplicated).is_err());
+    }
 }

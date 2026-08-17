@@ -533,54 +533,54 @@ impl Agent {
         let Ok(context) = self.session.build_context_entries() else {
             return Vec::new();
         };
-        let Some(message) = context
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.entry_type {
-                SessionEntryType::Message(message)
-                    if message.role == AgentMessageRole::Assistant =>
-                {
-                    Some(message)
-                }
-                _ => None,
-            })
-        else {
-            return Vec::new();
-        };
-        let thinking = message
-            .thinking_blocks()
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if thinking.is_empty() {
-            return Vec::new();
-        }
-        let tool_call_ids: Vec<String> = message
-            .tool_calls()
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        if tool_call_ids.is_empty() {
-            return Vec::new();
-        }
+        // 每条带 thinking 块与工具调用的 assistant 消息各投影一个 replay：
+        // transport 校验要求每条工具消息都有绑定 replay（防丢 reasoning 续接，
+        // 与 DeepSeek 要求每条 tool_calls 消息携带 reasoning_content 一致），
+        // 只投影最后一条会在多轮工具后校验失败。
         let Some((provider_name, model_name, variant)) = parse_model_selector(&self.config.model)
         else {
             return Vec::new();
         };
-        vec![ProviderReasoningReplay::Chat {
-            provider_name: provider_name.to_string(),
-            model_name: model_name.to_string(),
-            reasoning_effort: variant.to_string(),
-            tool_call_ids,
-            reasoning_content: thinking,
-        }]
+        let mut replays = Vec::new();
+        for entry in &context {
+            let SessionEntryType::Message(message) = &entry.entry_type else {
+                continue;
+            };
+            if message.role != AgentMessageRole::Assistant || !message.has_tool_calls() {
+                continue;
+            }
+            let thinking = message
+                .thinking_blocks()
+                .into_iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if thinking.is_empty() {
+                continue;
+            }
+            let tool_call_ids: Vec<String> = message
+                .tool_calls()
+                .into_iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            if tool_call_ids.is_empty() {
+                continue;
+            }
+            replays.push(ProviderReasoningReplay::Chat {
+                provider_name: provider_name.to_string(),
+                model_name: model_name.to_string(),
+                reasoning_effort: variant.to_string(),
+                tool_call_ids,
+                reasoning_content: thinking,
+            });
+        }
+        replays
     }
 
     /// 注册表工具 → 模型可见 schema（不超过 provider 单请求上限）。
