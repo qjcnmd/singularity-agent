@@ -42,15 +42,6 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let thread = thread_from_record(&record);
-        // 信任门控：ask 未决且有交互 UI 时返回 -32010 trust_required（带 cwd）。
-        if let TrustResolution::AskNeeded = self.resolve_thread_trust(&thread)? {
-            let cwd = thread.cwd.clone().unwrap_or_default();
-            emit_messages(
-                &mut emit,
-                trust_required_response(message.required_id(), &cwd)?,
-            );
-            return Ok(());
-        }
         let payload = serde_json::to_value(&params.input)?;
         let input_text = match input_items_to_text(&payload) {
             Ok(text) => text,

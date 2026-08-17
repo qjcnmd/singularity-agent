@@ -2,13 +2,13 @@
 
 > **本文档描述当前有效架构**，与 `origin/main` 源码一致；技术细节对照 Pi v0.84.1 一手源码核查记录（`outputs/arch-review/01`、`02`）与当前源码。已移除机制的细节不展开，见附录 A；历史实现由 Git 保存。
 >
-> **维护规则**：修改以下任一事实时同步更新本文：进程边界、协议 transport/命令/事件、会话格式、Compaction、工具面与工具语义、Provider/模型能力声明、trust 决策、配置 schema、评估工具、发布二进制。
+> **维护规则**：修改以下任一事实时同步更新本文：进程边界、协议 transport/命令/事件、会话格式、Compaction、工具面与工具语义、Provider/模型能力声明、配置 schema、评估工具、发布二进制。
 
 ## 1. 总览与进程架构（图 a）
 
-采用 Codex 进程模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，每命令独立子进程，连接内单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史、输入组装、工具装配、trust 决策）全部下沉到 core。
+采用 Codex 进程模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，每命令独立子进程，连接内单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史、输入组装、工具装配）全部下沉到 core。
 
-- **headless core**：AgentLoop（Pi 式 runLoop）、SessionManager（JSONL 树）、Compaction、工具注册表（ToolSpec 单一事实源）、消息与事件流、资源加载（AGENTS.md + trust 门控）、Provider 边界（trait Provider）。
+- **headless core**：AgentLoop（Pi 式 runLoop）、SessionManager（JSONL 树）、Compaction、工具注册表（ToolSpec 单一事实源）、消息与事件流、资源加载（AGENTS.md 无条件逐层加载）、Provider 边界（trait Provider）。
 - **app-server**：JSON-RPC（JSONL framing）；命令/事件协议收敛为 Pi RPC 级命令集 + 事件流；无 7 态 Turn、无 trace 合同、无 cursor/gap/背压/全局排序、无 16-worker 池。
 - **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**（JSON-Lines），无 TCP daemon、无连接复用、无空闲自停；未来 Desktop 可嵌入 core 或经同一协议启动 stdio 子进程。
 - **客户端**：`sg` CLI（一次性 stdio 子进程客户端）；未来 Desktop 同协议、同配置、同会话。
@@ -28,7 +28,7 @@ flowchart LR
         CP["Compaction"]
         TR["工具注册表<br/>(ToolSpec 单一事实源)"]
         EV["消息与事件流"]
-        RL["资源加载<br/>(AGENTS.md + trust 门控)"]
+        RL["资源加载<br/>(AGENTS.md 逐层加载)"]
         PV["Provider 边界<br/>(trait Provider)"]
     end
     CFG[("~/.singularity/config.json<br/>全局配置单一事实源")]
@@ -55,7 +55,7 @@ flowchart LR
 
 ## 2. 主调用链（图 b）
 
-`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → LSP 式握手（initialize/initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（goal 交给 core）→ core 加载项目指令（trust 门控）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL → 索引更新状态与 usage。`sg continue` 通过索引定位并重开既有会话文件，走同一条链。
+`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → LSP 式握手（initialize/initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（goal 交给 core）→ core 逐层加载项目指令（root→cwd）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL → 索引更新状态与 usage。`sg continue` 通过索引定位并重开既有会话文件，走同一条链。
 
 ```mermaid
 sequenceDiagram
@@ -69,7 +69,7 @@ sequenceDiagram
     CLI->>S: thread/start {cwd, model}
     CLI->>S: turn/start {goal}
     S->>C: run(goal)
-    C->>C: 加载 AGENTS.md（trust 门控）+ 历史 buildContextEntries
+    C->>C: 加载 AGENTS.md（root→cwd 逐层）+ 历史 buildContextEntries
     loop 回合内
         C->>P: completion / 流式请求
         P-->>C: 流式响应 / usage
@@ -264,17 +264,15 @@ flowchart LR
 - **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等）+ 脱敏后的真实错误文本（敏感内容降级为 `Internal error`，不包含 API key、endpoint 原始请求/响应）；错误保留真实因果差异，不靠字符串匹配驱动控制流。
 - **配置校验**：配置值在本地信任边界完整校验，fail closed，不静默 trim/纠正；错误不携带原始值；API key 只通过配置引用的环境变量名解析，不进入会话/日志。
 
-## 10. 配置与信任
+## 10. 配置与项目指令
 
 **配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件 `~/.singularity/auth.v1-*.json` 按 Pi 策略保护：Unix 上 0600，Windows 上不做额外 ACL 管理（访问由目录 ACL 决定）。会话目录 `~/.singularity/sessions/`、索引 `~/.singularity/index.sqlite3` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
 
-**trust 决策（裁决 7）**：对齐 Pi——陌生项目 ask / always / never；决策持久化到信任存储（CLI 显式覆盖 → 是否存在项目资源 → 信任存储 → 默认策略 → 交互选择）。**不信任的项目不加载项目指令、技能与扩展**。cap-std 路径硬化（nofollow capability 绑定）已删除。
-
-**资源加载**：按 root→cwd 顺序逐层收集项目指令文件（每层优先 AGENTS.override.md，否则 AGENTS.md），合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB；来源与 aggregate SHA-256 作为内部校验事实。
+**资源加载（裁决 7 修订）**：AGENTS.md 与 Pi 一致**无条件逐层加载**（root→cwd），无 trust 门控；project/trust 方法与 trust.json 存储已删除。按 root→cwd 顺序逐层收集项目指令文件（每层优先 AGENTS.override.md，否则 AGENTS.md），合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB；来源 SHA-256 作为可验证 provenance。
 
 ## 11. 客户端与协议
 
-**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）、`sg trust`、`sg eval`。`sg turn status/pause/resume/input` 与 `thread/read/fork/archive/delete` 已删除。未来 Desktop 嵌入 core 或走同一 stdio 协议。
+**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）、`sg eval`。`sg turn status/pause/resume/input`、`thread/read/fork/archive/delete` 与 `sg trust` 已删除。未来 Desktop 嵌入 core 或走同一 stdio 协议。
 
 **JSON-RPC 传输合同**（stdio JSON-Lines framing）：
 

@@ -14,10 +14,7 @@ pub use project_instructions::{
     ProjectInstructions, find_workspace_root, load_project_instructions,
     load_project_instructions_from_cwd,
 };
-pub use trust::{
-    DEFAULT_PROJECT_TRUST, TrustDecisions, TrustDefault, TrustResolution,
-    has_project_trust_resource, resolve_project_trusted, user_singularity_home,
-};
+pub use trust::user_singularity_home;
 
 /// 创建仅属主可访问的新文件：Unix 上以 0600 创建并收紧；Windows 上按
 /// Pi 策略不做额外 ACL 管理，继承所在目录的 ACL。
@@ -64,8 +61,6 @@ pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
 pub const APP_ERROR_NOT_FOUND: i64 = -32004;
 /// AppServer 请求工作线程容量已满。
 pub const APP_ERROR_REQUEST_CAPACITY_EXCEEDED: i64 = -32006;
-/// turn/start 需要项目信任决策（ask 未决且客户端可交互时返回，携带 cwd）。
-pub const APP_ERROR_TRUST_REQUIRED: i64 = -32010;
 const TOKEN_VALUE_MIN_BODY_CHARS: usize = 8;
 const SECRET_ASSIGNMENT_MIN_VALUE_CHARS: usize = 1;
 const AWS_ACCESS_KEY_ID_BODY_CHARS: usize = 16;

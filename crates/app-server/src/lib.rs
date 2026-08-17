@@ -25,19 +25,18 @@ use singularity_agent::{
     tools::ToolRegistry,
 };
 use singularity_core::{
-    APP_ERROR_TRUST_REQUIRED, CancellationToken, DEFAULT_PROJECT_TRUST, ErrorCode,
-    ProjectInstructionError, TrustDecisions, TrustResolution, load_project_instructions,
-    resolve_project_trusted, user_singularity_home,
+    CancellationToken, ErrorCode, ProjectInstructionError, load_project_instructions_from_cwd,
+    user_singularity_home,
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, InitializeParams,
-    InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProjectTrustDecision,
-    ProjectTrustParams, ProjectTrustResult, ProviderConfigurationStatus, ServerCapabilitiesResult,
-    ServerShutdownResult, SessionDeleteResult, SessionIdParams, SessionReadParams,
-    SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams,
-    ThreadStartResult, TransportCapability, Turn, TurnIdParams, TurnInjectionParams,
-    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus,
+    ServerCapabilitiesResult, ServerShutdownResult, SessionDeleteResult, SessionIdParams,
+    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
+    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
+    TurnInjectionParams, TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult,
+    TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
@@ -54,8 +53,6 @@ const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
-/// CLI 通过该环境变量向 app-server 传递交互 UI 可用性（有值且非 "0" 视为交互）。
-const INTERACTIVE_UI_ENV: &str = "SINGULARITY_INTERACTIVE";
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
@@ -289,10 +286,6 @@ pub struct AppServer {
     /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化到索引之外）。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
-    /// 客户端是否可交互。
-    interactive_ui: bool,
-    /// trust.json 所在的用户级目录。
-    trust_home: Option<PathBuf>,
     #[doc(hidden)]
     pub test_provider_override:
         Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
@@ -444,17 +437,14 @@ fn agent_config_for_thread(
     thread: &Thread,
     provider: &dyn Provider,
     snapshot: &ProviderConfigSnapshot,
-    trust: TrustResolution,
 ) -> AppServerResult<AgentConfig> {
     let cwd = workspace_path(thread)
         .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-    let system_prompt = match trust {
-        TrustResolution::Trusted => match load_project_instructions(&cwd, &cwd) {
-            Ok(Some(instructions)) => instructions.content().to_string(),
-            Ok(None) => String::new(),
-            Err(_) => String::new(),
-        },
-        TrustResolution::NotTrusted | TrustResolution::AskNeeded => String::new(),
+    // AGENTS.md 与 Pi 一致无条件逐层加载（root→cwd），不再做 trust 门控。
+    let system_prompt = match load_project_instructions_from_cwd(&cwd) {
+        Ok(Some(instructions)) => instructions.content().to_string(),
+        Ok(None) => String::new(),
+        Err(_) => String::new(),
     };
     let context_window = provider
         .protocol_contract()
@@ -530,8 +520,6 @@ impl AppServer {
             thread_follow_up_pending: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            interactive_ui: std::env::var_os(INTERACTIVE_UI_ENV).is_some_and(|value| value != "0"),
-            trust_home: user_singularity_home(),
             test_provider_override: None,
         }
     }
@@ -550,20 +538,6 @@ impl AppServer {
         provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
     ) -> Self {
         self.test_provider_override = Some(provider);
-        self
-    }
-
-    /// 仅测试：覆盖 trust.json 所在目录。
-    #[doc(hidden)]
-    pub fn with_trust_home(mut self, home: impl AsRef<Path>) -> Self {
-        self.trust_home = Some(home.as_ref().to_path_buf());
-        self
-    }
-
-    /// 仅测试：覆盖交互 UI 可用性。
-    #[doc(hidden)]
-    pub fn with_interactive_ui(mut self, interactive: bool) -> Self {
-        self.interactive_ui = interactive;
         self
     }
 
@@ -611,8 +585,6 @@ impl AppServer {
             thread_follow_up_pending: Arc::clone(&self.thread_follow_up_pending),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            interactive_ui: self.interactive_ui,
-            trust_home: self.trust_home.clone(),
             test_provider_override: self.test_provider_override.clone(),
         })
     }
@@ -688,28 +660,8 @@ impl AppServer {
                     }
                 })?)
             };
-        let trust = self.resolve_thread_trust(thread)?;
-        let config =
-            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, trust)?;
+        let config = agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
         Ok((provider, config))
-    }
-
-    fn trust_decisions(&self) -> TrustDecisions {
-        self.trust_home
-            .as_deref()
-            .map(TrustDecisions::load)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn resolve_thread_trust(&self, thread: &Thread) -> AppServerResult<TrustResolution> {
-        let cwd = workspace_path(thread)
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-        Ok(resolve_project_trusted(
-            &cwd,
-            &self.trust_decisions(),
-            DEFAULT_PROJECT_TRUST,
-            self.interactive_ui,
-        ))
     }
 
     pub(crate) fn open_session_for_thread(
@@ -794,18 +746,6 @@ impl AppServer {
             cache.insert(turn_id.to_string(), usage.clone());
         });
     }
-}
-
-/// 构造 -32010 trust_required 错误响应（data 携带 canonical cwd）。
-fn trust_required_response(id: JsonRpcId, cwd: &str) -> AppServerResult<Vec<Value>> {
-    Ok(vec![
-        JsonRpcMessage::error_with_data(
-            id,
-            ErrorCode::new(APP_ERROR_TRUST_REQUIRED, "trust required"),
-            json!({ "cwd": cwd }),
-        )
-        .to_wire_value(),
-    ])
 }
 
 fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {

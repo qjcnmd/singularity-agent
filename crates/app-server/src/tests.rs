@@ -8,7 +8,6 @@ use singularity_model::{
 };
 
 fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
-    let trust_home = Box::leak(Box::new(tempfile::tempdir().expect("trust home")));
     AppServer::new(
         store,
         ProviderConfigSnapshot::capture(
@@ -22,7 +21,6 @@ fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
             None,
         ),
     )
-    .with_trust_home(trust_home.path())
     .with_sessions_dir(sessions_dir)
 }
 
@@ -708,7 +706,6 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
         ),
         ("agent/capability", r#"{}"#),
         ("turn/interrupt", r#"{"turnId":"t"}"#),
-        ("project/trust", r#"{"path":"/tmp","decision":"query"}"#),
         ("server/shutdown", r#"{}"#),
     ] {
         let body = format!(
@@ -872,4 +869,54 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
         "second request must carry the queued followUp text"
     );
     let _ = last;
+}
+
+#[test]
+fn project_instructions_load_from_workspace_root_to_cwd() {
+    // H2 回归：root→cwd 逐层加载（此前 &cwd,&cwd 只加载 cwd 层）。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let nested = workspace.join("src").join("nested");
+    std::fs::create_dir_all(nested.join("..")).expect("nested parent");
+    std::fs::create_dir_all(&nested).expect("nested cwd");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    std::fs::write(workspace.join("AGENTS.md"), "ROOT INSTRUCTION").expect("root agents");
+    std::fs::write(nested.join("AGENTS.md"), "NESTED INSTRUCTION").expect("nested agents");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![completed_response("instructions_turn")],
+        seen_requests: Arc::clone(&requests),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(
+        &server,
+        &sessions_dir,
+        "9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
+        &nested,
+    );
+
+    server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d","input":[{"type":"text","text":"do it"}]}}"#,
+        )
+        .expect("turn start");
+    let seen = requests.lock().expect("seen requests");
+    let request = seen.last().expect("provider request");
+    let joined: String = request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("ROOT INSTRUCTION"),
+        "root AGENTS.md must be loaded from workspace root: {joined}"
+    );
+    assert!(
+        joined.contains("NESTED INSTRUCTION"),
+        "nested AGENTS.md must be loaded: {joined}"
+    );
 }

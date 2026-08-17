@@ -113,7 +113,6 @@ fn method_registry_keeps_only_converged_methods() {
         "turn/followUp",
         "turn/interrupt",
         "agent/capability",
-        "project/trust",
         "server/shutdown",
     ] {
         assert!(
@@ -131,6 +130,7 @@ fn method_registry_keeps_only_converged_methods() {
         "turn/resume",
         "turn/input",
         "event/subscribe",
+        "project/trust",
     ] {
         assert!(
             Method::parse(removed).is_none(),
