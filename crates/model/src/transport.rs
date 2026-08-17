@@ -1713,7 +1713,7 @@ fn record_provider_attempt(
     on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
 ) -> Result<(), ProviderError> {
     let occurrence = occurrence.finish(error, usage, None);
-    if !on_attempt(ProviderAttemptEvent::Finished(occurrence.clone())) {
+    if !on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence.clone()))) {
         return Err(provider_attempt_observer_error());
     }
     metadata.occurrences.push(occurrence);
@@ -1730,7 +1730,7 @@ fn record_provider_retry(
     metadata.retry_count += 1;
     let retry_backoff = provider_retry_backoff(metadata.retry_count);
     let occurrence = occurrence.finish(Some(error), None, Some(retry_backoff));
-    if !on_attempt(ProviderAttemptEvent::Finished(occurrence.clone())) {
+    if !on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence.clone()))) {
         return Err(provider_attempt_observer_error());
     }
     metadata.occurrences.push(occurrence);

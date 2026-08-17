@@ -1017,7 +1017,7 @@ pub enum ProviderAttemptEvent {
     /// Emitted immediately before the HTTP request is sent.
     Started(ProviderAttemptStarted),
     /// Emitted once when that same request reaches a terminal outcome.
-    Finished(ProviderAttemptOccurrence),
+    Finished(Box<ProviderAttemptOccurrence>),
 }
 
 /// The stable, non-sensitive fields known when a provider HTTP attempt starts.

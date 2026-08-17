@@ -326,7 +326,12 @@ pub(super) fn openai_responses_input(
             ModelRole::System | ModelRole::Developer | ModelRole::User => {
                 let role = match message.role {
                     ModelRole::System => "system",
-                    ModelRole::Developer => "developer",
+                    // Leading system/developer messages are collapsed into the
+                    // Responses instructions field above. A developer message
+                    // that appears after user/assistant history must use a role
+                    // accepted by the OpenAI-compatible Responses input schema;
+                    // system preserves its instruction semantics.
+                    ModelRole::Developer => "system",
                     ModelRole::User => "user",
                     ModelRole::Assistant | ModelRole::Tool => unreachable!(),
                 };
@@ -1193,5 +1198,28 @@ pub(super) fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
             .unwrap_or_default(),
         cost_estimate: None,
         usage_present: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openai_responses_input;
+    use crate::{ModelMessage, ModelRole};
+
+    #[test]
+    fn responses_projects_non_leading_developer_to_system() {
+        let (instructions, input) = openai_responses_input(
+            &[
+                ModelMessage::text(ModelRole::User, "first"),
+                ModelMessage::text(ModelRole::Developer, "late instruction"),
+                ModelMessage::text(ModelRole::User, "last"),
+            ],
+            &[],
+        );
+
+        assert_eq!(instructions, None);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[2]["role"], "user");
     }
 }

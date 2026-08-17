@@ -90,7 +90,7 @@ pub const BUILTIN_MODELS: &[BuiltinModel] = &[
     BuiltinModel {
         provider: "longcat",
         model: "LongCat-2.0",
-        api_protocol: "responses",
+        api_protocol: "chat",
         context_window: 1_000_000,
         max_output_tokens: 131_072,
         reasoning: true,
@@ -249,6 +249,7 @@ mod tests {
         assert!(opencode.reasoning);
 
         let longcat = builtin_model("longcat", "LongCat-2.0").expect("entry");
+        assert_eq!(longcat.api_protocol, "chat");
         assert_eq!(longcat.context_window, 1_000_000);
         assert_eq!(longcat.max_output_tokens, 131_072);
         assert!(longcat.reasoning);
