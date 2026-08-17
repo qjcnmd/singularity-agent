@@ -187,17 +187,54 @@ impl AppServer {
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .insert(turn_id.to_string(), follow_up_handle);
         let callback_error = RefCell::new(None);
+        // 回调闭包共享 emit 的可变借用：RefCell 包装（单线程 turn 内串行使用）。
+        let emit_cell = RefCell::new(emit);
         let mut on_message_update = |delta: &str| {
             if callback_error.borrow().is_some() {
                 return;
             }
             match self.project_assistant_delta(assistant_events, delta) {
-                Ok(messages) => emit_messages(emit, messages),
+                Ok(messages) => emit_messages(&mut *emit_cell.borrow_mut(), messages),
+                Err(error) => *callback_error.borrow_mut() = Some(error),
+            }
+        };
+        let mut on_tool_execution_start = |tool_name: &str, tool_call_id: &str, _raw_args: &str| {
+            if callback_error.borrow().is_some() {
+                return;
+            }
+            // 参数原文不进入协议事件（由会话条目承载）；事件只带 toolName/toolCallId。
+            match self.event_notification(AppEvent::tool_execution_start(tool_call_id, tool_name)) {
+                Ok(event) => emit_cell.borrow_mut()(event),
+                Err(error) => *callback_error.borrow_mut() = Some(error),
+            }
+        };
+        let mut on_tool_execution_update = |tool_call_id: &str, delta: &str| {
+            if callback_error.borrow().is_some() {
+                return;
+            }
+            match self.event_notification(AppEvent::tool_execution_update(tool_call_id, delta)) {
+                Ok(event) => emit_cell.borrow_mut()(event),
+                Err(error) => *callback_error.borrow_mut() = Some(error),
+            }
+        };
+        let mut on_tool_execution_end = |tool_name: &str, tool_call_id: &str, is_error: bool| {
+            if callback_error.borrow().is_some() {
+                return;
+            }
+            match self.event_notification(AppEvent::tool_execution_end(
+                tool_call_id,
+                tool_name,
+                is_error,
+            )) {
+                Ok(event) => emit_cell.borrow_mut()(event),
                 Err(error) => *callback_error.borrow_mut() = Some(error),
             }
         };
         let mut events = AgentEvents::new();
         events.on_message_update = Some(&mut on_message_update);
+        events.on_tool_execution_start = Some(&mut on_tool_execution_start);
+        events.on_tool_execution_update = Some(&mut on_tool_execution_update);
+        events.on_tool_execution_end = Some(&mut on_tool_execution_end);
         let outcome = match agent.run(input_text, &mut events, cancellation) {
             Ok(outcome) => outcome,
             // provider 调用内的取消：按 AgentOutcome 的 aborted 语义收敛。

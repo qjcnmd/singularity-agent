@@ -282,7 +282,7 @@ flowchart LR
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入，turn 已终态则入 thread 待办、下次 `turn/start` 取走（Pi 式，不拒绝）。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入，turn 已终态则入 thread 待办、下次 `turn/start` 取走（Pi 式，不拒绝）。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；参数原文与结果全文不进入事件，由会话 toolResult 条目承载）；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出；客户端事件投影只含安全字段，不泄露 raw payload。
 
@@ -292,7 +292,7 @@ flowchart LR
 
 - 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id）；没有结构化 `ToolResult`/`preview` 投影层。
 - bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），并按 tail 规则截断（最后 2000 行 / 50 KiB）；read 单行 ≤ 4 MiB、单次扫描 ≤ 64 MiB 且同样按 tail 规则截断。超限内容写入工作区临时文件并通过 `fullOutputPath` 文本标记返回，不向模型发送原文件内容。
-- 工具结果文本不包含 provider 原始响应；raw tool arguments 只存在于会话 assistant 条目的 `args` 字段，用于重建合法的 assistant tool_calls 续接，不进入错误正文。保护路径与密钥边界由 write/edit/read 的路径拒绝规则与 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
+- 工具结果文本不包含 provider 原始响应；raw tool arguments 只存在于会话 assistant 条目的 `args` 字段，用于重建合法的 assistant tool_calls 续接，不进入错误正文。不做受保护路径拒绝规则（对齐 Pi：工具信任后直接执行）；密钥边界由 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
 
 ### 12.2 工具 schema（对齐 Pi）
 

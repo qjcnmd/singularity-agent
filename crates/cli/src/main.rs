@@ -978,6 +978,30 @@ fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
             "method": method,
             "params": {"item_id": item_id},
         })),
+        // 工具生命周期事件（N7）：只投影 toolCallId/toolName/isError，delta 与
+        // 参数原文不进入 JSON 投影（工具输出由 toolResult 渲染承载）。
+        "tool/execution/start" | "tool/execution/end" => {
+            let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let tool_call_id = params
+                .as_ref()
+                .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
+                .unwrap_or("");
+            let tool_name = params
+                .as_ref()
+                .and_then(|p| p.get("toolName").and_then(Value::as_str))
+                .unwrap_or("");
+            let mut projected = json!({
+                "method": method,
+                "params": {"tool_call_id": tool_call_id, "tool_name": tool_name},
+            });
+            if let Some(is_error) = params
+                .as_ref()
+                .and_then(|p| p.get("isError").and_then(Value::as_bool))
+            {
+                projected["params"]["is_error"] = json!(is_error);
+            }
+            Some(projected)
+        }
         _ => Some(json!({"method": method})),
     }?;
     if let Some(event) = message

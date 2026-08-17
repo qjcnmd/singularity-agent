@@ -1285,7 +1285,6 @@ dependencies = [
 name = "singularity_core"
 version = "0.1.0"
 dependencies = [
- "base64",
  "schemars",
  "serde",
  "serde_json",

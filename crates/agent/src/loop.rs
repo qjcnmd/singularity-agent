@@ -35,17 +35,23 @@ use crate::message::{
 use crate::session::{SessionEntryType, SessionError, SessionManager};
 use crate::tools::{ExecuteContext, ToolError, ToolExecution, ToolRegistry};
 
-/// 工具执行回调签名：工具名、参数原文。
-pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str);
+/// 工具执行回调签名：工具名、tool call id、参数原文。
+pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &str);
+/// 工具执行输出增量回调签名：tool call id、增量文本。
+pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str);
+/// 工具执行结束回调签名：工具名、tool call id、是否错误。
+pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, bool);
 
 /// 核心事件回调（Pi 事件集的 Phase 2d 最小子集）。
 pub struct AgentEvents<'a> {
     /// assistant 文本增量。
     pub on_message_update: Option<&'a mut dyn FnMut(&str)>,
-    /// 工具开始执行（工具名、参数原文）。
+    /// 工具开始执行（工具名、tool call id、参数原文）。
     pub on_tool_execution_start: Option<ToolExecutionCallback<'a>>,
-    /// 工具执行中的流式输出增量。
-    pub on_tool_execution_update: Option<&'a mut dyn FnMut(&str)>,
+    /// 工具执行中的流式输出增量（tool call id、增量文本）。
+    pub on_tool_execution_update: Option<ToolExecutionUpdateCallback<'a>>,
+    /// 工具执行结束（工具名、tool call id、是否错误）。
+    pub on_tool_execution_end: Option<ToolExecutionEndCallback<'a>>,
 }
 
 impl<'a> AgentEvents<'a> {
@@ -54,6 +60,7 @@ impl<'a> AgentEvents<'a> {
             on_message_update: None,
             on_tool_execution_start: None,
             on_tool_execution_update: None,
+            on_tool_execution_end: None,
         }
     }
 }
@@ -337,14 +344,14 @@ impl Agent {
                         .append_message(assistant_response_message(&response))?;
                     for call in &tool_calls {
                         if let Some(on_start) = events.on_tool_execution_start.as_deref_mut() {
-                            on_start(&call.tool_name, &call.raw_arguments);
+                            on_start(&call.tool_name, &call.tool_call_id, &call.raw_arguments);
                         }
                         // 用短生命周期闭包包装 update 回调：`&mut dyn FnMut` 的 reborrow
                         // 会保留原对象生命周期，直接传入会把 ExecuteContext 的 cwd 借用
                         // 绑到回调生命周期上，导致与后续 session 写冲突。
                         let mut on_update = |text: &str| {
                             if let Some(callback) = events.on_tool_execution_update.as_deref_mut() {
-                                callback(text);
+                                callback(&call.tool_call_id, text);
                             }
                         };
                         let execution = match self.registry.execute(
@@ -366,6 +373,9 @@ impl Agent {
                         if cancellation.is_cancelled() {
                             outcome.aborted = true;
                             return Ok(outcome);
+                        }
+                        if let Some(on_end) = events.on_tool_execution_end.as_deref_mut() {
+                            on_end(&call.tool_name, &call.tool_call_id, execution.is_error);
                         }
                         self.session.append_message(tool_result_message(
                             &call.tool_call_id,
@@ -1431,8 +1441,9 @@ mod tests {
         .unwrap();
         let mut events = AgentEvents::new();
         let mut started: Vec<(String, String)> = Vec::new();
-        let mut on_tool_execution_start =
-            |name: &str, args: &str| started.push((name.to_string(), args.to_string()));
+        let mut on_tool_execution_start = |name: &str, _call_id: &str, args: &str| {
+            started.push((name.to_string(), args.to_string()))
+        };
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);
         let outcome = agent
             .run("create hello.txt", &mut events, &CancellationToken::new())
@@ -1556,7 +1567,7 @@ mod tests {
         let handle = agent.steer_handle();
         let mut events = AgentEvents::new();
         // 工具执行开始时（run 期间）从外部句柄注入转向消息。
-        let mut on_tool_execution_start = |_name: &str, _args: &str| {
+        let mut on_tool_execution_start = |_name: &str, _call_id: &str, _args: &str| {
             handle
                 .lock()
                 .unwrap()
@@ -2354,7 +2365,8 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut events = AgentEvents::new();
         let canceller = cancellation.clone();
-        let mut on_tool_execution_start = move |_name: &str, _args: &str| canceller.cancel();
+        let mut on_tool_execution_start =
+            move |_name: &str, _call_id: &str, _args: &str| canceller.cancel();
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);
         let outcome = agent.run("go", &mut events, &cancellation).unwrap();
         assert!(outcome.aborted);
