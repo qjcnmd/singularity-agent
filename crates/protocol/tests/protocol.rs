@@ -3,7 +3,7 @@
 use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload, Method, MethodKind,
+    AppEvent, EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload, Method, MethodKind,
     SessionReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
     TurnStatus, parse_json_rpc_payload, rpc_methods,
 };
@@ -209,4 +209,25 @@ fn initialize_params_keep_client_info_contract() {
     assert_eq!(params["clientInfo"]["name"], "sg");
     let _: rpc_methods::Initialize = rpc_methods::Initialize;
     assert!(Method::Initialize.spec().validate_params(params).is_ok());
+}
+
+#[test]
+fn tool_execution_events_use_pi_wire_fields() {
+    let args = json!({"command": "echo hi"});
+    let start = AppEvent::tool_execution_start("call-1", "bash", args.clone());
+    assert_eq!(start.method, "tool/execution/start");
+    assert_eq!(start.params["toolCallId"], "call-1");
+    assert_eq!(start.params["toolName"], "bash");
+    assert_eq!(start.params["args"], args);
+
+    let update =
+        AppEvent::tool_execution_update("call-1", "bash", json!({"command": "echo hi"}), "hi\n");
+    assert_eq!(update.params["partialResult"], "hi\n");
+    assert_eq!(update.params["toolName"], "bash");
+    assert_eq!(update.params["args"]["command"], "echo hi");
+
+    let end = AppEvent::tool_execution_end("call-1", "bash", "done", false);
+    assert_eq!(end.params["result"]["content"][0]["text"], "done");
+    assert_eq!(end.params["result"]["isError"], false);
+    assert_eq!(end.params["isError"], false);
 }

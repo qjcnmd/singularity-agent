@@ -1,7 +1,7 @@
 //! 从 workspace 层级读取并限制项目指令的实现。
 //!
 //! 信任边界内不再防 symlink（Phase 8b 裁决 7）：使用 `std::fs` 直接读取；
-//! 是否加载由信任决策（`trust.rs`）控制，本模块不重复防御。
+//! AGENTS.md 无条件逐层加载（root→cwd），不依赖 trust 门控（已删除）。
 
 use std::fmt::{Display, Formatter};
 use std::io;

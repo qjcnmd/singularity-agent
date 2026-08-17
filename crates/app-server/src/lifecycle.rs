@@ -198,38 +198,49 @@ impl AppServer {
                 Err(error) => *callback_error.borrow_mut() = Some(error),
             }
         };
-        let mut on_tool_execution_start = |tool_name: &str, tool_call_id: &str, _raw_args: &str| {
+        let mut on_tool_execution_start = |tool_name: &str, tool_call_id: &str, args: &Value| {
             if callback_error.borrow().is_some() {
                 return;
             }
-            // 参数原文不进入协议事件（由会话条目承载）；事件只带 toolName/toolCallId。
-            match self.event_notification(AppEvent::tool_execution_start(tool_call_id, tool_name)) {
-                Ok(event) => emit_cell.borrow_mut()(event),
-                Err(error) => *callback_error.borrow_mut() = Some(error),
-            }
-        };
-        let mut on_tool_execution_update = |tool_call_id: &str, delta: &str| {
-            if callback_error.borrow().is_some() {
-                return;
-            }
-            match self.event_notification(AppEvent::tool_execution_update(tool_call_id, delta)) {
-                Ok(event) => emit_cell.borrow_mut()(event),
-                Err(error) => *callback_error.borrow_mut() = Some(error),
-            }
-        };
-        let mut on_tool_execution_end = |tool_name: &str, tool_call_id: &str, is_error: bool| {
-            if callback_error.borrow().is_some() {
-                return;
-            }
-            match self.event_notification(AppEvent::tool_execution_end(
+            match self.event_notification(AppEvent::tool_execution_start(
                 tool_call_id,
                 tool_name,
-                is_error,
+                args.clone(),
             )) {
                 Ok(event) => emit_cell.borrow_mut()(event),
                 Err(error) => *callback_error.borrow_mut() = Some(error),
             }
         };
+        let mut on_tool_execution_update =
+            |tool_name: &str, tool_call_id: &str, args: &Value, partial_result: &str| {
+                if callback_error.borrow().is_some() {
+                    return;
+                }
+                match self.event_notification(AppEvent::tool_execution_update(
+                    tool_call_id,
+                    tool_name,
+                    args.clone(),
+                    partial_result,
+                )) {
+                    Ok(event) => emit_cell.borrow_mut()(event),
+                    Err(error) => *callback_error.borrow_mut() = Some(error),
+                }
+            };
+        let mut on_tool_execution_end =
+            |tool_name: &str, tool_call_id: &str, execution: &ToolExecution| {
+                if callback_error.borrow().is_some() {
+                    return;
+                }
+                match self.event_notification(AppEvent::tool_execution_end(
+                    tool_call_id,
+                    tool_name,
+                    &execution.content,
+                    execution.is_error,
+                )) {
+                    Ok(event) => emit_cell.borrow_mut()(event),
+                    Err(error) => *callback_error.borrow_mut() = Some(error),
+                }
+            };
         let mut events = AgentEvents::new();
         events.on_message_update = Some(&mut on_message_update);
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);

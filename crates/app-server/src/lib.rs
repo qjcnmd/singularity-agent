@@ -22,7 +22,7 @@ use singularity_agent::{
     session::{
         SessionEntryFilter, SessionError, SessionManager, SessionReadOptions, SessionRepository,
     },
-    tools::ToolRegistry,
+    tools::{ToolExecution, ToolRegistry},
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, load_project_instructions_from_cwd,

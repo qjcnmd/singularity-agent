@@ -982,47 +982,57 @@ impl AppEvent {
         }
     }
 
-    /// 构造工具开始执行事件（对齐 Pi `tool_execution_start`；参数原文不进入
-    /// 协议事件，由会话条目承载）。
+    /// 构造工具开始执行事件（对齐 Pi `tool_execution_start`）。
     pub fn tool_execution_start(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
+        args: Value,
     ) -> Self {
         Self {
             method: "tool/execution/start".to_string(),
             params: serde_json::json!({
                 "toolCallId": tool_call_id.into(),
                 "toolName": tool_name.into(),
+                "args": args,
             }),
         }
     }
 
-    /// 构造工具执行输出增量事件（对齐 Pi `tool_execution_update` 的 partialResult）。
+    /// 构造工具执行输出增量事件（对齐 Pi `tool_execution_update`）。
     pub fn tool_execution_update(
         tool_call_id: impl Into<String>,
-        delta: impl Into<String>,
+        tool_name: impl Into<String>,
+        args: Value,
+        partial_result: impl Into<String>,
     ) -> Self {
         Self {
             method: "tool/execution/update".to_string(),
             params: serde_json::json!({
                 "toolCallId": tool_call_id.into(),
-                "delta": delta.into(),
+                "toolName": tool_name.into(),
+                "args": args,
+                "partialResult": partial_result.into(),
             }),
         }
     }
 
-    /// 构造工具执行结束事件（对齐 Pi `tool_execution_end`；结果全文由 toolResult
-    /// 会话条目承载，事件只带 isError）。
+    /// 构造工具执行结束事件（对齐 Pi `tool_execution_end`）。
     pub fn tool_execution_end(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
+        result: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        let result = result.into();
         Self {
             method: "tool/execution/end".to_string(),
             params: serde_json::json!({
                 "toolCallId": tool_call_id.into(),
                 "toolName": tool_name.into(),
+                "result": {
+                    "content": [{"type": "text", "text": result}],
+                    "isError": is_error,
+                },
                 "isError": is_error,
             }),
         }

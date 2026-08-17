@@ -91,7 +91,7 @@ sg config import-env --file C:\path\to\.env
 
 思考档位必须逐模型声明，`reasoning_variants` 是唯一事实源；每个 variant 都写 `enabled`，启用档位可写一个 `wire_effort`，而 `off` 必须显式写成 `enabled:false`。`default_variant` 必须精确命中；无 map 表示不支持。Chat 纯开关只允许一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位必须写 wire。selector 可用 `provider_id/model_id#variant` 精确选择，未知档位、未声明的 `#off` 和不支持的模型 fail closed，不承诺自动 catalog 识别。
 
-Provider 私有 reasoning/output items 为 approval、重启和跨 turn 的官方续接保留在私有 checkpoint/本地 SQLite 中；它们不投影到公共 conversation、trace、Evaluation 或错误正文。SQLite 不是内容加密层，Responses `encrypted_content` 仍是 provider opaque blob。
+Provider 私有 reasoning/output items 的语义按协议处理：Chat 的 reasoning 文本以 thinking 块写入会话 JSONL，下一轮按模型声明投影为 provider replay；Responses 的 opaque output items 只在同一 provider 进程内传递，无法从公共文本块重建。Singularity 不使用 checkpoint，SQLite 仅保存 session index 元数据；Responses `encrypted_content` 仍是 provider opaque blob。
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 

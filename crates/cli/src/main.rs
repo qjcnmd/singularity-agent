@@ -958,7 +958,7 @@ fn protocol_events(messages: Vec<JsonRpcNotification>) -> Vec<Value> {
         .collect()
 }
 
-// 将单条协议通知投影为不泄露 raw payload 的事件。
+// 将单条协议通知投影为约定事件字段，不透传未知 envelope 字段。
 fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
     let method = message.method;
     let params = serde_json::from_value::<ItemEventParams>(message.params.clone()).ok();
@@ -978,9 +978,9 @@ fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
             "method": method,
             "params": {"item_id": item_id},
         })),
-        // 工具生命周期事件（N7）：只投影 toolCallId/toolName/isError，delta 与
-        // 参数原文不进入 JSON 投影（工具输出由 toolResult 渲染承载）。
-        "tool/execution/start" | "tool/execution/end" => {
+        // 工具生命周期事件（N7）：按 Pi 字段投影 toolCallId/toolName/args、
+        // partialResult 与 result。
+        "tool/execution/start" => {
             let params = serde_json::from_value::<Value>(message.params.clone()).ok();
             let tool_call_id = params
                 .as_ref()
@@ -990,17 +990,77 @@ fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
                 .as_ref()
                 .and_then(|p| p.get("toolName").and_then(Value::as_str))
                 .unwrap_or("");
-            let mut projected = json!({
+            let args = params
+                .as_ref()
+                .and_then(|p| p.get("args"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Some(json!({
                 "method": method,
-                "params": {"tool_call_id": tool_call_id, "tool_name": tool_name},
-            });
-            if let Some(is_error) = params
+                "params": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                },
+            }))
+        }
+        "tool/execution/update" => {
+            let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let tool_call_id = params
+                .as_ref()
+                .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
+                .unwrap_or("");
+            let tool_name = params
+                .as_ref()
+                .and_then(|p| p.get("toolName").and_then(Value::as_str))
+                .unwrap_or("");
+            let args = params
+                .as_ref()
+                .and_then(|p| p.get("args"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let partial_result = params
+                .as_ref()
+                .and_then(|p| p.get("partialResult").and_then(Value::as_str))
+                .unwrap_or("");
+            Some(json!({
+                "method": method,
+                "params": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "partial_result": partial_result,
+                },
+            }))
+        }
+        "tool/execution/end" => {
+            let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let tool_call_id = params
+                .as_ref()
+                .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
+                .unwrap_or("");
+            let tool_name = params
+                .as_ref()
+                .and_then(|p| p.get("toolName").and_then(Value::as_str))
+                .unwrap_or("");
+            let result = params
+                .as_ref()
+                .and_then(|p| p.get("result"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let is_error = params
                 .as_ref()
                 .and_then(|p| p.get("isError").and_then(Value::as_bool))
-            {
-                projected["params"]["is_error"] = json!(is_error);
-            }
-            Some(projected)
+                .unwrap_or(false);
+            Some(json!({
+                "method": method,
+                "params": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "result": result,
+                    "is_error": is_error,
+                },
+            }))
         }
         _ => Some(json!({"method": method})),
     }?;
@@ -1250,5 +1310,51 @@ mod tests {
         // 截断点之后的内容不得进入参考材料。
         assert!(!reference.contains("entry-31"));
         assert!(!reference.contains("[end untrusted session reference]"));
+    }
+
+    #[test]
+    fn safe_protocol_event_projects_full_tool_update_projection() {
+        let message: JsonRpcNotification = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "tool/execution/update",
+            "params": {
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "args": {"command": "echo hi"},
+                "partialResult": "hi\n"
+            }
+        }))
+        .expect("notification fixture");
+        let projected = safe_protocol_event(message).expect("projected event");
+
+        assert_eq!(projected["method"], "tool/execution/update");
+        assert_eq!(projected["params"]["tool_call_id"], "call-1");
+        assert_eq!(projected["params"]["tool_name"], "bash");
+        assert_eq!(projected["params"]["args"]["command"], "echo hi");
+        assert_eq!(projected["params"]["partial_result"], "hi\n");
+    }
+
+    #[test]
+    fn safe_protocol_event_projects_full_tool_end_result() {
+        let message: JsonRpcNotification = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "tool/execution/end",
+            "params": {
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "result": {
+                    "content": [{"type": "text", "text": "done"}],
+                    "isError": false
+                },
+                "isError": false
+            }
+        }))
+        .expect("notification fixture");
+        let projected = safe_protocol_event(message).expect("projected event");
+
+        assert_eq!(projected["params"]["tool_call_id"], "call-1");
+        assert_eq!(projected["params"]["tool_name"], "bash");
+        assert_eq!(projected["params"]["result"]["content"][0]["text"], "done");
+        assert_eq!(projected["params"]["is_error"], false);
     }
 }

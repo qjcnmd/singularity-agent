@@ -88,7 +88,7 @@ sequenceDiagram
 Pi 式双层循环（裁决 4/9）。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
 - **steer / followUp 是 thread 级内存队列**（裁决 9/M2）：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入；turn 已终态时按 turn→thread 历史映射入 thread 待办队列，下一次 `turn/start` 取走注入（不再返回 not found）。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
-- **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed` 且为瞬时类错误做运行级重试（首次 + 最多 4 次，2s/4s/8s/16s 退避）；`Invalid` 直接失败。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
+- **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed`/`Invalid` 直接以 typed provider 错误结束，不在 AgentLoop 层做整轮重试。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
 - 停止条件：无工具调用的成功 assistant 响应；外部取消（aborted，不视为模型错误）；达到 `max_turns` 上限；模型错误或会话错误直接返回。
 
 ```mermaid
@@ -105,9 +105,7 @@ flowchart TD
     F -- "Success + stop" --> I["终态 assistant 落盘"]
     F -- "overflow" --> J["强制 compact 一次<br/>同轮重试；二次失败原样返回"]
     J --> B
-    F -- "瞬时 Failed" --> K["运行级退避重试"]
-    K --> B
-    F -- "Invalid / 不可重试" --> Z
+    F -- "Failed / Invalid" --> Z
     I --> L{"外层:<br/>followUp 队列有消息?"}
     L -- 是 --> B
     L -- 否 --> M(["返回 AgentOutcome<br/>compaction 已在每轮检查"])
@@ -124,7 +122,7 @@ flowchart TD
 **执行可靠性（裁决 5，对齐 Pi，实测调整）**：
 
 - 超时：bash 缺少 `timeout_ms` 时使用 120000 ms；显式值必须是 integer 1..=600000，上限 600000 ms。
-- 输出截断：保留最后 2000 行 / 50 KiB，超限写入临时文件并返回 fullOutputPath。
+- 输出截断：bash 保留最后 2000 行 / 50 KiB，超限写入系统临时文件并返回 `fullOutputPath`；read 仅返回尾部与 `offset` 续读提示，不写临时文件。
 - 中断：abort 信号杀死整个进程树。
 - 工作目录绑定会话/任务工作区。
 - 不实现并发修改检测（Pi 没有；遇到真实覆盖冲突场景再按需加）。
@@ -137,7 +135,7 @@ flowchart TD
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
     D -- "合法" --> F["执行（进程内）<br/>bash: timeout_ms 默认 120000 / 上限 600000<br/>中断杀进程树<br/>cwd 绑定工作区"]
-    F --> G["工具自身输出截断<br/>read/bash: 最后 2000 行 / 50 KiB<br/>超限: 临时文件 + fullOutputPath"]
+    F --> G["工具自身输出截断<br/>read: offset 续读；bash: 临时文件 + fullOutputPath"]
     G --> I["toolResult 消息回传<br/>(content + is_error, 按调用顺序, 进入下一回合)"]
 ```
 
@@ -258,8 +256,8 @@ flowchart LR
 **静态能力声明**（裁决 8）：删除 capability probe 体系；每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；不做网络探测或能力协商。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。显式溢出重试兜底见第 6 节。
 
 - **Provider 边界**：`trait Provider`；保留 OpenAI-compatible 双协议 adapter（Chat Completions / Responses），同一请求对象投影两条 wire 路径，共用请求校验、重试、响应归一化；`finish_reason=length`/`content_filter` 作为未完成响应 fail closed。
-- **usage 记账**：每次调用回传 input/output/total、cached input、reasoning token 与 cost（含 cached_input_tokens/cost 字段），供评估指标与诊断使用。成本按 `(input − cached)×input价 + cached×cache价 + output×output价` 计（input 已含缓存命中，命中部分按 cache 价）。
-- **重试（两层）**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。**运行级**（agent 层）在传输层耗尽后对瞬时类错误（NetworkError/RateLimited/ProviderOverloaded + 瞬时文本信号）整轮至多 5 次尝试（首次 + 4 次重试，2s 指数退避 2/4/8/16s，可取消）；取消/挂起超时/认证/限额/校验/上下文溢出不重试。
+- **usage 记账**：Provider 返回 usage 时记录 input/output/total、cached input、reasoning token 与 cost，供评估指标与诊断使用；缺少原始 usage 时各计数保持 0、`usage_present=false` 且 `cost_estimate=null`，不把缺失伪装成零消费。成本按 `(input − cached)×input价 + cached×cache价 + output×output价` 计（input 已含缓存命中，命中部分按 cache 价）。
+- **重试**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。AgentLoop 不对传输层耗尽后的瞬时错误做整轮重试；仅在显式上下文溢出时按第 6 节强制压缩一次并重试同一轮。
 - **思考档位**：每模型显式声明 reasoning 档位；Chat 与 Responses 分别按各自 wire 合同发送对应字段。
 - **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等）+ 脱敏后的真实错误文本（敏感内容降级为 `Internal error`，不包含 API key、endpoint 原始请求/响应）；错误保留真实因果差异，不靠字符串匹配驱动控制流。
 - **配置校验**：配置值在本地信任边界完整校验，fail closed，不静默 trim/纠正；错误不携带原始值；API key 只通过配置引用的环境变量名解析，不进入会话/日志。
@@ -282,23 +280,23 @@ flowchart LR
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入，turn 已终态则入 thread 待办、下次 `turn/start` 取走（Pi 式，不拒绝）。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；参数原文与结果全文不进入事件，由会话 toolResult 条目承载）；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入，turn 已终态则入 thread 待办、下次 `turn/start` 取走（Pi 式，不拒绝）。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；start/update 携带 `toolCallId`、`toolName`、`args`，update 另带 `partialResult`，end 携带结构化 `result` 与 `isError`）；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
 
-**客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出。防御细节：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节），客户端跳过非 JSON 行不终止协议（真正的 response 行仍被解析）；客户端事件投影只含安全字段，不泄露 raw payload。
+**客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出。防御细节：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节），客户端跳过非 JSON 行不终止协议（真正的 response 行仍被解析）；客户端事件投影只保留各事件合同字段，不透传未知 envelope 字段。
 
 ## 12. 保留的技术细节
 
 ### 12.1 脱敏与工具输出合同
 
 - 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id）；没有结构化 `ToolResult`/`preview` 投影层。
-- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），并按 tail 规则截断（最后 2000 行 / 50 KiB）；read 单行 ≤ 4 MiB、单次扫描 ≤ 64 MiB 且同样按 tail 规则截断。超限内容写入工作区临时文件并通过 `fullOutputPath` 文本标记返回，不向模型发送原文件内容。
-- 工具结果文本不包含 provider 原始响应；raw tool arguments 只存在于会话 assistant 条目的 `args` 字段，用于重建合法的 assistant tool_calls 续接，不进入错误正文。不做受保护路径拒绝规则（对齐 Pi：工具信任后直接执行）；密钥边界由 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
+- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），并按 tail 规则截断（最后 2000 行 / 50 KiB）；超限内容写入系统临时文件并通过 `fullOutputPath` 文本标记返回，不向模型发送原文件内容。read 单行 ≤ 4 MiB、单次扫描 ≤ 64 MiB，超限仅返回尾部与 `offset` 续读提示，不写临时文件。工具生命周期事件按 Pi 合同广播参数、partial result 与结构化 result；会话 `toolResult` 仍是 LLM 上下文的权威结果消息。
+- 工具结果文本不包含 provider 原始响应；raw tool arguments 同时存在于会话 assistant 的 `tool_call` 内容块 `args` 字段及 N7 工具生命周期事件，用于客户端关联与展示。不做受保护路径拒绝规则（对齐 Pi：工具信任后直接执行）；密钥边界由 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
 
 ### 12.2 工具 schema（对齐 Pi）
 
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
-| read | `{path, offset?, limit?}` | 文本文件有界读取（非图片）；单行 ≤ 4 MiB，单次扫描 ≤ 64 MiB；输出 tail 截断 2000 行 / 50 KiB，超限写临时文件并返回 fullOutputPath；offset 1-indexed，limit 自动 clamp 到 2000 |
+| read | `{path, offset?, limit?}` | 文本文件有界读取（非图片）；单行 ≤ 4 MiB，单次扫描 ≤ 64 MiB；超限只提示 offset 续读，不写临时文件/fullOutputPath；offset 1-indexed，limit 自动 clamp 到 2000 |
 | bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 使用 120000；显式 schema 为 integer `1..=600000`，负数/浮点/字符串/null/溢出为 typed 参数错误；输出截断最后 2000 行/50 KiB，超限写临时文件并返回 fullOutputPath；含 exitCode；abort 杀进程树（Unix 独立进程组） |
 | edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；保留行尾风格；结果含 diff / firstChangedLine |
 | write | `{path, content}` | 写文件（新建或覆盖） |

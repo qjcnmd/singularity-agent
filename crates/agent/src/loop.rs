@@ -6,7 +6,7 @@
 //! `session.rs`/`compaction.rs`/`tools/`/`singularity_model` 提供。
 //!
 //! 与 Pi 的差异（Phase 2d 简化）：
-//! - 事件回调仅保留最小子集（文本增量/工具开始/工具输出增量），无完整事件流。
+//! - 事件回调仅保留文本增量与工具生命周期子集，无完整扩展事件流。
 //! - steer/follow-up 为内存队列（裁决 9：不持久化）。
 //! - provider 流式不可用时回退 `complete`（旧 AgentLoop 同款 fallback）。
 //! - 中断：外部 `CancellationToken` 取消时终止并返回已完成的文本（`aborted=true`）。
@@ -14,6 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
@@ -35,22 +36,22 @@ use crate::message::{
 use crate::session::{SessionEntryType, SessionError, SessionManager};
 use crate::tools::{ExecuteContext, ToolError, ToolExecution, ToolRegistry};
 
-/// 工具执行回调签名：工具名、tool call id、参数原文。
-pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &str);
-/// 工具执行输出增量回调签名：tool call id、增量文本。
-pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str);
-/// 工具执行结束回调签名：工具名、tool call id、是否错误。
-pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, bool);
+/// 工具开始回调签名：工具名、tool call id、结构化参数。
+pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value);
+/// 工具更新回调签名：工具名、tool call id、结构化参数、partial result。
+pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value, &str);
+/// 工具结束回调签名：工具名、tool call id、最终执行结果。
+pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, &ToolExecution);
 
 /// 核心事件回调（Pi 事件集的 Phase 2d 最小子集）。
 pub struct AgentEvents<'a> {
     /// assistant 文本增量。
     pub on_message_update: Option<&'a mut dyn FnMut(&str)>,
-    /// 工具开始执行（工具名、tool call id、参数原文）。
+    /// 工具开始执行（工具名、tool call id、结构化参数）。
     pub on_tool_execution_start: Option<ToolExecutionCallback<'a>>,
-    /// 工具执行中的流式输出增量（tool call id、增量文本）。
+    /// 工具执行中的流式输出增量（工具名、tool call id、参数、partial result）。
     pub on_tool_execution_update: Option<ToolExecutionUpdateCallback<'a>>,
-    /// 工具执行结束（工具名、tool call id、是否错误）。
+    /// 工具执行结束（工具名、tool call id、最终结果）。
     pub on_tool_execution_end: Option<ToolExecutionEndCallback<'a>>,
 }
 
@@ -241,6 +242,7 @@ impl Agent {
         };
         // 显式上下文溢出每轮只允许一次强制压缩重试（N3：循环层不再做整轮瞬时重试）。
         let mut context_overflow_retried = false;
+        let mut cost_estimate_complete = true;
         self.session.append_message(user_message(input))?;
 
         let mut preferences = ModelPreferences::default();
@@ -329,7 +331,11 @@ impl Agent {
                 }
                 outcome.turns += 1;
                 context_overflow_retried = false;
-                aggregate_usage(&mut outcome.usage, &response.usage);
+                aggregate_usage(
+                    &mut outcome.usage,
+                    &response.usage,
+                    &mut cost_estimate_complete,
+                );
                 let assistant_text = response
                     .assistant_message
                     .as_ref()
@@ -344,14 +350,19 @@ impl Agent {
                         .append_message(assistant_response_message(&response))?;
                     for call in &tool_calls {
                         if let Some(on_start) = events.on_tool_execution_start.as_deref_mut() {
-                            on_start(&call.tool_name, &call.tool_call_id, &call.raw_arguments);
+                            on_start(&call.tool_name, &call.tool_call_id, &call.arguments);
                         }
                         // 用短生命周期闭包包装 update 回调：`&mut dyn FnMut` 的 reborrow
                         // 会保留原对象生命周期，直接传入会把 ExecuteContext 的 cwd 借用
                         // 绑到回调生命周期上，导致与后续 session 写冲突。
                         let mut on_update = |text: &str| {
                             if let Some(callback) = events.on_tool_execution_update.as_deref_mut() {
-                                callback(&call.tool_call_id, text);
+                                callback(
+                                    &call.tool_name,
+                                    &call.tool_call_id,
+                                    &call.arguments,
+                                    text,
+                                );
                             }
                         };
                         let execution = match self.registry.execute(
@@ -370,18 +381,20 @@ impl Agent {
                                 is_error: true,
                             },
                         };
-                        if cancellation.is_cancelled() {
-                            outcome.aborted = true;
-                            return Ok(outcome);
-                        }
                         if let Some(on_end) = events.on_tool_execution_end.as_deref_mut() {
-                            on_end(&call.tool_name, &call.tool_call_id, execution.is_error);
+                            on_end(&call.tool_name, &call.tool_call_id, &execution);
                         }
                         self.session.append_message(tool_result_message(
                             &call.tool_call_id,
                             &call.tool_name,
                             &execution,
                         ))?;
+                        // 与 Pi 顺序一致：已开始的工具先发 end 并写入 toolResult，
+                        // 再收敛取消；后续工具不再执行。
+                        if cancellation.is_cancelled() {
+                            outcome.aborted = true;
+                            return Ok(outcome);
+                        }
                     }
                     self.maybe_compact(
                         &mut outcome.compacted,
@@ -643,7 +656,7 @@ impl Agent {
             }
             Err(error) => {
                 // 传输层重试（`MAX_PROVIDER_ATTEMPTS`，对齐 Codex stream 5 次重试）
-                // 已耗尽：typed 传播（N3 单层归属裁决），不再转换为运行级重试。
+                // 已耗尽：typed 传播（N3 单层归属裁决），不再转换为整轮重试。
                 Err(AgentError::Provider(error))
             }
         }
@@ -735,19 +748,25 @@ fn parse_model_selector(selector: &str) -> Option<(&str, &str, &str)> {
     Some((provider_name, model_name, variant))
 }
 
-/// 逐轮聚合 usage；cost_estimate 仅当所有轮都提供时求和。
-fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
+/// 逐轮聚合 usage；任一轮缺 usage 或成本估算时，聚合 cost 保持 None。
+fn aggregate_usage(
+    aggregate: &mut ModelUsage,
+    response: &ModelUsage,
+    cost_estimate_complete: &mut bool,
+) {
     aggregate.input_tokens += response.input_tokens;
     aggregate.output_tokens += response.output_tokens;
     aggregate.total_tokens += response.total_tokens;
     aggregate.cached_input_tokens += response.cached_input_tokens;
     aggregate.reasoning_tokens += response.reasoning_tokens;
     aggregate.usage_present |= response.usage_present;
-    aggregate.cost_estimate = match (aggregate.cost_estimate, response.cost_estimate) {
-        (Some(left), Some(right)) => Some(left + right),
-        // 初始聚合值（None）不是缺轮；只有响应侧缺值才置 None。
-        (None, Some(right)) => Some(right),
-        _ => None,
+    if !response.usage_present || response.cost_estimate.is_none() {
+        *cost_estimate_complete = false;
+    }
+    aggregate.cost_estimate = if *cost_estimate_complete {
+        Some(aggregate.cost_estimate.unwrap_or(0.0) + response.cost_estimate.unwrap_or(0.0))
+    } else {
+        None
     };
 }
 
@@ -913,6 +932,40 @@ mod tests {
         (agent, dir, provider)
     }
 
+    #[test]
+    fn aggregate_cost_stays_unknown_after_missing_usage_round() {
+        let first_usage = ModelUsage::default();
+        let second_usage = ModelUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 2,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            cost_estimate: Some(2.0),
+            usage_present: true,
+        };
+        let (mut agent, _dir, _provider) = setup(vec![
+            FakeStep {
+                text: "first".to_string(),
+                tool_calls: Vec::new(),
+                usage: first_usage,
+            },
+            FakeStep {
+                text: "second".to_string(),
+                tool_calls: Vec::new(),
+                usage: second_usage,
+            },
+        ]);
+        agent.follow_up("continue");
+
+        let outcome = agent
+            .run("start", &mut AgentEvents::new(), &CancellationToken::new())
+            .expect("scripted run");
+
+        assert!(outcome.usage.usage_present);
+        assert!(outcome.usage.cost_estimate.is_none());
+    }
+
     /// 失败脚本假 provider：按脚本顺序返回失败 turn（status=Failed）；`calls`
     /// 统计模型调用总次数，用于验证失败路径不重试。
     struct FailingProvider {
@@ -1011,7 +1064,8 @@ mod tests {
     /// 从 `complete_stream` 直接返回 `Err(ProviderError)` 的假 provider：
     /// 模拟传输层重试（`MAX_PROVIDER_ATTEMPTS`）耗尽后仍失败的路径——在修复前这部分
     /// 是死代码，`stream_completion` 直接以 `Err(AgentError::Provider)` 向外传播，
-    /// 运行级重试永远不触发。脚本按序在若干次失败后返回一次成功。
+    /// AgentLoop 不做整轮重试；脚本按序在若干次失败后返回一次成功，用于覆盖
+    /// provider 传输层耗尽后仍失败的 typed 传播路径。
     struct ErrReturningProvider {
         /// 每次 `complete_stream` 弹出的结果：`Err(model_error)` 或 `Ok(text)`。
         steps: Mutex<VecDeque<std::result::Result<String, ModelError>>>,
@@ -1082,7 +1136,7 @@ mod tests {
         }
     }
 
-    /// 恒返回 `ModelTurnStatus::Invalid` 的假 provider：校验失败绝不做运行级重试。
+    /// 恒返回 `ModelTurnStatus::Invalid` 的假 provider：校验失败直接 typed 传播。
     struct InvalidStatusProvider {
         contract: ProviderProtocolContract,
         calls: std::sync::atomic::AtomicUsize,
@@ -1171,8 +1225,8 @@ mod tests {
         }
     }
 
-    /// 运行级重试经 provider 失败路径：`Err(ProviderError)` 中不可重试错误（挂起超时）
-    /// 不被转换为 `Ok(Failed)`，保持 `Err(AgentError::Provider)` 传播，agent 直接失败且一次尝试。
+    /// Provider 失败路径：`Err(ProviderError)` 中不可重试错误（挂起超时）不被转换为
+    /// `Ok(Failed)`，保持 `Err(AgentError::Provider)` 传播，agent 直接失败且一次尝试。
     #[test]
     fn non_retryable_err_provider_error_fails_immediately() {
         let dir = tempfile::tempdir().unwrap();
@@ -1207,7 +1261,7 @@ mod tests {
         );
     }
 
-    /// 运行级重试：非瞬时类（挂起超时、账户限额、校验失败）不重试，直接失败。
+    /// 非瞬时类（挂起超时、账户限额、校验失败）不重试，直接失败。
     #[test]
     fn non_retryable_errors_fail_immediately_without_retry() {
         // 挂起超时（120s fail-fast 决策）：不重试。
@@ -1327,7 +1381,7 @@ mod tests {
         );
     }
 
-    /// 瞬时类失败不再运行级重试（N3 单层归属）：一次调用后 typed 传播原错误。
+    /// 瞬时类失败不在 AgentLoop 层整轮重试（N3 单层归属）：一次调用后 typed 传播原错误。
     #[test]
     fn transient_failure_propagates_typed_after_single_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -1441,7 +1495,7 @@ mod tests {
         .unwrap();
         let mut events = AgentEvents::new();
         let mut started: Vec<(String, String)> = Vec::new();
-        let mut on_tool_execution_start = |name: &str, _call_id: &str, args: &str| {
+        let mut on_tool_execution_start = |name: &str, _call_id: &str, args: &Value| {
             started.push((name.to_string(), args.to_string()))
         };
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);
@@ -1470,6 +1524,88 @@ mod tests {
         assert_eq!(second.messages[2].role, ModelRole::Tool);
         assert_eq!(second.messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert!(second.messages[2].content.contains("Successfully wrote"));
+    }
+
+    #[test]
+    fn tool_lifecycle_callbacks_carry_pi_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let provider = Arc::new(FakeProvider::new(
+            fake_contract(),
+            vec![
+                FakeStep {
+                    text: String::new(),
+                    tool_calls: vec![tool_call(
+                        "call_bash",
+                        "bash",
+                        json!({ "command": "printf hi" }),
+                    )],
+                    usage: usage(50, 10),
+                },
+                FakeStep {
+                    text: "done".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: usage(120, 20),
+                },
+            ],
+        ));
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig::default(),
+            session,
+        )
+        .unwrap();
+        let mut events = AgentEvents::new();
+        let mut starts = Vec::new();
+        let mut updates = Vec::new();
+        let mut ends = Vec::new();
+        let mut on_start = |name: &str, id: &str, args: &Value| {
+            starts.push((name.to_string(), id.to_string(), args.clone()));
+        };
+        let mut on_update = |name: &str, id: &str, args: &Value, partial: &str| {
+            updates.push((
+                name.to_string(),
+                id.to_string(),
+                args.clone(),
+                partial.to_string(),
+            ));
+        };
+        let mut on_end = |name: &str, id: &str, result: &ToolExecution| {
+            ends.push((
+                name.to_string(),
+                id.to_string(),
+                result.content.clone(),
+                result.is_error,
+            ));
+        };
+        events.on_tool_execution_start = Some(&mut on_start);
+        events.on_tool_execution_update = Some(&mut on_update);
+        events.on_tool_execution_end = Some(&mut on_end);
+
+        agent
+            .run("run bash", &mut events, &CancellationToken::new())
+            .unwrap();
+
+        assert_eq!(
+            starts,
+            vec![(
+                "bash".to_string(),
+                "call_bash".to_string(),
+                json!({ "command": "printf hi" }),
+            )]
+        );
+        assert!(updates.iter().any(|(name, id, args, partial)| {
+            name == "bash"
+                && id == "call_bash"
+                && args == &json!({ "command": "printf hi" })
+                && partial.contains("hi")
+        }));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].0, "bash");
+        assert_eq!(ends[0].1, "call_bash");
+        assert!(!ends[0].3);
+        assert!(ends[0].2.contains("hi"));
     }
 
     /// 3. steer 注入：运行前队列注入 → 会话上下文持久化 → 后续轮次上下文中出现。
@@ -1567,7 +1703,7 @@ mod tests {
         let handle = agent.steer_handle();
         let mut events = AgentEvents::new();
         // 工具执行开始时（run 期间）从外部句柄注入转向消息。
-        let mut on_tool_execution_start = |_name: &str, _call_id: &str, _args: &str| {
+        let mut on_tool_execution_start = |_name: &str, _call_id: &str, _args: &Value| {
             handle
                 .lock()
                 .unwrap()
@@ -2342,6 +2478,7 @@ mod tests {
     fn cancellation_during_tool_execution_aborts() {
         let dir = tempfile::tempdir().unwrap();
         let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let session_path = session.path().to_path_buf();
         let provider = Arc::new(FakeProvider::new(
             fake_contract(),
             vec![FakeStep {
@@ -2364,12 +2501,25 @@ mod tests {
         // 在工具执行回调中取消：bash 工具在信号检查点观察到取消。
         let cancellation = CancellationToken::new();
         let mut events = AgentEvents::new();
+        let mut ended = Vec::new();
+        let mut on_tool_execution_end = |name: &str, id: &str, result: &ToolExecution| {
+            ended.push((name.to_string(), id.to_string(), result.clone()));
+        };
+        events.on_tool_execution_end = Some(&mut on_tool_execution_end);
         let canceller = cancellation.clone();
         let mut on_tool_execution_start =
-            move |_name: &str, _call_id: &str, _args: &str| canceller.cancel();
+            move |_name: &str, _call_id: &str, _args: &Value| canceller.cancel();
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);
         let outcome = agent.run("go", &mut events, &cancellation).unwrap();
         assert!(outcome.aborted);
         assert_eq!(outcome.turns, 1);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, "bash");
+        assert_eq!(ended[0].1, "call_1");
+        assert!(ended[0].2.is_error);
+        assert!(ended[0].2.content.contains("Command aborted"));
+        let session_text = std::fs::read_to_string(session_path).unwrap();
+        assert!(session_text.contains("\"role\":\"toolResult\""));
+        assert!(session_text.contains("Command aborted"));
     }
 }
