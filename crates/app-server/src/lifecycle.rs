@@ -90,6 +90,22 @@ impl AppServer {
                         ..SessionMetadataUpdate::default()
                     },
                 );
+                // M1/H4：失败 turn 发出 turn 级终态错误事件（typed cause + 重试
+                // 状态，对齐 Codex ErrorNotification）；消息按传输边界同样脱敏。
+                let message = failure.original.clone().unwrap_or_default();
+                let message = if singularity_core::contains_sensitive_text(&message) {
+                    "Internal error".to_string()
+                } else {
+                    message
+                };
+                emit(self.event_notification(AppEvent::turn_error(
+                    &turn_id,
+                    &record.session_id,
+                    failure.stage.as_str(),
+                    failure.cause.as_str(),
+                    &message,
+                    false,
+                ))?);
                 return Err(AppServerError::TurnExecution {
                     stage: failure.stage,
                     cause: failure.cause,

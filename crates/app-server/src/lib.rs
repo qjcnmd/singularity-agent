@@ -115,6 +115,21 @@ impl fmt::Display for TurnFailureStage {
     }
 }
 
+/// provider/模型边界失败的具体类别（对齐 Codex `TurnError` 粒度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    RateLimited,
+    QuotaExceeded,
+    Network,
+    Timeout,
+    Auth,
+    Validation,
+    Overloaded,
+    Cancelled,
+    ContextOverflow,
+    Unknown,
+}
+
 /// 已进入 Running Turn 后失败的稳定原始原因分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnFailureCause {
@@ -123,6 +138,8 @@ pub enum TurnFailureCause {
     ProjectInstructions,
     Serialization,
     StoredInputUnavailable,
+    /// provider/模型边界失败（限流/配额/网络/校验等，见 `ProviderFailureKind`）。
+    Provider(ProviderFailureKind),
     Internal,
 }
 
@@ -134,6 +151,18 @@ impl TurnFailureCause {
             Self::ProjectInstructions => "project_instructions",
             Self::Serialization => "serialization",
             Self::StoredInputUnavailable => "stored_input_unavailable",
+            Self::Provider(kind) => match kind {
+                ProviderFailureKind::RateLimited => "provider_rate_limited",
+                ProviderFailureKind::QuotaExceeded => "provider_quota_exceeded",
+                ProviderFailureKind::Network => "provider_network",
+                ProviderFailureKind::Timeout => "provider_timeout",
+                ProviderFailureKind::Auth => "provider_auth",
+                ProviderFailureKind::Validation => "provider_validation",
+                ProviderFailureKind::Overloaded => "provider_overloaded",
+                ProviderFailureKind::Cancelled => "provider_cancelled",
+                ProviderFailureKind::ContextOverflow => "provider_context_overflow",
+                ProviderFailureKind::Unknown => "provider_unknown",
+            },
             Self::Internal => "internal",
         }
     }
@@ -766,12 +795,37 @@ fn turn_failure_cause(error: &AppServerError) -> TurnFailureCause {
         AppServerError::Store(_) => TurnFailureCause::Store,
         AppServerError::ProjectInstructions(_) => TurnFailureCause::ProjectInstructions,
         AppServerError::Workspace(_) => TurnFailureCause::Workspace,
+        AppServerError::Agent(AgentError::Provider(provider_error)) => {
+            TurnFailureCause::Provider(provider_failure_kind(&provider_error.error.kind))
+        }
         AppServerError::Agent(_) => TurnFailureCause::Internal,
         AppServerError::InvalidJson(_) => TurnFailureCause::Serialization,
         AppServerError::InvalidParams(_) => TurnFailureCause::Internal,
         AppServerError::Session(_) => TurnFailureCause::Store,
         AppServerError::TurnExecution { cause, .. }
         | AppServerError::TurnTerminalization { cause, .. } => *cause,
+    }
+}
+
+/// 把模型错误类型投影为 provider 失败类别（Codex 粒度）。
+fn provider_failure_kind(kind: &singularity_model::ModelErrorKind) -> ProviderFailureKind {
+    match kind {
+        singularity_model::ModelErrorKind::RateLimited => ProviderFailureKind::RateLimited,
+        singularity_model::ModelErrorKind::BudgetExceeded => ProviderFailureKind::QuotaExceeded,
+        singularity_model::ModelErrorKind::NetworkError => ProviderFailureKind::Network,
+        singularity_model::ModelErrorKind::Timeout => ProviderFailureKind::Timeout,
+        singularity_model::ModelErrorKind::AuthError => ProviderFailureKind::Auth,
+        singularity_model::ModelErrorKind::InvalidRequest
+        | singularity_model::ModelErrorKind::ToolCallParseError
+        | singularity_model::ModelErrorKind::JsonSchemaViolation
+        | singularity_model::ModelErrorKind::ContentFilter => ProviderFailureKind::Validation,
+        singularity_model::ModelErrorKind::ProviderOverloaded => ProviderFailureKind::Overloaded,
+        singularity_model::ModelErrorKind::Cancelled => ProviderFailureKind::Cancelled,
+        singularity_model::ModelErrorKind::ContextLengthExceeded => {
+            ProviderFailureKind::ContextOverflow
+        }
+        singularity_model::ModelErrorKind::UnknownProviderError
+        | singularity_model::ModelErrorKind::UnsupportedCapability => ProviderFailureKind::Unknown,
     }
 }
 

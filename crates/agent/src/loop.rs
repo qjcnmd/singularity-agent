@@ -13,7 +13,6 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -104,14 +103,6 @@ pub enum AgentError {
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
-
-/// 一次失败的模型 turn 的**运行级重试**：单轮最多尝试次数（首次 + 最多 4 次重试）。
-/// 这是传输层重试（`model/src/transport.rs`）耗尽后的第二层，只处理"整轮仍失败"。
-pub const MAX_MODEL_RUN_ATTEMPTS: u32 = 5;
-/// 最多重试次数（= 总尝试 - 1）。
-pub const MAX_MODEL_RUN_RETRIES: u32 = MAX_MODEL_RUN_ATTEMPTS - 1;
-/// 指数退避基底秒数：2s/4s/8s/16s。
-const RETRY_BACKOFF_BASE_SECONDS: u64 = 2;
 
 /// 一次 `run` 的最终结果。
 #[derive(Debug, Clone, PartialEq)]
@@ -238,8 +229,7 @@ impl Agent {
             compacted: false,
             aborted: false,
         };
-        // 本轮失败的瞬时类重试计数；成功时（`outcome.turns += 1` 处）归零，重试不递增 turns。
-        let mut attempts = 0u32;
+        // 显式上下文溢出每轮只允许一次强制压缩重试（N3：循环层不再做整轮瞬时重试）。
         let mut context_overflow_retried = false;
         self.session.append_message(user_message(input))?;
 
@@ -314,8 +304,8 @@ impl Agent {
                     }
                     Err(error) => return Err(error),
                 };
-                // 模型调用整体失败（传输层重试已耗尽）：按瞬时类做运行级重试。
-                // 重试是同一轮模型的重新请求，不递增 outcome.turns，也不计入 usage。
+                // 非 Success 响应（校验失败 Invalid 等）：typed 传播，不重试
+                // （N3 裁决：瞬时失败只归传输层，循环层不再做整轮重试）。
                 if response.status != ModelTurnStatus::Success {
                     let model_error = response.error.clone().unwrap_or_else(|| {
                         ModelError::new(
@@ -323,49 +313,11 @@ impl Agent {
                             "unknown provider error",
                         )
                     });
-                    if is_context_overflow_error(&model_error) {
-                        if context_overflow_retried {
-                            return Err(AgentError::Loop(format!(
-                                "model turn failed: {}",
-                                model_error.message
-                            )));
-                        }
-                        context_overflow_retried = true;
-                        // 强制压缩失败时返回原始溢出错误（保留真实因果），
-                        // 不掩盖为压缩错误。
-                        if self.force_compact(cancellation).is_err() {
-                            return Err(AgentError::Loop(format!(
-                                "model turn failed: {}",
-                                model_error.message
-                            )));
-                        }
-                        continue;
-                    }
-                    // 仅 `Failed` 状态且判定为瞬时类才重试；`Invalid`（校验失败）不重试。
-                    let retryable = response.status == ModelTurnStatus::Failed
-                        && is_retryable_run_error(&model_error);
-                    if retryable && attempts < MAX_MODEL_RUN_RETRIES {
-                        attempts += 1;
-                        let delay = Duration::from_secs(
-                            RETRY_BACKOFF_BASE_SECONDS.saturating_mul(1u64 << (attempts - 1)),
-                        );
-                        // 退避等待期间可取消：取消则立即停止重试并返回原错误（app-server
-                        // 侧会把取消态收敛为 aborted，不视为模型失败）。
-                        if cancellable_sleep(cancellation, delay) {
-                            return Err(AgentError::Loop(format!(
-                                "model turn failed: {}",
-                                model_error.message
-                            )));
-                        }
-                        continue;
-                    }
-                    return Err(AgentError::Loop(format!(
-                        "model turn failed: {}",
-                        model_error.message
+                    return Err(AgentError::Provider(ProviderError::from_model_error(
+                        model_error,
                     )));
                 }
                 outcome.turns += 1;
-                attempts = 0;
                 context_overflow_retried = false;
                 aggregate_usage(&mut outcome.usage, &response.usage);
                 let assistant_text = response
@@ -621,29 +573,9 @@ impl Agent {
                     .map_err(AgentError::Provider)
             }
             Err(error) => {
-                // 传输层重试（`MAX_PROVIDER_ATTEMPTS`）耗尽后的 `Err(ProviderError)`：
-                // 瞬时类错误转成 `Ok(ModelTurnResponse::Failed)`，交由运行级重试
-                // （loop.rs 调用方）按其既有 2s/4s/8s/16s 退避逻辑接管；不可重试
-                // 错误（取消/挂起超时/认证/限额/校验/上下文溢出等）原样传播。
-                if is_retryable_run_error(&error.error) {
-                    Ok(ModelTurnResponse {
-                        request_id: request.request_id.clone(),
-                        response_id: format!("fail-{}", Uuid::new_v4().simple()),
-                        status: ModelTurnStatus::Failed,
-                        assistant_message: None,
-                        tool_calls: Vec::new(),
-                        usage: ModelUsage::default(),
-                        finish_reason: None,
-                        validation: None,
-                        error: Some(*error.error),
-                        provider_name: None,
-                        model_name: None,
-                        provider_attempt_metadata: None,
-                        provider_reasoning_history: Vec::new(),
-                    })
-                } else {
-                    Err(AgentError::Provider(error))
-                }
+                // 传输层重试（`MAX_PROVIDER_ATTEMPTS`，对齐 Codex stream 5 次重试）
+                // 已耗尽：typed 传播（N3 单层归属裁决），不再转换为运行级重试。
+                Err(AgentError::Provider(error))
             }
         }
     }
@@ -717,87 +649,6 @@ fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecD
 
 fn is_context_overflow_error(error: &ModelError) -> bool {
     error.kind == ModelErrorKind::ContextLengthExceeded
-}
-
-/// 判断一次失败的模型 turn（`ModelTurnStatus::Failed`）是否应做运行级重试。
-///
-/// 已裁决边界：
-/// - **可重试**（瞬时类）：`NetworkError`/`RateLimited`/`ProviderOverloaded` 类型、HTTP
-///   429/5xx 状态码，以及 provider 文本含 overloaded/rate-limit/too many requests/5xx/
-///   服务不可用/内部错误/网络错误等瞬时信号（类型分类优先，文本仅作补充）。
-/// - **不可重试**：取消、挂起超时（`Timeout`，120s fail-fast）、认证/账户限额
-///   （quota/billing/insufficient_quota/usage limit/balance）、校验失败、上下文溢出等。
-///   `ModelTurnStatus::Invalid` 不在本函数内，调用方已排除。
-fn is_retryable_run_error(error: &ModelError) -> bool {
-    // 账户限额文本守卫最先执行：任何 kind（含瞬时类 RateLimited 等）命中
-    // quota/billing 文本即不可重试——限额是账户状态，重试无意义。
-    let lower = error.message.to_lowercase();
-    if [
-        "quota",
-        "billing",
-        "insufficient_quota",
-        "usage limit",
-        "balance",
-    ]
-    .iter()
-    .any(|pattern| lower.contains(pattern))
-    {
-        return false;
-    }
-    // 明确的不可重试类型：优先级最高，即使文本命中瞬时模式也忽略。
-    match error.kind {
-        ModelErrorKind::Cancelled
-        | ModelErrorKind::Timeout
-        | ModelErrorKind::AuthError
-        | ModelErrorKind::BudgetExceeded
-        | ModelErrorKind::ContextLengthExceeded
-        | ModelErrorKind::InvalidRequest
-        | ModelErrorKind::ToolCallParseError
-        | ModelErrorKind::JsonSchemaViolation
-        | ModelErrorKind::ContentFilter
-        | ModelErrorKind::UnsupportedCapability => return false,
-        // 瞬时类：网络、限流、过载。
-        ModelErrorKind::NetworkError
-        | ModelErrorKind::RateLimited
-        | ModelErrorKind::ProviderOverloaded => return true,
-        // 其余（如 UnknownProviderError）继续依据状态码与文本判断。
-        ModelErrorKind::UnknownProviderError => {}
-    }
-    // HTTP 429 或 5xx（类型可能已被归类为非瞬时的 UnknownProviderError 等）。
-    if matches!(error.http_status, Some(429 | 500 | 502 | 503 | 504)) {
-        return true;
-    }
-    // 瞬时类文本信号（补充，用于 provider 未归类的情况）。
-    [
-        "overloaded",
-        "rate limit",
-        "too many requests",
-        "500",
-        "502",
-        "503",
-        "504",
-        "服务不可用",
-        "内部错误",
-        "网络错误",
-    ]
-    .iter()
-    .any(|pattern| lower.contains(pattern))
-}
-
-/// 可取消的退避等待：以短步进轮询取消标志，取消时立即返回 `true`
-/// （调用方停止重试并返回原有错误）。非异步上下文（`run` 运行在阻塞线程）。
-fn cancellable_sleep(cancellation: &CancellationToken, total: Duration) -> bool {
-    const STEP: Duration = Duration::from_millis(40);
-    let mut remaining = total;
-    while !remaining.is_zero() {
-        if cancellation.is_cancelled() {
-            return true;
-        }
-        let chunk = remaining.min(STEP);
-        std::thread::sleep(chunk);
-        remaining = remaining.saturating_sub(chunk);
-    }
-    false
 }
 
 fn user_message(text: &str) -> AgentMessage {
@@ -1017,8 +868,8 @@ mod tests {
         (agent, dir, provider)
     }
 
-    /// 失败脚本假 provider：按脚本顺序返回失败 turn 或成功文本 turn；
-    /// `calls` 统计本轮模型尝试总次数（首次 + 重试），用于验证重试计数。
+    /// 失败脚本假 provider：按脚本顺序返回失败 turn（status=Failed）；`calls`
+    /// 统计模型调用总次数，用于验证失败路径不重试。
     struct FailingProvider {
         steps: Mutex<VecDeque<FailStep>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -1027,10 +878,8 @@ mod tests {
 
     #[derive(Clone)]
     enum FailStep {
-        /// 返回 status=Failed + 给定 error 的 turn（触发运行级重试判定）。
+        /// 返回 status=Failed + 给定 error 的 turn。
         Fail(ModelError),
-        /// 返回一次成功文本 turn（"重试后成功"场景）。
-        Success(String),
     }
 
     impl FailingProvider {
@@ -1061,12 +910,7 @@ mod tests {
                     provider_attempt_metadata: None,
                     provider_reasoning_history: Vec::new(),
                 },
-                Some(FailStep::Success(text)) => ModelTurnResponse::completed(
-                    request.request_id.clone(),
-                    format!("ok-{}", Uuid::new_v4().simple()),
-                    text,
-                ),
-                // 脚本耗尽：视作未知瞬时错误，触发重试直至次数耗尽。
+                // 脚本耗尽：视作未知错误（非瞬时类文本不触发任何重试语义）。
                 None => ModelTurnResponse {
                     request_id: request.request_id.clone(),
                     response_id: format!("empty-{}", Uuid::new_v4().simple()),
@@ -1282,85 +1126,6 @@ mod tests {
         }
     }
 
-    /// 运行级重试：瞬时类失败后重试成功，总尝试数正确，且重试不消费 max_turns。
-    #[test]
-    fn retry_transient_failure_then_succeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-        let provider = Arc::new(FailingProvider::new(
-            fake_contract(),
-            vec![
-                FailStep::Fail(ModelError::new(
-                    ModelErrorKind::NetworkError,
-                    "network flap",
-                )),
-                FailStep::Fail(ModelError::new(
-                    ModelErrorKind::RateLimited,
-                    "rate limit hit",
-                )),
-                FailStep::Success("recovered".to_string()),
-            ],
-        ));
-        let mut agent = Agent::new(
-            provider.clone(),
-            ToolRegistry::new(),
-            AgentConfig::default(),
-            session,
-        )
-        .unwrap();
-        let outcome = agent
-            .run("hello", &mut AgentEvents::new(), &CancellationToken::new())
-            .unwrap();
-        // 3 次尝试（2 次失败重试 + 1 次成功），但只算 1 轮。
-        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(outcome.turns, 1);
-        assert_eq!(outcome.final_text, "recovered");
-        assert!(!outcome.aborted);
-    }
-
-    /// 运行级重试经真实 provider 失败路径：`complete_stream` 直接返回
-    /// `Err(ProviderError)`（传输层重试耗尽后的形态），`stream_completion` 把瞬时类
-    /// 错误转成 `Ok(ModelTurnResponse::Failed)`，运行级重试据此接管并在退避后重试成功。
-    /// 修复前该 `Err` 路径是死代码——`stream_completion` 直接向外传播错误，这里会立即失败。
-    #[test]
-    fn retry_transient_err_provider_error_then_succeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-        let provider = Arc::new(ErrReturningProvider::new(
-            fake_contract(),
-            vec![
-                Err(ModelError::new(
-                    ModelErrorKind::NetworkError,
-                    "network flap after transport retries",
-                )),
-                Err(ModelError::new(
-                    ModelErrorKind::ProviderOverloaded,
-                    "provider overloaded",
-                )),
-                Ok("recovered".to_string()),
-            ],
-        ));
-        let mut agent = Agent::new(
-            provider.clone(),
-            ToolRegistry::new(),
-            AgentConfig::default(),
-            session,
-        )
-        .unwrap();
-        let outcome = agent
-            .run("hello", &mut AgentEvents::new(), &CancellationToken::new())
-            .unwrap();
-        // 3 次尝试（2 次 Err 失败重试 + 1 次成功），但只算 1 轮。
-        assert_eq!(
-            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "Err(NetworkError/ProviderOverloaded) must be converted to Ok(Failed) and retried"
-        );
-        assert_eq!(outcome.turns, 1);
-        assert_eq!(outcome.final_text, "recovered");
-        assert!(!outcome.aborted);
-    }
-
     /// 运行级重试经 provider 失败路径：`Err(ProviderError)` 中不可重试错误（挂起超时）
     /// 不被转换为 `Ok(Failed)`，保持 `Err(AgentError::Provider)` 传播，agent 直接失败且一次尝试。
     #[test]
@@ -1517,20 +1282,17 @@ mod tests {
         );
     }
 
-    /// 运行级重试：达到 5 次总尝试上限后返回原有错误。
+    /// 瞬时类失败不再运行级重试（N3 单层归属）：一次调用后 typed 传播原错误。
     #[test]
-    fn retry_exhausts_max_attempts_then_returns_original_error() {
+    fn transient_failure_propagates_typed_after_single_call() {
         let dir = tempfile::tempdir().unwrap();
         let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
         let provider = Arc::new(FailingProvider::new(
             fake_contract(),
-            vec![
-                FailStep::Fail(ModelError::new(
-                    ModelErrorKind::ProviderOverloaded,
-                    "provider overloaded",
-                ));
-                MAX_MODEL_RUN_ATTEMPTS as usize
-            ],
+            vec![FailStep::Fail(ModelError::new(
+                ModelErrorKind::ProviderOverloaded,
+                "provider overloaded",
+            ))],
         ));
         let mut agent = Agent::new(
             provider.clone(),
@@ -1542,60 +1304,15 @@ mod tests {
         let err = agent
             .run("task", &mut AgentEvents::new(), &CancellationToken::new())
             .unwrap_err();
+        assert!(
+            matches!(err, AgentError::Provider(_)),
+            "transient provider failure must propagate typed, got: {err:?}"
+        );
         assert!(err.to_string().contains("provider overloaded"));
         assert_eq!(
             provider.calls.load(std::sync::atomic::Ordering::SeqCst),
-            MAX_MODEL_RUN_ATTEMPTS as usize
-        );
-    }
-
-    /// 运行级重试：退避等待期间取消 → 立即停止重试并返回原错误。
-    #[test]
-    fn cancel_during_backoff_stops_retry() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-        // 脚本只给一次成功；若未取消会继续重试并最终成功，用于对照。
-        let provider = Arc::new(FailingProvider::new(
-            fake_contract(),
-            vec![FailStep::Fail(ModelError::new(
-                ModelErrorKind::NetworkError,
-                "transient network hiccup",
-            ))],
-        ));
-        let mut agent = Agent::new(
-            provider.clone(),
-            ToolRegistry::new(),
-            AgentConfig::default(),
-            session,
-        )
-        .unwrap();
-        let cancellation = CancellationToken::new();
-        // 首次调用立即失败后进入 2s 退避；之后短延迟取消，退避轮询应观察到并停止。
-        let canceller = cancellation.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(120));
-            canceller.cancel();
-        });
-        let started = std::time::Instant::now();
-        let err = agent
-            .run("task", &mut AgentEvents::new(), &cancellation)
-            .unwrap_err();
-        handle.join().unwrap();
-        assert!(
-            err.to_string().contains("transient network hiccup"),
-            "must return the original model error, got: {}",
-            err
-        );
-        assert_eq!(
-            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "cancellation during backoff must stop before a retry call"
-        );
-        // 不应等待完整 2s 退避。
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "backoff must be cancellable, elapsed {:?}",
-            started.elapsed()
+            "no run-level retry after N3"
         );
     }
 

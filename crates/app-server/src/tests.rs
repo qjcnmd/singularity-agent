@@ -920,3 +920,58 @@ fn project_instructions_load_from_workspace_root_to_cwd() {
         "nested AGENTS.md must be loaded: {joined}"
     );
 }
+
+#[test]
+fn turn_failure_emits_typed_error_event_with_provider_cause() {
+    // H4/M1：provider 边界失败（429）→ turn/error 终态事件携带 typed cause，
+    // willRetry=false（N3 后循环层不再重试）。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "3b4c5d6e-7f80-4912-8a3b-4c5d6e7f8091";
+    let mut rate_limited = ModelTurnResponse::completed("rl_request", "rl_response", "unused");
+    rate_limited.status = ModelTurnStatus::Failed;
+    rate_limited.assistant_message = None;
+    rate_limited.error = Some(ModelError::new(
+        ModelErrorKind::RateLimited,
+        "429 rate limit exceeded",
+    ));
+    let provider = StaticProvider {
+        responses: vec![rate_limited],
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    let mut collected = Vec::new();
+    let message: JsonRpcMessage = serde_json::from_str(&format!(
+        r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"x"}}]}}}}"#
+    ))
+    .expect("message");
+    let result = server.handle_turn_start_streaming_with_output(message, |output| {
+        collected.push(output);
+    });
+    assert!(result.is_err(), "turn must fail");
+
+    let error_event = collected
+        .iter()
+        .find(|message| message["method"] == "turn/error")
+        .expect("turn/error terminal event");
+    assert_eq!(
+        error_event["params"]["error"]["cause"], "provider_rate_limited",
+        "typed provider cause: {error_event:?}"
+    );
+    assert_eq!(error_event["params"]["error"]["stage"], "agent_loop");
+    assert_eq!(error_event["params"]["error"]["willRetry"], false);
+    assert!(
+        error_event["params"]["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("rate limit")),
+        "message must carry the original cause: {error_event:?}"
+    );
+    assert_eq!(error_event["params"]["threadId"], session_id);
+    assert!(error_event["params"]["turnId"].is_string());
+}

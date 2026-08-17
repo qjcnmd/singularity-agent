@@ -925,6 +925,31 @@ impl AppEvent {
         }
     }
 
+    /// 构造 turn 终态错误事件（失败 turn 的 turn 级终态；对齐 Codex
+    /// `ErrorNotification{error, willRetry, threadId, turnId}` 语义）。
+    pub fn turn_error(
+        turn_id: &str,
+        thread_id: &str,
+        stage: &str,
+        cause: &str,
+        message: &str,
+        will_retry: bool,
+    ) -> Self {
+        Self {
+            method: "turn/error".to_string(),
+            params: serde_json::json!({
+                "turnId": turn_id,
+                "threadId": thread_id,
+                "error": {
+                    "stage": stage,
+                    "cause": cause,
+                    "message": message,
+                    "willRetry": will_retry,
+                },
+            }),
+        }
+    }
+
     /// 构造 item started 事件。
     pub fn item_started(item_id: impl Into<String>) -> Self {
         Self::item_event("item/started", item_id)
