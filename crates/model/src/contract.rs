@@ -403,8 +403,8 @@ fn validate_model_response_with_protocol_context(
     }
     if tool_calls.len() > tool_choice.max_tool_calls as usize {
         // 响应超限降级为 warning：请求的并行上限在部分协议（如 Responses API）
-        // 无法表达，且 agent loop 会逐个顺序执行全部工具调用；作为致命校验
-        // 会杀死本可正常完成的 turn。
+        // 无法表达；Agent loop 会按 provider 声明的上限分窗口执行全部工具调用，
+        // 作为致命校验会杀死本可正常完成的 turn。
         warnings.push("max_tool_calls_exceeded".to_string());
     }
     if let Some(capabilities) = capabilities {

@@ -187,11 +187,12 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let session = self.open_session_for_thread(&thread_from_record(&record))?;
+        let session = self.open_and_repair_session_for_thread(&thread_from_record(&record))?;
         if session.path() != Path::new(&record.rollout_path) {
             return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
         }
-        // resume 只打开并校验会话；status 只由 turn 真正开始/终止时修改。
+        let record = self.store.get_session(&params.thread_id)?;
+        // resume 在目标会话打开时完成一次幂等 repair；继续操作仍追加新 turn。
         json_response(
             message.required_id(),
             ThreadResult {
@@ -413,8 +414,7 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
-        // 只统计仍持有取消令牌的活跃 turn；turn_threads 保留历史映射
-        // （M2 thread 级队列寻址用），不能直接当活跃判定。
+        // 只统计仍持有取消令牌且仍有活动 turn→thread 映射的 turn。
         let turn_active = {
             let active_turns = self
                 .active_turns

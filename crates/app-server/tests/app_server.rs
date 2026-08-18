@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::{AppServerProcess, send_json};
+use support::{AppServerProcess, isolated_home, send_json};
 
 fn spawn(workspace: &Path, home: &Path) -> AppServerProcess {
     AppServerProcess::spawn(workspace, home, "http://127.0.0.1:1/v1/responses")
@@ -18,7 +18,8 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = isolated_home();
+    let home = home_dir.path().to_path_buf();
     let mut process = spawn(&workspace, &home);
     process.initialize();
 
@@ -87,7 +88,8 @@ fn legacy_project_jsonl_migrates_to_uuid_rollouts_and_cleans_after_verification(
     let legacy_bytes = format!("{header}\n");
     std::fs::write(&legacy_file, &legacy_bytes).expect("legacy session");
 
-    let home = dir.path().join("home");
+    let home_dir = isolated_home();
+    let home = home_dir.path().to_path_buf();
     let mut process = spawn(&workspace, &home);
     process.initialize();
     process.send_request(3, "thread/list", json!({}));
@@ -124,7 +126,8 @@ fn removed_thread_and_turn_methods_return_stable_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = isolated_home();
+    let home = home_dir.path().to_path_buf();
     let mut process = spawn(&workspace, &home);
     process.initialize();
     for (id, method, params) in [
@@ -147,7 +150,8 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = isolated_home();
+    let home = home_dir.path().to_path_buf();
     let mut process = spawn(&workspace, &home);
     process.initialize();
 
@@ -221,7 +225,8 @@ fn stdio_rejects_json_rpc_batch_frames() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = isolated_home();
+    let home = home_dir.path().to_path_buf();
     let mut process = spawn(&workspace, &home);
     process.initialize();
     process.send_request(3, "thread/list", json!({}));

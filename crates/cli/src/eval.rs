@@ -150,7 +150,6 @@ struct ModelAggregate {
     total_duration_secs: f64,
     total_tokens: u64,
     avg_cache_hit_ratio: Option<f64>,
-    total_cost_estimate: f64,
     total_tool_calls: u64,
     total_tool_failures: u64,
 }
@@ -244,7 +243,6 @@ pub(crate) fn run_eval(
                         + (ratio - agg.avg_cache_hit_ratio.unwrap_or(0.0)) / agg.cells as f64,
                 );
             }
-            agg.total_cost_estimate += usage["cost_estimate"].as_f64().unwrap_or(0.0);
         }
         agg.total_tool_calls += cell.tool_calls;
         agg.total_tool_failures += cell.tool_failures;
@@ -261,7 +259,6 @@ pub(crate) fn run_eval(
         totals.timed_out += agg.timed_out;
         totals.total_duration_secs += agg.total_duration_secs;
         totals.total_tokens += agg.total_tokens;
-        totals.total_cost_estimate += agg.total_cost_estimate;
         totals.total_tool_calls += agg.total_tool_calls;
         totals.total_tool_failures += agg.total_tool_failures;
     }
@@ -281,7 +278,6 @@ pub(crate) fn run_eval(
         "by_model": by_model,
         "total_duration_secs": total_secs,
         "total_tokens": totals.total_tokens,
-        "total_cost_estimate": totals.total_cost_estimate,
     });
     let results_path = run_dir.join("results.json");
     fs::write(
@@ -293,7 +289,7 @@ pub(crate) fn run_eval(
     println!("eval {} finished in {total_secs:.1}s", run_dir.display());
     for (model, agg) in by_model {
         println!(
-            "  {model}: {} cells, passed={} failed={} partial={} interrupted={} crashed={} timed_out={} tokens={} cost=${:.4}",
+            "  {model}: {} cells, passed={} failed={} partial={} interrupted={} crashed={} timed_out={} tokens={}",
             agg.cells,
             agg.passed,
             agg.failed,
@@ -301,8 +297,7 @@ pub(crate) fn run_eval(
             agg.interrupted,
             agg.crashed,
             agg.timed_out,
-            agg.total_tokens,
-            agg.total_cost_estimate
+            agg.total_tokens
         );
     }
     println!("results: {}", results_path.display());
@@ -1380,7 +1375,7 @@ mod tests {
 
     #[test]
     fn parse_sg_json_extracts_turn_state_and_usage() {
-        let stdout = r#"{"thread":{"thread_id":"t1"},"turn":{"turn_id":"tr1","thread_id":"t1","status":"completed","agent_loop_status":"completed","model_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150,"cached_input_tokens":40,"reasoning_tokens":10,"cost_estimate":0.01}},"events":[]}"#;
+        let stdout = r#"{"thread":{"thread_id":"t1"},"turn":{"turn_id":"tr1","thread_id":"t1","status":"completed","agent_loop_status":"completed","model_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150,"cached_input_tokens":40,"reasoning_tokens":10}},"events":[]}"#;
         let parsed = parse_sg_json(stdout).expect("parseable");
         assert!(!parsed.interrupted);
         assert!(!parsed.failed);

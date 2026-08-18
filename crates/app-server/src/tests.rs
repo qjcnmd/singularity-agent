@@ -59,7 +59,7 @@ fn insert_session(server: &AppServer, sessions_dir: &Path, session_id: &str, cwd
 }
 
 #[test]
-fn jsonl_repair_rebuilds_index_and_marks_incomplete_turn_once() {
+fn jsonl_discovery_rebuilds_index_without_repairing_incomplete_turn() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -87,17 +87,26 @@ fn jsonl_repair_rebuilds_index_and_marks_incomplete_turn_once() {
         })
         .expect("stale index");
 
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("discover sessions");
+    let discovered = store.get_session(session_id).expect("discovered record");
+    assert_eq!(discovered.status, Some(SessionStatus::Active));
+    let discovered_session = SessionManager::open_existing(session.path()).expect("reopen");
+    assert_eq!(discovered_session.metadata_entries().len(), 1);
+
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":2,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume repairs session");
     assert_eq!(
-        repair_session_index_from_jsonl(&store, &sessions_dir).unwrap(),
-        1
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "interrupted"
     );
-    let repaired = store.get_session(session_id).expect("repaired record");
-    assert_eq!(repaired.status, Some(SessionStatus::Interrupted));
-    let reopened = SessionManager::open_existing(session.path()).expect("reopen");
-    assert_eq!(reopened.metadata_entries().len(), 2);
     assert_eq!(
-        repair_session_index_from_jsonl(&store, &sessions_dir).unwrap(),
-        0
+        server.store().get_session(session_id).unwrap().status,
+        Some(SessionStatus::Interrupted)
     );
     assert_eq!(
         SessionManager::open_existing(session.path())
@@ -106,6 +115,35 @@ fn jsonl_repair_rebuilds_index_and_marks_incomplete_turn_once() {
             .len(),
         2
     );
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":3,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("second resume");
+    assert_eq!(
+        SessionManager::open_existing(session.path())
+            .unwrap()
+            .metadata_entries()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn jsonl_discovery_isolates_one_corrupt_rollout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let valid_id = "c2e0d5f5-7d50-4ef7-a6f9-0f0c1b3f44ab";
+    SessionManager::create_with_id(&workspace, &sessions_dir, valid_id).expect("valid session");
+    std::fs::write(sessions_dir.join("broken.jsonl"), b"not-json\n").expect("broken session");
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("discovery isolates bad file");
+    let sessions = store.list_sessions().expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, valid_id);
 }
 
 #[test]
@@ -150,7 +188,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
     assert_eq!(settings[0]["result"]["updated"], true);
     let record = server.store().get_session(&thread_id).expect("record");
     assert_eq!(record.model.as_deref(), Some("openai_compatible/gpt-test"));
-    repair_session_index_from_jsonl(server.store(), &sessions_dir).expect("repair settings");
+    rebuild_session_index_from_jsonl(server.store(), &sessions_dir).expect("discover settings");
     assert_eq!(
         server
             .store()
@@ -266,7 +304,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
 }
 
 #[test]
-fn completed_turn_runtime_indexes_remain_bounded_and_usage_is_released() {
+fn completed_turn_runtime_indexes_are_released_and_usage_is_released() {
     let temp = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
     let sessions_dir = temp.path().join("sessions");
@@ -277,10 +315,9 @@ fn completed_turn_runtime_indexes_remain_bounded_and_usage_is_released() {
             .activate_turn(&turn_id, "thread-1")
             .expect("activate");
         server.remember_usage(&turn_id, &ModelUsage::default());
-        server.remember_turn_status(&turn_id, TurnStatus::Completed, "completed");
         drop(guard);
     }
-    assert!(server.turn_threads.lock().unwrap().len() <= MAX_TERMINAL_TURN_REFERENCES);
+    assert!(server.turn_threads.lock().unwrap().is_empty());
     assert!(server.usage_by_turn.lock().unwrap().is_empty());
 }
 
@@ -544,7 +581,8 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         "completed"
     );
 
-    // interrupted 也是纯展示状态，continue 不受限制。
+    // SQLite-only 的陈旧 interrupted 不得覆盖 JSONL 中已有的 completed 事实；
+    // resume 打开目标会话时重新投影为 completed。
     server
         .store()
         .update_session(
@@ -562,7 +600,11 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .expect("resume interrupted");
     assert_eq!(
         resumed[0]["result"]["thread"]["lastTurnStatus"],
-        "interrupted"
+        "completed"
+    );
+    assert_eq!(
+        server.store().get_session(&session_id).unwrap().status,
+        Some(SessionStatus::Completed)
     );
 }
 
@@ -1047,7 +1089,7 @@ fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
 }
 
 #[test]
-fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
+fn steer_and_follow_up_after_turn_completion_are_rejected() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1082,7 +1124,7 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
         .to_string();
     assert_eq!(turn_one["result"]["turn"]["status"], "completed");
 
-    // turn 已终态：steer / followUp 不再 not found，入 thread 级待办队列。
+    // turn 已终态：steer / followUp 必须拒绝；客户端应发送新的 turn/start。
     for (method, text) in [
         ("turn/steer", "change direction"),
         ("turn/followUp", "keep going"),
@@ -1092,33 +1134,17 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
                 r#"{{"jsonrpc":"2.0","method":"{method}","id":3,"params":{{"turnId":"{turn_id}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
             ))
             .expect("post-terminal inject");
-        assert!(
-            responses[0]["result"].is_object(),
-            "{method} after completion must be queued, got: {responses:?}"
+        assert_eq!(
+            responses[0]["error"]["code"], -32004,
+            "{method}: {responses:?}"
         );
-        assert_eq!(responses[0]["result"]["outcome"], "queued");
-        assert_eq!(responses[0]["result"]["turn"]["status"], "completed");
+        assert!(
+            responses[0]["result"].is_null(),
+            "{method} must not acknowledge terminal input"
+        );
     }
-    assert_eq!(
-        server
-            .thread_steer_pending
-            .lock()
-            .expect("steer pending")
-            .get(session_id)
-            .map(VecDeque::len),
-        Some(1)
-    );
-    assert_eq!(
-        server
-            .thread_follow_up_pending
-            .lock()
-            .expect("follow up pending")
-            .get(session_id)
-            .map(VecDeque::len),
-        Some(1)
-    );
 
-    // turn 2 在同一 thread 开始：取走待办并注入，请求消息包含纸条文本。
+    // turn 2 只能通过显式 turn/start 开始，不应携带已拒绝的输入。
     let responses = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"turn/start","id":4,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"second"}}]}}}}"#
@@ -1129,105 +1155,14 @@ fn steer_and_follow_up_after_turn_completion_queue_for_next_turn_start() {
         "completed"
     );
     let seen = requests.lock().expect("seen requests");
-    let last = seen.last().expect("second provider call");
     assert!(
-        seen.iter().any(|request| request
+        seen.iter().all(|request| !request
             .messages
             .iter()
-            .any(|m| m.content == "change direction")),
-        "second request must carry the queued steer text"
-    );
-    assert!(
-        seen.iter()
-            .any(|request| request.messages.iter().any(|m| m.content == "keep going")),
-        "second request must carry the queued followUp text"
-    );
-    let _ = last;
-}
-
-#[test]
-fn terminal_turn_queue_is_thread_scoped_and_consumed_once() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace_a = temp.path().join("workspace-a");
-    let workspace_b = temp.path().join("workspace-b");
-    std::fs::create_dir_all(&workspace_a).expect("workspace a");
-    std::fs::create_dir_all(&workspace_b).expect("workspace b");
-    let sessions_dir = temp.path().join("sessions");
-    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
-    let session_a = "a1e2d3c4-1111-4222-8333-444455556666";
-    let session_b = "b1e2d3c4-7777-4888-8999-000011112222";
-    let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let provider = StaticProvider {
-        responses: vec![completed_response("queued_once")],
-        seen_requests: Arc::clone(&requests),
-    };
-    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
-    initialize(&mut server);
-    insert_session(&server, &sessions_dir, session_a, &workspace_a);
-    insert_session(&server, &sessions_dir, session_b, &workspace_b);
-
-    let first = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"first-a"}}]}}}}"#
-        ))
-        .expect("turn a");
-    let turn_a = first
-        .iter()
-        .find(|message| message["id"] == 2)
-        .and_then(|message| message["result"]["turn"]["turn_id"].as_str())
-        .expect("turn a id")
-        .to_string();
-
-    let queued = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{{"turnId":"{turn_a}","input":[{{"type":"text","text":"only-a"}}]}}}}"#
-        ))
-        .expect("queue a");
-    assert_eq!(queued[0]["result"]["outcome"], "queued");
-
-    server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":4,"params":{{"threadId":"{session_b}","input":[{{"type":"text","text":"first-b"}}]}}}}"#
-        ))
-        .expect("turn b");
-    let requests_after_b = requests.lock().expect("requests after b");
-    assert!(
-        !requests_after_b[1]
-            .messages
-            .iter()
-            .any(|message| message.content == "only-a")
-    );
-    drop(requests_after_b);
-
-    server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"second-a"}}]}}}}"#
-        ))
-        .expect("turn a queued");
-    server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":6,"params":{{"threadId":"{session_a}","input":[{{"type":"text","text":"third-a"}}]}}}}"#
-        ))
-        .expect("turn a without duplicate queue");
-
-    let requests = requests.lock().expect("requests");
-    assert!(
-        requests[2]
-            .messages
-            .iter()
-            .any(|message| message.content == "only-a")
-    );
-    assert_eq!(
-        requests[3]
-            .messages
-            .iter()
-            .filter(|message| message.content == "only-a")
-            .count(),
-        1,
-        "consumed queue text must remain in history without being injected again"
+            .any(|m| { m.content == "change direction" || m.content == "keep going" })),
+        "rejected terminal inputs must not appear in a later turn"
     );
 }
-
 #[test]
 fn turn_injection_unknown_turn_is_not_found() {
     let temp = tempfile::tempdir().expect("temp dir");

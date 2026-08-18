@@ -491,14 +491,10 @@ fn initialize_app_server(
             paths.sessions_dir.display()
         );
     }
-    // JSONL 是事实源：启动时先修复孤立 turn/索引投影，再向客户端提供 thread
-    // 列表；SQLite 写入失败会让启动失败，而不会覆盖 rollout。
-    let repaired =
-        singularity_app_server::repair_session_index_from_jsonl(&store, &paths.sessions_dir)
-            .map_err(|error| format!("failed to repair app-server session index: {error}"))?;
-    if repaired > 0 {
-        eprintln!("repaired {repaired} interrupted session turn(s)");
-    }
+    // 启动只读取 JSONL header 建立可用索引；单个损坏 rollout 由 discovery 隔离，
+    // 不在这里追加 interrupted 或其它 repair 条目。目标 Session 真正打开时再 repair。
+    singularity_app_server::rebuild_session_index_from_jsonl(&store, &paths.sessions_dir)
+        .map_err(|error| format!("failed to rebuild app-server session index: {error}"))?;
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
     Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))

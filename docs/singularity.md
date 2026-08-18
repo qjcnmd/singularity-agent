@@ -89,7 +89,7 @@ sequenceDiagram
 
 Pi 式双层循环。内层每轮迭代：检查取消与轮数上限 → drain steer 队列注入 user 消息 → compaction preflight → 模型调用（流式 assistant 消息）→ 仅 `Success` 响应执行工具并把 toolResult 按序回传 → 进入下一轮；无 toolCall 的 `Success` 响应持久化终态 assistant 消息。一个 assistant response 的工具批次先按 source order 完成查找、参数校验和执行模式 preflight；无 `Sequential` 工具时实际并行执行，有任一 `Sequential` 工具时整批顺序执行。生命周期事件按实际完成/回调到达顺序交付，durable ToolResult 始终按 assistant source order 写入并用于下一次请求；取消会传播给批次内所有工具并等待其终态结果收敛。内层退出后进入外层：drain followUp 队列，仍有消息则继续内层，否则返回聚合结果。
 
-- **steer / followUp 是 thread 级内存队列**：纯内存投递，进程退出即丢；不持久化、无幂等键。有 turn 在跑时实时注入并返回 outcome=active；turn 已终态时按 turn→thread 历史映射入 thread 待办队列并返回 outcome=queued，下一次 `turn/start` 取走注入；未知 turn 返回 not found。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
+- **steer / followUp 仅面向活动 turn**：有 turn 在跑时实时注入并返回 outcome=active；turn 已终态或不存在时返回 typed not-found 错误，不保存 thread 级待办输入。终态后的用户输入必须由客户端发送新的 `turn/start`。steer 在工具执行完成后、下一次模型调用前注入；followUp 在 agent 即将停止时注入。
 - **模型失败语义**：`Success` 才持久化 assistant 消息或执行工具；`Failed`/`Invalid` 直接以 typed provider 错误结束，不在 AgentLoop 层做整轮重试。显式上下文溢出（`ContextLengthExceeded`）强制压缩一次后重试同一轮（见第 6 节），第二次失败按原错误返回。
 - 停止条件：无工具调用的成功 assistant 响应；外部取消（aborted，不视为模型错误）；达到 `max_turns` 上限；模型错误或会话错误直接返回。
 
@@ -159,7 +159,7 @@ flowchart TD
 - 落盘时机：turn 启动先把 `turn_started` metadata 和当前 user 消息追加 JSONL；随后只有终态 assistant/toolResult/compaction 消息、turn terminal metadata 和标准化 usage 追加 JSONL，流式 delta 不落盘。终态发布顺序固定为 JSONL → SQLite → 协议通知。进程崩溃时已追加的 user/assistant tool-call 条目保留，不存在的回合不写入状态。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
 - 恢复：重开文件 → 逐行解析 + 版本迁移 → `repair_orphaned_tool_calls`（有 tool_call_id 但无后续 ToolResult 的 assistant 条目，追加 synthetic failed ToolResult：`[previous execution outcome unknown; do not retry]`；不重写/删除原条目、绝不重新执行工具）→ `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
-- metadata、custom、label、model_change、thinking_level_change、session_info 等非消息条目不进模型 context；公开 `session/read` 只返回稳定的 message/thinking/tool_call/tool_result/turn/settings/usage/compaction projection，不返回 raw SessionEntry、parent/tree、迁移字段或 provider-private replay。`session_index.status` 只表示 turn 状态：尚无 turn 时为 null（缺失值），turn 运行中为 active，终态为 completed/failed/interrupted；启动扫描会从 JSONL 修复 active/usage/model 的 SQLite 投影。`sg continue`/resume 不改变终态，继续操作总是新 turn。
+- metadata、custom、label、model_change、thinking_level_change、session_info 等非消息条目不进模型 context；公开 `session/read` 只返回稳定的 message/thinking/tool_call/tool_result/turn/settings/usage/compaction projection，不返回 raw SessionEntry、parent/tree、迁移字段或 provider-private replay。`session_index.status` 只表示 turn 状态：尚无 turn 时为 null（缺失值），turn 运行中为 active，终态为 completed/failed/interrupted；启动只读取 JSONL header 建立索引，不追加 repair；目标 Session 在 `thread/resume` 或实际 turn 执行时打开后才修复 incomplete turn/orphaned tool call 并刷新该行投影。`sg continue`/resume 不改变终态，继续操作总是新 turn。
 
 ```mermaid
 flowchart TD
@@ -242,9 +242,10 @@ sequenceDiagram
 
 - **任务集**（通用格式）：task_id + `workspace/`（几百~1000 行项目，含测试）+ `instruction.md` + `checker.sh`。
 - **执行规模**：3 题 × 2 模型 = 6 cell 全并行（一次 3 题以控制供应商并发；模型组：opencode-go/deepseek-v4-flash#max、longcat/LongCat-2.0#high；当前题集：warehouse-audit / billing-calc / cache-ttl）。
-- **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 均为独立 stdio 子进程）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；600s 超时防挂死）→ 从 rollout + usage 聚合指标。
+- **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 均为独立 stdio 子进程）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；600s 超时防挂死）→ 从 rollout + usage 聚合指标。并行工具的本地 worker 窗口受 provider 的 `max_parallel_tool_calls` 限制。
+- **核心链路 smoke**：`crates/cli/tests/core_chain_smoke.rs` 提供三个 `#[ignore]` 的真实 Provider case（跨进程重开、长上下文 compaction、工具/并行恢复），默认不运行。运行前必须显式设置 `SINGULARITY_SMOKE_MODELS_CONFIG` 和所选 provider 的密钥环境变量；测试会把配置复制到仓库外临时目录，并为每个 case 使用独立 `SINGULARITY_HOME`、file-backed SQLite 和临时 workspace。未提供临时配置/凭据时只保留未验证状态，不读取日常用户配置。
 - **判分语义**：turn 失败但 checker 通过时判 passed（workspace 状态是客观证据）；checker 输出经读取线程边读边同步捕获（孙进程持管道不 EOF 也能拿到已读部分）。
-- **指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率；成本估算；耗时拆解；工具调用数；工具失败数；重复动作。
+- **指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率；耗时拆解；工具调用数；工具失败数；重复动作。
 - 每次 harness 改动后重跑，指标按模型分组对比。
 
 ```mermaid
@@ -267,8 +268,8 @@ flowchart LR
 **静态能力声明**（裁决 8）：每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；不做网络探测或能力协商。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。显式溢出重试兜底见第 6 节。
 
 - **Provider 边界**：`trait Provider`；保留 OpenAI-compatible 双协议 adapter（Chat Completions / Responses），同一请求对象投影两条 wire 路径，共用请求校验、重试、响应归一化；`finish_reason=length`/`content_filter` 作为未完成响应 fail closed。
-- **usage 记账**：Provider 返回 usage 时记录 input/output/total、cached input、reasoning token 与 cost，供评估指标与诊断使用；缺少原始 usage 时各计数保持 unknown、`usage_present=false` 且 `cost_estimate=null`，不把缺失伪装成零消费。成本按 `(input − cached)×input价 + cached×cache价 + output×output价` 计（input 已含缓存命中，命中部分按 cache 价）。
-- **重试**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/timeout/body 读取错误与 HTTP 429/5xx；backoff 以 50 ms 为基数逐次翻倍，每次等待检查取消。AgentLoop 不对传输层耗尽后的瞬时错误做整轮重试；仅在显式上下文溢出时按第 6 节强制压缩一次并重试同一轮。
+- **usage 记账**：Provider 返回 usage 时记录 input/output/total、cached input、reasoning token 与 usage_present，供评估指标与诊断使用；缺少原始 usage 时保持 `usage_present=false`，不把缺失伪装成可计算的金额。
+- **重试**：传输层单次 complete 最多 6 次 attempt（首次 + 最多 5 次重试），只重试可重试的网络/body 读取错误与 HTTP 408/429/5xx；优先遵守 `retry-after-ms`、`retry-after` 秒值或 IMF-fixdate，缺失或非法时以 500 ms 为基数逐次翻倍并带小幅 jitter，单次等待最多 60 秒，每次等待检查取消。AgentLoop 不对传输层耗尽后的瞬时错误做整轮重试；仅在显式上下文溢出时按第 6 节强制压缩一次并重试同一轮。
 - **思考档位**：每模型显式声明 reasoning 档位；Chat 与 Responses 分别按各自 wire 合同发送对应字段。
 - **失败诊断**：失败投影稳定 typed 分类（阶段、transport 类别、HTTP status、校验码等）+ 脱敏后的真实错误文本（敏感内容降级为 `Internal error`，不包含 API key、endpoint 原始请求/响应）；错误保留真实因果差异，不靠字符串匹配驱动控制流。
 - **配置校验**：配置值在本地信任边界完整校验，fail closed，不静默 trim/纠正；错误不携带原始值；API key 只通过配置引用的环境变量名解析，不进入会话/日志。
@@ -291,7 +292,7 @@ flowchart LR
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、thread/settings、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入并返回 outcome=active，turn 已终态则入 thread 待办、下次 `turn/start` 取走并返回 outcome=queued（Pi 式，不拒绝），未知 turn 返回 not found。`thread/settings` 只持久化非敏感 provider/model/reasoning 选择，当前 turn 使用启动时快照，下一 turn 生效。`server/capabilities` 返回 protocolVersion 和固定 feature list；缺失能力按 typed unsupported 处理。`session/read` 有界解析并返回公开 history items（message/thinking/tool_call/tool_result/turn/settings/usage/compaction），不返回 raw SessionEntry、全文 delta 或 private replay；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/completed、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；start/update 携带 `toolCallId`、`toolName`、`args`，update 另带 `partialResult`，end 携带结构化 `result` 与 `isError`）。每个 started item 恰有一个 terminal；并行工具按完成顺序发布事件，ToolResult 按模型 source order 写入 JSONL。**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、thread/settings、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 仅接受活动 turn：有 turn 在跑实时注入并返回 outcome=active；turn 已终态或不存在时返回 typed not-found 错误，终态后的输入必须通过新的 `turn/start` 发送。`thread/settings` 只持久化非敏感 provider/model/reasoning 选择，当前 turn 使用启动时快照，下一 turn 生效。`server/capabilities` 返回 protocolVersion 和固定 feature list；缺失能力按 typed unsupported 处理。`session/read` 有界解析并返回公开 history items（message/thinking/tool_call/tool_result/turn/settings/usage/compaction），不返回 raw SessionEntry、全文 delta 或 private replay；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/completed、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；start/update 携带 `toolCallId`、`toolName`、`args`，update 另带 `partialResult`，end 携带结构化 `result` 与 `isError`）。每个 started item 恰有一个 terminal；并行工具按完成顺序发布事件，ToolResult 按模型 source order 写入 JSONL。**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出。防御细节：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节），客户端跳过非 JSON 行不终止协议（真正的 response 行仍被解析）；客户端事件投影只保留各事件合同字段，不透传未知 envelope 字段。
 

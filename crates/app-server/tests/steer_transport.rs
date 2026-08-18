@@ -312,7 +312,8 @@ fn scripted_provider_exits_bounded_when_app_server_fails_before_connecting() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
     let provider = ScriptedProvider::start(steer_responses());
     let mut process = spawn(&workspace, &home, &provider.base_url);
     process.initialize();
@@ -337,7 +338,8 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
     let provider = ScriptedProvider::start(interrupt_responses());
     let mut process = spawn(&workspace, &home, &provider.base_url);
     process.initialize();
@@ -398,7 +400,8 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
-    let home = dir.path().join("home");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
     let provider = ScriptedProvider::start(steer_responses());
     let mut process = spawn(&workspace, &home, &provider.base_url);
     process.initialize();
@@ -513,18 +516,17 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
         "followUp must trigger an extra round: {third}"
     );
 
-    // turn 结束后同方法不再 not found：按 M2 裁决入 thread 级待办队列，
-    // 下一次 turn/start 取走（Pi 式 thread 队列）。
+    // turn 结束后不再接受输入；客户端必须显式发送新的 turn/start。
     process.send_request(
         8,
         "turn/steer",
         json!({"turnId": turn_id, "input": [{"type": "text", "text": "late"}]}),
     );
     let late = process.output.recv_id(8, Duration::from_secs(5));
-    assert_eq!(late["result"]["outcome"], "queued");
-    assert_eq!(
-        late["result"]["turn"]["status"], "completed",
-        "late steer must be accepted into the thread queue: {late}"
+    assert_eq!(late["error"]["code"], -32004, "late steer: {late}");
+    assert!(
+        late["result"].is_null(),
+        "late steer must not be acknowledged"
     );
 
     assert!(

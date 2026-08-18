@@ -133,7 +133,10 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             "invalid timeout_ms: must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
         ));
     }
-    let (shell, shell_args) = shell_command(command);
+    let (shell, shell_args) = match shell_command(command) {
+        Ok(command) => command,
+        Err(error) => return error_result(error),
+    };
     #[cfg(windows)]
     handle_inheritance::deny_inherit_std_streams();
     let mut command = Command::new(&shell);
@@ -336,33 +339,41 @@ fn drain<'a>(
     readers_ended
 }
 
-/// 选择执行 shell（对齐 Pi `getShellConfig`）：Windows 优先 Git Bash，其次 PATH 上的
-/// bash，都没有时回退 `cmd /C`（Pi 在无 bash 时直接报错；回退保证工具在任何 Windows
-/// 上都可用）；Unix 优先 `/bin/bash`，否则 `sh -c`。
-fn shell_command(command: &str) -> (String, Vec<String>) {
+/// 选择执行 shell（对齐 Pi `getShellConfig`）：Windows 只接受已发现的 Git Bash 或
+/// PATH 上的 bash；缺失时返回配置错误，绝不以 `cmd /C` 伪装 Bash。Unix 优先 `/bin/bash`，
+/// 否则继续使用 `sh -c` 兼容现有行为。
+fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
     #[cfg(windows)]
     {
-        if let Some(bash) = find_bash_on_windows() {
-            return (bash, vec!["-c".to_string(), command.to_string()]);
-        }
-        (
-            "cmd".to_string(),
-            vec!["/C".to_string(), command.to_string()],
-        )
+        bash_shell_command(command, find_bash_on_windows())
     }
     #[cfg(not(windows))]
     {
         if Path::new("/bin/bash").exists() {
-            return (
+            return Ok((
                 "/bin/bash".to_string(),
                 vec!["-c".to_string(), command.to_string()],
-            );
+            ));
         }
-        (
+        Ok((
             "sh".to_string(),
             vec!["-c".to_string(), command.to_string()],
-        )
+        ))
     }
+}
+
+#[cfg(windows)]
+fn bash_shell_command(
+    command: &str,
+    bash: Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    let Some(bash) = bash else {
+        return Err(
+            "bash executable not found; install Git for Windows or add bash.exe to PATH"
+                .to_string(),
+        );
+    };
+    Ok((bash, vec!["-c".to_string(), command.to_string()]))
 }
 
 #[cfg(windows)]
@@ -683,7 +694,7 @@ mod tests {
             .join("\n");
         let file = dir.path().join("large.txt");
         std::fs::write(&file, content).expect("write fixture");
-        let (shell, _) = shell_command("");
+        let (shell, _) = shell_command("").expect("shell");
         let command = dump_command(&shell, &file);
         let result = run(&command, None);
         assert!(!result.is_error, "unexpected error: {}", result.content);
@@ -709,7 +720,7 @@ mod tests {
 
     #[test]
     fn timeout_terminates_and_marks_error() {
-        let (shell, _) = shell_command("");
+        let (shell, _) = shell_command("").expect("shell");
         let command = if shell.to_lowercase().contains("cmd") {
             "ping -n 10 127.0.0.1"
         } else {
@@ -764,5 +775,13 @@ mod tests {
             "cancellation did not return promptly: {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_bash_reports_configuration_error_instead_of_cmd_fallback() {
+        let error = bash_shell_command("echo should-not-run", None).expect_err("missing bash");
+        assert!(error.contains("bash executable not found"), "{error}");
+        assert!(!error.to_ascii_lowercase().contains("cmd"), "{error}");
     }
 }

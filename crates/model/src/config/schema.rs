@@ -35,7 +35,7 @@ pub(crate) struct ConfiguredModel {
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-    /// 合并后的用户显式能力声明（config.json `capabilities` 块）；models.json 路径为 None。
+    /// 合并后的显式能力声明（config.json 或 models.json `capabilities` 块）。
     pub(crate) capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
@@ -64,23 +64,26 @@ pub(crate) struct ModelsFileProvider {
 pub(crate) struct ModelsFileModel {
     pub(crate) api_protocol: String,
     pub(crate) max_context_tokens: Option<u32>,
-    pub(crate) max_output_tokens: u32,
+    #[serde(default)]
+    pub(crate) max_output_tokens: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     #[serde(default)]
     pub(crate) default_variant: Option<String>,
     #[serde(default)]
     pub(crate) tool_reasoning_history: Option<String>,
-    #[serde(default = "default_true")]
-    pub(crate) supports_developer_role: bool,
-    #[serde(default = "default_true")]
-    pub(crate) supports_tool_choice: bool,
+    #[serde(default)]
+    pub(crate) supports_developer_role: Option<bool>,
+    #[serde(default)]
+    pub(crate) supports_tool_choice: Option<bool>,
     #[serde(default)]
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     #[serde(default)]
     pub(crate) requires_assistant_content_for_tool_calls: bool,
     #[serde(default)]
     pub(crate) thinking_wire_format: Option<String>,
+    #[serde(default)]
+    pub(crate) capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -134,10 +137,6 @@ where
     }
 
     deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
-}
-
-pub(crate) fn default_true() -> bool {
-    true
 }
 
 pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), ProviderError> {

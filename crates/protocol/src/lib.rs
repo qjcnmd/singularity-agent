@@ -775,7 +775,7 @@ pub enum InputItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 向活动 turn 注入输入，或将输入排入已终态 turn 所属 thread 的下一轮队列。
+/// 向仍在运行的 turn 注入输入；终态后的用户输入必须通过新的 turn/start 发送。
 /// 未知 turn id 返回 not found；turn/steer 与 turn/followUp 共用此参数。
 pub struct TurnInjectionParams {
     pub turn_id: String,
@@ -808,9 +808,7 @@ pub struct TurnModelUsage {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
-    /// 各轮均提供时才有成本估算；否则为 None。
-    pub cost_estimate: Option<f64>,
-    /// 原始 usage 对象是否存在；缺失时各计数为 0（不伪装成零消费）。
+    /// 原始 usage 对象是否存在；缺失时各计数保持既有 unknown 表示。
     /// 旧服务端数据无此字段时按存在解释。
     #[serde(default = "default_usage_present_protocol")]
     pub usage_present: bool,
@@ -891,8 +889,6 @@ pub struct AgentCapabilityResult {
 pub enum TurnInjectionOutcome {
     /// 输入已注入仍在执行的 turn。
     Active,
-    /// 输入已排入 thread 的下一轮队列。
-    Queued,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

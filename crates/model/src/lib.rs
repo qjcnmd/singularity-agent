@@ -56,7 +56,8 @@ const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
 const MAX_PROVIDER_ATTEMPTS: u32 = 6;
-const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
+const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 500;
+const PROVIDER_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 /// Provider boundary code used when a protocol has no normalized text stream.
 pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
@@ -78,9 +79,6 @@ mod contract;
 mod openai;
 mod transport;
 
-pub use builtin_models::{
-    ModelCost, builtin_model_cost, estimate_cost, estimate_cost_peak, is_peak_hour_utc8,
-};
 pub use config::{import_env_to_user_config, read_user_model_catalog, resolve_provider_config};
 pub use contract::{
     is_strict_tool_schema_compatible, validate_model_request,
@@ -595,7 +593,7 @@ pub struct ProviderProtocolContract {
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
-    /// 单次请求可携带的最大工具调用数（并行上限；执行侧仍逐个顺序完成）。
+    /// 单次请求与本地工具工作窗口的最大并行调用数。
     pub max_parallel_tool_calls: u32,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
@@ -623,10 +621,10 @@ impl Default for ProviderProtocolContract {
 /// 模型条目的显式能力声明（旧 probe 时代 config.json 的 `capabilities` 块）。
 ///
 /// 全部字段可选：顶层配置字段优先，其次本声明，最后 `ProviderProtocolContract`
-/// 默认值。`supports_reasoning`/`max_parallel_tool_calls` 只解析接受，当前
-/// 契约没有对应消费点。
+/// 默认值。`supports_reasoning` 只解析接受；`max_parallel_tool_calls` 同时约束
+/// 请求声明与 Agent 本地工具工作窗口。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ProviderCapabilityDeclaration {
     pub supports_tools: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
@@ -744,7 +742,7 @@ pub struct ProviderConfigurationStatus {
     pub blocker: Option<ModelBlockerKind>,
 }
 
-/// 从模型提供方完成中累积的令牌与成本计数器。
+/// 从模型提供方完成中累积的真实令牌与缓存计数器。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -752,9 +750,8 @@ pub struct ModelUsage {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
-    pub cost_estimate: Option<f64>,
-    /// 原始 usage 对象是否存在；缺失时各计数为 0 且 `cost_estimate` 必须为
-    /// None——不把"缺失"伪装成"零消费"。旧序列化数据（无此字段）按存在处理。
+    /// 原始 usage 对象是否存在；缺失时各计数保持 unknown 的既有表示，
+    /// 不把缺失伪装成零消费或其它可计算金额。
     #[serde(default = "default_usage_present")]
     pub usage_present: bool,
 }

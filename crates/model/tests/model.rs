@@ -10,10 +10,10 @@ use singularity_model::{
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
     ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
     ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, builtin_model_cost,
-    chat_completions_endpoint, classify_model_error, estimate_cost_peak, is_peak_hour_utc8,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
-    validate_model_response, validate_model_turn_response, validate_provider_config,
+    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    classify_model_error, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
+    validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -205,6 +205,34 @@ fn sequence_response_server(
             let (_, _, _) = read_provider_request(&mut reader);
             tx.send(attempt + 1).expect("send provider attempt");
             write_provider_response(&mut stream, status_line, body, true);
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn sequence_response_server_with_headers(
+    responses: Vec<(&'static str, &'static str, &'static str)>,
+) -> (String, Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind header sequence provider");
+    let addr = listener
+        .local_addr()
+        .expect("header sequence provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for (attempt, (status_line, body, headers)) in responses.into_iter().enumerate() {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept header sequence provider request");
+            let mut reader =
+                BufReader::new(stream.try_clone().expect("clone header sequence stream"));
+            let (_, _, _) = read_provider_request(&mut reader);
+            tx.send(attempt + 1).expect("send header provider attempt");
+            write!(
+                stream,
+                "{status_line}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write header sequence provider response");
         }
     });
     (format!("http://{addr}"), rx)
@@ -1900,6 +1928,41 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
 }
 
 #[test]
+fn openai_provider_honors_retry_after_ms_before_retrying() {
+    let success_body = r#"{
+        "id": "resp_retry_header",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }]
+    }"#;
+    let (base_url, attempts) = sequence_response_server_with_headers(vec![
+        (
+            "HTTP/1.1 429 Too Many Requests",
+            "{}",
+            "retry-after-ms: 200\r\nretry-after: 9\r\n",
+        ),
+        ("HTTP/1.1 200 OK", success_body, ""),
+    ]);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_retry_header",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response after header-directed retry");
+    let metadata = response
+        .provider_attempt_metadata
+        .expect("attempt metadata");
+
+    assert_eq!(metadata.retry_count, 1);
+    assert_eq!(metadata.occurrences[0].retry_backoff_ms, Some(200));
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2]);
+}
+
+#[test]
 fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
     let success_body = r#"{
         "id": "resp_observed_retry",
@@ -2516,7 +2579,7 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         Some("provider_does_not_support_parallel_tool_calls")
     );
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
-    // 响应超限已降级为 warning（agent loop 逐个顺序执行全部工具调用），
+    // 响应超限已降级为 warning（agent loop 按声明上限分窗口执行全部工具调用），
     // 不再作为致命校验；parallel 未声明时 parallel 拒绝仍是唯一致命校验。
     assert_eq!(
         error.validation_errors,
@@ -3400,84 +3463,8 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
 }
 
 #[test]
-fn catalog_builtin_cost_estimate_flows_into_turn_usage() {
-    let (base_url, request_body) = captured_request_server(
-        "HTTP/1.1 200 OK",
-        r#"{"id":"done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000000,"completion_tokens":1000000,"total_tokens":2000000,"prompt_tokens_details":{"cached_tokens":1000000}}}"#,
-    );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "opencode-go/deepseek-v4-flash",
-            "providers": {
-                "opencode-go": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "OPENCODE_KEY",
-                    "models": {
-                        "deepseek-v4-flash": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000
-                        }
-                    }
-                }
-            }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "OPENCODE_KEY" => Some("sk-secret-value".to_string()),
-            _ => None,
-        },
-        None,
-    );
-    let provider = snapshot
-        .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
-        .expect("selected builtin provider");
-    let response = provider
-        .complete(
-            &ModelTurnRequest::new(
-                "builtin_cost_request",
-                vec![ModelMessage::text(ModelRole::User, "hello")],
-            ),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("Chat completion with usage");
-    request_body
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured provider request");
-    let usage = response.usage;
-    assert_eq!(usage.input_tokens, 1_000_000);
-    assert_eq!(usage.output_tokens, 1_000_000);
-    assert_eq!(usage.cached_input_tokens, 1_000_000);
-    let cost = usage.cost_estimate.expect("builtin cost estimate");
-    // 8/17 起为峰谷双价，最终估算依赖运行时刻所属的北京高峰/闲时段；与 provider 同一
-    // 逻辑重算期望值，使断言与运行时刻无关且精确。
-    let builtin = builtin_model_cost("opencode-go", "deepseek-v4-flash").expect("builtin price");
-    let expected = estimate_cost_peak(
-        1_000_000,
-        1_000_000,
-        1_000_000,
-        &builtin,
-        is_peak_hour_utc8(std::time::SystemTime::now()),
-    );
-    assert!(
-        (cost - expected).abs() < 1e-9,
-        "cost estimate was {cost} expected {expected}"
-    );
-}
-
-#[test]
-fn missing_provider_usage_is_never_misrepresented_as_zero_cost() {
-    // 内置价格模型但响应缺 usage：不得伪装成零消费（usage_present=false、
-    // cost_estimate=None），也不再触发上限校验错误。
+fn missing_provider_usage_remains_unknown() {
+    // 响应缺 usage 时保留 usage_present=false，也不触发上限校验错误。
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",
         r#"{"id":"no_usage_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
@@ -3532,7 +3519,6 @@ fn missing_provider_usage_is_never_misrepresented_as_zero_cost() {
         .expect("captured provider request");
     let usage = response.usage;
     assert!(!usage.usage_present, "missing usage must be marked absent");
-    assert!(usage.cost_estimate.is_none(), "no zero-cost masquerade");
     let validation = response.validation.expect("validation present");
     assert!(
         !validation

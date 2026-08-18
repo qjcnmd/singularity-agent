@@ -10,7 +10,7 @@ mod events;
 mod lifecycle;
 pub mod paths;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -57,7 +57,6 @@ const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
-const MAX_TERMINAL_TURN_REFERENCES: usize = 256;
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
@@ -258,7 +257,6 @@ pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage
         total_tokens: usage.total_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
-        cost_estimate: usage.cost_estimate,
         usage_present: usage.usage_present,
     }
 }
@@ -327,15 +325,11 @@ pub struct AppServer {
     shutdown_requested: bool,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// turn id -> thread 与最后已知生命周期（终态 steer 需要返回真实状态）。
+    /// 当前活动 turn id -> thread。终态后移除，避免把输入误认为已排队。
     turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
     /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    /// turn 已终态后到达的 steer 输入按 thread（session）排队，下一次 turn/start 取走
-    /// （Pi 式 thread 级队列；M2 裁决方案 B）。
-    thread_steer_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
-    thread_follow_up_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     /// 已提交 turn 的运行时 usage 缓存；权威副本是同一 session JSONL 的 usage metadata。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
@@ -349,8 +343,6 @@ pub struct AppServer {
 #[derive(Debug, Clone)]
 struct TurnReference {
     thread_id: String,
-    status: TurnStatus,
-    agent_loop_status: String,
 }
 
 #[cfg(test)]
@@ -397,8 +389,6 @@ impl Drop for ActiveTurnGuard {
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
         }
-        // turn_threads 保留 turn→thread 历史映射（M2：终态后 steer/followUp 仍
-        // 需要按 turn_id 解析 thread 入待办队列）；活跃判定只看 active_turns。
         if let Ok(mut steer_handles) = self.steer_handles.lock() {
             steer_handles.remove(&self.turn_id);
         }
@@ -408,16 +398,8 @@ impl Drop for ActiveTurnGuard {
         if let Ok(mut usage_by_turn) = self.usage_by_turn.lock() {
             usage_by_turn.remove(&self.turn_id);
         }
-        if let Ok(mut turn_threads) = self.turn_threads.lock()
-            && turn_threads.len() > MAX_TERMINAL_TURN_REFERENCES
-            && let Some(candidate) = turn_threads
-                .iter()
-                .find(|(turn_id, reference)| {
-                    *turn_id != &self.turn_id && reference.status != TurnStatus::Running
-                })
-                .map(|(turn_id, _)| turn_id.clone())
-        {
-            turn_threads.remove(&candidate);
+        if let Ok(mut turn_threads) = self.turn_threads.lock() {
+            turn_threads.remove(&self.turn_id);
         }
     }
 }
@@ -488,17 +470,16 @@ pub fn thread_from_record(record: &SessionRecord) -> Thread {
     }
 }
 
-/// 从 JSONL rollout 重建 SQLite 的轻量索引投影。
+/// 从 JSONL rollout 的 header 重建 SQLite 的轻量索引投影。
 ///
-/// JSONL 是唯一事实源：每个可解析 rollout 先完成 torn-tail/metadata repair，
-/// 再通过 store 的 upsert seam 写入索引。扫描成功后才清理指向已不存在 rollout
-/// 的旧索引行，避免半途失败把 SQLite 当成事实源。
-pub fn repair_session_index_from_jsonl(
+/// 启动发现只读取每个文件的首行，不解析正文、不追加 repair 条目，也不让单个
+/// 损坏文件阻断其它可用会话。JSONL 仍是唯一事实源；目标会话真正打开时再做
+/// interrupted/orphan repair 并刷新该会话的 SQLite 投影。
+pub fn rebuild_session_index_from_jsonl(
     store: &SessionStore,
     sessions_dir: &Path,
-) -> AppServerResult<usize> {
+) -> AppServerResult<()> {
     let mut rebuilt_ids = HashSet::new();
-    let mut repaired = 0usize;
     let entries = std::fs::read_dir(sessions_dir)
         .map_err(|error| AppServerError::Workspace(format!("failed to read sessions: {error}")))?;
     for entry in entries {
@@ -509,78 +490,52 @@ pub fn repair_session_index_from_jsonl(
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        // Legacy migration deliberately preserves the source bytes. Do not let an
-        // index-repair scan trigger SessionManager's v1-v3 rewrite on an already
-        // indexed rollout; later opens still perform the normal compatibility
-        // migration when the session is actually used.
-        if let Some((legacy_id, version)) = legacy_session_header(&path)?
-            && version < singularity_agent::session::CURRENT_SESSION_VERSION
-            && store.get_session(&legacy_id).is_ok()
-        {
-            rebuilt_ids.insert(legacy_id);
+        let Some(header) = (match discover_session_header(&path) {
+            Ok(header) => header,
+            Err(error) => {
+                eprintln!(
+                    "skipping unreadable session during discovery {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        }) else {
             continue;
-        }
-        let mut session = SessionManager::open_existing(&path)?;
-        let repaired_turns = session.repair_interrupted_turns()?;
-        let existing = store.get_session(session.session_id()).ok();
-        let metadata = session.metadata_entries();
-        let model = metadata
-            .iter()
-            .rev()
-            .find(|entry| entry.kind() == SessionMetadataKind::ThreadSettings)
-            .and_then(|entry| {
-                let model = entry.field_string("model")?;
-                let provider = entry.field_string("provider").unwrap_or_default();
-                let selector = if provider.is_empty() {
-                    model.to_string()
-                } else {
-                    format!("{provider}/{model}")
-                };
-                Some(match entry.field_string("reasoning") {
-                    Some(reasoning) if !reasoning.is_empty() => {
-                        format!("{selector}#{reasoning}")
-                    }
-                    _ => selector,
-                })
-            })
-            .or_else(|| existing.as_ref().and_then(|record| record.model.clone()));
-        let status = metadata.iter().rev().find_map(|entry| {
-            if !entry.kind().matches_turn_terminal() {
-                return None;
-            }
-            match entry.kind() {
-                SessionMetadataKind::TurnCompleted => Some(SessionStatus::Completed),
-                SessionMetadataKind::TurnFailed => Some(SessionStatus::Failed),
-                SessionMetadataKind::TurnInterrupted => Some(SessionStatus::Interrupted),
-                _ => None,
-            }
-        });
-        let token_usage = metadata
-            .iter()
-            .rev()
-            .find(|entry| entry.kind() == SessionMetadataKind::Usage)
-            .and_then(|entry| entry.field("usage").cloned())
-            .or_else(|| existing.as_ref().map(|record| record.token_usage.clone()))
-            .unwrap_or_else(|| json!({}));
-        let created_at = existing
-            .as_ref()
-            .map(|record| record.created_at.clone())
-            .unwrap_or_else(now_iso);
-        let status = status.or_else(|| existing.as_ref().and_then(|record| record.status));
+        };
+        let existing = store.get_session(&header.session_id).ok();
+        let cwd = header
+            .cwd
+            .or_else(|| existing.as_ref().map(|record| record.cwd.clone()))
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .to_string_lossy()
+                    .to_string()
+            });
         let record = SessionRecord {
-            session_id: session.session_id().to_string(),
+            session_id: header.session_id.clone(),
             rollout_path: path.to_string_lossy().to_string(),
-            cwd: session.cwd().to_string_lossy().to_string(),
+            cwd,
             title: existing.as_ref().and_then(|record| record.title.clone()),
-            model,
-            status,
-            created_at,
-            updated_at: now_iso(),
-            token_usage,
+            model: existing.as_ref().and_then(|record| record.model.clone()),
+            // Incomplete active turns remain active in the projection until the
+            // corresponding session is explicitly opened and repaired.
+            status: existing.as_ref().and_then(|record| record.status),
+            created_at: header
+                .timestamp
+                .or_else(|| existing.as_ref().map(|record| record.created_at.clone()))
+                .unwrap_or_else(now_iso),
+            updated_at: existing
+                .as_ref()
+                .map(|record| record.updated_at.clone())
+                .unwrap_or_else(now_iso),
+            token_usage: existing
+                .as_ref()
+                .map(|record| record.token_usage.clone())
+                .unwrap_or_else(|| json!({})),
         };
         store.upsert_session(&record)?;
-        rebuilt_ids.insert(record.session_id);
-        repaired += repaired_turns;
+        rebuilt_ids.insert(header.session_id);
     }
     // 只有完整扫描和所有 upsert 都成功后，才移除悬空索引行。
     for record in store.list_sessions()? {
@@ -590,7 +545,72 @@ pub fn repair_session_index_from_jsonl(
             store.delete_session(&record.session_id)?;
         }
     }
-    Ok(repaired)
+    Ok(())
+}
+
+struct DiscoveredSessionHeader {
+    session_id: String,
+    cwd: Option<String>,
+    timestamp: Option<String>,
+}
+
+fn refresh_session_index_from_open_session(
+    store: &SessionStore,
+    session: &SessionManager,
+) -> AppServerResult<SessionRecord> {
+    let existing = store.get_session(session.session_id()).ok();
+    let metadata = session.metadata_entries();
+    let model = metadata
+        .iter()
+        .rev()
+        .find(|entry| entry.kind() == SessionMetadataKind::ThreadSettings)
+        .and_then(|entry| {
+            let model = entry.field_string("model")?;
+            let provider = entry.field_string("provider").unwrap_or_default();
+            let selector = if provider.is_empty() {
+                model.to_string()
+            } else {
+                format!("{provider}/{model}")
+            };
+            Some(match entry.field_string("reasoning") {
+                Some(reasoning) if !reasoning.is_empty() => format!("{selector}#{reasoning}"),
+                _ => selector,
+            })
+        })
+        .or_else(|| existing.as_ref().and_then(|record| record.model.clone()));
+    let status = metadata
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.kind() {
+            SessionMetadataKind::TurnCompleted => Some(SessionStatus::Completed),
+            SessionMetadataKind::TurnFailed => Some(SessionStatus::Failed),
+            SessionMetadataKind::TurnInterrupted => Some(SessionStatus::Interrupted),
+            _ => None,
+        })
+        .or_else(|| existing.as_ref().and_then(|record| record.status));
+    let token_usage = metadata
+        .iter()
+        .rev()
+        .find(|entry| entry.kind() == SessionMetadataKind::Usage)
+        .and_then(|entry| entry.field("usage").cloned())
+        .or_else(|| existing.as_ref().map(|record| record.token_usage.clone()))
+        .unwrap_or_else(|| json!({}));
+    let record = SessionRecord {
+        session_id: session.session_id().to_string(),
+        rollout_path: session.path().to_string_lossy().to_string(),
+        cwd: session.cwd().to_string_lossy().to_string(),
+        title: existing.as_ref().and_then(|record| record.title.clone()),
+        model,
+        status,
+        created_at: existing
+            .as_ref()
+            .map(|record| record.created_at.clone())
+            .unwrap_or_else(now_iso),
+        updated_at: now_iso(),
+        token_usage,
+    };
+    store.upsert_session(&record)?;
+    Ok(record)
 }
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
@@ -713,7 +733,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     }
 }
 
-fn legacy_session_header(path: &Path) -> AppServerResult<Option<(String, u32)>> {
+fn discover_session_header(path: &Path) -> AppServerResult<Option<DiscoveredSessionHeader>> {
     let file = std::fs::File::open(path)
         .map_err(|error| AppServerError::Session(SessionError::Io(error)))?;
     let mut reader = BufReader::new(file);
@@ -744,12 +764,29 @@ fn legacy_session_header(path: &Path) -> AppServerResult<Option<(String, u32)>> 
             "session header id is missing".to_string(),
         )));
     };
-    let version = value
-        .get("version")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(singularity_agent::session::CURRENT_SESSION_VERSION);
-    Ok(Some((id.to_string(), version)))
+    if id.trim().is_empty() {
+        return Err(AppServerError::Session(SessionError::InvalidHeader(
+            "session header id is empty".to_string(),
+        )));
+    }
+    let cwd = match value.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cwd)) => Some(cwd.clone()),
+        Some(_) => {
+            return Err(AppServerError::Session(SessionError::InvalidHeader(
+                "session header cwd must be a string".to_string(),
+            )));
+        }
+    };
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(Some(DiscoveredSessionHeader {
+        session_id: id.to_string(),
+        cwd,
+        timestamp,
+    }))
 }
 
 /// 将持久化的 `InputItem` 数组投影为拼接文本。
@@ -897,8 +934,6 @@ impl AppServer {
             turn_threads: Arc::new(Mutex::new(HashMap::new())),
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
-            thread_steer_pending: Arc::new(Mutex::new(HashMap::new())),
-            thread_follow_up_pending: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1013,8 +1048,6 @@ impl AppServer {
             turn_threads: Arc::clone(&self.turn_threads),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
-            thread_steer_pending: Arc::clone(&self.thread_steer_pending),
-            thread_follow_up_pending: Arc::clone(&self.thread_follow_up_pending),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
             #[cfg(test)]
@@ -1050,8 +1083,6 @@ impl AppServer {
                 turn_id.to_string(),
                 TurnReference {
                     thread_id: thread_id.to_string(),
-                    status: TurnStatus::Running,
-                    agent_loop_status: AgentStatus::Running.as_str().to_string(),
                 },
             );
         let guard = ActiveTurnGuard {
@@ -1120,6 +1151,21 @@ impl AppServer {
                 record.session_id
             ))));
         }
+        Ok(session)
+    }
+
+    pub(crate) fn open_and_repair_session_for_thread(
+        &self,
+        thread: &Thread,
+    ) -> AppServerResult<SessionManager> {
+        let mut session = self.open_session_for_thread(thread)?;
+        session
+            .repair_interrupted_turns()
+            .map_err(AppServerError::Session)?;
+        session
+            .repair_orphaned_tool_calls()
+            .map_err(AppServerError::Session)?;
+        refresh_session_index_from_open_session(&self.store, &session)?;
         Ok(session)
     }
 
@@ -1226,8 +1272,7 @@ impl AppServer {
     }
 
     fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        // turn_threads 保留历史映射（M2 队列寻址），存活判定只看仍持有取消
-        // 令牌的 turn（active_turns ∩ turn_threads）。
+        // 活跃判定同时要求取消令牌和当前 turn→thread 映射存在。
         let active = self.active_turns.lock();
         let threads = self.turn_threads.lock();
         match (active, threads) {
@@ -1279,65 +1324,15 @@ impl AppServer {
         });
     }
 
-    pub(crate) fn remember_turn_status(
-        &self,
-        turn_id: &str,
-        status: TurnStatus,
-        agent_loop_status: &str,
-    ) {
-        let _ = self.turn_threads.lock().map(|mut references| {
-            if let Some(reference) = references.get_mut(turn_id) {
-                reference.status = status;
-                reference.agent_loop_status = agent_loop_status.to_string();
-            }
-        });
-    }
-
-    /// 关闭已结束 turn 的实时注入窗口，并把窗口关闭前已到达但尚未被
-    /// AgentLoop drain 的输入转移到对应 thread 的下一轮队列。句柄表锁与
-    /// 注入路径保持同一锁顺序，避免 turn 结束竞态丢失输入。
-    pub(crate) fn close_turn_inputs(
-        &self,
-        turn_id: &str,
-        thread_id: &str,
-        status: TurnStatus,
-        agent_loop_status: &str,
-    ) {
-        let Ok(mut references) = self.turn_threads.lock() else {
-            return;
-        };
-        let Some(reference) = references.get_mut(turn_id) else {
-            return;
-        };
-        reference.status = status;
-        reference.agent_loop_status = agent_loop_status.to_string();
-        for (handles, pending) in [
-            (&self.steer_handles, &self.thread_steer_pending),
-            (&self.follow_up_handles, &self.thread_follow_up_pending),
-        ] {
-            let handle = handles
-                .lock()
-                .ok()
-                .and_then(|mut entries| entries.remove(turn_id));
-            let Some(handle) = handle else {
-                continue;
-            };
-            let residual = handle
-                .lock()
-                .ok()
-                .map(|mut queue| std::mem::take(&mut *queue))
-                .unwrap_or_default();
-            if residual.is_empty() {
-                continue;
-            }
-            if let Ok(mut queues) = pending.lock() {
-                queues
-                    .entry(thread_id.to_string())
-                    .or_default()
-                    .extend(residual);
-            }
+    /// 关闭已结束 turn 的实时注入窗口；活动映射保留到 guard drop，
+    /// 让并发 session/delete 仍能观察到终态化 worker。终态后的输入必须通过新的 turn/start。
+    pub(crate) fn close_turn_inputs(&self, turn_id: &str) {
+        if let Ok(mut handles) = self.steer_handles.lock() {
+            handles.remove(turn_id);
         }
-        drop(references);
+        if let Ok(mut handles) = self.follow_up_handles.lock() {
+            handles.remove(turn_id);
+        }
     }
 }
 
