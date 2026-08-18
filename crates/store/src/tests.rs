@@ -80,6 +80,42 @@ fn session_index_crud_round_trips_metadata() {
 }
 
 #[test]
+fn session_index_upsert_rebuilds_stale_projection() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("index.sqlite3")).expect("open store");
+    let session_id = "a7a1f0a1-65b0-4b78-b0e3-9c78d334aa12";
+    let record = SessionRecord {
+        session_id: session_id.to_string(),
+        rollout_path: dir.path().join("first.jsonl").to_string_lossy().to_string(),
+        cwd: dir.path().to_string_lossy().to_string(),
+        title: None,
+        model: Some("provider/old".to_string()),
+        status: Some(SessionStatus::Active),
+        created_at: "2026-08-15T00:00:00Z".to_string(),
+        updated_at: "2026-08-15T00:00:00Z".to_string(),
+        token_usage: serde_json::json!({"input_tokens": 1}),
+    };
+    store.upsert_session(&record).expect("insert projection");
+    let repaired = SessionRecord {
+        rollout_path: dir
+            .path()
+            .join("second.jsonl")
+            .to_string_lossy()
+            .to_string(),
+        model: Some("provider/new".to_string()),
+        status: Some(SessionStatus::Interrupted),
+        updated_at: "2026-08-15T00:02:00Z".to_string(),
+        token_usage: serde_json::json!({"input_tokens": 8, "output_tokens": 2}),
+        ..record
+    };
+    store.upsert_session(&repaired).expect("repair projection");
+    assert_eq!(
+        store.get_session(session_id).expect("read repaired"),
+        repaired
+    );
+}
+
+#[test]
 fn trusted_reopen_keeps_the_same_file_identity() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("index.sqlite3")).expect("open store");

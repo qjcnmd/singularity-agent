@@ -53,6 +53,9 @@ impl AppServer {
         let turn_id = turn_id();
         let (cancellation, _active_turn) = self.activate_turn(&turn_id, &record.session_id)?;
         let title = title_from_input(&input_text);
+        // JSONL is the authoritative lifecycle source: commit turn_started before
+        // projecting Active into SQLite or publishing turn/started.
+        self.append_turn_started_metadata(&record.session_id, &turn_id)?;
         let mut metadata = SessionMetadataUpdate {
             status: Some(SessionStatus::Active),
             ..SessionMetadataUpdate::default()
@@ -112,7 +115,7 @@ impl AppServer {
                 return self.finish_agent_failure(
                     &record,
                     &turn_id,
-                    &assistant_events,
+                    &mut assistant_events,
                     &error,
                     &status.model_usage,
                     &mut emit,
@@ -122,7 +125,7 @@ impl AppServer {
                 return self.finish_agent_failure(
                     &record,
                     &turn_id,
-                    &assistant_events,
+                    &mut assistant_events,
                     &error,
                     &ModelUsage::default(),
                     &mut emit,
@@ -138,6 +141,7 @@ impl AppServer {
         };
         if let Err(error) = self.update_session_status_and_usage(
             &record.session_id,
+            Some(&turn_id),
             session_status_for_agent(&status.status),
             &status.model_usage,
         ) {
@@ -149,12 +153,12 @@ impl AppServer {
             // durable terminal metadata is authoritative. If the intended status
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
-            let _ = self.persist_failure_state(&record.session_id, &status.model_usage);
+            let _ = self.persist_failure_state(&record.session_id, &turn_id, &status.model_usage);
             self.remember_turn_status(&turn_id, TurnStatus::Failed, AgentStatus::Failed.as_str());
             let _event_failure = self.emit_failure_terminal_events(
                 &turn_id,
                 &record.session_id,
-                &assistant_events,
+                &mut assistant_events,
                 &failure,
                 &mut emit,
             );
@@ -173,6 +177,53 @@ impl AppServer {
             terminal_turn.status,
             &terminal_turn.agent_loop_status,
         );
+        // Cancellation can interrupt a side-effecting tool after its item has
+        // started but before the tool callback emits an execution-end event.
+        // Close every such item before the turn terminal event; never leave a
+        // client with an unpaired item/started notification.
+        for tool_call_id in assistant_events.open_tool_items() {
+            match self.realtime_tool_terminal_event(&mut assistant_events, &tool_call_id, true) {
+                Ok(Some(event)) => emit(event),
+                Ok(None) => {}
+                Err(error) => {
+                    let failure =
+                        turn_failure_from_error(&error, TurnFailureStage::EventNotification);
+                    let _ = self.emit_failure_terminal_events(
+                        &turn_id,
+                        &record.session_id,
+                        &mut assistant_events,
+                        &failure,
+                        &mut emit,
+                    );
+                    return Err(AppServerError::TurnTerminalization {
+                        stage: failure.stage,
+                        cause: failure.cause,
+                        failure: TurnTerminalizationFailure::EventNotification,
+                        original: failure.original,
+                    });
+                }
+            }
+        }
+        match self.realtime_item_completed_event(&mut assistant_events) {
+            Ok(Some(event)) => emit(event),
+            Ok(None) => {}
+            Err(error) => {
+                let failure = turn_failure_from_error(&error, TurnFailureStage::EventNotification);
+                let _ = self.emit_failure_terminal_events(
+                    &turn_id,
+                    &record.session_id,
+                    &mut assistant_events,
+                    &failure,
+                    &mut emit,
+                );
+                return Err(AppServerError::TurnTerminalization {
+                    stage: failure.stage,
+                    cause: failure.cause,
+                    failure: TurnTerminalizationFailure::EventNotification,
+                    original: failure.original,
+                });
+            }
+        }
         let terminal_turn = self.turn_with_usage(terminal_turn);
         let completion = self.event_notification(AppEvent::turn_completed(&terminal_turn));
         match completion {
@@ -185,7 +236,7 @@ impl AppServer {
                 let _ = self.emit_failure_terminal_events(
                     &turn_id,
                     &record.session_id,
-                    &assistant_events,
+                    &mut assistant_events,
                     &failure,
                     &mut emit,
                 );
@@ -215,13 +266,14 @@ impl AppServer {
         &self,
         record: &SessionRecord,
         turn_id: &str,
-        assistant_events: &AssistantItemEventState,
+        assistant_events: &mut AssistantItemEventState,
         error: &AppServerError,
         usage: &ModelUsage,
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<()> {
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
-        let (metadata_error, _durable) = self.persist_failure_state(&record.session_id, usage);
+        let (metadata_error, _durable) =
+            self.persist_failure_state(&record.session_id, turn_id, usage);
         self.remember_turn_status(turn_id, TurnStatus::Failed, AgentStatus::Failed.as_str());
         let event_failure = self.emit_failure_terminal_events(
             turn_id,
@@ -258,32 +310,34 @@ impl AppServer {
     fn persist_failure_state(
         &self,
         session_id: &str,
+        turn_id: &str,
         usage: &ModelUsage,
     ) -> (Option<String>, bool) {
-        let first_error =
-            match self.update_session_status_and_usage(session_id, SessionStatus::Failed, usage) {
-                Ok(_) => return (None, true),
-                Err(error) => error.to_string(),
-            };
+        let first_error = match self.update_session_status_and_usage(
+            session_id,
+            Some(turn_id),
+            SessionStatus::Failed,
+            usage,
+        ) {
+            Ok(_) => return (None, true),
+            Err(error) => error.to_string(),
+        };
         if self
-            .update_session_status_and_usage(session_id, SessionStatus::Failed, usage)
+            .update_session_status_and_usage(
+                session_id,
+                Some(turn_id),
+                SessionStatus::Failed,
+                usage,
+            )
             .is_ok()
         {
             return (Some(first_error), true);
         }
-        let token_usage = match serde_json::to_value(usage_to_wire(usage)) {
-            Ok(value) => value,
-            Err(_) => return (Some(first_error), false),
-        };
-        let fallback = self.store.update_session(
-            session_id,
-            SessionMetadataUpdate {
-                status: Some(SessionStatus::Interrupted),
-                token_usage: Some(&token_usage),
-                ..SessionMetadataUpdate::default()
-            },
-        );
-        (Some(first_error), fallback.is_ok())
+        // Do not write a terminal SQLite projection without its JSONL fact. The
+        // next reopen will repair an active turn from turn_started, while an
+        // index-only fallback would violate the JSONL-first ordering contract.
+        let _ = usage;
+        (Some(first_error), false)
     }
 
     /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个事件，
@@ -292,7 +346,7 @@ impl AppServer {
         &self,
         turn_id: &str,
         thread_id: &str,
-        assistant_events: &AssistantItemEventState,
+        assistant_events: &mut AssistantItemEventState,
         failure: &TurnFailure,
         emit: &mut impl FnMut(Value),
     ) -> Option<TurnFailure> {
@@ -307,6 +361,19 @@ impl AppServer {
                         TurnFailureStage::EventNotification,
                     ));
                 }
+            }
+        }
+        for tool_call_id in assistant_events.open_tool_items() {
+            match self.realtime_tool_terminal_event(assistant_events, &tool_call_id, true) {
+                Ok(Some(event)) => emit(event),
+                Ok(None) => {}
+                Err(error) if first_failure.is_none() => {
+                    first_failure = Some(turn_failure_from_error(
+                        &error,
+                        TurnFailureStage::EventNotification,
+                    ));
+                }
+                Err(_) => {}
             }
         }
         let message = failure
@@ -385,13 +452,14 @@ impl AppServer {
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .insert(turn_id.to_string(), follow_up_handle);
         let callback_error = RefCell::new(None);
+        let assistant_events_cell = RefCell::new(assistant_events);
         // 回调闭包共享 emit 的可变借用：RefCell 包装（单线程 turn 内串行使用）。
         let emit_cell = RefCell::new(emit);
         let mut on_message_update = |delta: &str| {
             if callback_error.borrow().is_some() {
                 return;
             }
-            match self.project_assistant_delta(assistant_events, delta) {
+            match self.project_assistant_delta(&mut assistant_events_cell.borrow_mut(), delta) {
                 Ok(messages) => emit_messages(&mut *emit_cell.borrow_mut(), messages),
                 Err(error) => *callback_error.borrow_mut() = Some(error),
             }
@@ -399,6 +467,18 @@ impl AppServer {
         let mut on_tool_execution_start = |tool_name: &str, tool_call_id: &str, args: &Value| {
             if callback_error.borrow().is_some() {
                 return;
+            }
+            if assistant_events_cell
+                .borrow_mut()
+                .start_tool_item(tool_call_id)
+            {
+                match self.event_notification(AppEvent::item_started(tool_call_id)) {
+                    Ok(event) => emit_cell.borrow_mut()(event),
+                    Err(error) => {
+                        *callback_error.borrow_mut() = Some(error);
+                        return;
+                    }
+                }
             }
             match self.event_notification(AppEvent::tool_execution_start(
                 tool_call_id,
@@ -436,6 +516,18 @@ impl AppServer {
                     execution.is_error,
                 )) {
                     Ok(event) => emit_cell.borrow_mut()(event),
+                    Err(error) => *callback_error.borrow_mut() = Some(error),
+                }
+                if callback_error.borrow().is_some() {
+                    return;
+                }
+                match self.realtime_tool_terminal_event(
+                    &mut assistant_events_cell.borrow_mut(),
+                    tool_call_id,
+                    execution.is_error,
+                ) {
+                    Ok(Some(event)) => emit_cell.borrow_mut()(event),
+                    Ok(None) => {}
                     Err(error) => *callback_error.borrow_mut() = Some(error),
                 }
             };

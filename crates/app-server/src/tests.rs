@@ -5,6 +5,7 @@ use singularity_agent::session::SessionManager;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, Provider, ProviderError, ProviderProtocolContract,
+    ProviderReasoningReplay,
 };
 
 fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
@@ -55,6 +56,232 @@ fn insert_session(server: &AppServer, sessions_dir: &Path, session_id: &str, cwd
         .expect("insert session");
     let _ = created_at;
     session_id.to_string()
+}
+
+#[test]
+fn jsonl_repair_rebuilds_index_and_marks_incomplete_turn_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "9b63cd69-94af-4e42-a53d-dac832be76f8";
+    let mut session =
+        SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+            "turn-1",
+        ))
+        .expect("turn metadata");
+    store
+        .insert_session(&SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: session.path().to_string_lossy().to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: None,
+            model: Some("provider/model".to_string()),
+            status: Some(SessionStatus::Active),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            token_usage: json!({}),
+        })
+        .expect("stale index");
+
+    assert_eq!(
+        repair_session_index_from_jsonl(&store, &sessions_dir).unwrap(),
+        1
+    );
+    let repaired = store.get_session(session_id).expect("repaired record");
+    assert_eq!(repaired.status, Some(SessionStatus::Interrupted));
+    let reopened = SessionManager::open_existing(session.path()).expect("reopen");
+    assert_eq!(reopened.metadata_entries().len(), 2);
+    assert_eq!(
+        repair_session_index_from_jsonl(&store, &sessions_dir).unwrap(),
+        0
+    );
+    assert_eq!(
+        SessionManager::open_existing(session.path())
+            .unwrap()
+            .metadata_entries()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn thread_settings_are_jsonl_first_and_never_store_credentials() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let started = server
+        .handle_json(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "thread/start",
+                "id": 2,
+                "params": {"cwd": workspace},
+            })
+            .to_string(),
+        )
+        .expect("thread start");
+    let thread_id = started[1]["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id")
+        .to_string();
+    let settings = server
+        .handle_json(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "thread/settings",
+                "id": 3,
+                "params": {
+                    "threadId": thread_id,
+                    "provider": "openai_compatible",
+                    "model": "gpt-test",
+                },
+            })
+            .to_string(),
+        )
+        .expect("settings");
+    assert_eq!(settings[0]["result"]["updated"], true);
+    let record = server.store().get_session(&thread_id).expect("record");
+    assert_eq!(record.model.as_deref(), Some("openai_compatible/gpt-test"));
+    repair_session_index_from_jsonl(server.store(), &sessions_dir).expect("repair settings");
+    assert_eq!(
+        server
+            .store()
+            .get_session(&thread_id)
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai_compatible/gpt-test")
+    );
+    let rollout = std::fs::read_to_string(record.rollout_path).expect("rollout");
+    assert!(rollout.contains("thread_settings"));
+    assert!(!rollout.contains("apiKey"));
+    assert!(!rollout.contains("authorization"));
+}
+
+#[test]
+fn capabilities_expose_additive_camel_case_protocol_fields() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &temp.path().join("sessions"));
+    initialize(&mut server);
+    let response = server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}}"#)
+        .expect("capabilities");
+    assert_eq!(response[0]["result"]["protocolVersion"], "1");
+    assert!(response[0]["result"].get("protocol_version").is_none());
+}
+
+#[test]
+fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "7b63cd69-94af-4e42-a53d-dac832be76f8";
+    let mut session =
+        SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
+    session
+        .append_message(singularity_agent::message::AgentMessage {
+            role: singularity_agent::message::AgentMessageRole::Assistant,
+            content: vec![singularity_agent::message::ContentBlock::Thinking {
+                thinking: "visible reasoning".to_string(),
+                signature: None,
+            }, singularity_agent::message::ContentBlock::ToolCall {
+                id: "call-1".to_string(),
+                name: "write".to_string(),
+                args: json!({"path":"out.txt","content":"ok"}),
+            }],
+            provider_reasoning_replay: Some(ProviderReasoningReplay::Responses {
+                provider_name: "private-provider".to_string(),
+                model_name: "private-model".to_string(),
+                reasoning_effort: "high".to_string(),
+                tool_call_ids: vec!["call-1".to_string()],
+                items: vec![
+                    json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque-secret"}),
+                    json!({"type":"function_call","call_id":"call-1","name":"write","arguments":"{}"}),
+                ],
+            }),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+            timestamp: None,
+        })
+        .expect("assistant");
+    session
+        .append_message(singularity_agent::message::AgentMessage {
+            role: singularity_agent::message::AgentMessageRole::ToolResult,
+            content: vec![singularity_agent::message::ContentBlock::Text {
+                text: "write failed".to_string(),
+            }],
+            provider_reasoning_replay: None,
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("write".to_string()),
+            is_error: Some(true),
+            timestamp: None,
+        })
+        .expect("tool result");
+    store
+        .insert_session(&SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: session.path().to_string_lossy().to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: None,
+            model: None,
+            status: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            token_usage: json!({}),
+        })
+        .expect("index");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let output = server
+        .handle_json(
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"session/read",
+                "id":2,
+                "params":{"sessionId":session_id}
+            })
+            .to_string(),
+        )
+        .expect("session/read");
+    let wire = serde_json::to_string(&output).expect("wire");
+    assert!(wire.contains("visible reasoning"));
+    assert!(wire.contains("out.txt"));
+    assert!(wire.contains("\"isError\":true"));
+    assert!(!wire.contains("opaque-secret"));
+    assert!(!wire.contains("private-provider"));
+    assert!(!wire.contains("providerReasoningReplay"));
+    assert!(!wire.contains("parentId"));
+}
+
+#[test]
+fn completed_turn_runtime_indexes_remain_bounded_and_usage_is_released() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let sessions_dir = temp.path().join("sessions");
+    let server = app_server(store, &sessions_dir);
+    for index in 0..300 {
+        let turn_id = format!("turn-{index}");
+        let (_cancellation, guard) = server
+            .activate_turn(&turn_id, "thread-1")
+            .expect("activate");
+        server.remember_usage(&turn_id, &ModelUsage::default());
+        server.remember_turn_status(&turn_id, TurnStatus::Completed, "completed");
+        drop(guard);
+    }
+    assert!(server.turn_threads.lock().unwrap().len() <= MAX_TERMINAL_TURN_REFERENCES);
+    assert!(server.usage_by_turn.lock().unwrap().is_empty());
 }
 
 #[derive(Clone)]
@@ -124,6 +351,33 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
             r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"write hello.txt"}}]}}}}"#
         ))
         .expect("turn start");
+    let methods = responses
+        .iter()
+        .filter_map(|value| value["method"].as_str())
+        .collect::<Vec<_>>();
+    let tool_started = responses
+        .iter()
+        .position(|value| {
+            value["method"] == "item/started" && value["params"]["item"]["item_id"] == "call_1"
+        })
+        .expect("tool item started");
+    let execution_started = responses
+        .iter()
+        .position(|value| value["method"] == "tool/execution/start")
+        .expect("tool execution started");
+    let execution_ended = responses
+        .iter()
+        .position(|value| value["method"] == "tool/execution/end")
+        .expect("tool execution ended");
+    let tool_completed = responses
+        .iter()
+        .position(|value| {
+            value["method"] == "item/completed" && value["params"]["item"]["item_id"] == "call_1"
+        })
+        .expect("tool item completed");
+    assert!(tool_started < execution_started && execution_started < execution_ended);
+    assert!(execution_ended < tool_completed);
+    assert!(methods.contains(&"item/completed"));
     let result = responses
         .iter()
         .find(|message| message["id"] == 2)
@@ -141,6 +395,20 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     assert_eq!(record.title.as_deref(), Some("write hello.txt"));
     let session = SessionManager::open_existing(&rollout).expect("session");
     assert_eq!(session.session_id(), session_id);
+    let metadata = session.metadata_entries();
+    assert_eq!(metadata.len(), 3, "start, terminal and usage facts");
+    assert_eq!(
+        metadata[0].kind(),
+        singularity_agent::session::SessionMetadataKind::TurnStarted
+    );
+    assert_eq!(
+        metadata[1].kind(),
+        singularity_agent::session::SessionMetadataKind::TurnCompleted
+    );
+    assert_eq!(
+        metadata[2].kind(),
+        singularity_agent::session::SessionMetadataKind::Usage
+    );
 }
 
 fn failed_response() -> ModelTurnResponse {

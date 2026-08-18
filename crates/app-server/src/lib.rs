@@ -10,8 +10,9 @@ mod events;
 mod lifecycle;
 pub mod paths;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,8 +20,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use singularity_agent::{
     agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
+    message::{AgentMessageRole, ContentBlock},
     session::{
-        SessionEntryFilter, SessionError, SessionManager, SessionReadOptions, SessionRepository,
+        SessionEntry, SessionEntryFilter, SessionEntryType, SessionError, SessionManager,
+        SessionMetadataKind, SessionReadOptions, SessionRepository,
     },
     tools::{ToolExecution, ToolRegistry},
 };
@@ -30,10 +33,11 @@ use singularity_core::{
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, InitializeParams,
-    InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus,
-    ServerCapabilitiesResult, ServerShutdownResult, SessionDeleteResult, SessionIdParams,
-    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
+    AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, HistoryItem,
+    InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind,
+    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult,
+    SessionDeleteResult, SessionIdParams, SessionReadParams, SessionReadResult, Thread,
+    ThreadIdParams, ThreadListResult, ThreadResult, ThreadSettingsParams, ThreadSettingsResult,
     ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
     TurnInjectionOutcome, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
     TurnStartParams, TurnStartResult, TurnStatus,
@@ -53,6 +57,7 @@ const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
+const MAX_TERMINAL_TURN_REFERENCES: usize = 256;
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
@@ -274,6 +279,8 @@ pub struct AssistantItemEventState {
     first_delta_observed: bool,
     started_generated: bool,
     delta_generated: bool,
+    assistant_terminal_generated: bool,
+    tool_items: HashMap<String, bool>,
 }
 
 impl AssistantItemEventState {
@@ -283,11 +290,28 @@ impl AssistantItemEventState {
             first_delta_observed: false,
             started_generated: false,
             delta_generated: false,
+            assistant_terminal_generated: false,
+            tool_items: HashMap::new(),
         }
     }
 
     pub fn appeared(&self) -> bool {
         self.started_generated || self.delta_generated
+    }
+
+    pub fn start_tool_item(&mut self, tool_call_id: &str) -> bool {
+        if self.tool_items.contains_key(tool_call_id) {
+            return false;
+        }
+        self.tool_items.insert(tool_call_id.to_string(), false);
+        true
+    }
+
+    pub fn open_tool_items(&self) -> Vec<String> {
+        self.tool_items
+            .iter()
+            .filter_map(|(id, terminal)| (!*terminal).then_some(id.clone()))
+            .collect()
     }
 }
 
@@ -312,7 +336,7 @@ pub struct AppServer {
     /// （Pi 式 thread 级队列；M2 裁决方案 B）。
     thread_steer_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     thread_follow_up_pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
-    /// 已提交 turn 的聚合 usage（进程内缓存；usage 不持久化到索引之外）。
+    /// 已提交 turn 的运行时 usage 缓存；权威副本是同一 session JSONL 的 usage metadata。
     usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     execution_stopped: Arc<AtomicBool>,
     #[cfg(test)]
@@ -364,6 +388,8 @@ struct ActiveTurnGuard {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
+    usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
 }
 
 impl Drop for ActiveTurnGuard {
@@ -378,6 +404,20 @@ impl Drop for ActiveTurnGuard {
         }
         if let Ok(mut follow_up_handles) = self.follow_up_handles.lock() {
             follow_up_handles.remove(&self.turn_id);
+        }
+        if let Ok(mut usage_by_turn) = self.usage_by_turn.lock() {
+            usage_by_turn.remove(&self.turn_id);
+        }
+        if let Ok(mut turn_threads) = self.turn_threads.lock()
+            && turn_threads.len() > MAX_TERMINAL_TURN_REFERENCES
+            && let Some(candidate) = turn_threads
+                .iter()
+                .find(|(turn_id, reference)| {
+                    *turn_id != &self.turn_id && reference.status != TurnStatus::Running
+                })
+                .map(|(turn_id, _)| turn_id.clone())
+        {
+            turn_threads.remove(&candidate);
         }
     }
 }
@@ -448,6 +488,270 @@ pub fn thread_from_record(record: &SessionRecord) -> Thread {
     }
 }
 
+/// 从 JSONL rollout 重建 SQLite 的轻量索引投影。
+///
+/// JSONL 是唯一事实源：每个可解析 rollout 先完成 torn-tail/metadata repair，
+/// 再通过 store 的 upsert seam 写入索引。扫描成功后才清理指向已不存在 rollout
+/// 的旧索引行，避免半途失败把 SQLite 当成事实源。
+pub fn repair_session_index_from_jsonl(
+    store: &SessionStore,
+    sessions_dir: &Path,
+) -> AppServerResult<usize> {
+    let mut rebuilt_ids = HashSet::new();
+    let mut repaired = 0usize;
+    let entries = std::fs::read_dir(sessions_dir)
+        .map_err(|error| AppServerError::Workspace(format!("failed to read sessions: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AppServerError::Workspace(format!("failed to enumerate sessions: {error}"))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // Legacy migration deliberately preserves the source bytes. Do not let an
+        // index-repair scan trigger SessionManager's v1-v3 rewrite on an already
+        // indexed rollout; later opens still perform the normal compatibility
+        // migration when the session is actually used.
+        if let Some((legacy_id, version)) = legacy_session_header(&path)?
+            && version < singularity_agent::session::CURRENT_SESSION_VERSION
+            && store.get_session(&legacy_id).is_ok()
+        {
+            rebuilt_ids.insert(legacy_id);
+            continue;
+        }
+        let mut session = SessionManager::open_existing(&path)?;
+        let repaired_turns = session.repair_interrupted_turns()?;
+        let existing = store.get_session(session.session_id()).ok();
+        let metadata = session.metadata_entries();
+        let model = metadata
+            .iter()
+            .rev()
+            .find(|entry| entry.kind() == SessionMetadataKind::ThreadSettings)
+            .and_then(|entry| {
+                let model = entry.field_string("model")?;
+                let provider = entry.field_string("provider").unwrap_or_default();
+                let selector = if provider.is_empty() {
+                    model.to_string()
+                } else {
+                    format!("{provider}/{model}")
+                };
+                Some(match entry.field_string("reasoning") {
+                    Some(reasoning) if !reasoning.is_empty() => {
+                        format!("{selector}#{reasoning}")
+                    }
+                    _ => selector,
+                })
+            })
+            .or_else(|| existing.as_ref().and_then(|record| record.model.clone()));
+        let status = metadata.iter().rev().find_map(|entry| {
+            if !entry.kind().matches_turn_terminal() {
+                return None;
+            }
+            match entry.kind() {
+                SessionMetadataKind::TurnCompleted => Some(SessionStatus::Completed),
+                SessionMetadataKind::TurnFailed => Some(SessionStatus::Failed),
+                SessionMetadataKind::TurnInterrupted => Some(SessionStatus::Interrupted),
+                _ => None,
+            }
+        });
+        let token_usage = metadata
+            .iter()
+            .rev()
+            .find(|entry| entry.kind() == SessionMetadataKind::Usage)
+            .and_then(|entry| entry.field("usage").cloned())
+            .or_else(|| existing.as_ref().map(|record| record.token_usage.clone()))
+            .unwrap_or_else(|| json!({}));
+        let created_at = existing
+            .as_ref()
+            .map(|record| record.created_at.clone())
+            .unwrap_or_else(now_iso);
+        let status = status.or_else(|| existing.as_ref().and_then(|record| record.status));
+        let record = SessionRecord {
+            session_id: session.session_id().to_string(),
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd: session.cwd().to_string_lossy().to_string(),
+            title: existing.as_ref().and_then(|record| record.title.clone()),
+            model,
+            status,
+            created_at,
+            updated_at: now_iso(),
+            token_usage,
+        };
+        store.upsert_session(&record)?;
+        rebuilt_ids.insert(record.session_id);
+        repaired += repaired_turns;
+    }
+    // 只有完整扫描和所有 upsert 都成功后，才移除悬空索引行。
+    for record in store.list_sessions()? {
+        if !rebuilt_ids.contains(&record.session_id)
+            && Path::new(&record.rollout_path).parent() == Some(sessions_dir)
+        {
+            store.delete_session(&record.session_id)?;
+        }
+    }
+    Ok(repaired)
+}
+
+/// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
+/// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
+/// 或其 `provider_reasoning_replay`、parent/tree、迁移字段。
+pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
+    match &entry.entry_type {
+        SessionEntryType::Message(message) => match message.role {
+            AgentMessageRole::User | AgentMessageRole::Assistant => {
+                let role = match message.role {
+                    AgentMessageRole::User => "user",
+                    AgentMessageRole::Assistant => "assistant",
+                    _ => unreachable!(),
+                }
+                .to_string();
+                let mut items = Vec::new();
+                let mut text_index = 0usize;
+                let mut thinking_index = 0usize;
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } if !text.is_empty() => {
+                            items.push(HistoryItem::Message {
+                                id: format!("{}:text:{text_index}", entry.id),
+                                role: role.clone(),
+                                text: text.clone(),
+                            });
+                            text_index += 1;
+                        }
+                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                            items.push(HistoryItem::Thinking {
+                                id: format!("{}:thinking:{thinking_index}", entry.id),
+                                text: thinking.clone(),
+                            });
+                            thinking_index += 1;
+                        }
+                        ContentBlock::ToolCall { id, name, args } => {
+                            items.push(HistoryItem::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                items
+            }
+            AgentMessageRole::ToolResult => vec![HistoryItem::ToolResult {
+                id: message
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| entry.id.clone()),
+                output: message.content_text(),
+                is_error: message.is_error.unwrap_or(false),
+            }],
+            _ => Vec::new(),
+        },
+        SessionEntryType::Compaction(compaction) => vec![HistoryItem::Compaction {
+            id: entry.id.clone(),
+            summary: compaction.summary.clone(),
+        }],
+        SessionEntryType::Metadata(metadata) => match metadata.kind() {
+            SessionMetadataKind::TurnStarted => metadata
+                .turn_id()
+                .map(|id| HistoryItem::Turn {
+                    id: id.to_string(),
+                    status: TurnStatus::Running,
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::TurnCompleted
+            | SessionMetadataKind::TurnFailed
+            | SessionMetadataKind::TurnInterrupted => metadata
+                .turn_id()
+                .map(|id| HistoryItem::Turn {
+                    id: id.to_string(),
+                    status: match metadata.kind() {
+                        SessionMetadataKind::TurnCompleted => TurnStatus::Completed,
+                        SessionMetadataKind::TurnFailed => TurnStatus::Failed,
+                        SessionMetadataKind::TurnInterrupted => TurnStatus::Interrupted,
+                        _ => unreachable!(),
+                    },
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::ThreadSettings => vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: metadata.field_string("provider").map(str::to_string),
+                model: metadata.field_string("model").map(str::to_string),
+                reasoning: metadata.field_string("reasoning").map(str::to_string),
+            }],
+            SessionMetadataKind::Usage => metadata
+                .field("usage")
+                .cloned()
+                .map(|usage| HistoryItem::Usage {
+                    id: entry.id.clone(),
+                    usage,
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::Item => Vec::new(),
+        },
+        SessionEntryType::ModelChange { provider, model_id } => {
+            vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: Some(provider.clone()),
+                model: Some(model_id.clone()),
+                reasoning: None,
+            }]
+        }
+        SessionEntryType::ThinkingLevelChange { thinking_level } => {
+            vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: None,
+                model: None,
+                reasoning: Some(thinking_level.clone()),
+            }]
+        }
+        SessionEntryType::Custom(_) | SessionEntryType::Other(_) => Vec::new(),
+    }
+}
+
+fn legacy_session_header(path: &Path) -> AppServerResult<Option<(String, u32)>> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| AppServerError::Session(SessionError::Io(error)))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| AppServerError::Session(SessionError::Io(error)))?;
+    if line.len() > 16 * 1024 * 1024 {
+        return Err(AppServerError::Session(SessionError::InvalidSession(
+            format!(
+                "session header exceeds bounded line limit: {}",
+                path.display()
+            ),
+        )));
+    }
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.is_empty() {
+        return Err(AppServerError::Session(SessionError::InvalidSession(
+            format!("session header is missing: {}", path.display()),
+        )));
+    }
+    let value: Value = serde_json::from_str(line)?;
+    if value.get("type").and_then(Value::as_str) != Some("session") {
+        return Ok(None);
+    }
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return Err(AppServerError::Session(SessionError::InvalidHeader(
+            "session header id is missing".to_string(),
+        )));
+    };
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(singularity_agent::session::CURRENT_SESSION_VERSION);
+    Ok(Some((id.to_string(), version)))
+}
+
 /// 将持久化的 `InputItem` 数组投影为拼接文本。
 fn input_items_to_text(input: &Value) -> AppServerResult<String> {
     let items: Vec<singularity_protocol::InputItem> =
@@ -475,6 +779,38 @@ fn title_from_input(input: &str) -> String {
         .chars()
         .take(MAX_SESSION_TITLE_CHARS)
         .collect()
+}
+
+fn split_model_selector(
+    selector: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(selector) = selector.filter(|selector| !selector.trim().is_empty()) else {
+        return (None, None, None);
+    };
+    let (without_reasoning, reasoning) = selector
+        .rsplit_once('#')
+        .map_or((selector, None), |(model, reasoning)| {
+            (model, Some(reasoning))
+        });
+    let (provider, model) = without_reasoning
+        .split_once('/')
+        .map_or((None, without_reasoning), |(provider, model)| {
+            (Some(provider), model)
+        });
+    (
+        provider.map(str::to_string),
+        Some(model.to_string()),
+        reasoning.map(str::to_string),
+    )
+}
+
+fn compose_model_selector(provider: &str, model: &str, reasoning: Option<&str>) -> String {
+    let mut selector = format!("{provider}/{model}");
+    if let Some(reasoning) = reasoning {
+        selector.push('#');
+        selector.push_str(reasoning);
+    }
+    selector
 }
 
 /// 组装新核心 `Agent` 的配置。
@@ -723,6 +1059,8 @@ impl AppServer {
             active_turns: Arc::clone(&self.active_turns),
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
+            turn_threads: Arc::clone(&self.turn_threads),
+            usage_by_turn: Arc::clone(&self.usage_by_turn),
         };
         Ok((cancellation, guard))
     }
@@ -788,6 +1126,7 @@ impl AppServer {
     pub(crate) fn update_session_status_and_usage(
         &self,
         session_id: &str,
+        turn_id: Option<&str>,
         status: SessionStatus,
         usage: &ModelUsage,
     ) -> AppServerResult<SessionRecord> {
@@ -800,6 +1139,13 @@ impl AppServer {
                 "injected terminal metadata failure".to_string(),
             )));
         }
+        if let Some(turn_id) = turn_id
+            && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
+        {
+            self.append_terminal_metadata_if_missing(session_id, turn_id, metadata)?;
+            let usage_value = serde_json::to_value(usage_to_wire(usage))?;
+            self.append_usage_metadata_if_missing(session_id, turn_id, usage_value)?;
+        }
         let token_usage = serde_json::to_value(usage_to_wire(usage))?;
         Ok(self.store.update_session(
             session_id,
@@ -809,6 +1155,61 @@ impl AppServer {
                 ..SessionMetadataUpdate::default()
             },
         )?)
+    }
+
+    fn append_terminal_metadata_if_missing(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        metadata: singularity_agent::session::SessionMetadata,
+    ) -> AppServerResult<()> {
+        let record = self.store.get_session(session_id)?;
+        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
+        let already_terminal = session
+            .metadata_entries()
+            .iter()
+            .any(|entry| entry.turn_id() == Some(turn_id) && entry.kind().matches_turn_terminal());
+        if !already_terminal {
+            session.append_metadata(metadata)?;
+        }
+        Ok(())
+    }
+
+    fn append_usage_metadata_if_missing(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        usage: Value,
+    ) -> AppServerResult<()> {
+        let record = self.store.get_session(session_id)?;
+        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
+        let already_persisted = session.metadata_entries().iter().any(|entry| {
+            entry.kind() == SessionMetadataKind::Usage && entry.turn_id() == Some(turn_id)
+        });
+        if !already_persisted {
+            session.append_metadata(singularity_agent::session::SessionMetadata::usage(
+                turn_id, usage,
+            )?)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_turn_started_metadata(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> AppServerResult<()> {
+        let record = self.store.get_session(session_id)?;
+        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
+        let already_started = session.metadata_entries().iter().any(|entry| {
+            entry.turn_id() == Some(turn_id) && entry.kind() == SessionMetadataKind::TurnStarted
+        });
+        if !already_started {
+            session.append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+                turn_id,
+            ))?;
+        }
+        Ok(())
     }
 
     /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
@@ -845,7 +1246,8 @@ impl AppServer {
             .usage_by_turn
             .lock()
             .ok()
-            .and_then(|cache| cache.get(&turn.turn_id).cloned());
+            .and_then(|cache| cache.get(&turn.turn_id).cloned())
+            .or_else(|| self.persisted_usage_for_turn(&turn));
         match usage {
             Some(usage) => Turn {
                 model_usage: Some(usage_to_wire(&usage)),
@@ -853,6 +1255,22 @@ impl AppServer {
             },
             None => turn,
         }
+    }
+
+    fn persisted_usage_for_turn(&self, turn: &Turn) -> Option<ModelUsage> {
+        let record = self.store.get_session(&turn.thread_id).ok()?;
+        let session = SessionManager::open_existing(Path::new(&record.rollout_path)).ok()?;
+        let value = session
+            .metadata_entries()
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                entry.kind() == SessionMetadataKind::Usage
+                    && entry.turn_id() == Some(turn.turn_id.as_str())
+            })?
+            .field("usage")
+            .cloned()?;
+        serde_json::from_value(value).ok()
     }
 
     pub(crate) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage) {
@@ -1018,6 +1436,29 @@ fn session_status_for_agent(status: &AgentStatus) -> SessionStatus {
         AgentStatus::CancelRequested | AgentStatus::Cancelled => SessionStatus::Interrupted,
         AgentStatus::Running => SessionStatus::Active,
         AgentStatus::Failed => SessionStatus::Failed,
+    }
+}
+
+fn terminal_metadata_for_status(
+    turn_id: &str,
+    status: SessionStatus,
+) -> Option<singularity_agent::session::SessionMetadata> {
+    match status {
+        SessionStatus::Completed => Some(
+            singularity_agent::session::SessionMetadata::turn_completed(turn_id),
+        ),
+        SessionStatus::Failed => Some(singularity_agent::session::SessionMetadata::turn_failed(
+            turn_id,
+            "turn failed",
+        )),
+        SessionStatus::Interrupted => Some(
+            singularity_agent::session::SessionMetadata::turn_interrupted(
+                turn_id,
+                "turn interrupted",
+                false,
+            ),
+        ),
+        SessionStatus::Active => None,
     }
 }
 

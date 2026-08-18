@@ -375,6 +375,16 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         turn_response["result"]["turn"]["agent_loop_status"],
         "cancelled"
     );
+    let tool_terminal = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "item/failed"
+                && message["params"]["item"]["item_id"] == "call_interrupt_0"
+        });
+    assert_eq!(
+        tool_terminal["params"]["item"]["item_id"],
+        "call_interrupt_0"
+    );
     assert!(
         provider.errors().is_empty(),
         "provider worker must be error-free: {:?}",
@@ -442,7 +452,10 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     );
 
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
-    assert_eq!(turn_response["result"]["turn"]["status"], "completed");
+    assert_eq!(
+        turn_response["result"]["turn"]["status"], "completed",
+        "turn/start response: {turn_response}"
+    );
     assert_eq!(
         provider
             .served

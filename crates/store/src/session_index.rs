@@ -61,6 +61,46 @@ pub struct SessionMetadataUpdate<'a> {
 }
 
 impl SessionStore {
+    /// 以 JSONL 解析结果重建或刷新单条索引投影。
+    ///
+    /// 该操作只写 `session_index`，不把 SQLite 变成事实源；调用方必须先成功
+    /// 读取并校验 rollout，再把 `SessionRecord` 传入。这样 JSONL append 成功而
+    /// 索引更新失败时，重开路径可以安全地再次投影。
+    pub fn upsert_session(&self, record: &SessionRecord) -> StoreResult<()> {
+        let changed = self.connection.execute(
+            "insert into session_index(
+                 session_id, rollout_path, cwd, title, model, status,
+                 created_at, updated_at, token_usage
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             on conflict(session_id) do update set
+                 rollout_path = excluded.rollout_path,
+                 cwd = excluded.cwd,
+                 title = excluded.title,
+                 model = excluded.model,
+                 status = excluded.status,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 token_usage = excluded.token_usage",
+            params![
+                record.session_id,
+                record.rollout_path,
+                record.cwd,
+                record.title,
+                record.model,
+                record.status.map(|status| status.as_storage_text()),
+                record.created_at,
+                record.updated_at,
+                serde_json::to_string(&record.token_usage)?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidState(
+                "session index upsert did not change a row".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn insert_session(&self, record: &SessionRecord) -> StoreResult<()> {
         let changed = self.connection.execute(
             "insert into session_index(

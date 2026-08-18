@@ -753,9 +753,20 @@ impl Agent {
                 continue;
             }
             if let Some(replay) = &message.provider_reasoning_replay {
-                // Keep a malformed or mismatched private replay in the request so the
-                // provider boundary can reject it fail-closed with its typed error.
-                replays.push(replay.clone());
+                // A provider/model switch invalidates the opaque continuation. Keep
+                // visible thinking/messages/tool results in Session, but never send a
+                // private replay across an incompatible provider boundary.
+                let Some((provider_name, model_name, variant)) = selector else {
+                    continue;
+                };
+                if replay.is_compatible_with(
+                    provider_name,
+                    model_name,
+                    variant,
+                    tool_reasoning_mode,
+                ) {
+                    replays.push(replay.clone());
+                }
                 continue;
             }
             if tool_reasoning_mode != ProviderToolReasoningMode::ReplayReasoningContent {
@@ -2780,6 +2791,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2792,6 +2804,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2849,6 +2862,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2861,6 +2875,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2909,6 +2924,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -3010,6 +3026,7 @@ mod tests {
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
                 provider_reasoning_replay: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -3022,6 +3039,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: Some("call_big_1".to_string()),
                 tool_name: Some("write".to_string()),
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -3101,11 +3119,12 @@ mod tests {
                 provider_reasoning_replay: Some(replay.clone()),
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
         let agent = Agent::new(
-            provider,
+            provider.clone(),
             ToolRegistry::new(),
             AgentConfig {
                 model: "provider/model#high".to_string(),
@@ -3114,7 +3133,39 @@ mod tests {
             session,
         )
         .unwrap();
-        assert_eq!(agent.reasoning_history_for_request(), vec![replay]);
+        assert_eq!(agent.reasoning_history_for_request(), vec![replay.clone()]);
+
+        let mut incompatible_session = SessionManager::create(
+            &dir.path().join("other-project"),
+            &dir.path().join("other-sessions"),
+        )
+        .unwrap();
+        incompatible_session
+            .append_message(AgentMessage {
+                role: AgentMessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    args: json!({"path": "out.txt", "content": "x"}),
+                }],
+                provider_reasoning_replay: Some(replay),
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let incompatible = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "other/model#high".to_string(),
+                ..AgentConfig::default()
+            },
+            incompatible_session,
+        )
+        .unwrap();
+        assert!(incompatible.reasoning_history_for_request().is_empty());
     }
 
     #[test]
@@ -3140,6 +3191,7 @@ mod tests {
                 tool_call_id: Some("orphan_write_1".to_string()),
                 tool_name: Some("write".to_string()),
                 provider_reasoning_replay: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();

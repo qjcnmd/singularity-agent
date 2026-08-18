@@ -9,6 +9,8 @@ use singularity_core::{ClientInfo, ErrorCode, JSON_RPC_METHOD_NOT_FOUND};
 
 /// JSON-RPC 2.0 parse error code。
 pub const JSON_RPC_PARSE_ERROR: i64 = -32700;
+/// Stable application error for a negotiated feature that this server does not support.
+pub const APP_ERROR_UNSUPPORTED: i64 = -32007;
 
 /// JSON-RPC method 的调用类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +142,7 @@ method_registry! {
     ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
     ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
     ThreadResume => ("thread/resume", Request, ThreadIdParams, ThreadResult),
+    ThreadSettings => ("thread/settings", Request, ThreadSettingsParams, ThreadSettingsResult),
     SessionRead => ("session/read", Request, SessionReadParams, SessionReadResult),
     SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
@@ -534,6 +537,11 @@ impl InitializeResult {
 /// 服务端支持的传输能力集合。
 pub struct ServerCapabilitiesResult {
     pub transports: Vec<TransportCapability>,
+    /// 协议版本和固定能力名称为 additive 字段；旧客户端只读取 transports。
+    #[serde(rename = "protocolVersion", default)]
+    pub protocol_version: String,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -563,6 +571,30 @@ pub struct ThreadIdParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// 更新一个 thread 的非敏感 provider/model/reasoning 选择。
+pub struct ThreadSettingsParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// thread/settings 的脱敏结果；不包含 key、header 或其他认证材料。
+pub struct ThreadSettingsResult {
+    pub thread_id: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 只包含 session id 的请求参数。
 pub struct SessionIdParams {
     pub session_id: String,
@@ -582,9 +614,54 @@ pub struct SessionReadParams {
     /// 过滤后的路径条目起始偏移（默认从 0 开始）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
-    /// 条目类型过滤；空数组 = 全部，只接受 `message` / `compaction`。
+    /// 稳定公开 history kind 过滤；空数组 = 全部。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entry_types: Vec<String>,
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+/// `session/read` 的公开历史 item；不暴露 SessionEntry 的 parent/tree、迁移或
+/// provider-private replay 字段。
+pub enum HistoryItem {
+    Message {
+        id: String,
+        role: String,
+        text: String,
+    },
+    Thinking {
+        id: String,
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        id: String,
+        output: String,
+        #[serde(rename = "isError")]
+        is_error: bool,
+    },
+    Turn {
+        id: String,
+        status: TurnStatus,
+    },
+    Settings {
+        id: String,
+        provider: Option<String>,
+        model: Option<String>,
+        reasoning: Option<String>,
+    },
+    Usage {
+        id: String,
+        usage: Value,
+    },
+    Compaction {
+        id: String,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -605,7 +682,7 @@ pub struct SessionReadResult {
     /// 最近一次 compaction 摘要；无 compaction 时为 None。
     pub summary: Option<String>,
     /// 当前 leaf 路径上最近 `recent_limit` 条会话条目。
-    pub recent_entries: Vec<Value>,
+    pub recent_entries: Vec<HistoryItem>,
     /// 会话文件中的条目总数（不含 header）。
     pub total_entries: usize,
 }
@@ -712,11 +789,11 @@ pub struct Turn {
     pub thread_id: String,
     pub status: TurnStatus,
     pub agent_loop_status: String,
-    /// 进程内聚合的 provider usage 投影（评估工具数据源）。
+    /// provider usage 投影（评估工具数据源）。
     ///
     /// 可选字段保持协议向后兼容：旧客户端读新响应时忽略未知字段，
-    /// 新客户端读旧服务端时字段缺失回退为 None。usage 不持久化（裁决 6），
-    /// 仅 app-server 进程内可提供；进程重启后查询历史 turn 为 None。
+    /// 新客户端读旧服务端时字段缺失回退为 None。终态 usage 同时写入
+    /// JSONL metadata，app-server 重启后可从公开历史恢复。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_usage: Option<TurnModelUsage>,
 }

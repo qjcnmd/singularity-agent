@@ -24,16 +24,55 @@ impl AppServer {
     /// 仅在 realtime item 已经出现过时构造脱敏失败事件。
     pub(super) fn realtime_item_failed_event(
         &self,
-        assistant_events: &AssistantItemEventState,
+        assistant_events: &mut AssistantItemEventState,
     ) -> AppServerResult<Option<Value>> {
-        if !assistant_events.appeared() {
+        if !assistant_events.appeared() || assistant_events.assistant_terminal_generated {
             return Ok(None);
         }
-        self.event_notification(AppEvent::item_failed(
+        let event = self.event_notification(AppEvent::item_failed(
             assistant_events.item_id.clone(),
             SAFE_ASSISTANT_ITEM_FAILURE,
-        ))
-        .map(Some)
+        ))?;
+        assistant_events.assistant_terminal_generated = true;
+        Ok(Some(event))
+    }
+
+    pub(super) fn realtime_item_completed_event(
+        &self,
+        assistant_events: &mut AssistantItemEventState,
+    ) -> AppServerResult<Option<Value>> {
+        if !assistant_events.appeared() || assistant_events.assistant_terminal_generated {
+            return Ok(None);
+        }
+        let event =
+            self.event_notification(AppEvent::item_completed(assistant_events.item_id.clone()))?;
+        assistant_events.assistant_terminal_generated = true;
+        Ok(Some(event))
+    }
+
+    pub(super) fn realtime_tool_terminal_event(
+        &self,
+        assistant_events: &mut AssistantItemEventState,
+        tool_call_id: &str,
+        is_error: bool,
+    ) -> AppServerResult<Option<Value>> {
+        if assistant_events
+            .tool_items
+            .get(tool_call_id)
+            .is_none_or(|terminal| *terminal)
+        {
+            return Ok(None);
+        }
+        let event = if is_error {
+            AppEvent::item_failed(tool_call_id, "tool execution failed")
+        } else {
+            AppEvent::item_completed(tool_call_id)
+        };
+        let event = self.event_notification(event)?;
+        if let Some(terminal) = assistant_events.tool_items.get_mut(tool_call_id) {
+            *terminal = true;
+        }
+        Ok(Some(event))
     }
 
     /// 把 assistant response 的 delta 投影到同一预分配 item，并记录实际生成的部分。

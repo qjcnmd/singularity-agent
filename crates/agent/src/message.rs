@@ -12,7 +12,6 @@
 /// 避免与旧 AgentLoop 形成第二套 LLM 消息表示。
 pub type LlmMessage = singularity_model::ModelMessage;
 
-use serde_json::Value;
 use singularity_model::{ModelTurnResponse, ProviderReasoningReplay};
 
 use crate::tools::ToolExecution;
@@ -78,6 +77,13 @@ pub struct AgentMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Whether a persisted tool result represents a tool-level failure.
+    ///
+    /// `None` keeps older session rows wire-compatible; tool results created by
+    /// the current loop always set this explicitly so public history can expose
+    /// the real `isError` value after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// unix 毫秒时间戳，对齐 Pi 消息 timestamp。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
@@ -94,6 +100,7 @@ impl AgentMessage {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: None,
         }
     }
@@ -155,6 +162,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
         provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,
+        is_error: None,
         timestamp: None,
     }
 }
@@ -192,36 +200,21 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
         provider_reasoning_replay: response.provider_reasoning_history.first().cloned(),
         tool_call_id: None,
         tool_name: None,
+        is_error: None,
         timestamp: None,
     }
 }
 
-/// 从响应携带的 provider reasoning replay 提取可展示的推理文本：
-/// Chat replay 直接取 `reasoning_content`；Responses replay 从 reasoning item 的
-/// `summary` 段尽力提取（OpenAI `{"type":"reasoning","summary":[{"type":"summary_text",...}]}`）。
+/// 从响应携带的 provider reasoning replay 提取可展示的推理文本。
+/// 只有 Chat/DeepSeek 明确返回的 `reasoning_content` 属于公开 thinking；
+/// Responses replay 是 provider-private opaque state，即使其中包含 summary
+/// 文本也不得复制到公开 Session/history。
 pub(crate) fn reasoning_text_from_replay(replay: &[ProviderReasoningReplay]) -> Option<String> {
     let first = replay.first()?;
     match first {
         ProviderReasoningReplay::Chat {
             reasoning_content, ..
         } if !reasoning_content.is_empty() => Some(reasoning_content.clone()),
-        ProviderReasoningReplay::Responses { items, .. } => items.iter().find_map(|item| {
-            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-                return None;
-            }
-            let summary = item
-                .get("summary")
-                .and_then(Value::as_array)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|part| part.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            (!summary.is_empty()).then_some(summary)
-        }),
         _ => None,
     }
 }
@@ -239,6 +232,7 @@ pub(crate) fn tool_result_message(
         provider_reasoning_replay: None,
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
+        is_error: Some(execution.is_error),
         timestamp: None,
     }
 }

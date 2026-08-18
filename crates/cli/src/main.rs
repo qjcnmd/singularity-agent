@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use singularity_core::ClientInfo;
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 use singularity_protocol::{
-    AgentCapabilityResult, EmptyParams, EventMetadata, InitializeParams, InputItem,
+    AgentCapabilityResult, EmptyParams, EventMetadata, HistoryItem, InitializeParams, InputItem,
     ItemEventParams, JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method,
     ProviderConfigurationStatus, RpcMethod, SessionDeleteResult, SessionIdParams,
     SessionReadParams, SessionReadResult, Thread, ThreadEventParams, ThreadIdParams,
@@ -84,7 +84,7 @@ enum Command {
         /// Comma-separated model selector override.
         #[arg(long)]
         models: Option<String>,
-        /// Maximum parallel cells (default: 10).
+        /// Maximum parallel cells (default: config or 6).
         #[arg(long)]
         max_parallel: Option<usize>,
         /// Per-cell timeout in seconds (default: config or 1800).
@@ -365,35 +365,20 @@ fn project_session_reference(read: &SessionReadResult) -> String {
 /// 逐条投影 transcript；只接受 message 条目，其余角色（bashExecution / custom /
 /// summary 等）和所有其他字段不进入参考材料。v4 起 content 为内容块数组，只取
 /// text 块（thinking 与 tool_call 块不进入参考材料）。
-fn reference_transcript_line(entry: &Value) -> Option<String> {
-    let object = entry.as_object()?;
-    if object.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
-    let message = object.get("message")?.as_object()?;
-    let role = message.get("role").and_then(Value::as_str)?;
-    if !matches!(role, "user" | "assistant" | "toolResult") {
-        return None;
-    }
-    let content = match message.get("content") {
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(Value::as_str) == Some("text") {
-                    block.get("text").and_then(Value::as_str)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        Some(Value::String(text)) => text.clone(),
+fn reference_transcript_line(entry: &HistoryItem) -> Option<String> {
+    let (role, content) = match entry {
+        HistoryItem::Message { role, text, .. }
+            if matches!(role.as_str(), "user" | "assistant") =>
+        {
+            (role.as_str(), text.as_str())
+        }
+        HistoryItem::ToolResult { output, .. } => ("toolResult", output.as_str()),
         _ => return None,
     };
     if content.trim().is_empty() {
         return None;
     }
-    Some(format!("{role}: {}", collapse_reference_lines(&content)))
+    Some(format!("{role}: {}", collapse_reference_lines(content)))
 }
 
 /// 折叠换行：旧会话 content 中即使嵌入 `CURRENT REQUEST` 等标记，也会留在
@@ -655,7 +640,7 @@ impl AppServerClient {
             session_id: session_id.to_string(),
             recent_limit: limit.unwrap_or(20),
             offset: None,
-            entry_types: Vec::new(),
+            kinds: Vec::new(),
         })?;
         Ok(reply.result)
     }
@@ -1205,8 +1190,53 @@ mod tests {
             updated_at: "2026-08-15T00:01:00Z".to_string(),
             token_usage: json!({}),
             summary: None,
-            recent_entries,
+            recent_entries: recent_entries
+                .into_iter()
+                .filter_map(legacy_or_public_history_item)
+                .collect(),
             total_entries: 0,
+        }
+    }
+
+    fn legacy_or_public_history_item(value: Value) -> Option<HistoryItem> {
+        if let Ok(item) = serde_json::from_value::<HistoryItem>(value.clone()) {
+            return Some(item);
+        }
+        let object = value.as_object()?;
+        let id = object.get("id")?.as_str()?.to_string();
+        if object.get("type").and_then(Value::as_str) == Some("compaction") {
+            return Some(HistoryItem::Compaction {
+                id,
+                summary: object.get("summary")?.as_str()?.to_string(),
+            });
+        }
+        let message = object.get("message")?.as_object()?;
+        let role = message.get("role")?.as_str()?;
+        let content = match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        };
+        match role {
+            "user" | "assistant" => Some(HistoryItem::Message {
+                id,
+                role: role.to_string(),
+                text: content,
+            }),
+            "toolResult" => Some(HistoryItem::ToolResult {
+                id: message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id.as_str())
+                    .to_string(),
+                output: content,
+                is_error: false,
+            }),
+            _ => None,
         }
     }
 

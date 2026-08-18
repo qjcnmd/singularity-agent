@@ -89,7 +89,7 @@ where
     let mut writer_result = None;
     let mut writer_timeout = false;
     let mut server = Some(server);
-    // 单 worker 槽位：同一时刻至多一个 turn/start 或 turn/resume 执行。
+    // 单 worker 槽位：同一时刻至多一个 turn/start 执行。
     let mut turn_task: Option<JoinHandle<Result<(), String>>> = None;
     let mut reader = reader;
     let mut terminal_error = None;
@@ -491,6 +491,14 @@ fn initialize_app_server(
             paths.sessions_dir.display()
         );
     }
+    // JSONL 是事实源：启动时先修复孤立 turn/索引投影，再向客户端提供 thread
+    // 列表；SQLite 写入失败会让启动失败，而不会覆盖 rollout。
+    let repaired =
+        singularity_app_server::repair_session_index_from_jsonl(&store, &paths.sessions_dir)
+            .map_err(|error| format!("failed to repair app-server session index: {error}"))?;
+    if repaired > 0 {
+        eprintln!("repaired {repaired} interrupted session turn(s)");
+    }
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
     Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))
@@ -515,7 +523,7 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
         )
 }
 
-/// 在单一 turn 工作线程内执行 turn/start 或 turn/resume，事件与最终响应顺序入队。
+/// 在单一 turn 工作线程内执行 turn/start，事件与最终响应顺序入队。
 fn run_turn_request(
     mut worker: AppServer,
     message: JsonRpcMessage,

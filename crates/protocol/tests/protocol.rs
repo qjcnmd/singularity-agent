@@ -106,6 +106,7 @@ fn method_registry_keeps_only_converged_methods() {
         "thread/list",
         "thread/start",
         "thread/resume",
+        "thread/settings",
         "session/read",
         "session/delete",
         "turn/start",

@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use serde::de::DeserializeOwned;
 use serde::ser::Error as _;
@@ -182,6 +182,234 @@ pub struct CustomEntry {
     pub data: Option<Value>,
 }
 
+/// JSONL 中不参与模型上下文的持久化 metadata 类型。
+///
+/// metadata 只描述可恢复的产品事实；具体字段由 `SessionMetadata` 的受限构造器
+/// 写入，解析时保留未知字段以便新旧版本之间安全重开。它不是第二个事件存储，
+/// 而是同一条 session JSONL 树上的非消息 entry。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMetadataKind {
+    TurnStarted,
+    TurnCompleted,
+    TurnFailed,
+    TurnInterrupted,
+    ThreadSettings,
+    Usage,
+    Item,
+}
+
+impl SessionMetadataKind {
+    pub fn matches_turn_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::TurnCompleted | Self::TurnFailed | Self::TurnInterrupted
+        )
+    }
+}
+
+/// 一条可恢复的 session metadata。`fields` 采用 JSON 对象以允许未来增加非敏感
+/// 字段，同时所有当前写入路径都通过下面的类型化构造器，避免把认证信息落盘。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionMetadata {
+    kind: SessionMetadataKind,
+    fields: Map<String, Value>,
+}
+
+impl SessionMetadata {
+    /// 构造 metadata；公开字段必须是对象，且 settings 禁止敏感键。
+    pub fn new(kind: SessionMetadataKind, fields: Map<String, Value>) -> Result<Self> {
+        if fields.keys().any(|key| is_reserved_metadata_key(key)) {
+            return Err(SessionError::InvalidStructure(
+                "metadata contains a reserved session entry field".to_string(),
+            ));
+        }
+        if matches!(kind, SessionMetadataKind::ThreadSettings)
+            && fields.keys().any(|key| is_sensitive_metadata_key(key))
+        {
+            return Err(SessionError::InvalidStructure(
+                "thread settings metadata contains a sensitive field".to_string(),
+            ));
+        }
+        Ok(Self { kind, fields })
+    }
+
+    pub fn kind(&self) -> SessionMetadataKind {
+        self.kind
+    }
+
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.fields.get(name)
+    }
+
+    pub fn field_string(&self, name: &str) -> Option<&str> {
+        self.field(name).and_then(Value::as_str)
+    }
+
+    pub fn turn_id(&self) -> Option<&str> {
+        self.field_string("turnId")
+    }
+
+    pub fn synthetic(&self) -> bool {
+        self.field("synthetic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn turn_started(turn_id: impl Into<String>) -> Self {
+        Self::simple(SessionMetadataKind::TurnStarted, "turnId", turn_id.into())
+    }
+
+    pub fn turn_completed(turn_id: impl Into<String>) -> Self {
+        Self::simple(SessionMetadataKind::TurnCompleted, "turnId", turn_id.into())
+    }
+
+    pub fn turn_failed(turn_id: impl Into<String>, error: impl Into<String>) -> Self {
+        let mut fields = Map::new();
+        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
+        fields.insert("error".to_string(), Value::String(error.into()));
+        Self::unchecked(SessionMetadataKind::TurnFailed, fields)
+    }
+
+    pub fn turn_interrupted(
+        turn_id: impl Into<String>,
+        reason: impl Into<String>,
+        synthetic: bool,
+    ) -> Self {
+        let mut fields = Map::new();
+        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
+        fields.insert("reason".to_string(), Value::String(reason.into()));
+        fields.insert("synthetic".to_string(), Value::Bool(synthetic));
+        Self::unchecked(SessionMetadataKind::TurnInterrupted, fields)
+    }
+
+    pub fn thread_settings(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        reasoning: Option<String>,
+    ) -> Result<Self> {
+        let mut fields = Map::new();
+        fields.insert("provider".to_string(), Value::String(provider.into()));
+        fields.insert("model".to_string(), Value::String(model.into()));
+        if let Some(reasoning) = reasoning {
+            fields.insert("reasoning".to_string(), Value::String(reasoning));
+        }
+        Self::new(SessionMetadataKind::ThreadSettings, fields)
+    }
+
+    pub fn usage(turn_id: impl Into<String>, usage: Value) -> Result<Self> {
+        if !usage.is_object() {
+            return Err(SessionError::InvalidStructure(
+                "usage metadata must be a JSON object".to_string(),
+            ));
+        }
+        let mut fields = Map::new();
+        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
+        fields.insert("usage".to_string(), usage);
+        Self::new(SessionMetadataKind::Usage, fields)
+    }
+
+    pub fn item(
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+        item_type: impl Into<String>,
+        status: impl Into<String>,
+        payload: Option<Value>,
+    ) -> Result<Self> {
+        let mut fields = Map::new();
+        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
+        fields.insert("itemId".to_string(), Value::String(item_id.into()));
+        fields.insert("itemType".to_string(), Value::String(item_type.into()));
+        fields.insert("status".to_string(), Value::String(status.into()));
+        if let Some(payload) = payload {
+            fields.insert("payload".to_string(), payload);
+        }
+        Self::new(SessionMetadataKind::Item, fields)
+    }
+
+    fn simple(kind: SessionMetadataKind, key: &str, value: String) -> Self {
+        let mut fields = Map::new();
+        fields.insert(key.to_string(), Value::String(value));
+        Self::unchecked(kind, fields)
+    }
+
+    fn unchecked(kind: SessionMetadataKind, fields: Map<String, Value>) -> Self {
+        Self { kind, fields }
+    }
+}
+
+impl Serialize for SessionMetadata {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = self.fields.clone();
+        map.insert("metadataType".to_string(), json!(self.kind));
+        Value::Object(map).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionMetadata {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut map = Map::<String, Value>::deserialize(deserializer)?;
+        let kind_value = map
+            .remove("metadataType")
+            .ok_or_else(|| serde::de::Error::custom("metadata entry has no metadataType"))?;
+        let kind = serde_json::from_value(kind_value)
+            .map_err(|error| serde::de::Error::custom(format!("invalid metadataType: {error}")))?;
+        if map.keys().any(|key| is_reserved_metadata_key(key)) {
+            return Err(serde::de::Error::custom(
+                "metadata contains a reserved session entry field",
+            ));
+        }
+        if matches!(kind, SessionMetadataKind::ThreadSettings)
+            && map.keys().any(|key| is_sensitive_metadata_key(key))
+        {
+            return Err(serde::de::Error::custom(
+                "thread settings metadata contains a sensitive field",
+            ));
+        }
+        Ok(Self { kind, fields: map })
+    }
+}
+
+fn is_sensitive_metadata_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "api_key",
+        "apikey",
+        "authorization",
+        "auth_token",
+        "token",
+        "secret",
+        "password",
+    ]
+    .iter()
+    .any(|sensitive| key.contains(sensitive))
+}
+
+fn is_reserved_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "parentId" | "timestamp" | "type" | "metadataType"
+    )
+}
+
+/// Strip the JSONL envelope before decoding a metadata payload. Keeping this
+/// boundary explicit prevents `id`/`parentId`/`type` from becoming metadata
+/// fields when a session is reopened, while still preserving unknown payload
+/// fields for forward-compatible reads.
+fn metadata_payload(value: &Value) -> Value {
+    let mut payload = value.as_object().cloned().unwrap_or_default();
+    for key in ["id", "parentId", "timestamp", "type"] {
+        payload.remove(key);
+    }
+    Value::Object(payload)
+}
+
 /// 会话条目类型。`Other` 保留未建模条目（label/session_info/custom_message/
 /// branch_summary 及未知类型）的原始 JSON，保证迁移重写不丢数据。
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +417,7 @@ pub enum SessionEntryType {
     Message(AgentMessage),
     Compaction(CompactionEntry),
     Custom(CustomEntry),
+    Metadata(SessionMetadata),
     ModelChange { provider: String, model_id: String },
     ThinkingLevelChange { thinking_level: String },
     Other(Value),
@@ -200,6 +429,7 @@ impl SessionEntryType {
             Self::Message(_) => "message",
             Self::Compaction(_) => "compaction",
             Self::Custom(_) => "custom",
+            Self::Metadata(_) => "metadata",
             Self::ModelChange { .. } => "model_change",
             Self::ThinkingLevelChange { .. } => "thinking_level_change",
             Self::Other(_) => unreachable!("Other 条目保留原始 type，不调用 type_name"),
@@ -244,6 +474,10 @@ impl SessionEntry {
             ),
             Some("compaction") => typed_or_other(value, SessionEntryType::Compaction),
             Some("custom") => typed_or_other(value, SessionEntryType::Custom),
+            Some("metadata") => {
+                let payload = metadata_payload(value);
+                typed_or_other(&payload, SessionEntryType::Metadata)
+            }
             Some("model_change") => typed_or_other(value, |wire: ModelChangeWire| {
                 SessionEntryType::ModelChange {
                     provider: wire.provider,
@@ -342,6 +576,12 @@ impl Serialize for SessionEntry {
                     serde_json::to_value(custom).map_err(S::Error::custom)?,
                 );
             }
+            SessionEntryType::Metadata(metadata) => {
+                merge_payload(
+                    &mut map,
+                    serde_json::to_value(metadata).map_err(S::Error::custom)?,
+                );
+            }
             SessionEntryType::ModelChange { provider, model_id } => {
                 map.insert("provider".to_string(), json!(provider));
                 map.insert("modelId".to_string(), json!(model_id));
@@ -392,6 +632,10 @@ pub struct SessionManager {
     entries: Vec<SessionEntry>,
     by_id: HashMap<String, usize>,
     leaf_id: Option<String>,
+    /// `branch()` deliberately selects an in-memory historical leaf.  A normal
+    /// append follows the latest durable leaf so separate long-lived managers
+    /// cannot fork a session; the pin lasts for that one explicit branch append.
+    leaf_pinned: bool,
     /// 会话 id（header 字段与文件名来源）。Phase 2a 无读取方，契约保留。
     #[allow(dead_code)]
     session_id: String,
@@ -484,14 +728,16 @@ impl SessionManager {
         let mut handle = singularity_core::create_owner_only_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
+        let append_lock = append_lock_for(&file);
         Ok(Self {
             file,
             cwd,
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            leaf_pinned: false,
             session_id,
-            append_lock: Arc::new(Mutex::new(())),
+            append_lock,
         })
     }
 
@@ -501,6 +747,18 @@ impl SessionManager {
     /// 文件不存在或为空时按 Pi 语义创建新会话并写入 header；非空但无法解析为合法
     /// pi session 时报错。
     pub fn open(path: &Path) -> Result<Self> {
+        // Readers share the same process-local append lock as writers. This keeps
+        // settings/history/reopen paths from observing a partially written JSONL
+        // line while a long-lived turn appends an entry.
+        let append_lock = append_lock_for(path);
+        let _guard = lock_append(&append_lock);
+        Self::open_unlocked(path)
+    }
+
+    /// Open a session while the caller already owns its per-file append lock.
+    /// This is used by append refresh to avoid recursively locking a non-reentrant
+    /// mutex.
+    fn open_unlocked(path: &Path) -> Result<Self> {
         let file = path.to_path_buf();
         let metadata = match std::fs::symlink_metadata(&file) {
             Ok(metadata) => metadata,
@@ -545,14 +803,16 @@ impl SessionManager {
             by_id.insert(entry.id.clone(), index);
             leaf_id = Some(entry.id.clone());
         }
+        let append_lock = append_lock_for(&file);
         Ok(Self {
             file,
             cwd,
             entries,
             by_id,
             leaf_id,
+            leaf_pinned: false,
             session_id,
-            append_lock: Arc::new(Mutex::new(())),
+            append_lock,
         })
     }
 
@@ -574,14 +834,16 @@ impl SessionManager {
             .open(file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
+        let append_lock = append_lock_for(file);
         Ok(Self {
             file: file.to_path_buf(),
             cwd,
             entries: Vec::new(),
             by_id: HashMap::new(),
             leaf_id: None,
+            leaf_pinned: false,
             session_id,
-            append_lock: Arc::new(Mutex::new(())),
+            append_lock,
         })
     }
 
@@ -595,9 +857,78 @@ impl SessionManager {
         self.append_entry(SessionEntryType::Compaction(entry))
     }
 
+    /// 追加不进入模型上下文的 metadata。所有 lifecycle/settings/usage/item
+    /// 持久化都经过这一条 append seam，沿用同一 append lock 与 flush 边界。
+    pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
+        // 重新走构造器校验，避免未来新增的公开字段绕过 settings 脱敏约束。
+        let metadata = SessionMetadata::new(metadata.kind, metadata.fields)?;
+        self.append_entry(SessionEntryType::Metadata(metadata))
+    }
+
+    /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。
+    /// 已有终态的 turn 不重复追加；该方法不执行任何工具，也不自动重放请求。
+    pub fn repair_interrupted_turns(&mut self) -> Result<usize> {
+        let path = self.session_path();
+        let mut started = HashSet::new();
+        let mut terminal = HashSet::new();
+        for &entry_index in &path {
+            let SessionEntryType::Metadata(metadata) = &self.entries[entry_index].entry_type else {
+                continue;
+            };
+            let Some(turn_id) = metadata.turn_id() else {
+                continue;
+            };
+            match metadata.kind() {
+                SessionMetadataKind::TurnStarted => {
+                    started.insert(turn_id.to_string());
+                }
+                SessionMetadataKind::TurnCompleted
+                | SessionMetadataKind::TurnFailed
+                | SessionMetadataKind::TurnInterrupted => {
+                    terminal.insert(turn_id.to_string());
+                }
+                _ => {}
+            }
+        }
+        let mut repaired = 0;
+        for turn_id in started {
+            if terminal.contains(&turn_id) {
+                continue;
+            }
+            self.append_metadata(SessionMetadata::turn_interrupted(
+                turn_id,
+                "session reopened with an incomplete turn",
+                true,
+            ))?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    /// 返回当前 leaf 路径上的 metadata，供索引修复和公开投影读取；调用方不应
+    /// 将这些条目直接作为模型消息。
+    pub fn metadata_entries(&self) -> Vec<SessionMetadata> {
+        self.session_path()
+            .into_iter()
+            .filter_map(|index| match &self.entries[index].entry_type {
+                SessionEntryType::Metadata(metadata) => Some(metadata.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn append_entry(&mut self, entry_type: SessionEntryType) -> Result<String> {
         let (id, entry) = {
-            let _guard = lock_append(&self.append_lock);
+            let append_lock = Arc::clone(&self.append_lock);
+            let _guard = lock_append(&append_lock);
+            // A long-lived app-server may open a second SessionManager for
+            // thread/settings while the turn worker still owns its manager.
+            // Refresh under the shared per-file lock so the next parentId
+            // follows the latest durable leaf instead of creating a branch
+            // from stale in-memory state.
+            if !self.leaf_pinned {
+                self.refresh_from_disk_locked()?;
+            }
             let id = generate_id(|candidate| self.by_id.contains_key(candidate));
             let entry = SessionEntry {
                 id: id.clone(),
@@ -619,7 +950,24 @@ impl SessionManager {
         self.by_id.insert(id.clone(), self.entries.len());
         self.entries.push(entry);
         self.leaf_id = Some(id.clone());
+        self.leaf_pinned = false;
         Ok(id)
+    }
+
+    fn refresh_from_disk_locked(&mut self) -> Result<()> {
+        let refreshed = Self::open_unlocked(&self.file)?;
+        if refreshed.session_id != self.session_id {
+            return Err(SessionError::InvalidSession(format!(
+                "session header id {} does not match current session {}",
+                refreshed.session_id, self.session_id
+            )));
+        }
+        self.cwd = refreshed.cwd;
+        self.entries = refreshed.entries;
+        self.by_id = refreshed.by_id;
+        self.leaf_id = refreshed.leaf_id;
+        self.leaf_pinned = false;
+        Ok(())
     }
 
     /// 将 leaf 指针移动到指定条目；下次追加将成为该条目的子条目（Pi `branch`）。
@@ -629,6 +977,7 @@ impl SessionManager {
             return Err(SessionError::EntryNotFound(at_entry_id.to_string()));
         }
         self.leaf_id = Some(at_entry_id.to_string());
+        self.leaf_pinned = true;
         Ok(())
     }
 
@@ -749,6 +1098,7 @@ impl SessionManager {
                     provider_reasoning_replay: None,
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
+                    is_error: Some(true),
                     timestamp: None,
                 }))?;
                 repaired += 1;
@@ -963,6 +1313,7 @@ fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
             ),
         )],
         SessionEntryType::Custom(_)
+        | SessionEntryType::Metadata(_)
         | SessionEntryType::ModelChange { .. }
         | SessionEntryType::ThinkingLevelChange { .. }
         | SessionEntryType::Other(_) => Vec::new(),
@@ -1221,6 +1572,10 @@ fn strict_entry_from_value(value: &Value) -> std::result::Result<SessionEntry, S
         Some("custom") => SessionEntryType::Custom(
             serde_json::from_value(value.clone())
                 .map_err(|error| format!("invalid custom payload: {error}"))?,
+        ),
+        Some("metadata") => SessionEntryType::Metadata(
+            serde_json::from_value(metadata_payload(value))
+                .map_err(|error| format!("invalid metadata payload: {error}"))?,
         ),
         Some("model_change") => {
             let wire: ModelChangeWire = serde_json::from_value(value.clone())
@@ -1616,6 +1971,20 @@ fn merge_v3_tool_call_batches(entries: &mut Vec<Value>) -> Result<()> {
     Ok(())
 }
 
+fn append_lock_for(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
 fn lock_append(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
     match lock.lock() {
         Ok(guard) => guard,
@@ -1744,6 +2113,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -1757,6 +2127,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: Some(1_700_000_000_001),
         }
     }
@@ -1770,6 +2141,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
+            is_error: None,
             timestamp: Some(1_700_000_000_002),
         }
     }
@@ -2223,6 +2595,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2271,6 +2644,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2423,6 +2797,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2530,6 +2905,7 @@ mod tests {
                 provider_reasoning_replay: Some(replay.clone()),
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             })
             .unwrap();
@@ -2728,5 +3104,97 @@ mod tests {
         let error = atomic_replace_file(&missing_temporary, &original).unwrap_err();
         assert!(!error.to_string().is_empty());
         assert_eq!(std::fs::read(&original).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn metadata_round_trip_is_durable_but_never_enters_model_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let mut manager =
+            SessionManager::create_with_id(dir.path(), &sessions, &Uuid::now_v7().to_string())
+                .unwrap();
+        manager
+            .append_metadata(SessionMetadata::turn_started("turn-1"))
+            .unwrap();
+        manager
+            .append_metadata(
+                SessionMetadata::thread_settings(
+                    "openai_compatible",
+                    "gpt-test",
+                    Some("medium".to_string()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manager.append_message(user("visible")).unwrap();
+        let reopened = SessionManager::open_existing(manager.path()).unwrap();
+        let metadata = reopened.metadata_entries();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].kind(), SessionMetadataKind::TurnStarted);
+        assert_eq!(metadata[1].field_string("model"), Some("gpt-test"));
+        assert!(
+            metadata
+                .iter()
+                .all(|entry| entry.field("parentId").is_none())
+        );
+        let context = reopened.build_session_context().unwrap();
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.messages[0].content, "visible");
+    }
+
+    #[test]
+    fn separate_session_managers_follow_the_latest_durable_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session_id = Uuid::now_v7().to_string();
+        let file = sessions.join(format!("{session_id}.jsonl"));
+        let mut first = SessionManager::create_with_id(dir.path(), &sessions, &session_id).unwrap();
+        first.append_message(user("first")).unwrap();
+        let mut second = SessionManager::open_existing(&file).unwrap();
+        second
+            .append_metadata(SessionMetadata::turn_started("turn-1"))
+            .unwrap();
+        first.append_message(assistant("second")).unwrap();
+
+        let reopened = SessionManager::open_existing(&file).unwrap();
+        let context = reopened.build_session_context().unwrap();
+        assert_eq!(context.messages.len(), 2);
+        assert_eq!(context.messages[0].content, "first");
+        assert_eq!(context.messages[1].content, "second");
+        assert_eq!(reopened.metadata_entries().len(), 1);
+    }
+
+    #[test]
+    fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session_id = Uuid::now_v7().to_string();
+        let file = sessions.join(format!("{session_id}.jsonl"));
+        let mut manager =
+            SessionManager::create_with_id(dir.path(), &sessions, &session_id).unwrap();
+        manager
+            .append_metadata(SessionMetadata::turn_started("turn-1"))
+            .unwrap();
+        drop(manager);
+
+        let mut reopened = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened.repair_interrupted_turns().unwrap(), 1);
+        drop(reopened);
+        let mut reopened_again = SessionManager::open_existing(&file).unwrap();
+        assert_eq!(reopened_again.repair_interrupted_turns().unwrap(), 0);
+        let metadata = reopened_again.metadata_entries();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[1].kind(), SessionMetadataKind::TurnInterrupted);
+        assert!(metadata[1].synthetic());
+    }
+
+    #[test]
+    fn thread_settings_reject_sensitive_fields() {
+        let mut fields = Map::new();
+        fields.insert("provider".to_string(), json!("openai_compatible"));
+        fields.insert("model".to_string(), json!("gpt-test"));
+        fields.insert("apiKey".to_string(), json!("do-not-persist"));
+        let error = SessionMetadata::new(SessionMetadataKind::ThreadSettings, fields).unwrap_err();
+        assert!(error.to_string().contains("sensitive"));
     }
 }

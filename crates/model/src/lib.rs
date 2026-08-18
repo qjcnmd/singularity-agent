@@ -302,6 +302,19 @@ impl ProviderReasoningReplay {
         self.validate().is_ok()
     }
 
+    /// Check the private replay binding without exposing its opaque payload. The
+    /// agent uses this gate when a persisted thread switches provider/model.
+    pub fn is_compatible_with(
+        &self,
+        provider_name: &str,
+        model_name: &str,
+        reasoning_effort: &str,
+        mode: ProviderToolReasoningMode,
+    ) -> bool {
+        self.validate_for(provider_name, model_name, reasoning_effort, mode)
+            .is_ok()
+    }
+
     /// Validate the replay against one selected provider/model/variant and mode.
     pub(crate) fn validate_for(
         &self,

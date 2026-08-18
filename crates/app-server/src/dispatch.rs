@@ -100,6 +100,7 @@ impl AppServer {
             Method::ThreadStart => self.thread_start(message),
             Method::SessionRead => self.session_read(message),
             Method::SessionDelete => self.session_delete(message),
+            Method::ThreadSettings => self.thread_settings(message),
             Method::TurnStart => self.turn_start(message),
             Method::TurnSteer => self.turn_steer(message),
             Method::TurnFollowUp => self.turn_follow_up(message),
@@ -148,6 +149,15 @@ impl AppServer {
                     available: true,
                     auth_token_required: false,
                 }],
+                protocol_version: "1".to_string(),
+                features: vec![
+                    "item_lifecycle".to_string(),
+                    "tool_items".to_string(),
+                    "thread_settings".to_string(),
+                    "interrupted_recovery".to_string(),
+                    "usage_history_projection".to_string(),
+                    "thinking_projection".to_string(),
+                ],
             },
         )
     }
@@ -186,6 +196,70 @@ impl AppServer {
             message.required_id(),
             ThreadResult {
                 thread: self.project_thread(&record),
+            },
+        )
+    }
+
+    pub(super) fn thread_settings(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        let params: ThreadSettingsParams = parse_params(&message)?;
+        let record = match self.store.get_session(&params.thread_id) {
+            Ok(record) => record,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (current_provider, current_model, current_reasoning) =
+            split_model_selector(record.model.as_deref());
+        let changed =
+            params.provider.is_some() || params.model.is_some() || params.reasoning.is_some();
+        let provider = params
+            .provider
+            .or(current_provider)
+            .unwrap_or_else(|| "openai_compatible".to_string());
+        let model = params.model.or(current_model);
+        let reasoning = params.reasoning.or(current_reasoning);
+        let Some(model) = model.filter(|model| !model.trim().is_empty()) else {
+            return invalid_params_response(message.required_id());
+        };
+        if provider.trim().is_empty()
+            || provider.chars().any(char::is_whitespace)
+            || model.chars().any(char::is_whitespace)
+            || reasoning.as_deref().is_some_and(|value| {
+                value.trim().is_empty() || value.chars().any(char::is_whitespace)
+            })
+        {
+            return invalid_params_response(message.required_id());
+        }
+        let selector = compose_model_selector(&provider, &model, reasoning.as_deref());
+        self.validate_model_selector(Some(&selector))?;
+        if changed {
+            let settings = singularity_agent::session::SessionMetadata::thread_settings(
+                provider.clone(),
+                model.clone(),
+                reasoning.clone(),
+            )?;
+            let mut session = self.open_session_for_thread(&thread_from_record(&record))?;
+            session.append_metadata(settings)?;
+            self.store.update_session(
+                &record.session_id,
+                SessionMetadataUpdate {
+                    model: Some(Some(&selector)),
+                    ..SessionMetadataUpdate::default()
+                },
+            )?;
+        }
+        json_response(
+            message.required_id(),
+            ThreadSettingsResult {
+                thread_id: record.session_id,
+                provider: Some(provider),
+                model: Some(model),
+                reasoning,
+                updated: changed,
             },
         )
     }
@@ -246,12 +320,21 @@ impl AppServer {
         if !(1..=200).contains(&params.recent_limit) {
             return invalid_params_response(message.required_id());
         }
-        let filter = match params.entry_types.as_slice() {
-            [] => SessionEntryFilter::All,
-            [kind] if kind == "message" => SessionEntryFilter::Messages,
-            [kind] if kind == "compaction" => SessionEntryFilter::Compactions,
-            _ => return invalid_params_response(message.required_id()),
-        };
+        if params.kinds.iter().any(|kind| {
+            !matches!(
+                kind.as_str(),
+                "message"
+                    | "thinking"
+                    | "tool_call"
+                    | "tool_result"
+                    | "turn"
+                    | "settings"
+                    | "usage"
+                    | "compaction"
+            )
+        }) {
+            return invalid_params_response(message.required_id());
+        }
         let record = match self.store.get_session(&params.session_id) {
             Ok(record) => record,
             Err(StoreError::NotFound(_)) => {
@@ -269,7 +352,7 @@ impl AppServer {
                 &record.session_id,
                 &SessionReadOptions {
                     recent_limit: params.recent_limit as usize,
-                    filter,
+                    filter: SessionEntryFilter::All,
                     range,
                 },
             )
@@ -277,8 +360,21 @@ impl AppServer {
         let recent_entries = read
             .entries
             .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()?;
+            .flat_map(project_public_history)
+            .filter(|item| {
+                params.kinds.is_empty()
+                    || params.kinds.iter().any(|kind| match item {
+                        HistoryItem::Message { .. } => kind == "message",
+                        HistoryItem::Thinking { .. } => kind == "thinking",
+                        HistoryItem::ToolCall { .. } => kind == "tool_call",
+                        HistoryItem::ToolResult { .. } => kind == "tool_result",
+                        HistoryItem::Turn { .. } => kind == "turn",
+                        HistoryItem::Settings { .. } => kind == "settings",
+                        HistoryItem::Usage { .. } => kind == "usage",
+                        HistoryItem::Compaction { .. } => kind == "compaction",
+                    })
+            })
+            .collect::<Vec<_>>();
         // 与 thread/list、thread/resume 复用同一 last-turn 投影，
         // 三个读取接口不得显示互相矛盾的状态。
         let status = self

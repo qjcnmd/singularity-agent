@@ -832,6 +832,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: None,
         }
     }
@@ -845,6 +846,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: None,
         }
     }
@@ -858,6 +860,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: Some(call_id.to_string()),
             tool_name: Some("bash".to_string()),
+            is_error: None,
             timestamp: None,
         }
     }
@@ -873,6 +876,7 @@ mod tests {
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
+            is_error: None,
             timestamp: None,
         }
     }
@@ -1115,6 +1119,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             },
             AgentMessage {
@@ -1125,6 +1130,7 @@ mod tests {
                 provider_reasoning_replay: None,
                 tool_call_id: None,
                 tool_name: None,
+                is_error: None,
                 timestamp: None,
             },
             user(""),

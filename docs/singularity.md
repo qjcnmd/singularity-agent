@@ -6,11 +6,11 @@
 
 ## 1. 总览与进程架构（图 a）
 
-采用 Codex 进程模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，每命令独立子进程，连接内单 worker 顺序处理，无业务状态）+ 全部客户端走同一协议。业务状态（历史、输入组装、工具装配）全部下沉到 core。
+采用 Codex 进程模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，单客户端连接可长驻，连接内单 turn worker 与有界 writer）+ 全部客户端走同一协议。会话正文由 JSONL 持久化，SQLite 只保存索引投影；运行时只保留当前连接所需的活动句柄和有界终态引用。
 
 - **headless core**：AgentLoop（Pi 式 runLoop）、SessionManager（JSONL 树）、Compaction、工具注册表（ToolSpec 单一事实源）、消息与事件流、资源加载（AGENTS.md 无条件逐层加载）、Provider 边界（trait Provider）。
-- **app-server**：JSON-RPC（JSONL framing）；命令/事件协议收敛为 Pi RPC 级命令集 + 事件流；无 7 态 Turn、无 trace 合同、无 cursor/gap/背压/全局排序、无 16-worker 池。
-- **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**（JSON-Lines），无 TCP daemon、无连接复用、无空闲自停；未来 Desktop 可嵌入 core 或经同一协议启动 stdio 子进程。
+- **app-server**：JSON-RPC（JSONL framing）；命令/事件协议包含 thread/turn/item 生命周期、公开 history projection、settings、usage 与 capabilities；输出队列有界，满时阻塞，不主动丢事件。
+- **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**；Desktop 可保持一个长驻 stdio 连接并在同一进程中执行多轮、切换设置、取消和重连。没有 TCP daemon、cursor/gap replay 或独立 Desktop UI。
 - **客户端**：`sg` CLI（一次性 stdio 子进程客户端）；未来 Desktop 同协议、同配置、同会话。
 - **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1-*.json`（私有认证文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 不依赖 evaluation。
@@ -21,7 +21,7 @@ flowchart LR
         CLI["sg CLI<br/>(子进程协议客户端)"]
         Dsk["未来 Desktop"]
     end
-    Svr["app-server<br/>stdio JSON-RPC (JSONL)<br/>每命令独立子进程<br/>无业务状态"]
+    Svr["app-server<br/>stdio JSON-RPC (JSONL)<br/>长驻连接 + 单 turn worker<br/>有界 writer"]
     subgraph Core["headless core（库）"]
         Loop["AgentLoop<br/>(Pi 式 runLoop)"]
         SM["SessionManager<br/>(JSONL 树)"]
@@ -55,7 +55,7 @@ flowchart LR
 
 ## 2. 主调用链（图 b）
 
-`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → LSP 式握手（initialize/initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（goal 交给 core）→ core 逐层加载项目指令（root→cwd）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用 → 事件实时回传客户端 → 消息终态追加到会话 JSONL → 索引更新状态与 usage。`sg continue` 通过索引定位并重开既有会话文件，走同一条链。
+`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → 握手（initialize/initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（先追加 `turn_started` metadata，再把 goal 交给 core）→ core 逐层加载项目指令（root→cwd）与历史（buildContextEntries）→ AgentLoop 运行 → provider 调用和工具事件实时回传客户端 → 终态消息、terminal metadata、usage 追加到 JSONL → SQLite 更新索引 → 发布 item/turn 终态事件。`sg continue` 和 Desktop 重连都通过索引定位并重开既有会话文件，继续操作追加新 turn。
 
 ```mermaid
 sequenceDiagram
@@ -73,11 +73,13 @@ sequenceDiagram
     loop 回合内
         C->>P: completion / 流式请求
         P-->>C: 流式响应 / usage
-        C->>F: 消息终态 (message_end) 追加一行
-        C-->>S: 事件流（message / tool / turn / agent 事件）
+        C->>F: 终态 message/toolResult 追加一行
+        C-->>S: item/tool execution 实时事件
         S-->>CLI: 事件流（实时渲染）
     end
-    C-->>S: 回合终态（agent_end）
+    C->>F: turn terminal + usage metadata
+    S->>S: 更新 SQLite projection
+    S-->>CLI: item terminal + turn terminal
     S-->>CLI: turn 完成响应
 ```
 
@@ -152,22 +154,22 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式语义对齐 Pi（裁决 10）：JSONL 树（v4），每个 entry 有 `id` 与 `parentId`（带时间戳），七类消息 role（user / assistant / toolResult / bashExecution / custom / branchSummary / compactionSummary），compaction entry，打开时 v1/v2/v3→v4 迁移（迁移即重写文件）。v4 起消息 `content` 为内容块数组（`text` / `thinking` / `tool_call`），一次模型响应 = 一条 assistant 消息（对齐 Pi `AssistantMessage.content`）；工具结果按 `toolCallId` 关联的独立 toolResult 消息回写；thinking 块随会话持久化，续接时从最后一条 assistant 消息投影 provider reasoning replay（N2）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint；进程退出即中断，重开会话即继续，可写重开时对崩溃遗留的孤立 tool call 补 synthetic failed ToolResult（不重新执行工具）。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage，不保存对话正文。
+会话格式语义对齐 Pi（裁决 10）：JSONL 树（v4），每个 entry 有 `id` 与 `parentId`（带时间戳），消息 role 为 user / assistant / toolResult 等，另有 compaction 和不进入模型上下文的 metadata entry。metadata 类型包括 `turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`、`thread_settings`、`usage` 与最终 item 事实；它们与消息共享同一 append seam，不构成第二事实源。v4 起消息 `content` 为内容块数组（`text` / `thinking` / `tool_call`），一次模型响应 = 一条 assistant 消息；工具结果按 `toolCallId` 关联的独立 toolResult 消息回写，并持久化 `isError` 语义；thinking 块随会话持久化，续接时仅在 provider/model/reasoning binding 兼容时投影 provider-private replay（不兼容时丢弃私有 replay，保留可见 thinking/message/tool history）。存放于 `~/.singularity/sessions/<uuid>.jsonl`（header UUID 即 session id），迁移旧项目 `.singularity/agent-sessions/` 时先备份到 `~/.singularity/backups/` 并校验。**会话 JSONL 是唯一持久事实源**：无 checkpoint、无 cursor/gap replay；重开时对未终态的 `turn_started` 只追加一次 synthetic `turn_interrupted`，对孤立 tool call 补 synthetic failed ToolResult，均不重新执行工具。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage 等轻量投影，不保存对话正文。
 
-- 落盘时机：turn 启动先把当前 user 消息追加 JSONL；随后只有终态 assistant/toolResult/compaction 消息追加 JSONL，流式 delta 不落盘。进程崩溃时已追加的 user/assistant tool-call 条目保留，不存在的回合不写入状态。
+- 落盘时机：turn 启动先把 `turn_started` metadata 和当前 user 消息追加 JSONL；随后只有终态 assistant/toolResult/compaction 消息、turn terminal metadata 和标准化 usage 追加 JSONL，流式 delta 不落盘。终态发布顺序固定为 JSONL → SQLite → 协议通知。进程崩溃时已追加的 user/assistant tool-call 条目保留，不存在的回合不写入状态。
 - 追加即推进 leaf；**分支只移动 leaf 指针**，不删除、不改写既有条目。
 - 恢复：重开文件 → 逐行解析 + 版本迁移 → `repair_orphaned_tool_calls`（有 tool_call_id 但无后续 ToolResult 的 assistant 条目，追加 synthetic failed ToolResult：`[previous execution outcome unknown; do not retry]`；不重写/删除原条目、绝不重新执行工具）→ `buildContextEntries`（取路径中最近 compaction entry：`[compaction 摘要]` + `firstKeptEntryId` 起的原始条目；被总结的旧条目从 context 省略但保留在文件）→ `buildSessionContext` 转 LLM 消息。
-- 事件条目不进 context（custom / label / model_change / thinking_level_change / session_info 只作树内记录）。
-- `session_index.status` 只表示 turn 状态：尚无 turn 时为 null（缺失值），turn 运行中为 active，终态为 completed/failed/interrupted；`sg continue`/resume 不改变它，继续成功与否由真实 JSONL 内容决定。崩溃遗留的 active 行在读取侧投影为 interrupted（仅当本进程存在该会话的存活 turn 时才报告 active），读取不回写索引；`thread/list`、`thread/resume`、`session/read` 复用同一投影，不显示互相矛盾的状态。
+- metadata、custom、label、model_change、thinking_level_change、session_info 等非消息条目不进模型 context；公开 `session/read` 只返回稳定的 message/thinking/tool_call/tool_result/turn/settings/usage/compaction projection，不返回 raw SessionEntry、parent/tree、迁移字段或 provider-private replay。`session_index.status` 只表示 turn 状态：尚无 turn 时为 null（缺失值），turn 运行中为 active，终态为 completed/failed/interrupted；启动扫描会从 JSONL 修复 active/usage/model 的 SQLite 投影。`sg continue`/resume 不改变终态，继续操作总是新 turn。
 
 ```mermaid
 flowchart TD
-    A(["消息达到终态 (message_end)"]) --> B["appendMessage<br/>追加 JSONL 一行<br/>(id / parentId / 时间戳)"]
+    A(["turn/item 达到终态"]) --> B["append JSONL metadata/message<br/>(id / parentId / 时间戳)"]
     B --> C["leaf 指向新条目"]
     C --> D["进程退出<br/>(回合中断, 无 checkpoint)"]
     D --> E["重开会话文件<br/>(sg continue / 恢复)"]
     E --> F["逐行解析 + 版本迁移<br/>(v1/v2/v3 到 v4, 打开时重写)"]
-    F --> F2["repair_orphaned_tool_calls<br/>孤立 tool call → synthetic failed ToolResult<br/>(unknown / do not retry, 不重新执行)"]
+    F --> F1["repair_interrupted_turns<br/>未终态 turn_started → synthetic turn_interrupted<br/>(只追加一次, 不重放)"]
+    F1 --> F2["repair_orphaned_tool_calls<br/>孤立 tool call → synthetic failed ToolResult<br/>(unknown / do not retry, 不重新执行)"]
     F2 --> G["buildContextEntries<br/>[compaction 摘要] + [firstKeptEntryId 起条目]"]
     G --> H["buildSessionContext<br/>entry 转 LLM 消息"]
     H --> I["继续回合"]
@@ -214,7 +216,7 @@ flowchart TD
 
 ## 7. 取消/中断传播（图 g）
 
-`turn/interrupt` → app-server → core `abort()` → 取消进行中的 provider HTTP 请求 + 杀死工具子进程树 → 回合以 aborted 终态收尾（已落盘条目保留，运行中未完成的工具不补成功结果）。中断前工具已产生的 workspace 副作用不回滚（照 Pi：取消不宣称回滚副作用）。
+`turn/interrupt` → app-server → core `abort()` → 取消进行中的 provider HTTP 请求 + 杀死工具子进程树 → 回合以 `interrupted`/`cancelled` 终态收尾（已落盘条目保留，运行中未完成的工具只产生失败/未知说明，不补成功结果）。中断前工具已产生的 workspace 副作用不回滚（照 Pi：取消不宣称回滚副作用）。
 
 ```mermaid
 sequenceDiagram
@@ -228,8 +230,8 @@ sequenceDiagram
     C->>P: 取消进行中的 HTTP 请求
     C->>T: 杀整个进程树
     T-->>C: 子进程终止
-    C-->>S: 回合以 aborted 终态收尾
-    S-->>U: 终态事件 (message_end / turn_end / agent_end)
+    C-->>S: 回合以 interrupted 终态收尾
+    S-->>U: item terminal + turn/error 或 turn/completed
 ```
 
 （图 g：取消/中断传播）
@@ -279,17 +281,17 @@ flowchart LR
 
 ## 11. 客户端与协议
 
-**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）、`sg eval`。`sg turn status/pause/resume/input`、`thread/read/fork/archive/delete` 与 `sg trust` 已删除。未来 Desktop 嵌入 core 或走同一 stdio 协议。
+**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程；Desktop 可保持同一连接长驻。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）、`sg eval`。`sg turn status/pause/resume/input`、`thread/read/fork/archive/delete` 与 `sg trust` 已删除。Desktop UI 不在本仓库实现，只消费同一 headless core/app-server 协议。
 
 **JSON-RPC 传输合同**（stdio JSON-Lines framing）：
 
 - 每行一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。
 - 所有 envelope 带 `jsonrpc: "2.0"`，由互斥的 request / notification / success / error 表示；request id 只接受字符串或可精确表示的 JSON 整数，`null` 仅用于服务端无法关联合法请求时的 response/error id；error envelope 不允许省略 `id`；响应按解析后的合法 id 关联。
-- 错误码：`-32700`（解析失败）、`-32600`（无效请求）、`-32601`（未知方法）、`-32602`（无效参数）、`-32603`（内部错误）。错误诊断原则（§9 方案 A）：`-32603` 透出保留真实因果的脱敏文本（如 DB/锁/provider 错误原文），文本疑似含密钥时回退 `Internal error`；`data` 仅允许显式脱敏内容。
+- 错误码：`-32700`（解析失败）、`-32600`（无效请求）、`-32601`（未知方法）、`-32602`（无效参数）、`-32603`（内部错误）、`-32007`（协商能力缺失/unsupported）。错误诊断原则（§9 方案 A）：`-32603` 透出保留真实因果的脱敏文本（如 DB/锁/provider 错误原文），文本疑似含密钥时回退 `Internal error`；`data` 仅允许显式脱敏内容。
 - batch 没有 stdio 消费者；transport 对 batch frame 直接返回 `-32600` 拒绝。
 - 方法注册表（method 名、params/result schema）是命令合同的唯一事实源。
 
-**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入并返回 outcome=active，turn 已终态则入 thread 待办、下次 `turn/start` 取走并返回 outcome=queued（Pi 式，不拒绝），未知 turn 返回 not found。`session/read` 有界解析并默认返回摘要 + 最近 20 条路径条目，不返回全文；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；start/update 携带 `toolCallId`、`toolName`、`args`，update 另带 `partialResult`，end 携带结构化 `result` 与 `isError`）；`item/completed` 类型在协议中保留但当前 loop 不发（第一段 delta 只发 started）。**会话 JSONL 是唯一持久记录**。
+**命令/事件集（当前实现）**：initialize/initialized、server/capabilities、thread/start、thread/list、thread/resume、thread/settings、session/read、session/delete、turn/start、turn/steer、turn/followUp、turn/interrupt、agent/capability、server/shutdown。turn/steer 与 turn/followUp 为 thread 级队列：有 turn 在跑实时注入并返回 outcome=active，turn 已终态则入 thread 待办、下次 `turn/start` 取走并返回 outcome=queued（Pi 式，不拒绝），未知 turn 返回 not found。`thread/settings` 只持久化非敏感 provider/model/reasoning 选择，当前 turn 使用启动时快照，下一 turn 生效。`server/capabilities` 返回 protocolVersion 和固定 feature list；缺失能力按 typed unsupported 处理。`session/read` 有界解析并返回公开 history items（message/thinking/tool_call/tool_result/turn/settings/usage/compaction），不返回 raw SessionEntry、全文 delta 或 private replay；CLI 通过显式 `sg run --session-reference <id>` 把该结果投影为 untrusted reference material（仅 user/assistant/toolResult 字符串文本，带来源 id、non-instructional 声明、16 KiB/4096 token 硬上限），当前请求用独立 `CURRENT REQUEST` 边界分隔；目标文本不做隐式语言解析。实际发出的事件为 thread/started、turn/started、item/started、item/agentMessage/delta、item/completed、item/failed、turn/completed、turn/error（失败 turn 的 turn 级终态，携带 typed stage/cause、脱敏 message 与 willRetry，对齐 Codex ErrorNotification）、tool/execution/start、tool/execution/update、tool/execution/end（工具生命周期，对齐 Pi tool_execution_start/_update/_end；start/update 携带 `toolCallId`、`toolName`、`args`，update 另带 `partialResult`，end 携带结构化 `result` 与 `isError`）。每个 started item 恰有一个 terminal；并行工具按完成顺序发布事件，ToolResult 按模型 source order 写入 JSONL。**会话 JSONL 是唯一持久记录**。
 
 **客户端失败语义**：CLI 用 typed params/result 与 JsonRpcId 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、子进程退出、超时、非法 envelope 与 JSON-RPC error 均为非零退出。防御细节：残留子进程可能直写非 JSON 行（含 lossy 替换后的坏字节），客户端跳过非 JSON 行不终止协议（真正的 response 行仍被解析）；客户端事件投影只保留各事件合同字段，不透传未知 envelope 字段。
 
@@ -297,7 +299,7 @@ flowchart LR
 
 ### 12.1 脱敏与工具输出合同
 
-- 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id）；没有结构化 `ToolResult`/`preview` 投影层。
+- 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id），并在公开 history 中投影为带 `isError` 的 `tool_result` item；没有把流式 delta 永久化为独立事件。
 - bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），并按 tail 规则截断（最后 2000 行 / 50 KiB）；超限内容写入系统临时文件并通过 `fullOutputPath` 文本标记返回，不向模型发送原文件内容。read 单行 ≤ 4 MiB、单次扫描 ≤ 64 MiB，超限仅返回尾部与 `offset` 续读提示，不写临时文件。工具生命周期事件按 Pi 合同广播参数、partial result 与结构化 result；会话 `toolResult` 仍是 LLM 上下文的权威结果消息。
 - 工具结果文本不包含 provider 原始响应；raw tool arguments 同时存在于会话 assistant 的 `tool_call` 内容块 `args` 字段及 N7 工具生命周期事件，用于客户端关联与展示。不做受保护路径拒绝规则（对齐 Pi：工具信任后直接执行）；密钥边界由 provider 错误脱敏承担，不做统一的全文本 secret 扫描。
 
@@ -313,9 +315,9 @@ flowchart LR
 
 ### 12.3 会话落盘细节
 
-- 流式期间的消息 delta 不落盘；终态 user/assistant/toolResult/compaction 消息各追加一行。
+- 流式期间的消息 delta 不落盘；终态 user/assistant/toolResult/compaction 消息各追加一行，turn lifecycle/settings/usage 作为 metadata 追加到同一 JSONL。
 - turn 启动时当前 user 消息立即写盘（先于第一次模型请求），进程崩溃后重开会话可看到该 user 消息。
-- assistant tool-call 消息与其 toolResult 配对写盘；崩溃造成孤立 tool call 时，可写恢复路径先补 synthetic failed ToolResult（unknown / do not retry），不重写原条目、不重新执行工具。
+- `turn_started` 在 SQLite active 投影和 `turn/started` 通知之前写盘；terminal metadata 与 usage 在 SQLite 终态投影和终态通知之前写盘。assistant tool-call 消息与其 toolResult 配对写盘；崩溃造成孤立 tool call 时，可写恢复路径先补 synthetic failed ToolResult（unknown / do not retry），不重写原条目、不重新执行工具。metadata 永远不进入模型 context。
 
 ### 12.4 错误码与错误合同
 

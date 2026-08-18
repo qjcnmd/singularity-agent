@@ -56,6 +56,10 @@ use super::truncate::{
 /// 内部保留缓冲上限：2×50KB（对齐 Pi `maxOutputBytes`），防止单条超大输出撑爆内存；
 /// 超过该上限的部分只存在于完整输出临时文件。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
+/// Reader-to-capture queue bound. The main loop drains it continuously; a
+/// bounded queue prevents a fast producer from turning command output into an
+/// unbounded in-memory backlog while preserving the full-output spill path.
+const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 /// 完整输出临时文件名的随机后缀。
 const FULL_OUTPUT_FILE_PREFIX: &str = "bash-";
@@ -152,7 +156,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     };
     let stdout = child.stdout.take().expect("bash stdout is piped");
     let stderr = child.stderr.take().expect("bash stderr is piped");
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
     // 读取线程在 EOF 时自行退出；JoinHandle 直接丢弃（detach），不 join，
     // 避免被残留子进程持有的管道句柄无限阻塞。
@@ -273,7 +277,7 @@ enum BashOutcome {
 }
 
 /// 读取管道字节，清洗控制字符、去掉 `\r`，分块送入 channel（Pi `onChunk` 语义）。
-fn pump_output(mut reader: impl Read + Send + 'static, sender: mpsc::Sender<String>) {
+fn pump_output(mut reader: impl Read + Send + 'static, sender: mpsc::SyncSender<String>) {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         match reader.read(&mut buffer) {
@@ -381,8 +385,8 @@ fn find_bash_on_windows() -> Option<String> {
         .find(|candidate| Path::new(candidate).is_file())
 }
 
-/// 杀进程树：Windows 用 `taskkill /T /F`（含子进程），随后 `child.kill()` 兜底；
-/// 其他平台直接 kill 直接子进程（Phase 3 再引入平台级进程树枚举）。
+/// 杀进程树：Windows 用 `taskkill /T /F`，Unix 终止创建时绑定的进程组；
+/// 最后以 `Child::kill` 兜底，保证 shell 本身也会被回收。
 fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
@@ -391,6 +395,19 @@ fn kill_process_tree(child: &mut Child) {
         // stdout/stderr 全部指向 null，避免中断时污染协议帧。
         let _ = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // `CommandExt::process_group(0)` makes the shell the process-group
+        // leader. A negative pid targets that group, including descendants,
+        // without relying on a process-tree enumeration race.
+        let pid = child.id().to_string();
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -704,6 +721,48 @@ mod tests {
             result.content.contains("timed out after 300 ms"),
             "content: {}",
             result.content
+        );
+    }
+
+    #[test]
+    fn cancellation_terminates_shell_tree_promptly() {
+        let dir = tempdir().expect("temp dir");
+        let token = singularity_core::CancellationToken::new();
+        let worker_token = token.clone();
+        let cwd = dir.path().to_path_buf();
+        let command = if cfg!(windows) {
+            "ping -n 30 127.0.0.1".to_string()
+        } else {
+            // Keep a descendant alive so the Unix process-group path, rather
+            // than only Child::kill, is exercised.
+            "sleep 30 & wait".to_string()
+        };
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            ToolRegistry::new().execute(
+                "bash",
+                ExecuteContext {
+                    args: json!({"command": command}),
+                    cwd: &cwd,
+                    signal: Some(&worker_token),
+                    on_update: None,
+                    mutation_queue: None,
+                },
+            )
+        });
+        thread::sleep(Duration::from_millis(150));
+        token.cancel();
+        let result = worker.join().expect("bash worker").expect("execute");
+        assert!(result.is_error, "cancelled command must be an error");
+        assert!(
+            result.content.contains("Command aborted"),
+            "content: {}",
+            result.content
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation did not return promptly: {:?}",
+            started.elapsed()
         );
     }
 }

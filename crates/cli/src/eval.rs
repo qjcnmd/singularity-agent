@@ -1,6 +1,6 @@
 //! `sg eval` 轻量回归评估工具（裁决 2，独立于产品核心）。
 //!
-//! 固定任务集 × 模型列表（默认 5 题 × 2 模型 = 10 cell）全并行；每个 cell：
+//! 固定任务集 × 模型列表（默认 3 题 × 2 模型 = 6 cell）全并行；每个 cell：
 //! 干净 workspace 副本 → 子进程跑真实 `sg run --json`（禁止 mock）→ 收集会话
 //! 文件（rollout）+ turn usage → 独立运行 `checker.sh` 判分（exit 0=通过，
 //! 绝不采信 agent 自报）→ 聚合指标，按模型分组输出，结果 JSON 落盘。
@@ -8,7 +8,7 @@
 //! checker.sh 约定：exit 0 = 通过；exit 1 = 失败；exit 2 = 部分通过；
 //! 其他 exit = checker 异常（按失败处理并标记）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,7 +25,7 @@ const DEFAULT_CONFIG_PATH: &str = "evaluations/eval-config.json";
 /// 默认每 cell 超时（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// 默认并行度。
-const DEFAULT_MAX_PARALLEL: usize = 5;
+const DEFAULT_MAX_PARALLEL: usize = 6;
 /// checker.sh 运行超时。checker.sh 死循环或等待输入时不能无限占用 worker 线程
 /// （per-cell 的 DEFAULT_TIMEOUT_SECS 只作用于 sg run，不作用于 checker）。
 const CHECKER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -42,7 +42,7 @@ pub(crate) struct EvalConfig {
     /// 每 cell 超时秒数（可选，默认 1800）。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// 并行 cell 上限（可选，默认 5；超出部分排队等待）。
+    /// 并行 cell 上限（可选，默认 6；超出部分排队等待）。
     #[serde(default)]
     pub max_parallel: Option<usize>,
     /// 判分使用的 bash 可执行文件（可选；默认探测 Git for Windows 安装）。
@@ -206,7 +206,7 @@ pub(crate) fn run_eval(
         .map(|id| load_task(&tasks_root, id))
         .collect::<Result<_, _>>()?;
 
-    // 10 cell 全并行：线程池直接按 cell 数开线程（数量固定且很小）。
+    // 默认 6 cell 全并行：线程池直接按 cell 数开线程（数量固定且很小）。
     let started = Instant::now();
     let bash = config
         .bash_path
@@ -306,7 +306,26 @@ pub(crate) fn run_eval(
         );
     }
     println!("results: {}", results_path.display());
+    if has_failed_cells(&totals) {
+        return Err(format!(
+            "evaluation run {} contains failed cells (failed={} partial={} interrupted={} crashed={} timed_out={})",
+            run_dir.display(),
+            totals.failed,
+            totals.partial,
+            totals.interrupted,
+            totals.crashed,
+            totals.timed_out,
+        ));
+    }
     Ok(())
+}
+
+fn has_failed_cells(totals: &ModelAggregate) -> bool {
+    totals.failed > 0
+        || totals.partial > 0
+        || totals.interrupted > 0
+        || totals.crashed > 0
+        || totals.timed_out > 0
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -360,11 +379,51 @@ fn run_cells(
         for handle in handles {
             match handle.join() {
                 Ok(mut local) => results.append(&mut local),
-                Err(_) => eprintln!("eval cell thread panicked; results may be incomplete"),
+                Err(_) => eprintln!("eval cell thread panicked; missing cells will be crashed"),
             }
         }
         results
     });
+    // A worker panic can otherwise silently reduce the denominator and let an
+    // incomplete Evaluation appear successful. Materialize every missing
+    // (task, model) cell as `crashed`, preserving the multidimensional result
+    // contract and forcing run_eval's non-zero gate.
+    let present: HashSet<(String, String)> = results
+        .iter()
+        .map(|result| (result.task_id.clone(), result.model.clone()))
+        .collect();
+    for task in tasks {
+        for model in models {
+            if present.contains(&(task.id.clone(), model.clone())) {
+                continue;
+            }
+            let cell_dir = cells_dir.join(cell_slug(task, model));
+            fs::create_dir_all(&cell_dir)
+                .map_err(|error| format!("create crashed cell directory: {error}"))?;
+            let result = CellResult {
+                task_id: task.id.clone(),
+                model: model.clone(),
+                status: "crashed".to_string(),
+                checker_exit: None,
+                duration_secs: 0.0,
+                usage: None,
+                cache_hit_ratio: None,
+                tool_calls: 0,
+                tool_failures: 0,
+                retries: None,
+                duplicate_actions: 0,
+                breakdown_ms: Breakdown::default(),
+                cell_dir: cell_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cell_dir.display().to_string()),
+                checker_output: String::new(),
+                error: Some("cell worker returned no result".to_string()),
+            };
+            write_cell_artifacts(&result, &cell_dir, None, None, None)?;
+            results.push(result);
+        }
+    }
     // 按 (task, model) 稳定排序输出。
     results.sort_by(|a, b| {
         (a.task_id.as_str(), a.model.as_str()).cmp(&(b.task_id.as_str(), b.model.as_str()))
@@ -412,17 +471,34 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
         }
     };
 
-    // 2) 子进程跑真实 sg run 链路。
-    let run = run_sg(&task.instruction, model, &workspace_copy, timeout);
+    // 2) 每个 cell 使用独立的配置副本、JSONL session 目录和 SQLite 索引。
+    // 并行 cell 不能共享一个 app-server home：启动修复和 rollout leaf
+    // 都是按 home 作用域管理的，否则一个 cell 的 repair 会让另一个 cell
+    // 的 turn/thread 变成 stale。
+    let (cell_home, sessions_dir) = match prepare_cell_home() {
+        Ok(home) => home,
+        Err(error) => {
+            result.error = Some(error);
+            result.duration_secs = cell_started.elapsed().as_secs_f64();
+            let _ = write_cell_artifacts(&result, cell_dir, None, None, None);
+            let _ = fs::remove_dir_all(&task_copy);
+            return result;
+        }
+    };
 
-    // 3) 按 thread_id 精确复制 rollout（会话 JSONL）到 cell 目录存档；子进程继承
-    //    本进程环境，会话写入 `user_singularity_home()/sessions/<id>.jsonl` 同一路径。
-    let sessions_dir = singularity_core::user_singularity_home()
-        .unwrap_or_default()
-        .join("sessions");
+    // 3) 子进程跑真实 sg run 链路。
+    let run = run_sg(
+        &task.instruction,
+        model,
+        &workspace_copy,
+        timeout,
+        &cell_home,
+    );
+
+    // 4) 按 thread_id 精确复制 rollout（会话 JSONL）到 cell 目录存档。
     let rollout = copy_rollout(run.as_ref().ok(), &sessions_dir, cell_dir);
 
-    // 4) 独立 checker.sh 判分（exit 0 = 通过）：执行任务副本内的 checker.sh，
+    // 5) 独立 checker.sh 判分（exit 0 = 通过）：执行任务副本内的 checker.sh，
     // 其 `dirname $0` 解析到副本根，`cd 副本根/workspace` 检查模型修改后的副本。
     let checker = run_checker(
         bash,
@@ -432,7 +508,7 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
         CHECKER_TIMEOUT,
     );
 
-    // 5) 指标聚合。
+    // 6) 指标聚合。
     let usage = run.as_ref().ok().and_then(|sg| sg.turn_usage.clone());
     result.usage = usage.clone();
     result.cache_hit_ratio = usage.as_ref().and_then(cache_hit_ratio);
@@ -488,8 +564,83 @@ fn run_cell(task: &Task, model: &str, timeout: u64, bash: &str, cell_dir: &Path)
         checker.as_ref(),
         rollout.as_deref(),
     );
+    let _ = fs::remove_dir_all(&cell_home);
     let _ = fs::remove_dir_all(&task_copy);
     result
+}
+
+/// 为一个 Evaluation cell 复制最小 Provider 配置，避免并行 cell 共享
+/// session/index 状态；认证材料只存在于临时 home，最终 artifact 只保留 rollout。
+fn prepare_cell_home() -> Result<(PathBuf, PathBuf), String> {
+    static NEXT_CELL_HOME: AtomicUsize = AtomicUsize::new(0);
+    let source_home = singularity_core::user_singularity_home()
+        .ok_or_else(|| "failed to resolve evaluation home".to_string())?;
+    let sequence = NEXT_CELL_HOME.fetch_add(1, Ordering::Relaxed);
+    // Keep the home outside a repository boundary even when the process-level
+    // TEMP points at a tool-managed directory (the normal Windows setup here).
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|local| local.join("Temp").join("sg-eval"))
+        .unwrap_or_else(|| std::env::temp_dir().join("sg-eval"));
+    fs::create_dir_all(&base)
+        .map_err(|error| format!("create evaluation cell base {}: {error}", base.display()))?;
+    let root = base.join(format!(
+        "singularity-eval-cell-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)
+        .map_err(|error| format!("create evaluation cell home {}: {error}", root.display()))?;
+    let config = source_home.join("config.json");
+    if !config.is_file() {
+        let _ = fs::remove_dir_all(&root);
+        return Err(format!(
+            "evaluation home has no config.json: {}",
+            config.display()
+        ));
+    }
+    if let Err(error) = fs::copy(&config, root.join("config.json")) {
+        let _ = fs::remove_dir_all(&root);
+        return Err(format!("copy evaluation config: {error}"));
+    }
+    let entries = match fs::read_dir(&source_home) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(format!("read evaluation auth directory: {error}"));
+        }
+    };
+    let mut auth_count = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(format!("read evaluation auth entry: {error}"));
+            }
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("auth.v1-") && name.ends_with(".json") {
+            if let Err(error) = fs::copy(entry.path(), root.join(name.as_ref())) {
+                let _ = fs::remove_dir_all(&root);
+                return Err(format!("copy evaluation auth generation: {error}"));
+            }
+            auth_count += 1;
+        }
+    }
+    if auth_count == 0 {
+        let _ = fs::remove_dir_all(&root);
+        return Err(format!(
+            "evaluation home has no auth generation: {}",
+            source_home.display()
+        ));
+    }
+    let sessions = root.join("sessions");
+    if let Err(error) = fs::create_dir(&sessions) {
+        let _ = fs::remove_dir_all(&root);
+        return Err(format!("create evaluation sessions directory: {error}"));
+    }
+    Ok((root, sessions))
 }
 
 /// sg run 子进程的运行结果。
@@ -505,7 +656,13 @@ struct SgRun {
 }
 
 /// 执行 `sg run <instruction> --model <selector> --json`（cwd = workspace 副本）。
-fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<SgRun, String> {
+fn run_sg(
+    instruction: &str,
+    model: &str,
+    cwd: &Path,
+    timeout: u64,
+    singularity_home: &Path,
+) -> Result<SgRun, String> {
     let exe =
         std::env::current_exe().map_err(|error| format!("failed to resolve sg binary: {error}"))?;
     let mut command = Command::new(&exe);
@@ -516,6 +673,11 @@ fn run_sg(instruction: &str, model: &str, cwd: &Path, timeout: u64) -> Result<Sg
         .arg(model)
         .arg("--json")
         .current_dir(cwd)
+        .env("SINGULARITY_HOME", singularity_home)
+        .env(
+            "SINGULARITY_APP_SERVER_DB",
+            singularity_home.join("index.sqlite3"),
+        )
         // 每个 cell 独立 sg 子进程；sg 自身再 spawn 独立 stdio app-server。
         // 非交互：stdin 不继承终端（否则 eval 从终端启动时子进程会误判交互并触发 trust 询问）。
         .stdin(Stdio::null())
@@ -1116,9 +1278,41 @@ fn copy_rollout(run: Option<&SgRun>, sessions_dir: &Path, cell_dir: &Path) -> Op
     if !source.is_file() {
         return None;
     }
+    let content = fs::read_to_string(&source).ok()?;
+    let mut sanitized = String::new();
+    for segment in content.split_inclusive('\n') {
+        let (line, line_ending) = segment.strip_suffix('\n').map_or((segment, ""), |line| {
+            (line.strip_suffix('\r').unwrap_or(line), "\n")
+        });
+        let mut value: Value = serde_json::from_str(line).ok()?;
+        strip_private_replay(&mut value);
+        sanitized.push_str(&serde_json::to_string(&value).ok()?);
+        sanitized.push_str(line_ending);
+    }
     let target = cell_dir.join("rollout.jsonl");
-    fs::copy(&source, &target).ok()?;
+    fs::write(&target, sanitized).ok()?;
     Some(target)
+}
+
+/// Evaluation artifacts are inspectable outputs, not a Provider adapter input.
+/// Keep public message/tool facts for metrics while removing opaque replay that
+/// must never appear in Evaluation, logs, or client-visible history.
+fn strip_private_replay(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("providerReasoningReplay");
+            object.remove("provider_reasoning_replay");
+            for child in object.values_mut() {
+                strip_private_replay(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_private_replay(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 将 cell 的 stdout/stderr/checker 输出与 rollout 落盘到 cell 目录。
@@ -1238,6 +1432,41 @@ mod tests {
     }
 
     #[test]
+    fn copy_rollout_strips_provider_private_replay_from_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cell = dir.path().join("cell");
+        std::fs::create_dir_all(&cell).unwrap();
+        let thread_id = "c0ffee00-0000-4000-8000-000000000000";
+        let source = sessions.join(format!("{thread_id}.jsonl"));
+        std::fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"session\",\"version\":4}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",",
+                "\"providerReasoningReplay\":{\"items\":[{\"type\":\"reasoning\"}]},",
+                "\"content\":[]}}\n"
+            ),
+        )
+        .unwrap();
+        let run = SgRun {
+            timed_out: false,
+            turn_interrupted: false,
+            turn_failed: false,
+            turn_usage: None,
+            thread_id: Some(thread_id.to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let copied = copy_rollout(Some(&run), &sessions, &cell).expect("copied");
+        let artifact = std::fs::read_to_string(copied).unwrap();
+        assert!(!artifact.contains("providerReasoningReplay"));
+        assert!(!artifact.contains("reasoning"));
+        assert!(artifact.contains("\"role\":\"assistant\""));
+    }
+
+    #[test]
     fn parse_sg_json_detects_interrupted_and_failed() {
         let interrupted =
             parse_sg_json(r#"{"turn":{"status":"interrupted","agent_loop_status":"cancelled"}}"#)
@@ -1255,6 +1484,40 @@ mod tests {
         assert_eq!(cache_hit_ratio(&usage), Some(0.25));
         let zero_input = json!({"input_tokens": 0, "cached_input_tokens": 0});
         assert_eq!(cache_hit_ratio(&zero_input), None);
+    }
+
+    #[test]
+    fn failed_cell_classes_force_nonzero_eval_result() {
+        let passing = ModelAggregate {
+            cells: 1,
+            passed: 1,
+            ..ModelAggregate::default()
+        };
+        assert!(!has_failed_cells(&passing));
+        for totals in [
+            ModelAggregate {
+                failed: 1,
+                ..ModelAggregate::default()
+            },
+            ModelAggregate {
+                partial: 1,
+                ..ModelAggregate::default()
+            },
+            ModelAggregate {
+                interrupted: 1,
+                ..ModelAggregate::default()
+            },
+            ModelAggregate {
+                crashed: 1,
+                ..ModelAggregate::default()
+            },
+            ModelAggregate {
+                timed_out: 1,
+                ..ModelAggregate::default()
+            },
+        ] {
+            assert!(has_failed_cells(&totals), "totals: {totals:?}");
+        }
     }
 
     #[test]
