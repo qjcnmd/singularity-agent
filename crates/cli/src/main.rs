@@ -792,6 +792,30 @@ impl AppServerClient {
     // 写端失败时先确认 app-server 是否已经退出，避免以竞争性的 Broken pipe
     // 覆盖“响应前退出”的稳定传输错误；进程仍存活时保留真实 I/O 原因。
     fn classify_transport_write_error(&mut self, operation: &str, error: std::io::Error) -> String {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        ) {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        return format!("app-server exited before response: {status}");
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(None) => break,
+                    Err(status_error) => {
+                        return format!(
+                            "{operation}: {error}; failed to poll app-server process status: {status_error}"
+                        );
+                    }
+                }
+            }
+        }
         match self.child.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(Some(status)) => format!("app-server exited before response: {status}"),

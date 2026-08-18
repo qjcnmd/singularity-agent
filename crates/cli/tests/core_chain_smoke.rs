@@ -136,11 +136,63 @@ fn run_continue(fixture: &SmokeFixture, thread_id: &str, instruction: &str) -> R
     }
 }
 
+fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
+    let mut config: Value = serde_json::from_str(
+        &fs::read_to_string(&fixture.models_config)
+            .map_err(|_| "could not read smoke models config".to_string())?,
+    )
+    .map_err(|_| "smoke models config is not valid JSON".to_string())?;
+    let default_model = config
+        .get("default_model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "smoke config does not declare default_model".to_string())?;
+    let (provider_name, model_selector) = default_model
+        .split_once('/')
+        .ok_or_else(|| "smoke default_model must use provider/model form".to_string())?;
+    let provider_name = provider_name.to_string();
+    let model_name = model_selector
+        .split_once('#')
+        .map_or(model_selector, |(name, _)| name)
+        .to_string();
+    let model = config
+        .get_mut("providers")
+        .and_then(Value::as_object_mut)
+        .and_then(|providers| providers.get_mut(&provider_name))
+        .and_then(|provider| provider.get_mut("models"))
+        .and_then(Value::as_object_mut)
+        .and_then(|models| models.get_mut(&model_name))
+        .ok_or_else(|| "smoke config does not contain the selected model".to_string())?;
+    // The isolated project instructions plus the normal request envelope need
+    // more than 26k tokens even after compaction. Two bounded tool reads
+    // exceed this window's 15,616-token trigger threshold, while the compacted
+    // follow-up request still fits.
+    model["max_context_tokens"] = Value::from(32_768_u64);
+    model["max_output_tokens"] = Value::from(1_024_u64);
+    if let Some(capabilities) = model.get_mut("capabilities") {
+        capabilities["max_context_tokens"] = Value::from(32_768_u64);
+        capabilities["max_output_tokens"] = Value::from(1_024_u64);
+    }
+    fs::write(
+        &fixture.models_config,
+        serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,
+    )
+    .map_err(|_| "could not update compaction smoke config".to_string())?;
+    fs::write(
+        fixture.workspace.join("AGENTS.md"),
+        // Stay below the per-file 32 KiB project-instruction limit while
+        // making a full tool read large enough to trigger compaction.
+        "Keep this context available for the task. ".repeat(780),
+    )
+    .map_err(|_| "could not create compaction smoke context".to_string())
+}
+
 fn parse_success_json(output: Output) -> Result<Value, String> {
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "sg run exited with status {:?}",
-            output.status.code()
+            "sg run exited with status {:?}: {}",
+            output.status.code(),
+            stderr.trim()
         ));
     }
     serde_json::from_slice(&output.stdout).map_err(|_| "sg run did not return JSON".to_string())
@@ -167,6 +219,37 @@ fn session_file(fixture: &SmokeFixture) -> Result<PathBuf, String> {
         .ok_or_else(|| "smoke did not create a session JSONL".to_string())
 }
 
+fn session_contains_compaction(fixture: &SmokeFixture) -> Result<bool, String> {
+    let rollout = fs::read_to_string(session_file(fixture)?)
+        .map_err(|_| "could not read isolated rollout".to_string())?;
+    Ok(rollout.lines().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|entry| entry.get("type").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            == Some("compaction")
+    }))
+}
+
+fn session_entry_shapes(fixture: &SmokeFixture) -> Result<String, String> {
+    let rollout = fs::read_to_string(session_file(fixture)?)
+        .map_err(|_| "could not read isolated rollout".to_string())?;
+    Ok(rollout
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<Value>(line).ok().map(|entry| {
+                let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("?");
+                let role = entry
+                    .pointer("/message/role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                format!("{entry_type}:{role}:{}B", line.len())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
 #[test]
 #[ignore = "requires explicit temporary provider config and credentials"]
 fn real_provider_restart_and_resume_smoke() {
@@ -183,17 +266,37 @@ fn real_provider_restart_and_resume_smoke() {
 #[ignore = "requires explicit temporary provider config and credentials"]
 fn real_provider_compaction_smoke() {
     let fixture = fixture().expect("explicit isolated smoke configuration");
-    let long_goal = "Keep the following context in mind and answer briefly: ".to_string()
-        + &"context ".repeat(20_000);
-    let first = run_json(&fixture, &long_goal).expect("initial long turn");
+    configure_compaction_fixture(&fixture).expect("compaction fixture");
+    let first = run_json(
+        &fixture,
+        "Use the read tool to read every line of AGENTS.md, then reply with a short acknowledgement.",
+    )
+    .expect("initial compaction turn");
     let id = thread_id(&first).expect("thread id").to_string();
-    run_continue(&fixture, &id, &long_goal).expect("compaction continuation");
-    let rollout = fs::read_to_string(session_file(&fixture).expect("session file"))
-        .expect("read isolated rollout");
+    let mut compacted = false;
+    for _ in 0..3 {
+        run_continue(
+            &fixture,
+            &id,
+            "Use the read tool to reread every line of AGENTS.md, then reply with a short acknowledgement.",
+        )
+        .expect("compaction continuation");
+        if session_contains_compaction(&fixture).expect("read compaction rollout") {
+            compacted = true;
+            break;
+        }
+    }
     assert!(
-        rollout.contains("compaction"),
-        "the long continuation did not compact"
+        compacted,
+        "the bounded compaction continuations did not compact; entry shapes: {}",
+        session_entry_shapes(&fixture).expect("read compaction entry shapes")
     );
+    run_continue(
+        &fixture,
+        &id,
+        "Confirm that the compacted project context remains available.",
+    )
+    .expect("continuation after compaction");
 }
 
 #[test]
