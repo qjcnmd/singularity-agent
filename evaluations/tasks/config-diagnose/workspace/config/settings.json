@@ -1,7 +1,0 @@
-{
-  "name": "demo-service",
-  "port": 8080,
-  "features": {
-    "tracing": true
-  }
-}

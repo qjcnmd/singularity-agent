@@ -134,11 +134,11 @@ Desktop 接入前补齐 Codex 式 \`item/completed\` 生命周期：每个 \`ite
 
 ### D-032：原始 SessionEntry 公共化（已撤回）
 
-曾讨论让 Desktop/app-server 的历史读取返回原始 SessionEntry，包括 \`providerReasoningReplay\` 等 provider-private reasoning state；用户已撤回该选择，不得实施。最终公开历史边界待重新讨论。
+曾讨论让 Desktop/app-server 的历史读取返回原始 SessionEntry，包括 \`providerReasoningReplay\` 等 provider-private reasoning state；用户已撤回该选择，不得实施。最终边界由 D-034 确定：公开结构化 history projection，不返回原始 SessionEntry。
 
 ### D-033：session/read entry_types（已撤回）
 
-曾讨论是否扩展 \`session/read\` 的 entry_types；用户已撤回该选择。最终历史读取 API 和过滤范围待重新讨论。
+曾讨论是否扩展 \`session/read\` 的 entry_types；用户已撤回该选择，不得实施。当前 \`session/read\` 的公开历史种类和过滤范围以 D-034 及当前 protocol 类型为准。
 
 ### D-034：Thinking 公开投影
 
@@ -158,7 +158,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 ### D-038：计划文件交付
 
-完整实施计划保留在被 Git 忽略的 plan/ 目录，不修改 .gitignore；通过本机计划文件路径和执行提示词交给另一个模型实施。计划文件本身不代表代码已实施或已验证。
+实施计划在执行期间作为被 Git 忽略的本机交接文件使用，不修改 `.gitignore`；计划文件本身不代表代码已实施或已验证。执行完成后该临时计划可以删除，当前有效架构和裁决以本文件、`docs/singularity.md`、源码和 Git 历史为准。
 
 ## 参考实现
 

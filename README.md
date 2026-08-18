@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是一个由 Rust 实现的本地命令行编码代理。核心产品运行时、协议、模型调用和工具保持平台无关；职责明确的辅助工具可以使用其他主流语言，但不得形成第二套产品运行时或绕过 Rust 主链路。
+Singularity 是一个由 Rust 实现的本地 coding-agent harness。当前 CLI 是主要客户端，Desktop 可通过同一 app-server 协议接入；核心运行时、协议、模型调用和工具保持平台无关。职责明确的辅助工具可以使用其他主流语言，但不得形成第二套产品运行时或绕过 Rust 主链路。
 
 当前支持 Windows x86-64。其他平台可以编译和运行确定性测试。
 
@@ -92,7 +92,7 @@ sg config models
 }
 ```
 
-选择 `provider_id/model_id#off` 时必须显式使用该 disabled variant。Chat 发送 `thinking.type=enabled` 与单一解析后的 wire effort；Responses 发送 `reasoning.effort` 与 `include=["reasoning.encrypted_content"]`。工具循环所需的 `reasoning_content`（Chat）以 thinking 内容块随会话 JSONL 持久化，续接时从最后一条 assistant 消息投影为 provider reasoning replay（N2）；Responses 原始 output items 为 provider opaque blob，仅在同一 provider 实例的进程内传递，不进入用户消息或错误正文；SQLite 不是内容加密层。
+选择 `provider_id/model_id#off` 时必须显式使用该 disabled variant。Chat 发送 `thinking.type=enabled` 与单一解析后的 wire effort；Responses 发送 `reasoning.effort` 与 `include=["reasoning.encrypted_content"]`。工具循环所需的 `reasoning_content`（Chat）以 thinking 内容块随会话 JSONL 持久化，续接时从最后一条 assistant 消息投影为 provider reasoning replay（N2）；Responses 原始 output items 作为 provider opaque continuation state 随会话持久化，在兼容的 provider/model/reasoning 绑定下重放，不进入用户消息或错误正文；SQLite 不是内容加密层。
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 

@@ -410,6 +410,3 @@ fn secret_value_delimiter(ch: char) -> bool {
 fn is_base64url_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
 }
-
-#[cfg(test)]
-mod tests {}

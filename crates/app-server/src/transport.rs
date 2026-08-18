@@ -932,12 +932,16 @@ mod tests {
         assert!(error.contains("must not be inside"), "{error}");
         // 仓库外 home → 通过。
         ensure_home_outside_repo(&outside, &nested_cwd).expect("outside accepted");
-        // 无 `.git` 边界时以 cwd 为边界：cwd 内 home 拒绝、cwd 外通过。
+        // 无 `.git` 边界时以 cwd 为边界。若测试临时目录本身位于另一个
+        // Git 仓库（例如本机 D:\Temp\.git）内，则该前提不成立，跳过这段。
         let plain = directory.path().join("plain");
         std::fs::create_dir_all(&plain).expect("plain cwd");
-        let error = ensure_home_outside_repo(&plain.join("home"), &plain).expect_err("cwd inside");
-        assert!(error.contains("must not be inside"), "{error}");
-        ensure_home_outside_repo(&outside, &plain).expect("outside cwd accepted");
+        if singularity_core::find_workspace_root(&plain).expect("find plain root") == plain {
+            let error =
+                ensure_home_outside_repo(&plain.join("home"), &plain).expect_err("cwd inside");
+            assert!(error.contains("must not be inside"), "{error}");
+            ensure_home_outside_repo(&outside, &plain).expect("outside cwd accepted");
+        }
     }
 
     #[test]

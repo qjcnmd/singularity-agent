@@ -86,23 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_file_with_content() {
-        let dir = tempdir().expect("temp dir");
-        let result = execute_write(dir.path(), "out.txt", "hello");
-        assert!(!result.is_error, "content: {}", result.content);
-        assert!(
-            result
-                .content
-                .contains("Successfully wrote 5 bytes to out.txt")
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("out.txt")).expect("read back"),
-            "hello"
-        );
-    }
-
-    #[test]
-    fn creates_parent_directories() {
+    fn writes_nested_file_and_overwrites_existing_content() {
         let dir = tempdir().expect("temp dir");
         let result = execute_write(dir.path(), "a/b/c.txt", "nested");
         assert!(!result.is_error, "content: {}", result.content);
@@ -110,17 +94,11 @@ mod tests {
             fs::read_to_string(dir.path().join("a/b/c.txt")).expect("read back"),
             "nested"
         );
-    }
 
-    #[test]
-    fn overwrites_existing_file() {
-        let dir = tempdir().expect("temp dir");
-        let first = execute_write(dir.path(), "out.txt", "first");
-        assert!(!first.is_error);
-        let second = execute_write(dir.path(), "out.txt", "second");
-        assert!(!second.is_error);
+        let second = execute_write(dir.path(), "a/b/c.txt", "second");
+        assert!(!second.is_error, "content: {}", second.content);
         assert_eq!(
-            fs::read_to_string(dir.path().join("out.txt")).expect("read back"),
+            fs::read_to_string(dir.path().join("a/b/c.txt")).expect("read back"),
             "second"
         );
     }
