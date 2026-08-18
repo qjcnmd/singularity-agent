@@ -2,7 +2,9 @@
 
 ## 项目目标与设计基线
 
-Singularity 的首要产品目标是成为一个像 Pi 一样能让模型可靠完成 coding task 的最小 harness；当前以 CLI 为主要产品形态，后续计划支持桌面端。
+本轮及后续架构讨论的用户裁决记录在 \`docs/decisions/desktop-reliability-decisions.md\`；涉及范围、状态、持久化、客户端或 Desktop 交互的实施必须引用对应决策编号，发现新证据时追加修正记录，不删除历史裁决。
+
+Singularity 的首要产品目标是成为一个像 Pi 一样能让模型可靠完成 coding task 的最小 harness，最终通过类似 Codex CLI/Desktop 的交互式客户端使用；当前 CLI 是主要客户端，Desktop 是近期接入目标。核心能力必须同时满足一次性 CLI 与长驻交互客户端的可靠性要求。
 
 当前核心架构与默认行为优先参考维护活跃、经过实际使用验证的主流 coding agent，主要以 Pi 的小核心、Agent Loop、Session、Context Compaction、Tool、Extension 和可嵌入能力作为基线；Codex CLI 等项目可作为辅助参考。
 
@@ -14,7 +16,7 @@ Singularity 的首要产品目标是成为一个像 Pi 一样能让模型可靠�
 
 任何比 Pi 基线明显更复杂的核心机制，都必须有当前真实消费者和明确必要性；“以后可自定义”本身不算当前消费者。未来可能需要的模型路由、多 Agent、任务图、自定义 Context 策略、额外工具、Sandbox、权限控制、插件或桌面能力，不作为提前增加核心复杂度的理由。
 
-核心能力保持 headless，并与具体 CLI、TUI 或未来 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。当前实现采用 headless core 库 + 薄 app-server（stdio JSON-RPC）+ 客户端经同一协议连接，配置为共享全局文件、会话为统一 JSONL 格式；这是当前事实，不是永久架构合同，改变进程边界需以当前证据和用户裁决为依据。
+核心能力保持 headless，并与具体 CLI、TUI 或 Desktop UI 解耦。不同客户端应复用同一核心 Agent 能力，不复制 Agent 状态和业务逻辑。客户端目标包含长驻交互场景：取消必须及时终止正在执行的工具及其子进程树，结束 turn 后释放不再需要的运行时索引，持久历史不得依赖进程内存。当前实现采用 headless core 库 + 薄 app-server（stdio JSON-RPC）+ 客户端经同一协议连接，配置为共享全局文件、会话为统一 JSONL 格式；这是当前事实，不是永久架构合同，改变进程边界需以当前证据和用户裁决为依据。
 
 现有源码、测试、Schema、历史实现和 Git 历史只能证明“当前这样实现”，不能证明设计本身正确。基础方向不合理时允许重构、替换或删除。
 
