@@ -12,6 +12,7 @@
 - **app-server**：JSON-RPC（JSONL framing）；命令/事件协议包含 thread/turn/item 生命周期、公开 history projection、settings、usage 与 capabilities；输出队列有界，满时阻塞，不主动丢事件。
 - **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**；Desktop 可保持一个长驻 stdio 连接并在同一进程中执行多轮、切换设置、取消和重连。没有 TCP daemon、cursor/gap replay 或独立 Desktop UI。
 - **客户端**：`sg` CLI（一次性 stdio 子进程客户端）；Desktop 接入复用同一协议、配置和会话。
+- **实现职责**：model 配置由 `config/{mod,selection,user,filesystem,schema}.rs` 分别协调装配、选择、用户配置/认证、文件边界和 schema；app-server 的唯一 `AppServer` 状态在 `state.rs`，请求 dispatch、turn lifecycle、事件、路径/索引、删除和 stdio transport 各自归属同名职责模块；CLI 的私有 `client`、`render`、`session_reference`、`commands` 模块分别负责协议子进程、输出投影、不可信会话引用和命令编排。
 - **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1-*.json`（私有认证文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 不依赖 evaluation。
 
@@ -243,7 +244,7 @@ sequenceDiagram
 - **任务集**（通用格式）：task_id + `workspace/`（几百~1000 行项目，含测试）+ `instruction.md` + `checker.sh`。
 - **执行规模**：3 题 × 2 模型 = 6 cell 全并行（一次 3 题以控制供应商并发；模型组：opencode-go/deepseek-v4-flash#max、longcat/LongCat-2.0#high；当前题集：warehouse-audit / billing-calc / cache-ttl）。
 - **流程**：准备干净 workspace 副本（含 checker.sh）→ 子进程跑 `sg run --json`（**真实产品链路，禁止 fake/mock**；每 cell 均为独立 stdio 子进程）→ 收集会话文件（rollout）→ 独立运行 checker.sh（exit 0 = 通过；**绝不采信 agent 自报**；600s 超时防挂死）→ 从 rollout + usage 聚合指标。并行工具的本地 worker 窗口受 provider 的 `max_parallel_tool_calls` 限制。
-- **核心链路 smoke**：`crates/cli/tests/core_chain_smoke.rs` 提供三个 `#[ignore]` 的真实 Provider case（跨进程重开、长上下文 compaction、工具/并行恢复），默认不运行。运行前必须显式设置 `SINGULARITY_SMOKE_MODELS_CONFIG` 和所选 provider 的密钥环境变量；测试会把配置复制到仓库外临时目录，并为每个 case 使用独立 `SINGULARITY_HOME`、file-backed SQLite 和临时 workspace。未提供临时配置/凭据时只保留未验证状态，不读取日常用户配置。
+- **核心链路 smoke**：`crates/cli/tests/core_chain_smoke.rs` 提供三个 `#[ignore]` 的真实 Provider case（跨进程重开、长上下文 compaction、工具/并行恢复），默认不运行。每个 case 从持久化用户 home（或显式绝对 `SINGULARITY_SMOKE_SOURCE_HOME`）只读复制 `config.json` 与当前 `auth_generation` 到仓库外临时 `SINGULARITY_HOME`，并在副本中选择本 case 的默认模型；子进程使用独立 file-backed SQLite 和临时 workspace，且清除模型与凭据覆盖环境变量。工具/并行与 compaction case 使用 `longcat/LongCat-2.0` 的最高 enabled reasoning；restart case 只选择明确声明 `api_protocol=responses` 和 `tool_reasoning_history=responses_items` 的唯一模型及其最高 enabled reasoning。source config、auth generation、所需模型或 app-server binary 缺失时，默认 ignored case 保持未验证，显式运行以不暴露认证内容的诊断失败。restart 断言隔离 JSONL 有 Responses provider-private replay 后才跨进程继续；parallel 断言同一 assistant entry 至少有两个 tool call，不用 wall-clock 重叠推断。source home 从不被修改或写入认证内容。
 - **判分语义**：turn 失败但 checker 通过时判 passed（workspace 状态是客观证据）；checker 输出经读取线程边读边同步捕获（孙进程持管道不 EOF 也能拿到已读部分）。
 - **指标**：通过/失败/部分得分；中断/崩溃/超时；总时长；token 总量；缓存命中率；耗时拆解；工具调用数；工具失败数；重复动作。
 - 每次 harness 改动后重跑，指标按模型分组对比。

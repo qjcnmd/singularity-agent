@@ -980,6 +980,52 @@ fn strict_open_rejects_invalid_header_and_known_schema() {
 }
 
 #[test]
+fn bounded_session_read_checks_file_metadata_before_parsing_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("oversized.jsonl");
+    std::fs::write(&file, "not-json").unwrap();
+    let error = match parse_session_lines_with_limits(&file, 1, 1024, 10) {
+        Ok(_) => panic!("metadata limit must reject before body parsing"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::InvalidSession(message) if message.contains("1 bytes")));
+}
+
+#[test]
+fn bounded_session_read_rejects_an_oversized_line_without_unbounded_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("oversized-line.jsonl");
+    let header = session_header("oversized-line");
+    let line_limit = header.len();
+    std::fs::write(&file, format!("{header}\n{}\n", "x".repeat(line_limit + 1))).unwrap();
+    let error = match parse_session_lines_with_limits(&file, 1024, line_limit, 10) {
+        Ok(_) => panic!("line limit must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::InvalidSession(message) if message.contains("line 2")));
+}
+
+#[test]
+fn bounded_session_read_counts_content_entries_without_counting_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("entry-boundary.jsonl");
+    let content = format!(
+        "{}\n{}\n{}\n",
+        session_header("entry-boundary"),
+        session_message("entry-1", None, "one"),
+        session_message("entry-2", Some("entry-1"), "two")
+    );
+    std::fs::write(&file, content).unwrap();
+    let error = match parse_session_lines_with_limits(&file, 1024, 1024, 1) {
+        Ok(_) => panic!("second content entry must exceed a one-entry content limit"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, SessionError::InvalidSession(message) if message.contains("1 entries"))
+    );
+}
+
+#[test]
 fn append_io_failure_does_not_advance_memory() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();

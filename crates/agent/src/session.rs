@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
@@ -1032,7 +1032,7 @@ impl SessionManager {
 
     /// 构建活跃的、compaction 感知的条目列表（Pi `buildContextEntries`）。
     ///
-    /// 沿 leaf→root 路径取最后一个 compaction 条目；结果 = [compaction] +
+    /// 沿 leaf→root 路径取最后一个 compaction 条目；结果 = \[compaction\] +
     /// (firstKeptEntryId 起、compaction 之前的所有条目) + (compaction 之后的条目)。
     /// 路径上无 compaction 时返回全部路径条目。
     pub fn build_context_entries(&self) -> Result<Vec<SessionEntry>> {
@@ -1411,42 +1411,54 @@ fn validate_append_limits(
 /// 有界逐行解析 session 文件：中间坏行 fail closed，只有最后物理行明确是
 /// 未完成的 JSON/UTF-8 append 才允许丢弃并原子修复。
 fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
-    let bytes = std::fs::read(file)?;
-    if bytes.len() > MAX_SESSION_FILE_BYTES {
+    parse_session_lines_with_limits(
+        file,
+        MAX_SESSION_FILE_BYTES,
+        MAX_SESSION_LINE_BYTES,
+        MAX_SESSION_ENTRIES,
+    )
+}
+
+fn parse_session_lines_with_limits(
+    file: &Path,
+    max_file_bytes: usize,
+    max_line_bytes: usize,
+    max_content_entries: usize,
+) -> Result<ParsedSessionLines> {
+    let metadata = std::fs::metadata(file)?;
+    if metadata.len() > max_file_bytes as u64 {
         return Err(SessionError::InvalidSession(format!(
-            "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
-            MAX_SESSION_FILE_BYTES
+            "session file exceeds bounded parse limits ({} bytes / {max_content_entries} entries)",
+            max_file_bytes
         )));
     }
 
+    let handle = std::fs::File::open(file)?;
+    let mut reader = BufReader::new(handle);
     let mut entries = Vec::new();
     let mut lines = Vec::new();
     let mut repair = TailRepair::None;
-    let mut start = 0usize;
     let mut line_number = 1usize;
-    while start < bytes.len() {
-        let newline = bytes[start..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|offset| start + offset);
-        let (end, has_newline) = match newline {
-            Some(end) => (end, true),
-            None => (bytes.len(), false),
-        };
-        let mut line = &bytes[start..end];
+    while let Some(bounded_line) = read_bounded_session_line(&mut reader, max_line_bytes)? {
+        if bounded_line.too_long {
+            return Err(SessionError::InvalidSession(format!(
+                "session entry exceeds {max_line_bytes} bytes at line {line_number}"
+            )));
+        }
+        let has_newline = bounded_line.has_newline;
+        let mut line = bounded_line.bytes.as_slice();
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
         }
-        if line.len() > MAX_SESSION_LINE_BYTES {
+        if line.len() > max_line_bytes {
             return Err(SessionError::InvalidSession(format!(
-                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes at line {line_number}"
+                "session entry exceeds {max_line_bytes} bytes at line {line_number}"
             )));
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             if !has_newline {
                 break;
             }
-            start = end + 1;
             line_number += 1;
             continue;
         }
@@ -1483,10 +1495,12 @@ fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
                 cause: "session entry is not a JSON object".to_string(),
             });
         }
-        if entries.len() >= MAX_SESSION_ENTRIES {
+        // MAX_SESSION_ENTRIES applies to content entries only; the header is
+        // a separate line and does not consume the content budget.
+        if entries.len() > max_content_entries {
             return Err(SessionError::InvalidSession(format!(
-                "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
-                MAX_SESSION_FILE_BYTES
+                "session file exceeds bounded parse limits ({} bytes / {max_content_entries} entries)",
+                max_file_bytes
             )));
         }
         entries.push(value);
@@ -1495,7 +1509,6 @@ fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
             repair = TailRepair::AddFinalNewline;
             break;
         }
-        start = end + 1;
         line_number += 1;
     }
     Ok(ParsedSessionLines {
@@ -1503,6 +1516,54 @@ fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
         lines,
         repair,
     })
+}
+
+struct BoundedSessionLine {
+    bytes: Vec<u8>,
+    has_newline: bool,
+    too_long: bool,
+}
+
+/// Read one physical JSONL line without allowing an unterminated line to grow
+/// beyond the session line limit. The extra byte permits a trailing CR to be
+/// stripped before applying the existing limit semantics.
+fn read_bounded_session_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<BoundedSessionLine>> {
+    let mut bytes = Vec::with_capacity(limit.min(4096) + 1);
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(BoundedSessionLine {
+                bytes,
+                has_newline: false,
+                too_long: false,
+            }));
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        if bytes.len().saturating_add(content_len) > limit.saturating_add(1) {
+            return Ok(Some(BoundedSessionLine {
+                bytes: Vec::new(),
+                has_newline: newline.is_some(),
+                too_long: true,
+            }));
+        }
+        bytes.extend_from_slice(&buffer[..content_len]);
+        let consumed = newline.map_or(content_len, |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(BoundedSessionLine {
+                bytes,
+                has_newline: true,
+                too_long: false,
+            }));
+        }
+    }
 }
 
 fn validate_header(value: &Value) -> Result<(String, u32, Option<String>)> {

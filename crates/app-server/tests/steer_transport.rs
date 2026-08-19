@@ -122,6 +122,13 @@ fn serve_script(
                 }
             }
         };
+        // Windows may propagate the listener's nonblocking mode to accepted
+        // sockets. The worker uses read/write timeouts for bounded I/O, so the
+        // accepted connection itself must be blocking before `read_exact`.
+        if let Err(error) = stream.set_nonblocking(false) {
+            record_error(&errors, format!("set blocking mode {index}"), error);
+            return;
+        }
         // 半个 header/body 后停住的客户端不能把 worker 永久卡在读/写里。
         if let Err(error) = stream.set_read_timeout(Some(STREAM_TIMEOUT)) {
             record_error(&errors, format!("set read timeout {index}"), error);
@@ -456,8 +463,10 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
 
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
     assert_eq!(
-        turn_response["result"]["turn"]["status"], "completed",
-        "turn/start response: {turn_response}"
+        turn_response["result"]["turn"]["status"],
+        "completed",
+        "turn/start response: {turn_response}; provider errors: {:?}",
+        provider.errors(),
     );
     assert_eq!(
         provider

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -141,6 +142,31 @@ fn jsonl_discovery_isolates_one_corrupt_rollout() {
     std::fs::write(sessions_dir.join("broken.jsonl"), b"not-json\n").expect("broken session");
 
     rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("discovery isolates bad file");
+    let sessions = store.list_sessions().expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, valid_id);
+}
+
+#[test]
+fn jsonl_discovery_rejects_an_oversized_unterminated_header_without_indexing_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let valid_id = "c2e0d5f5-7d50-4ef7-a6f9-0f0c1b3f44ab";
+    SessionManager::create_with_id(&workspace, &sessions_dir, valid_id).expect("valid session");
+
+    let mut oversized =
+        std::fs::File::create(sessions_dir.join("oversized.jsonl")).expect("oversized session");
+    let chunk = [b'x'; 4096];
+    for _ in 0..=(16 * 1024 * 1024 / chunk.len()) {
+        oversized.write_all(&chunk).expect("oversized header bytes");
+    }
+    oversized.flush().expect("flush oversized header");
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir)
+        .expect("discovery isolates oversized header");
     let sessions = store.list_sessions().expect("list sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session_id, valid_id);

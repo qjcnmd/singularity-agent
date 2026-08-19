@@ -2,6 +2,114 @@
 
 use super::*;
 
+pub(super) fn json_response<T: serde::Serialize>(
+    id: JsonRpcId,
+    result: T,
+) -> AppServerResult<Vec<Value>> {
+    Ok(vec![
+        JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
+    ])
+}
+
+pub(super) fn input_items_to_text(input: &Value) -> AppServerResult<String> {
+    let items: Vec<singularity_protocol::InputItem> =
+        serde_json::from_value(input.clone()).map_err(AppServerError::InvalidJson)?;
+    let text = items
+        .into_iter()
+        .map(|item| match item {
+            singularity_protocol::InputItem::Text { text } => text,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return Err(AppServerError::Workspace(
+            "persisted turn input is empty".to_string(),
+        ));
+    }
+    Ok(text)
+}
+
+pub(super) fn title_from_input(input: &str) -> String {
+    input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_SESSION_TITLE_CHARS)
+        .collect()
+}
+
+pub(super) fn split_model_selector(
+    selector: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(selector) = selector.filter(|selector| !selector.trim().is_empty()) else {
+        return (None, None, None);
+    };
+    let (without_reasoning, reasoning) = selector
+        .rsplit_once('#')
+        .map_or((selector, None), |(model, reasoning)| {
+            (model, Some(reasoning))
+        });
+    let (provider, model) = without_reasoning
+        .split_once('/')
+        .map_or((None, without_reasoning), |(provider, model)| {
+            (Some(provider), model)
+        });
+    (
+        provider.map(str::to_string),
+        Some(model.to_string()),
+        reasoning.map(str::to_string),
+    )
+}
+
+pub(super) fn compose_model_selector(
+    provider: &str,
+    model: &str,
+    reasoning: Option<&str>,
+) -> String {
+    let mut selector = format!("{provider}/{model}");
+    if let Some(reasoning) = reasoning {
+        selector.push('#');
+        selector.push_str(reasoning);
+    }
+    selector
+}
+
+pub(super) fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
+    Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
+}
+
+pub(super) fn parse_params<T>(message: &JsonRpcMessage) -> Result<T, AppServerError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    message
+        .params_as()
+        .map_err(|_| AppServerError::InvalidParams("Invalid params".to_string()))
+}
+
+pub(super) fn not_found_response(
+    id: JsonRpcId,
+    message: &'static str,
+) -> AppServerResult<Vec<Value>> {
+    Ok(vec![
+        JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
+    ])
+}
+
+pub(super) fn invalid_state_response(
+    id: JsonRpcId,
+    message: impl Into<String>,
+) -> AppServerResult<Vec<Value>> {
+    Ok(vec![
+        JsonRpcMessage::error(id, ErrorCode::new(APP_ERROR_INVALID_STATE, message)).to_wire_value(),
+    ])
+}
+
+pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
+    json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
+}
+
 impl AppServer {
     /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {

@@ -1,7 +1,199 @@
 //! AppServer construction, turn supervision, cancellation, and shutdown.
 
+use super::dispatch::{
+    input_items_to_text, invalid_params_response, json_response, not_found_response, parse_params,
+    title_from_input,
+};
 use super::*;
+
+fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
+    for message in messages {
+        emit(message);
+    }
+}
 use std::cell::RefCell;
+
+pub(super) fn agent_config_for_thread(
+    thread: &Thread,
+    provider: &dyn Provider,
+    snapshot: &ProviderConfigSnapshot,
+) -> AppServerResult<AgentConfig> {
+    let cwd = workspace_path(thread)
+        .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+    let system_prompt = match load_project_instructions_from_cwd(&cwd) {
+        Ok(Some(instructions)) => instructions.content().to_string(),
+        Ok(None) => String::new(),
+        Err(error) => return Err(AppServerError::ProjectInstructions(error)),
+    };
+    let context_window = provider
+        .protocol_contract()
+        .max_context_tokens
+        .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS) as u64;
+    let max_output_tokens = provider.protocol_contract().max_output_tokens as u64;
+    Ok(AgentConfig {
+        model: thread
+            .model
+            .clone()
+            .or_else(|| snapshot.resolved_default_selector())
+            .unwrap_or_default(),
+        system_prompt,
+        context_window,
+        max_output_tokens,
+        ..AgentConfig::default()
+    })
+}
+
+pub(super) fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
+    let mut status = RunStatus::failed("agent loop did not reach a final assistant message");
+    if outcome.aborted {
+        mark_run_cancelled(&mut status);
+    } else if outcome.final_text.trim().is_empty() {
+        status.status = AgentStatus::Failed;
+        status.error =
+            Some("agent loop exhausted its turn budget without a final message".to_string());
+    } else {
+        status.status = AgentStatus::Completed;
+        status.error = None;
+        status.final_answer = Some(outcome.final_text.clone());
+    }
+    status.model_turns = outcome.turns;
+    status.model_usage = outcome.usage;
+    status
+}
+
+pub(super) fn provider_configuration(
+    snapshot: &ProviderConfigSnapshot,
+) -> ProviderConfigurationStatus {
+    let config = snapshot.redacted_config();
+    let configuration = snapshot.configuration();
+    ProviderConfigurationStatus {
+        source: snapshot.source().map(|source| source.as_str().to_string()),
+        snapshot_id: snapshot.snapshot_id().to_string(),
+        configured: configuration.configured,
+        configuration_blocker: configuration
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code().to_string()),
+        api_key_present: config.api_key_present,
+        base_url_present: config.base_url_present,
+        model_present: config.model_name.is_some(),
+    }
+}
+
+pub(super) fn turn_failure_cause(error: &AppServerError) -> TurnFailureCause {
+    match error {
+        AppServerError::Store(_) => TurnFailureCause::Store,
+        AppServerError::ProjectInstructions(_) => TurnFailureCause::ProjectInstructions,
+        AppServerError::Workspace(_) => TurnFailureCause::Workspace,
+        AppServerError::Agent(AgentError::Provider(provider_error)) => {
+            TurnFailureCause::Provider(provider_failure_kind(&provider_error.error.kind))
+        }
+        AppServerError::Agent(_) => TurnFailureCause::Internal,
+        AppServerError::InvalidJson(_) => TurnFailureCause::Serialization,
+        AppServerError::InvalidParams(_) => TurnFailureCause::Internal,
+        AppServerError::Session(_) => TurnFailureCause::Store,
+        AppServerError::TurnExecution { cause, .. }
+        | AppServerError::TurnTerminalization { cause, .. } => *cause,
+    }
+}
+
+pub(super) fn provider_failure_kind(
+    kind: &singularity_model::ModelErrorKind,
+) -> ProviderFailureKind {
+    use singularity_model::ModelErrorKind::*;
+    match kind {
+        RateLimited => ProviderFailureKind::RateLimited,
+        BudgetExceeded => ProviderFailureKind::QuotaExceeded,
+        NetworkError => ProviderFailureKind::Network,
+        Timeout => ProviderFailureKind::Timeout,
+        AuthError => ProviderFailureKind::Auth,
+        InvalidRequest | ToolCallParseError | JsonSchemaViolation | ContentFilter => {
+            ProviderFailureKind::Validation
+        }
+        ProviderOverloaded => ProviderFailureKind::Overloaded,
+        Cancelled => ProviderFailureKind::Cancelled,
+        ContextLengthExceeded => ProviderFailureKind::ContextOverflow,
+        UnknownProviderError | UnsupportedCapability => ProviderFailureKind::Unknown,
+    }
+}
+
+pub(super) fn turn_failure_from_error(
+    error: &AppServerError,
+    fallback_stage: TurnFailureStage,
+) -> TurnFailure {
+    match error {
+        AppServerError::TurnExecution {
+            stage,
+            cause,
+            original,
+        }
+        | AppServerError::TurnTerminalization {
+            stage,
+            cause,
+            original,
+            ..
+        } => TurnFailure {
+            stage: *stage,
+            cause: *cause,
+            original: original.clone().or_else(|| Some(error.to_string())),
+        },
+        _ => TurnFailure {
+            stage: fallback_stage,
+            cause: turn_failure_cause(error),
+            original: Some(error.to_string()),
+        },
+    }
+}
+
+pub(super) fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
+    match status {
+        AgentStatus::Completed => TurnStatus::Completed,
+        AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
+        AgentStatus::Running => TurnStatus::Running,
+        AgentStatus::Failed => TurnStatus::Failed,
+    }
+}
+
+pub(super) fn session_status_for_agent(status: &AgentStatus) -> SessionStatus {
+    match status {
+        AgentStatus::Completed => SessionStatus::Completed,
+        AgentStatus::CancelRequested | AgentStatus::Cancelled => SessionStatus::Interrupted,
+        AgentStatus::Running => SessionStatus::Active,
+        AgentStatus::Failed => SessionStatus::Failed,
+    }
+}
+
+pub(super) fn terminal_metadata_for_status(
+    turn_id: &str,
+    status: SessionStatus,
+) -> Option<singularity_agent::session::SessionMetadata> {
+    match status {
+        SessionStatus::Completed => Some(
+            singularity_agent::session::SessionMetadata::turn_completed(turn_id),
+        ),
+        SessionStatus::Failed => Some(singularity_agent::session::SessionMetadata::turn_failed(
+            turn_id,
+            "turn failed",
+        )),
+        SessionStatus::Interrupted => Some(
+            singularity_agent::session::SessionMetadata::turn_interrupted(
+                turn_id,
+                "turn interrupted",
+                false,
+            ),
+        ),
+        SessionStatus::Active => None,
+    }
+}
+
+pub(super) fn mark_run_cancelled(status: &mut RunStatus) {
+    status.status = AgentStatus::Cancelled;
+    status.final_answer = None;
+    status.error = None;
+}
+pub(super) fn turn_id() -> String {
+    Uuid::new_v4().to_string()
+}
 
 impl AppServer {
     pub(super) fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {

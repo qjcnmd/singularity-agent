@@ -4,6 +4,182 @@
 //! 或订阅状态，客户端把 matching response 之前的 notification 关联到本次请求。
 
 use super::*;
+use singularity_agent::{
+    message::{AgentMessageRole, ContentBlock},
+    session::{SessionEntry, SessionEntryType, SessionMetadataKind},
+};
+use std::collections::HashMap;
+
+const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
+
+/// 一次 AgentLoop 调用预分配的 assistant item 事件状态（只用于实时协议事件）。
+pub(super) struct AssistantItemEventState {
+    pub(super) item_id: String,
+    first_delta_observed: bool,
+    started_generated: bool,
+    delta_generated: bool,
+    assistant_terminal_generated: bool,
+    pub(super) tool_items: HashMap<String, bool>,
+}
+
+impl AssistantItemEventState {
+    pub(super) fn new(item_id: String) -> Self {
+        Self {
+            item_id,
+            first_delta_observed: false,
+            started_generated: false,
+            delta_generated: false,
+            assistant_terminal_generated: false,
+            tool_items: HashMap::new(),
+        }
+    }
+
+    pub(super) fn appeared(&self) -> bool {
+        self.started_generated || self.delta_generated
+    }
+
+    pub(super) fn start_tool_item(&mut self, tool_call_id: &str) -> bool {
+        if self.tool_items.contains_key(tool_call_id) {
+            return false;
+        }
+        self.tool_items.insert(tool_call_id.to_string(), false);
+        true
+    }
+
+    pub(super) fn open_tool_items(&self) -> Vec<String> {
+        self.tool_items
+            .iter()
+            .filter_map(|(id, terminal)| (!*terminal).then_some(id.clone()))
+            .collect()
+    }
+}
+
+fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery) {
+    match event.method.as_str() {
+        "item/agentMessage/delta" => (EventClass::Progress, EventDelivery::BestEffort),
+        _ => (EventClass::State, EventDelivery::Reliable),
+    }
+}
+
+/// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
+/// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
+/// 或其 `provider_reasoning_replay`、parent/tree、迁移字段。
+pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
+    match &entry.entry_type {
+        SessionEntryType::Message(message) => match message.role {
+            AgentMessageRole::User | AgentMessageRole::Assistant => {
+                let role = match message.role {
+                    AgentMessageRole::User => "user",
+                    AgentMessageRole::Assistant => "assistant",
+                    _ => unreachable!(),
+                }
+                .to_string();
+                let mut items = Vec::new();
+                let mut text_index = 0usize;
+                let mut thinking_index = 0usize;
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } if !text.is_empty() => {
+                            items.push(HistoryItem::Message {
+                                id: format!("{}:text:{text_index}", entry.id),
+                                role: role.clone(),
+                                text: text.clone(),
+                            });
+                            text_index += 1;
+                        }
+                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                            items.push(HistoryItem::Thinking {
+                                id: format!("{}:thinking:{thinking_index}", entry.id),
+                                text: thinking.clone(),
+                            });
+                            thinking_index += 1;
+                        }
+                        ContentBlock::ToolCall { id, name, args } => {
+                            items.push(HistoryItem::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                items
+            }
+            AgentMessageRole::ToolResult => vec![HistoryItem::ToolResult {
+                id: message
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| entry.id.clone()),
+                output: message.content_text(),
+                is_error: message.is_error.unwrap_or(false),
+            }],
+            _ => Vec::new(),
+        },
+        SessionEntryType::Compaction(compaction) => vec![HistoryItem::Compaction {
+            id: entry.id.clone(),
+            summary: compaction.summary.clone(),
+        }],
+        SessionEntryType::Metadata(metadata) => match metadata.kind() {
+            SessionMetadataKind::TurnStarted => metadata
+                .turn_id()
+                .map(|id| HistoryItem::Turn {
+                    id: id.to_string(),
+                    status: TurnStatus::Running,
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::TurnCompleted
+            | SessionMetadataKind::TurnFailed
+            | SessionMetadataKind::TurnInterrupted => metadata
+                .turn_id()
+                .map(|id| HistoryItem::Turn {
+                    id: id.to_string(),
+                    status: match metadata.kind() {
+                        SessionMetadataKind::TurnCompleted => TurnStatus::Completed,
+                        SessionMetadataKind::TurnFailed => TurnStatus::Failed,
+                        SessionMetadataKind::TurnInterrupted => TurnStatus::Interrupted,
+                        _ => unreachable!(),
+                    },
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::ThreadSettings => vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: metadata.field_string("provider").map(str::to_string),
+                model: metadata.field_string("model").map(str::to_string),
+                reasoning: metadata.field_string("reasoning").map(str::to_string),
+            }],
+            SessionMetadataKind::Usage => metadata
+                .field("usage")
+                .cloned()
+                .map(|usage| HistoryItem::Usage {
+                    id: entry.id.clone(),
+                    usage,
+                })
+                .into_iter()
+                .collect(),
+            SessionMetadataKind::Item => Vec::new(),
+        },
+        SessionEntryType::ModelChange { provider, model_id } => {
+            vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: Some(provider.clone()),
+                model: Some(model_id.clone()),
+                reasoning: None,
+            }]
+        }
+        SessionEntryType::ThinkingLevelChange { thinking_level } => {
+            vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: None,
+                model: None,
+                reasoning: Some(thinking_level.clone()),
+            }]
+        }
+        SessionEntryType::Custom(_) | SessionEntryType::Other(_) => Vec::new(),
+    }
+}
 
 impl AppServer {
     /// 将应用事件包装为带类型化元数据的 JSON-RPC notification。

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -24,6 +25,18 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "config"
+path = "tests/config.rs"
+
+[[test]]
+name = "transport"
+path = "tests/transport.rs"
+
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52"
