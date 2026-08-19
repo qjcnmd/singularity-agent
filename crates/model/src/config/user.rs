@@ -412,7 +412,7 @@ pub(super) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, Provid
 }
 
 #[cfg(all(test, unix))]
-fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
+pub(super) fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
     let file = open_user_config_file(path, true)?;
     ensure_private_secret_handle(&file)
 }

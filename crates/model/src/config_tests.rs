@@ -585,5 +585,5 @@ fn auth_permissions_fail_closed_when_group_readable() {
     write_json_file(&path, r#"{"providers":{}}"#, true).expect("write auth file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
         .expect("make auth file group-readable");
-    assert!(ensure_private_secret_file(&path).is_err());
+    assert!(super::user::ensure_private_secret_file(&path).is_err());
 }
