@@ -1016,6 +1016,7 @@ fn bounded_session_read_counts_content_entries_without_counting_header() {
         session_message("entry-2", Some("entry-1"), "two")
     );
     std::fs::write(&file, content).unwrap();
+    assert!(parse_session_lines_with_limits(&file, 1024, 1024, 2).is_ok());
     let error = match parse_session_lines_with_limits(&file, 1024, 1024, 1) {
         Ok(_) => panic!("second content entry must exceed a one-entry content limit"),
         Err(error) => error,

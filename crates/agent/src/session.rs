@@ -1495,9 +1495,11 @@ fn parse_session_lines_with_limits(
                 cause: "session entry is not a JSON object".to_string(),
             });
         }
-        // MAX_SESSION_ENTRIES applies to content entries only; the header is
-        // a separate line and does not consume the content budget.
-        if entries.len() > max_content_entries {
+        // The parsed vector includes the header at index 0, but the limit
+        // applies only to content entries. Check the count before appending
+        // the next content entry so exactly N content entries are allowed.
+        let content_entries = entries.len().saturating_sub(1);
+        if content_entries >= max_content_entries {
             return Err(SessionError::InvalidSession(format!(
                 "session file exceeds bounded parse limits ({} bytes / {max_content_entries} entries)",
                 max_file_bytes
