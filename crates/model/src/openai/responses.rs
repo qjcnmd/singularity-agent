@@ -1,0 +1,1 @@
+//! Responses wire adapter seam.

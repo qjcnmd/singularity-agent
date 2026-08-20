@@ -1,5 +1,9 @@
 //! provider HTTP transport、retry、bounded body read 和取消传播。
 
+mod http;
+mod retry;
+mod stream;
+
 use super::contract::{provider_request_validation_error, request_uses_tool_protocol};
 use super::openai::{
     OpenAiCompletion, models_endpoint, openai_reasoning_content_present, openai_request_payload,
@@ -2151,5 +2155,5 @@ pub(super) fn provider_response_json_error() -> ModelError {
 }
 
 #[cfg(test)]
-#[path = "transport_tests.rs"]
+#[path = "../transport_tests.rs"]
 mod tests;

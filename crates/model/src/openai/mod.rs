@@ -1,5 +1,9 @@
 //! OpenAI Chat Completions/Responses 的请求投影、响应解码和 envelope 校验。
 
+mod chat;
+mod responses;
+mod wire;
+
 use super::contract::{
     message_text, provider_response_validation_error, request_uses_tool_protocol,
 };

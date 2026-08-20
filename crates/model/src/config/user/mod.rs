@@ -3,6 +3,10 @@
 //! User config and auth remain one lifecycle: read, validate, and atomically
 //! publish through the parent module's single source of truth.
 
+mod auth;
+mod catalog;
+mod import;
+
 use super::*;
 
 #[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
