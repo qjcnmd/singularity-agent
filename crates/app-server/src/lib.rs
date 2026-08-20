@@ -10,8 +10,6 @@ mod events;
 mod lifecycle;
 pub mod paths;
 mod state;
-#[allow(dead_code)]
-mod state_paths;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, SteerHandle},
+    agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, TurnInboxHandle},
     session::{
         SessionEntryFilter, SessionError, SessionManager, SessionMetadataKind, SessionReadOptions,
         SessionRepository,

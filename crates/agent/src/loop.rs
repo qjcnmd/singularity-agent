@@ -241,13 +241,6 @@ impl TurnInbox {
         self.enqueue(TurnInputKind::FollowUp, text)
     }
 
-    /// Compatibility helper for existing direct-handle callers: a raw push is
-    /// a steer input. New protocol paths should call `enqueue_follow_up` when
-    /// they need follow-up semantics.
-    pub fn push_back(&mut self, text: String) -> bool {
-        self.enqueue_steer(text)
-    }
-
     fn drain_steer(&mut self) -> Vec<String> {
         let mut steer = Vec::new();
         let mut retained = VecDeque::new();
@@ -279,8 +272,7 @@ impl TurnInbox {
 }
 
 /// steer/follow-up 共用的线程安全句柄。
-pub type SteerHandle = Arc<Mutex<TurnInbox>>;
-pub type TurnInboxHandle = SteerHandle;
+pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
 struct PreparedToolCall {
     call: singularity_model::ModelToolCall,
@@ -531,13 +523,8 @@ impl Agent {
         })
     }
 
-    /// 返回 steer 队列的线程安全句柄；`run` 每轮开始时 drain 队列内容。
-    pub fn steer_handle(&self) -> SteerHandle {
-        Arc::clone(&self.inbox)
-    }
-
-    /// 返回 follow-up 队列的线程安全句柄；`run` 在代理准备停止时 drain。
-    pub fn follow_up_handle(&self) -> SteerHandle {
+    /// 返回 turn 实时输入队列（steer / follow-up）的线程安全句柄。
+    pub fn inbox_handle(&self) -> TurnInboxHandle {
         Arc::clone(&self.inbox)
     }
 

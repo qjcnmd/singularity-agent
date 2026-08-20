@@ -390,16 +390,11 @@ impl AppServer {
         let session = self.open_session_for_thread(thread)?;
         let (provider, config) = self.provider_and_config_for_thread(thread)?;
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
-        let steer_handle = agent.steer_handle();
-        let follow_up_handle = agent.follow_up_handle();
-        self.steer_handles
+        let inbox_handle = agent.inbox_handle();
+        self.turn_inboxes
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(turn_id.to_string(), steer_handle);
-        self.follow_up_handles
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(turn_id.to_string(), follow_up_handle);
+            .insert(turn_id.to_string(), inbox_handle);
         let callback_error = RefCell::new(None);
         let assistant_events_cell = RefCell::new(assistant_events);
         // 回调闭包共享 emit 的可变借用：RefCell 包装（单线程 turn 内串行使用）。
@@ -817,12 +812,8 @@ impl AppServerControlHandle {
         // Release the reference lock before acquiring the inbox lock. The
         // ActiveTurnGuard removes inboxes before references during cleanup.
         drop(references);
-        let handles = if follow_up {
-            &self.follow_up_handles
-        } else {
-            &self.steer_handles
-        };
-        let handle = handles
+        let handle = self
+            .turn_inboxes
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .get(&params.turn_id)

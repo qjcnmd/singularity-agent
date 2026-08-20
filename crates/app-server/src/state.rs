@@ -18,8 +18,7 @@ pub struct AppServer {
     /// 当前活动 turn id -> thread。终态后移除，避免把输入误认为已排队。
     pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
     /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
-    pub(super) steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
     /// 已提交 turn 的运行时 usage 缓存；权威副本是同一 session JSONL 的 usage metadata。
     pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
@@ -59,8 +58,7 @@ pub struct AppServerCancellationHandle {
 pub struct AppServerControlHandle {
     pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
-    pub(super) steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
 }
 
 impl AppServerCancellationHandle {
@@ -87,8 +85,7 @@ impl AppServerCancellationHandle {
 pub(super) struct ActiveTurnGuard {
     pub(super) turn_id: String,
     pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    pub(super) steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
-    pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
     pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
     pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
@@ -99,11 +96,8 @@ impl Drop for ActiveTurnGuard {
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
         }
-        if let Ok(mut steer_handles) = self.steer_handles.lock() {
-            steer_handles.remove(&self.turn_id);
-        }
-        if let Ok(mut follow_up_handles) = self.follow_up_handles.lock() {
-            follow_up_handles.remove(&self.turn_id);
+        if let Ok(mut turn_inboxes) = self.turn_inboxes.lock() {
+            turn_inboxes.remove(&self.turn_id);
         }
         if let Ok(mut usage_by_turn) = self.usage_by_turn.lock() {
             usage_by_turn.remove(&self.turn_id);
@@ -131,8 +125,7 @@ impl AppServer {
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_threads: Arc::new(Mutex::new(HashMap::new())),
-            steer_handles: Arc::new(Mutex::new(HashMap::new())),
-            follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
+            turn_inboxes: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             usage_complete_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
@@ -246,8 +239,7 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             turn_threads: Arc::clone(&self.turn_threads),
-            steer_handles: Arc::clone(&self.steer_handles),
-            follow_up_handles: Arc::clone(&self.follow_up_handles),
+            turn_inboxes: Arc::clone(&self.turn_inboxes),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
@@ -296,8 +288,7 @@ impl AppServer {
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
-            steer_handles: Arc::clone(&self.steer_handles),
-            follow_up_handles: Arc::clone(&self.follow_up_handles),
+            turn_inboxes: Arc::clone(&self.turn_inboxes),
             turn_threads: Arc::clone(&self.turn_threads),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
@@ -536,8 +527,7 @@ impl AppServer {
         AppServerControlHandle {
             active_turns: Arc::clone(&self.active_turns),
             turn_threads: Arc::clone(&self.turn_threads),
-            steer_handles: Arc::clone(&self.steer_handles),
-            follow_up_handles: Arc::clone(&self.follow_up_handles),
+            turn_inboxes: Arc::clone(&self.turn_inboxes),
         }
     }
 
@@ -580,11 +570,8 @@ impl AppServer {
     /// 关闭已结束 turn 的实时注入窗口；活动映射保留到 guard drop，
     /// 让并发 session/delete 仍能观察到终态化 worker。终态后的输入必须通过新的 turn/start。
     pub(crate) fn close_turn_inputs(&self, turn_id: &str) {
-        if let Ok(mut handles) = self.steer_handles.lock() {
-            handles.remove(turn_id);
-        }
-        if let Ok(mut handles) = self.follow_up_handles.lock() {
-            handles.remove(turn_id);
+        if let Ok(mut inboxes) = self.turn_inboxes.lock() {
+            inboxes.remove(turn_id);
         }
     }
 }

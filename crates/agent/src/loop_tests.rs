@@ -1732,9 +1732,9 @@ fn follow_up_continues_one_more_turn() {
     );
 }
 
-/// 4b. steer_handle：run 期间经共享队列注入 → 下一轮上下文出现。
+/// 4b. inbox_handle：run 期间经共享队列注入 steer → 下一轮上下文出现。
 #[test]
-fn steer_handle_injects_during_run() {
+fn inbox_handle_injects_steer_during_run() {
     let (mut agent, _dir, provider) = setup(vec![
         FakeStep {
             text: String::new(),
@@ -1747,14 +1747,14 @@ fn steer_handle_injects_during_run() {
             usage: usage(100, 10),
         },
     ]);
-    let handle = agent.steer_handle();
+    let handle = agent.inbox_handle();
     let mut events = AgentEvents::new();
     // 工具执行开始时（run 期间）从外部句柄注入转向消息。
     let mut on_tool_execution_start = |_name: &str, _call_id: &str, _args: &Value| {
         handle
             .lock()
             .unwrap()
-            .push_back("steer during run".to_string());
+            .enqueue_steer("steer during run");
     };
     events.on_tool_execution_start = Some(&mut on_tool_execution_start);
     let outcome = agent

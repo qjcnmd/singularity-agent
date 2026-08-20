@@ -1041,18 +1041,12 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
     let (_, _guard) = server
         .activate_turn("turn_live", session_id)
         .expect("activate turn");
-    let steer = Arc::new(Mutex::new(TurnInbox::default()));
-    let follow_up = Arc::new(Mutex::new(TurnInbox::default()));
+    let inbox = Arc::new(Mutex::new(TurnInbox::default()));
     server
-        .steer_handles
+        .turn_inboxes
         .lock()
-        .expect("steer handles")
-        .insert("turn_live".to_string(), Arc::clone(&steer));
-    server
-        .follow_up_handles
-        .lock()
-        .expect("follow up handles")
-        .insert("turn_live".to_string(), Arc::clone(&follow_up));
+        .expect("turn inboxes")
+        .insert("turn_live".to_string(), Arc::clone(&inbox));
 
     let steer_response = server
         .handle_json(
