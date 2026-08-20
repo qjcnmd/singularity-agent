@@ -1,0 +1,19 @@
+//! 线性 JSONL Session 子系统的稳定 façade。
+//!
+//! `SessionManager` 仍是唯一的可变生命周期 owner；其公开合同由本模块
+//! 重新导出，而 format/file/context/repair/repository 子模块承载各自的
+//! schema、I/O、上下文、恢复和仓储接缝。客户端只依赖这里的 façade。
+
+mod manager;
+
+pub mod context;
+pub mod file;
+pub mod format;
+pub mod repair;
+pub mod repository;
+
+pub use manager::{
+    CompactionEntry, Result, SessionContext, SessionEntry, SessionEntryFilter, SessionEntryType,
+    SessionError, SessionManager, SessionMetadata, SessionMetadataKind, SessionRead,
+    SessionReadOptions, SessionRepository, CURRENT_SESSION_VERSION,
+};

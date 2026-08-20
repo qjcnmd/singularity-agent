@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use uuid::Uuid;
 
-use super::message::{
+use crate::message::{
     AgentMessage, AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
     ContentBlock, LlmMessage,
 };
@@ -1678,5 +1678,5 @@ fn normalize_cwd_string(cwd: &Path) -> String {
 }
 
 #[cfg(test)]
-#[path = "session_tests.rs"]
+#[path = "../session_tests.rs"]
 mod tests;
