@@ -5,6 +5,6 @@
 //! a stable format seam without introducing a second representation.
 
 pub use super::manager::{
-    CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionMetadata,
-    SessionMetadataKind, CURRENT_SESSION_VERSION,
+    CURRENT_SESSION_VERSION, CompactionEntry, SessionEntry, SessionEntryType, SessionError,
+    SessionMetadata, SessionMetadataKind,
 };

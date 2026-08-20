@@ -49,6 +49,7 @@ fn compaction(summary: &str, first_kept_entry_id: Option<String>) -> CompactionE
         first_kept_entry_id,
         tokens_before: Some(100),
         previous_summary: None,
+        usage: None,
         details: None,
     }
 }
@@ -180,6 +181,53 @@ fn separate_session_managers_follow_the_latest_durable_leaf() {
     );
     assert_eq!(reopened.entries[reopened.by_id[&s1]].parent_id, m2);
     assert_eq!(reopened.entries[reopened.by_id[&m3]].parent_id, s1);
+}
+
+#[test]
+fn incremental_tail_refresh_repairs_and_reopens_on_external_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let mut first = SessionManager::create(dir.path(), &sessions).unwrap();
+    let first_id = first.append_message(user("first")).unwrap();
+    let file = first.path().to_path_buf();
+    let mut second = SessionManager::open(&file).unwrap();
+
+    // A second manager appends one complete line. The first manager must read
+    // only that tail and bind its next parent to the durable leaf.
+    let second_id = second.append_message(user("second")).unwrap();
+    let third_id = first.append_message(user("third")).unwrap();
+    assert_eq!(first.entries[first.by_id[&third_id]].parent_id, second_id);
+    assert_eq!(first.entries[first.by_id[&first_id]].parent_id, "");
+
+    // A torn external tail falls back to the bounded full reopen/repair path
+    // before the next append; the malformed bytes must not enter memory.
+    use std::io::Write as _;
+    let mut handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap();
+    handle
+        .write_all(b"{\"type\":\"message\",\"id\":\"")
+        .unwrap();
+    handle.flush().unwrap();
+    drop(handle);
+    let repaired_id = first.append_message(user("after repair")).unwrap();
+    assert_eq!(first.entries[first.by_id[&repaired_id]].parent_id, third_id);
+    assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
+
+    // Replacing the file with a valid same-session rollout invalidates the
+    // cached identity and forces a full reopen before appending.
+    let replacement = format!(
+        "{}\n{}\n",
+        session_header(first.session_id()),
+        session_message("replacement", None, "replacement")
+    );
+    std::fs::write(&file, replacement).unwrap();
+    let after_replace = first.append_message(user("after replacement")).unwrap();
+    assert_eq!(
+        first.entries[first.by_id[&after_replace]].parent_id,
+        "replacement"
+    );
 }
 
 #[test]

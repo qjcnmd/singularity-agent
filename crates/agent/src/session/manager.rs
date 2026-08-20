@@ -6,15 +6,19 @@
 //! 新格式定义为唯一支持的 `version: 1`，严格校验 Header 与 Entry，拒绝任何未知字段。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::SystemTime;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use serde::ser::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus};
+use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelUsage};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::macros::format_description;
@@ -172,6 +176,8 @@ pub struct CompactionEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub previous_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
@@ -482,6 +488,30 @@ pub struct SessionManager {
     session_id: String,
     header_timestamp: String,
     append_lock: Arc<Mutex<()>>,
+    file_state: SessionFileState,
+}
+
+/// Validated on-disk position used by append refresh.  The identity tuple
+/// catches replacement even when a replacement happens to have the same
+/// length; header bytes provide an additional compatibility guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionFileState {
+    len: u64,
+    identity: (u64, u64),
+    modified: Option<SystemTime>,
+    header: Vec<u8>,
+}
+
+impl SessionFileState {
+    fn capture(path: &Path) -> Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Self {
+            len: metadata.len(),
+            identity: file_identity(&metadata),
+            modified: metadata.modified().ok(),
+            header: read_header_identity(path)?,
+        })
+    }
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -574,6 +604,7 @@ impl SessionManager {
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
         let append_lock = append_lock_for(&file);
+        let file_state = SessionFileState::capture(&file)?;
         Ok(Self {
             file,
             cwd,
@@ -583,6 +614,7 @@ impl SessionManager {
             session_id,
             header_timestamp: timestamp,
             append_lock,
+            file_state,
         })
     }
 
@@ -632,6 +664,7 @@ impl SessionManager {
             leaf_id = Some(entry.id.clone());
         }
         let append_lock = append_lock_for(&file);
+        let file_state = SessionFileState::capture(&file)?;
         Ok(Self {
             file,
             cwd,
@@ -641,6 +674,7 @@ impl SessionManager {
             session_id,
             header_timestamp,
             append_lock,
+            file_state,
         })
     }
 
@@ -678,6 +712,7 @@ impl SessionManager {
             leaf_id = Some(entry.id.clone());
         }
         drop(_guard);
+        let file_state = SessionFileState::capture(&file)?;
         Ok(Self {
             file,
             cwd,
@@ -687,6 +722,7 @@ impl SessionManager {
             session_id,
             header_timestamp,
             append_lock,
+            file_state,
         })
     }
 
@@ -709,6 +745,7 @@ impl SessionManager {
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
         let append_lock = append_lock_for(file);
+        let file_state = SessionFileState::capture(file)?;
         Ok(Self {
             file: file.to_path_buf(),
             cwd,
@@ -718,6 +755,7 @@ impl SessionManager {
             session_id,
             header_timestamp: timestamp,
             append_lock,
+            file_state,
         })
     }
 
@@ -796,7 +834,7 @@ impl SessionManager {
         entry_type: SessionEntryType,
         limits: AppendLimits,
     ) -> Result<String> {
-        let (id, entry) = {
+        let (id, entry, file_state) = {
             let append_lock = Arc::clone(&self.append_lock);
             let _guard = lock_append(&append_lock);
             self.refresh_from_disk_locked()?;
@@ -817,15 +855,54 @@ impl SessionManager {
             handle.write_all(serialized.as_bytes())?;
             handle.write_all(b"\n")?;
             handle.flush()?;
-            (id, entry)
+            let file_state = SessionFileState::capture(&self.file)?;
+            (id, entry, file_state)
         };
         self.by_id.insert(id.clone(), self.entries.len());
         self.entries.push(entry);
         self.leaf_id = Some(id.clone());
+        self.file_state = file_state;
         Ok(id)
     }
 
     fn refresh_from_disk_locked(&mut self) -> Result<()> {
+        let current_state = SessionFileState::capture(&self.file)?;
+        if current_state == self.file_state {
+            return Ok(());
+        }
+        if current_state.len > self.file_state.len
+            && current_state.len <= MAX_SESSION_FILE_BYTES as u64
+            && current_state.identity == self.file_state.identity
+            && current_state.header == self.file_state.header
+        {
+            if let Ok(tail) =
+                parse_session_tail(&self.file, self.file_state.len, self.entries.len())
+            {
+                let mut next_parent = self.leaf_id.as_deref().unwrap_or("").to_string();
+                let valid = tail.iter().all(|entry| {
+                    let is_valid =
+                        !self.by_id.contains_key(&entry.id) && entry.parent_id == next_parent;
+                    if is_valid {
+                        next_parent = entry.id.clone();
+                    }
+                    is_valid
+                });
+                if !valid {
+                    // A complete but incompatible tail may indicate a
+                    // replacement/branch; let full validation report the
+                    // precise structural error instead of mutating memory.
+                } else {
+                    for entry in tail {
+                        let index = self.entries.len();
+                        self.by_id.insert(entry.id.clone(), index);
+                        self.leaf_id = Some(entry.id.clone());
+                        self.entries.push(entry);
+                    }
+                    self.file_state = current_state;
+                    return Ok(());
+                }
+            }
+        }
         let refreshed = Self::open_unlocked(&self.file)?;
         if refreshed.session_id != self.session_id {
             return Err(SessionError::InvalidSession(format!(
@@ -837,6 +914,7 @@ impl SessionManager {
         self.entries = refreshed.entries;
         self.by_id = refreshed.by_id;
         self.leaf_id = refreshed.leaf_id;
+        self.file_state = refreshed.file_state;
         Ok(())
     }
 
@@ -1304,6 +1382,69 @@ fn parse_session_lines_with_limits(
     })
 }
 
+/// Parse only complete JSONL lines appended after a previously validated byte
+/// offset.  Any torn/invalid tail is returned as an error so the caller can
+/// use the existing bounded full reopen/repair path.
+fn parse_session_tail(
+    path: &Path,
+    offset: u64,
+    current_entries: usize,
+) -> Result<Vec<SessionEntry>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut line_number = current_entries.saturating_add(2);
+    while let Some(bounded_line) = read_bounded_session_line(&mut reader, MAX_SESSION_LINE_BYTES)? {
+        if bounded_line.too_long {
+            return Err(SessionError::InvalidSession(format!(
+                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes at line {line_number}"
+            )));
+        }
+        if !bounded_line.has_newline {
+            return Err(SessionError::InvalidSession(
+                "session tail is incomplete and requires repair".to_string(),
+            ));
+        }
+        let mut line = bounded_line.bytes.as_slice();
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            line_number += 1;
+            continue;
+        }
+        let text = std::str::from_utf8(line).map_err(|error| SessionError::MalformedLine {
+            line: line_number,
+            cause: format!("invalid UTF-8: {error}"),
+        })?;
+        let value =
+            serde_json::from_str::<Value>(text).map_err(|error| SessionError::MalformedLine {
+                line: line_number,
+                cause: error.to_string(),
+            })?;
+        if value.get("type").and_then(Value::as_str) == Some("session") {
+            return Err(SessionError::InvalidStructure(format!(
+                "intermediate session header at line {line_number}"
+            )));
+        }
+        let entry =
+            strict_entry_from_value(&value).map_err(|cause| SessionError::InvalidEntry {
+                line: line_number,
+                cause,
+            })?;
+        entries.push(entry);
+        if current_entries.saturating_add(entries.len()) > MAX_SESSION_ENTRIES {
+            return Err(SessionError::InvalidSession(format!(
+                "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
+                MAX_SESSION_FILE_BYTES
+            )));
+        }
+        line_number += 1;
+    }
+    Ok(entries)
+}
+
 struct BoundedSessionLine {
     bytes: Vec<u8>,
     has_newline: bool,
@@ -1346,6 +1487,47 @@ fn read_bounded_session_line<R: BufRead>(
                 too_long: false,
             }));
         }
+    }
+}
+
+fn read_header_identity(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let line = read_bounded_session_line(&mut reader, MAX_SESSION_LINE_BYTES)?
+        .ok_or_else(|| SessionError::InvalidSession("session header is missing".to_string()))?;
+    if line.too_long {
+        return Err(SessionError::InvalidSession(format!(
+            "session header exceeds {MAX_SESSION_LINE_BYTES} bytes"
+        )));
+    }
+    let mut identity = line.bytes;
+    identity.push(u8::from(line.has_newline));
+    Ok(identity)
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        // Stable std metadata APIs do not expose Windows file indexes on the
+        // pinned toolchain; creation time plus length still detects normal
+        // replacement while `modified` and header bytes cover same-size edits.
+        (
+            metadata
+                .created()
+                .ok()
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or_default(),
+            metadata.len(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (0, 0)
     }
 }
 
