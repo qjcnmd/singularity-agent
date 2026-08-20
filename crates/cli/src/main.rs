@@ -14,7 +14,7 @@ mod commands;
 mod render;
 mod session_reference;
 
-use client::AppServerClient;
+use client::{AppServerClient, FORCE_INTERRUPT_ERROR};
 use commands::run_cli;
 #[cfg(test)]
 use render::safe_protocol_event;
@@ -108,7 +108,11 @@ enum SessionCommand {
 fn main() {
     if let Err(error) = run_cli(Cli::parse()) {
         eprintln!("{error}");
-        std::process::exit(1);
+        std::process::exit(if error == FORCE_INTERRUPT_ERROR {
+            130
+        } else {
+            1
+        });
     }
 }
 

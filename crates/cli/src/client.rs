@@ -5,6 +5,10 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -13,7 +17,8 @@ use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId,
     JsonRpcMessage, JsonRpcNotification, Method, RpcMethod, SessionDeleteResult, SessionIdParams,
     SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadSettingsParams,
-    ThreadStartParams, Turn, TurnEventParams, TurnStartParams, TurnStatus, rpc_methods,
+    ThreadStartParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams, TurnStatus,
+    rpc_methods,
 };
 
 use crate::render::should_render_assistant_summary;
@@ -26,6 +31,8 @@ const CLI_CLIENT_TITLE: &str = "Singularity CLI";
 const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const CTRL_C_POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const FORCE_INTERRUPT_ERROR: &str = "forced exit after second Ctrl+C";
 
 pub(super) struct AppServerClient {
     child: Option<Child>,
@@ -40,6 +47,47 @@ pub(super) struct RpcReply<R> {
     result: R,
     notifications: Vec<JsonRpcNotification>,
     request_id: JsonRpcId,
+}
+
+/// First Ctrl+C is graceful; a second one is an explicit force escape hatch.
+/// The signal handler only records intent. The client thread remains the sole
+/// owner of stdin and sends the JSON-RPC interrupt at the active-turn seam.
+#[derive(Clone)]
+pub(super) struct CtrlCMonitor {
+    count: Arc<AtomicU8>,
+}
+
+impl CtrlCMonitor {
+    fn count(&self) -> u8 {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+fn spawn_ctrl_c_monitor() -> Option<CtrlCMonitor> {
+    let count = Arc::new(AtomicU8::new(0));
+    let handler_count = Arc::clone(&count);
+    thread::Builder::new()
+        .name("sg-ctrl-c".to_string())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            while runtime.block_on(tokio::signal::ctrl_c()).is_ok() {
+                let previous = handler_count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        Some(value.saturating_add(1))
+                    })
+                    .unwrap_or(2);
+                if previous >= 1 {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    Some(CtrlCMonitor { count })
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +155,7 @@ pub(super) fn render_and_wait_terminal(
     mut notifications: Vec<JsonRpcNotification>,
     request_id: &JsonRpcId,
     render: bool,
+    ctrl_c: Option<CtrlCMonitor>,
 ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
     let thread_id = initial_turn.thread_id.clone();
     let turn_id = initial_turn.turn_id.clone();
@@ -126,8 +175,24 @@ pub(super) fn render_and_wait_terminal(
         return Ok((initial_turn, notifications));
     }
 
+    let mut interrupt_sent = false;
     loop {
-        let message = client.read_message(client.response_timeout)?;
+        if let Some(monitor) = ctrl_c.as_ref() {
+            match monitor.count() {
+                0 => {}
+                1 if !interrupt_sent => {
+                    client.send_turn_interrupt(&turn_id)?;
+                    interrupt_sent = true;
+                }
+                _ if monitor.count() >= 2 => return Err(FORCE_INTERRUPT_ERROR.to_string()),
+                _ => {}
+            }
+        }
+        let message = match client.read_message(CTRL_C_POLL_INTERVAL) {
+            Ok(message) => message,
+            Err(error) if error == "timed out waiting for app-server response" => continue,
+            Err(error) => return Err(error),
+        };
         match message {
             JsonRpcMessage::Notification(notification) => {
                 let method = notification.method.as_str();
@@ -330,6 +395,7 @@ impl AppServerClient {
                 text: text.to_string(),
             }],
         };
+        let ctrl_c = spawn_ctrl_c_monitor();
         let reply = self.request::<rpc_methods::TurnStart>(&params)?;
         render_and_wait_terminal(
             self,
@@ -337,6 +403,7 @@ impl AppServerClient {
             reply.notifications,
             &reply.request_id,
             render,
+            ctrl_c,
         )
     }
 
@@ -468,6 +535,22 @@ impl AppServerClient {
         let method = M::METHOD;
         let message = JsonRpcMessage::notification(method.as_str(), params)
             .map_err(|error| format!("failed to serialize app-server notification: {error}"))?;
+        self.write_message(&message)
+    }
+
+    // First Ctrl+C uses this fire-and-continue control path. The matching
+    // response is consumed by the normal turn event loop; waiting here would
+    // stop draining terminal notifications and could deadlock shutdown.
+    fn send_turn_interrupt(&mut self, turn_id: &str) -> Result<(), String> {
+        let id = JsonRpcId::Number(self.next_request_id());
+        let message = JsonRpcMessage::request(
+            Method::TurnInterrupt,
+            id,
+            &TurnIdParams {
+                turn_id: turn_id.to_string(),
+            },
+        )
+        .map_err(|error| format!("failed to serialize turn/interrupt request: {error}"))?;
         self.write_message(&message)
     }
 
