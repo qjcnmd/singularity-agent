@@ -155,10 +155,10 @@ impl AppServer {
             return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
         }
 
-        // Request 方法以 notification（无 id）提交：按 JSON-RPC 方法表契约对称拒绝，
-        // 不执行任何副作用（thread/start 不得创建、turn/start 不得进槽位）。
+        // Request-only 方法以 notification（无 id）提交时必须静默忽略：
+        // 不执行任何副作用，也不能伪造一个带 null id 的错误响应。
         if method.spec().kind == MethodKind::Request && notification {
-            return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
+            return Ok(Vec::new());
         }
 
         if method

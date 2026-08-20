@@ -1088,7 +1088,7 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
 
-    // 每个 Request 方法以 notification（无 id）提交 → -32600 且不执行任何副作用。
+    // 每个 Request 方法以 notification（无 id）提交 → 静默忽略且不执行任何副作用。
     for (method, params) in [
         (
             "initialize",
@@ -1119,9 +1119,7 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
             params.replace("<session>", session_id)
         );
         let responses = server.handle_json(&body).expect("notification handled");
-        assert_eq!(responses.len(), 1, "{method}");
-        assert_eq!(responses[0]["error"]["code"], -32600, "{method}");
-        assert!(responses[0]["error"]["message"].is_string(), "{method}");
+        assert!(responses.is_empty(), "{method}: {responses:?}");
     }
 
     // 副作用检查：会话仍存在、thread/start 未创建任何 thread、服务器未关闭。
@@ -1138,6 +1136,22 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
         threads["result"]["threads"].as_array().map(Vec::len),
         Some(1)
     );
+}
+
+#[test]
+fn notification_only_method_with_id_returns_typed_invalid_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &temp.path().join("sessions"));
+    let response = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"initialized","id":9,"params":{}}"#,
+        )
+        .expect("notification-only request");
+    assert_eq!(response.len(), 1);
+    assert_eq!(response[0]["id"], 9);
+    assert_eq!(response[0]["error"]["code"], -32600);
+    assert!(!server.initialized_acknowledged);
 }
 
 #[test]
