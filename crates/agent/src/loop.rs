@@ -155,7 +155,7 @@ pub enum AgentError {
     #[error("agent run failed after partial progress: {error}")]
     RunFailed {
         error: Box<AgentError>,
-        outcome: AgentOutcome,
+        outcome: Box<AgentOutcome>,
     },
 }
 
@@ -202,16 +202,11 @@ struct TurnInput {
     text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TurnInboxState {
+    #[default]
     Open,
     Closed,
-}
-
-impl Default for TurnInboxState {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 /// 活动 turn 的单一输入箱。
@@ -1180,7 +1175,7 @@ impl Agent {
         } else {
             Err(AgentError::RunFailed {
                 error: Box::new(error),
-                outcome,
+                outcome: Box::new(outcome),
             })
         }
     }

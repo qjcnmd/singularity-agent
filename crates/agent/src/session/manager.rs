@@ -874,33 +874,27 @@ impl SessionManager {
             && current_state.len <= MAX_SESSION_FILE_BYTES as u64
             && current_state.identity == self.file_state.identity
             && current_state.header == self.file_state.header
-        {
-            if let Ok(tail) =
+            && let Ok(tail) =
                 parse_session_tail(&self.file, self.file_state.len, self.entries.len())
-            {
-                let mut next_parent = self.leaf_id.as_deref().unwrap_or("").to_string();
-                let valid = tail.iter().all(|entry| {
-                    let is_valid =
-                        !self.by_id.contains_key(&entry.id) && entry.parent_id == next_parent;
-                    if is_valid {
-                        next_parent = entry.id.clone();
-                    }
-                    is_valid
-                });
-                if !valid {
-                    // A complete but incompatible tail may indicate a
-                    // replacement/branch; let full validation report the
-                    // precise structural error instead of mutating memory.
-                } else {
-                    for entry in tail {
-                        let index = self.entries.len();
-                        self.by_id.insert(entry.id.clone(), index);
-                        self.leaf_id = Some(entry.id.clone());
-                        self.entries.push(entry);
-                    }
-                    self.file_state = current_state;
-                    return Ok(());
+        {
+            let mut next_parent = self.leaf_id.as_deref().unwrap_or("").to_string();
+            let valid = tail.iter().all(|entry| {
+                let is_valid =
+                    !self.by_id.contains_key(&entry.id) && entry.parent_id == next_parent;
+                if is_valid {
+                    next_parent = entry.id.clone();
                 }
+                is_valid
+            });
+            if valid {
+                for entry in tail {
+                    let index = self.entries.len();
+                    self.by_id.insert(entry.id.clone(), index);
+                    self.leaf_id = Some(entry.id.clone());
+                    self.entries.push(entry);
+                }
+                self.file_state = current_state;
+                return Ok(());
             }
         }
         let refreshed = Self::open_unlocked(&self.file)?;

@@ -156,11 +156,11 @@ impl Default for CompactionConfig {
 
 impl CompactionConfig {
     pub fn validate(&self, provider_max_output_tokens: u32) -> Result<()> {
-        if !self.threshold_ratio.is_finite()
-            || !self.retain_ratio.is_finite()
-            || !(0.0 < self.retain_ratio
-                && self.retain_ratio < self.threshold_ratio
-                && self.threshold_ratio < 1.0)
+        if !(self.threshold_ratio.is_finite()
+            && self.retain_ratio.is_finite()
+            && 0.0 < self.retain_ratio
+            && self.retain_ratio < self.threshold_ratio
+            && self.threshold_ratio < 1.0)
         {
             return Err(CompactionError::InvalidResponse(
                 "compaction ratios must satisfy 0 < retain_ratio < threshold_ratio < 1".to_string(),
