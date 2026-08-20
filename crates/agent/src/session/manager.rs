@@ -905,6 +905,7 @@ impl SessionManager {
             )));
         }
         self.cwd = refreshed.cwd;
+        self.header_timestamp = refreshed.header_timestamp;
         self.entries = refreshed.entries;
         self.by_id = refreshed.by_id;
         self.leaf_id = refreshed.leaf_id;
