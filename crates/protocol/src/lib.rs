@@ -502,12 +502,11 @@ pub struct EmptyParams {}
 pub struct EmptyResult {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 /// 初始化请求参数。
 pub struct InitializeParams {
     #[serde(rename = "clientInfo")]
     pub client_info: ClientInfo,
-    #[serde(default)]
-    pub capabilities: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

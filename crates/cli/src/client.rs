@@ -265,7 +265,6 @@ impl AppServerClient {
     pub(super) fn initialize(&mut self) -> Result<(), String> {
         let _ = self.request::<rpc_methods::Initialize>(&InitializeParams {
             client_info: ClientInfo::new(CLI_CLIENT_NAME, CLI_CLIENT_TITLE, CLI_CLIENT_VERSION),
-            capabilities: None,
         })?;
         self.notify::<rpc_methods::Initialized>(&EmptyParams::default())?;
         Ok(())

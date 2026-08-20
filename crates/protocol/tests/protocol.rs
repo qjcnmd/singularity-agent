@@ -261,10 +261,15 @@ fn turn_status_has_no_paused_suspended_or_blocked_state() {
 fn initialize_params_keep_client_info_contract() {
     let params = serde_json::to_value(InitializeParams {
         client_info: ClientInfo::new("sg", "Singularity CLI", "0.1.0"),
-        capabilities: None,
     })
     .expect("initialize params");
     assert_eq!(params["clientInfo"]["name"], "sg");
+    assert!(params.get("capabilities").is_none());
+    assert!(serde_json::from_value::<InitializeParams>(serde_json::json!({
+        "clientInfo": {"name": "sg", "title": "Singularity CLI", "version": "0.1.0"},
+        "capabilities": {}
+    }))
+    .is_err());
     let _: rpc_methods::Initialize = rpc_methods::Initialize;
     assert!(Method::Initialize.spec().validate_params(params).is_ok());
 }
