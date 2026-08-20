@@ -1,56 +1,35 @@
 //! provider 配置分层解析、脱敏状态和服务级配置快照。
 use std::collections::BTreeMap;
-use std::fmt;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-use serde::de::{self, Deserializer};
+pub mod filesystem;
+pub mod runtime;
+pub mod schema;
+pub mod selection;
+pub mod user;
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
+pub use filesystem::read_bounded_text;
+pub use runtime::*;
+pub use schema::*;
+pub use user::*;
 
 use super::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
     DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
     ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
-    MAX_DISCOVERED_MODEL_IDS, ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus, ModelError,
-    ModelErrorCategory, ModelErrorKind, ModelProviderConfig, OpenAiProvider, OpenAiProviderConfig,
+    ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig,
     PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderCapabilityDeclaration, ProviderConfigResolution, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, ProviderError, ProviderErrorStage,
-    ProviderProtocolContract, ProviderToolReasoningMode, RESPONSES_PATH, ThinkingWireFormat,
-    USER_AUTH_GENERATION_PREFIX, USER_AUTH_SCHEMA_VERSION, USER_CONFIG_DIR_NAME,
-    USER_CONFIG_FILE_NAME, USER_MODELS_CACHE_FILE_NAME, USER_MODELS_CACHE_SCHEMA_VERSION,
-    USER_MODELS_CACHE_TTL_SECONDS, UserConfigImportResult, UserModelCatalog, UserModelCatalogEntry,
-    UserProviderModelCatalog, chat_completions_endpoint, validate_provider_config,
+    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage,
+    ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
 };
-use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
-mod filesystem;
-mod schema;
-mod selection;
-mod user;
-use filesystem::{
-    BoundedTextError, read_bounded_text, read_bounded_text_from_file, write_json_file,
-};
-use schema::*;
 pub(super) use selection::model_selector_error;
 use selection::{parse_model_selector, provider_for_selection};
 #[cfg(test)]
-use user::{
-    UserAuthFile, UserAuthProvider, UserConfigFile, UserConfigProvider, acquire_config_writer_lock,
-    canonicalize_existing_prefix, ensure_home_outside_root, load_models_cache,
-    normalize_absolute_path, parse_import_model_selector, path_exists_or_missing,
-    read_private_auth_file, read_user_config_data_from_directory, repository_boundary_root,
-    write_new_auth_generation,
-};
-use user::{UserConfigData, UserConfigModel, user_config_error, user_config_layer};
-pub use user::{import_env_to_user_config, read_user_model_catalog};
-
-mod runtime;
-pub(crate) use runtime::{ModelSelectionSnapshot, configuration_error, redacted_models_config};
+use filesystem::write_json_file;
 #[cfg(test)]
-pub(crate) use runtime::{capture_models_file, provider_initialization_blocker};
+use crate::error::ModelErrorCategory;
+#[cfg(test)]
+pub(crate) use runtime::capture_models_file;
 
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
 where
@@ -60,7 +39,7 @@ where
     provider_config_resolution(&values)
 }
 
-fn missing_provider_config_error(
+pub(crate) fn missing_provider_config_error(
     name: &str,
     source: Option<ProviderConfigSource>,
 ) -> ProviderError {
@@ -77,7 +56,7 @@ fn missing_provider_config_error(
     )
 }
 
-fn missing_provider_auth_error(source: Option<ProviderConfigSource>) -> ProviderError {
+pub(crate) fn missing_provider_auth_error(source: Option<ProviderConfigSource>) -> ProviderError {
     let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
     ProviderError::from_model_error(
         ModelError::new(
@@ -91,7 +70,7 @@ fn missing_provider_auth_error(source: Option<ProviderConfigSource>) -> Provider
     )
 }
 
-fn provider_source_missing_error() -> ProviderError {
+pub(crate) fn provider_source_missing_error() -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
             ModelErrorKind::InvalidRequest,
@@ -104,7 +83,7 @@ fn provider_source_missing_error() -> ProviderError {
     )
 }
 
-fn parse_provider_limit(
+pub(crate) fn parse_provider_limit(
     value: Option<&str>,
     name: &str,
     fallback: u32,
@@ -135,7 +114,7 @@ fn parse_provider_limit(
     }
 }
 
-fn validate_provider_value(
+pub(crate) fn validate_provider_value(
     value: Option<&str>,
     name: &str,
     source: Option<ProviderConfigSource>,
@@ -173,9 +152,7 @@ fn validate_provider_value(
     Ok(())
 }
 
-/// Validate a provider endpoint before it can be used for transport or persisted discovery.
-/// The original spelling is retained by callers; parsing is only used for trust-boundary checks.
-fn validate_base_url(
+pub(crate) fn validate_base_url(
     value: Option<&str>,
     source: Option<ProviderConfigSource>,
 ) -> Result<(), ProviderError> {
@@ -210,7 +187,7 @@ fn validate_base_url(
     Ok(())
 }
 
-fn normalized_endpoint_identity(base_url: &str) -> Result<String, ProviderError> {
+pub(crate) fn normalized_endpoint_identity(base_url: &str) -> Result<String, ProviderError> {
     validate_base_url(Some(base_url), Some(ProviderConfigSource::UserConfigFile))?;
     let url = reqwest::Url::parse(base_url)
         .map_err(|_| user_config_error("user provider endpoint could not be normalized"))?;
@@ -286,17 +263,17 @@ impl ProviderConfigLayer {
 }
 
 #[derive(Clone, Default)]
-struct ResolvedProviderValues {
-    source: Option<ProviderConfigSource>,
-    provider_name: Option<String>,
-    model_name: Option<String>,
-    context_tokens: Option<String>,
-    max_output_tokens: Option<String>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    models_config_path: Option<String>,
-    user_config: Option<UserConfigData>,
-    user_config_error: Option<ProviderError>,
+pub(crate) struct ResolvedProviderValues {
+    pub(crate) source: Option<ProviderConfigSource>,
+    pub(crate) provider_name: Option<String>,
+    pub(crate) model_name: Option<String>,
+    pub(crate) context_tokens: Option<String>,
+    pub(crate) max_output_tokens: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) models_config_path: Option<String>,
+    pub(crate) user_config: Option<UserConfigData>,
+    pub(crate) user_config_error: Option<ProviderError>,
 }
 
 fn configured_model_from_file(
@@ -686,14 +663,14 @@ fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfig
     }
 }
 
-fn resolve_provider_values<F>(mut get_env: F) -> ResolvedProviderValues
+pub(crate) fn resolve_provider_values<F>(mut get_env: F) -> ResolvedProviderValues
 where
     F: FnMut(&str) -> Option<String>,
 {
     resolve_provider_values_with_user_config(&mut get_env, user_config_layer)
 }
 
-fn resolve_provider_values_with_user_config<F, U>(
+pub(crate) fn resolve_provider_values_with_user_config<F, U>(
     mut get_env: F,
     user_config: U,
 ) -> ResolvedProviderValues
@@ -714,11 +691,11 @@ where
         .unwrap_or_default()
 }
 
-fn normalized_provider_value(value: Option<String>) -> Option<String> {
+pub(crate) fn normalized_provider_value(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
-fn find_import_env_file(project_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_import_env_file(project_dir: &Path) -> Option<PathBuf> {
     let mut dir = project_dir.to_path_buf();
     loop {
         let path = dir.join(".env");
@@ -731,7 +708,7 @@ fn find_import_env_file(project_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-fn read_import_env_layer(path: &Path) -> ProviderConfigLayer {
+pub(crate) fn read_import_env_layer(path: &Path) -> ProviderConfigLayer {
     let Ok(text) = read_bounded_text(path, super::MAX_DISCOVERY_RESPONSE_BYTES) else {
         return ProviderConfigLayer::default();
     };
@@ -754,7 +731,7 @@ fn read_import_env_layer(path: &Path) -> ProviderConfigLayer {
     layer
 }
 
-fn parse_env_line(line: &str) -> Option<(String, String)> {
+pub(crate) fn parse_env_line(line: &str) -> Option<(String, String)> {
     let mut text = line.trim_start();
     if text.is_empty() || text.starts_with('#') {
         return None;
@@ -784,7 +761,7 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
-fn redacted_presence(present: bool) -> String {
+pub(crate) fn redacted_presence(present: bool) -> String {
     if present {
         "present(redacted)".to_string()
     } else {

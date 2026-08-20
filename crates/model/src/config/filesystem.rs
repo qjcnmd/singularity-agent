@@ -4,14 +4,15 @@
 //! replacement are kept behind the configuration module's existing helpers.
 
 use super::*;
+use uuid::Uuid;
 
-pub(super) enum BoundedTextError {
+pub enum BoundedTextError {
     TooLarge,
     Read(std::io::Error),
 }
 
 impl BoundedTextError {
-    pub(super) fn is_invalid_data(&self) -> bool {
+    pub fn is_invalid_data(&self) -> bool {
         match self {
             Self::TooLarge => true,
             Self::Read(error) => error.kind() == std::io::ErrorKind::InvalidData,
@@ -19,12 +20,12 @@ impl BoundedTextError {
     }
 }
 
-pub(super) fn read_bounded_text(path: &Path, max_bytes: usize) -> Result<String, BoundedTextError> {
+pub fn read_bounded_text(path: &Path, max_bytes: usize) -> Result<String, BoundedTextError> {
     let mut file = std::fs::File::open(path).map_err(BoundedTextError::Read)?;
     read_bounded_text_from_file(&mut file, max_bytes)
 }
 
-pub(super) fn read_bounded_text_from_file(
+pub fn read_bounded_text_from_file(
     file: &mut std::fs::File,
     max_bytes: usize,
 ) -> Result<String, BoundedTextError> {
@@ -49,7 +50,7 @@ pub(super) fn read_bounded_text_from_file(
     })
 }
 
-pub(super) fn write_json_file(
+pub fn write_json_file(
     path: &Path,
     contents: &str,
     secret: bool,

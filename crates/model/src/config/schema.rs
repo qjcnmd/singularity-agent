@@ -7,13 +7,93 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{
     OpenAiProvider, ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderError,
     ProviderToolReasoningMode, ThinkingWireFormat, configuration_error,
 };
+
+/// 脱敏的模型提供方配置存在性信息；这里永不存储敏感信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelProviderConfig {
+    pub provider_name: Option<String>,
+    pub model_name: Option<String>,
+    pub base_url_present: bool,
+    pub api_key_present: bool,
+}
+
+/// 解析出有效模型提供方配置值的配置层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderConfigSource {
+    ProcessEnvironment,
+    UserConfigFile,
+}
+
+impl ProviderConfigSource {
+    /// 返回配置来源的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessEnvironment => "process_env",
+            Self::UserConfigFile => "user_config",
+        }
+    }
+}
+
+/// 构建模型提供方前解析得到的来源和脱敏配置状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfigResolution {
+    pub source: Option<ProviderConfigSource>,
+    pub config: ModelProviderConfig,
+}
+
+/// 模型提供方初始化无法继续时报告的稳定阻塞类别。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBlockerKind {
+    RequiredEnvMissing,
+    AuthenticationProviderError,
+    BaseUrlNetworkError,
+    ModelNameConfigError,
+    ProviderRuntimeUnavailable,
+}
+
+impl ModelBlockerKind {
+    /// 返回阻塞类别代码。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::RequiredEnvMissing => "required_env_missing",
+            Self::AuthenticationProviderError => "authentication_provider_error",
+            Self::BaseUrlNetworkError => "base_url_network_error",
+            Self::ModelNameConfigError => "model_name_config_error",
+            Self::ProviderRuntimeUnavailable => "provider_runtime_unavailable",
+        }
+    }
+
+    /// 返回阻塞类别说明。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequiredEnvMissing => "required env missing",
+            Self::AuthenticationProviderError => "authentication/provider error",
+            Self::BaseUrlNetworkError => "base_url/network error",
+            Self::ModelNameConfigError => "model name/config error",
+            Self::ProviderRuntimeUnavailable => "provider runtime unavailable",
+        }
+    }
+}
+
+/// 暴露给 `AppServer` 的脱敏模型提供方就绪状态和阻塞信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderConfigurationStatus {
+    pub configured: bool,
+    pub provider_name: Option<String>,
+    pub model_name: Option<String>,
+    pub api_key_status: String,
+    pub base_url_status: String,
+    pub blocker: Option<ModelBlockerKind>,
+}
 
 #[derive(Clone)]
 pub(crate) struct ConfiguredProvider {
@@ -88,10 +168,10 @@ pub(crate) struct ModelsFileModel {
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ModelsFileReasoningVariant {
-    pub(crate) enabled: bool,
+pub struct ModelsFileReasoningVariant {
+    pub enabled: bool,
     #[serde(default)]
-    pub(crate) wire_effort: Option<String>,
+    pub wire_effort: Option<String>,
 }
 
 #[derive(Clone)]
@@ -137,6 +217,18 @@ where
     }
 
     deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
+}
+
+pub(crate) fn deserialize_unique_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let mut seen = std::collections::BTreeSet::new();
+    if values.iter().any(|value| !seen.insert(value)) {
+        return Err(de::Error::custom("duplicate model id"));
+    }
+    Ok(values)
 }
 
 pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), ProviderError> {

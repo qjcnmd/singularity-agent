@@ -1,4 +1,4 @@
-use crate::contract;
+use crate::provider::contract;
 use crate::provider::ProviderAttemptMetadata;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

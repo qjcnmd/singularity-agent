@@ -1,4 +1,79 @@
-//! Shared OpenAI-compatible wire helpers.
-//!
-//! The concrete adapters remain in the parent module while this seam is kept
-//! private so wire changes cannot leak into the AgentLoop contract.
+//! OpenAI 协议端点路径与共享线路辅助能力。
+
+use crate::error::ProviderError;
+use crate::types::{ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage};
+
+pub const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+pub const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+pub const RESPONSES_PATH: &str = "/responses";
+pub const V1_RESPONSES_PATH: &str = "/v1/responses";
+
+/// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。
+pub fn chat_completions_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}{CHAT_COMPLETIONS_PATH}")
+    } else {
+        format!("{trimmed}{V1_CHAT_COMPLETIONS_PATH}")
+    }
+}
+
+/// 将基础 URL 解析为兼容 OpenAI 的 Responses 端点。
+pub fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(RESPONSES_PATH) {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix(CHAT_COMPLETIONS_PATH) {
+        format!("{prefix}{RESPONSES_PATH}")
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}{RESPONSES_PATH}")
+    } else {
+        format!("{trimmed}{V1_RESPONSES_PATH}")
+    }
+}
+
+/// 将基础 URL 解析为标准 OpenAI `/models` catalog 端点。
+pub fn models_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/models") {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix(CHAT_COMPLETIONS_PATH) {
+        format!("{prefix}/models")
+    } else if let Some(prefix) = trimmed.strip_suffix(RESPONSES_PATH) {
+        format!("{prefix}/models")
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/models")
+    } else {
+        format!("{trimmed}/v1/models")
+    }
+}
+
+/// 将模型提供方失败转换为 `AgentLoop` 使用的失败响应结构。
+pub fn provider_error_response(
+    request: &ModelTurnRequest,
+    error: ProviderError,
+) -> ModelTurnResponse {
+    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
+    ModelTurnResponse {
+        request_id: request.request_id.clone(),
+        response_id: format!("{}_provider_error", request.request_id),
+        status: ModelTurnStatus::Failed,
+        assistant_message: None,
+        tool_calls: Vec::new(),
+        usage: ModelUsage::default(),
+        finish_reason: None,
+        validation: None,
+        error: Some(*error.error),
+        provider_name: None,
+        model_name: request.model_preferences.model_name.clone(),
+        provider_attempt_metadata,
+        provider_reasoning_history: Vec::new(),
+    }
+}
+
+pub struct OpenAiCompletion {
+    pub response: ModelTurnResponse,
+    pub reasoning_content_present: bool,
+}

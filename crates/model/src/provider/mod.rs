@@ -1,7 +1,12 @@
-pub(crate) mod contract;
+pub mod contract;
+pub mod runtime;
+pub mod telemetry;
+
+pub use contract::*;
+pub use telemetry::*;
+
 use crate::error::ProviderError;
-use crate::provider_streaming_unsupported_error;
-use crate::{ModelTurnRequest, ModelTurnResponse, ProviderApiProtocol, ProviderProtocolContract};
+use crate::types::{ModelTurnRequest, ModelTurnResponse};
 use singularity_core::CancellationToken;
 use std::sync::Arc;
 
@@ -112,11 +117,3 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         (**self).complete_observed(request, cancellation, on_attempt)
     }
 }
-
-pub(crate) mod runtime;
-pub(crate) mod telemetry;
-pub use telemetry::{
-    ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent, ProviderStreamingCapability,
-};

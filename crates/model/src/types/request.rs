@@ -1,9 +1,17 @@
 use super::message::ModelMessage;
 use super::reasoning::ProviderReasoningReplay;
 use super::tool::{ModelToolSchema, ToolChoicePolicy};
-use crate::ModelPreferences;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// `AgentLoop` 为完成请求提供的可选模型参数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelPreferences {
+    pub model_name: Option<String>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_output_tokens: Option<u32>,
+}
 
 /// 传给模型提供方的完整模型请求，包括可见 tool 和 tool 策略。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
