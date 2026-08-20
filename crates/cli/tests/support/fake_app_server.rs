@@ -12,6 +12,7 @@ use std::time::Duration;
 
 // 读取 scenario、处理请求循环，并执行对应的 fake action。
 fn main() {
+    ignore_test_ctrl_break();
     let Some(scenario_path) = std::env::var_os(shared::SCENARIO_ENV) else {
         return;
     };
@@ -21,6 +22,24 @@ fn main() {
         process::exit(1);
     }
 }
+
+#[cfg(windows)]
+fn ignore_test_ctrl_break() {
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler_routine: Option<extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    extern "system" fn handler(ctrl_type: u32) -> i32 {
+        (ctrl_type == 1) as i32
+    }
+    let installed = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+    assert_ne!(installed, 0, "install fake app-server Ctrl+Break handler");
+}
+
+#[cfg(not(windows))]
+fn ignore_test_ctrl_break() {}
 
 // 加载 scenario 并按 method/调用次数分发交互。
 fn run(scenario_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,6 +132,12 @@ fn execute_actions(
                 .and_then(Value::as_str)
                 .ok_or("write action is missing text")?;
             std::fs::write(path, text)?;
+        } else if let Some(write_pid) = action.get("write_pid") {
+            let path = write_pid
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("write_pid action is missing path")?;
+            std::fs::write(path, process::id().to_string())?;
         } else if let Some(text) = action.get("stderr").and_then(Value::as_str) {
             eprintln!("{text}");
         } else if let Some(delay_ms) = action.get("sleep_ms").and_then(Value::as_u64) {

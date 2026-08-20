@@ -169,9 +169,19 @@ pub fn capture_params(path: &Path) -> Value {
     json!({"capture": {"path": path, "value": "params"}})
 }
 
+/// 捕获完整 JSON-RPC request，便于断言控制 lane 的 method、id 与 params。
+pub fn capture_request(path: &Path) -> Value {
+    json!({"capture": {"path": path, "value": "request"}})
+}
+
 /// 构造写入固定文本的动作。
 pub fn write_text(path: &Path, text: &str) -> Value {
     json!({"write": {"path": path, "text": text}})
+}
+
+/// 将 fake app-server 当前进程 ID 写入文件。
+pub fn write_pid(path: &Path) -> Value {
+    json!({"write_pid": {"path": path}})
 }
 
 /// 构造向 fake server stderr 输出文本的动作。

@@ -1,9 +1,10 @@
 //! read 工具：有界流式读取指定文件内容，支持基于 `offset` 与 `limit` 的行范围读取。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 
 use serde_json::{Value, json};
+use singularity_core::CancellationToken;
 
 use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
@@ -51,6 +52,19 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         }
     };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
+    execute_reader(path, offset, limit, &mut reader, ctx.signal)
+}
+
+fn execute_reader(
+    path: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    reader: &mut impl BufRead,
+    signal: Option<&CancellationToken>,
+) -> Result<ToolExecution, ToolError> {
+    if signal.is_some_and(CancellationToken::is_cancelled) {
+        return error_result("Operation aborted");
+    }
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
     let mut state = ReadState {
@@ -63,17 +77,21 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     };
     let mut line_number = 0usize;
     loop {
-        if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
+        if signal.is_some_and(CancellationToken::is_cancelled) {
             return error_result("Operation aborted");
         }
-        let Some(line) = (match read_bounded_line(&mut reader) {
+        let Some(line) = (match read_bounded_line(reader, signal) {
             Ok(line) => line,
+            Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
             Err(error) => {
                 return error_result(format!("Could not read file: {path}. {error}"));
             }
         }) else {
             break;
         };
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return error_result("Operation aborted");
+        }
         line_number += 1;
         let selected_position = line_number.saturating_sub(start_line);
         if selected_position == 0 {
@@ -196,23 +214,60 @@ fn render_read_output(
     selected_content
 }
 
-/// 有界读取一行：单行超过 `MAX_READ_LINE_BYTES` 时 fail closed，不分配无界内存。
-fn read_bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+#[derive(Debug)]
+enum ReadFailure {
+    Cancelled,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Operation aborted"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// 有界读取一行：单行超过 MAX_READ_LINE_BYTES 时 fail closed，不分配无界内存。
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    signal: Option<&CancellationToken>,
+) -> Result<Option<Vec<u8>>, ReadFailure> {
     let mut bytes = Vec::new();
-    let max = u64::try_from(MAX_READ_LINE_BYTES).unwrap_or(u64::MAX);
-    let read = {
-        let mut limited = reader.take(max.saturating_add(1));
-        limited.read_until(b'\n', &mut bytes)?
+    let newline_terminated = loop {
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err(ReadFailure::Cancelled);
+        }
+        let (take_len, newline_terminated) = {
+            let buffer = reader.fill_buf().map_err(ReadFailure::Io)?;
+            if buffer.is_empty() {
+                break false;
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let take_len = newline.map_or(buffer.len(), |index| index.saturating_add(1));
+            if bytes.len().saturating_add(take_len) > MAX_READ_LINE_BYTES.saturating_add(1) {
+                return Err(ReadFailure::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("line exceeds {MAX_READ_LINE_BYTES} bytes"),
+                )));
+            }
+            bytes.extend_from_slice(&buffer[..take_len]);
+            (take_len, newline.is_some())
+        };
+        reader.consume(take_len);
+        if newline_terminated {
+            break true;
+        }
     };
-    if read == 0 {
+    if bytes.is_empty() {
         return Ok(None);
     }
-    let newline_terminated = bytes.last() == Some(&b'\n');
-    if !newline_terminated && read > max as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+    if !newline_terminated && bytes.len() > MAX_READ_LINE_BYTES {
+        return Err(ReadFailure::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
             format!("line exceeds {MAX_READ_LINE_BYTES} bytes"),
-        ));
+        )));
     }
     if newline_terminated {
         bytes.pop();
@@ -230,6 +285,10 @@ mod tests {
     use crate::tools::test_support::context;
     use serde_json::json;
     use std::fs;
+    use std::io::{self, Read};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn write_lines(dir: &std::path::Path, name: &str, lines: usize) {
@@ -323,32 +382,99 @@ mod tests {
         );
     }
 
+    struct BlockingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        started: Option<Sender<(usize, usize)>>,
+        release: Option<Receiver<()>>,
+    }
+
+    impl BlockingReader {
+        fn new(bytes: Vec<u8>, started: Sender<(usize, usize)>, release: Receiver<()>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                started: Some(started),
+                release: Some(release),
+            }
+        }
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+            let amount;
+            {
+                let available = self.fill_buf()?;
+                amount = available.len().min(target.len());
+                target[..amount].copy_from_slice(&available[..amount]);
+            }
+            self.consume(amount);
+            Ok(amount)
+        }
+    }
+
+    impl BufRead for BlockingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&self.bytes[self.position..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            let next_position = self.position.saturating_add(amount).min(self.bytes.len());
+            let consumed = next_position.saturating_sub(self.position);
+            self.position = next_position;
+            if consumed == 0 {
+                return;
+            }
+            if let (Some(started), Some(release)) = (self.started.take(), self.release.take()) {
+                let consumed_lines = self.bytes[..self.position]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count();
+                started
+                    .send((self.position, consumed_lines))
+                    .expect("read scan started receiver");
+                release.recv().expect("release blocked reader");
+            }
+        }
+    }
+
     #[test]
-    fn read_cancelled_during_large_scan_returns_aborted_error() {
-        use singularity_core::CancellationToken;
-
-        let dir = tempdir().expect("temp dir");
-        let path = dir.path().join("cancellation.txt");
-        let line = "x".repeat(1024);
-        let content = (0..20_000)
-            .map(|index| format!("{line}-{index}"))
+    fn read_cancelled_during_scan_returns_aborted_without_partial_output() {
+        let data = (1..=100)
+            .map(|line| format!("line{line}"))
             .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, content).expect("fixture");
+            .join("\n")
+            .into_bytes();
+        let target_offset = 90_u64;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancellation = singularity_core::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            let mut reader = BlockingReader::new(data, started_tx, release_rx);
+            execute_reader(
+                "cancellation.txt",
+                Some(target_offset),
+                Some(10),
+                &mut reader,
+                Some(&worker_cancellation),
+            )
+        });
 
-        let cancellation = CancellationToken::new();
+        let (consumed_bytes, consumed_lines) = started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read scan must consume input before cancellation");
+        assert!(consumed_bytes > 0);
+        assert_eq!(consumed_lines, 1);
+        assert!(consumed_lines < target_offset as usize);
+
         cancellation.cancel();
-
-        let ctx = ExecuteContext {
-            args: json!({ "path": "cancellation.txt", "offset": 10_000, "limit": 10 }),
-            cwd: dir.path(),
-            signal: Some(&cancellation),
-            on_update: None,
-            mutation_queue: None,
-        };
-
-        let result = ToolRegistry::new().execute("read", ctx).expect("execute");
-        assert!(result.is_error, "cancelled read must fail closed as error");
+        release_tx.send(()).expect("release read scan");
+        let result = worker
+            .join()
+            .expect("read scan worker")
+            .expect("read scan result");
+        assert!(result.is_error);
         assert_eq!(result.content, "Operation aborted");
     }
 
@@ -375,6 +501,23 @@ mod tests {
             .expect("execute");
         assert!(result.is_error, "content: {}", result.content);
         assert!(result.content.contains("line exceeds"));
+    }
+
+    #[test]
+    fn max_sized_line_with_newline_is_accepted() {
+        let mut input = vec![b'x'; MAX_READ_LINE_BYTES];
+        input.push(b'\n');
+        let mut reader = std::io::Cursor::new(input);
+
+        let line = read_bounded_line(&mut reader, None)
+            .expect("read boundary line")
+            .expect("line must be present");
+        assert_eq!(line.len(), MAX_READ_LINE_BYTES);
+        assert!(
+            read_bounded_line(&mut reader, None)
+                .expect("read EOF")
+                .is_none()
+        );
     }
 
     #[test]

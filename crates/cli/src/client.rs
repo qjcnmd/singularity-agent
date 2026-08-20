@@ -1,6 +1,8 @@
 //! stdio app-server client and process lifecycle.
 
 use super::*;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -55,11 +57,32 @@ pub(super) struct RpcReply<R> {
 #[derive(Clone)]
 pub(super) struct CtrlCMonitor {
     count: Arc<AtomicU8>,
+    #[cfg(test)]
+    scripted_counts: Option<Arc<std::sync::Mutex<VecDeque<u8>>>>,
 }
 
 impl CtrlCMonitor {
     fn count(&self) -> u8 {
+        #[cfg(test)]
+        if let Some(scripted_counts) = &self.scripted_counts
+            && let Some(next) = scripted_counts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+        {
+            self.count.store(next, Ordering::SeqCst);
+        }
         self.count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn scripted(counts: impl IntoIterator<Item = u8>) -> Self {
+        Self {
+            count: Arc::new(AtomicU8::new(0)),
+            scripted_counts: Some(Arc::new(std::sync::Mutex::new(
+                counts.into_iter().collect(),
+            ))),
+        }
     }
 }
 
@@ -75,7 +98,7 @@ fn spawn_ctrl_c_monitor() -> Option<CtrlCMonitor> {
             else {
                 return;
             };
-            while runtime.block_on(tokio::signal::ctrl_c()).is_ok() {
+            while runtime.block_on(wait_for_ctrl_c()).is_ok() {
                 let previous = handler_count
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                         Some(value.saturating_add(1))
@@ -87,7 +110,32 @@ fn spawn_ctrl_c_monitor() -> Option<CtrlCMonitor> {
             }
         })
         .ok()?;
-    Some(CtrlCMonitor { count })
+    Some(CtrlCMonitor {
+        count,
+        #[cfg(test)]
+        scripted_counts: None,
+    })
+}
+
+async fn wait_for_ctrl_c() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = ctrl_c => result,
+            event = ctrl_break.recv() => event
+                .map(|_| Ok(()))
+                .unwrap_or_else(|| Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Ctrl+Break signal stream closed",
+                ))),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -764,94 +812,141 @@ fn canonical_current_dir() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use singularity_protocol::{Turn, TurnEventParams, TurnStatus};
-    use std::sync::atomic::AtomicU8;
+    use singularity_protocol::{Turn, TurnStatus};
+    use std::sync::Mutex;
     use std::sync::mpsc;
 
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn running_turn() -> Turn {
+        Turn {
+            thread_id: "thread_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            status: TurnStatus::Running,
+            agent_loop_status: "running".to_string(),
+            model_usage: None,
+        }
+    }
+
     #[test]
-    fn ctrl_c_monitor_first_signal_sends_interrupt_and_completes_gracefully() {
+    fn first_ctrl_c_sends_one_typed_interrupt_and_drains_matching_events() {
         let (stdout_tx, stdout_rx) = mpsc::channel();
+        let writer = RecordingWriter::default();
+        let written = Arc::clone(&writer.bytes);
         let mut client = AppServerClient {
             child: None,
-            stdin: Some(Box::new(std::io::Cursor::new(Vec::<u8>::new()))),
+            stdin: Some(Box::new(writer)),
             stdout: stdout_rx,
             stdout_reader: None,
             response_timeout: Duration::from_millis(100),
             next_id: 1,
         };
 
-        let initial_turn = Turn {
-            thread_id: "thread_1".to_string(),
-            turn_id: "turn_1".to_string(),
-            status: TurnStatus::Running,
-            agent_loop_status: "running".to_string(),
-            model_usage: None,
-        };
-
-        let count = Arc::new(AtomicU8::new(1));
-        let monitor = CtrlCMonitor { count };
-
-        let completed_turn = Turn {
-            thread_id: "thread_1".to_string(),
-            turn_id: "turn_1".to_string(),
-            status: TurnStatus::Interrupted,
-            agent_loop_status: "interrupted".to_string(),
-            model_usage: None,
-        };
+        let item_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "item": {"item_id": "item_1"},
+                "delta": "drain this item"
+            }
+        });
         let completed_notification = json!({
             "jsonrpc": "2.0",
             "method": "turn/completed",
-            "params": TurnEventParams { turn: completed_turn }
+            "params": {"turn": {
+                "thread_id": "thread_1",
+                "turn_id": "turn_1",
+                "status": "interrupted",
+                "agent_loop_status": "cancelled"
+            }}
         });
         stdout_tx
-            .send(Ok(serde_json::to_string(&completed_notification).unwrap()))
-            .unwrap();
+            .send(Ok(item_notification.to_string()))
+            .expect("item event");
+        stdout_tx
+            .send(Ok(completed_notification.to_string()))
+            .expect("terminal event");
 
-        let (terminal_turn, _) = render_and_wait_terminal(
+        let (terminal_turn, notifications) = render_and_wait_terminal(
             &mut client,
-            initial_turn,
+            running_turn(),
             Vec::new(),
             &JsonRpcId::Number(1),
             false,
-            Some(monitor),
+            Some(CtrlCMonitor::scripted([0, 1])),
         )
         .expect("terminal turn");
 
         assert_eq!(terminal_turn.status, TurnStatus::Interrupted);
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0].method, "item/agentMessage/delta");
+        assert_eq!(notifications[1].method, "turn/completed");
+
+        let written = String::from_utf8(
+            written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("recorded JSON-RPC wire");
+        let requests: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("recorded request JSON"))
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "turn/interrupt");
+        assert!(requests[0]["id"].is_number());
+        assert_eq!(requests[0]["params"]["turnId"], "turn_1");
     }
 
     #[test]
-    fn ctrl_c_monitor_second_signal_triggers_force_interrupt_error() {
+    fn second_ctrl_c_uses_force_escape_hatch_before_reading_more_events() {
         let (_stdout_tx, stdout_rx) = mpsc::channel();
+        let writer = RecordingWriter::default();
+        let written = Arc::clone(&writer.bytes);
         let mut client = AppServerClient {
             child: None,
-            stdin: Some(Box::new(std::io::Cursor::new(Vec::<u8>::new()))),
+            stdin: Some(Box::new(writer)),
             stdout: stdout_rx,
             stdout_reader: None,
             response_timeout: Duration::from_millis(100),
             next_id: 1,
         };
 
-        let initial_turn = Turn {
-            thread_id: "thread_1".to_string(),
-            turn_id: "turn_1".to_string(),
-            status: TurnStatus::Running,
-            agent_loop_status: "running".to_string(),
-            model_usage: None,
-        };
-
-        let count = Arc::new(AtomicU8::new(2));
-        let monitor = CtrlCMonitor { count };
-
         let result = render_and_wait_terminal(
             &mut client,
-            initial_turn,
+            running_turn(),
             Vec::new(),
             &JsonRpcId::Number(1),
             false,
-            Some(monitor),
+            Some(CtrlCMonitor::scripted([2])),
         );
 
         assert_eq!(result.unwrap_err(), FORCE_INTERRUPT_ERROR);
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 }

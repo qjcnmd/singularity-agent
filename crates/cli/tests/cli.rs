@@ -6,11 +6,13 @@ mod support;
 use assert_cmd::Command;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Once;
+use std::time::{Duration, Instant};
 use support::{
     FakeAppServer as RawFakeAppServer, Scenario as RawScenario, agent_loop_capability,
-    capture_params, exit, print_stderr, sleep_ms, thread as raw_fake_thread, turn as fake_turn,
-    write_text,
+    capture_params, capture_request, exit, print_stderr, sleep_ms, thread as raw_fake_thread,
+    turn as fake_turn, write_pid, write_text,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -1069,6 +1071,166 @@ fn cli_exits_nonzero_for_immediate_interrupted_turn() {
     assert_immediate_terminal_turn_exits_nonzero("interrupted", "cancelled");
 }
 
+#[test]
+fn cli_first_ctrl_c_sends_one_interrupt_drains_events_and_exits_130() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let started_path = temp.path().join("turn-started");
+    let server_pid_path = temp.path().join("server.pid");
+    let interrupt_request_path = temp.path().join("interrupt.json");
+    let method_trace_path = temp.path().join("methods.log");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond(
+                "thread/start",
+                json!({"thread": fake_thread("thread_ctrl_c")}),
+            )
+            .interaction(
+                "turn/start",
+                vec![
+                    write_pid(&server_pid_path),
+                    write_text(&started_path, "started"),
+                    respond(json!({
+                        "turn": fake_turn("turn_ctrl_c", "thread_ctrl_c", "running", "running")
+                    })),
+                ],
+            )
+            .interaction(
+                "turn/interrupt",
+                vec![
+                    capture_request(&interrupt_request_path),
+                    send(json!({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread_ctrl_c",
+                            "turnId": "turn_ctrl_c",
+                            "item": {"item_id": "item_after_interrupt"},
+                            "delta": "drained after interrupt"
+                        }
+                    })),
+                    send(json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "turn": fake_turn(
+                                "turn_ctrl_c",
+                                "thread_ctrl_c",
+                                "interrupted",
+                                "cancelled"
+                            )
+                        }
+                    })),
+                ],
+            )
+            .shutdown()
+            .trace_methods_to(&method_trace_path),
+    );
+
+    let mut child = spawn_cli_with_fake_app_server(&fake_server, &db_path, &["run", "write tests"]);
+    wait_for_file(&started_path, &mut child);
+    send_ctrl_c(&child);
+    let server_pid: u32 = std::fs::read_to_string(&server_pid_path)
+        .expect("server pid")
+        .trim()
+        .parse()
+        .expect("server pid value");
+    let output = wait_for_exit(child);
+
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("drained after interrupt"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("turn turn_ctrl_c interrupted"),
+        "stdout={stdout}"
+    );
+
+    let request: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&interrupt_request_path).expect("interrupt request"),
+    )
+    .expect("interrupt request json");
+    assert_eq!(request["method"], "turn/interrupt");
+    assert!(request["id"].is_number());
+    assert_eq!(request["params"]["turnId"], "turn_ctrl_c");
+    let methods = std::fs::read_to_string(&method_trace_path).expect("method trace");
+    assert_eq!(
+        methods.matches("turn/interrupt\n").count(),
+        1,
+        "methods={methods}"
+    );
+    assert!(methods.contains("server/shutdown\n"), "methods={methods}");
+    wait_for_process_exit(server_pid);
+}
+
+#[test]
+fn cli_second_ctrl_c_forces_bounded_exit_and_shutdowns_app_server() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let started_path = temp.path().join("turn-started");
+    let server_pid_path = temp.path().join("server.pid");
+    let interrupt_request_path = temp.path().join("interrupt.json");
+    let method_trace_path = temp.path().join("methods.log");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond(
+                "thread/start",
+                json!({"thread": fake_thread("thread_force")}),
+            )
+            .interaction(
+                "turn/start",
+                vec![
+                    write_pid(&server_pid_path),
+                    write_text(&started_path, "started"),
+                    respond(json!({
+                        "turn": fake_turn("turn_force", "thread_force", "running", "running")
+                    })),
+                ],
+            )
+            .interaction(
+                "turn/interrupt",
+                vec![capture_request(&interrupt_request_path)],
+            )
+            .shutdown()
+            .trace_methods_to(&method_trace_path),
+    );
+
+    let mut child = spawn_cli_with_fake_app_server(&fake_server, &db_path, &["run", "write tests"]);
+    wait_for_file(&started_path, &mut child);
+    send_ctrl_c(&child);
+    wait_for_file(&interrupt_request_path, &mut child);
+    send_ctrl_c(&child);
+    let server_pid: u32 = std::fs::read_to_string(&server_pid_path)
+        .expect("server pid")
+        .trim()
+        .parse()
+        .expect("server pid value");
+    let output = wait_for_exit(child);
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(stderr(&output).contains("forced exit after second Ctrl+C"));
+    let methods = std::fs::read_to_string(&method_trace_path).expect("method trace");
+    assert_eq!(
+        methods.matches("turn/interrupt\n").count(),
+        1,
+        "methods={methods}"
+    );
+    assert!(methods.contains("server/shutdown\n"), "methods={methods}");
+    wait_for_process_exit(server_pid);
+}
+
 // 验证 continue 遇到非终态 turn 时展示服务端可操作提示（含 turn ID），
 // 不重试、不自动 resume，退出非零。
 #[test]
@@ -1517,6 +1679,113 @@ fn cli_with_fake_app_server(fake_server: &FakeAppServer, db_path: &Path) -> Comm
     let mut command = cli_with_app_server(path_str(fake_server.binary()), db_path);
     fake_server.configure(&mut command);
     command
+}
+
+fn spawn_cli_with_fake_app_server(
+    fake_server: &FakeAppServer,
+    db_path: &Path,
+    args: &[&str],
+) -> std::process::Child {
+    let mut command = ProcessCommand::new(assert_cmd::cargo::cargo_bin("sg"));
+    command
+        .args(args)
+        .env(APP_SERVER_BIN_ENV, path_str(fake_server.binary()))
+        .env(APP_SERVER_DB_ENV, db_path)
+        .env(APP_SERVER_TRANSPORT_ENV, "stdio")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    fake_server.configure_process(&mut command);
+    configure_ctrl_c_process_group(&mut command);
+    command.spawn().expect("spawn cli process")
+}
+
+fn wait_for_file(path: &Path, child: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.is_file() {
+        if let Some(status) = child.try_wait().expect("poll cli process") {
+            panic!("CLI exited before marker: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_for_exit(mut child: std::process::Child) -> std::process::Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().expect("poll cli exit").is_some() {
+            return child.wait_with_output().expect("collect cli output");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CLI did not exit within bounded time"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn configure_ctrl_c_process_group(_command: &mut ProcessCommand) {}
+
+#[cfg(unix)]
+fn send_ctrl_c(child: &std::process::Child) {
+    let status = ProcessCommand::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(status.success(), "SIGINT failed: {status}");
+}
+
+#[cfg(windows)]
+fn configure_ctrl_c_process_group(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(windows)]
+fn send_ctrl_c(child: &std::process::Child) {
+    const CTRL_BREAK_EVENT: u32 = 1;
+    unsafe extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, process_group_id: u32) -> i32;
+    }
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(sent, 0, "CTRL_BREAK_EVENT failed");
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        return ProcessCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        return ProcessCommand::new("tasklist")
+            .args(["/FI", &filter, "/NH"])
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_alive(pid) {
+        assert!(Instant::now() < deadline, "process {pid} remained alive");
+        std::thread::yield_now();
+    }
 }
 
 // 复用统一场景断言立即终态会导致 CLI 非零退出。
