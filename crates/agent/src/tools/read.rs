@@ -10,9 +10,6 @@ use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
 const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
-/// 单次 read 的扫描字节上限：避免在超大文件上无界流式扫描。
-const MAX_READ_SCAN_BYTES: usize = 64 * 1024 * 1024;
-
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 
 pub(crate) fn parameters() -> Value {
@@ -63,11 +60,8 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         selected_truncated: false,
         first_line_exceeds_limit: false,
         first_line_len: None,
-        scan_limit_hit: false,
-        eof: true,
     };
     let mut line_number = 0usize;
-    let mut scanned_bytes = 0usize;
     loop {
         if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
             return error_result("Operation aborted");
@@ -80,13 +74,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         }) else {
             break;
         };
-        scanned_bytes = scanned_bytes.saturating_add(line.len().saturating_add(1));
         line_number += 1;
-        if scanned_bytes > MAX_READ_SCAN_BYTES {
-            state.scan_limit_hit = true;
-            state.eof = false;
-            break;
-        }
         let selected_position = line_number.saturating_sub(start_line);
         if selected_position == 0 {
             continue;
@@ -157,8 +145,6 @@ struct ReadState {
     selected_truncated: bool,
     first_line_exceeds_limit: bool,
     first_line_len: Option<usize>,
-    scan_limit_hit: bool,
-    eof: bool,
 }
 
 fn render_read_output(
@@ -183,14 +169,10 @@ fn render_read_output(
         start_line_display.saturating_add(state.selected.len().saturating_sub(1));
     if state.selected_truncated {
         let next_offset = end_line_display.saturating_add(1);
-        let remainder = if state.scan_limit_hit || !state.eof {
-            "file exceeds read scan limit".to_string()
-        } else {
-            format!(
-                "{} more lines in file",
-                state.total_lines.saturating_sub(end_line_display)
-            )
-        };
+        let remainder = format!(
+            "{} more lines in file",
+            state.total_lines.saturating_sub(end_line_display)
+        );
         return format!(
             "{selected_content}\n\n[Showing lines {start_line_display}-{end_line_display} ({} limit). {remainder}. Use offset={next_offset} to continue.]",
             format_size(DEFAULT_MAX_BYTES)
@@ -199,15 +181,11 @@ fn render_read_output(
     if let Some(limit) = limit {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let end = start_line_display.saturating_add(state.selected.len().saturating_sub(1));
-        if end < state.total_lines || state.scan_limit_hit || !state.eof {
-            let remainder = if state.scan_limit_hit || !state.eof {
-                "file exceeds read scan limit".to_string()
-            } else {
-                format!(
-                    "{} more lines in file",
-                    state.total_lines.saturating_sub(end)
-                )
-            };
+        if end < state.total_lines {
+            let remainder = format!(
+                "{} more lines in file",
+                state.total_lines.saturating_sub(end)
+            );
             let next_offset = end.saturating_add(1);
             return format!(
                 "{selected_content}\n\n[{remainder}. Use offset={next_offset} to continue.]"
@@ -308,6 +286,40 @@ mod tests {
             result
                 .content
                 .contains("Offset 10 is beyond end of file (3 lines total)")
+        );
+    }
+
+    #[test]
+    fn offset_scan_reaches_true_eof_beyond_legacy_scan_cap() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("over-cap.txt");
+        let line = "x".repeat(1024);
+        let content = (0..66_000)
+            .map(|index| format!("{line}-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.len() > 64 * 1024 * 1024);
+        std::fs::write(&path, content).expect("fixture");
+
+        let result = ToolRegistry::new()
+            .execute(
+                "read",
+                context(
+                    json!({ "path": "over-cap.txt", "offset": 66_000, "limit": 1 }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.ends_with("-65999"),
+            "content: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("scan limit"),
+            "content: {}",
+            result.content
         );
     }
 

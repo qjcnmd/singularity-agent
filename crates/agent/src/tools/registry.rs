@@ -139,9 +139,22 @@ fn mutation_key(cwd: &Path, path: &str) -> Result<MutationKey, String> {
     };
     let normalized = canonicalize_for_mutation(&candidate)?;
     Ok(MutationKey {
-        environment,
-        path: normalized,
+        environment: normalize_mutation_key(&environment),
+        path: normalize_mutation_key(&normalized),
     })
+}
+
+/// Windows resolves ordinary paths case-insensitively, including missing path
+/// components that have not yet been created.  Fold only the in-memory queue
+/// key; callers still receive and write the original path spelling.
+#[cfg(windows)]
+fn normalize_mutation_key(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+#[cfg(not(windows))]
+fn normalize_mutation_key(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn canonicalize_for_mutation(candidate: &Path) -> Result<PathBuf, String> {
@@ -591,6 +604,35 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("alias lease")
                 .expect("alias path lock");
+        });
+        assert_eq!(registry.mutation_queue.entry_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutation_queue_serializes_windows_case_aliases() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Same.txt"), "original").unwrap();
+        let registry = ToolRegistry::new();
+        let lease = registry
+            .mutation_queue
+            .lock(dir.path(), "Same.txt")
+            .expect("original path lease");
+        let (sender, receiver) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = registry.mutation_queue.lock(dir.path(), "same.TXT");
+                sender.send(result.map(|_| ())).unwrap();
+            });
+            assert!(
+                receiver.recv_timeout(Duration::from_millis(50)).is_err(),
+                "Windows path aliases must share the mutation lease"
+            );
+            drop(lease);
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("case alias lease")
+                .expect("case alias path lock");
         });
         assert_eq!(registry.mutation_queue.entry_count(), 0);
     }
