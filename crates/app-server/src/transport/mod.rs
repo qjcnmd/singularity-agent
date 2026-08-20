@@ -274,38 +274,34 @@ where
                     }
                 } else if is_turn_control(&message) && ready_for_turn.load(Ordering::SeqCst) {
                     if let Err(error) = control_tx.try_send(message) {
-                        if let Some(id) = error.into_inner().id().cloned() {
-                            if let Err(error) = send_output_async(
-                                output_tx.clone(),
-                                cancellation.clone(),
-                                internal_error_value(
-                                    Some(id),
-                                    "control request queue is full",
-                                ),
-                            )
-                            .await
-                            {
-                                terminal_error = Some(error);
-                                break;
-                            }
+                        let Some(id) = error.into_inner().id().cloned() else {
+                            continue;
+                        };
+                        if let Err(error) = send_output_async(
+                            output_tx.clone(),
+                            cancellation.clone(),
+                            internal_error_value(Some(id), "control request queue is full"),
+                        )
+                        .await
+                        {
+                            terminal_error = Some(error);
+                            break;
                         }
                     }
                 } else {
                     if let Err(error) = ordinary_tx.try_send(message) {
-                        if let Some(id) = error.into_inner().id().cloned() {
-                            if let Err(error) = send_output_async(
-                                output_tx.clone(),
-                                cancellation.clone(),
-                                internal_error_value(
-                                    Some(id),
-                                    "ordinary request queue is full",
-                                ),
-                            )
-                            .await
-                            {
-                                terminal_error = Some(error);
-                                break;
-                            }
+                        let Some(id) = error.into_inner().id().cloned() else {
+                            continue;
+                        };
+                        if let Err(error) = send_output_async(
+                            output_tx.clone(),
+                            cancellation.clone(),
+                            internal_error_value(Some(id), "ordinary request queue is full"),
+                        )
+                        .await
+                        {
+                            terminal_error = Some(error);
+                            break;
                         }
                     }
                 }
@@ -381,39 +377,39 @@ where
             break;
         }
     }
-    if !ordinary_done {
-        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
-            match tokio::time::timeout(remaining, &mut ordinary_task).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    worker_error.get_or_insert(error);
-                }
-                Ok(Err(error)) => {
-                    worker_error.get_or_insert(format!("ordinary dispatch task failed: {error}"));
-                }
-                Err(_) => {
-                    worker_error.get_or_insert(
-                        "timed out waiting for ordinary dispatch during shutdown".to_string(),
-                    );
-                }
+    if !ordinary_done
+        && let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
+    {
+        match tokio::time::timeout(remaining, &mut ordinary_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                worker_error.get_or_insert(error);
+            }
+            Ok(Err(error)) => {
+                worker_error.get_or_insert(format!("ordinary dispatch task failed: {error}"));
+            }
+            Err(_) => {
+                worker_error.get_or_insert(
+                    "timed out waiting for ordinary dispatch during shutdown".to_string(),
+                );
             }
         }
     }
-    if !control_done {
-        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
-            match tokio::time::timeout(remaining, &mut control_task).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    worker_error.get_or_insert(error);
-                }
-                Ok(Err(error)) => {
-                    worker_error.get_or_insert(format!("control dispatch task failed: {error}"));
-                }
-                Err(_) => {
-                    worker_error.get_or_insert(
-                        "timed out waiting for control dispatch during shutdown".to_string(),
-                    );
-                }
+    if !control_done
+        && let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
+    {
+        match tokio::time::timeout(remaining, &mut control_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                worker_error.get_or_insert(error);
+            }
+            Ok(Err(error)) => {
+                worker_error.get_or_insert(format!("control dispatch task failed: {error}"));
+            }
+            Err(_) => {
+                worker_error.get_or_insert(
+                    "timed out waiting for control dispatch during shutdown".to_string(),
+                );
             }
         }
     }
