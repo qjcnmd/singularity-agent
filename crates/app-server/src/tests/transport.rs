@@ -711,9 +711,19 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             .await
             .expect("write initialized");
 
-        // Yield to ensure initialized is processed by ordinary dispatch
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A request/response barrier proves that initialized was processed before turn/start.
+        client_stdin
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"agent/capability\",\"id\":99,\"params\":{}}\n",
+            )
+            .await
+            .expect("write capability barrier");
+        let mut capability_response_line = String::new();
+        client_reader
+            .read_line(&mut capability_response_line)
+            .await
+            .expect("read capability barrier");
+        assert!(capability_response_line.contains("\"result\""));
 
         // 4. Send turn/start
         let turn_start_line = format!(
