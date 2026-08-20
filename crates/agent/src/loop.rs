@@ -1128,7 +1128,7 @@ impl Agent {
             Err(crate::compaction::CompactionError::Session(error)) => {
                 return Err(AgentError::Session(error));
             }
-            Err(error) => {
+            Err(_error) => {
                 emit_diagnostic(
                     events,
                     AgentDiagnostic::warning(
