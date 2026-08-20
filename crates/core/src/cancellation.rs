@@ -1,9 +1,9 @@
-//! 可在线程和 provider/sandbox 边界传播的取消令牌。
+//! 可在线程和 provider 边界传播的取消令牌。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 可在线程、provider 和 sandbox 之间共享的取消状态。
+/// 可在线程与 provider 之间共享的取消状态。
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,

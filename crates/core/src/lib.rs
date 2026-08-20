@@ -66,8 +66,8 @@ const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
 /// Protected metadata directories whose names are reserved by the workspace/runtime contract.
 ///
-/// Keep this list in `core` so tools, sandbox policy resolution, and the Windows enforcement
-/// adapter cannot silently diverge. Windows may materialize a missing `.git` sentinel only when
+/// Keep this list in `core` so tools and runtime path validation
+/// cannot silently diverge. Windows may materialize a missing `.git` sentinel only when
 /// no ancestor repository marker exists; nested markers are rejected by the adapter so Git uses
 /// its existing ancestor discovery semantics.
 const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
