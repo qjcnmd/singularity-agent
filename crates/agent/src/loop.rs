@@ -832,7 +832,7 @@ impl Agent {
                     events,
                     AgentDiagnostic::warning(
                         "compaction_failed",
-                        format!("automatic context compaction failed: {error}"),
+                        "automatic context compaction failed".to_string(),
                     ),
                 );
                 return Err(AgentError::Compaction(error));
@@ -880,7 +880,7 @@ impl Agent {
                     events,
                     AgentDiagnostic::warning(
                         "compaction_failed",
-                        format!("forced context compaction failed: {error}"),
+                        "forced context compaction failed".to_string(),
                     ),
                 );
                 Err(AgentError::Compaction(error))
@@ -1133,7 +1133,7 @@ impl Agent {
                     events,
                     AgentDiagnostic::warning(
                         "compaction_skipped",
-                        format!("automatic context compaction skipped: {error}"),
+                        "automatic context compaction skipped".to_string(),
                     ),
                 );
             }
