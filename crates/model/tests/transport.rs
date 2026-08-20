@@ -123,12 +123,6 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             "",
         ),
         (
-            "incomplete",
-            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
-            "responses_stream_incomplete",
-            "max_output_tokens",
-        ),
-        (
             "missing_terminal",
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
             "responses_stream_terminal_missing",
@@ -189,6 +183,49 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             .recv_timeout(Duration::from_secs(1))
             .expect("stream request was sent");
     }
+}
+
+#[test]
+fn openai_responses_stream_length_preserves_partial_response() {
+    let body = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]},{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"
+    );
+    let chunks = body
+        .as_bytes()
+        .chunks(3)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_server(chunks, None);
+    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_stream_incomplete",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: json!({"type":"object"}),
+    });
+    let response = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
+        .expect("max_output_tokens incomplete stream remains partial success");
+    assert!(response.is_length_truncated());
+    assert_eq!(response.finish_reason.as_deref(), Some("length"));
+    assert_eq!(
+        response.assistant_message.as_ref().unwrap().content,
+        "partial"
+    );
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_read");
+    assert_eq!(response.usage.total_tokens, 7);
+    requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("incomplete stream request was sent");
 }
 
 #[test]
@@ -286,27 +323,66 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
 }
 
 #[test]
-fn openai_chat_streaming_is_explicitly_unsupported() {
-    let provider = OpenAiProvider::new(provider_config_with_base_url(
-        "http://127.0.0.1:1/v1/chat/completions".to_string(),
-    ))
-    .expect("provider");
-    let request = ModelTurnRequest::new(
+fn openai_chat_streaming_normalizes_visible_deltas_and_tool_fragments() {
+    let body = concat!(
+        "data: {\"id\":\"chat_stream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, requests) = chat_stream_server(
+        body.as_bytes()
+            .chunks(7)
+            .map(|chunk| chunk.to_vec())
+            .collect(),
+        None,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
         "request_chat_stream",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
-    let error = provider
+    request.tools.push(ModelToolSchema {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: json!({"type":"object"}),
+    });
+    let mut events = Vec::new();
+    let response = provider
         .complete_stream(
             &request,
             &singularity_core::CancellationToken::new(),
-            &mut |_| {},
+            &mut |event| events.push(event),
         )
-        .expect_err("Chat streaming must be unsupported");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+        .expect("Chat stream completion");
     assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_streaming_unsupported")
+        events,
+        vec![
+            ProviderStreamEvent::OutputTextDelta {
+                delta: "你".into()
+            },
+            ProviderStreamEvent::OutputTextDelta {
+                delta: "好".into()
+            }
+        ]
     );
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response.stop_reason(),
+        Some(singularity_model::ModelStopReason::Stop)
+    );
+    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(
+        response.tool_calls[0].raw_arguments,
+        r#"{"path":"README.md"}"#
+    );
+    assert_eq!(response.usage.total_tokens, 7);
+    let body = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("Chat request");
+    let payload: Value = serde_json::from_str(&body).expect("request JSON");
+    assert_eq!(payload["stream"], true);
+    assert_eq!(payload["stream_options"]["include_usage"], true);
 }
 
 #[test]
@@ -315,15 +391,14 @@ fn streaming_capability_is_bound_to_the_selected_protocol() {
         ProviderStreamingCapability::for_protocol(ProviderApiProtocol::OpenAiResponses),
         ProviderStreamingCapability::OutputTextDelta
     );
-    for protocol in [
-        ProviderApiProtocol::Declared,
-        ProviderApiProtocol::OpenAiChatCompletions,
-    ] {
-        assert_eq!(
-            ProviderStreamingCapability::for_protocol(protocol),
-            ProviderStreamingCapability::Unsupported
-        );
-    }
+    assert_eq!(
+        ProviderStreamingCapability::for_protocol(ProviderApiProtocol::OpenAiChatCompletions),
+        ProviderStreamingCapability::OutputTextDelta
+    );
+    assert_eq!(
+        ProviderStreamingCapability::for_protocol(ProviderApiProtocol::Declared),
+        ProviderStreamingCapability::Unsupported
+    );
 
     let provider = OpenAiProvider::new(provider_config_with_base_url(
         "http://127.0.0.1:1/v1/responses".to_string(),
@@ -335,7 +410,7 @@ fn streaming_capability_is_bound_to_the_selected_protocol() {
     );
     assert_eq!(
         provider.streaming_capability(ProviderApiProtocol::OpenAiChatCompletions),
-        ProviderStreamingCapability::Unsupported
+        ProviderStreamingCapability::OutputTextDelta
     );
     assert_eq!(
         provider.streaming_capability(ProviderApiProtocol::Declared),
@@ -657,170 +732,101 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
 }
 
 #[test]
+fn openai_chat_request_output_cap_remains_on_wire() {
+    let (base_url, requests) = captured_request_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"request_cap","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_cap",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.model_preferences.max_output_tokens = Some(123);
+    provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("request cap is within provider capability");
+    let body = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured request body");
+    let payload: Value = serde_json::from_str(&body).expect("request JSON");
+    assert_eq!(payload["max_tokens"], 123);
+}
+
+#[test]
 fn openai_chat_response_wire_discriminators_fail_closed_before_normalization() {
     let cases = [
         (
-            "role",
-            r#"{
-                "id": "chat_invalid_role",
-                "choices": [{
-                    "message": {
-                        "role": "user",
-                        "content": "ignored",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
+            r#"{"id":"chat_invalid_role","choices":[{"message":{"role":"user","content":"ignored"},"finish_reason":"tool_calls"}]}"#,
             "chat_message_role_invalid",
-            true,
         ),
         (
-            "tool type",
-            r#"{
-                "id": "chat_invalid_tool_type",
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "custom",
-                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
+            r#"{"id":"chat_invalid_tool_type","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"custom","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
             "chat_tool_call_type_invalid",
-            true,
         ),
         (
-            "content part",
-            r#"{
-                "id": "chat_invalid_content_part",
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid"}}],
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
+            r#"{"id":"chat_invalid_content_part","choices":[{"message":{"role":"assistant","content":[{"type":"image_url"}]},"finish_reason":"stop"}]}"#,
             "chat_content_part_type_invalid",
-            true,
-        ),
-        (
-            "length",
-            r#"{
-                "id": "chat_length_with_tool_call",
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
-                        }]
-                    },
-                    "finish_reason": "length"
-                }]
-            }"#,
-            "chat_completion_incomplete",
-            true,
-        ),
-        (
-            "content filter",
-            r#"{
-                "id": "chat_filter_with_tool_call",
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
-                        }]
-                    },
-                    "finish_reason": "content_filter"
-                }]
-            }"#,
-            "chat_completion_incomplete",
-            true,
-        ),
-        (
-            "length without tools",
-            r#"{
-                "id": "chat_incomplete_text",
-                "choices": [{
-                    "message": {"role": "assistant", "content": "partial"},
-                    "finish_reason": "length"
-                }]
-            }"#,
-            "chat_completion_incomplete",
-            false,
-        ),
-        (
-            "content filter without tools",
-            r#"{
-                "id": "chat_incomplete_text",
-                "choices": [{
-                    "message": {"role": "assistant", "content": "partial"},
-                    "finish_reason": "content_filter"
-                }]
-            }"#,
-            "chat_completion_incomplete",
-            false,
         ),
     ];
-
-    for (case_name, body, expected_code, with_tools) in cases {
+    for (body, expected_code) in cases {
         let base_url = single_response_server("HTTP/1.1 200 OK", body);
         let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-        let request = if with_tools {
-            capability_test_request(None, false, 1)
-        } else {
-            ModelTurnRequest::new(
-                "chat_incomplete_text",
-                vec![ModelMessage::text(ModelRole::User, "hello")],
-            )
-        };
         let error = provider
-            .complete(&request, &singularity_core::CancellationToken::new())
+            .complete(
+                &ModelTurnRequest::new(
+                    "chat_invalid",
+                    vec![ModelMessage::text(ModelRole::User, "hello")],
+                ),
+                &singularity_core::CancellationToken::new(),
+            )
             .expect_err("malformed Chat response must fail closed");
-
-        assert_eq!(
-            error.error.kind,
-            ModelErrorKind::JsonSchemaViolation,
-            "{case_name}"
-        );
+        assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
         assert_eq!(
             error.error.code.as_deref(),
-            Some("provider_response_invalid"),
-            "{case_name}"
-        );
-        assert_eq!(
-            error.error.stage,
-            Some(ProviderErrorStage::ResponseValidation),
-            "{case_name}"
+            Some("provider_response_invalid")
         );
         assert_eq!(
             error.error.validation_errors,
-            vec![expected_code.to_string()],
-            "{case_name}"
+            vec![expected_code.to_string()]
         );
     }
+}
+
+#[test]
+fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
+    let length_body = r#"{
+        "id":"chat_length_with_tool_call",
+        "choices":[{"message":{"role":"assistant","content":"partial","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"length"}],
+        "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}
+    }"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", length_body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = capability_test_request(None, false, 1);
+    request.request_id = "chat_length_with_tool_call".to_string();
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("length response remains a normal partial completion");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert!(response.is_length_truncated());
+    assert_eq!(response.finish_reason.as_deref(), Some("length"));
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.usage.total_tokens, 7);
+
+    let filter_body = r#"{"id":"chat_filter","choices":[{"message":{"role":"assistant","content":"blocked"},"finish_reason":"content_filter"}]}"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", filter_body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = provider
+        .complete(
+            &ModelTurnRequest::new(
+                "chat_filter",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("content filter remains a typed error");
+    assert_eq!(error.error.kind, ModelErrorKind::ContentFilter);
+    assert_eq!(error.error.code.as_deref(), Some("content_filter"));
 }
 
 #[test]

@@ -1,4 +1,6 @@
-use super::{provider_retry_backoff, retry_after_delay};
+use super::{
+    full_jitter_delay_ms, provider_retry_backoff, retry_after_delay, retry_backoff_window_ms,
+};
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelTurnRequest, OpenAiProvider, OpenAiProviderConfig,
@@ -150,17 +152,27 @@ fn retry_after_parser_falls_back_for_invalid_and_clamps_large_values() {
 }
 
 #[test]
-fn provider_retry_backoff_has_bounded_jitter() {
+fn provider_retry_backoff_uses_full_jitter_window() {
     for retry_count in 1..=6 {
+        let window = retry_backoff_window_ms(retry_count);
+        assert_eq!(
+            window,
+            (PROVIDER_RETRY_BASE_BACKOFF_MS.saturating_mul(1_u64 << (retry_count - 1)))
+                .min(PROVIDER_RETRY_MAX_BACKOFF_MS)
+        );
+        assert_eq!(full_jitter_delay_ms(retry_count, 0), 0);
+        assert_eq!(full_jitter_delay_ms(retry_count, window), window);
+        assert_eq!(full_jitter_delay_ms(retry_count, window + 1), 0);
+
         let delay = provider_retry_backoff(retry_count);
-        let base = (PROVIDER_RETRY_BASE_BACKOFF_MS.saturating_mul(1_u64 << (retry_count - 1)))
-            .min(PROVIDER_RETRY_MAX_BACKOFF_MS);
-        let jitter = (base / 10).max(1);
         assert!(
-            delay >= Duration::from_millis(base - jitter)
-                && delay
-                    <= Duration::from_millis((base + jitter).min(PROVIDER_RETRY_MAX_BACKOFF_MS,)),
-            "retry {retry_count} produced {delay:?} outside jitter window"
+            delay <= Duration::from_millis(window),
+            "retry {retry_count} produced {delay:?} outside full-jitter window"
         );
     }
+    assert_eq!(retry_backoff_window_ms(8), PROVIDER_RETRY_MAX_BACKOFF_MS);
+    assert_eq!(
+        retry_backoff_window_ms(u32::MAX),
+        PROVIDER_RETRY_MAX_BACKOFF_MS
+    );
 }

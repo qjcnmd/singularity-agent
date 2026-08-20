@@ -5,7 +5,8 @@ mod responses;
 mod wire;
 
 use super::contract::{
-    message_text, provider_response_validation_error, request_uses_tool_protocol,
+    message_text, provider_content_filter_error, provider_response_validation_error,
+    request_uses_tool_protocol,
 };
 use super::{
     CHAT_COMPLETIONS_PATH, ModelError, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
@@ -171,6 +172,39 @@ pub(super) fn openai_request_payload(
             }
         }
     }
+    payload
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn openai_chat_stream_request_payload(
+    request: &ModelTurnRequest,
+    model_name: &str,
+    capabilities: &ProviderProtocolContract,
+    reasoning_enabled: bool,
+    reasoning_disabled: bool,
+    wire_reasoning_effort: Option<&str>,
+    thinking_wire_format: ThinkingWireFormat,
+    supports_developer_role: bool,
+    supports_tool_choice: bool,
+    requires_assistant_content_for_tool_calls: bool,
+) -> Value {
+    let mut payload = openai_request_payload(
+        request,
+        model_name,
+        capabilities,
+        reasoning_enabled,
+        reasoning_disabled,
+        wire_reasoning_effort,
+        thinking_wire_format,
+        supports_developer_role,
+        supports_tool_choice,
+        requires_assistant_content_for_tool_calls,
+    );
+    payload["stream"] = json!(true);
+    // Request usage in the final stream chunk when the provider implements
+    // the OpenAI-compatible include_usage extension. Providers that omit it
+    // still produce a valid response with usage_present=false.
+    payload["stream_options"] = json!({"include_usage": true});
     payload
 }
 
@@ -485,7 +519,13 @@ pub(super) fn parse_openai_responses_response(
         ));
     }
     let status = payload.get("status").and_then(Value::as_str);
-    if status != Some("completed") {
+    let incomplete_reason = payload
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str);
+    let length_truncated =
+        status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
+    if status != Some("completed") && !length_truncated {
         return Err(provider_response_validation_error(
             config,
             model_name,
@@ -633,6 +673,13 @@ pub(super) fn parse_openai_responses_response(
             ));
         }
     }
+    let response_finish_reason = if length_truncated {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
     finalize_provider_response(
         request,
         config,
@@ -646,7 +693,7 @@ pub(super) fn parse_openai_responses_response(
         assistant_message,
         tool_calls,
         parse_openai_responses_usage(payload.get("usage")),
-        status.map(str::to_string),
+        Some(response_finish_reason.to_string()),
     )
     .map(|mut response| {
         response.provider_reasoning_history = provider_reasoning_history;
@@ -799,6 +846,13 @@ pub(super) fn parse_openai_response(
         .get("finish_reason")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if finish_reason.as_deref() == Some("content_filter") {
+        return Err(provider_content_filter_error(
+            config,
+            model_name,
+            "provider Chat response was stopped by content filter",
+        ));
+    }
     let provider_reasoning_history = message
         .get("reasoning_content")
         .and_then(Value::as_str)
@@ -1028,12 +1082,6 @@ fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str
         }
     }
 
-    if matches!(
-        choice.get("finish_reason").and_then(Value::as_str),
-        Some("length" | "content_filter")
-    ) {
-        return Err("chat_completion_incomplete");
-    }
     Ok(())
 }
 

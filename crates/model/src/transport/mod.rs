@@ -6,7 +6,8 @@ mod stream;
 
 use super::contract::{provider_request_validation_error, request_uses_tool_protocol};
 use super::openai::{
-    OpenAiCompletion, models_endpoint, openai_reasoning_content_present, openai_request_payload,
+    OpenAiCompletion, models_endpoint, openai_chat_stream_request_payload,
+    openai_reasoning_content_present, openai_request_payload,
     openai_responses_reasoning_content_present, openai_responses_request_payload,
     openai_responses_stream_request_payload, parse_openai_response,
     parse_openai_responses_response,
@@ -22,16 +23,18 @@ use super::{
     ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
     ProviderAttemptStarted, ProviderAttemptStatus, ProviderError, ProviderErrorStage,
     ProviderProtocolContract, ProviderRuntime, ProviderStreamEvent, ProviderStreamingCapability,
-    ProviderToolReasoningMode, ProviderTransportCategory, provider_streaming_unsupported_error,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    ProviderToolReasoningMode, ProviderTransportCategory, ThinkingWireFormat,
+    provider_streaming_unsupported_error, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities,
 };
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use singularity_core::CancellationToken;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 /// The single validated protocol choice shared by one provider completion.
 struct CompletionContext {
@@ -643,6 +646,253 @@ impl OpenAiProvider {
                 .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
         )?;
         Ok(completion.response)
+    }
+
+    /// Execute a bounded Chat Completions SSE attempt sequence without exposing raw events.
+    fn complete_chat_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        model_name: &str,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        self.validate_reasoning_history(request)?;
+        let runtime = self.runtime.as_ref();
+        let started_at = Instant::now();
+        let mut metadata = ProviderAttemptMetadata::zero();
+        let endpoint = self.config.endpoint();
+        let request_payload = openai_chat_stream_request_payload(
+            request,
+            model_name,
+            capabilities,
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.reasoning_enabled),
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| !selection.reasoning_enabled),
+            self.selected_model
+                .as_ref()
+                .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
+            self.selected_model
+                .as_ref()
+                .map(|selection| selection.thinking_wire_format)
+                .unwrap_or(ThinkingWireFormat::ThinkingType),
+            self.selected_model
+                .as_ref()
+                .is_none_or(|selection| selection.supports_developer_role),
+            self.selected_model
+                .as_ref()
+                .is_none_or(|selection| selection.supports_tool_choice),
+            self.selected_model
+                .as_ref()
+                .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
+        );
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error().with_provider_attempt_metadata(
+                    provider_attempt_metadata(&metadata, started_at),
+                ));
+            }
+            metadata.attempt_count += 1;
+            let mut occurrence = ProviderAttemptInProgress::new(
+                ProviderAttemptOperationPhase::Completion,
+                &self.config.provider_name,
+                model_name,
+                ProviderApiProtocol::OpenAiChatCompletions,
+                metadata.attempt_count,
+            );
+            emit_provider_attempt_started(&occurrence, on_attempt)?;
+            let response =
+                match block_on_provider_future(
+                    runtime,
+                    cancellation,
+                    "provider_request_send_failed",
+                    ProviderErrorStage::RequestSend,
+                    self.request_timeout_seconds,
+                    || {
+                        self.client
+                            .post(&endpoint)
+                            .bearer_auth(&self.config.api_key)
+                            .json(&request_payload)
+                            .send()
+                    },
+                ) {
+                    Ok(response) => {
+                        occurrence.mark_response_headers_received();
+                        response
+                    }
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        let retry_backoff = record_provider_retry(
+                            &mut metadata,
+                            occurrence,
+                            &error.error,
+                            None,
+                            on_attempt,
+                        )?;
+                        wait_stream_retry_backoff(
+                            runtime,
+                            cancellation,
+                            retry_backoff,
+                            &metadata,
+                            started_at,
+                        )?;
+                        continue;
+                    }
+                    Err(error) => {
+                        record_provider_attempt(
+                            &mut metadata,
+                            occurrence,
+                            Some(&error.error),
+                            None,
+                            on_attempt,
+                        )?;
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let status = response.status();
+            if !status.is_success() {
+                let error = ProviderError::from_model_error(model_error_from_http_status(
+                    status.as_u16(),
+                    &self.config.provider_name,
+                    model_name,
+                ));
+                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                    && http_status_is_retryable(status.as_u16())
+                {
+                    let retry_backoff = record_provider_retry(
+                        &mut metadata,
+                        occurrence,
+                        &error.error,
+                        retry_after_delay(response.headers()),
+                        on_attempt,
+                    )?;
+                    wait_stream_retry_backoff(
+                        runtime,
+                        cancellation,
+                        retry_backoff,
+                        &metadata,
+                        started_at,
+                    )?;
+                    continue;
+                }
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    on_attempt,
+                )?;
+                return Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )),
+                );
+            }
+            let response_retry_after = retry_after_delay(response.headers());
+            let attempt = read_openai_chat_sse(
+                runtime,
+                cancellation,
+                self.request_timeout_seconds,
+                response,
+                on_event,
+                occurrence.started_at,
+            );
+            let payload = match attempt {
+                Ok(success) => {
+                    occurrence.set_time_to_first_text_delta(success.time_to_first_text_delta_ms);
+                    success.payload
+                }
+                Err(failure)
+                    if !failure.emitted_text_delta
+                        && metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                        && provider_error_is_retryable(&failure.error) =>
+                {
+                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
+                    let retry_backoff = record_provider_retry(
+                        &mut metadata,
+                        occurrence,
+                        &failure.error.error,
+                        response_retry_after,
+                        on_attempt,
+                    )?;
+                    wait_stream_retry_backoff(
+                        runtime,
+                        cancellation,
+                        retry_backoff,
+                        &metadata,
+                        started_at,
+                    )?;
+                    continue;
+                }
+                Err(failure) => {
+                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&failure.error.error),
+                        None,
+                        on_attempt,
+                    )?;
+                    return Err(failure.error.with_provider_attempt_metadata(
+                        provider_attempt_metadata(&metadata, started_at),
+                    ));
+                }
+            };
+            let reasoning_content_present = openai_reasoning_content_present(&payload);
+            let usage_available = payload.get("usage").is_some_and(Value::is_object);
+            let parsed = parse_openai_response(
+                request,
+                &self.config,
+                payload,
+                capabilities,
+                model_name,
+                self.selected_model
+                    .as_ref()
+                    .and_then(|selection| selection.reasoning_variant.as_deref()),
+            );
+            return match parsed {
+                Ok(mut response) => {
+                    let occurrence_error = response.error.as_ref();
+                    let usage = (usage_available && occurrence_error.is_none())
+                        .then(|| response.usage.clone());
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        occurrence_error,
+                        usage,
+                        on_attempt,
+                    )?;
+                    response.provider_attempt_metadata =
+                        Some(provider_attempt_metadata(&metadata, started_at));
+                    Ok(OpenAiCompletion {
+                        response,
+                        reasoning_content_present,
+                    })
+                }
+                Err(error) => {
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
+                    Err(
+                        error.with_provider_attempt_metadata(provider_attempt_metadata(
+                            &metadata, started_at,
+                        )),
+                    )
+                }
+            };
+        }
     }
 
     /// Execute a bounded Responses SSE attempt sequence without exposing raw events.
@@ -1320,15 +1570,26 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        self.complete_responses_stream(
-            &request,
-            cancellation,
-            &context.capabilities,
-            model_name,
-            on_event,
-            on_attempt,
-        )
-        .and_then(|completion| {
+        let completion = match context.api_protocol {
+            ProviderApiProtocol::OpenAiResponses => self.complete_responses_stream(
+                &request,
+                cancellation,
+                &context.capabilities,
+                model_name,
+                on_event,
+                on_attempt,
+            ),
+            ProviderApiProtocol::OpenAiChatCompletions => self.complete_chat_stream(
+                &request,
+                cancellation,
+                &context.capabilities,
+                model_name,
+                on_event,
+                on_attempt,
+            ),
+            ProviderApiProtocol::Declared => Err(provider_streaming_unsupported_error()),
+        }?;
+        Ok(completion).and_then(|completion| {
             validate_response_tool_reasoning_contract(
                 request_uses_tool_protocol(&request),
                 &completion,
@@ -1388,6 +1649,339 @@ fn wait_stream_retry_backoff(
     wait_provider_backoff(runtime, cancellation, duration).map_err(|error| {
         error.with_provider_attempt_metadata(provider_attempt_metadata(metadata, started_at))
     })
+}
+
+/// Decode one Chat Completions body while preserving arbitrary HTTP chunk and SSE frame boundaries.
+fn read_openai_chat_sse(
+    runtime: &ProviderRuntime,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    mut response: reqwest::Response,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+    attempt_started_at: Instant,
+) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(StreamAttemptFailure {
+            error: provider_response_stream_too_large_error(),
+            emitted_text_delta: false,
+            time_to_first_text_delta_ms: None,
+        });
+    }
+    let mut decoder = ChatSseDecoder::new(on_event, attempt_started_at);
+    loop {
+        let chunk = match block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            ProviderErrorStage::ResponseBodyRead,
+            request_timeout_seconds,
+            || response.chunk(),
+        ) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Err(StreamAttemptFailure {
+                    error,
+                    emitted_text_delta: decoder.emitted_text_delta,
+                    time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+                });
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        if let Err(error) = decoder.push(&chunk) {
+            return Err(StreamAttemptFailure {
+                error,
+                emitted_text_delta: decoder.emitted_text_delta,
+                time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+            });
+        }
+    }
+    match decoder.finish() {
+        Ok(payload) => Ok(StreamAttemptSuccess {
+            payload,
+            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+        }),
+        Err(error) => Err(StreamAttemptFailure {
+            error,
+            emitted_text_delta: decoder.emitted_text_delta,
+            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+        }),
+    }
+}
+
+struct ChatToolAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Incremental, total-size-bounded Chat SSE decoder. It emits only visible
+/// content deltas; reasoning and tool-call fragments remain provider-private
+/// until the final normalized response is parsed.
+struct ChatSseDecoder<'a> {
+    pending: Vec<u8>,
+    event_data: Vec<u8>,
+    event_name: Option<String>,
+    total_bytes: usize,
+    response_id: Option<String>,
+    content: String,
+    reasoning_content: String,
+    tool_calls: BTreeMap<usize, ChatToolAccumulator>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    saw_choice: bool,
+    done: bool,
+    emitted_text_delta: bool,
+    attempt_started_at: Instant,
+    time_to_first_text_delta_ms: Option<u64>,
+    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
+}
+
+impl<'a> ChatSseDecoder<'a> {
+    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent), attempt_started_at: Instant) -> Self {
+        Self {
+            pending: Vec::new(),
+            event_data: Vec::new(),
+            event_name: None,
+            total_bytes: 0,
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: None,
+            usage: None,
+            saw_choice: false,
+            done: false,
+            emitted_text_delta: false,
+            attempt_started_at,
+            time_to_first_text_delta_ms: None,
+            on_event,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(provider_response_stream_too_large_error)?;
+        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_stream_too_large_error());
+        }
+        self.pending.extend_from_slice(chunk);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.process_line(&line)?;
+        }
+        Ok(())
+    }
+
+    fn process_line(&mut self, line: &[u8]) -> Result<(), ProviderError> {
+        if line.is_empty() {
+            return self.dispatch_event();
+        }
+        if line.first() == Some(&b':') {
+            return Ok(());
+        }
+        let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
+            let value = line.get(separator + 1..).unwrap_or_default();
+            let value = if value.first() == Some(&b' ') {
+                value.get(1..).unwrap_or_default()
+            } else {
+                value
+            };
+            (line.get(..separator).unwrap_or_default(), value)
+        } else {
+            (line, &[] as &[u8])
+        };
+        match field {
+            b"data" => {
+                let additional = value.len().saturating_add(1);
+                if self.event_data.len().saturating_add(additional)
+                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
+                {
+                    return Err(provider_response_stream_too_large_error());
+                }
+                if !self.event_data.is_empty() {
+                    self.event_data.push(b'\n');
+                }
+                self.event_data.extend_from_slice(value);
+            }
+            b"event" => {
+                let event = std::str::from_utf8(value)
+                    .map_err(|_| provider_chat_stream_malformed_error("event_name_invalid"))?;
+                self.event_name = Some(event.to_string());
+            }
+            b"id" | b"retry" => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn dispatch_event(&mut self) -> Result<(), ProviderError> {
+        if self.event_data.is_empty() {
+            self.event_name = None;
+            return Ok(());
+        }
+        let raw = std::str::from_utf8(&self.event_data)
+            .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
+            .trim()
+            .to_string();
+        self.event_data.clear();
+        self.event_name = None;
+        if raw == "[DONE]" {
+            if self.done {
+                return Err(provider_chat_stream_malformed_error("event_after_done"));
+            }
+            self.done = true;
+            return Ok(());
+        }
+        if self.done {
+            return Err(provider_chat_stream_malformed_error("event_after_done"));
+        }
+        let payload = serde_json::from_str::<Value>(&raw)
+            .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_json"))?;
+        if payload.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(provider_chat_stream_terminal_error(
+                "chat_stream_error",
+                "provider Chat stream returned an error",
+            ));
+        }
+        if let Some(id) = payload.get("id").and_then(Value::as_str)
+            && self.response_id.is_none()
+        {
+            self.response_id = Some(id.to_string());
+        }
+        if let Some(usage) = payload.get("usage").filter(|value| value.is_object()) {
+            self.usage = Some(usage.clone());
+        }
+        let Some(choices) = payload.get("choices").and_then(Value::as_array) else {
+            // A usage-only chunk is legal in the OpenAI include_usage extension.
+            return Ok(());
+        };
+        for choice in choices {
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if index != 0 {
+                return Err(provider_chat_stream_malformed_error(
+                    "multiple_choices_unsupported",
+                ));
+            }
+            self.saw_choice = true;
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.finish_reason = Some(reason.to_string());
+            }
+            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+                continue;
+            };
+            if let Some(text) = delta.get("content").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                if self.time_to_first_text_delta_ms.is_none() {
+                    self.time_to_first_text_delta_ms =
+                        Some(duration_millis(self.attempt_started_at.elapsed()));
+                }
+                self.emitted_text_delta = true;
+                self.content.push_str(text);
+                (self.on_event)(ProviderStreamEvent::OutputTextDelta {
+                    delta: text.to_string(),
+                });
+            }
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(reasoning) = delta.get(key).and_then(Value::as_str) {
+                    self.reasoning_content.push_str(reasoning);
+                }
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in tool_calls {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let entry =
+                        self.tool_calls
+                            .entry(index)
+                            .or_insert_with(|| ChatToolAccumulator {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: String::new(),
+                            });
+                    if let Some(id) = call.get("id").and_then(Value::as_str)
+                        && entry.id.is_empty()
+                    {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(function) = call.get("function").and_then(Value::as_object) {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            entry.name.push_str(name);
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Value, ProviderError> {
+        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
+            return Err(provider_chat_stream_malformed_error(
+                "event_frame_unterminated",
+            ));
+        }
+        if !self.done {
+            return Err(provider_chat_stream_malformed_error(
+                "terminal_done_missing",
+            ));
+        }
+        if !self.saw_choice {
+            return Err(provider_chat_stream_malformed_error("choice_missing"));
+        }
+        let finish_reason = self
+            .finish_reason
+            .clone()
+            .ok_or_else(|| provider_chat_stream_malformed_error("finish_reason_missing"))?;
+        let mut message = serde_json::Map::new();
+        message.insert("role".to_string(), Value::String("assistant".to_string()));
+        let content = if self.content.is_empty() && !self.tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(self.content.clone())
+        };
+        message.insert("content".to_string(), content);
+        if !self.reasoning_content.is_empty() {
+            message.insert(
+                "reasoning_content".to_string(),
+                Value::String(self.reasoning_content.clone()),
+            );
+        }
+        if !self.tool_calls.is_empty() {
+            let calls = self
+                .tool_calls
+                .values()
+                .map(|call| {
+                    serde_json::json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect::<Vec<_>>();
+            message.insert("tool_calls".to_string(), Value::Array(calls));
+        }
+        let choice = serde_json::json!({"index": 0, "message": Value::Object(message), "finish_reason": finish_reason});
+        let mut payload = serde_json::json!({
+            "id": self.response_id.clone().unwrap_or_else(|| "chat_stream".to_string()),
+            "choices": [choice],
+        });
+        if let Some(usage) = self.usage.clone() {
+            payload["usage"] = usage;
+        }
+        Ok(payload)
+    }
 }
 
 /// Decode one Responses body while preserving arbitrary HTTP chunk and SSE frame boundaries.
@@ -1615,30 +2209,19 @@ impl<'a> ResponsesSseDecoder<'a> {
                 ));
             }
             "response.incomplete" => {
-                // OpenAI Responses 语义：provider 主动宣告响应未完成，最常见原因是
-                // max_output_tokens 截断。事件 data 是完整 Response 对象，原因在
-                // `response.incomplete_details.reason`（openai-python
-                // `ResponseIncompleteEvent.response: Response` + vLLM E2E 同构）。
-                // 把 reason 带进错误文本，避免诊断时只能看到笼统的
-                // "stream was incomplete"。
-                let reason = payload
-                    .get("response")
-                    .and_then(|response| response.get("incomplete_details"))
-                    .and_then(|details| details.get("reason"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let mut error = ModelError::new(
-                    ModelErrorKind::UnknownProviderError,
-                    format!("provider Responses stream was incomplete (reason: {reason})"),
-                )
-                .with_provider_diagnostic(
-                    "responses_stream_incomplete",
-                    ProviderErrorStage::ResponseValidation,
-                );
-                error
-                    .validation_errors
-                    .push("responses_stream_incomplete".to_string());
-                return Err(ProviderError::from_model_error(error));
+                // The response object is still the authoritative partial fact.
+                // `parse_openai_responses_response` maps max_output_tokens to
+                // the typed length stop reason; other incomplete reasons fail
+                // closed there without discarding visible/tool fragments.
+                let response = payload.get("response").cloned().ok_or_else(|| {
+                    provider_responses_stream_malformed_error("incomplete_response_missing")
+                })?;
+                if !response.is_object() {
+                    return Err(provider_responses_stream_malformed_error(
+                        "incomplete_response_invalid",
+                    ));
+                }
+                self.terminal_response = Some(response);
             }
             _ => {}
         }
@@ -1655,6 +2238,26 @@ impl<'a> ResponsesSseDecoder<'a> {
             .clone()
             .ok_or_else(provider_responses_stream_terminal_missing_error)
     }
+}
+
+fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Chat stream was malformed",
+    )
+    .with_provider_diagnostic(
+        "chat_stream_malformed",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error.validation_errors.push(reason.to_string());
+    ProviderError::from_model_error(error)
+}
+
+fn provider_chat_stream_terminal_error(code: &'static str, message: &'static str) -> ProviderError {
+    let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
+        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
+    error.validation_errors.push(code.to_string());
+    ProviderError::from_model_error(error)
 }
 
 fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
@@ -1928,20 +2531,24 @@ pub(super) fn http_status_is_retryable(status: u16) -> bool {
 }
 
 pub(super) fn provider_retry_backoff(retry_count: u32) -> Duration {
+    // Full jitter avoids synchronized retries across independent provider
+    // clients while retaining the bounded exponential window.  Retry-After
+    // is handled by `record_provider_retry` and remains authoritative.
+    let sample = Uuid::new_v4().as_u128() as u64;
+    Duration::from_millis(full_jitter_delay_ms(retry_count, sample))
+}
+
+fn retry_backoff_window_ms(retry_count: u32) -> u64 {
     let shift = retry_count.saturating_sub(1).min(10);
-    let multiplier = 1_u64 << shift;
-    let base_ms = PROVIDER_RETRY_BASE_BACKOFF_MS
-        .saturating_mul(multiplier)
-        .min(PROVIDER_RETRY_MAX_BACKOFF_MS);
-    let jitter_ms = (base_ms / 10).max(1);
-    let span = jitter_ms.saturating_mul(2).saturating_add(1);
-    let sample = unix_timestamp_ms().wrapping_add(u64::from(retry_count).wrapping_mul(0x9e37_79b9));
-    let offset = sample % span;
-    let delay_ms = base_ms
-        .saturating_sub(jitter_ms)
-        .saturating_add(offset)
-        .min(PROVIDER_RETRY_MAX_BACKOFF_MS);
-    Duration::from_millis(delay_ms)
+    PROVIDER_RETRY_BASE_BACKOFF_MS
+        .saturating_mul(1_u64 << shift)
+        .min(PROVIDER_RETRY_MAX_BACKOFF_MS)
+}
+
+fn full_jitter_delay_ms(retry_count: u32, sample: u64) -> u64 {
+    // The upper bound is inclusive: [0, min(60s, 500ms * 2^(n-1))].
+    let window = retry_backoff_window_ms(retry_count);
+    sample % window.saturating_add(1)
 }
 
 fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {

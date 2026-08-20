@@ -1144,6 +1144,28 @@ fn missing_provider_usage_remains_unknown() {
 }
 
 #[test]
+fn provider_usage_above_configured_output_limit_remains_accountable() {
+    let base_url = single_response_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"usage_over_limit","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":9999,"total_tokens":10002}}"#,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let response = provider
+        .complete(
+            &ModelTurnRequest::new(
+                "usage_over_limit_request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("usage above configured limit is a provider fact, not a schema failure");
+
+    assert_eq!(response.usage.output_tokens, 9999);
+    assert_eq!(response.usage.total_tokens, 10002);
+    assert!(response.validation.expect("validation present").valid);
+}
+
+#[test]
 fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",

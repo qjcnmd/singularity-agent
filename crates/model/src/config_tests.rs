@@ -323,6 +323,47 @@ fn provider_config_snapshot_preserves_the_original_configuration_error() {
 }
 
 #[test]
+fn partial_process_environment_is_authoritative_over_user_config_layer() {
+    let mut user_layer_read = false;
+    let snapshot = ProviderConfigSnapshot::capture_with_provider_and_sources(
+        |name| match name {
+            // A single process setting selects the whole process layer. The
+            // remaining settings must not be filled from user config.
+            ENV_MODEL => Some("process-model".to_string()),
+            _ => None,
+        },
+        OpenAiProvider::new,
+        || {
+            user_layer_read = true;
+            Some(ProviderConfigLayer {
+                model_name: Some("user-model".to_string()),
+                base_url: Some("https://user.example/v1".to_string()),
+                api_key: Some("user-key".to_string()),
+                ..ProviderConfigLayer::default()
+            })
+        },
+    );
+
+    assert_eq!(
+        snapshot.source(),
+        Some(ProviderConfigSource::ProcessEnvironment)
+    );
+    assert!(
+        !user_layer_read,
+        "process layer must short-circuit user config"
+    );
+
+    let error = snapshot
+        .provider()
+        .expect_err("partial process environment must fail instead of merging user config");
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_configuration_missing")
+    );
+    assert!(error.message.contains("SINGULARITY_BASE_URL"));
+}
+
+#[test]
 fn selected_provider_without_auth_fails_closed_as_auth_error() {
     let data = user_config_with_two_providers(UserAuthFile::default());
     let result = capture_user_model_selection(

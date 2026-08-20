@@ -78,6 +78,19 @@ pub(super) fn provider_response_validation_error(
     ProviderError::from_model_error(error)
 }
 
+pub(super) fn provider_content_filter_error(
+    config: &OpenAiProviderConfig,
+    model_name: &str,
+    message: &str,
+) -> ProviderError {
+    let mut error = ModelError::new(ModelErrorKind::ContentFilter, message)
+        .with_provider(config.provider_name.clone())
+        .with_model(model_name.to_string())
+        .with_provider_diagnostic("content_filter", ProviderErrorStage::ResponseValidation);
+    error.validation_errors.push("content_filter".to_string());
+    ProviderError::from_model_error(error)
+}
+
 fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> bool {
     !validation.errors.is_empty()
         && validation.errors.iter().all(|error| {
@@ -294,20 +307,6 @@ pub fn validate_model_turn_response(
         result
             .errors
             .push("successful_response_has_error".to_string());
-    }
-    if let Some(capabilities) = capabilities
-        && response.usage.usage_present
-        && response.usage.output_tokens > u64::from(capabilities.max_output_tokens)
-    {
-        result
-            .errors
-            .push("response_output_tokens_exceed_provider_limit".to_string());
-    }
-    if matches!(
-        response.finish_reason.as_deref(),
-        Some("length" | "content_filter")
-    ) {
-        result.errors.push("chat_completion_incomplete".to_string());
     }
     result.errors.sort();
     result.errors.dedup();

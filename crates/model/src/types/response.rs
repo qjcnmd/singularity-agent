@@ -7,6 +7,17 @@ use crate::provider::ProviderAttemptMetadata;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Typed terminal reason normalized across Chat Completions and Responses.
+///
+/// The wire-compatible `finish_reason` string remains serialized for v1
+/// callers; this enum is the only control-flow interpretation of that field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStopReason {
+    Stop,
+    Length,
+}
+
 /// 模型提供方 turn 产生了有效完成，还是未通过校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -61,5 +72,19 @@ impl ModelTurnResponse {
             provider_attempt_metadata: None,
             provider_reasoning_history: Vec::new(),
         }
+    }
+
+    /// Interpret the provider finish reason without exposing string matching to callers.
+    pub fn stop_reason(&self) -> Option<ModelStopReason> {
+        match self.finish_reason.as_deref() {
+            Some("length") => Some(ModelStopReason::Length),
+            Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
+            _ => None,
+        }
+    }
+
+    /// Return true when the provider stopped because its output budget was reached.
+    pub fn is_length_truncated(&self) -> bool {
+        self.stop_reason() == Some(ModelStopReason::Length)
     }
 }

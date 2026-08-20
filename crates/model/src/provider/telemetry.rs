@@ -45,9 +45,8 @@ impl ProviderStreamingCapability {
     pub const fn for_protocol(protocol: ProviderApiProtocol) -> Self {
         match protocol {
             ProviderApiProtocol::OpenAiResponses => Self::OutputTextDelta,
-            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                Self::Unsupported
-            }
+            ProviderApiProtocol::OpenAiChatCompletions => Self::OutputTextDelta,
+            ProviderApiProtocol::Declared => Self::Unsupported,
         }
     }
 }

@@ -701,6 +701,10 @@ where
     F: FnMut(&str) -> Option<String>,
     U: FnOnce() -> Option<ProviderConfigLayer>,
 {
+    // Provenance is selected atomically: any process-environment provider
+    // field makes that complete layer authoritative. Never merge missing
+    // process fields from user config, because doing so would make a snapshot
+    // depend on two mutable sources and hide an incomplete process setup.
     let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
     if process_layer.any_present() {
         return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);

@@ -154,6 +154,38 @@ pub(crate) fn responses_provider_server(
     (format!("http://{addr}/v1/responses"), rx)
 }
 
+pub(crate) fn chat_stream_server(
+    chunks: Vec<Vec<u8>>,
+    declared_length: Option<usize>,
+) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Chat stream provider");
+    let addr = listener.local_addr().expect("Chat stream provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept Chat stream request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone Chat stream request"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        tx.send(request_body).expect("send Chat stream request");
+        let length = declared_length
+            .map(|length| format!("content-length: {length}\r\n"))
+            .unwrap_or_default();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{length}\r\n"
+        )
+        .expect("write Chat stream headers");
+        stream.flush().expect("flush Chat stream headers");
+        for chunk in chunks {
+            stream.write_all(&chunk).expect("write Chat stream chunk");
+            stream.flush().expect("flush Chat stream chunk");
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    (format!("http://{addr}/v1/chat/completions"), rx)
+}
+
 pub(crate) fn responses_stream_server(
     chunks: Vec<Vec<u8>>,
     declared_length: Option<usize>,
