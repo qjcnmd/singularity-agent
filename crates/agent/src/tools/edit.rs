@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(&modified_bytes[..3], &[0xEF, 0xBB, 0xBF]);
 
         // 2. Untouched prefix bytes must be identical
-        let prefix_len = prefix.as_bytes().len();
+        let prefix_len = prefix.len();
         assert_eq!(&modified_bytes[3..3 + prefix_len], prefix.as_bytes());
 
         // 3. Replacement bytes

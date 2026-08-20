@@ -440,10 +440,10 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
             error: (!diagnostics.is_empty()).then(|| diagnostics.join("; ")),
         });
     }
-    if cache_changed {
-        if let Ok(cache_text) = serde_json::to_string_pretty(&cache) {
-            let _ = write_json_file(&cache_path, &cache_text, false);
-        }
+    if cache_changed
+        && let Ok(cache_text) = serde_json::to_string_pretty(&cache)
+    {
+        let _ = write_json_file(&cache_path, &cache_text, false);
     }
     let default_selector = user_config.config.default_model.clone();
     Ok(UserModelCatalog {
