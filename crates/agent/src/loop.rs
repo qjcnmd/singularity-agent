@@ -700,7 +700,7 @@ impl Agent {
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
                 let tool_calls = response.tool_calls.clone();
-                let length_truncated = response.finish_reason.as_deref() == Some("length");
+                let length_truncated = response.is_length_truncated();
                 if length_truncated && !tool_calls.is_empty() {
                     // A length-truncated response may contain only partially
                     // parsed tool calls. Persist the assistant turn and a
