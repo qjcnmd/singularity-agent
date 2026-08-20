@@ -304,15 +304,17 @@ fn run_json(fixture: &SmokeFixture, goal: &str) -> Result<Value, String> {
 fn run_continue(fixture: &SmokeFixture, thread_id: &str, instruction: &str) -> Result<(), String> {
     let output = fixture
         .command()
-        .args(["continue", thread_id, instruction])
+        .args(["continue", "--json", thread_id, instruction])
         .output()
         .map_err(|_| "could not start sg continue".to_string())?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "sg continue exited with status {:?}",
-            output.status.code()
+            "sg continue exited with status {:?}, stderr: {}, stdout: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
         ))
     }
 }
@@ -347,11 +349,11 @@ fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
     // more than 26k tokens even after compaction. Two bounded tool reads
     // exceed this window's 15,616-token trigger threshold, while the compacted
     // follow-up request still fits.
-    model["max_context_tokens"] = Value::from(32_768_u64);
-    model["max_output_tokens"] = Value::from(1_024_u64);
+    model["max_context_tokens"] = Value::from(48_000_u64);
+    model["max_output_tokens"] = Value::from(8_192_u64);
     if let Some(capabilities) = model.get_mut("capabilities") {
-        capabilities["max_context_tokens"] = Value::from(32_768_u64);
-        capabilities["max_output_tokens"] = Value::from(1_024_u64);
+        capabilities["max_context_tokens"] = Value::from(48_000_u64);
+        capabilities["max_output_tokens"] = Value::from(8_192_u64);
     }
     fs::write(
         &fixture.config_path,
