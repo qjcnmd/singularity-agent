@@ -8,8 +8,8 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
 
 use super::{
     OpenAiProvider, ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderError,

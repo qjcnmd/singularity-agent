@@ -1,5 +1,3 @@
-//! HTTP 请求执行、状态码分类与有界响应体读取。
-
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,30 +9,26 @@ use crate::error::{
 };
 use crate::provider::runtime::ProviderRuntime;
 use crate::provider::telemetry::ProviderAttemptMetadata;
-use crate::transport::retry::PROVIDER_CANCELLATION_POLL_MS;
 use crate::types::{ModelTurnResponse, ProviderToolReasoningMode};
+use crate::{
+    HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
+    HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
+    MAX_PROVIDER_RESPONSE_BODY_BYTES, PROVIDER_CANCELLATION_POLL_MS,
+    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
+};
 
-pub const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
-pub const HTTP_STATUS_FORBIDDEN: u16 = 403;
-pub const HTTP_STATUS_NOT_FOUND: u16 = 404;
-pub const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
-pub const HTTP_STATUS_RATE_LIMITED: u16 = 429;
-pub const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
-pub const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
-pub const PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE: &str = "provider_runtime_initialization_failed";
-
-pub fn duration_millis(duration: Duration) -> u64 {
+pub(super) fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-pub fn unix_timestamp_ms() -> u64 {
+pub(super) fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 
-pub fn model_error_from_http_status(
+pub(crate) fn model_error_from_http_status(
     status: u16,
     provider_name: &str,
     model_name: &str,
@@ -56,7 +50,7 @@ pub fn model_error_from_http_status(
     error
 }
 
-pub fn provider_transport_error(
+pub(super) fn provider_transport_error(
     error: reqwest::Error,
     code: &'static str,
     stage: ProviderErrorStage,
@@ -88,7 +82,7 @@ pub fn provider_transport_error(
     ProviderError::from_model_error(model_error)
 }
 
-pub fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
+pub(crate) fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
             ModelErrorKind::UnknownProviderError,
@@ -101,7 +95,7 @@ pub fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
     )
 }
 
-pub fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
+pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
     provider_transport_error(
         error,
         "provider_client_initialization_failed",
@@ -110,14 +104,14 @@ pub fn provider_client_initialization_error(error: reqwest::Error) -> ProviderEr
     )
 }
 
-pub fn provider_cancelled_error() -> ProviderError {
+pub(super) fn provider_cancelled_error() -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
             .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
     )
 }
 
-pub fn provider_tool_reasoning_history_error(
+pub(super) fn provider_tool_reasoning_history_error(
     response: &ModelTurnResponse,
     mode: ProviderToolReasoningMode,
 ) -> ProviderError {
@@ -146,7 +140,7 @@ pub fn provider_tool_reasoning_history_error(
     }
 }
 
-pub fn provider_attempt_metadata(
+pub(super) fn provider_attempt_metadata(
     metadata: &ProviderAttemptMetadata,
     started_at: Instant,
 ) -> ProviderAttemptMetadata {
@@ -158,7 +152,7 @@ pub fn provider_attempt_metadata(
     }
 }
 
-pub fn block_on_provider_future<C, F, T>(
+pub(crate) fn block_on_provider_future<C, F, T>(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     error_code: &'static str,
@@ -201,7 +195,7 @@ where
     }
 }
 
-pub fn read_bounded_provider_response_body(
+pub(crate) fn read_bounded_provider_response_body(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
@@ -238,7 +232,7 @@ pub fn read_bounded_provider_response_body(
     }
 }
 
-pub fn provider_response_body_too_large_error() -> ProviderError {
+pub(super) fn provider_response_body_too_large_error() -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response body exceeded the fixed safety limit",
@@ -251,7 +245,7 @@ pub fn provider_response_body_too_large_error() -> ProviderError {
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_response_json_error() -> ModelError {
+pub(super) fn provider_response_json_error() -> ModelError {
     ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response was not valid JSON",

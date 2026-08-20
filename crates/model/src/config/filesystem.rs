@@ -6,13 +6,13 @@
 use super::*;
 use uuid::Uuid;
 
-pub enum BoundedTextError {
+pub(crate) enum BoundedTextError {
     TooLarge,
     Read(std::io::Error),
 }
 
 impl BoundedTextError {
-    pub fn is_invalid_data(&self) -> bool {
+    pub(crate) fn is_invalid_data(&self) -> bool {
         match self {
             Self::TooLarge => true,
             Self::Read(error) => error.kind() == std::io::ErrorKind::InvalidData,
@@ -20,12 +20,12 @@ impl BoundedTextError {
     }
 }
 
-pub fn read_bounded_text(path: &Path, max_bytes: usize) -> Result<String, BoundedTextError> {
+pub(crate) fn read_bounded_text(path: &Path, max_bytes: usize) -> Result<String, BoundedTextError> {
     let mut file = std::fs::File::open(path).map_err(BoundedTextError::Read)?;
     read_bounded_text_from_file(&mut file, max_bytes)
 }
 
-pub fn read_bounded_text_from_file(
+pub(crate) fn read_bounded_text_from_file(
     file: &mut std::fs::File,
     max_bytes: usize,
 ) -> Result<String, BoundedTextError> {
@@ -50,7 +50,7 @@ pub fn read_bounded_text_from_file(
     })
 }
 
-pub fn write_json_file(
+pub(crate) fn write_json_file(
     path: &Path,
     contents: &str,
     secret: bool,

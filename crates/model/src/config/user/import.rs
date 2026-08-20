@@ -7,25 +7,25 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{
-    USER_AUTH_SCHEMA_VERSION, UserAuthFile, UserAuthProvider, acquire_config_writer_lock,
-    new_auth_generation_name, write_new_auth_generation,
+    UserAuthFile, UserAuthProvider, acquire_config_writer_lock, new_auth_generation_name,
+    write_new_auth_generation,
 };
 use super::catalog::user_model_override_is_selectable;
-use crate::config::filesystem::write_json_file;
-use crate::config::schema::{
-    ProviderConfigSource, validate_identifier, validate_model_id, validate_provider_identifier,
-};
-use crate::config::{
-    find_import_env_file, normalized_endpoint_identity, parse_model_selector, read_import_env_layer,
-    validate_base_url, validate_provider_value,
-};
-use crate::{DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_MODEL};
 use super::{
     USER_CONFIG_FILE_NAME, UserConfigData, UserConfigFile, UserConfigProvider,
     ensure_no_reparse_components, read_user_config_data, user_config_directory_result,
     user_config_error,
 };
+use crate::config::filesystem::write_json_file;
+use crate::config::schema::{
+    ProviderConfigSource, validate_identifier, validate_model_id, validate_provider_identifier,
+};
+use crate::config::{
+    find_import_env_file, normalized_endpoint_identity, parse_model_selector,
+    read_import_env_layer, validate_base_url, validate_provider_value,
+};
 use crate::error::ProviderError;
+use crate::{DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_MODEL, USER_AUTH_SCHEMA_VERSION};
 
 /// Outcome of importing a dotenv file into the user-level split config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -178,7 +178,7 @@ fn reject_import_endpoint_change(
     Ok(())
 }
 
-pub fn parse_import_model_selector(
+pub(crate) fn parse_import_model_selector(
     model_value: &str,
     provider_name: &str,
 ) -> Result<(String, String), ProviderError> {

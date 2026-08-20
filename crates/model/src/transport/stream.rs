@@ -7,28 +7,27 @@ use reqwest::Response;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
+use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::runtime::ProviderRuntime;
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::http::{
-    MAX_PROVIDER_RESPONSE_BODY_BYTES, block_on_provider_future, duration_millis,
-};
+use crate::transport::http::{block_on_provider_future, duration_millis};
 
 /// A stream attempt error plus whether retrying could duplicate visible text.
-pub struct StreamAttemptFailure {
-    pub error: ProviderError,
-    pub emitted_text_delta: bool,
-    pub time_to_first_text_delta_ms: Option<u64>,
+pub(super) struct StreamAttemptFailure {
+    pub(super) error: ProviderError,
+    pub(super) emitted_text_delta: bool,
+    pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
 /// A completed stream decode plus timing captured at the decoder boundary.
-pub struct StreamAttemptSuccess {
-    pub payload: Value,
-    pub time_to_first_text_delta_ms: Option<u64>,
+pub(super) struct StreamAttemptSuccess {
+    pub(super) payload: Value,
+    pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
 /// Decode one Chat Completions body while preserving arbitrary HTTP chunk and SSE frame boundaries.
-pub fn read_openai_chat_sse(
+pub(super) fn read_openai_chat_sse(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
@@ -87,16 +86,16 @@ pub fn read_openai_chat_sse(
     }
 }
 
-pub struct ChatToolAccumulator {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+pub(super) struct ChatToolAccumulator {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) arguments: String,
 }
 
 /// Incremental, total-size-bounded Chat SSE decoder. It emits only visible
 /// content deltas; reasoning and tool-call fragments remain provider-private
 /// until the final normalized response is parsed.
-pub struct ChatSseDecoder<'a> {
+pub(super) struct ChatSseDecoder<'a> {
     pending: Vec<u8>,
     event_data: Vec<u8>,
     event_name: Option<String>,
@@ -109,14 +108,14 @@ pub struct ChatSseDecoder<'a> {
     usage: Option<Value>,
     saw_choice: bool,
     done: bool,
-    pub emitted_text_delta: bool,
+    pub(super) emitted_text_delta: bool,
     attempt_started_at: Instant,
-    pub time_to_first_text_delta_ms: Option<u64>,
+    pub(super) time_to_first_text_delta_ms: Option<u64>,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
 impl<'a> ChatSseDecoder<'a> {
-    pub fn new(
+    pub(super) fn new(
         on_event: &'a mut dyn FnMut(ProviderStreamEvent),
         attempt_started_at: Instant,
     ) -> Self {
@@ -364,7 +363,7 @@ impl<'a> ChatSseDecoder<'a> {
 }
 
 /// Decode one Responses body while preserving arbitrary HTTP chunk and SSE frame boundaries.
-pub fn read_openai_responses_sse(
+pub(super) fn read_openai_responses_sse(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
@@ -635,14 +634,17 @@ pub fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderErr
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_chat_stream_terminal_error(code: &'static str, message: &'static str) -> ProviderError {
+pub(super) fn provider_chat_stream_terminal_error(
+    code: &'static str,
+    message: &'static str,
+) -> ProviderError {
     let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
         .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
     error.validation_errors.push(code.to_string());
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
+pub(super) fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream was malformed",
@@ -655,7 +657,7 @@ pub fn provider_responses_stream_malformed_error(reason: &'static str) -> Provid
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_responses_stream_terminal_missing_error() -> ProviderError {
+pub(super) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream did not contain a completed terminal",
@@ -670,7 +672,7 @@ pub fn provider_responses_stream_terminal_missing_error() -> ProviderError {
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_responses_stream_terminal_error(
+pub(super) fn provider_responses_stream_terminal_error(
     code: &'static str,
     message: &'static str,
 ) -> ProviderError {
@@ -680,7 +682,7 @@ pub fn provider_responses_stream_terminal_error(
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_response_stream_too_large_error() -> ProviderError {
+pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream exceeded the fixed safety limit",

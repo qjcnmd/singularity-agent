@@ -4,9 +4,8 @@ use serde_json::{Value, json};
 
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::contract::{
-    ProviderProtocolContract, ThinkingWireFormat, message_text,
-    provider_content_filter_error, provider_response_validation_error, request_uses_tool_protocol,
-    validate_model_turn_response,
+    ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
+    provider_response_validation_error, request_uses_tool_protocol, validate_model_turn_response,
 };
 use crate::provider::runtime::OpenAiProviderConfig;
 use crate::types::{
@@ -511,9 +510,7 @@ pub fn parse_tool_call_arguments(
     }
 }
 
-pub fn parse_tool_arguments(
-    raw_arguments: &str,
-) -> (Value, ModelToolParseStatus, Vec<String>) {
+pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Vec<String>) {
     match serde_json::from_str::<Value>(raw_arguments) {
         Ok(arguments) if arguments.is_object() => {
             (arguments, ModelToolParseStatus::Valid, Vec::new())

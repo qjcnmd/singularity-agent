@@ -1,12 +1,6 @@
-//! OpenAI 协议端点路径与共享线路辅助能力。
-
 use crate::error::ProviderError;
 use crate::types::{ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage};
-
-pub const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-pub const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
-pub const RESPONSES_PATH: &str = "/responses";
-pub const V1_RESPONSES_PATH: &str = "/v1/responses";
+use crate::{CHAT_COMPLETIONS_PATH, RESPONSES_PATH, V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH};
 
 /// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。
 pub fn chat_completions_endpoint(base_url: &str) -> String {
@@ -73,7 +67,7 @@ pub fn provider_error_response(
     }
 }
 
-pub struct OpenAiCompletion {
-    pub response: ModelTurnResponse,
-    pub reasoning_content_present: bool,
+pub(crate) struct OpenAiCompletion {
+    pub(crate) response: ModelTurnResponse,
+    pub(crate) reasoning_content_present: bool,
 }

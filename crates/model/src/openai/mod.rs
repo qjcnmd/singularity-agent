@@ -1,12 +1,15 @@
 //! OpenAI Chat Completions/Responses 的请求投影、响应解码和 envelope 校验。
 
-pub mod chat;
-pub mod responses;
-pub mod wire;
+pub(crate) mod chat;
+pub(crate) mod responses;
+pub(crate) mod wire;
 
-pub use chat::*;
-pub use responses::*;
-pub use wire::*;
+pub(crate) use chat::*;
+pub(crate) use responses::*;
+pub(crate) use wire::OpenAiCompletion;
+pub use wire::{
+    chat_completions_endpoint, models_endpoint, provider_error_response, responses_endpoint,
+};
 
 #[cfg(test)]
 mod tests {

@@ -1,12 +1,12 @@
 //! provider HTTP transport、retry、bounded body read 和取消传播。
 
-pub mod http;
-pub mod retry;
-pub mod stream;
+pub(crate) mod http;
+pub(crate) mod retry;
+pub(crate) mod stream;
 
-pub use http::*;
-pub use retry::*;
-pub use stream::*;
+pub(crate) use http::*;
+pub(crate) use retry::*;
+pub(crate) use stream::*;
 
 use std::fmt;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
+use crate::MAX_PROVIDER_ATTEMPTS;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::openai::{
     OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
@@ -22,6 +23,7 @@ use crate::openai::{
     openai_responses_request_payload, openai_responses_stream_request_payload,
     parse_openai_response, parse_openai_responses_response, responses_endpoint,
 };
+use crate::provider::Provider;
 use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
     provider_request_validation_error, request_uses_tool_protocol, validate_model_request,
@@ -33,7 +35,6 @@ use crate::provider::telemetry::{
     ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent, ProviderStreamingCapability, provider_streaming_unsupported_error,
 };
-use crate::provider::Provider;
 use crate::types::{
     ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderToolReasoningMode,
 };
@@ -238,17 +239,13 @@ impl OpenAiProvider {
 
     /// Clone a provider for one allowlisted model while freezing its protocol
     /// and token limits. The clone shares the HTTP client, runtime and caches.
-    pub fn with_selected_model(&self, selected_model: SelectedModel) -> Self {
+    pub(crate) fn with_selected_model(&self, selected_model: SelectedModel) -> Self {
         let mut selected = self.clone();
         selected.config.model_name = selected_model.model_name.clone();
         selected.config.max_context_tokens = selected_model.max_context_tokens;
         selected.config.max_output_tokens = selected_model.max_output_tokens;
         selected.selected_model = Some(selected_model);
         selected
-    }
-
-    pub fn selected_model(&self) -> Option<&SelectedModel> {
-        self.selected_model.as_ref()
     }
 
     pub(super) fn configured_provider_name(&self) -> &str {
@@ -1077,7 +1074,7 @@ impl OpenAiProvider {
                     self.selected_model
                         .as_ref()
                         .map(|selection| selection.thinking_wire_format)
-                        .unwrap_or(super::ThinkingWireFormat::ThinkingType),
+                        .unwrap_or(ThinkingWireFormat::ThinkingType),
                     // 无 selected_model（env 配置路径）时按 false 处理：OpenAI
                     // 兼容 chat 端点对 developer role 的支持并不通用（dashscope
                     // compatible-mode 实测 HTTP 400），wire 统一投影为 system；

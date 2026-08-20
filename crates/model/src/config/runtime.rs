@@ -9,8 +9,8 @@ use std::fmt;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::error::ModelErrorCategory;
 use super::*;
+use crate::error::ModelErrorCategory;
 
 /// Immutable, secret-bearing provider instances and their allowlisted model
 /// selections. This type never implements `Debug`; the enclosing snapshot only

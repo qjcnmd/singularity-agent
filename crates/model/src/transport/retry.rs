@@ -1,5 +1,3 @@
-//! Provider transport 重试退避、Full Jitter 采样与 `Retry-After` 解析。
-
 use reqwest::header::HeaderMap;
 use singularity_core::CancellationToken;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,17 +7,12 @@ use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
 };
 use crate::provider::runtime::ProviderRuntime;
-
-pub const MAX_PROVIDER_ATTEMPTS: u32 = 6;
-pub const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 500;
-pub const PROVIDER_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
-pub const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
-
-use super::http::{
+use crate::{
     HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
+    PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
 };
 
-pub fn provider_error_is_retryable(error: &ProviderError) -> bool {
+pub(super) fn provider_error_is_retryable(error: &ProviderError) -> bool {
     // 只对网络层快速失败重试（连接失败/中断）。挂起超时不重试：120s 无响应后
     // 重试大概率仍无响应，且 6 次重试 × 120s 会让单个挂起请求拖到 12 分钟。
     matches!(error.error.kind, ModelErrorKind::NetworkError)
@@ -29,7 +22,7 @@ pub fn provider_error_is_retryable(error: &ProviderError) -> bool {
         )
 }
 
-pub fn http_status_is_retryable(status: u16) -> bool {
+pub(super) fn http_status_is_retryable(status: u16) -> bool {
     // 可重试的 HTTP 状态码条件：408（服务端请求超时）、429（速率限制）及 5xx（服务端错误）。
     // 客户端发起的本地传输超时不重试（快速失败），仅当远端服务明确返回瞬时错误时才执行指数退避重试。
     status == HTTP_STATUS_REQUEST_TIMEOUT
@@ -37,7 +30,7 @@ pub fn http_status_is_retryable(status: u16) -> bool {
         || status >= HTTP_STATUS_INTERNAL_SERVER_ERROR
 }
 
-pub fn provider_retry_backoff(retry_count: u32) -> Duration {
+pub(crate) fn provider_retry_backoff(retry_count: u32) -> Duration {
     // Full jitter avoids synchronized retries across independent provider
     // clients while retaining the bounded exponential window. Retry-After
     // is handled by `record_provider_retry` and remains authoritative.
@@ -58,7 +51,7 @@ pub(crate) fn full_jitter_delay_ms(retry_count: u32, sample: u64) -> u64 {
     sample % window.saturating_add(1)
 }
 
-pub fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
@@ -143,7 +136,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
         .checked_sub(719_468)
 }
 
-pub fn wait_provider_backoff(
+pub(super) fn wait_provider_backoff(
     runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     duration: Duration,
@@ -152,8 +145,11 @@ pub fn wait_provider_backoff(
     loop {
         if cancellation.is_cancelled() {
             return Err(ProviderError::from_model_error(
-                ModelError::new(ModelErrorKind::Cancelled, "model request cancelled by client")
-                    .with_provider_diagnostic("client_cancelled", ProviderErrorStage::Cancelled),
+                ModelError::new(
+                    ModelErrorKind::Cancelled,
+                    "model request cancelled by client",
+                )
+                .with_provider_diagnostic("client_cancelled", ProviderErrorStage::Cancelled),
             ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());

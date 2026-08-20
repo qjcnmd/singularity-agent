@@ -74,7 +74,9 @@ impl OpenAiProviderConfig {
         Self::from_resolved_values(values)
     }
 
-    pub(crate) fn from_resolved_values(values: ResolvedProviderValues) -> Result<Self, ProviderError> {
+    pub(crate) fn from_resolved_values(
+        values: ResolvedProviderValues,
+    ) -> Result<Self, ProviderError> {
         validate_provider_value(values.provider_name.as_deref(), ENV_PROVIDER, values.source)?;
         validate_provider_value(values.model_name.as_deref(), ENV_MODEL, values.source)?;
         if let Some(provider_name) = values.provider_name.as_deref() {
@@ -211,34 +213,34 @@ impl OpenAiProviderConfig {
 /// enabled state and the single wire effort together prevents a second runtime
 /// mapping table from silently changing the provider request.
 #[derive(Clone)]
-pub struct SelectedModel {
-    pub model_name: String,
-    pub api_protocol: ProviderApiProtocol,
-    pub max_context_tokens: Option<u32>,
-    pub max_output_tokens: u32,
-    pub reasoning_variant: Option<String>,
-    pub reasoning_enabled: bool,
-    pub wire_reasoning_effort: Option<String>,
-    pub thinking_wire_format: ThinkingWireFormat,
-    pub tool_reasoning_mode: ProviderToolReasoningMode,
-    pub supports_developer_role: bool,
-    pub supports_tool_choice: bool,
-    pub requires_reasoning_content_for_tool_calls: bool,
-    pub requires_assistant_content_for_tool_calls: bool,
+pub(crate) struct SelectedModel {
+    pub(crate) model_name: String,
+    pub(crate) api_protocol: ProviderApiProtocol,
+    pub(crate) max_context_tokens: Option<u32>,
+    pub(crate) max_output_tokens: u32,
+    pub(crate) reasoning_variant: Option<String>,
+    pub(crate) reasoning_enabled: bool,
+    pub(crate) wire_reasoning_effort: Option<String>,
+    pub(crate) thinking_wire_format: ThinkingWireFormat,
+    pub(crate) tool_reasoning_mode: ProviderToolReasoningMode,
+    pub(crate) supports_developer_role: bool,
+    pub(crate) supports_tool_choice: bool,
+    pub(crate) requires_reasoning_content_for_tool_calls: bool,
+    pub(crate) requires_assistant_content_for_tool_calls: bool,
     /// 合并后的用户显式能力声明；协议契约构造时叠加到静态基线。
-    pub capability_overrides: Option<ProviderCapabilityDeclaration>,
+    pub(crate) capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
 /// Provider transport runtime ownership: an app-server borrows its existing handle, while
 /// independent consumers own a dedicated runtime shared by provider clones.
 #[derive(Clone)]
-pub enum ProviderRuntime {
+pub(crate) enum ProviderRuntime {
     External(tokio::runtime::Handle),
     Owned(Arc<tokio::runtime::Runtime>),
 }
 
 impl ProviderRuntime {
-    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
         match self {
             Self::External(handle) => handle.block_on(future),
             Self::Owned(runtime) => runtime.block_on(future),

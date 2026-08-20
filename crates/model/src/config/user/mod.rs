@@ -3,13 +3,20 @@
 //! User config and auth remain one lifecycle: read, validate, and atomically
 //! publish through the parent module's single source of truth.
 
-pub mod auth;
-pub mod catalog;
-pub mod import;
+pub(crate) mod auth;
+pub(crate) mod catalog;
+pub(crate) mod import;
 
-pub use auth::*;
-pub use catalog::*;
-pub use import::*;
+pub(crate) use auth::*;
+#[cfg(test)]
+pub(crate) use catalog::load_models_cache;
+pub use catalog::{
+    ModelCacheStatus, ModelDiscoveryStatus, UserModelCatalog, UserModelCatalogEntry,
+    UserProviderModelCatalog, read_user_model_catalog,
+};
+#[cfg(test)]
+pub(crate) use import::parse_import_model_selector;
+pub use import::{UserConfigImportResult, import_env_to_user_config};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,85 +24,81 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
-use crate::config::schema::{
-    ModelsFileReasoningVariant, deserialize_unique_map,
-};
+use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::config::{ProviderConfigLayer, parse_model_selector};
 use crate::error::ProviderError;
 use crate::provider::contract::ProviderCapabilityDeclaration;
-use crate::USER_CONFIG_DIR_NAME;
-
-pub const USER_CONFIG_FILE_NAME: &str = "config.json";
+use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserConfigFile {
+pub(crate) struct UserConfigFile {
     #[serde(default = "default_user_config_version")]
-    pub version: u32,
+    pub(crate) version: u32,
     #[serde(default)]
-    pub default_provider: Option<String>,
+    pub(crate) default_provider: Option<String>,
     #[serde(default)]
-    pub default_model: Option<String>,
+    pub(crate) default_model: Option<String>,
     #[serde(default)]
-    pub auth_generation: Option<String>,
+    pub(crate) auth_generation: Option<String>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
-    pub providers: BTreeMap<String, UserConfigProvider>,
+    pub(crate) providers: BTreeMap<String, UserConfigProvider>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserConfigProvider {
-    pub base_url: String,
+pub(crate) struct UserConfigProvider {
+    pub(crate) base_url: String,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
-    pub models: BTreeMap<String, UserConfigModel>,
+    pub(crate) models: BTreeMap<String, UserConfigModel>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserConfigModel {
+pub(crate) struct UserConfigModel {
     #[serde(default)]
-    pub api_protocol: Option<String>,
+    pub(crate) api_protocol: Option<String>,
     #[serde(default)]
-    pub max_context_tokens: Option<u32>,
+    pub(crate) max_context_tokens: Option<u32>,
     #[serde(default)]
-    pub max_output_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
-    pub reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
+    pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     #[serde(default)]
-    pub default_variant: Option<String>,
+    pub(crate) default_variant: Option<String>,
     #[serde(default)]
-    pub tool_reasoning_history: Option<String>,
+    pub(crate) tool_reasoning_history: Option<String>,
     #[serde(default)]
-    pub supports_developer_role: Option<bool>,
+    pub(crate) supports_developer_role: Option<bool>,
     #[serde(default)]
-    pub supports_tool_choice: Option<bool>,
+    pub(crate) supports_tool_choice: Option<bool>,
     #[serde(default)]
-    pub requires_reasoning_content_for_tool_calls: bool,
+    pub(crate) requires_reasoning_content_for_tool_calls: bool,
     #[serde(default)]
-    pub requires_assistant_content_for_tool_calls: bool,
+    pub(crate) requires_assistant_content_for_tool_calls: bool,
     #[serde(default)]
-    pub thinking_wire_format: Option<String>,
+    pub(crate) thinking_wire_format: Option<String>,
     #[serde(default)]
-    pub capabilities: Option<ProviderCapabilityDeclaration>,
+    pub(crate) capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
-pub fn default_user_config_version() -> u32 {
+pub(crate) fn default_user_config_version() -> u32 {
     1
 }
 
-pub fn user_config_error(message: impl Into<String>) -> ProviderError {
+pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
     super::configuration_error(message, "provider_configuration_invalid")
 }
 
 #[derive(Clone)]
-pub struct UserConfigData {
-    pub directory: PathBuf,
-    pub config: UserConfigFile,
-    pub auth: UserAuthFile,
+pub(crate) struct UserConfigData {
+    pub(crate) directory: PathBuf,
+    pub(crate) config: UserConfigFile,
+    pub(crate) auth: UserAuthFile,
 }
 
 /// Resolve the user-level directory shared by all worktrees.
-pub fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
+pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
     let explicit_home = std::env::var_os("SINGULARITY_HOME");
     let home = explicit_home
         .clone()
@@ -122,7 +125,7 @@ pub fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> 
     }
 }
 
-pub fn normalize_absolute_path(path: &Path) -> Result<PathBuf, ProviderError> {
+pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, ProviderError> {
     if !path.is_absolute() {
         return Err(user_config_error(
             "user config directory must be an absolute path",
@@ -243,7 +246,7 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     }
 }
 
-pub fn ensure_no_reparse_components(
+pub(crate) fn ensure_no_reparse_components(
     path: &Path,
     allow_missing_tail: bool,
 ) -> Result<(), ProviderError> {
@@ -284,14 +287,14 @@ pub fn ensure_no_reparse_components(
     Ok(())
 }
 
-pub fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {
+pub(crate) fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {
     let Some(directory) = user_config_directory_result()? else {
         return Ok(None);
     };
     read_user_config_data_from_directory(directory)
 }
 
-pub fn read_user_config_data_from_directory(
+pub(crate) fn read_user_config_data_from_directory(
     directory: PathBuf,
 ) -> Result<Option<UserConfigData>, ProviderError> {
     let config_path = directory.join(USER_CONFIG_FILE_NAME);
@@ -338,7 +341,7 @@ pub fn read_user_config_data_from_directory(
         read_private_auth_file(&auth_path)?
     } else {
         UserAuthFile {
-            schema_version: auth::USER_AUTH_SCHEMA_VERSION,
+            schema_version: crate::USER_AUTH_SCHEMA_VERSION,
             providers: BTreeMap::new(),
         }
     };
@@ -349,7 +352,7 @@ pub fn read_user_config_data_from_directory(
     }))
 }
 
-pub fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool, ProviderError> {
+pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool, ProviderError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),

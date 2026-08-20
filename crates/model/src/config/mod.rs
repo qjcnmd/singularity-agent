@@ -2,34 +2,44 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub mod filesystem;
-pub mod runtime;
-pub mod schema;
-pub mod selection;
-pub mod user;
+pub(crate) mod filesystem;
+pub(crate) mod runtime;
+pub(crate) mod schema;
+pub(crate) mod selection;
+pub(crate) mod user;
 
-pub use filesystem::read_bounded_text;
-pub use runtime::*;
-pub use schema::*;
-pub use user::*;
+pub(crate) use filesystem::read_bounded_text;
+pub use runtime::ProviderConfigSnapshot;
+pub(crate) use runtime::*;
+pub(crate) use schema::*;
+pub use schema::{
+    ModelBlockerKind, ModelProviderConfig, ProviderConfigResolution, ProviderConfigSource,
+    ProviderConfigurationStatus,
+};
+pub(crate) use user::*;
+pub use user::{
+    ModelCacheStatus, ModelDiscoveryStatus, UserConfigImportResult, UserModelCatalog,
+    UserModelCatalogEntry, UserProviderModelCatalog, import_env_to_user_config,
+    read_user_model_catalog,
+};
 
 use super::{
     DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
     ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
     ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig,
     PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage,
-    ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
+    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage, ProviderToolReasoningMode,
+    ThinkingWireFormat, validate_provider_config,
 };
 
-pub(super) use selection::model_selector_error;
-use selection::{parse_model_selector, provider_for_selection};
-#[cfg(test)]
-use filesystem::write_json_file;
 #[cfg(test)]
 use crate::error::ModelErrorCategory;
 #[cfg(test)]
+use filesystem::write_json_file;
+#[cfg(test)]
 pub(crate) use runtime::capture_models_file;
+pub(super) use selection::model_selector_error;
+use selection::{parse_model_selector, provider_for_selection};
 
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
 where

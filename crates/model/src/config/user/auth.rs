@@ -4,26 +4,22 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use super::{ensure_no_reparse_components, path_exists_or_missing, user_config_error};
+use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
+use crate::config::schema::deserialize_unique_map;
+use crate::error::ProviderError;
+use crate::{USER_AUTH_GENERATION_PREFIX, USER_AUTH_SCHEMA_VERSION};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
-use crate::config::schema::deserialize_unique_map;
-use super::{ensure_no_reparse_components, path_exists_or_missing, user_config_error};
-use crate::error::ProviderError;
-
-pub const USER_AUTH_GENERATION_PREFIX: &str = "auth.v1-";
-pub const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserAuthFile {
+pub(crate) struct UserAuthFile {
     #[serde(default = "default_auth_schema_version")]
-    pub schema_version: u32,
+    pub(crate) schema_version: u32,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
-    pub providers: BTreeMap<String, UserAuthProvider>,
+    pub(crate) providers: BTreeMap<String, UserAuthProvider>,
 }
 
 impl Default for UserAuthFile {
@@ -54,8 +50,8 @@ impl fmt::Debug for UserAuthFile {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserAuthProvider {
-    pub api_key: String,
+pub(crate) struct UserAuthProvider {
+    pub(crate) api_key: String,
 }
 
 impl fmt::Debug for UserAuthProvider {
@@ -67,11 +63,11 @@ impl fmt::Debug for UserAuthProvider {
     }
 }
 
-pub fn default_auth_schema_version() -> u32 {
+pub(crate) fn default_auth_schema_version() -> u32 {
     USER_AUTH_SCHEMA_VERSION
 }
 
-pub fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
+pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let mut file = open_user_config_file(path, true)?;
     ensure_private_secret_handle(&file)?;
     let text = read_bounded_text_from_file(&mut file, crate::MAX_DISCOVERY_RESPONSE_BYTES)
@@ -90,12 +86,15 @@ pub fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError
 }
 
 #[cfg(all(test, unix))]
-pub fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
+pub(crate) fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
     let file = open_user_config_file(path, true)?;
     ensure_private_secret_handle(&file)
 }
 
-pub fn open_user_config_file(path: &Path, private: bool) -> Result<std::fs::File, ProviderError> {
+pub(crate) fn open_user_config_file(
+    path: &Path,
+    private: bool,
+) -> Result<std::fs::File, ProviderError> {
     ensure_no_reparse_components(path, false)?;
     let parent = path
         .parent()
@@ -129,7 +128,7 @@ pub fn open_user_config_file(path: &Path, private: bool) -> Result<std::fs::File
     Ok(file)
 }
 
-pub fn ensure_regular_user_config_handle(file: &std::fs::File) -> Result<(), ProviderError> {
+pub(crate) fn ensure_regular_user_config_handle(file: &std::fs::File) -> Result<(), ProviderError> {
     let metadata = file
         .metadata()
         .map_err(|_| user_config_error("user provider config metadata could not be checked"))?;
@@ -153,7 +152,7 @@ pub fn ensure_regular_user_config_handle(file: &std::fs::File) -> Result<(), Pro
     Ok(())
 }
 
-pub fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), ProviderError> {
+pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), ProviderError> {
     ensure_regular_user_config_handle(file)?;
     #[cfg(unix)]
     {
@@ -170,7 +169,7 @@ pub fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), Provider
     Ok(())
 }
 
-pub fn create_private_secret_file(path: &Path) -> Result<std::fs::File, ProviderError> {
+pub(crate) fn create_private_secret_file(path: &Path) -> Result<std::fs::File, ProviderError> {
     let parent = path
         .parent()
         .ok_or_else(|| user_config_error("user provider config path has no parent"))?;
@@ -187,7 +186,10 @@ pub fn create_private_secret_file(path: &Path) -> Result<std::fs::File, Provider
         .map_err(|_| user_config_error("user provider auth file could not be created"))
 }
 
-pub fn auth_generation_path(directory: &Path, generation: &str) -> Result<PathBuf, ProviderError> {
+pub(crate) fn auth_generation_path(
+    directory: &Path,
+    generation: &str,
+) -> Result<PathBuf, ProviderError> {
     if !generation.starts_with(USER_AUTH_GENERATION_PREFIX)
         || !generation.ends_with(".json")
         || generation.contains(['/', '\\', ':'])
@@ -207,15 +209,15 @@ pub fn auth_generation_path(directory: &Path, generation: &str) -> Result<PathBu
     Ok(path)
 }
 
-pub fn new_auth_generation_name() -> String {
+pub(crate) fn new_auth_generation_name() -> String {
     format!(
         "{}{}.json",
         USER_AUTH_GENERATION_PREFIX,
-        Uuid::new_v4().simple()
+        uuid::Uuid::new_v4().simple()
     )
 }
 
-pub fn write_new_auth_generation(
+pub(crate) fn write_new_auth_generation(
     directory: &Path,
     generation: &str,
     contents: &str,
@@ -240,11 +242,11 @@ pub fn write_new_auth_generation(
     result.map(|()| path)
 }
 
-pub struct ConfigWriterLock {
+pub(crate) struct ConfigWriterLock {
     pub(crate) _file: std::fs::File,
 }
 
-pub fn acquire_config_writer_lock(
+pub(crate) fn acquire_config_writer_lock(
     directory: &Path,
 ) -> Result<ConfigWriterLock, ProviderError> {
     ensure_no_reparse_components(directory, false)?;

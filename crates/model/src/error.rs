@@ -1,5 +1,5 @@
-use crate::provider::contract;
 use crate::provider::ProviderAttemptMetadata;
+use crate::provider::contract;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::Provider;
+use crate::{Provider, USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
 
 fn executable_user_model() -> UserConfigModel {
     UserConfigModel {

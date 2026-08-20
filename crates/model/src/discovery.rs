@@ -1,20 +1,19 @@
 //! 模型发现逻辑与 `/models` 端点查询。
 
-use std::collections::HashSet;
 use serde_json::Value;
 use singularity_core::CancellationToken;
+use std::collections::HashSet;
 
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::openai::models_endpoint;
 use crate::provider::runtime::OpenAiProviderConfig;
-use crate::transport::http::{block_on_provider_future, model_error_from_http_status, read_bounded_provider_response_body};
-
-pub const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
-pub const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
-pub const MAX_MODEL_ID_LENGTH: usize = 512;
+use crate::transport::http::{
+    block_on_provider_future, model_error_from_http_status, read_bounded_provider_response_body,
+};
+use crate::{MAX_DISCOVERED_MODEL_IDS, MAX_DISCOVERY_RESPONSE_BYTES, MAX_MODEL_ID_LENGTH};
 
 /// Discover public model ids from the provider's standard `/models` endpoint using a client and runtime.
-pub fn discover_provider_models(
+pub(crate) fn discover_provider_models(
     config: &OpenAiProviderConfig,
     client: &reqwest::Client,
     runtime: &crate::provider::runtime::ProviderRuntime,
@@ -28,12 +27,7 @@ pub fn discover_provider_models(
         "provider_models_request_failed",
         ProviderErrorStage::RequestSend,
         request_timeout_seconds,
-        || {
-            client
-                .get(&endpoint)
-                .bearer_auth(&config.api_key)
-                .send()
-        },
+        || client.get(&endpoint).bearer_auth(&config.api_key).send(),
     )?;
     let status = response.status();
     if !status.is_success() {

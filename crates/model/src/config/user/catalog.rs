@@ -6,26 +6,22 @@ use std::path::Path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::{UserConfigModel, read_user_config_data};
 use crate::config::filesystem::{read_bounded_text, write_json_file};
 use crate::config::schema::{
-    deserialize_unique_map, deserialize_unique_vec, validate_model_id,
-    validate_provider_identifier,
+    deserialize_unique_map, deserialize_unique_vec, validate_model_id, validate_provider_identifier,
 };
 use crate::config::{
     configured_model_from_user_file, normalized_endpoint_identity, validate_base_url,
     validate_provider_value,
 };
-use super::{UserConfigModel, read_user_config_data};
-use crate::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_API_KEY,
-    MAX_DISCOVERED_MODEL_IDS, OpenAiProviderConfig, ProviderConfigSource,
-};
 use crate::error::ProviderError;
 use crate::transport::OpenAiProvider;
-
-pub const USER_MODELS_CACHE_FILE_NAME: &str = "models-cache.json";
-pub const USER_MODELS_CACHE_SCHEMA_VERSION: u32 = 1;
-pub const USER_MODELS_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
+use crate::{
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_API_KEY, MAX_DISCOVERED_MODEL_IDS,
+    OpenAiProviderConfig, ProviderConfigSource, USER_MODELS_CACHE_FILE_NAME,
+    USER_MODELS_CACHE_SCHEMA_VERSION, USER_MODELS_CACHE_TTL_SECONDS,
+};
 
 /// State of one provider's `/models` discovery record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -287,10 +283,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
         if api_key.is_some() && !auth_valid {
             diagnostics.push("provider authentication is invalid".to_string());
         }
-        let explicit_ids = provider_file
-            .models
-            .keys()
-            .collect::<BTreeSet<_>>();
+        let explicit_ids = provider_file.models.keys().collect::<BTreeSet<_>>();
         if explicit_ids.iter().any(|id| {
             provider_file
                 .models
@@ -388,10 +381,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
         if let Some(error) = discovery_error {
             diagnostics.push(error);
         }
-        let discovered_set = discovered_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let discovered_set = discovered_ids.iter().cloned().collect::<BTreeSet<_>>();
         let mut model_entries = Vec::new();
         for id in &discovered_ids {
             let model_override = provider_file.models.get(id);
@@ -422,11 +412,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
                     explicit: true,
                     selectable,
                     max_context_tokens: model_override.max_context_tokens,
-                    reasoning_variants: model_override
-                        .reasoning_variants
-                        .keys()
-                        .cloned()
-                        .collect(),
+                    reasoning_variants: model_override.reasoning_variants.keys().cloned().collect(),
                     default_variant: model_override.default_variant.clone(),
                 });
             }
@@ -440,9 +426,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
             error: (!diagnostics.is_empty()).then(|| diagnostics.join("; ")),
         });
     }
-    if cache_changed
-        && let Ok(cache_text) = serde_json::to_string_pretty(&cache)
-    {
+    if cache_changed && let Ok(cache_text) = serde_json::to_string_pretty(&cache) {
         let _ = write_json_file(&cache_path, &cache_text, false);
     }
     let default_selector = user_config.config.default_model.clone();

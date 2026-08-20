@@ -7,17 +7,18 @@ use std::collections::HashSet;
 
 use super::runtime::OpenAiProviderConfig;
 use super::telemetry::ProviderAttemptMetadata;
-use crate::error::{ModelError, ModelErrorCategory, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::error::{
+    ModelError, ModelErrorCategory, ModelErrorKind, ProviderError, ProviderErrorStage,
+};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelValidationResult, ProviderToolReasoningMode,
     ToolChoicePolicy,
 };
-
-pub const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
-pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
-pub const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
+use crate::{
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
+    TEXT_TOOL_CALL_ENVELOPE_ERROR,
+};
 
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -159,7 +160,7 @@ impl ModelValidationResult {
     }
 }
 
-pub fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
+pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
     !request.tools.is_empty()
         || request
             .messages
@@ -167,7 +168,7 @@ pub fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
             .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
 }
 
-pub fn provider_request_validation_error(
+pub(crate) fn provider_request_validation_error(
     validation: ModelValidationResult,
     config: &OpenAiProviderConfig,
 ) -> ProviderError {
@@ -191,7 +192,7 @@ pub fn provider_request_validation_error(
         .with_provider_attempt_metadata(ProviderAttemptMetadata::zero())
 }
 
-pub fn provider_response_validation_error(
+pub(crate) fn provider_response_validation_error(
     config: &OpenAiProviderConfig,
     model_name: &str,
     message: &str,
@@ -208,7 +209,7 @@ pub fn provider_response_validation_error(
     ProviderError::from_model_error(error)
 }
 
-pub fn provider_content_filter_error(
+pub(crate) fn provider_content_filter_error(
     config: &OpenAiProviderConfig,
     model_name: &str,
     message: &str,
@@ -551,7 +552,7 @@ fn validate_model_response_with_protocol_context(
     validation_result(errors, warnings)
 }
 
-pub fn model_error_category(error: &ModelError) -> ModelErrorCategory {
+pub(crate) fn model_error_category(error: &ModelError) -> ModelErrorCategory {
     match error.kind {
         ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
         ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
@@ -595,7 +596,7 @@ fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelVal
     }
 }
 
-pub fn message_text(message: &ModelMessage) -> &str {
+pub(crate) fn message_text(message: &ModelMessage) -> &str {
     &message.content
 }
 

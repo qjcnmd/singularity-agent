@@ -117,7 +117,6 @@ pub struct ProviderAttemptMetadata {
     #[schemars(skip)]
     pub occurrences: Vec<ProviderAttemptOccurrence>,
 }
-
 impl ProviderAttemptMetadata {
     pub(crate) fn zero() -> Self {
         Self {
@@ -129,17 +128,15 @@ impl ProviderAttemptMetadata {
     }
 }
 
-pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
-
 /// Build the stable unsupported result used by Chat, Declared, and legacy providers.
-pub fn provider_streaming_unsupported_error() -> crate::error::ProviderError {
+pub(crate) fn provider_streaming_unsupported_error() -> crate::error::ProviderError {
     crate::error::ProviderError::from_model_error(
         crate::error::ModelError::new(
             crate::error::ModelErrorKind::UnsupportedCapability,
             "provider streaming is unsupported for this protocol",
         )
         .with_provider_diagnostic(
-            PROVIDER_STREAMING_UNSUPPORTED_CODE,
+            crate::PROVIDER_STREAMING_UNSUPPORTED_CODE,
             crate::error::ProviderErrorStage::ResponseValidation,
         ),
     )
