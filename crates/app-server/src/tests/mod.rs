@@ -1679,9 +1679,7 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
         "must not emit turn/completed when metadata persistence fails"
     );
     assert!(
-        !events
-            .iter()
-            .any(|value| value["method"] == "turn/error"),
+        !events.iter().any(|value| value["method"] == "turn/error"),
         "must not emit turn/error when metadata persistence fails"
     );
 }
@@ -1718,11 +1716,7 @@ fn agent_failure_metadata_double_failure_emits_no_terminal_event() {
         "must not emit turn/completed when agent failure metadata persistence fails"
     );
     assert!(
-        !events
-            .iter()
-            .any(|value| value["method"] == "turn/error"),
+        !events.iter().any(|value| value["method"] == "turn/error"),
         "must not emit turn/error when agent failure metadata persistence fails"
     );
 }
-
-
