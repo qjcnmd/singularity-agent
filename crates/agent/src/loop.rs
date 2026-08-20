@@ -513,16 +513,15 @@ impl Agent {
             .compaction
             .validate(provider_max_output_tokens)
             .map_err(AgentError::Compaction)?;
-        // 摘要请求与正常请求使用同一模型偏好：不绑定时 max_output_tokens 缺省
-        // 会让摘要按 reserve 推导出超过模型输出上限的 max_tokens（真实链路已被
-        // Provider HTTP 400 拒绝），模型选择也会回落到 provider 默认。
+        // 摘要请求复用 provider/model 选择，但使用独立的摘要输出上限；
+        // 正常 turn 的 max_output_tokens 不应把 8192-token 摘要压缩成 1 token。
         let mut compaction_preferences = ModelPreferences::default();
         if !config.model.is_empty() {
             compaction_preferences.model_name = Some(config.model.clone());
         }
         compaction_preferences.max_output_tokens = Some(effective_max_output_tokens(
             provider.as_ref(),
-            config.max_output_tokens,
+            config.compaction.summary_max_tokens as u64,
         ));
         let compaction = CompactionEngine::new(Arc::clone(&provider))
             .with_model_preferences(compaction_preferences)
