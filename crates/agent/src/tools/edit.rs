@@ -6,11 +6,15 @@
 //! - **变更补丁反馈**：修改成功后返回替换统计摘要以及 Unified Diff 格式的补丁文本供模型核对。
 
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Read};
 
 use serde_json::{Value, json};
 
 use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::truncate::format_size;
+
+const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
 
 pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. oldString must match exactly once in the file (unique). If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 
@@ -57,87 +61,268 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         Ok(lease) => lease,
         Err(error) => return error_result(format!("Could not edit file: {path}. {error}")),
     };
-    let content = match fs::read_to_string(&full_path) {
+    if full_path.is_dir() {
+        return error_result(format!("Could not edit file: {path}. Path is not a file."));
+    }
+    let original = match read_bounded_file(&full_path) {
         Ok(content) => content,
         Err(error) => {
             return error_result(format!("Could not edit file: {path}. {error}"));
         }
     };
-    if full_path.is_dir() {
-        return error_result(format!("Could not edit file: {path}. Path is not a file."));
-    }
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }
-    let (bom, text) = strip_bom(&content);
-    let original_ending = detect_line_ending(&text);
-    let normalized = normalize_to_lf(&text);
+    let content = match std::str::from_utf8(&original) {
+        Ok(content) => content,
+        Err(error) => {
+            return error_result(format!("Could not edit file: {path}. {error}"));
+        }
+    };
+    let (bom, text) = strip_bom(content);
+    let normalized = normalize_with_map(text);
     let old_normalized = normalize_to_lf(old_string);
     let new_normalized = normalize_to_lf(new_string);
     if old_normalized.is_empty() {
         return error_result(format!("oldString must not be empty in {path}."));
     }
-    let occurrences = normalized.matches(old_normalized.as_str()).count();
-    if occurrences == 0 {
+    let mut matches = normalized.text.match_indices(old_normalized.as_ref());
+    let Some((match_start, match_end)) = matches
+        .next()
+        .map(|(start, value)| (start, start.saturating_add(value.len())))
+    else {
         return error_result(format!(
             "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
         ));
-    }
-    if occurrences > 1 {
+    };
+    if matches.next().is_some() {
+        let occurrences = 2usize.saturating_add(matches.count());
         return error_result(format!(
             "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
         ));
     }
-    let new_content = normalized.replacen(old_normalized.as_str(), new_normalized.as_str(), 1);
-    if new_content == normalized {
+    let original_start = normalized
+        .boundaries
+        .get(match_start)
+        .copied()
+        .unwrap_or_default();
+    let original_end = normalized
+        .boundaries
+        .get(match_end)
+        .copied()
+        .unwrap_or(text.len());
+    let ending = choose_replacement_ending(text, original_start, original_end);
+    let replacement = restore_line_endings(new_normalized.as_ref(), ending);
+    let bom_bytes = if bom { '\u{FEFF}'.len_utf8() } else { 0 };
+    if original[bom_bytes..].get(original_start..original_end) == Some(replacement.as_bytes()) {
         return error_result(format!(
             "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
         ));
     }
-    let final_content = format!(
-        "{bom}{}",
-        restore_line_endings(&new_content, original_ending)
-    );
-    if let Err(error) = fs::write(&full_path, final_content) {
+    let raw_start = bom_bytes + original_start;
+    let raw_end = bom_bytes + original_end;
+    let projected_len = raw_start
+        .saturating_add(replacement.len())
+        .saturating_add(original.len().saturating_sub(raw_end));
+    if projected_len > MAX_EDIT_BYTES {
+        return error_result(format!(
+            "Could not edit file: projected result exceeds {} limit.",
+            format_size(MAX_EDIT_BYTES)
+        ));
+    }
+    let mut final_content = Vec::with_capacity(projected_len);
+    final_content.extend_from_slice(&original[..raw_start]);
+    final_content.extend_from_slice(replacement.as_bytes());
+    final_content.extend_from_slice(&original[raw_end..]);
+    if let Err(error) = fs::write(&full_path, &final_content) {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
-    let patch = generate_patch(path, &normalized, &new_content);
+    let mut projected_text = String::with_capacity(
+        text.len()
+            .saturating_sub(original_end.saturating_sub(original_start))
+            .saturating_add(new_normalized.len()),
+    );
+    projected_text.push_str(&normalized.text[..match_start]);
+    projected_text.push_str(new_normalized.as_ref());
+    projected_text.push_str(&normalized.text[match_end..]);
+    let patch = generate_patch(path, &normalized.text, &projected_text);
     Ok(ToolExecution {
         content: format!("Successfully replaced 1 block(s) in {path}.\n\n{patch}"),
         is_error: false,
     })
 }
 
-/// 分离 UTF-8 BOM 头，返回 BOM 前缀与文件文本正文。
-fn strip_bom(content: &str) -> (String, String) {
+/// 分离 UTF-8 BOM 头，返回 BOM 标志与文件文本正文。
+fn strip_bom(content: &str) -> (bool, &str) {
     if let Some(text) = content.strip_prefix('\u{FEFF}') {
-        ("\u{FEFF}".to_string(), text.to_string())
+        (true, text)
     } else {
-        (String::new(), content.to_string())
+        (false, content)
     }
 }
 
-/// 检测文件原始换行符风格（以首个出现的换行类型为准）。
-fn detect_line_ending(content: &str) -> &'static str {
-    let crlf = content.find("\r\n");
-    let lf = content.find('\n');
-    match (crlf, lf) {
-        (Some(crlf), Some(lf)) if crlf < lf => "\r\n",
-        _ => "\n",
+fn read_bounded_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_EDIT_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file exceeds {} limit",
+                super::truncate::format_size(MAX_EDIT_BYTES)
+            ),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(MAX_EDIT_BYTES);
+    let mut content = Vec::with_capacity(capacity.min(MAX_EDIT_BYTES));
+    let read = file
+        .by_ref()
+        .take(MAX_EDIT_BYTES as u64 + 1)
+        .read_to_end(&mut content)?;
+    if read > MAX_EDIT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file exceeds {} limit",
+                super::truncate::format_size(MAX_EDIT_BYTES)
+            ),
+        ));
+    }
+    Ok(content)
+}
+
+struct NormalizedText {
+    text: String,
+    /// Each normalized byte boundary maps to the corresponding original byte
+    /// boundary. CRLF therefore maps one normalized byte to two source bytes.
+    boundaries: Vec<usize>,
+}
+
+fn normalize_with_map(text: &str) -> NormalizedText {
+    let mut normalized = String::with_capacity(text.len());
+    let mut boundaries = Vec::with_capacity(text.len().saturating_add(1));
+    boundaries.push(0);
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let original_start = index;
+        if bytes[index] == b'\r' {
+            index += 1;
+            if bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+            normalized.push('\n');
+            boundaries.push(index);
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("byte index must be a character boundary");
+        index += character.len_utf8();
+        normalized.push(character);
+        for offset in 1..=character.len_utf8() {
+            boundaries.push(original_start + offset);
+        }
+    }
+    NormalizedText {
+        text: normalized,
+        boundaries,
     }
 }
 
-/// 将文本中的换行符统一归一化为 LF。
-fn normalize_to_lf(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+/// 将文本中的换行符统一归一化为 LF，避免无意义的副本。
+fn normalize_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    }
 }
 
-/// 按照原始换行风格还原文本中的换行符。
-fn restore_line_endings(text: &str, ending: &str) -> String {
-    if ending == "\r\n" {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_string()
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LineEnding {
+    #[default]
+    Lf,
+    CrLf,
+    Cr,
+}
+
+#[derive(Debug, Default)]
+struct LineEndingCounts {
+    lf: usize,
+    crlf: usize,
+    cr: usize,
+}
+
+impl LineEndingCounts {
+    fn add_assign(&mut self, other: Self) {
+        self.lf = self.lf.saturating_add(other.lf);
+        self.crlf = self.crlf.saturating_add(other.crlf);
+        self.cr = self.cr.saturating_add(other.cr);
+    }
+
+    fn unique(&self) -> Option<LineEnding> {
+        let values = [
+            (LineEnding::Lf, self.lf),
+            (LineEnding::CrLf, self.crlf),
+            (LineEnding::Cr, self.cr),
+        ];
+        let max = values.iter().map(|(_, count)| *count).max().unwrap_or(0);
+        (max > 0 && values.iter().filter(|(_, count)| *count == max).count() == 1)
+            .then(|| values.iter().find(|(_, count)| *count == max).unwrap().0)
+    }
+}
+
+fn count_line_endings(text: &str) -> LineEndingCounts {
+    let bytes = text.as_bytes();
+    let mut counts = LineEndingCounts::default();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                counts.crlf = counts.crlf.saturating_add(1);
+                index += 2;
+            }
+            b'\r' => {
+                counts.cr = counts.cr.saturating_add(1);
+                index += 1;
+            }
+            b'\n' => {
+                counts.lf = counts.lf.saturating_add(1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    counts
+}
+
+fn choose_replacement_ending(text: &str, start: usize, end: usize) -> LineEnding {
+    if let Some(ending) = count_line_endings(&text[start..end]).unique() {
+        return ending;
+    }
+    let left = text[..start]
+        .rfind(['\r', '\n'])
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0);
+    let right = text[end..]
+        .find(['\r', '\n'])
+        .map(|index| end.saturating_add(index).saturating_add(1))
+        .unwrap_or(text.len());
+    let mut adjacent = count_line_endings(&text[left..start]);
+    adjacent.add_assign(count_line_endings(&text[end..right]));
+    if let Some(ending) = adjacent.unique() {
+        return ending;
+    }
+    count_line_endings(text).unique().unwrap_or_default()
+}
+
+fn restore_line_endings(text: &str, ending: LineEnding) -> String {
+    match ending {
+        LineEnding::Lf => text.to_string(),
+        LineEnding::CrLf => text.replace('\n', "\r\n"),
+        LineEnding::Cr => text.replace('\n', "\r"),
     }
 }
 
@@ -283,5 +468,142 @@ mod tests {
             fs::read_to_string(dir.path().join("sample.txt")).expect("read back"),
             "a\r\nB\r\nc"
         );
+    }
+
+    #[test]
+    fn exact_twenty_mib_input_and_result_are_accepted() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("limit.txt");
+        let content = format!("{}END", "a".repeat(MAX_EDIT_BYTES - 3));
+        assert_eq!(content.len(), MAX_EDIT_BYTES);
+        fs::write(&path, &content).expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "limit.txt", "oldString": "END", "newString": "XYZ" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").len(),
+            MAX_EDIT_BYTES as u64
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .expect("read back")
+                .ends_with("XYZ")
+        );
+    }
+
+    #[test]
+    fn input_over_twenty_mib_is_rejected_before_edit() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("over-limit.txt");
+        let content = "a".repeat(MAX_EDIT_BYTES + 1);
+        fs::write(&path, &content).expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "over-limit.txt", "oldString": "a", "newString": "b" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("exceeds 20.0MB limit"),
+            "content: {}",
+            result.content
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").len(),
+            (MAX_EDIT_BYTES + 1) as u64
+        );
+    }
+
+    #[test]
+    fn projected_result_over_twenty_mib_is_rejected_before_write() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("projected-limit.txt");
+        let content = format!("{}END", "a".repeat(MAX_EDIT_BYTES - 3));
+        fs::write(&path, &content).expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "projected-limit.txt", "oldString": "END", "newString": "ENDS" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("projected result exceeds"),
+            "content: {}",
+            result.content
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read back"), content);
+    }
+
+    #[test]
+    fn mixed_newlines_preserve_untouched_bytes_and_choose_adjacent_style() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("mixed.txt");
+        let original = b"\xEF\xBB\xBFa\r\nb\nc\r\nd";
+        fs::write(&path, original).expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "mixed.txt", "oldString": "b", "newString": "B\nX" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert_eq!(
+            fs::read(&path).expect("read back"),
+            b"\xEF\xBB\xBFa\r\nB\nX\nc\r\nd"
+        );
+    }
+
+    #[test]
+    fn replacement_region_style_wins_over_adjacent_style() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("region-ending.txt");
+        fs::write(&path, b"a\r\nb\r\nc\n").expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "region-ending.txt", "oldString": "b\r\n", "newString": "B\nX\n" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert_eq!(fs::read(&path).expect("read back"), b"a\r\nB\r\nX\r\nc\n");
+    }
+
+    #[test]
+    fn tied_region_and_file_newlines_fall_back_to_lf() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tie-ending.txt");
+        fs::write(&path, b"a\r\nb\n").expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "tie-ending.txt", "oldString": "a\r\nb\n", "newString": "x\ny" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert_eq!(fs::read(&path).expect("read back"), b"x\ny");
     }
 }
