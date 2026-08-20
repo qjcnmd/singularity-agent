@@ -758,6 +758,11 @@ impl AppServer {
         let Some(reference) = references.get(&params.turn_id).cloned() else {
             return not_found_response(message.required_id(), TURN_NOT_FOUND);
         };
+        // Do not hold turn_threads while acquiring an injection handle. The
+        // active-turn guard removes handles before it removes this reference;
+        // releasing this read lock first prevents a terminal cleanup/control
+        // injection lock cycle.
+        drop(references);
         let handles = if follow_up {
             &self.follow_up_handles
         } else {
