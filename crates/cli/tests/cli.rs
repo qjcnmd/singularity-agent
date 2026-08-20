@@ -1197,6 +1197,67 @@ fn cli_continue_resumes_thread_and_does_not_upload_history() {
     assert_eq!(params["input"][0]["text"], "continue safely");
     assert!(params.get("history").is_none());
 }
+
+// 验证 continue 同时支持模型选择与 JSON 终态投影，并把选择写入 thread/settings。
+#[test]
+fn cli_continue_forwards_model_and_projects_json_result() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let params_path = temp.path().join("thread-settings-params.json");
+    let thread = fake_thread("thread_continue_json");
+    let turn = fake_turn(
+        "turn_continue_json",
+        "thread_continue_json",
+        "completed",
+        "completed",
+    );
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond("thread/resume", json!({"thread": thread}))
+            .interaction(
+                "thread/settings",
+                vec![
+                    capture_params(&params_path),
+                    respond(json!({
+                        "threadId": "thread_continue_json",
+                        "provider": null,
+                        "model": "gpt-test",
+                        "reasoning": null,
+                        "updated": true
+                    })),
+                ],
+            )
+            .respond("turn/start", json!({"turn": turn}))
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args([
+            "continue",
+            "thread_continue_json",
+            "continue with selected model",
+            "--model",
+            "gpt-test",
+            "--json",
+        ])
+        .output()
+        .expect("continue json cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(params_path).expect("settings params"))
+            .expect("settings params json");
+    assert_eq!(settings["threadId"], "thread_continue_json");
+    assert_eq!(settings["model"], "gpt-test");
+    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json output");
+    assert_eq!(result["thread"]["thread_id"], "thread_continue_json");
+    assert_eq!(result["turn"]["turn_id"], "turn_continue_json");
+    assert_eq!(result["turn"]["agent_loop_status"], "completed");
+}
+
 // 验证无效 thread id 由 app-server 错误原样归因。
 #[test]
 fn cli_continue_rejects_invalid_thread_id_through_app_server() {
