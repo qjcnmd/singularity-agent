@@ -10,6 +10,7 @@ mod events;
 mod lifecycle;
 pub mod paths;
 mod state;
+#[allow(dead_code)]
 mod state_paths;
 
 use std::collections::HashMap;

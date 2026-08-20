@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+mod state_paths;
 mod transport;
 
 // Tokio's stdio adapter owns an OS read that cannot be cancelled; bound runtime teardown after
