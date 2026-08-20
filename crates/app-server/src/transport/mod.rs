@@ -7,6 +7,11 @@
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
 //! 顺序性保证事件与响应天然有序，无需全局排序或 cursor/gap 机制。
 
+pub(crate) mod error;
+pub(crate) mod framing;
+pub(crate) mod output;
+pub(crate) mod supervisor;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

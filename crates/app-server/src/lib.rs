@@ -9,6 +9,7 @@ mod dispatch;
 mod events;
 mod lifecycle;
 pub mod paths;
+mod state_paths;
 mod state;
 
 use std::collections::HashMap;
