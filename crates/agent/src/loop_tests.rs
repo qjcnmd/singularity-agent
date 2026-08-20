@@ -1813,7 +1813,7 @@ fn tiny_context_window_triggers_compaction() {
     );
 }
 
-/// 7b. compaction 摘要请求必须继承有效输出上限：不绑定时会按 reserve
+/// 7b. compaction 摘要请求必须继承有效输出上限：不绑定时会按默认策略
 ///     派生超过模型 max_output_tokens 的请求（真实链路被 Provider 400 拒绝）。
 #[test]
 fn compaction_summarization_respects_model_output_limit() {

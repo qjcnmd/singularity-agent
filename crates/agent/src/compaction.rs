@@ -5,7 +5,7 @@
 //!
 //! 核心流程：
 //! 1. **触发判定**（`should_compact`）：依据当前 Token 数、模型上下文窗口与保留缓冲区预算判定是否触发。
-//! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
+//! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `retain_ratio` 预算内的最新消息；
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。

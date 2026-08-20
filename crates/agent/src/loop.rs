@@ -850,8 +850,8 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     ///
-    /// overflow 时不能保留正常 20000-token 近期窗口；强制路径把 keep/recent
-    /// reserve 都压到 0，只保留绝对必要的最近安全边界（toolResult 永不切）。
+    /// overflow 时不能保留正常近期窗口；强制路径把 retain ratio 压到 0，
+    /// 只保留绝对必要的最近安全边界（toolResult 永不切）。
     fn force_compact(
         &mut self,
         cancellation: &CancellationToken,
@@ -1129,6 +1129,7 @@ impl Agent {
                 return Err(AgentError::Session(error));
             }
             Err(_error) => {
+                outcome.usage_complete = false;
                 emit_diagnostic(
                     events,
                     AgentDiagnostic::warning(
