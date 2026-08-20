@@ -237,6 +237,78 @@ struct CompactionFailureProvider {
     fail_summary_once: std::sync::atomic::AtomicUsize,
 }
 
+struct LengthTruncatingProvider {
+    inner: FakeProvider,
+    truncate_first: std::sync::atomic::AtomicUsize,
+}
+
+impl LengthTruncatingProvider {
+    fn new(steps: Vec<FakeStep>) -> Self {
+        Self {
+            inner: FakeProvider::new(fake_contract(), steps),
+            truncate_first: std::sync::atomic::AtomicUsize::new(1),
+        }
+    }
+}
+
+impl Provider for LengthTruncatingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.inner.protocol_contract()
+    }
+
+    fn streaming_capability(
+        &self,
+        selected_protocol: singularity_model::ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        self.inner.streaming_capability(selected_protocol)
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let mut response = self
+            .inner
+            .complete_stream(request, cancellation, on_event)?;
+        if self
+            .truncate_first
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            response.finish_reason = Some("length".to_string());
+        }
+        Ok(response)
+    }
+
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let _ = on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            operation_phase: ProviderAttemptOperationPhase::Completion,
+            provider_name: "fake".to_string(),
+            model_name: "fake-model".to_string(),
+            actual_api_protocol: ProviderApiProtocol::Declared,
+            attempt_index: 1,
+            started_at_unix_ms: 1,
+        }));
+        self.complete_stream(request, cancellation, on_event)
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        self.inner.complete(request, cancellation)
+    }
+}
+
 impl CompactionFailureProvider {
     fn new(steps: Vec<FakeStep>) -> Self {
         Self {
@@ -807,6 +879,53 @@ fn turn_inbox_stop_barrier_has_no_accepted_but_lost_state() {
     assert_eq!(pending[0].text, "steer after handoff");
     assert!(inbox.take_at_stop().is_none());
     assert!(!inbox.enqueue_follow_up("too late"));
+}
+
+#[test]
+fn length_truncated_tool_calls_are_failed_without_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(LengthTruncatingProvider::new(vec![
+        FakeStep {
+            text: "partial".to_string(),
+            tool_calls: vec![tool_call(
+                "call_1",
+                "write",
+                json!({"path": "out.txt", "content": "should not run"}),
+            )],
+            usage: usage(10, 5),
+        },
+        FakeStep {
+            text: "done".to_string(),
+            tool_calls: Vec::new(),
+            usage: usage(10, 5),
+        },
+    ]));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.turns, 2);
+    assert_eq!(outcome.final_text, "done");
+    let entries = agent.session.entries();
+    let failed_tool_results = entries
+        .iter()
+        .filter_map(|entry| match &entry.entry_type {
+            SessionEntryType::Message(message) if message.role == AgentMessageRole::ToolResult => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failed_tool_results.len(), 1);
+    assert_eq!(failed_tool_results[0].is_error, Some(true));
+    assert!(failed_tool_results[0].content_text().contains("truncated"));
 }
 
 /// 非瞬时类（挂起超时、账户限额、校验失败）不重试，直接失败。

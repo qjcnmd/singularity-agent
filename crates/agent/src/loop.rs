@@ -700,6 +700,40 @@ impl Agent {
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
                 let tool_calls = response.tool_calls.clone();
+                let length_truncated = response.finish_reason.as_deref() == Some("length");
+                if length_truncated && !tool_calls.is_empty() {
+                    // A length-truncated response may contain only partially
+                    // parsed tool calls. Persist the assistant turn and a
+                    // model-visible failure for each call, but never execute
+                    // those calls or surface them as successful tool events.
+                    if let Err(error) = self
+                        .session
+                        .append_message(assistant_response_message(&response))
+                    {
+                        return self.fail_after_progress(AgentError::Session(error), outcome);
+                    }
+                    for call in &tool_calls {
+                        if let Err(error) = self.session.append_message(tool_result_message(
+                            &call.tool_call_id,
+                            &call.tool_name,
+                            &tool_error_execution(
+                                "model output was truncated before the tool call completed",
+                            ),
+                        )) {
+                            return self.fail_after_progress(AgentError::Session(error), outcome);
+                        }
+                    }
+                    outcome.final_text = assistant_text;
+                    if let Err(error) = self.maybe_compact(
+                        &mut outcome,
+                        Some(&response.usage),
+                        cancellation,
+                        events,
+                    ) {
+                        return self.fail_after_progress(error, outcome);
+                    }
+                    continue;
+                }
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
                     if let Err(error) = self
