@@ -496,6 +496,8 @@ pub struct SessionManager {
 /// length; header bytes provide an additional compatibility guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionFileState {
+    /// Byte offset after the last validated complete line. Full opens repair
+    /// torn tails before recording this position.
     len: u64,
     identity: (u64, u64),
     modified: Option<SystemTime>,
