@@ -1646,3 +1646,83 @@ fn terminal_event_failure_emits_fallback_error_and_reports_event_stage() {
     );
     assert!(events.iter().any(|value| value["method"] == "turn/error"));
 }
+
+#[test]
+fn terminal_metadata_double_failure_emits_no_terminal_event() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("completed")],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    server.inject_terminalization_faults(3, 0);
+
+    let mut events = Vec::new();
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
+            events.push(value);
+        },
+    );
+    assert!(result.is_ok(), "turn start streaming returns ok");
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/completed"),
+        "must not emit turn/completed when metadata persistence fails"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/error"),
+        "must not emit turn/error when metadata persistence fails"
+    );
+}
+
+#[test]
+fn agent_failure_metadata_double_failure_emits_no_terminal_event() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "5f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![failed_response()],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    server.inject_terminalization_faults(2, 0);
+
+    let mut events = Vec::new();
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
+            events.push(value);
+        },
+    );
+    assert!(result.is_ok(), "turn start streaming returns ok");
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/completed"),
+        "must not emit turn/completed when agent failure metadata persistence fails"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/error"),
+        "must not emit turn/error when agent failure metadata persistence fails"
+    );
+}
+
+

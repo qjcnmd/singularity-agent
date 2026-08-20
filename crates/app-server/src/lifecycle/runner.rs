@@ -273,19 +273,21 @@ impl AppServer {
             // durable terminal metadata is authoritative. If the intended status
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
-            let _ = self.persist_failure_state(
+            let (_metadata_error, durable) = self.persist_failure_state(
                 &record.session_id,
                 &turn_id,
                 &status.model_usage,
                 status.usage_complete,
             );
-            let _ = self.emit_failure_terminal_events(
-                &turn_id,
-                &record.session_id,
-                &mut assistant_events,
-                &failure,
-                &mut emit,
-            );
+            if durable {
+                let _ = self.emit_failure_terminal_events(
+                    &turn_id,
+                    &record.session_id,
+                    &mut assistant_events,
+                    &failure,
+                    &mut emit,
+                );
+            }
             return Ok(());
         }
         // Publication order: durable metadata first, then the in-process usage

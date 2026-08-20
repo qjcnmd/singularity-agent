@@ -133,15 +133,17 @@ impl AppServer {
             _ => (usage, usage_complete),
         };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
-        let (_metadata_error, _durable) =
+        let (_metadata_error, durable) =
             self.persist_failure_state(&record.session_id, turn_id, usage, usage_complete);
-        let _ = self.emit_failure_terminal_events(
-            turn_id,
-            &record.session_id,
-            assistant_events,
-            &failure,
-            emit,
-        );
+        if durable {
+            let _ = self.emit_failure_terminal_events(
+                turn_id,
+                &record.session_id,
+                assistant_events,
+                &failure,
+                emit,
+            );
+        }
         Ok(())
     }
 
