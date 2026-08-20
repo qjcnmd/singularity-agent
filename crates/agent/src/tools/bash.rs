@@ -1294,13 +1294,9 @@ mod tests {
         let token = singularity_core::CancellationToken::new();
         let worker_token = token.clone();
         let cwd = dir.path().to_path_buf();
-        let command = if cfg!(windows) {
-            "ping -n 30 127.0.0.1".to_string()
-        } else {
-            // Keep a descendant alive so the Unix process-group path, rather
-            // than only Child::kill, is exercised.
-            "sleep 30 & wait".to_string()
-        };
+        // Keep a descendant alive so the platform tree-containment path,
+        // rather than only terminating the shell, is exercised.
+        let command = "sleep 30 & wait".to_string();
         let started = Instant::now();
         let worker = thread::spawn(move || {
             ToolRegistry::new().execute(
