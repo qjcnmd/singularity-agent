@@ -1,6 +1,6 @@
 use super::*;
 use crate::session::SessionMetadata;
-use singularity_model::{ModelTurnResponse, ProviderProtocolContract};
+use singularity_model::{ModelTurnResponse, ModelUsage, ProviderProtocolContract};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -83,8 +83,9 @@ fn entries_of(messages: Vec<AgentMessage>) -> Vec<SessionEntry> {
 fn budget(window: u64, keep_recent: u64) -> CompactionBudget {
     CompactionBudget {
         context_window: window,
-        reserve_tokens: DEFAULT_RESERVE_TOKENS,
-        keep_recent_tokens: keep_recent,
+        threshold_ratio: 0.90,
+        retain_ratio: keep_recent as f64 / window as f64,
+        summary_max_tokens: 4_096,
     }
 }
 
@@ -139,19 +140,36 @@ fn mock_engine(texts: Vec<String>) -> (CompactionEngine, MockProvider) {
 fn should_compact_threshold_boundaries() {
     let (engine, _) = mock_engine(vec![]);
     let budget = budget(100_000, 20_000);
-    // 阈值 = 100_000 - 16_384 = 83_616。
+    // 阈值 = 100_000 * 0.90 = 90_000。
     assert!(!engine.should_compact(0, &budget));
-    assert!(!engine.should_compact(83_615, &budget));
-    assert!(!engine.should_compact(83_616, &budget), "等于阈值不触发");
-    assert!(engine.should_compact(83_617, &budget), "超过阈值触发");
+    assert!(!engine.should_compact(89_999, &budget));
+    assert!(!engine.should_compact(90_000, &budget), "等于阈值不触发");
+    assert!(engine.should_compact(90_001, &budget), "超过阈值触发");
     assert!(engine.should_compact(100_000, &budget));
-    // context_window < reserve_tokens：阈值饱和为 0。
+    // ratio 仍按模型窗口计算，不使用绝对 reserve sentinel。
     let tiny = CompactionBudget {
         context_window: 100,
-        reserve_tokens: 16_384,
-        keep_recent_tokens: 20_000,
+        threshold_ratio: 0.90,
+        retain_ratio: 0.20,
+        summary_max_tokens: 4_096,
     };
-    assert!(engine.should_compact(1, &tiny));
+    assert!(!engine.should_compact(1, &tiny));
+}
+
+#[test]
+fn compaction_config_rejects_invalid_ratio_and_output_cap() {
+    let invalid_ratio = CompactionConfig {
+        threshold_ratio: 0.2,
+        retain_ratio: 0.2,
+        summary_max_tokens: 8192,
+    };
+    assert!(invalid_ratio.validate(16_384).is_err());
+    let invalid_cap = CompactionConfig {
+        threshold_ratio: 0.9,
+        retain_ratio: 0.2,
+        summary_max_tokens: 16_385,
+    };
+    assert!(invalid_cap.validate(16_384).is_err());
 }
 
 /// 2. find_cut_point：全量切点、toolResult 跟随、split turn、keep 边界、元数据回扫。
@@ -386,13 +404,15 @@ fn compact_full_flow_and_reopen_slicing() {
     let (mut engine, mock) = mock_engine(vec!["## Goal\nsummary of history".to_string()]);
     let budget = budget(100_000, 4_000);
     let outcome = engine
-        .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+        .compact(&mut session, &budget, 90_001, &CancellationToken::new())
         .unwrap();
     assert_eq!(
         outcome,
         CompactionOutcome::Compacted {
             first_kept_entry_id: id_u1.clone(),
-            tokens_before: 90_000,
+            tokens_before: 90_001,
+            usage: ModelUsage::default(),
+            usage_complete: false,
         }
     );
 
@@ -426,7 +446,7 @@ fn compact_full_flow_and_reopen_slicing() {
     let last: Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
     assert_eq!(last["type"], "compaction");
     assert_eq!(last["firstKeptEntryId"], id_u1);
-    assert_eq!(last["tokensBefore"], 90_000);
+    assert_eq!(last["tokensBefore"], 90_001);
     assert!(last.get("previousSummary").is_none());
     let summary = last["summary"].as_str().unwrap();
     assert!(summary.starts_with("## Goal"));
@@ -462,13 +482,15 @@ fn compact_full_flow_and_reopen_slicing() {
         .unwrap();
     let (mut engine, mock) = mock_engine(vec!["## Goal\nupdated summary".to_string()]);
     let outcome = engine
-        .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+        .compact(&mut session, &budget, 90_001, &CancellationToken::new())
         .unwrap();
     assert_eq!(
         outcome,
         CompactionOutcome::Compacted {
             first_kept_entry_id: id_u2.clone(),
-            tokens_before: 90_000,
+            tokens_before: 90_001,
+            usage: ModelUsage::default(),
+            usage_complete: false,
         }
     );
     let requests = mock.requests();
@@ -529,13 +551,15 @@ fn compact_split_turn_merges_two_summaries() {
     ]);
     let budget = budget(100_000, 2_600);
     let outcome = engine
-        .compact(&mut session, &budget, 90_000, &CancellationToken::new())
+        .compact(&mut session, &budget, 90_001, &CancellationToken::new())
         .unwrap();
     assert_eq!(
         outcome,
         CompactionOutcome::Compacted {
             first_kept_entry_id: id_a1.clone(),
-            tokens_before: 90_000,
+            tokens_before: 90_001,
+            usage: ModelUsage::default(),
+            usage_complete: false,
         }
     );
     let requests = mock.requests();

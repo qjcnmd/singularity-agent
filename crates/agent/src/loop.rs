@@ -5,7 +5,7 @@
 //! - **外层循环**：当模型完成当前阶段工作（返回纯文本且无工具调用）准备收尾时，消费跟进（FollowUp）队列继续执行下一阶段目标。
 //!
 //! 会话状态持久化、上下文压缩、工具注册分发与模型调用分别由
-//! `session.rs`、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
+//! `session/` facade、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -18,16 +18,15 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderError, ProviderProtocolContract,
-    ProviderReasoningReplay, ProviderStreamEvent, ProviderToolReasoningMode, ToolChoiceMode,
-    ToolChoicePolicy, is_strict_tool_schema_compatible,
+    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
+    ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
+    ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::compaction::{
-    CompactionBudget, CompactionEngine, CompactionOutcome, DEFAULT_KEEP_RECENT_TOKENS,
-    DEFAULT_RESERVE_TOKENS,
+    CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, CompactionReason,
 };
 use crate::message::{
     AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message, user_message,
@@ -44,6 +43,39 @@ pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value,
 /// 工具执行结束时的回调签名：接收工具名称、调用 ID 与最终执行结果。
 pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, &ToolExecution);
 
+/// Typed severity for non-fatal runtime diagnostics emitted by the AgentLoop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// A safe, non-persistent diagnostic.  The code is stable for projections;
+/// message text is intentionally kept free of raw provider payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDiagnostic {
+    pub severity: AgentDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+impl AgentDiagnostic {
+    pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: AgentDiagnosticSeverity::Warning,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Provider-attempt observer.  The callback is deliberately non-vetoing: its
+/// return value is ignored by the AgentLoop and cannot turn a provider success
+/// into a transport failure.
+pub type ProviderAttemptCallback<'a> = &'a mut dyn FnMut(ProviderAttemptEvent);
+pub type AgentDiagnosticCallback<'a> = &'a mut dyn FnMut(&AgentDiagnostic);
+
 /// Agent 运行生命周期事件监听回调集合。
 pub struct AgentEvents<'a> {
     /// 模型流式文本输出增量更新。
@@ -54,6 +86,10 @@ pub struct AgentEvents<'a> {
     pub on_tool_execution_update: Option<ToolExecutionUpdateCallback<'a>>,
     /// 工具执行完成事件。
     pub on_tool_execution_end: Option<ToolExecutionEndCallback<'a>>,
+    /// 非致命、脱敏 Agent 诊断；不会写入 Session JSONL。
+    pub on_diagnostic: Option<AgentDiagnosticCallback<'a>>,
+    /// provider HTTP attempt 生命周期观测；回调不能否决 provider 结果。
+    pub on_provider_attempt: Option<ProviderAttemptCallback<'a>>,
 }
 
 impl<'a> AgentEvents<'a> {
@@ -63,6 +99,8 @@ impl<'a> AgentEvents<'a> {
             on_tool_execution_start: None,
             on_tool_execution_update: None,
             on_tool_execution_end: None,
+            on_diagnostic: None,
+            on_provider_attempt: None,
         }
     }
 }
@@ -83,6 +121,7 @@ pub struct AgentConfig {
     /// 模型静态声明的 context window（compaction 触发预算依据）。
     pub context_window: u64,
     pub max_output_tokens: u64,
+    pub compaction: CompactionConfig,
 }
 
 impl Default for AgentConfig {
@@ -92,6 +131,7 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             context_window: 128_000,
             max_output_tokens: 4_096,
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -109,9 +149,26 @@ pub enum AgentError {
     Compaction(#[from] crate::compaction::CompactionError),
     #[error("agent loop error: {0}")]
     Loop(String),
+    /// A provider/session failure after the run has already accumulated
+    /// durable facts.  The inner error remains the authoritative cause while
+    /// `outcome` carries the lower-bound turns/usage observed before it.
+    #[error("agent run failed after partial progress: {error}")]
+    RunFailed {
+        error: Box<AgentError>,
+        outcome: AgentOutcome,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
+
+/// Agent 的终止原因。错误细节继续由 `AgentError` 携带，避免在 outcome 中
+/// 复制第二套错误事实源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTerminalReason {
+    Completed,
+    Aborted,
+    Failed,
+}
 
 /// 一次 `run` 的最终结果。
 #[derive(Debug, Clone, PartialEq)]
@@ -122,13 +179,113 @@ pub struct AgentOutcome {
     /// 各轮 provider 调用的聚合 usage。
     pub usage: ModelUsage,
     pub compacted: bool,
-    /// 因外部取消而提前终止时为 true。
-    pub aborted: bool,
+    /// `true` 表示每个已发出的 provider 请求都带有可确认的 usage；
+    /// 取消/失败时未知的末次请求保持 `false`，不得估算成精确值。
+    pub usage_complete: bool,
+    pub terminal_reason: AgentTerminalReason,
+    /// Aggregated terminal provider-attempt telemetry, when the provider
+    /// exposed it. Detailed occurrences are runtime-only and never persisted
+    /// in Session JSONL.
+    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
 }
 
-/// steer 注入的线程安全句柄：`Agent::steer_handle` 的返回类型，供进程边界
-/// （app-server turn/input）在 `run` 期间向队列注入消息；`run` 每轮开始时 drain。
-pub type SteerHandle = Arc<Mutex<VecDeque<String>>>;
+/// turn 输入的类别；两个类别共享同一个原子 inbox。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnInputKind {
+    Steer,
+    FollowUp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnInput {
+    kind: TurnInputKind,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnInboxState {
+    Open,
+    Closed,
+}
+
+impl Default for TurnInboxState {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// 活动 turn 的单一输入箱。
+///
+/// `enqueue_*`、`drain_steer` 与 `take_at_stop` 都在调用方持有的同一把
+/// Mutex 内运行。自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出
+/// 并继续执行；只有箱为空时才原子地转为 Closed，之后的输入明确拒绝。
+/// 这保证不存在“已接受但丢失”的中间状态，也不引入持久队列或 grace period。
+#[derive(Debug, Default)]
+pub struct TurnInbox {
+    state: TurnInboxState,
+    entries: VecDeque<TurnInput>,
+}
+
+impl TurnInbox {
+    pub fn enqueue(&mut self, kind: TurnInputKind, text: impl Into<String>) -> bool {
+        if self.state == TurnInboxState::Closed {
+            return false;
+        }
+        self.entries.push_back(TurnInput {
+            kind,
+            text: text.into(),
+        });
+        true
+    }
+
+    pub fn enqueue_steer(&mut self, text: impl Into<String>) -> bool {
+        self.enqueue(TurnInputKind::Steer, text)
+    }
+
+    pub fn enqueue_follow_up(&mut self, text: impl Into<String>) -> bool {
+        self.enqueue(TurnInputKind::FollowUp, text)
+    }
+
+    /// Compatibility helper for existing direct-handle callers: a raw push is
+    /// a steer input. New protocol paths should call `enqueue_follow_up` when
+    /// they need follow-up semantics.
+    pub fn push_back(&mut self, text: String) -> bool {
+        self.enqueue_steer(text)
+    }
+
+    fn drain_steer(&mut self) -> Vec<String> {
+        let mut steer = Vec::new();
+        let mut retained = VecDeque::new();
+        while let Some(input) = self.entries.pop_front() {
+            if input.kind == TurnInputKind::Steer {
+                steer.push(input.text);
+            } else {
+                retained.push_back(input);
+            }
+        }
+        self.entries = retained;
+        steer
+    }
+
+    /// Atomic natural-stop barrier.  A non-empty box remains open and hands
+    /// all accepted inputs to the next loop; an empty box closes permanently.
+    fn take_at_stop(&mut self) -> Option<Vec<TurnInput>> {
+        if self.entries.is_empty() {
+            self.state = TurnInboxState::Closed;
+            None
+        } else {
+            Some(self.entries.drain(..).collect())
+        }
+    }
+
+    fn close(&mut self) {
+        self.state = TurnInboxState::Closed;
+    }
+}
+
+/// steer/follow-up 共用的线程安全句柄。
+pub type SteerHandle = Arc<Mutex<TurnInbox>>;
+pub type TurnInboxHandle = SteerHandle;
 
 struct PreparedToolCall {
     call: singularity_model::ModelToolCall,
@@ -331,10 +488,8 @@ pub struct Agent {
     registry: ToolRegistry,
     provider: Arc<dyn Provider + Send + Sync>,
     config: AgentConfig,
-    /// 转向队列：下一轮（工具执行后交付）注入，内存态不持久化。
-    steer_queue: SteerHandle,
-    /// 跟进队列：代理将要停止时注入，内存态不持久化。
-    follow_up_queue: SteerHandle,
+    /// steer/follow-up 共用的活动 turn 输入箱；内存态不持久化。
+    inbox: TurnInboxHandle,
 }
 
 impl Agent {
@@ -344,6 +499,20 @@ impl Agent {
         config: AgentConfig,
         session: SessionManager,
     ) -> Result<Self> {
+        let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
+        let mut config = config;
+        // The documented default is 8192, but a provider with a smaller
+        // declared output limit may safely clamp that implicit default. An
+        // explicit non-default cap remains fail-closed below.
+        if config.compaction == CompactionConfig::default()
+            && provider_max_output_tokens < config.compaction.summary_max_tokens
+        {
+            config.compaction.summary_max_tokens = provider_max_output_tokens;
+        }
+        config
+            .compaction
+            .validate(provider_max_output_tokens)
+            .map_err(AgentError::Compaction)?;
         // 摘要请求与正常请求使用同一模型偏好：不绑定时 max_output_tokens 缺省
         // 会让摘要按 reserve 推导出超过模型输出上限的 max_tokens（真实链路已被
         // Provider HTTP 400 拒绝），模型选择也会回落到 provider 默认。
@@ -356,42 +525,42 @@ impl Agent {
             config.max_output_tokens,
         ));
         let compaction = CompactionEngine::new(Arc::clone(&provider))
-            .with_model_preferences(compaction_preferences);
+            .with_model_preferences(compaction_preferences)
+            .with_summary_max_tokens(config.compaction.summary_max_tokens);
         Ok(Self {
             session,
             compaction,
             registry,
             provider,
             config,
-            steer_queue: Arc::new(Mutex::new(VecDeque::new())),
-            follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
+            inbox: Arc::new(Mutex::new(TurnInbox::default())),
         })
     }
 
     /// 返回 steer 队列的线程安全句柄；`run` 每轮开始时 drain 队列内容。
     pub fn steer_handle(&self) -> SteerHandle {
-        Arc::clone(&self.steer_queue)
+        Arc::clone(&self.inbox)
     }
 
     /// 返回 follow-up 队列的线程安全句柄；`run` 在代理准备停止时 drain。
     pub fn follow_up_handle(&self) -> SteerHandle {
-        Arc::clone(&self.follow_up_queue)
+        Arc::clone(&self.inbox)
     }
 
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
-    pub fn steer(&mut self, text: &str) {
-        lock_queue(&self.steer_queue).push_back(text.to_string());
+    pub fn steer(&mut self, text: &str) -> bool {
+        lock_inbox(&self.inbox).enqueue_steer(text.to_string())
     }
 
     /// 注入跟进：代理将要停止（无工具调用且文本非空）时继续一轮再停止。
-    pub fn follow_up(&mut self, text: &str) {
-        lock_queue(&self.follow_up_queue).push_back(text.to_string());
+    pub fn follow_up(&mut self, text: &str) -> bool {
+        lock_inbox(&self.inbox).enqueue_follow_up(text.to_string())
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用与
     /// steer，外层循环消费 follow-up；停止后返回聚合结果。
     ///
-    /// `cancellation` 取消时终止并返回已完成文本（`aborted=true`，不视为错误）。
+    /// `cancellation` 取消时终止并返回已完成文本（`terminal_reason=Aborted`，不视为错误）。
     pub fn run(
         &mut self,
         input: &str,
@@ -403,7 +572,9 @@ impl Agent {
             turns: 0,
             usage: ModelUsage::default(),
             compacted: false,
-            aborted: false,
+            usage_complete: true,
+            terminal_reason: AgentTerminalReason::Completed,
+            provider_attempt_metadata: None,
         };
         // 显式上下文溢出每轮只允许一次强制压缩重试（N3：循环层不再做整轮瞬时重试）。
         let mut context_overflow_retried = false;
@@ -440,43 +611,79 @@ impl Agent {
             // 内层循环：工具调用与 steer 注入。
             loop {
                 if cancellation.is_cancelled() {
-                    outcome.aborted = true;
+                    outcome.terminal_reason = AgentTerminalReason::Aborted;
+                    outcome.usage_complete = false;
+                    lock_inbox(&self.inbox).close();
                     return Ok(outcome);
                 }
                 // 注入 steer 队列全部消息（作为 user 消息追加到本轮上下文）。
-                let steer_messages = std::mem::take(&mut *lock_queue(&self.steer_queue));
+                let steer_messages = lock_inbox(&self.inbox).drain_steer();
                 for text in steer_messages {
-                    self.session.append_message(user_message(&text))?;
+                    if let Err(error) = self.session.append_message(user_message(&text)) {
+                        return self.fail_after_progress(AgentError::Session(error), outcome);
+                    }
                 }
-                self.compact_before_request(
+                let preflight_compaction = match self.compact_before_request(
                     &capabilities,
                     &tools,
                     max_output_tokens,
                     cancellation,
-                )?;
-                let request = self.build_request(
+                    events,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => return self.fail_after_progress(error, outcome),
+                };
+                record_compaction(&mut outcome, &preflight_compaction);
+                let request = match self.build_request(
                     &preferences,
                     &capabilities,
                     &tools,
                     &tool_choice,
                     max_output_tokens,
                     outcome.turns,
-                )?;
-                let response = match self.stream_completion(&request, events, cancellation) {
+                ) {
+                    Ok(request) => request,
+                    Err(error) => return self.fail_after_progress(error, outcome),
+                };
+                let model_turn_ordinal = outcome.turns.saturating_add(1);
+                let response = match self.stream_completion(
+                    &request,
+                    events,
+                    cancellation,
+                    model_turn_ordinal,
+                ) {
                     Ok(response) => response,
                     Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
+                        record_provider_attempts(&mut outcome, &error, model_turn_ordinal);
+                        // The rejected request has no complete usage record;
+                        // later successful turns cannot make this aggregate
+                        // exact again.
+                        outcome.usage_complete = false;
+                        let original_error = AgentError::Provider(error);
                         if context_overflow_retried {
-                            return Err(AgentError::Provider(error));
+                            return self.fail_after_progress(original_error, outcome);
                         }
                         context_overflow_retried = true;
                         // 强制压缩失败时向上传播原始上下文溢出错误，保留真实失败根因。
-                        if self.force_compact(cancellation).is_err() {
-                            return Err(AgentError::Provider(error));
-                        }
+                        let forced = match self.force_compact(cancellation, events) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                return self.fail_after_progress(original_error, outcome);
+                            }
+                        };
+                        record_compaction(&mut outcome, &forced);
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        record_error_attempts(&mut outcome, &error, model_turn_ordinal);
+                        return self.fail_after_progress(error, outcome);
+                    }
                 };
+                record_response_attempts(
+                    &mut outcome,
+                    response.provider_attempt_metadata.as_ref(),
+                    model_turn_ordinal,
+                );
                 // 非 Success 响应（如校验失败 Invalid 等）：强类型向上传播，不在此层盲目重试。
                 if response.status != ModelTurnStatus::Success {
                     let model_error = response.error.clone().unwrap_or_else(|| {
@@ -485,13 +692,14 @@ impl Agent {
                             "unknown provider error",
                         )
                     });
-                    return Err(AgentError::Provider(ProviderError::from_model_error(
-                        model_error,
-                    )));
+                    return self.fail_after_progress(
+                        AgentError::Provider(ProviderError::from_model_error(model_error)),
+                        outcome,
+                    );
                 }
                 outcome.turns += 1;
                 context_overflow_retried = false;
-                aggregate_usage(&mut outcome.usage, &response.usage);
+                record_usage(&mut outcome, &response.usage);
                 let assistant_text = response
                     .assistant_message
                     .as_ref()
@@ -500,8 +708,12 @@ impl Agent {
                 let tool_calls = response.tool_calls.clone();
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
-                    self.session
-                        .append_message(assistant_response_message(&response))?;
+                    if let Err(error) = self
+                        .session
+                        .append_message(assistant_response_message(&response))
+                    {
+                        return self.fail_after_progress(AgentError::Session(error), outcome);
+                    }
                     // 查找、参数校验和执行模式判定先按 source order 完成；
                     // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
                     let prepared_calls = tool_calls
@@ -536,37 +748,53 @@ impl Agent {
                     // Durable toolResult entries are always appended in assistant source order,
                     // regardless of completion/event order.
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
-                        self.session.append_message(tool_result_message(
+                        if let Err(error) = self.session.append_message(tool_result_message(
                             &call.tool_call_id,
                             &call.tool_name,
                             execution,
-                        ))?;
+                        )) {
+                            return self.fail_after_progress(AgentError::Session(error), outcome);
+                        }
                     }
                     if cancellation.is_cancelled() {
-                        outcome.aborted = true;
+                        outcome.terminal_reason = AgentTerminalReason::Aborted;
+                        outcome.usage_complete = false;
+                        lock_inbox(&self.inbox).close();
                         return Ok(outcome);
                     }
-                    self.maybe_compact(
-                        &mut outcome.compacted,
+                    if let Err(error) = self.maybe_compact(
+                        &mut outcome,
                         Some(&response.usage),
                         cancellation,
-                    )?;
+                        events,
+                    ) {
+                        return self.fail_after_progress(error, outcome);
+                    }
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
-                self.session
-                    .append_message(assistant_response_message(&response))?;
+                if let Err(error) = self
+                    .session
+                    .append_message(assistant_response_message(&response))
+                {
+                    return self.fail_after_progress(AgentError::Session(error), outcome);
+                }
                 outcome.final_text = assistant_text;
-                self.maybe_compact(&mut outcome.compacted, Some(&response.usage), cancellation)?;
+                if let Err(error) =
+                    self.maybe_compact(&mut outcome, Some(&response.usage), cancellation, events)
+                {
+                    return self.fail_after_progress(error, outcome);
+                }
                 break;
             }
             // 代理将要停止：消费 follow-up 队列后回到内层循环。
-            let follow_ups = std::mem::take(&mut *lock_queue(&self.follow_up_queue));
-            if follow_ups.is_empty() {
+            let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
-            }
-            for text in follow_ups {
-                self.session.append_message(user_message(&text))?;
+            };
+            for input in pending_inputs {
+                if let Err(error) = self.session.append_message(user_message(&input.text)) {
+                    return self.fail_after_progress(AgentError::Session(error), outcome);
+                }
             }
         }
     }
@@ -579,19 +807,37 @@ impl Agent {
         tools: &[ModelToolSchema],
         max_output_tokens: u32,
         cancellation: &CancellationToken,
-    ) -> Result<()> {
+        events: &mut AgentEvents,
+    ) -> Result<CompactionOutcome> {
         let estimated = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
         if estimated <= self.config.context_window {
-            return Ok(());
+            return Ok(CompactionOutcome::NotNeeded);
         }
-        let budget = CompactionBudget {
-            context_window: self.config.context_window,
-            reserve_tokens: DEFAULT_RESERVE_TOKENS,
-            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
-        };
+        let budget =
+            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let context_tokens = self.estimate_context_tokens(None)?;
-        self.compaction
-            .compact(&mut self.session, &budget, context_tokens, cancellation)?;
+        let result = match self.compaction.compact_with_reason(
+            &mut self.session,
+            &budget,
+            context_tokens,
+            CompactionReason::ContextOverflow,
+            cancellation,
+        ) {
+            Ok(result) => result,
+            Err(crate::compaction::CompactionError::Session(error)) => {
+                return Err(AgentError::Session(error));
+            }
+            Err(error) => {
+                emit_diagnostic(
+                    events,
+                    AgentDiagnostic::warning(
+                        "compaction_failed",
+                        format!("automatic context compaction failed: {error}"),
+                    ),
+                );
+                return Err(AgentError::Compaction(error));
+            }
+        };
         let after = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
         if after > self.config.context_window {
             return Err(AgentError::Loop(format!(
@@ -599,24 +845,47 @@ impl Agent {
                 self.config.context_window
             )));
         }
-        Ok(())
+        Ok(result)
     }
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     ///
     /// overflow 时不能保留正常 20000-token 近期窗口；强制路径把 keep/recent
     /// reserve 都压到 0，只保留绝对必要的最近安全边界（toolResult 永不切）。
-    fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<()> {
-        let budget = CompactionBudget {
-            context_window: self.config.context_window,
-            reserve_tokens: 0,
-            keep_recent_tokens: 0,
-        };
-        // 强制路径不受 should_compact 的窗口判定限制；usage_or_estimate 传
-        // u64::MAX 使 compact 进入真正的摘要/切点流程。
-        self.compaction
-            .compact(&mut self.session, &budget, u64::MAX, cancellation)?;
-        Ok(())
+    fn force_compact(
+        &mut self,
+        cancellation: &CancellationToken,
+        events: &mut AgentEvents,
+    ) -> Result<CompactionOutcome> {
+        let mut budget =
+            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
+        // Forced overflow recovery is an explicit mode: do not preserve the
+        // normal recent-content ratio when the provider has already rejected
+        // the request for exceeding its context window.
+        budget.retain_ratio = 0.0;
+        let tokens_before = self.estimate_context_tokens(None)?;
+        match self.compaction.compact_with_reason(
+            &mut self.session,
+            &budget,
+            tokens_before,
+            CompactionReason::ContextOverflow,
+            cancellation,
+        ) {
+            Ok(result) => Ok(result),
+            Err(crate::compaction::CompactionError::Session(error)) => {
+                Err(AgentError::Session(error))
+            }
+            Err(error) => {
+                emit_diagnostic(
+                    events,
+                    AgentDiagnostic::warning(
+                        "compaction_failed",
+                        format!("forced context compaction failed: {error}"),
+                    ),
+                );
+                Err(AgentError::Compaction(error))
+            }
+        }
     }
 
     fn estimated_request_tokens(
@@ -790,27 +1059,40 @@ impl Agent {
         request: &ModelTurnRequest,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
     ) -> Result<ModelTurnResponse> {
-        let mut ignore_attempt = |_attempt: singularity_model::ProviderAttemptEvent| true;
+        let on_message_update = &mut events.on_message_update;
+        let on_provider_attempt = &mut events.on_provider_attempt;
         let mut on_stream = |event: ProviderStreamEvent| match event {
             ProviderStreamEvent::OutputTextDelta { delta } => {
-                if let Some(on_update) = events.on_message_update.as_deref_mut() {
+                if let Some(on_update) = on_message_update.as_deref_mut() {
                     on_update(&delta);
                 }
             }
+        };
+        let mut on_attempt = |event: ProviderAttemptEvent| {
+            let event = bind_attempt_ordinal(event, model_turn_ordinal);
+            if let Some(on_attempt) = on_provider_attempt.as_deref_mut() {
+                on_attempt(event);
+            }
+        };
+        let mut observed_attempt = |event: ProviderAttemptEvent| {
+            on_attempt(event);
+            true
         };
         match self.provider.complete_stream_observed(
             request,
             cancellation,
             &mut on_stream,
-            &mut ignore_attempt,
+            &mut observed_attempt,
         ) {
-            Ok(response) => Ok(response),
+            Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
             Err(error)
                 if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
             {
                 self.provider
-                    .complete(request, cancellation)
+                    .complete_observed(request, cancellation, &mut observed_attempt)
+                    .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
                     .map_err(AgentError::Provider)
             }
             Err(error) => {
@@ -827,15 +1109,13 @@ impl Agent {
     /// 若摘要模型调用遭遇瞬时错误，降级记录警告并继续会话，避免中断已完成的执行。
     fn maybe_compact(
         &mut self,
-        compacted: &mut bool,
+        outcome: &mut AgentOutcome,
         last_usage: Option<&ModelUsage>,
         cancellation: &CancellationToken,
+        events: &mut AgentEvents,
     ) -> Result<()> {
-        let budget = CompactionBudget {
-            context_window: self.config.context_window,
-            reserve_tokens: DEFAULT_RESERVE_TOKENS,
-            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
-        };
+        let budget =
+            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let context_tokens = self.estimate_context_tokens(last_usage)?;
         if !self.compaction.should_compact(context_tokens, &budget) {
             return Ok(());
@@ -844,13 +1124,18 @@ impl Agent {
             .compaction
             .compact(&mut self.session, &budget, context_tokens, cancellation)
         {
-            Ok(CompactionOutcome::Compacted { .. }) => *compacted = true,
-            Ok(_) => {}
+            Ok(result) => record_compaction(outcome, &result),
             Err(crate::compaction::CompactionError::Session(error)) => {
                 return Err(AgentError::Session(error));
             }
             Err(error) => {
-                eprintln!("[singularity-agent] compaction skipped: {error}");
+                emit_diagnostic(
+                    events,
+                    AgentDiagnostic::warning(
+                        "compaction_skipped",
+                        format!("automatic context compaction skipped: {error}"),
+                    ),
+                );
             }
         }
         Ok(())
@@ -875,13 +1160,44 @@ impl Agent {
         }
         Ok(usage.total_tokens + trailing)
     }
+
+    fn fail_after_progress(
+        &self,
+        error: AgentError,
+        mut outcome: AgentOutcome,
+    ) -> Result<AgentOutcome> {
+        if is_cancelled_agent_error(&error) {
+            outcome.terminal_reason = AgentTerminalReason::Aborted;
+            outcome.usage_complete = false;
+            lock_inbox(&self.inbox).close();
+            return Ok(outcome);
+        }
+        outcome.terminal_reason = AgentTerminalReason::Failed;
+        outcome.usage_complete = false;
+        lock_inbox(&self.inbox).close();
+        if outcome.turns == 0 {
+            Err(error)
+        } else {
+            Err(AgentError::RunFailed {
+                error: Box::new(error),
+                outcome,
+            })
+        }
+    }
 }
 
-/// 加锁 steer/follow-up 队列；中毒时恢复（工具执行中 panic 不应使注入通道永久不可用）。
-fn lock_queue(queue: &Mutex<VecDeque<String>>) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+/// 加锁活动 turn inbox；中毒时恢复，避免一次工具 panic 使输入通道永久不可用。
+fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
     queue
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn is_cancelled_agent_error(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
+    )
 }
 
 fn is_context_overflow_error(error: &ModelError) -> bool {
@@ -904,13 +1220,112 @@ fn parse_model_selector(selector: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// 逐轮聚合 provider 返回的真实 token/cache usage。
+fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
+    aggregate_usage(&mut outcome.usage, response);
+    if !response.usage_present {
+        outcome.usage_complete = false;
+    }
+}
+
 fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
-    aggregate.input_tokens += response.input_tokens;
-    aggregate.output_tokens += response.output_tokens;
-    aggregate.total_tokens += response.total_tokens;
-    aggregate.cached_input_tokens += response.cached_input_tokens;
-    aggregate.reasoning_tokens += response.reasoning_tokens;
+    aggregate.input_tokens = aggregate.input_tokens.saturating_add(response.input_tokens);
+    aggregate.output_tokens = aggregate
+        .output_tokens
+        .saturating_add(response.output_tokens);
+    aggregate.total_tokens = aggregate.total_tokens.saturating_add(response.total_tokens);
+    aggregate.cached_input_tokens = aggregate
+        .cached_input_tokens
+        .saturating_add(response.cached_input_tokens);
+    aggregate.reasoning_tokens = aggregate
+        .reasoning_tokens
+        .saturating_add(response.reasoning_tokens);
     aggregate.usage_present |= response.usage_present;
+}
+
+fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
+    let CompactionOutcome::Compacted {
+        usage,
+        usage_complete,
+        ..
+    } = result
+    else {
+        return;
+    };
+    outcome.compacted = true;
+    aggregate_usage(&mut outcome.usage, usage);
+    outcome.usage_complete &= *usage_complete;
+}
+
+fn record_response_attempts(
+    outcome: &mut AgentOutcome,
+    metadata: Option<&ProviderAttemptMetadata>,
+    model_turn_ordinal: u32,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    let aggregate = outcome
+        .provider_attempt_metadata
+        .get_or_insert_with(ProviderAttemptMetadata::default);
+    aggregate.attempt_count = aggregate
+        .attempt_count
+        .saturating_add(metadata.attempt_count);
+    aggregate.retry_count = aggregate.retry_count.saturating_add(metadata.retry_count);
+    aggregate.latency_ms = aggregate.latency_ms.saturating_add(metadata.latency_ms);
+    for mut occurrence in metadata.occurrences.clone() {
+        occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+        aggregate.occurrences.push(occurrence);
+    }
+}
+
+fn record_error_attempts(outcome: &mut AgentOutcome, error: &AgentError, model_turn_ordinal: u32) {
+    let AgentError::Provider(provider) = error else {
+        return;
+    };
+    record_provider_attempts(outcome, provider, model_turn_ordinal);
+}
+
+fn record_provider_attempts(
+    outcome: &mut AgentOutcome,
+    provider: &ProviderError,
+    model_turn_ordinal: u32,
+) {
+    record_response_attempts(
+        outcome,
+        provider.provider_attempt_metadata.as_ref(),
+        model_turn_ordinal,
+    );
+}
+
+fn bind_attempt_ordinal(
+    event: ProviderAttemptEvent,
+    model_turn_ordinal: u32,
+) -> ProviderAttemptEvent {
+    match event {
+        ProviderAttemptEvent::Finished(mut occurrence) => {
+            occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+            ProviderAttemptEvent::Finished(occurrence)
+        }
+        other => other,
+    }
+}
+
+fn bind_response_attempt_ordinal(
+    mut response: ModelTurnResponse,
+    model_turn_ordinal: u32,
+) -> ModelTurnResponse {
+    if let Some(metadata) = response.provider_attempt_metadata.as_mut() {
+        for occurrence in &mut metadata.occurrences {
+            occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+        }
+    }
+    response
+}
+
+fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
+    if let Some(callback) = events.on_diagnostic.as_deref_mut() {
+        callback(&diagnostic);
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use singularity_model::{ModelToolCall, ModelToolParseStatus, ProviderStreamingCapability};
+use singularity_model::{
+    ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
+    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderStreamingCapability,
+};
 
 static PARALLEL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static PARALLEL_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -200,6 +203,24 @@ impl Provider for FakeProvider {
         Ok(self.respond(request, &step))
     }
 
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let _ = on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            operation_phase: ProviderAttemptOperationPhase::Completion,
+            provider_name: "fake".to_string(),
+            model_name: "fake-model".to_string(),
+            actual_api_protocol: ProviderApiProtocol::Declared,
+            attempt_index: 1,
+            started_at_unix_ms: 1,
+        }));
+        self.complete_stream(request, cancellation, on_event)
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -208,6 +229,72 @@ impl Provider for FakeProvider {
         self.requests.lock().unwrap().push(request.clone());
         let step = self.pop()?;
         Ok(self.respond(request, &step))
+    }
+}
+
+struct CompactionFailureProvider {
+    inner: FakeProvider,
+    fail_summary_once: std::sync::atomic::AtomicUsize,
+}
+
+impl CompactionFailureProvider {
+    fn new(steps: Vec<FakeStep>) -> Self {
+        Self {
+            inner: FakeProvider::new(fake_contract(), steps),
+            fail_summary_once: std::sync::atomic::AtomicUsize::new(1),
+        }
+    }
+}
+
+impl Provider for CompactionFailureProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.inner.protocol_contract()
+    }
+
+    fn streaming_capability(
+        &self,
+        selected_protocol: singularity_model::ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        self.inner.streaming_capability(selected_protocol)
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        self.inner.complete_stream(request, cancellation, on_event)
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        if self
+            .fail_summary_once
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::Timeout,
+                "summary backend unavailable",
+            )))
+        } else {
+            unreachable!("the scripted provider only uses complete for compaction")
+        }
+    }
+
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        self.inner
+            .complete_stream_observed(request, cancellation, on_event, on_attempt)
     }
 }
 
@@ -388,11 +475,15 @@ impl ErrReturningProvider {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.steps.lock().unwrap().pop_front() {
             Some(Err(error)) => Err(ProviderError::from_model_error(error)),
-            Some(Ok(text)) => Ok(ModelTurnResponse::completed(
-                request.request_id.clone(),
-                format!("ok-{}", Uuid::new_v4().simple()),
-                text,
-            )),
+            Some(Ok(text)) => {
+                let mut response = ModelTurnResponse::completed(
+                    request.request_id.clone(),
+                    format!("ok-{}", Uuid::new_v4().simple()),
+                    text,
+                );
+                response.usage = usage(10, 2);
+                Ok(response)
+            }
             // 脚本耗尽：视作瞬时类网络错误，触发重试直至次数耗尽。
             None => Err(ProviderError::from_model_error(ModelError::new(
                 ModelErrorKind::NetworkError,
@@ -555,6 +646,167 @@ fn non_retryable_err_provider_error_fails_immediately() {
         1,
         "Timeout Err(ProviderError) must not be retried"
     );
+}
+
+#[test]
+fn second_provider_error_returns_accumulated_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![
+            Ok("first".to_string()),
+            Err(ModelError::new(
+                ModelErrorKind::Timeout,
+                "second request failed",
+            )),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    agent.follow_up("continue");
+    let error = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect_err("second provider error must remain a failure");
+    let AgentError::RunFailed { outcome, .. } = error else {
+        panic!("expected accumulated RunFailed outcome, got {error:?}");
+    };
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(outcome.usage.total_tokens, 12);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Failed);
+    assert!(!outcome.usage_complete);
+}
+
+#[test]
+fn second_provider_cancellation_returns_aborted_accumulated_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![
+            Ok("first".to_string()),
+            Err(ModelError::new(ModelErrorKind::Cancelled, "cancelled")),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    agent.follow_up("continue");
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect("typed provider cancellation is a normal aborted outcome");
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(outcome.usage.total_tokens, 12);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
+    assert!(!outcome.usage_complete);
+}
+
+#[test]
+fn provider_attempt_observer_is_non_vetoing_and_optional() {
+    let (mut agent, _dir, _provider) = setup(vec![FakeStep {
+        text: "done".to_string(),
+        tool_calls: Vec::new(),
+        usage: usage(1, 1),
+    }]);
+    let mut seen = 0usize;
+    let mut on_attempt = |_event: ProviderAttemptEvent| seen += 1;
+    let mut events = AgentEvents::new();
+    events.on_provider_attempt = Some(&mut on_attempt);
+    let outcome = agent
+        .run("task", &mut events, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(seen, 1);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Completed);
+    // No callback is also a supported path; provider outcome remains valid.
+    let (mut agent, _dir, _provider) = setup(vec![FakeStep {
+        text: "done".to_string(),
+        tool_calls: Vec::new(),
+        usage: usage(1, 1),
+    }]);
+    agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+}
+
+#[test]
+fn compaction_provider_failure_emits_safe_diagnostic_without_session_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(CompactionFailureProvider::new(vec![
+        FakeStep {
+            text: "x".repeat(100_000),
+            tool_calls: vec![tool_call(
+                "call_1",
+                "write",
+                json!({"path": "out.txt", "content": "x"}),
+            )],
+            usage: usage(19_000, 1_000),
+        },
+        FakeStep {
+            text: "done".to_string(),
+            tool_calls: Vec::new(),
+            usage: usage(1, 1),
+        },
+    ]));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig {
+            context_window: 30_000,
+            max_output_tokens: 1,
+            compaction: CompactionConfig {
+                threshold_ratio: 0.5,
+                summary_max_tokens: 4_096,
+                ..CompactionConfig::default()
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let mut diagnostics = Vec::new();
+    let mut on_diagnostic = |diagnostic: &AgentDiagnostic| diagnostics.push(diagnostic.clone());
+    let mut events = AgentEvents::new();
+    events.on_diagnostic = Some(&mut on_diagnostic);
+    let outcome = agent
+        .run("task", &mut events, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.final_text, "done");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "compaction_skipped");
+    assert_eq!(diagnostics[0].severity, AgentDiagnosticSeverity::Warning);
+    assert!(
+        agent
+            .session
+            .entries()
+            .iter()
+            .all(|entry| !matches!(entry.entry_type, SessionEntryType::Compaction(_)))
+    );
+}
+
+#[test]
+fn turn_inbox_stop_barrier_has_no_accepted_but_lost_state() {
+    let mut inbox = TurnInbox::default();
+    assert!(inbox.enqueue_follow_up("continue"));
+    let pending = inbox
+        .take_at_stop()
+        .expect("pending input keeps inbox open");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, TurnInputKind::FollowUp);
+    assert!(inbox.enqueue_steer("steer after handoff"));
+    let pending = inbox.take_at_stop().expect("new input is still accepted");
+    assert_eq!(pending[0].text, "steer after handoff");
+    assert!(inbox.take_at_stop().is_none());
+    assert!(!inbox.enqueue_follow_up("too late"));
 }
 
 /// 非瞬时类（挂起超时、账户限额、校验失败）不重试，直接失败。
@@ -745,7 +997,7 @@ fn single_text_turn_stops_with_usage() {
     assert_eq!(outcome.usage.output_tokens, 50);
     assert_eq!(outcome.usage.total_tokens, 150);
     assert!(!outcome.compacted);
-    assert!(!outcome.aborted);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Completed);
     assert_eq!(deltas, "hello from model");
     // 请求包含 system prompt（developer 角色）+ user 输入。
     let requests = provider.requests.lock().unwrap();
@@ -1208,7 +1460,7 @@ fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
         .run("cancel", &mut AgentEvents::new(), &cancellation)
         .unwrap();
     cancellation_thread.join().unwrap();
-    assert!(outcome.aborted);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
     let entries = agent.session.build_context_entries().unwrap();
     let tool_results = entries
@@ -1524,6 +1776,11 @@ fn tiny_context_window_triggers_compaction() {
         AgentConfig {
             context_window: 30_000,
             max_output_tokens: 1,
+            compaction: CompactionConfig {
+                threshold_ratio: 0.5,
+                summary_max_tokens: 4_096,
+                ..CompactionConfig::default()
+            },
             ..AgentConfig::default()
         },
         session,
@@ -1585,7 +1842,7 @@ fn compaction_summarization_respects_model_output_limit() {
             FakeStep {
                 text: "## Goal\nsummary".to_string(),
                 tool_calls: Vec::new(),
-                usage: ModelUsage::default(),
+                usage: usage(100, 20),
             },
             FakeStep {
                 text: "done".to_string(),
@@ -1601,6 +1858,11 @@ fn compaction_summarization_respects_model_output_limit() {
             // 配置远大于 fake_contract 的 4096：有效上限必须取两者较小值。
             context_window: 30_000,
             max_output_tokens: 1_000_000,
+            compaction: CompactionConfig {
+                threshold_ratio: 0.5,
+                summary_max_tokens: 4_096,
+                ..CompactionConfig::default()
+            },
             ..AgentConfig::default()
         },
         session,
@@ -1610,6 +1872,8 @@ fn compaction_summarization_respects_model_output_limit() {
         .run("task", &mut AgentEvents::new(), &CancellationToken::new())
         .unwrap();
     assert!(outcome.compacted);
+    assert_eq!(outcome.usage.total_tokens, 20_120);
+    assert!(outcome.usage_complete);
     let requests = provider.requests.lock().unwrap();
     let summarization = requests
         .iter()
@@ -2217,7 +2481,7 @@ fn cancelled_run_returns_aborted_outcome() {
     let outcome = agent
         .run("task", &mut AgentEvents::new(), &cancellation)
         .unwrap();
-    assert!(outcome.aborted);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
     assert_eq!(outcome.turns, 0);
     // 已取消时不发起任何 provider 调用。
     assert!(provider.requests.lock().unwrap().is_empty());
@@ -2261,7 +2525,7 @@ fn cancellation_during_tool_execution_aborts() {
         move |_name: &str, _call_id: &str, _args: &Value| canceller.cancel();
     events.on_tool_execution_start = Some(&mut on_tool_execution_start);
     let outcome = agent.run("go", &mut events, &cancellation).unwrap();
-    assert!(outcome.aborted);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
     assert_eq!(outcome.turns, 1);
     assert_eq!(ended.len(), 1);
     assert_eq!(ended[0].0, "bash");

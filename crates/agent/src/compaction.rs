@@ -18,8 +18,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnStatus, Provider,
-    ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnStatus, ModelUsage,
+    Provider, ProviderError,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,10 +29,12 @@ use crate::session::{
     CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionManager,
 };
 
-/// 默认保留给模型输出与系统指令的缓冲区 Token 数（16384）。
-pub const DEFAULT_RESERVE_TOKENS: u64 = 16384;
-/// 默认从切点向后保留的最近上下文 Token 预算（20000）。
-pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20000;
+/// 默认在上下文窗口 90% 处触发压缩。
+pub const DEFAULT_THRESHOLD_RATIO: f64 = 0.90;
+/// 默认保留上下文窗口 20% 的最近内容。
+pub const DEFAULT_RETAIN_RATIO: f64 = 0.20;
+/// 摘要请求的默认最大输出 token 数。
+pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 /// 生成摘要时单条工具结果序列化的最大字符数截断上限。
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
@@ -134,15 +136,71 @@ Be concise. Focus on what's needed to understand the kept suffix."#;
 /// 会话无历史消息时的占位摘要文本。
 const NO_PRIOR_HISTORY: &str = "No prior history.";
 
-/// 上下文压缩的预算与触发参数配置。
+/// 上下文压缩的用户可配置策略。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    pub threshold_ratio: f64,
+    pub retain_ratio: f64,
+    pub summary_max_tokens: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            threshold_ratio: DEFAULT_THRESHOLD_RATIO,
+            retain_ratio: DEFAULT_RETAIN_RATIO,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+        }
+    }
+}
+
+impl CompactionConfig {
+    pub fn validate(&self, provider_max_output_tokens: u32) -> Result<()> {
+        if !self.threshold_ratio.is_finite()
+            || !self.retain_ratio.is_finite()
+            || !(0.0 < self.retain_ratio
+                && self.retain_ratio < self.threshold_ratio
+                && self.threshold_ratio < 1.0)
+        {
+            return Err(CompactionError::InvalidResponse(
+                "compaction ratios must satisfy 0 < retain_ratio < threshold_ratio < 1".to_string(),
+            ));
+        }
+        if self.summary_max_tokens == 0 || self.summary_max_tokens > provider_max_output_tokens {
+            return Err(CompactionError::InvalidResponse(format!(
+                "summary_max_tokens must be positive and no greater than provider output limit ({provider_max_output_tokens})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// 一次压缩的运行预算（由模型窗口和 ratio 配置计算）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionBudget {
-    /// 模型静态声明的上下文窗口上限（Token 数）。
     pub context_window: u64,
-    /// 预留给模型生成及系统消息的安全缓冲区 Token 数，默认 `DEFAULT_RESERVE_TOKENS`。
-    pub reserve_tokens: u64,
-    /// 从切点向后保留的最新上下文 Token 数，默认 `DEFAULT_KEEP_RECENT_TOKENS`。
-    pub keep_recent_tokens: u64,
+    pub threshold_ratio: f64,
+    pub retain_ratio: f64,
+    pub summary_max_tokens: u32,
+}
+
+impl CompactionBudget {
+    pub fn from_config(context_window: u64, config: &CompactionConfig) -> Self {
+        Self {
+            context_window,
+            threshold_ratio: config.threshold_ratio,
+            retain_ratio: config.retain_ratio,
+            summary_max_tokens: config.summary_max_tokens,
+        }
+    }
+
+    fn threshold_tokens(&self) -> u64 {
+        ((self.context_window as f64) * self.threshold_ratio).floor() as u64
+    }
+
+    fn retain_tokens(&self) -> u64 {
+        ((self.context_window as f64) * self.retain_ratio).floor() as u64
+    }
 }
 
 /// 摘要产物：结构化摘要文本以及跨轮次累积读取与修改的文件列表。
@@ -151,6 +209,8 @@ pub struct CompactionSummary {
     pub text: String,
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
+    pub usage: ModelUsage,
+    pub usage_complete: bool,
 }
 
 /// `compact` 入口的结果。
@@ -161,7 +221,17 @@ pub enum CompactionOutcome {
     Compacted {
         first_kept_entry_id: String,
         tokens_before: u64,
+        usage: ModelUsage,
+        usage_complete: bool,
     },
+}
+
+/// Why a compaction was requested.  `ContextOverflow` bypasses only the
+/// threshold decision; its persisted `tokens_before` remains a real estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionReason {
+    Threshold,
+    ContextOverflow,
 }
 
 /// Compaction 错误。
@@ -193,7 +263,7 @@ struct CutPointResult {
 pub struct CompactionEngine {
     provider: Arc<dyn Provider + Send + Sync>,
     model_preferences: ModelPreferences,
-    reserve_tokens: u64,
+    summary_max_tokens: u32,
 }
 
 impl CompactionEngine {
@@ -202,7 +272,7 @@ impl CompactionEngine {
         Self {
             provider,
             model_preferences: ModelPreferences::default(),
-            reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
         }
     }
 
@@ -212,15 +282,15 @@ impl CompactionEngine {
         self
     }
 
-    /// 绑定摘要生成时预留的安全 Token 预算。
-    pub fn with_reserve_tokens(mut self, reserve_tokens: u64) -> Self {
-        self.reserve_tokens = reserve_tokens;
+    /// 绑定摘要生成的独立输出上限。
+    pub fn with_summary_max_tokens(mut self, summary_max_tokens: u32) -> Self {
+        self.summary_max_tokens = summary_max_tokens;
         self
     }
 
-    /// 判定是否应当触发压缩：当当前上下文 Token 数超过 `context_window - reserve_tokens` 时触发。
+    /// 判定是否应当触发压缩：当前上下文超过窗口的 threshold ratio 时触发。
     pub fn should_compact(&self, context_tokens: u64, budget: &CompactionBudget) -> bool {
-        context_tokens > budget.context_window.saturating_sub(budget.reserve_tokens)
+        context_tokens > budget.threshold_tokens()
     }
 
     /// 在给定的会话条目列表中查找安全切点，返回保留区域起始条目的索引。
@@ -234,7 +304,7 @@ impl CompactionEngine {
             return None;
         }
         Some(
-            self.find_cut_point_in_range(entries, 0, entries.len(), budget.keep_recent_tokens)
+            self.find_cut_point_in_range(entries, 0, entries.len(), budget.retain_tokens())
                 .first_kept_entry_index,
         )
     }
@@ -306,12 +376,13 @@ impl CompactionEngine {
         } else {
             SUMMARIZATION_PROMPT
         });
-        let text =
-            self.complete_summarization(&prompt, 4, 5, "summarization failed", cancellation)?;
+        let result = self.complete_summarization(&prompt, "summarization failed", cancellation)?;
         Ok(CompactionSummary {
-            text,
+            text: result.text,
             read_files: Vec::new(),
             modified_files: Vec::new(),
+            usage: result.usage,
+            usage_complete: result.usage_complete,
         })
     }
 
@@ -323,7 +394,28 @@ impl CompactionEngine {
         usage_or_estimate: u64,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        if !self.should_compact(usage_or_estimate, budget) {
+        self.compact_with_reason(
+            session,
+            budget,
+            usage_or_estimate,
+            CompactionReason::Threshold,
+            cancellation,
+        )
+    }
+
+    /// 执行一次带显式原因的压缩。ContextOverflow 仅绕过阈值判定，调用方
+    /// 仍须传入强制前重建上下文的真实估算值。
+    pub fn compact_with_reason(
+        &mut self,
+        session: &mut SessionManager,
+        budget: &CompactionBudget,
+        tokens_before: u64,
+        reason: CompactionReason,
+        cancellation: &CancellationToken,
+    ) -> Result<CompactionOutcome> {
+        if matches!(reason, CompactionReason::Threshold)
+            && !self.should_compact(tokens_before, budget)
+        {
             return Ok(CompactionOutcome::NotNeeded);
         }
         let entries = session.build_context_entries()?;
@@ -351,7 +443,7 @@ impl CompactionEngine {
             &entries,
             boundary_start,
             entries.len(),
-            budget.keep_recent_tokens,
+            budget.retain_tokens(),
         );
         let history_end = if cut.is_split_turn {
             cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
@@ -384,6 +476,12 @@ impl CompactionEngine {
                     text: comp.summary.clone(),
                     read_files,
                     modified_files,
+                    usage: comp.usage.clone().unwrap_or_default(),
+                    usage_complete: comp
+                        .usage
+                        .as_ref()
+                        .map(|usage| usage.usage_present)
+                        .unwrap_or(false),
                 })
             }
             _ => None,
@@ -406,38 +504,60 @@ impl CompactionEngine {
         }
         let (read_files, modified_files) = compute_file_lists(&file_ops);
 
+        let mut summary_usage = ModelUsage::default();
+        let mut summary_usage_complete = true;
         let mut summary_text = if cut.is_split_turn && !turn_prefix_messages.is_empty() {
             // Split Turn 场景：历史记录与超长轮前缀分别摘要后进行组合。
             let history_text = if messages_to_summarize.is_empty() {
                 NO_PRIOR_HISTORY.to_string()
             } else {
-                self.generate_summary(
+                let summary = self.generate_summary(
                     &self.serialize_conversation(&messages_to_summarize),
                     previous.as_ref(),
                     cancellation,
-                )?
-                .text
+                )?;
+                merge_compaction_usage(
+                    &mut summary_usage,
+                    &mut summary_usage_complete,
+                    &summary.usage,
+                    summary.usage_complete,
+                );
+                summary.text
             };
-            let turn_prefix_text = self.generate_turn_prefix_summary(
+            let prefix = self.generate_turn_prefix_summary(
                 &self.serialize_conversation(&turn_prefix_messages),
                 cancellation,
             )?;
+            merge_compaction_usage(
+                &mut summary_usage,
+                &mut summary_usage_complete,
+                &prefix.usage,
+                prefix.usage_complete,
+            );
+            let turn_prefix_text = prefix.text;
             format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_text}")
         } else {
-            self.generate_summary(
+            let summary = self.generate_summary(
                 &self.serialize_conversation(&messages_to_summarize),
                 previous.as_ref(),
                 cancellation,
-            )?
-            .text
+            )?;
+            merge_compaction_usage(
+                &mut summary_usage,
+                &mut summary_usage_complete,
+                &summary.usage,
+                summary.usage_complete,
+            );
+            summary.text
         };
         summary_text.push_str(&format_file_operations(&read_files, &modified_files));
 
         let entry = CompactionEntry {
             summary: summary_text,
             first_kept_entry_id: Some(first_kept_entry_id.clone()),
-            tokens_before: Some(usage_or_estimate),
+            tokens_before: Some(tokens_before),
             previous_summary: previous.as_ref().map(|summary| summary.text.clone()),
+            usage: summary_usage.usage_present.then_some(summary_usage.clone()),
             details: Some(json!({
                 "readFiles": read_files,
                 "modifiedFiles": modified_files,
@@ -446,7 +566,9 @@ impl CompactionEngine {
         session.append_compaction(entry)?;
         Ok(CompactionOutcome::Compacted {
             first_kept_entry_id,
-            tokens_before: usage_or_estimate,
+            tokens_before,
+            usage: summary_usage,
+            usage_complete: summary_usage_complete,
         })
     }
 
@@ -513,34 +635,45 @@ impl CompactionEngine {
         &self,
         conversation: &str,
         cancellation: &CancellationToken,
-    ) -> Result<String> {
+    ) -> Result<SummaryResponse> {
         let prompt = format!(
             "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
         );
-        self.complete_summarization(
-            &prompt,
-            1,
-            2,
-            "turn prefix summarization failed",
-            cancellation,
-        )
+        self.complete_summarization(&prompt, "turn prefix summarization failed", cancellation)
+    }
+
+    fn summary_max_output_tokens(&self) -> u32 {
+        self.summary_max_tokens
+            .min(self.provider.protocol_contract().max_output_tokens)
+            .min(
+                self.model_preferences
+                    .max_output_tokens
+                    .unwrap_or(self.summary_max_tokens),
+            )
     }
 
     /// 执行摘要模型的具体补全调用，处理安全预算与错误映射。
     fn complete_summarization(
         &self,
         prompt_text: &str,
-        fraction_numerator: u64,
-        fraction_denominator: u64,
         error_prefix: &str,
         cancellation: &CancellationToken,
-    ) -> Result<String> {
-        let from_reserve =
-            self.reserve_tokens.saturating_mul(fraction_numerator) / fraction_denominator;
-        let cap = self.model_preferences.max_output_tokens.unwrap_or(u32::MAX) as u64;
+    ) -> Result<SummaryResponse> {
+        let cap = self.summary_max_output_tokens();
+        let contract = self.provider.protocol_contract();
+        let prompt_tokens = estimate_tokens_of(prompt_text)
+            + estimate_tokens_of(SUMMARIZATION_SYSTEM_PROMPT)
+            + cap as u64;
+        if contract
+            .max_context_tokens
+            .is_some_and(|window| prompt_tokens > window as u64)
+        {
+            return Err(CompactionError::InvalidResponse(format!(
+                "{error_prefix}: summary request exceeds provider context window"
+            )));
+        }
         let mut preferences = self.model_preferences.clone();
-        preferences.max_output_tokens =
-            Some(u32::try_from(from_reserve.min(cap)).unwrap_or(u32::MAX));
+        preferences.max_output_tokens = Some(cap);
         let mut request = ModelTurnRequest::new(
             format!("compaction-{}", Uuid::now_v7()),
             crate::agent::instruction_message(
@@ -566,15 +699,48 @@ impl CompactionEngine {
                 "{error_prefix}: {detail}"
             )));
         }
-        response
+        let usage_complete = response.usage.usage_present;
+        let usage = response.usage.clone();
+        let text = response
             .assistant_message
             .map(|message| message.content)
             .ok_or_else(|| {
                 CompactionError::InvalidResponse(format!(
                     "{error_prefix}: missing assistant message"
                 ))
-            })
+            })?;
+        Ok(SummaryResponse {
+            text,
+            usage,
+            usage_complete,
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SummaryResponse {
+    text: String,
+    usage: ModelUsage,
+    usage_complete: bool,
+}
+
+fn merge_compaction_usage(
+    aggregate: &mut ModelUsage,
+    complete: &mut bool,
+    usage: &ModelUsage,
+    usage_complete: bool,
+) {
+    aggregate.input_tokens = aggregate.input_tokens.saturating_add(usage.input_tokens);
+    aggregate.output_tokens = aggregate.output_tokens.saturating_add(usage.output_tokens);
+    aggregate.total_tokens = aggregate.total_tokens.saturating_add(usage.total_tokens);
+    aggregate.cached_input_tokens = aggregate
+        .cached_input_tokens
+        .saturating_add(usage.cached_input_tokens);
+    aggregate.reasoning_tokens = aggregate
+        .reasoning_tokens
+        .saturating_add(usage.reasoning_tokens);
+    aggregate.usage_present |= usage.usage_present;
+    *complete &= usage_complete;
 }
 
 /// 基于 UTF-16 字符数的启发式 Token 估算函数（`ceil(chars / 4)`）。
