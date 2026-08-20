@@ -50,6 +50,19 @@ where
     })
     .await
     .map_err(|error| format!("app-server startup task failed: {error}"))??;
+    run_server_with_io(server, reader, writer).await
+}
+
+/// 在给定 AppServer 实例和 IO 流上运行 JSON-Lines 控制面。
+pub(crate) async fn run_server_with_io<R, W>(
+    server: AppServer,
+    reader: R,
+    writer: W,
+) -> Result<(), String>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let cancellation = server.cancellation_handle();
     // Ordinary requests retain the single AppServer/SQLite owner. The control
     // lane receives only cloneable active-turn/inbox handles and therefore

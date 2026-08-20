@@ -1680,7 +1680,9 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
         "must not emit turn/error when metadata persistence fails"
     );
     assert!(
-        !events.iter().any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
+        !events
+            .iter()
+            .any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
         "must not emit item terminal events when metadata persistence fails"
     );
     assert!(
@@ -1699,8 +1701,7 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
         ))
         .expect("resume repairs session after fail-stop");
     assert_eq!(
-        resumed[0]["result"]["thread"]["lastTurnStatus"],
-        "interrupted",
+        resumed[0]["result"]["thread"]["lastTurnStatus"], "interrupted",
         "reopen repair must converge uncompleted turn to interrupted"
     );
 }
@@ -1744,7 +1745,9 @@ fn agent_failure_metadata_double_failure_emits_no_terminal_event() {
         "must not emit turn/error when agent failure metadata persistence fails"
     );
     assert!(
-        !events.iter().any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
+        !events
+            .iter()
+            .any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
         "must not emit item terminal events when agent failure metadata persistence fails"
     );
     assert!(
@@ -1793,7 +1796,10 @@ fn single_metadata_failure_recovers_via_bounded_retry() {
             events.push(value);
         },
     );
-    assert!(result.is_ok(), "single failure with retry compensation returns ok");
+    assert!(
+        result.is_ok(),
+        "single failure with retry compensation returns ok"
+    );
     assert!(
         !events
             .iter()

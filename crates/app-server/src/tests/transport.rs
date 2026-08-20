@@ -1,26 +1,31 @@
 use super::framing::read_bounded_line_with_limit;
-use super::supervisor::run_turn_request;
+use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
 use crate::state_paths::{
     FILE_BACKED_STORE_REQUIRED, ensure_home_outside_repo, resolve_app_server_state_paths,
 };
 use serde_json::{Value, json};
 use singularity_agent::agent::AgentError;
+use singularity_agent::session::{SessionManager, SessionMetadataKind};
 use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
-use singularity_model::ProviderConfigSnapshot;
+use singularity_core::CancellationToken;
+use singularity_model::{
+    ModelTurnRequest, ModelTurnResponse, Provider, ProviderConfigSnapshot, ProviderError,
+    ProviderProtocolContract,
+};
 use singularity_protocol::{JsonRpcId, JsonRpcMessage};
 use singularity_store::{SessionStore, StoreError};
 use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -595,4 +600,246 @@ fn stdout_writer_join_obeys_the_shutdown_deadline() {
     .expect_err("stalled writer must not outlive the deadline");
 
     assert_eq!(error, "timed out waiting for stdout writer during shutdown");
+}
+
+struct TestProvider {
+    response: ModelTurnResponse,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+}
+
+impl Provider for TestProvider {
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("lock");
+        seen_requests.push(request.clone());
+        let mut response = self.response.clone();
+        response.request_id = request.request_id.clone();
+        Ok(response)
+    }
+
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+}
+
+#[test]
+fn terminal_storage_fail_stop_over_stdio_supervisor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let index_path = temp.path().join("index.sqlite3");
+    let store = SessionStore::open(&index_path).expect("store");
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(TestProvider {
+        response: ModelTurnResponse::completed("request_1", "response_1", "all done"),
+        seen_requests: Arc::clone(&seen_requests),
+    });
+
+    let session_id = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
+        .expect("create session");
+    let session_path = session.path().to_path_buf();
+    store
+        .insert_session(&singularity_store::SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: session.path().to_string_lossy().to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: None,
+            model: Some("gpt-test".to_string()),
+            status: None,
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+            updated_at: "2026-08-20T00:00:00Z".to_string(),
+            token_usage: json!({}),
+        })
+        .expect("insert session");
+    drop(session);
+
+    let server_sessions_dir = sessions_dir.clone();
+    let server_provider = Arc::clone(&provider);
+    let (server_result, wire_bytes) = block_on(async move {
+        let handle = tokio::runtime::Handle::current();
+        let snapshot = ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            Some(handle),
+        );
+
+        let server = AppServer::new(store, snapshot)
+            .with_sessions_dir(&server_sessions_dir)
+            .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
+
+        // 1. turn terminal metadata 首次写入和 fallback terminal metadata 都失败
+        server.inject_terminalization_faults(3, 0);
+
+        let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
+        let (client_stdout, server_stdout) = tokio::io::duplex(65536);
+        let mut reader = tokio::io::BufReader::new(server_stdin);
+        let mut client_reader = tokio::io::BufReader::new(client_stdout);
+
+        let server_task =
+            tokio::spawn(
+                async move { run_server_with_io(server, &mut reader, server_stdout).await },
+            );
+
+        // 1. Send initialize
+        client_stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"test\",\"title\":\"Test\",\"version\":\"0.1.0\"}}}\n")
+            .await
+            .expect("write initialize");
+
+        // 2. Wait for initialize response
+        let mut init_response_line = String::new();
+        client_reader
+            .read_line(&mut init_response_line)
+            .await
+            .expect("read initialize response");
+        assert!(init_response_line.contains("\"result\""));
+
+        // 3. Send initialized
+        client_stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")
+            .await
+            .expect("write initialized");
+
+        // Yield to ensure initialized is processed by ordinary dispatch
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 4. Send turn/start
+        let turn_start_line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"turn/start\",\"id\":2,\"params\":{{\"threadId\":\"{session_id}\",\"input\":[{{\"type\":\"text\",\"text\":\"run task\"}}]}}}}\n"
+        );
+        client_stdin
+            .write_all(turn_start_line.as_bytes())
+            .await
+            .expect("write turn/start");
+
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(init_response_line.as_bytes());
+        let _ = client_reader.read_to_end(&mut wire_bytes).await;
+        let server_res = server_task.await.expect("join server task");
+        drop(client_stdin);
+        (server_res, wire_bytes)
+    });
+
+    // 5. turn worker 错误使 supervisor 结束 stdio 连接
+    assert!(
+        server_result.is_err(),
+        "supervisor must exit with error when turn worker experiences fatal terminal storage failure"
+    );
+
+    // 6. 客户端观察到 EOF/连接关闭并读取全部 wire frames
+    let wire_output = String::from_utf8(wire_bytes).expect("UTF-8 wire output");
+    let messages: Vec<Value> = wire_output
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect();
+
+    // 3. wire 可以收到安全、无敏感数据的连接级 fatal storage diagnostic
+    let fatal_diagnostic = messages.iter().find(|msg| {
+        msg["method"] == "agent/diagnostic"
+            && msg["params"]["severity"] == "error"
+            && msg["params"]["code"] == "storage_fatal"
+    });
+    assert!(
+        fatal_diagnostic.is_some(),
+        "wire must receive sanitized storage_fatal diagnostic: {wire_output}"
+    );
+    let diag_str = fatal_diagnostic.unwrap().to_string();
+    assert!(
+        !diag_str.contains("test-key") && !diag_str.contains("sk-"),
+        "diagnostic must not leak sensitive data"
+    );
+
+    // 4. 不产生 item/completed、item/failed、turn/completed 或 turn/error 终态事件
+    assert!(
+        !messages.iter().any(|msg| msg["method"] == "turn/completed"),
+        "must not produce turn/completed"
+    );
+    assert!(
+        !messages.iter().any(|msg| msg["method"] == "turn/error"),
+        "must not produce turn/error"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|msg| msg["method"] == "item/completed" || msg["method"] == "item/failed"),
+        "must not produce item/completed or item/failed"
+    );
+
+    // 2. 已经写入的 turn_started 保留在 JSONL
+    let session_on_disk = SessionManager::open_existing(&session_path).expect("open session file");
+    let entries = session_on_disk.metadata_entries();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.kind() == SessionMetadataKind::TurnStarted),
+        "turn_started must be persisted in JSONL"
+    );
+    assert!(
+        !entries.iter().any(|entry| {
+            entry.kind() == SessionMetadataKind::TurnCompleted
+                || entry.kind() == SessionMetadataKind::TurnInterrupted
+        }),
+        "terminal metadata must not have been persisted during double fault"
+    );
+
+    let initial_requests = seen_requests.lock().unwrap().len();
+    assert_eq!(
+        initial_requests, 1,
+        "provider was called exactly once during turn"
+    );
+
+    // 7. 用同一 session 文件创建新 app-server 实例
+    let new_store = SessionStore::open(&index_path).expect("open store again");
+    let new_snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+            _ => None,
+        },
+        None,
+    );
+    let mut new_server = AppServer::new(new_store, new_snapshot)
+        .with_sessions_dir(&sessions_dir)
+        .with_test_provider(Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>);
+
+    new_server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"initialize","id":10,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        )
+        .expect("initialize new server");
+    new_server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+        .expect("initialized new server");
+
+    // 8. reopen/resume 收敛为 interrupted
+    let resume_response = new_server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":11,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("thread/resume succeeds");
+    assert_eq!(
+        resume_response[0]["result"]["thread"]["lastTurnStatus"], "interrupted",
+        "resume converges uncompleted turn to interrupted"
+    );
+
+    // 9. 不重执行工具或 Provider 调用
+    assert_eq!(
+        seen_requests.lock().unwrap().len(),
+        initial_requests,
+        "reopen/resume must not re-execute provider calls or tools"
+    );
 }

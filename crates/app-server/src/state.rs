@@ -23,7 +23,6 @@ pub struct AppServer {
     pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
     pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
-    #[cfg(test)]
     pub(super) terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
     #[doc(hidden)]
     pub test_provider_override:
@@ -35,7 +34,6 @@ pub(super) struct TurnReference {
     pub(super) thread_id: String,
 }
 
-#[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct TerminalizationFaults {
     pub(super) metadata_failures_remaining: usize,
@@ -129,7 +127,6 @@ impl AppServer {
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
             usage_complete_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
             terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
             test_provider_override: None,
         }
@@ -152,19 +149,15 @@ impl AppServer {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_terminalization_faults(
-        &self,
-        metadata_failures: usize,
-        event_failures: usize,
-    ) {
+    /// 仅测试：注入 terminalization 故障计数。
+    #[doc(hidden)]
+    pub fn inject_terminalization_faults(&self, metadata_failures: usize, event_failures: usize) {
         if let Ok(mut faults) = self.terminalization_faults.lock() {
             faults.metadata_failures_remaining = metadata_failures;
             faults.event_failures_remaining = event_failures;
         }
     }
 
-    #[cfg(test)]
     pub(super) fn consume_terminal_metadata_failure(&self) -> bool {
         let Ok(mut faults) = self.terminalization_faults.lock() else {
             return false;
@@ -176,12 +169,6 @@ impl AppServer {
         true
     }
 
-    #[cfg(not(test))]
-    pub(super) fn consume_terminal_metadata_failure(&self) -> bool {
-        false
-    }
-
-    #[cfg(test)]
     pub(crate) fn consume_terminal_event_failure(&self, method: &str) -> bool {
         if !matches!(method, "turn/completed" | "turn/error" | "item/failed") {
             return false;
@@ -194,11 +181,6 @@ impl AppServer {
         }
         faults.event_failures_remaining -= 1;
         true
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn consume_terminal_event_failure(&self, _method: &str) -> bool {
-        false
     }
 
     pub fn sessions_dir(&self) -> &Path {
@@ -243,7 +225,6 @@ impl AppServer {
             usage_by_turn: Arc::clone(&self.usage_by_turn),
             usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            #[cfg(test)]
             terminalization_faults: Arc::clone(&self.terminalization_faults),
             test_provider_override: self.test_provider_override.clone(),
         })
