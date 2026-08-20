@@ -60,7 +60,9 @@ impl AssistantItemEventState {
 
 fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery) {
     match event.method.as_str() {
-        "item/agentMessage/delta" => (EventClass::Progress, EventDelivery::BestEffort),
+        "item/agentMessage/delta" | "agent/diagnostic" | "provider/attempt" => {
+            (EventClass::Progress, EventDelivery::BestEffort)
+        }
         _ => (EventClass::State, EventDelivery::Reliable),
     }
 }

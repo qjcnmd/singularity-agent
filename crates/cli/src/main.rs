@@ -109,13 +109,13 @@ enum SessionCommand {
 fn main() {
     if let Err(error) = run_cli(Cli::parse()) {
         eprintln!("{error}");
-        std::process::exit(if error == FORCE_INTERRUPT_ERROR
-            || error.starts_with(INTERRUPTED_ERROR_PREFIX)
-        {
-            130
-        } else {
-            1
-        });
+        std::process::exit(
+            if error == FORCE_INTERRUPT_ERROR || error.starts_with(INTERRUPTED_ERROR_PREFIX) {
+                130
+            } else {
+                1
+            },
+        );
     }
 }
 

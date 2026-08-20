@@ -9,8 +9,8 @@ mod dispatch;
 mod events;
 mod lifecycle;
 pub mod paths;
-mod state_paths;
 mod state;
+mod state_paths;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -224,6 +224,7 @@ pub struct RunStatus {
     pub final_answer: Option<String>,
     pub model_turns: u32,
     pub model_usage: ModelUsage,
+    pub usage_complete: bool,
     pub error: Option<String>,
 }
 
@@ -234,6 +235,7 @@ impl RunStatus {
             final_answer: None,
             model_turns: 0,
             model_usage: ModelUsage::default(),
+            usage_complete: false,
             error: Some(message.into()),
         }
     }
@@ -249,6 +251,14 @@ struct TurnFailure {
 
 /// 将 provider 层聚合 usage 投影为协议线格式。
 pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage {
+    usage_to_wire_with_completeness(usage, true)
+}
+
+/// 将 provider 聚合 usage 与其完整性投影为协议线格式。
+pub fn usage_to_wire_with_completeness(
+    usage: &ModelUsage,
+    usage_complete: bool,
+) -> singularity_protocol::TurnModelUsage {
     singularity_protocol::TurnModelUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -256,6 +266,7 @@ pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage
         cached_input_tokens: usage.cached_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         usage_present: usage.usage_present,
+        usage_complete,
     }
 }
 
@@ -277,7 +288,7 @@ use events::project_public_history;
 pub use paths::rebuild_session_index_from_jsonl;
 pub use paths::thread_from_record;
 use paths::{canonical_thread_cwd, refresh_session_index_from_open_session, workspace_path};
-pub use state::{AppServer, AppServerCancellationHandle};
+pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 
 #[cfg(test)]
 mod tests;

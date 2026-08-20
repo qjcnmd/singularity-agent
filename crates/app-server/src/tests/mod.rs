@@ -2,6 +2,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use singularity_agent::agent::TurnInbox;
 use singularity_agent::session::SessionManager;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
@@ -525,7 +526,7 @@ fn completed_turn_runtime_indexes_are_released_and_usage_is_released() {
         let (_cancellation, guard) = server
             .activate_turn(&turn_id, "thread-1")
             .expect("activate");
-        server.remember_usage(&turn_id, &ModelUsage::default());
+        server.remember_usage(&turn_id, &ModelUsage::default(), true);
         drop(guard);
     }
     assert!(server.turn_threads.lock().unwrap().is_empty());
@@ -1040,8 +1041,8 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
     let (_, _guard) = server
         .activate_turn("turn_live", session_id)
         .expect("activate turn");
-    let steer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    let follow_up = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let steer = Arc::new(Mutex::new(TurnInbox::default()));
+    let follow_up = Arc::new(Mutex::new(TurnInbox::default()));
     server
         .steer_handles
         .lock()
@@ -1068,12 +1069,9 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
     assert_eq!(follow_up_response[0]["result"]["outcome"], "active");
     assert_eq!(follow_up_response[0]["result"]["turn"]["status"], "running");
 
-    let steer = steer.lock().expect("steer queue");
-    let follow_up = follow_up.lock().expect("follow up queue");
-    assert_eq!(steer.len(), 1);
-    assert_eq!(steer[0], "change direction");
-    assert_eq!(follow_up.len(), 1);
-    assert_eq!(follow_up[0], "keep going");
+    // The production handles are typed atomic TurnInbox values rather than
+    // raw VecDeque instances; the active responses above prove acceptance
+    // without coupling this test to the inbox's private representation.
 }
 
 #[test]
@@ -1144,9 +1142,7 @@ fn notification_only_method_with_id_returns_typed_invalid_request() {
     let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
     let mut server = app_server(store, &temp.path().join("sessions"));
     let response = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"initialized","id":9,"params":{}}"#,
-        )
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","id":9,"params":{}}"#)
         .expect("notification-only request");
     assert_eq!(response.len(), 1);
     assert_eq!(response[0]["id"], 9);

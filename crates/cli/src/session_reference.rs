@@ -135,11 +135,7 @@ impl ReferenceBudget {
 /// Append one generated section as exactly one line. The separator newline is
 /// charged to both budgets, so a line that fits only without its newline is
 /// rejected and replaced by the bounded truncation marker.
-fn push_reference_line(
-    reference: &mut String,
-    budget: &mut ReferenceBudget,
-    text: &str,
-) -> bool {
+fn push_reference_line(reference: &mut String, budget: &mut ReferenceBudget, text: &str) -> bool {
     let mut line = String::with_capacity(text.len() + 1);
     line.push_str(text);
     line.push('\n');

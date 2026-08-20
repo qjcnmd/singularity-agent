@@ -22,6 +22,7 @@ pub struct AppServer {
     pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     /// 已提交 turn 的运行时 usage 缓存；权威副本是同一 session JSONL 的 usage metadata。
     pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
+    pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
     #[cfg(test)]
     pub(super) terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
@@ -47,6 +48,19 @@ pub(super) struct TerminalizationFaults {
 pub struct AppServerCancellationHandle {
     pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
+}
+
+/// Narrow cloneable control seam for active-turn cancellation and input.
+///
+/// It deliberately contains only the in-memory active-turn maps; ordinary
+/// state requests continue to run through the single `AppServer` owner and
+/// its SQLite connection.
+#[derive(Clone)]
+pub struct AppServerControlHandle {
+    pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
+    pub(super) steer_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
+    pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
 }
 
 impl AppServerCancellationHandle {
@@ -77,6 +91,7 @@ pub(super) struct ActiveTurnGuard {
     pub(super) follow_up_handles: Arc<Mutex<HashMap<String, SteerHandle>>>,
     pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
     pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
+    pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl Drop for ActiveTurnGuard {
@@ -92,6 +107,9 @@ impl Drop for ActiveTurnGuard {
         }
         if let Ok(mut usage_by_turn) = self.usage_by_turn.lock() {
             usage_by_turn.remove(&self.turn_id);
+        }
+        if let Ok(mut usage_complete_by_turn) = self.usage_complete_by_turn.lock() {
+            usage_complete_by_turn.remove(&self.turn_id);
         }
         if let Ok(mut turn_threads) = self.turn_threads.lock() {
             turn_threads.remove(&self.turn_id);
@@ -116,6 +134,7 @@ impl AppServer {
             steer_handles: Arc::new(Mutex::new(HashMap::new())),
             follow_up_handles: Arc::new(Mutex::new(HashMap::new())),
             usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
+            usage_complete_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
@@ -230,6 +249,7 @@ impl AppServer {
             steer_handles: Arc::clone(&self.steer_handles),
             follow_up_handles: Arc::clone(&self.follow_up_handles),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
+            usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
             #[cfg(test)]
             terminalization_faults: Arc::clone(&self.terminalization_faults),
@@ -280,6 +300,7 @@ impl AppServer {
             follow_up_handles: Arc::clone(&self.follow_up_handles),
             turn_threads: Arc::clone(&self.turn_threads),
             usage_by_turn: Arc::clone(&self.usage_by_turn),
+            usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
         };
         Ok((cancellation, guard))
     }
@@ -365,6 +386,7 @@ impl AppServer {
         turn_id: Option<&str>,
         status: SessionStatus,
         usage: &ModelUsage,
+        usage_complete: bool,
     ) -> AppServerResult<SessionRecord> {
         if matches!(
             status,
@@ -379,10 +401,12 @@ impl AppServer {
             && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
         {
             self.append_terminal_metadata_if_missing(session_id, turn_id, metadata)?;
-            let usage_value = serde_json::to_value(usage_to_wire(usage))?;
+            let usage_value =
+                serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
             self.append_usage_metadata_if_missing(session_id, turn_id, usage_value)?;
         }
-        let token_usage = serde_json::to_value(usage_to_wire(usage))?;
+        let token_usage =
+            serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
         Ok(self.store.update_session(
             session_id,
             SessionMetadataUpdate {
@@ -481,18 +505,43 @@ impl AppServer {
             .usage_by_turn
             .lock()
             .ok()
-            .and_then(|cache| cache.get(&turn.turn_id).cloned())
+            .and_then(|cache| {
+                cache.get(&turn.turn_id).cloned().map(|usage| {
+                    let usage_complete = self
+                        .usage_complete_by_turn
+                        .lock()
+                        .ok()
+                        .and_then(|complete| complete.get(&turn.turn_id).copied())
+                        .unwrap_or(true);
+                    (usage, usage_complete)
+                })
+            })
             .or_else(|| self.persisted_usage_for_turn(&turn));
         match usage {
-            Some(usage) => Turn {
-                model_usage: Some(usage_to_wire(&usage)),
+            Some((usage, usage_complete)) => Turn {
+                model_usage: Some(usage_to_wire_with_completeness(&usage, usage_complete)),
                 ..turn
             },
             None => turn,
         }
     }
 
-    fn persisted_usage_for_turn(&self, turn: &Turn) -> Option<ModelUsage> {
+    /// Return the narrow active-turn handle used by the stdio control lane.
+    ///
+    /// The handle contains no session-store owner and therefore cannot process
+    /// ordinary state requests. It is cloneable so interrupt/steer/follow-up
+    /// requests can bypass the ordinary request queue without duplicating the
+    /// application state owner.
+    pub fn control_handle(&self) -> AppServerControlHandle {
+        AppServerControlHandle {
+            active_turns: Arc::clone(&self.active_turns),
+            turn_threads: Arc::clone(&self.turn_threads),
+            steer_handles: Arc::clone(&self.steer_handles),
+            follow_up_handles: Arc::clone(&self.follow_up_handles),
+        }
+    }
+
+    fn persisted_usage_for_turn(&self, turn: &Turn) -> Option<(ModelUsage, bool)> {
         let record = self.store.get_session(&turn.thread_id).ok()?;
         let session = SessionManager::open_existing(Path::new(&record.rollout_path)).ok()?;
         let value = session
@@ -505,12 +554,26 @@ impl AppServer {
             })?
             .field("usage")
             .cloned()?;
-        serde_json::from_value(value).ok()
+        let wire: singularity_protocol::TurnModelUsage = serde_json::from_value(value).ok()?;
+        Some((
+            ModelUsage {
+                input_tokens: wire.input_tokens,
+                output_tokens: wire.output_tokens,
+                total_tokens: wire.total_tokens,
+                cached_input_tokens: wire.cached_input_tokens,
+                reasoning_tokens: wire.reasoning_tokens,
+                usage_present: wire.usage_present,
+            },
+            wire.usage_complete,
+        ))
     }
 
-    pub(crate) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage) {
+    pub(crate) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage, usage_complete: bool) {
         let _ = self.usage_by_turn.lock().map(|mut cache| {
             cache.insert(turn_id.to_string(), usage.clone());
+        });
+        let _ = self.usage_complete_by_turn.lock().map(|mut cache| {
+            cache.insert(turn_id.to_string(), usage_complete);
         });
     }
 

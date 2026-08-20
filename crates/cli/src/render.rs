@@ -3,8 +3,8 @@
 use super::*;
 use singularity_protocol::{
     AgentDiagnosticParams, ProviderAttemptEventParams, ProviderAttemptSummaryParams,
-    ThreadEventParams, ToolExecutionEndParams, ToolExecutionStartParams,
-    ToolExecutionUpdateParams, Turn, TurnErrorParams, TurnEventParams, TurnStatus,
+    ThreadEventParams, ToolExecutionEndParams, ToolExecutionStartParams, ToolExecutionUpdateParams,
+    Turn, TurnErrorParams, TurnEventParams, TurnStatus,
 };
 
 // 过滤并脱敏可公开渲染的协议事件。
@@ -20,7 +20,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
     let method = message.method;
     let mut output = match method.as_str() {
         "thread/started" => {
-            let params = serde_json::from_value::<ThreadEventParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ThreadEventParams>(message.params.clone()).ok()?;
             Some(json!({
                 "method": method,
                 "params": {"thread": params.thread},
@@ -36,30 +37,31 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
         "item/agentMessage/delta" => {
             let params = serde_json::from_value::<ItemEventParams>(message.params.clone()).ok()?;
             Some(json!({
-            "method": method,
-            "params": {
-                "thread_id": params.thread_id,
-                "turn_id": params.turn_id,
-                "item_id": params.item.item_id,
-                "delta": params.delta.unwrap_or_default(),
-            },
-        }))
+                "method": method,
+                "params": {
+                    "thread_id": params.thread_id,
+                    "turn_id": params.turn_id,
+                    "item_id": params.item.item_id,
+                    "delta": params.delta.unwrap_or_default(),
+                },
+            }))
         }
         "item/started" | "item/completed" | "item/failed" => {
             let params = serde_json::from_value::<ItemEventParams>(message.params.clone()).ok()?;
             Some(json!({
-            "method": method,
-            "params": {
-                "thread_id": params.thread_id,
-                "turn_id": params.turn_id,
-                "item_id": params.item.item_id,
-                "error": params.error,
-            },
-        }))
+                "method": method,
+                "params": {
+                    "thread_id": params.thread_id,
+                    "turn_id": params.turn_id,
+                    "item_id": params.item.item_id,
+                    "error": params.error,
+                },
+            }))
         }
         // 工具生命周期事件：投影 toolCallId、toolName、args、partialResult 与 result。
         "tool/execution/start" => {
-            let params = serde_json::from_value::<ToolExecutionStartParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ToolExecutionStartParams>(message.params.clone()).ok()?;
             Some(json!({
                 "method": method,
                 "params": {
@@ -72,7 +74,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             }))
         }
         "tool/execution/update" => {
-            let params = serde_json::from_value::<ToolExecutionUpdateParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ToolExecutionUpdateParams>(message.params.clone()).ok()?;
             Some(json!({
                 "method": method,
                 "params": {
@@ -86,7 +89,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             }))
         }
         "tool/execution/end" => {
-            let params = serde_json::from_value::<ToolExecutionEndParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ToolExecutionEndParams>(message.params.clone()).ok()?;
             Some(json!({
                 "method": method,
                 "params": {
@@ -113,7 +117,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             }))
         }
         "agent/diagnostic" => {
-            let params = serde_json::from_value::<AgentDiagnosticParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<AgentDiagnosticParams>(message.params.clone()).ok()?;
             Some(json!({
                 "method": method,
                 "params": {
@@ -126,7 +131,9 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             }))
         }
         "provider/attempt" => {
-            let params = serde_json::from_value::<ProviderAttemptEventParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ProviderAttemptEventParams>(message.params.clone())
+                    .ok()?;
             Some(json!({
                 "method": method,
                 "params": {
@@ -148,7 +155,9 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             }))
         }
         "provider/attempt/summary" => {
-            let params = serde_json::from_value::<ProviderAttemptSummaryParams>(message.params.clone()).ok()?;
+            let params =
+                serde_json::from_value::<ProviderAttemptSummaryParams>(message.params.clone())
+                    .ok()?;
             Some(json!({
                 "method": method,
                 "params": {

@@ -11,7 +11,9 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
         emit(message);
     }
 }
-use std::cell::RefCell;
+use singularity_agent::agent::{AgentDiagnostic, AgentDiagnosticSeverity};
+use singularity_model::ProviderAttemptEvent;
+use std::cell::{Cell, RefCell};
 
 pub(super) fn agent_config_for_thread(
     thread: &Thread,
@@ -52,23 +54,33 @@ pub(super) fn agent_config_for_thread(
         system_prompt,
         context_window,
         max_output_tokens,
+        compaction: singularity_agent::compaction::CompactionConfig::default(),
     })
 }
 
 pub(super) fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     let mut status = RunStatus::failed("agent loop did not reach a final assistant message");
-    if outcome.aborted {
-        mark_run_cancelled(&mut status);
-    } else if outcome.final_text.trim().is_empty() {
-        status.status = AgentStatus::Failed;
-        status.error = Some("agent loop stopped without a final assistant message".to_string());
-    } else {
-        status.status = AgentStatus::Completed;
-        status.error = None;
-        status.final_answer = Some(outcome.final_text.clone());
+    match outcome.terminal_reason {
+        singularity_agent::agent::AgentTerminalReason::Aborted => mark_run_cancelled(&mut status),
+        singularity_agent::agent::AgentTerminalReason::Failed => {
+            status.status = AgentStatus::Failed;
+            status.error = Some("agent loop stopped without a final assistant message".to_string());
+        }
+        singularity_agent::agent::AgentTerminalReason::Completed => {
+            if outcome.final_text.trim().is_empty() {
+                status.status = AgentStatus::Failed;
+                status.error =
+                    Some("agent loop stopped without a final assistant message".to_string());
+            } else {
+                status.status = AgentStatus::Completed;
+                status.error = None;
+                status.final_answer = Some(outcome.final_text.clone());
+            }
+        }
     }
     status.model_turns = outcome.turns;
     status.model_usage = outcome.usage;
+    status.usage_complete = outcome.usage_complete;
     status
 }
 
@@ -334,6 +346,7 @@ impl AppServer {
                     &mut assistant_events,
                     &error,
                     &status.model_usage,
+                    status.usage_complete,
                     &mut emit,
                 );
             }
@@ -344,6 +357,7 @@ impl AppServer {
                     &mut assistant_events,
                     &error,
                     &ModelUsage::default(),
+                    false,
                     &mut emit,
                 );
             }
@@ -360,6 +374,7 @@ impl AppServer {
             Some(&turn_id),
             session_status_for_agent(&status.status),
             &status.model_usage,
+            status.usage_complete,
         ) {
             let failure = TurnFailure {
                 stage: TurnFailureStage::TerminalOutcome,
@@ -369,7 +384,12 @@ impl AppServer {
             // durable terminal metadata is authoritative. If the intended status
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
-            let _ = self.persist_failure_state(&record.session_id, &turn_id, &status.model_usage);
+            let _ = self.persist_failure_state(
+                &record.session_id,
+                &turn_id,
+                &status.model_usage,
+                status.usage_complete,
+            );
             let _ = self.emit_failure_terminal_events(
                 &turn_id,
                 &record.session_id,
@@ -381,7 +401,7 @@ impl AppServer {
         }
         // Publication order: durable metadata first, then the in-process usage
         // projection used by the terminal event and RPC response.
-        self.remember_usage(&turn_id, &status.model_usage);
+        self.remember_usage(&turn_id, &status.model_usage, status.usage_complete);
         // Cancellation can interrupt a side-effecting tool after its item has
         // started but before the tool callback emits an execution-end event.
         // Close every such item before the turn terminal event; never leave a
@@ -440,6 +460,7 @@ impl AppServer {
 
     /// 将 AgentLoop 错误收敛为唯一终态：先写 durable failure，再发 item/failed
     /// 与 turn/error。
+    #[allow(clippy::too_many_arguments)]
     fn finish_agent_failure(
         &self,
         record: &SessionRecord,
@@ -447,11 +468,18 @@ impl AppServer {
         assistant_events: &mut AssistantItemEventState,
         error: &AppServerError,
         usage: &ModelUsage,
+        usage_complete: bool,
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<()> {
+        let (usage, usage_complete) = match error {
+            AppServerError::Agent(AgentError::RunFailed { outcome, .. }) => {
+                (&outcome.usage, outcome.usage_complete)
+            }
+            _ => (usage, usage_complete),
+        };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
         let (_metadata_error, _durable) =
-            self.persist_failure_state(&record.session_id, turn_id, usage);
+            self.persist_failure_state(&record.session_id, turn_id, usage, usage_complete);
         let _ = self.emit_failure_terminal_events(
             turn_id,
             &record.session_id,
@@ -469,12 +497,14 @@ impl AppServer {
         session_id: &str,
         turn_id: &str,
         usage: &ModelUsage,
+        usage_complete: bool,
     ) -> (Option<String>, bool) {
         let first_error = match self.update_session_status_and_usage(
             session_id,
             Some(turn_id),
             SessionStatus::Failed,
             usage,
+            usage_complete,
         ) {
             Ok(_) => return (None, true),
             Err(error) => error.to_string(),
@@ -485,6 +515,7 @@ impl AppServer {
                 Some(turn_id),
                 SessionStatus::Failed,
                 usage,
+                usage_complete,
             )
             .is_ok()
         {
@@ -590,6 +621,45 @@ impl AppServer {
         let assistant_events_cell = RefCell::new(assistant_events);
         // 回调闭包共享 emit 的可变借用：RefCell 包装（单线程 turn 内串行使用）。
         let emit_cell = RefCell::new(emit);
+        // Provider transport emits attempt-start before terminal events. The
+        // start type intentionally has no model-turn field, so keep the
+        // current ordinal at this owner boundary and advance it only after a
+        // non-retrying terminal occurrence. Finished occurrences already carry
+        // the AgentLoop-bound ordinal and take precedence.
+        let next_attempt_model_turn = Cell::new(1u32);
+        let mut on_diagnostic = |diagnostic: &AgentDiagnostic| {
+            let severity = match diagnostic.severity {
+                AgentDiagnosticSeverity::Info => "info",
+                AgentDiagnosticSeverity::Warning => "warning",
+                AgentDiagnosticSeverity::Error => "error",
+            };
+            let event = AppEvent::agent_diagnostic(
+                &thread.thread_id,
+                turn_id,
+                severity,
+                &diagnostic.code,
+                &diagnostic.message,
+            );
+            // Diagnostics are a best-effort observer side channel. A failed
+            // projection must not convert an otherwise valid Agent run into a
+            // failure or persist diagnostic text in Session JSONL.
+            if let Ok(event) = self.event_notification(event) {
+                emit_cell.borrow_mut()(event);
+            }
+        };
+        let mut on_provider_attempt = |attempt: ProviderAttemptEvent| {
+            let fallback_ordinal = next_attempt_model_turn.get();
+            let (event, ordinal, terminal_without_retry) =
+                provider_attempt_app_event(&thread.thread_id, turn_id, fallback_ordinal, &attempt);
+            // Attempt observations are similarly non-vetoing and contain only
+            // typed provider/model/protocol fields and bounded diagnostics.
+            if let Ok(event) = self.event_notification(event) {
+                emit_cell.borrow_mut()(event);
+            }
+            if terminal_without_retry {
+                next_attempt_model_turn.set(ordinal.saturating_add(1));
+            }
+        };
         let mut on_message_update = |delta: &str| {
             if callback_error.borrow().is_some() {
                 return;
@@ -681,18 +751,43 @@ impl AppServer {
         events.on_tool_execution_start = Some(&mut on_tool_execution_start);
         events.on_tool_execution_update = Some(&mut on_tool_execution_update);
         events.on_tool_execution_end = Some(&mut on_tool_execution_end);
+        events.on_diagnostic = Some(&mut on_diagnostic);
+        events.on_provider_attempt = Some(&mut on_provider_attempt);
         let outcome = match agent.run(input_text, &mut events, cancellation) {
             Ok(outcome) => outcome,
-            // provider 调用内的取消：按 AgentOutcome 的 aborted 语义收敛。
-            Err(_) if cancellation.is_cancelled() => AgentOutcome {
-                final_text: String::new(),
-                turns: 0,
-                usage: singularity_model::ModelUsage::default(),
-                compacted: false,
-                aborted: true,
-            },
-            Err(error) => return Err(error.into()),
+            // AgentLoop owns typed Provider cancellation.  Do not infer an
+            // aborted outcome from an unrelated concurrent error here.
+            Err(error) => {
+                if let AgentError::RunFailed { outcome, .. } = &error {
+                    emit_provider_attempt_summaries(
+                        self,
+                        &thread.thread_id,
+                        turn_id,
+                        outcome,
+                        &mut *emit_cell.borrow_mut(),
+                    );
+                } else if let AgentError::Provider(provider) = &error
+                    && let Some(metadata) = provider.provider_attempt_metadata.as_ref()
+                {
+                    emit_provider_attempt_metadata_summaries(
+                        self,
+                        &thread.thread_id,
+                        turn_id,
+                        metadata,
+                        1,
+                        &mut *emit_cell.borrow_mut(),
+                    );
+                }
+                return Err(error.into());
+            }
         };
+        emit_provider_attempt_summaries(
+            self,
+            &thread.thread_id,
+            turn_id,
+            &outcome,
+            &mut *emit_cell.borrow_mut(),
+        );
         if let Some(error) = callback_error.into_inner() {
             return Err(error);
         }
@@ -704,6 +799,191 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_interrupt(message)
+    }
+
+    /// 同一连接内 steer：把输入注入下一轮开始的 steer 队列。
+    pub(super) fn turn_steer(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_steer(message)
+    }
+
+    /// 同一连接内 follow-up：把输入注入“代理准备停止时继续一轮”的队列。
+    pub(super) fn turn_follow_up(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_follow_up(message)
+    }
+
+    pub(super) fn agent_capability(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        json_response(
+            message.required_id(),
+            AgentCapabilityResult {
+                provider_configuration: provider_configuration(&self.provider_snapshot),
+            },
+        )
+    }
+
+    pub(super) fn server_shutdown(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.shutdown_requested = true;
+        self.request_execution_stop()?;
+        json_response(
+            message.required_id(),
+            ServerShutdownResult { shutdown: true },
+        )
+    }
+}
+
+fn serialized_enum_text<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn provider_attempt_app_event(
+    thread_id: &str,
+    turn_id: &str,
+    fallback_ordinal: u32,
+    attempt: &ProviderAttemptEvent,
+) -> (AppEvent, u32, bool) {
+    match attempt {
+        ProviderAttemptEvent::Started(started) => (
+            AppEvent::provider_attempt(
+                thread_id,
+                turn_id,
+                fallback_ordinal,
+                serialized_enum_text(&started.operation_phase),
+                &started.provider_name,
+                &started.model_name,
+                serialized_enum_text(&started.actual_api_protocol),
+                started.attempt_index,
+                "started",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            fallback_ordinal,
+            false,
+        ),
+        ProviderAttemptEvent::Finished(occurrence) => {
+            let ordinal = occurrence.model_turn_ordinal.unwrap_or(fallback_ordinal);
+            (
+                AppEvent::provider_attempt(
+                    thread_id,
+                    turn_id,
+                    ordinal,
+                    serialized_enum_text(&occurrence.operation_phase),
+                    &occurrence.provider_name,
+                    &occurrence.model_name,
+                    serialized_enum_text(&occurrence.actual_api_protocol),
+                    occurrence.attempt_index,
+                    serialized_enum_text(&occurrence.terminal_status),
+                    Some(occurrence.attempt_duration_ms),
+                    Some(occurrence.retry_scheduled),
+                    occurrence.retry_backoff_ms,
+                    occurrence.error_category.as_ref().map(serialized_enum_text),
+                    occurrence.diagnostic_code.clone(),
+                ),
+                ordinal,
+                !occurrence.retry_scheduled,
+            )
+        }
+    }
+}
+
+fn emit_provider_attempt_summaries(
+    server: &AppServer,
+    thread_id: &str,
+    turn_id: &str,
+    outcome: &AgentOutcome,
+    emit: &mut impl FnMut(Value),
+) {
+    let Some(metadata) = outcome.provider_attempt_metadata.as_ref() else {
+        return;
+    };
+    emit_provider_attempt_metadata_summaries(
+        server,
+        thread_id,
+        turn_id,
+        metadata,
+        outcome.turns.max(1),
+        emit,
+    );
+}
+
+fn emit_provider_attempt_metadata_summaries(
+    server: &AppServer,
+    thread_id: &str,
+    turn_id: &str,
+    metadata: &singularity_model::ProviderAttemptMetadata,
+    fallback_ordinal: u32,
+    emit: &mut impl FnMut(Value),
+) {
+    let mut groups = std::collections::BTreeMap::<u32, (u32, u32, u64)>::new();
+    for occurrence in &metadata.occurrences {
+        let ordinal = occurrence.model_turn_ordinal.unwrap_or(fallback_ordinal);
+        let group = groups.entry(ordinal).or_default();
+        group.0 = group.0.saturating_add(1);
+        group.1 = group
+            .1
+            .saturating_add(u32::from(occurrence.retry_scheduled));
+        group.2 = group.2.saturating_add(occurrence.attempt_duration_ms);
+    }
+    if groups.is_empty() && metadata.attempt_count > 0 {
+        groups.insert(
+            fallback_ordinal,
+            (
+                metadata.attempt_count,
+                metadata.retry_count,
+                metadata.latency_ms,
+            ),
+        );
+    }
+    for (ordinal, (attempt_count, retry_count, latency_ms)) in groups {
+        let event = AppEvent::provider_attempt_summary(
+            thread_id,
+            turn_id,
+            ordinal,
+            attempt_count,
+            retry_count,
+            latency_ms,
+        );
+        if let Ok(event) = server.event_notification(event) {
+            emit(event);
+        }
+    }
+}
+
+impl AppServerControlHandle {
+    /// Dispatch one control-lane JSON-RPC message against active-turn handles.
+    ///
+    /// Notifications are intentionally side-effect free at the protocol layer:
+    /// they are accepted without producing a response, while request messages
+    /// receive the typed control result or an error response from the caller.
+    pub fn handle(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        // Request-only control methods arriving as notifications are true
+        // no-ops: no cancellation, enqueue, or response is allowed.
+        if message.is_notification() {
+            return Ok(Vec::new());
+        }
+        match message.method_name() {
+            Some("turn/interrupt") => self.turn_interrupt(message),
+            Some("turn/steer") => self.turn_steer(message),
+            Some("turn/followUp") => self.turn_follow_up(message),
+            _ => invalid_params_response(message.required_id()),
+        }
+    }
+
+    fn turn_interrupt(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = parse_params(&message)?;
         let cancellation = self
             .active_turns
@@ -728,16 +1008,11 @@ impl AppServer {
         ])
     }
 
-    /// 同一连接内 steer：把输入注入下一轮开始的 steer 队列。
-    pub(super) fn turn_steer(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+    fn turn_steer(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.inject_turn_input(message, false)
     }
 
-    /// 同一连接内 follow-up：把输入注入“代理准备停止时继续一轮”的队列。
-    pub(super) fn turn_follow_up(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
+    fn turn_follow_up(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.inject_turn_input(message, true)
     }
 
@@ -749,8 +1024,6 @@ impl AppServer {
         let params: TurnInjectionParams = parse_params(&message)?;
         let payload = serde_json::to_value(&params.input)?;
         let text = input_items_to_text(&payload)?;
-        // turn_threads 只保留活动 turn；终态化先移除映射，再摘除句柄，
-        // 因此注入请求不会在终态窗口中被确认。
         let references = self
             .turn_threads
             .lock()
@@ -758,10 +1031,8 @@ impl AppServer {
         let Some(reference) = references.get(&params.turn_id).cloned() else {
             return not_found_response(message.required_id(), TURN_NOT_FOUND);
         };
-        // Do not hold turn_threads while acquiring an injection handle. The
-        // active-turn guard removes handles before it removes this reference;
-        // releasing this read lock first prevents a terminal cleanup/control
-        // injection lock cycle.
+        // Release the reference lock before acquiring the inbox lock. The
+        // ActiveTurnGuard removes inboxes before references during cleanup.
         drop(references);
         let handles = if follow_up {
             &self.follow_up_handles
@@ -776,10 +1047,23 @@ impl AppServer {
         let Some(handle) = handle else {
             return not_found_response(message.required_id(), TURN_NOT_FOUND);
         };
-        handle
+        let accepted = handle
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .push_back(text);
+            .enqueue(
+                if follow_up {
+                    singularity_agent::agent::TurnInputKind::FollowUp
+                } else {
+                    singularity_agent::agent::TurnInputKind::Steer
+                },
+                text,
+            );
+        if !accepted {
+            return invalid_state_response(
+                message.required_id(),
+                "turn is no longer accepting input",
+            );
+        }
         json_response(
             message.required_id(),
             TurnInjectionResult {
@@ -792,30 +1076,6 @@ impl AppServer {
                 },
                 outcome: TurnInjectionOutcome::Active,
             },
-        )
-    }
-
-    pub(super) fn agent_capability(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        json_response(
-            message.required_id(),
-            AgentCapabilityResult {
-                provider_configuration: provider_configuration(&self.provider_snapshot),
-            },
-        )
-    }
-
-    pub(super) fn server_shutdown(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        self.shutdown_requested = true;
-        self.request_execution_stop()?;
-        json_response(
-            message.required_id(),
-            ServerShutdownResult { shutdown: true },
         )
     }
 }

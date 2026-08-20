@@ -14,15 +14,15 @@ pub(crate) mod output;
 pub(crate) mod supervisor;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde_json::Value;
 use singularity_app_server::{
-    AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput,
+    AppServer, AppServerCancellationHandle, AppServerControlHandle, AppServerError, AppServerOutput,
 };
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR, contains_sensitive_text};
 use singularity_model::ProviderConfigSnapshot;
@@ -91,13 +91,10 @@ where
     .await
     .map_err(|error| format!("app-server startup task failed: {error}"))??;
     let cancellation = server.cancellation_handle();
-    // The ordinary owner and the control lane each keep an independent SQLite
-    // connection, while all active-turn maps remain shared through Arcs.
-    // `turn_factory` is moved through each setup task and never handles
-    // ordinary requests, so a slow state operation cannot block controls.
-    let control_server = server
-        .turn_worker()
-        .map_err(|error| format!("app-server control lane setup failed: {error}"))?;
+    // Ordinary requests retain the single AppServer/SQLite owner. The control
+    // lane receives only cloneable active-turn/inbox handles and therefore
+    // cannot create a second mutable state owner.
+    let control_handle = server.control_handle();
     let turn_factory = server
         .turn_worker()
         .map_err(|error| format!("app-server turn factory setup failed: {error}"))?;
@@ -121,7 +118,7 @@ where
         Arc::clone(&ready_for_turn),
     ));
     let mut control_task = tokio::spawn(run_control_dispatch(
-        control_server,
+        control_handle,
         control_rx,
         output_tx.clone(),
         cancellation.clone(),
@@ -677,7 +674,7 @@ async fn run_ordinary_dispatch(
 /// 独立 control owner。它使用 AppServer 的共享活动-turn句柄，因而控制
 /// 请求不会排在 session/read、thread/list 等 ordinary state request 后面。
 async fn run_control_dispatch(
-    mut server: AppServer,
+    control: AppServerControlHandle,
     mut requests: mpsc::Receiver<JsonRpcMessage>,
     outputs: mpsc::Sender<Value>,
     cancellation: AppServerCancellationHandle,
@@ -685,28 +682,27 @@ async fn run_control_dispatch(
     while let Some(message) = requests.recv().await {
         let direct_outputs = outputs.clone();
         let direct_cancellation = cancellation.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let notification = message.is_notification();
-            let request_id = message.id().cloned();
-            let result = server.handle_with_output(message);
-            let dispatch_result = match result {
-                Ok(messages) => {
-                    send_app_server_outputs(&direct_outputs, &direct_cancellation, messages)
+        let task = tokio::task::spawn_blocking({
+            let control = control.clone();
+            move || {
+                let request_id = message.id().cloned();
+                let result = control.handle(message);
+                match result {
+                    Ok(messages) => {
+                        send_app_server_outputs(&direct_outputs, &direct_cancellation, messages)
+                    }
+                    Err(error) => send_output(
+                        &direct_outputs,
+                        &direct_cancellation,
+                        transport_error_value(request_id, &error),
+                    )
+                    .map(|_| ()),
                 }
-                Err(error) if !notification => send_output(
-                    &direct_outputs,
-                    &direct_cancellation,
-                    transport_error_value(request_id, &error),
-                )
-                .map(|_| ()),
-                Err(_) => Ok(()),
-            };
-            (server, dispatch_result)
+            }
         });
-        let (next_server, result) = task
+        let result = task
             .await
             .map_err(|error| format!("control dispatch task failed: {error}"))?;
-        server = next_server;
         result?;
     }
     Ok(())

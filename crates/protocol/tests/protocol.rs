@@ -3,7 +3,8 @@
 use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload, Method, MethodKind,
+    AgentDiagnosticParams, AppEvent, EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload,
+    Method, MethodKind, ProviderAttemptEventParams, ProviderAttemptSummaryParams,
     SessionReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
     TurnStatus, parse_json_rpc_payload, rpc_methods,
 };
@@ -265,13 +266,61 @@ fn initialize_params_keep_client_info_contract() {
     .expect("initialize params");
     assert_eq!(params["clientInfo"]["name"], "sg");
     assert!(params.get("capabilities").is_none());
-    assert!(serde_json::from_value::<InitializeParams>(serde_json::json!({
-        "clientInfo": {"name": "sg", "title": "Singularity CLI", "version": "0.1.0"},
-        "capabilities": {}
-    }))
-    .is_err());
+    assert!(
+        serde_json::from_value::<InitializeParams>(serde_json::json!({
+            "clientInfo": {"name": "sg", "title": "Singularity CLI", "version": "0.1.0"},
+            "capabilities": {}
+        }))
+        .is_err()
+    );
     let _: rpc_methods::Initialize = rpc_methods::Initialize;
     assert!(Method::Initialize.spec().validate_params(params).is_ok());
+}
+
+#[test]
+fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
+    let diagnostic = AppEvent::agent_diagnostic(
+        "thread-1",
+        "turn-1",
+        "warning",
+        "compaction_skipped",
+        "automatic context compaction skipped",
+    );
+    let diagnostic_params: AgentDiagnosticParams =
+        serde_json::from_value(diagnostic.params.clone()).expect("diagnostic params");
+    assert_eq!(diagnostic.method(), "agent/diagnostic");
+    assert_eq!(diagnostic_params.code, "compaction_skipped");
+    assert!(!diagnostic.params.to_string().contains("raw"));
+
+    let attempt = AppEvent::provider_attempt(
+        "thread-1",
+        "turn-1",
+        2,
+        "completion",
+        "openai",
+        "gpt-test",
+        "open_ai_responses",
+        1,
+        "error",
+        Some(12),
+        Some(true),
+        Some(4),
+        Some("network".to_string()),
+        Some("provider_timeout".to_string()),
+    );
+    let attempt_params: ProviderAttemptEventParams =
+        serde_json::from_value(attempt.params.clone()).expect("attempt params");
+    assert_eq!(attempt.method(), "provider/attempt");
+    assert_eq!(attempt_params.model_turn_ordinal, 2);
+    assert_eq!(attempt_params.retry_scheduled, Some(true));
+    assert!(attempt.params.get("raw").is_none());
+
+    let summary = AppEvent::provider_attempt_summary("thread-1", "turn-1", 2, 2, 1, 20);
+    let summary_params: ProviderAttemptSummaryParams =
+        serde_json::from_value(summary.params.clone()).expect("summary params");
+    assert_eq!(summary.method(), "provider/attempt/summary");
+    assert_eq!(summary_params.attempt_count, 2);
+    assert_eq!(summary_params.latency_ms, 20);
 }
 
 #[test]

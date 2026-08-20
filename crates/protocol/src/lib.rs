@@ -790,9 +790,18 @@ pub struct TurnModelUsage {
     /// 旧服务端数据无此字段时按存在解释。
     #[serde(default = "default_usage_present_protocol")]
     pub usage_present: bool,
+    /// Whether every provider request represented by this aggregate reported
+    /// exact usage. Missing/unknown final-request usage remains partial rather
+    /// than being represented as zero.
+    #[serde(default = "default_usage_complete_protocol")]
+    pub usage_complete: bool,
 }
 
 fn default_usage_present_protocol() -> bool {
+    true
+}
+
+fn default_usage_complete_protocol() -> bool {
     true
 }
 
@@ -1115,6 +1124,87 @@ impl AppEvent {
                     "message": message,
                     "willRetry": will_retry,
                 },
+            }),
+        }
+    }
+
+    /// 构造非致命、脱敏的 Agent 诊断事件。
+    pub fn agent_diagnostic(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        severity: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: "agent/diagnostic".to_string(),
+            params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
+                "severity": severity.into(),
+                "code": code.into(),
+                "message": message.into(),
+            }),
+        }
+    }
+
+    /// 构造单次 Provider attempt 的脱敏进度/终态事件。
+    #[allow(clippy::too_many_arguments)]
+    pub fn provider_attempt(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        model_turn_ordinal: u32,
+        operation_phase: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        protocol: impl Into<String>,
+        attempt_index: u32,
+        status: impl Into<String>,
+        attempt_duration_ms: Option<u64>,
+        retry_scheduled: Option<bool>,
+        retry_backoff_ms: Option<u64>,
+        error_category: Option<String>,
+        diagnostic_code: Option<String>,
+    ) -> Self {
+        Self {
+            method: "provider/attempt".to_string(),
+            params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
+                "modelTurnOrdinal": model_turn_ordinal,
+                "operationPhase": operation_phase.into(),
+                "provider": provider.into(),
+                "model": model.into(),
+                "protocol": protocol.into(),
+                "attemptIndex": attempt_index,
+                "status": status.into(),
+                "attemptDurationMs": attempt_duration_ms,
+                "retryScheduled": retry_scheduled,
+                "retryBackoffMs": retry_backoff_ms,
+                "errorCategory": error_category,
+                "diagnosticCode": diagnostic_code,
+            }),
+        }
+    }
+
+    /// 构造一个 model turn 的 Provider attempt aggregate 终态事件。
+    pub fn provider_attempt_summary(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        model_turn_ordinal: u32,
+        attempt_count: u32,
+        retry_count: u32,
+        latency_ms: u64,
+    ) -> Self {
+        Self {
+            method: "provider/attempt/summary".to_string(),
+            params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
+                "modelTurnOrdinal": model_turn_ordinal,
+                "attemptCount": attempt_count,
+                "retryCount": retry_count,
+                "latencyMs": latency_ms,
             }),
         }
     }
