@@ -114,7 +114,6 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 output: message.content_text(),
                 is_error: message.is_error.unwrap_or(false),
             }],
-            _ => Vec::new(),
         },
         SessionEntryType::Compaction(compaction) => vec![HistoryItem::Compaction {
             id: entry.id.clone(),
@@ -159,25 +158,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 })
                 .into_iter()
                 .collect(),
-            SessionMetadataKind::Item => Vec::new(),
         },
-        SessionEntryType::ModelChange { provider, model_id } => {
-            vec![HistoryItem::Settings {
-                id: entry.id.clone(),
-                provider: Some(provider.clone()),
-                model: Some(model_id.clone()),
-                reasoning: None,
-            }]
-        }
-        SessionEntryType::ThinkingLevelChange { thinking_level } => {
-            vec![HistoryItem::Settings {
-                id: entry.id.clone(),
-                provider: None,
-                model: None,
-                reasoning: Some(thinking_level.clone()),
-            }]
-        }
-        SessionEntryType::Custom(_) | SessionEntryType::Other(_) => Vec::new(),
     }
 }
 

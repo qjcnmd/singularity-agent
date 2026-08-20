@@ -9,15 +9,13 @@ mod trust;
 pub use cancellation::CancellationToken;
 pub use project_instructions::{
     PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
-    PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES, PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME,
-    ProjectInstructionError, ProjectInstructionErrorCode, ProjectInstructionSource,
+    PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES, ProjectInstructionError, ProjectInstructionErrorCode,
     ProjectInstructions, find_workspace_root, load_project_instructions,
     load_project_instructions_from_cwd,
 };
 pub use trust::user_singularity_home;
 
-/// 创建仅属主可访问的新文件：Unix 上以 0600 创建并收紧；Windows 上按
-/// Pi 策略不做额外 ACL 管理，继承所在目录的 ACL。
+/// 创建仅属主可访问的新文件（在 Unix 系统上以 0600 权限创建）。
 pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     let mut options = OpenOptions::new();

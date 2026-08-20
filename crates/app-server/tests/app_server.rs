@@ -71,57 +71,6 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
 }
 
 #[test]
-fn legacy_project_jsonl_migrates_to_uuid_rollouts_and_cleans_after_verification() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let workspace = dir.path().join("workspace");
-    let legacy = workspace.join(".singularity").join("agent-sessions");
-    std::fs::create_dir_all(&legacy).expect("legacy dir");
-    let session_id = "6f5f53d8-6c3b-4f29-8913-8cbf2d4f3f01";
-    let legacy_file = legacy.join("thread_old.jsonl");
-    let header = json!({
-        "type": "session",
-        "version": 3,
-        "id": session_id,
-        "timestamp": "2026-08-15T00:00:00Z",
-        "cwd": workspace
-    });
-    let legacy_bytes = format!("{header}\n");
-    std::fs::write(&legacy_file, &legacy_bytes).expect("legacy session");
-
-    let home_dir = isolated_home();
-    let home = home_dir.path().to_path_buf();
-    let mut process = spawn(&workspace, &home);
-    process.initialize();
-    process.send_request(3, "thread/list", json!({}));
-    let listed = process.output.recv_id(3, Duration::from_secs(5));
-    assert_eq!(
-        listed["result"]["threads"][0]["thread_id"], session_id,
-        "migrated session must use header UUID"
-    );
-    let migrated = home.join("sessions").join(format!("{session_id}.jsonl"));
-    assert!(migrated.is_file(), "migrated rollout missing");
-    assert_eq!(
-        std::fs::read(&migrated).expect("read migrated"),
-        legacy_bytes.as_bytes()
-    );
-    let backup = std::fs::read_dir(home.join("backups"))
-        .expect("backup dir")
-        .filter_map(Result::ok)
-        .find(|entry| entry.path().is_dir())
-        .expect("migration backup directory")
-        .path();
-    assert_eq!(
-        std::fs::read(backup.join("thread_old.jsonl")).expect("backup file"),
-        legacy_bytes.as_bytes()
-    );
-    assert!(
-        !legacy_file.exists(),
-        "legacy project file must be cleaned after verified migration"
-    );
-    process.shutdown();
-}
-
-#[test]
 fn removed_thread_and_turn_methods_return_stable_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
@@ -169,12 +118,12 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
         .expect("open rollout");
     writeln!(
         file,
-        "{{\"id\":\"e1\",\"parentId\":null,\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"one\"}}]}}}}"
+        "{{\"id\":\"e1\",\"parentId\":null,\"timestamp\":\"2026-08-20T00:00:01.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"one\"}}]}}}}"
     )
     .expect("append entry");
     writeln!(
         file,
-        "{{\"id\":\"e2\",\"parentId\":\"e1\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"two\"}}]}}}}"
+        "{{\"id\":\"e2\",\"parentId\":\"e1\",\"timestamp\":\"2026-08-20T00:00:02.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"two\"}}]}}}}"
     )
     .expect("append entry");
     drop(file);

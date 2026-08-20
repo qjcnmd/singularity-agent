@@ -12,8 +12,8 @@ use singularity_core::ClientInfo;
 use singularity_protocol::{
     AgentCapabilityResult, EmptyParams, InitializeParams, InputItem, JsonRpcId, JsonRpcMessage,
     JsonRpcNotification, Method, RpcMethod, SessionDeleteResult, SessionIdParams,
-    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadStartParams, Turn,
-    TurnStartParams, rpc_methods,
+    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadSettingsParams,
+    ThreadStartParams, Turn, TurnStartParams, rpc_methods,
 };
 
 use crate::render::should_render_assistant_summary;
@@ -176,6 +176,23 @@ impl AppServerClient {
             thread_id: thread_id.to_string(),
         })?;
         Ok(reply.result.thread)
+    }
+
+    pub(super) fn thread_settings(
+        &mut self,
+        thread_id: &str,
+        model: Option<String>,
+    ) -> Result<(), String> {
+        if model.is_none() {
+            return Ok(());
+        }
+        let _ = self.request::<rpc_methods::ThreadSettings>(&ThreadSettingsParams {
+            thread_id: thread_id.to_string(),
+            provider: None,
+            model,
+            reasoning: None,
+        })?;
+        Ok(())
     }
 
     // 读取 AgentLoop capability 快照。

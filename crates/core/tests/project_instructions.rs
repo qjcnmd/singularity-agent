@@ -64,21 +64,6 @@ fn loads_agents_files_from_workspace_root_to_nested_cwd() {
         .expect("instructions present");
 
     assert_eq!(
-        loaded
-            .sources()
-            .iter()
-            .map(|source| source.path.as_str())
-            .collect::<Vec<_>>(),
-        ["AGENTS.md", "crates/AGENTS.md", "crates/agent/AGENTS.md"]
-    );
-    assert!(
-        loaded
-            .sources()
-            .iter()
-            .all(|source| source.content_digest.starts_with("sha256:")
-                && source.content_digest.len() == "sha256:".len() + 64)
-    );
-    assert_eq!(
         loaded.content(),
         "root instructions\n\ncrate instructions\n\nagent instructions"
     );
@@ -99,14 +84,6 @@ fn discovers_git_workspace_root_from_nested_cwd() {
         .expect("discover project instructions")
         .expect("instructions present");
 
-    assert_eq!(
-        loaded
-            .sources()
-            .iter()
-            .map(|source| source.path.as_str())
-            .collect::<Vec<_>>(),
-        ["AGENTS.md", "src/nested/AGENTS.md"]
-    );
     assert_eq!(loaded.content(), "root instructions\n\nnested instructions");
 }
 
@@ -124,7 +101,7 @@ fn missing_agents_files_are_not_an_error() {
 }
 
 #[test]
-fn override_file_wins_once_per_hierarchy_layer() {
+fn override_files_are_ignored() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let cwd = workspace.join("src");
@@ -138,19 +115,11 @@ fn override_file_wins_once_per_hierarchy_layer() {
         .expect("load project instructions")
         .expect("instructions present");
 
-    assert_eq!(loaded.content(), "root override\n\ncwd override");
-    assert_eq!(
-        loaded
-            .sources()
-            .iter()
-            .map(|source| source.path.as_str())
-            .collect::<Vec<_>>(),
-        ["AGENTS.override.md", "src/AGENTS.override.md"]
-    );
+    assert_eq!(loaded.content(), "root ordinary\n\ncwd ordinary");
 }
 
 #[test]
-fn source_digests_change_when_instruction_content_changes() {
+fn instruction_content_changes_are_observed() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let cwd = workspace.join("src");
@@ -166,10 +135,8 @@ fn source_digests_change_when_instruction_content_changes() {
         .expect("load second instructions")
         .expect("second instructions present");
 
-    assert_ne!(
-        first.sources()[0].content_digest,
-        second.sources()[0].content_digest
-    );
+    assert_eq!(first.content(), "first instructions");
+    assert_eq!(second.content(), "second instructions");
 }
 
 #[test]

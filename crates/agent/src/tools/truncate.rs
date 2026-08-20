@@ -1,4 +1,7 @@
-//! 工具输出截断（对齐 Pi `truncateHead`/`truncateTail` 语义）。
+//! 工具输出文本的安全截断算法。
+//!
+//! 提供按行数（最大 2000 行）或按字节数（最大 50KB）对工具返回内容进行有界截断的能力，
+//! 防止超大单次命令输出或大文件读取撑爆模型上下文。
 
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -9,23 +12,23 @@ pub enum TruncatedBy {
     Bytes,
 }
 
-/// 截断结果。`content` 为截断后的文本，其余字段描述截断发生的上下文。
+/// 截断结果结构体。`content` 为截断后的安全文本，其余字段记录截断元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Truncation {
     pub content: String,
     pub truncated: bool,
     pub truncated_by: Option<TruncatedBy>,
-    /// 原始内容的总行数（结尾换行不产生额外空行）。
+    /// 原始内容的总行数（结尾换行不计为额外空行）。
     pub total_lines: usize,
-    /// 截断后保留的行数。
+    /// 截断后实际保留的行数。
     pub output_lines: usize,
-    /// 仅 bash 尾部截断：末尾单行本身超限时返回该行的尾部（半行）。
+    /// 尾部截断场景：末尾单行本身超限时是否只保留了该行的尾部。
     pub last_line_partial: bool,
-    /// 仅 read 头部截断：第一行单独超过字节上限。
+    /// 头部截断场景：首行单独超过字节上限标志。
     pub first_line_exceeds_limit: bool,
 }
 
-/// 人类可读字节大小（对齐 Pi `formatSize`）。
+/// 将字节数格式化为人类可读的容量大小字符串（如 `45.2KB`、`1.5MB`）。
 pub fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
@@ -36,7 +39,7 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
-/// 行列表；空内容返回空，结尾换行不产生额外空行（对齐 Pi `splitLinesForCounting`）。
+/// 将文本按换行切分为行列表；空内容返回空数组，末尾换行不产生多余空行。
 fn split_lines(content: &str) -> Vec<&str> {
     if content.is_empty() {
         return Vec::new();

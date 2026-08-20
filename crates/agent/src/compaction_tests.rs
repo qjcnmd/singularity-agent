@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::SessionMetadata;
 use singularity_model::{ModelTurnResponse, ProviderProtocolContract};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -245,17 +246,16 @@ fn find_cut_point_split_turn_and_keep_boundary() {
 #[test]
 fn find_cut_point_metadata_scan() {
     let (engine, _) = mock_engine(vec![]);
-    // model_change 无上下文消息：切点从 u0（index 1）回扫吸收该元数据条目。
-    let model_change = SessionEntry {
+    // thread_settings 元数据无上下文消息：切点从 u0（index 1）回扫吸收该元数据条目。
+    let thread_settings = SessionEntry {
         id: "m0000001".to_string(),
         parent_id: String::new(),
         timestamp: None,
-        entry_type: SessionEntryType::ModelChange {
-            provider: "openai".to_string(),
-            model_id: "gpt-4o".to_string(),
-        },
+        entry_type: SessionEntryType::Metadata(
+            SessionMetadata::thread_settings("openai", "gpt-4o", None).unwrap(),
+        ),
     };
-    let mut entries = vec![model_change];
+    let mut entries = vec![thread_settings];
     entries.extend(entries_of(vec![
         user("aaaaaaaaaa"),
         assistant("bbbbbbbbbb"),
@@ -292,7 +292,7 @@ fn serialize_conversation_roles_and_truncation() {
         file_call("read", "src/main.rs"),
         tool_result("c1", &long_output),
         AgentMessage {
-            role: AgentMessageRole::BashExecution,
+            role: AgentMessageRole::User,
             content: vec![ContentBlock::Text {
                 text: "ran a command".to_string(),
             }],
@@ -303,7 +303,7 @@ fn serialize_conversation_roles_and_truncation() {
             timestamp: None,
         },
         AgentMessage {
-            role: AgentMessageRole::CompactionSummary,
+            role: AgentMessageRole::User,
             content: vec![ContentBlock::Text {
                 text: "earlier summary".to_string(),
             }],
@@ -321,9 +321,7 @@ fn serialize_conversation_roles_and_truncation() {
     assert!(text.contains(r#"[Assistant tool calls]: read(path="src/main.rs")"#));
     assert!(text.contains("[Tool result]: "));
     assert!(text.contains("[User]: ran a command"));
-    assert!(text.contains(&format!(
-        "{COMPACTION_SUMMARY_PREFIX}earlier summary{COMPACTION_SUMMARY_SUFFIX}"
-    )));
+    assert!(text.contains("[User]: earlier summary"));
     assert!(!text.contains("[User]: \n"), "空 user 内容应跳过");
     // 截断：保留开头 2000 字符并附精确截断标记（2500 - 2000 = 500）。
     assert!(text.contains(&"x".repeat(2000)));
@@ -503,7 +501,7 @@ fn compact_full_flow_and_reopen_slicing() {
     );
 }
 
-/// 5b. split turn：历史摘要 + turn 前缀摘要两次调用，按 Pi 模板合并。
+/// 5b. split turn：历史摘要 + turn 前缀摘要两次调用，合并为完整结构。
 #[test]
 fn compact_split_turn_merges_two_summaries() {
     let dir = tempfile::tempdir().unwrap();
@@ -599,9 +597,9 @@ fn compact_nothing_to_summarize() {
     assert_eq!(lines.len(), 1, "只有一条消息，无 compaction 条目");
 }
 
-/// 6. 摘要 prompt 常量与 Pi 结构一致（抽查关键段落与顺序）。
+/// 6. 摘要 Prompt 常量结构完整性校验（段落与顺序检查）。
 #[test]
-fn summarization_prompts_match_pi_structure() {
+fn summarization_prompts_match_expected_structure() {
     let sections = [
         "## Goal",
         "## Constraints & Preferences",
@@ -621,7 +619,7 @@ fn summarization_prompts_match_pi_structure() {
         SUMMARIZATION_PROMPT
             .contains("Preserve exact file paths, function names, and error messages.")
     );
-    // 段落顺序与 Pi 一致。
+    // 校验段落顺序一致性。
     let positions: Vec<usize> = [
         "## Goal",
         "## Progress",

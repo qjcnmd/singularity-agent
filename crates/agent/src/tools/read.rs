@@ -1,4 +1,4 @@
-//! read 工具：有界流式读取文件内容（可选 offset/limit 行范围），对齐 Pi read 语义。
+//! read 工具：有界流式读取指定文件内容，支持基于 `offset` 与 `limit` 的行范围读取。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -33,7 +33,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
-        execution_mode: super::registry::ToolExecutionMode::Parallel,
         execute,
     }
 }
@@ -124,6 +123,19 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         state.selected_bytes = next_bytes;
     }
     state.total_lines = line_number;
+
+    if line_number == 0 {
+        if offset.is_some_and(|offset| offset > 1) {
+            return error_result(format!(
+                "Offset {} is beyond end of file (0 lines total)",
+                offset.unwrap_or(0)
+            ));
+        }
+        return Ok(ToolExecution {
+            content: String::new(),
+            is_error: false,
+        });
+    }
 
     if start_line >= line_number {
         return error_result(format!(
@@ -322,5 +334,49 @@ mod tests {
             .expect("execute");
         assert!(result.is_error, "content: {}", result.content);
         assert!(result.content.contains("line exceeds"));
+    }
+
+    #[test]
+    fn reads_empty_file_successfully() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").expect("fixture");
+        let result = ToolRegistry::new()
+            .execute("read", context(json!({ "path": "empty.txt" }), dir.path()))
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert_eq!(result.content, "");
+
+        let with_offset_one = ToolRegistry::new()
+            .execute(
+                "read",
+                context(json!({ "path": "empty.txt", "offset": 1 }), dir.path()),
+            )
+            .expect("execute");
+        assert!(
+            !with_offset_one.is_error,
+            "content: {}",
+            with_offset_one.content
+        );
+        assert_eq!(with_offset_one.content, "");
+    }
+
+    #[test]
+    fn reads_empty_file_with_offset_beyond_end_is_error() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").expect("fixture");
+        let result = ToolRegistry::new()
+            .execute(
+                "read",
+                context(json!({ "path": "empty.txt", "offset": 2 }), dir.path()),
+            )
+            .expect("execute");
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .contains("Offset 2 is beyond end of file (0 lines total)")
+        );
     }
 }

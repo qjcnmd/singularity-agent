@@ -1,15 +1,11 @@
-//! Pi 式 Agent 循环（新 headless core，Phase 2d）。
+//! Singularity 核心 Agent 执行循环。
 //!
-//! 语义基线：`@earendil-works/pi-coding-agent` v0.84.1 的 `dist/agent-loop.js`
-//! `runAgentLoop` 双层循环：内层循环处理工具调用与 steer 注入，外层循环在
-//! 代理将要停止时消费 follow-up 队列。会话、compaction、工具与模型边界分别由
-//! `session.rs`/`compaction.rs`/`tools/`/`singularity_model` 提供。
+//! 采用双层状态机循环结构：
+//! - **内层循环**：处理单轮任务执行中的模型流式请求、工具批次安全并发执行、中间引导（Steer）注入与上下文压缩；
+//! - **外层循环**：当模型完成当前阶段工作（返回纯文本且无工具调用）准备收尾时，消费跟进（FollowUp）队列继续执行下一阶段目标。
 //!
-//! 与 Pi 的差异（Phase 2d 简化）：
-//! - 事件回调仅保留文本增量与工具生命周期子集，无完整扩展事件流。
-//! - steer/follow-up 为内存队列（裁决 9：不持久化）。
-//! - provider 流式不可用时回退 `complete`（旧 AgentLoop 同款 fallback）。
-//! - 中断：外部 `CancellationToken` 取消时终止并返回已完成的文本（`aborted=true`）。
+//! 会话状态持久化、上下文压缩、工具注册分发与模型调用分别由
+//! `session.rs`、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -38,26 +34,25 @@ use crate::message::{
 };
 use crate::session::{SessionEntryType, SessionError, SessionManager};
 use crate::tools::{
-    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolExecutionMode, ToolPreflight,
-    ToolRegistry,
+    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
 
-/// 工具开始回调签名：工具名、tool call id、结构化参数。
+/// 工具开始执行时的回调签名：接收工具名称、调用 ID 与结构化参数。
 pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value);
-/// 工具更新回调签名：工具名、tool call id、结构化参数、partial result。
+/// 工具执行输出增量更新时的回调签名：接收工具名称、调用 ID、结构化参数与部分输出文本。
 pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value, &str);
-/// 工具结束回调签名：工具名、tool call id、最终执行结果。
+/// 工具执行结束时的回调签名：接收工具名称、调用 ID 与最终执行结果。
 pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, &ToolExecution);
 
-/// 核心事件回调（Pi 事件集的 Phase 2d 最小子集）。
+/// Agent 运行生命周期事件监听回调集合。
 pub struct AgentEvents<'a> {
-    /// assistant 文本增量。
+    /// 模型流式文本输出增量更新。
     pub on_message_update: Option<&'a mut dyn FnMut(&str)>,
-    /// 工具开始执行（工具名、tool call id、结构化参数）。
+    /// 工具开始执行事件。
     pub on_tool_execution_start: Option<ToolExecutionCallback<'a>>,
-    /// 工具执行中的流式输出增量（工具名、tool call id、参数、partial result）。
+    /// 工具执行中产生的流式增量输出事件。
     pub on_tool_execution_update: Option<ToolExecutionUpdateCallback<'a>>,
-    /// 工具执行结束（工具名、tool call id、最终结果）。
+    /// 工具执行完成事件。
     pub on_tool_execution_end: Option<ToolExecutionEndCallback<'a>>,
 }
 
@@ -88,8 +83,6 @@ pub struct AgentConfig {
     /// 模型静态声明的 context window（compaction 触发预算依据）。
     pub context_window: u64,
     pub max_output_tokens: u64,
-    /// 单次任务允许的最大模型轮数；达到后以轮数预算耗尽结束。
-    pub max_turns: u32,
 }
 
 impl Default for AgentConfig {
@@ -99,7 +92,6 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             context_window: 128_000,
             max_output_tokens: 4_096,
-            max_turns: 50,
         }
     }
 }
@@ -210,32 +202,6 @@ fn execute_prepared_tool(
         Ok(execution) => execution,
         Err(error) => tool_error_execution(error),
     }
-}
-
-fn execute_tool_batch_sequential(
-    registry: &ToolRegistry,
-    calls: &[PreparedToolCall],
-    cwd: &Path,
-    cancellation: &CancellationToken,
-    events: &mut AgentEvents<'_>,
-) -> Vec<ToolExecution> {
-    calls
-        .iter()
-        .map(|item| {
-            let execution = if let Some(execution) = &item.preflight_execution {
-                execution.clone()
-            } else {
-                let prepared = item
-                    .prepared
-                    .expect("prepared tool call must have a preflight result");
-                execute_prepared_tool(registry, prepared, &item.call, cwd, cancellation, |text| {
-                    emit_tool_update(events, &item.call, text);
-                })
-            };
-            emit_tool_end(events, &item.call, &execution);
-            execution
-        })
-        .collect()
 }
 
 fn execute_tool_batch_parallel(
@@ -477,9 +443,6 @@ impl Agent {
                     outcome.aborted = true;
                     return Ok(outcome);
                 }
-                if outcome.turns >= self.config.max_turns {
-                    return Ok(outcome);
-                }
                 // 注入 steer 队列全部消息（作为 user 消息追加到本轮上下文）。
                 let steer_messages = std::mem::take(&mut *lock_queue(&self.steer_queue));
                 for text in steer_messages {
@@ -506,8 +469,7 @@ impl Agent {
                             return Err(AgentError::Provider(error));
                         }
                         context_overflow_retried = true;
-                        // 强制压缩失败时返回原始上下文溢出错误（保留真实因果，
-                        // 与 H4 typed 错误语义一致），不掩盖为压缩错误。
+                        // 强制压缩失败时向上传播原始上下文溢出错误，保留真实失败根因。
                         if self.force_compact(cancellation).is_err() {
                             return Err(AgentError::Provider(error));
                         }
@@ -515,8 +477,7 @@ impl Agent {
                     }
                     Err(error) => return Err(error),
                 };
-                // 非 Success 响应（校验失败 Invalid 等）：typed 传播，不重试
-                // （N3 裁决：瞬时失败只归传输层，循环层不再做整轮重试）。
+                // 非 Success 响应（如校验失败 Invalid 等）：强类型向上传播，不在此层盲目重试。
                 if response.status != ModelTurnStatus::Success {
                     let model_error = response.error.clone().unwrap_or_else(|| {
                         ModelError::new(
@@ -538,8 +499,7 @@ impl Agent {
                     .unwrap_or_default();
                 let tool_calls = response.tool_calls.clone();
                 if !tool_calls.is_empty() {
-                    // 一次模型响应 = 一条 assistant 消息（v4 内容块：thinking +
-                    // 文本 + 全部 tool_call 块，对齐 Pi AssistantMessage.content 数组）。
+                    // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
                     self.session
                         .append_message(assistant_response_message(&response))?;
                     // 查找、参数校验和执行模式判定先按 source order 完成；
@@ -565,28 +525,14 @@ impl Agent {
                     for item in &prepared_calls {
                         emit_tool_start(events, &item.call);
                     }
-                    let sequential = prepared_calls.iter().any(|item| {
-                        item.prepared
-                            .is_some_and(|prepared| prepared.mode == ToolExecutionMode::Sequential)
-                    });
-                    let executions = if sequential {
-                        execute_tool_batch_sequential(
-                            &self.registry,
-                            &prepared_calls,
-                            self.session.cwd(),
-                            cancellation,
-                            events,
-                        )
-                    } else {
-                        execute_tool_batch_parallel(
-                            &self.registry,
-                            &prepared_calls,
-                            self.session.cwd(),
-                            cancellation,
-                            effective_max_parallel_tool_calls,
-                            events,
-                        )
-                    };
+                    let executions = execute_tool_batch_parallel(
+                        &self.registry,
+                        &prepared_calls,
+                        self.session.cwd(),
+                        cancellation,
+                        effective_max_parallel_tool_calls,
+                        events,
+                    );
                     // Durable toolResult entries are always appended in assistant source order,
                     // regardless of completion/event order.
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
@@ -868,20 +814,17 @@ impl Agent {
                     .map_err(AgentError::Provider)
             }
             Err(error) => {
-                // 传输层重试（`MAX_PROVIDER_ATTEMPTS`，对齐 Codex stream 5 次重试）
-                // 已耗尽：typed 传播（N3 单层归属裁决），不再转换为整轮重试。
+                // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
                 Err(AgentError::Provider(error))
             }
         }
     }
 
-    /// 每轮 provider 调用后检查 compaction：budget = context_window +
-    /// Pi 默认 reserve（16384）/keep_recent（20000）；触发则生成摘要并追加
-    /// CompactionEntry（后续上下文经 build_session_context 自动使用新基线）。
+    /// 每轮模型调用后评估是否需要触发上下文压缩。
     ///
-    /// 摘要生成失败（provider 瞬时错误/无效响应）**降级**为记录后继续：已完成的
-    /// assistant 结果已持久化，不应因摘要失败丢弃整轮；会话写入失败（真实存储
-    /// 错误）保持传播。
+    /// 触发条件满足时调用 CompactionEngine 生成历史结构化摘要并追加 CompactionEntry 节点；
+    /// 后续请求将自动以该压缩节点作为上下文构建基线。
+    /// 若摘要模型调用遭遇瞬时错误，降级记录警告并继续会话，避免中断已完成的执行。
     fn maybe_compact(
         &mut self,
         compacted: &mut bool,
@@ -913,8 +856,7 @@ impl Agent {
         Ok(())
     }
 
-    /// 上下文 token 估算（Pi `estimateContextTokens`）：有 usage 时用最近一次
-    /// provider 调用的 total_tokens 加其之后追加消息的估算；否则全量估算。
+    /// 估算当前会话累积的上下文 Token 总量：若存在模型返回的精确 Usage 则基于基线增量累加，否则全量启发式估算。
     fn estimate_context_tokens(&self, last_usage: Option<&ModelUsage>) -> Result<u64> {
         let messages = self.session.build_session_context()?.messages;
         let estimate_all: u64 = messages

@@ -471,8 +471,7 @@ fn initialize_app_server(
     };
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
-    // 收紧本次实际打开并创建的索引文件（Unix 0700 语义；Windows 按 Pi 策略
-    // 由目录 ACL 决定）：显式 SINGULARITY_APP_SERVER_DB 指向的路径同样处理。
+    // 收紧本次实际打开并创建的索引文件权限（在 Unix 系统上应用 0600/0700 权限）。
     if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
         singularity_store::ensure_owner_only_file(Path::new(&db_path)).map_err(|error| {
             format!("failed to enforce owner-only app-server index {db_path}: {error}")
@@ -481,16 +480,6 @@ fn initialize_app_server(
         paths.ensure_index_owner_only()?;
     }
     validate_database_file(Path::new(&db_path), false)?;
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
-    let migrated =
-        singularity_app_server::paths::migrate_legacy_project_sessions(&paths, &store, &cwd)?;
-    if migrated > 0 {
-        eprintln!(
-            "migrated {migrated} legacy project session(s) to {}",
-            paths.sessions_dir.display()
-        );
-    }
     // 启动只读取 JSONL header 建立可用索引；单个损坏 rollout 由 discovery 隔离，
     // 不在这里追加 interrupted 或其它 repair 条目。目标 Session 真正打开时再 repair。
     singularity_app_server::rebuild_session_index_from_jsonl(&store, &paths.sessions_dir)

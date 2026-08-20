@@ -1,4 +1,4 @@
-//! write 工具：写文件（创建/覆盖/自动建父目录），对齐 Pi write 语义。
+//! write 工具：全量创建或覆盖写入指定文件（若父级目录不存在则自动递归创建）。
 
 use std::fs;
 
@@ -25,7 +25,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
-        execution_mode: super::registry::ToolExecutionMode::Parallel,
         execute,
     }
 }

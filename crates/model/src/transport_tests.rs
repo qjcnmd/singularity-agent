@@ -45,8 +45,7 @@ fn selected_provider() -> OpenAiProvider {
         })
 }
 
-/// 请求侧校验：无 reasoning 历史的旧工具消息（如 v3 迁移）允许无绑定 replay；
-/// 只有重复绑定才拒绝（对齐 Pi：无 thinking 块的消息原样发送，不伪造 replay）。
+/// 请求侧校验：对于无推理历史的普通工具调用消息允许无绑定重放，仅拒绝重复冲突绑定。
 #[test]
 fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
     let provider = selected_provider();

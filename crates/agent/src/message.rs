@@ -1,54 +1,41 @@
-//! Pi 式 Agent 消息类型（语义基线：`@earendil-works/pi-coding-agent` v0.84.1 的
-//! `packages/ai/src/types.ts` 与 `dist/core/session-manager.js`）。
+//! 会话消息与内容块数据模型。
 //!
-//! v4 会话格式：assistant 消息的 `content` 是 content block 数组
-//! （Text/Thinking/ToolCall），一次模型响应 = 一条 assistant 消息（对齐 Pi
-//! `AssistantMessage.content: (TextContent|ThinkingContent|ToolCall)[]`）；
-//! 工具结果仍按 `toolCallId` 关联的独立 `toolResult` 消息回写（对齐 Pi
-//! `ToolResultMessage`）。thinking 块随会话持久化，续接时投影为 provider
-//! reasoning replay（N2 裁决）。
+//! 支持富文本内容块（纯文本 `Text`、思考链 `Thinking`、工具调用 `ToolCall`）
+//! 以及工具执行结果 `ToolResult`，确保单次模型交互的完整语义（含推理过程与多工具调用）
+//! 能够精确持久化与协议重放。
 
-/// 可直接交给模型提供方的消息形态，复用 `singularity_model::ModelMessage`，
-/// 避免与旧 AgentLoop 形成第二套 LLM 消息表示。
+/// 交由模型提供方执行的模型层消息类型别名。
 pub type LlmMessage = singularity_model::ModelMessage;
 
 use singularity_model::{ModelTurnResponse, ProviderReasoningReplay};
 
 use crate::tools::ToolExecution;
 
-/// Pi AgentMessage 的 role 枚举。
-///
-/// 序列化为 Pi JSON 使用的 camelCase 小写 role（`user`/`assistant`/`toolResult`/
-/// `bashExecution`/`custom`/`branchSummary`/`compactionSummary`）。
+/// 会话消息角色枚举。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentMessageRole {
+    /// 用户输入消息。
     User,
+    /// 模型助手响应消息。
     Assistant,
+    /// 工具执行结果回填消息。
     ToolResult,
-    BashExecution,
-    Custom,
-    BranchSummary,
-    CompactionSummary,
 }
 
-/// 消息 content 的内容块（对齐 Pi `AssistantMessage.content` 联合类型）。
-///
-/// JSON 判别字段为 `type`：`text` / `thinking` / `tool_call`。
+/// 消息体内的结构化内容块。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    /// 纯文本块（`{"type":"text","text":...}`）。
+    /// 纯文本内容块（`{"type":"text","text":...}`）。
     Text { text: String },
-    /// 推理文本块（`{"type":"thinking","thinking":...,"signature":...}`；
-    /// 对齐 Pi `ThinkingContent{type:"thinking", thinking, signature}`）。
+    /// 思考/推理链内容块（`{"type":"thinking","thinking":...,"signature":...}`）。
     Thinking {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
-    /// 工具调用块（`{"type":"tool_call","id":...,"name":...,"args":...}`；
-    /// 对齐 Pi `ToolCall{id, name, args}`）。
+    /// 工具调用描述块（`{"type":"tool_call","id":...,"name":...,"args":...}`）。
     ToolCall {
         id: String,
         name: String,
@@ -56,41 +43,31 @@ pub enum ContentBlock {
     },
 }
 
-/// Pi 式会话消息 payload。
-///
-/// JSON 字段名对齐 Pi：`role`/`content`/`toolCallId`/`toolName`/`timestamp`。
-/// v4 起 `content` 为 content block 数组；`toolCallId`/`toolName` 仅 toolResult
-/// 消息使用（关联其对应的 assistant tool call）。
+/// 核心会话消息数据结构。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMessage {
     pub role: AgentMessageRole,
     pub content: Vec<ContentBlock>,
-    /// Provider-private continuation captured with an assistant tool-call response.
-    ///
-    /// This field is durable session state, not a user-visible content block.  The
-    /// provider adapter owns its wire interpretation; the agent only carries it
-    /// across reopen and request construction.
+    /// 模型提供方私有推理状态（用于支持 Responses 等协议的推理连续性重放）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_reasoning_replay: Option<ProviderReasoningReplay>,
+    /// 对应的工具调用 ID（仅 ToolResult 角色消息使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 对应的工具名称（仅 ToolResult 角色消息使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
-    /// Whether a persisted tool result represents a tool-level failure.
-    ///
-    /// `None` keeps older session rows wire-compatible; tool results created by
-    /// the current loop always set this explicitly so public history can expose
-    /// the real `isError` value after a restart.
+    /// 工具执行是否失败标志。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-    /// unix 毫秒时间戳，对齐 Pi 消息 timestamp。
+    /// Unix 毫秒时间戳。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
 }
 
 impl AgentMessage {
-    /// 构造纯文本消息（v4 内容块形态）。
+    /// 构造纯文本内容消息。
     pub fn text(role: AgentMessageRole, content: impl Into<String>) -> Self {
         Self {
             role,
@@ -105,7 +82,7 @@ impl AgentMessage {
         }
     }
 
-    /// 拼接全部文本块的纯文本视图（摘要/估算/投影共用）。
+    /// 提取并拼接消息内部所有纯文本块的内容视图。
     pub fn content_text(&self) -> String {
         let mut text = String::new();
         for block in &self.content {
@@ -119,7 +96,7 @@ impl AgentMessage {
         text
     }
 
-    /// 工具调用块列表（assistant 消息；一次响应多条调用都在同一消息内）。
+    /// 获取消息包含的所有工具调用块引用。
     pub fn tool_calls(&self) -> Vec<&ContentBlock> {
         self.content
             .iter()
@@ -127,14 +104,14 @@ impl AgentMessage {
             .collect()
     }
 
-    /// 是否有任何工具调用块。
+    /// 判断消息是否包含至少一个工具调用块。
     pub fn has_tool_calls(&self) -> bool {
         self.content
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     }
 
-    /// thinking 块列表（N2：续接时投影 provider reasoning replay）。
+    /// 获取消息包含的所有思考推理块引用。
     pub fn thinking_blocks(&self) -> Vec<&ContentBlock> {
         self.content
             .iter()
@@ -143,15 +120,10 @@ impl AgentMessage {
     }
 }
 
-/// Pi `COMPACTION_SUMMARY_PREFIX`（messages.js）：compaction 摘要进入 LLM 上下文时的固定前缀。
+/// 压缩摘要节点进入模型上下文时的说明前缀。
 pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-/// Pi `COMPACTION_SUMMARY_SUFFIX`（messages.js）。
+/// 压缩摘要节点进入模型上下文时的闭合后缀。
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
-/// Pi `BRANCH_SUMMARY_PREFIX`（messages.js）。
-pub const BRANCH_SUMMARY_PREFIX: &str =
-    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
-/// Pi `BRANCH_SUMMARY_SUFFIX`（messages.js）。
-pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
 pub(crate) fn user_message(text: &str) -> AgentMessage {
     AgentMessage {

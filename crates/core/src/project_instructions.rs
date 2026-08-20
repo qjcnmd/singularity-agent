@@ -1,19 +1,14 @@
-//! 从 workspace 层级读取并限制项目指令的实现。
+//! 项目级指令文件（`AGENTS.md`）加载与合并模块。
 //!
-//! 信任边界内不再防 symlink（Phase 8b 裁决 7）：使用 `std::fs` 直接读取；
-//! AGENTS.md 无条件逐层加载（root→cwd），不依赖 trust 门控（已删除）。
+//! 支持从工作区根目录（Workspace Root）逐层向下检索至当前工作目录（CWD），
+//! 并按照层级顺序合并指令内容，附加最大单文件（32KB）与总文件大小（64KB）的安全限制。
 
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
 /// 项目指令文件名。
 pub const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
-/// 当前层级可覆盖普通项目指令的文件名。
-pub const PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME: &str = "AGENTS.override.md";
 /// 单个项目指令文件的最大字节数。
 pub const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
 /// 合并项目指令的最大总字节数。
@@ -21,33 +16,17 @@ pub const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 单个项目指令来源的 workspace-relative provenance。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectInstructionSource {
-    /// 相对于 workspace root 的稳定 POSIX 风格路径。
-    pub path: String,
-    /// 文件原始 UTF-8 字节的 SHA-256 摘要。
-    pub content_digest: String,
-}
-
 /// 当前 workspace 读取到的项目指令集合及其可验证来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructions {
     /// 按 workspace root 到 cwd 顺序合并、且唯一发送给模型的正文。
     content: String,
-    /// 按正文合并顺序排列的来源 provenance。
-    sources: Vec<ProjectInstructionSource>,
 }
 
 impl ProjectInstructions {
     /// Returns the model-visible merged instruction text.
     pub fn content(&self) -> &str {
         &self.content
-    }
-
-    /// Returns the ordered workspace-relative provenance records.
-    pub fn sources(&self) -> &[ProjectInstructionSource] {
-        &self.sources
     }
 }
 
@@ -180,25 +159,15 @@ pub fn load_project_instructions(
     }
 
     let mut content = String::new();
-    let mut sources = Vec::new();
+    let mut found = false;
     let mut total_bytes = 0usize;
     for directory in instruction_directories(&workspace_root, &cwd) {
-        let override_relative = directory
-            .relative_path
-            .join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
         let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-        let instruction_file = match read_project_instruction_file(
+        let instruction_file = read_project_instruction_file(
             &directory.dir,
-            PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME,
-            &override_relative,
-        )? {
-            Some(instruction_file) => Some(instruction_file),
-            None => read_project_instruction_file(
-                &directory.dir,
-                PROJECT_INSTRUCTIONS_FILE_NAME,
-                &ordinary_relative,
-            )?,
-        };
+            PROJECT_INSTRUCTIONS_FILE_NAME,
+            &ordinary_relative,
+        )?;
         let Some(instruction_file) = instruction_file else {
             continue;
         };
@@ -223,16 +192,13 @@ pub fn load_project_instructions(
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }
         content.push_str(&instruction_file.text);
-        sources.push(ProjectInstructionSource {
-            path: workspace_relative_path(&instruction_file.relative_path),
-            content_digest: instruction_file.content_digest,
-        });
+        found = true;
     }
 
-    if sources.is_empty() {
+    if !found {
         Ok(None)
     } else {
-        Ok(Some(ProjectInstructions { content, sources }))
+        Ok(Some(ProjectInstructions { content }))
     }
 }
 
@@ -240,7 +206,6 @@ struct ProjectInstructionFile {
     relative_path: PathBuf,
     text: String,
     byte_len: usize,
-    content_digest: String,
 }
 
 /// 待检查指令的目录：`dir` 为绝对路径（读取用），`relative_path` 为 workspace 相对路径（provenance 用）。
@@ -316,7 +281,6 @@ fn read_project_instruction_file(
         ));
     }
     let byte_len = bytes.len();
-    let content_digest = sha256_digest(&bytes);
     let text = String::from_utf8(bytes).map_err(|_| {
         ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::InvalidUtf8,
@@ -327,16 +291,7 @@ fn read_project_instruction_file(
         relative_path: relative_path.to_path_buf(),
         text,
         byte_len,
-        content_digest,
     }))
-}
-
-fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn workspace_relative_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 fn canonicalize_directory(

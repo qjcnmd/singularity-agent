@@ -31,8 +31,7 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             "method": method,
             "params": {"item_id": item_id},
         })),
-        // 工具生命周期事件（N7）：按 Pi 字段投影 toolCallId/toolName/args、
-        // partialResult 与 result。
+        // 工具生命周期事件：投影 toolCallId、toolName、args、partialResult 与 result。
         "tool/execution/start" => {
             let params = serde_json::from_value::<Value>(message.params.clone()).ok();
             let tool_call_id = params

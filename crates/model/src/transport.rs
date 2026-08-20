@@ -1922,9 +1922,8 @@ pub(super) fn provider_error_is_retryable(error: &ProviderError) -> bool {
 }
 
 pub(super) fn http_status_is_retryable(status: u16) -> bool {
-    // 对齐 Pi 重试条件：408（服务器明确返回请求超时）/409/429/5xx。
-    // 注意与客户端挂起超时的区别：客户端 120s 无响应是 fail-fast（不重试），
-    // 408 是服务端明确信号（临时过载，值得重试）。
+    // 可重试的 HTTP 状态码条件：408（服务端请求超时）、429（速率限制）及 5xx（服务端错误）。
+    // 客户端发起的本地传输超时不重试（快速失败），仅当远端服务明确返回瞬时错误时才执行指数退避重试。
     status == HTTP_STATUS_REQUEST_TIMEOUT
         || status == HTTP_STATUS_RATE_LIMITED
         || status >= HTTP_STATUS_INTERNAL_SERVER_ERROR

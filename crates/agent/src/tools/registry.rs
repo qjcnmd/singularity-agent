@@ -179,23 +179,11 @@ fn canonicalize_for_mutation(candidate: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-/// Whether calls from one assistant response may run concurrently.
-///
-/// The default is [`Parallel`](Self::Parallel); a tool opts into `Sequential`
-/// only when its own side effects require whole-call serialization.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ToolExecutionMode {
-    #[default]
-    Parallel,
-    Sequential,
-}
-
 /// Result of the lookup and argument-validation preflight performed before a
 /// tool batch starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedTool {
     pub(crate) name: &'static str,
-    pub(crate) mode: ToolExecutionMode,
 }
 
 /// Preflight either produces an executable tool or a model-visible rejection.
@@ -234,7 +222,6 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
-    pub execution_mode: ToolExecutionMode,
     pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
@@ -249,14 +236,19 @@ impl ToolRegistry {
     /// 创建注册表并注册默认工具（read/bash/edit/write）。
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(read::spec());
-        registry.register(bash::spec());
-        registry.register(edit::spec());
-        registry.register(write::spec());
+        registry.insert_fixed(read::spec());
+        registry.insert_fixed(bash::spec());
+        registry.insert_fixed(edit::spec());
+        registry.insert_fixed(write::spec());
         registry
     }
 
+    fn insert_fixed(&mut self, spec: ToolSpec) {
+        self.tools.insert(spec.name, spec);
+    }
+
     /// 注册工具。重复名称是编程错误，直接 panic（调用方必须使用唯一名称）。
+    #[cfg(test)]
     pub fn register(&mut self, spec: ToolSpec) {
         if self.tools.contains_key(spec.name) {
             panic!("tool already registered: {}", spec.name);
@@ -299,10 +291,7 @@ impl ToolRegistry {
                 is_error: true,
             }));
         }
-        Ok(ToolPreflight::Ready(PreparedTool {
-            name: spec.name,
-            mode: spec.execution_mode,
-        }))
+        Ok(ToolPreflight::Ready(PreparedTool { name: spec.name }))
     }
 
     /// Execute a call that has already passed [`Self::preflight`].
@@ -330,8 +319,7 @@ pub(crate) fn error_result(message: impl Into<String>) -> Result<ToolExecution, 
     })
 }
 
-/// 相对路径绑定到会话工作区，绝对路径原样使用。
-/// 本层不做 workspace 边界约束（Phase 3 的沙箱/权限范围）。
+/// 相对路径解析绑定到当前工作区目录，绝对路径保持原样。
 pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
@@ -341,8 +329,8 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// 按 JSON Schema（properties/required/type）做最小校验，对齐 Pi `validateToolArguments`
-/// 语义：缺必填参数、类型不匹配、未知参数都视为参数校验失败。
+/// 依据工具定义的 JSON Schema（properties / required / type）进行参数合法性校验。
+/// 缺少必填参数、参数类型不匹配或出现未知未声明参数均作为校验错误拦截。
 fn validate_arguments(parameters: &Value, args: &Value) -> Result<(), String> {
     let Some(object) = args.as_object() else {
         return Err("tool arguments must be a JSON object".to_string());
@@ -402,7 +390,6 @@ mod tests {
             name: "ping",
             description: "custom test tool",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
-            execution_mode: ToolExecutionMode::Parallel,
             execute: ping_execute,
         }
     }

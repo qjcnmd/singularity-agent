@@ -1,7 +1,7 @@
 use super::*;
 use crate::message::AgentMessage;
 use crate::session::{CompactionEntry, SessionEntryType};
-use crate::tools::{ToolExecutionMode, ToolSpec};
+use crate::tools::ToolSpec;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,8 +13,6 @@ use singularity_model::{ModelToolCall, ModelToolParseStatus, ProviderStreamingCa
 static PARALLEL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static PARALLEL_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static PARALLEL_TEST_LOCK: Mutex<()> = Mutex::new(());
-static SEQUENTIAL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static SEQUENTIAL_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 fn record_max(maximum: &AtomicUsize, value: usize) {
     let mut current = maximum.load(Ordering::SeqCst);
@@ -80,22 +78,6 @@ fn counted_delay_execute(
     })
 }
 
-fn sequential_execute(ctx: ExecuteContext<'_>) -> std::result::Result<ToolExecution, ToolError> {
-    let id = ctx
-        .args
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let active = SEQUENTIAL_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
-    record_max(&SEQUENTIAL_MAX_ACTIVE, active);
-    std::thread::sleep(Duration::from_millis(25));
-    SEQUENTIAL_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-    Ok(ToolExecution {
-        content: id.to_string(),
-        is_error: false,
-    })
-}
-
 fn failure_execute(_ctx: ExecuteContext<'_>) -> std::result::Result<ToolExecution, ToolError> {
     Ok(ToolExecution {
         content: "intentional tool failure".to_string(),
@@ -121,7 +103,6 @@ fn cancellation_execute(ctx: ExecuteContext<'_>) -> std::result::Result<ToolExec
 
 fn custom_spec(
     name: &'static str,
-    mode: ToolExecutionMode,
     execute: for<'a> fn(ExecuteContext<'a>) -> std::result::Result<ToolExecution, ToolError>,
     parameters: Value,
 ) -> ToolSpec {
@@ -129,7 +110,6 @@ fn custom_spec(
         name,
         description: "parallelism test tool",
         parameters,
-        execution_mode: mode,
         execute,
     }
 }
@@ -934,7 +914,6 @@ fn parallel_tool_batch_overlaps_and_preserves_source_order() {
     let mut registry = ToolRegistry::new();
     registry.register(custom_spec(
         "overlap",
-        ToolExecutionMode::Parallel,
         counted_delay_execute,
         delay_parameters(),
     ));
@@ -1037,7 +1016,6 @@ fn parallel_tool_batch_respects_provider_concurrency_limit() {
     let mut registry = ToolRegistry::new();
     registry.register(custom_spec(
         "overlap",
-        ToolExecutionMode::Parallel,
         counted_delay_execute,
         delay_parameters(),
     ));
@@ -1089,7 +1067,6 @@ fn preflight_rejection_does_not_consume_parallel_worker_slot() {
     let mut registry = ToolRegistry::new();
     registry.register(custom_spec(
         "overlap",
-        ToolExecutionMode::Parallel,
         counted_delay_execute,
         delay_parameters(),
     ));
@@ -1131,67 +1108,12 @@ fn preflight_rejection_does_not_consume_parallel_worker_slot() {
 }
 
 #[test]
-fn sequential_tool_forces_the_whole_batch_to_run_in_order() {
-    SEQUENTIAL_ACTIVE.store(0, Ordering::SeqCst);
-    SEQUENTIAL_MAX_ACTIVE.store(0, Ordering::SeqCst);
-    let dir = tempfile::tempdir().unwrap();
-    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let mut registry = ToolRegistry::new();
-    registry.register(custom_spec(
-        "serial",
-        ToolExecutionMode::Sequential,
-        sequential_execute,
-        delay_parameters(),
-    ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
-    let provider = Arc::new(FakeProvider::new(
-        contract,
-        vec![
-            FakeStep {
-                text: String::new(),
-                tool_calls: vec![
-                    tool_call("serial_a", "serial", json!({ "id": "a" })),
-                    tool_call("serial_b", "serial", json!({ "id": "b" })),
-                ],
-                usage: usage(50, 10),
-            },
-            FakeStep {
-                text: "done".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(100, 20),
-            },
-        ],
-    ));
-    let mut agent =
-        Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
-    let mut ends = Vec::new();
-    let mut on_end = |_: &str, id: &str, _: &ToolExecution| ends.push(id.to_string());
-    let mut events = AgentEvents::new();
-    events.on_tool_execution_end = Some(&mut on_end);
-    agent
-        .run("sequential", &mut events, &CancellationToken::new())
-        .unwrap();
-    assert_eq!(SEQUENTIAL_MAX_ACTIVE.load(Ordering::SeqCst), 1);
-    assert_eq!(ends, vec!["serial_a", "serial_b"]);
-    let requests = provider.requests.lock().unwrap();
-    let ids = requests[1]
-        .messages
-        .iter()
-        .filter(|message| message.role == ModelRole::Tool)
-        .filter_map(|message| message.tool_call_id.as_deref())
-        .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["serial_a", "serial_b"]);
-}
-
-#[test]
 fn tool_failure_does_not_drop_other_parallel_results() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let mut registry = ToolRegistry::new();
     registry.register(custom_spec(
         "fail",
-        ToolExecutionMode::Parallel,
         failure_execute,
         json!({
             "type": "object",
@@ -1200,12 +1122,7 @@ fn tool_failure_does_not_drop_other_parallel_results() {
             "additionalProperties": false
         }),
     ));
-    registry.register(custom_spec(
-        "delay",
-        ToolExecutionMode::Parallel,
-        delay_execute,
-        delay_parameters(),
-    ));
+    registry.register(custom_spec("delay", delay_execute, delay_parameters()));
     let mut contract = fake_contract();
     contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
@@ -1260,7 +1177,6 @@ fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
     let mut registry = ToolRegistry::new();
     registry.register(custom_spec(
         "cancel_wait",
-        ToolExecutionMode::Parallel,
         cancellation_execute,
         json!({
             "type": "object",
@@ -1485,36 +1401,6 @@ fn steer_handle_injects_during_run() {
             .iter()
             .any(|message| message.content == "steer during run")
     );
-}
-
-/// 5. max_turns 上限：达到后终止，不再发起 provider 调用。
-#[test]
-fn default_max_turns_is_fifty() {
-    assert_eq!(AgentConfig::default().max_turns, 50);
-}
-
-#[test]
-fn max_turns_stops_the_loop() {
-    let (mut agent, _dir, provider) = setup(vec![
-        FakeStep {
-            text: String::new(),
-            tool_calls: vec![tool_call("call_1", "bash", json!({ "command": "echo a" }))],
-            usage: usage(10, 5),
-        },
-        FakeStep {
-            text: String::new(),
-            tool_calls: vec![tool_call("call_2", "bash", json!({ "command": "echo b" }))],
-            usage: usage(10, 5),
-        },
-    ]);
-    agent.config.max_turns = 2;
-    let outcome = agent
-        .run("go", &mut AgentEvents::new(), &CancellationToken::new())
-        .unwrap();
-    assert_eq!(outcome.turns, 2);
-    // 两条脚本全部消费；若循环试图第三轮会因脚本耗尽而报错。
-    assert_eq!(provider.requests.lock().unwrap().len(), 2);
-    assert_eq!(outcome.final_text, "");
 }
 
 /// 6. 会话落盘：run 后 session 文件可重开，消息完整（树链正确）。

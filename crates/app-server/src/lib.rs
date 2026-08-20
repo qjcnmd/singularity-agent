@@ -117,7 +117,7 @@ impl fmt::Display for TurnFailureStage {
     }
 }
 
-/// provider/模型边界失败的具体类别（对齐 Codex `TurnError` 粒度）。
+/// 模型提供方及调用边界失败的具体分类枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailureKind {
     RateLimited,

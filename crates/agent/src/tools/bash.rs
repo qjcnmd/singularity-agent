@@ -1,15 +1,10 @@
-//! bash 工具：进程内执行 shell 命令（对齐 Pi bash 语义）。
+//! bash 工具：在当前工作目录下执行 Shell 命令行指令。
 //!
-//! - 默认超时 120 秒（`timeout_ms` 缺省时生效），超时后杀进程树并返回错误；
-//!   模型可显式传 `timeout_ms` 覆盖（长命令）。默认超时是信任边界安全网：
-//!   无界命令（如全盘 `find`）若无线索约束会永久挂起并阻塞整个 turn。
-//! - stdout+stderr 合并；输出截断到**最后** 2000 行/50KB（保留尾部），超限时把完整输出
-//!   写入系统临时目录（`bash-<uuid>.log`），内容尾部附 `[Full output: <path>]` 说明。
-//! - 中断信号（`CancellationToken`）到达时杀进程树并返回 "Command aborted"。
-//! - 非 0 退出码 → is_error，内容附 "Command exited with code N"。
-//! - Windows 上 spawn 前清除本进程 stdout/stderr 句柄的继承位：否则子进程树（含
-//!   强杀后的残留孙进程）会继承并直写本进程的 stdout 管道，非 UTF-8 字节会破坏
-//!   JSON-RPC 流（CLI 报 "stream did not contain valid UTF-8"）。
+//! - **超时控制**：默认超时 120 秒（支持参数 `timeout_ms` 覆盖，硬上限 600 秒）；超时后自动强制终止整棵子进程树并返回超时错误。
+//! - **输出流式捕获与截断**：标准输出（stdout）与标准错误（stderr）合并捕获；结果输出保留尾部最后 2000 行 / 50KB；
+//!   超出部分自动完整转储至系统临时文件（`bash-<uuid>.log`），并在返回结果尾部附带日志路径提示。
+//! - **中断处理**：收到外部取消信号（`CancellationToken`）时立即终止进程树并返回 `Command aborted`。
+//! - **进程隔离与管道保护**：在 Windows 上启动子进程前清除句柄继承标志，避免残留子进程直写 stdout 管道破坏 JSON-RPC 流。
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -21,19 +16,70 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // 唯一 unsafe 模块：单次 SetHandleInformation 调用（见模块注释）。
-mod handle_inheritance {
+#[allow(unsafe_code, clippy::upper_case_acronyms)] // Windows 平台底层进程与作业对象管理。
+mod windows_process {
+    use std::ffi::c_void;
     use std::os::windows::io::{AsRawHandle, RawHandle};
+    use std::ptr;
+
+    type HANDLE = *mut c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    #[repr(C)]
+    struct IO_COUNTERS {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: DWORD,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: DWORD,
+        affinity: usize,
+        priority_class: DWORD,
+        scheduling_class: DWORD,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        io_info: IO_COUNTERS,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_limit: usize,
+        peak_job_memory_limit: usize,
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x0000_2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const HANDLE_FLAG_INHERIT: DWORD = 0x0000_0001;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn SetHandleInformation(h_object: RawHandle, dw_mask: u32, dw_flags: u32) -> i32;
+        fn SetHandleInformation(h_object: RawHandle, dw_mask: DWORD, dw_flags: DWORD) -> BOOL;
+        fn CreateJobObjectW(lp_job_attributes: *const c_void, lp_name: *const u16) -> HANDLE;
+        fn SetInformationJobObject(
+            h_job: HANDLE,
+            job_object_information_class: i32,
+            lp_job_object_information: *const c_void,
+            cb_job_object_information_length: DWORD,
+        ) -> BOOL;
+        fn AssignProcessToJobObject(h_job: HANDLE, h_process: RawHandle) -> BOOL;
+        fn TerminateJobObject(h_job: HANDLE, u_exit_code: u32) -> BOOL;
+        fn CloseHandle(h_object: HANDLE) -> BOOL;
     }
 
-    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-
     /// 清除 stdout/stderr 句柄的继承位，防止 spawn 时子进程（及孙进程）继承并
-    /// 直写本进程的 stdout/stderr 管道（见模块注释）。尽力而为：句柄无效时忽略。
+    /// 直写本进程的 stdout/stderr 管道。尽力而为：句柄无效时忽略。
     pub(super) fn deny_inherit_std_streams() {
         for handle in [
             std::io::stdout().as_raw_handle(),
@@ -41,6 +87,58 @@ mod handle_inheritance {
         ] {
             unsafe {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+
+    /// Windows 作业对象（Job Object）RAII 保护结构体。
+    ///
+    /// 绑定至此 Job Object 的子进程及其派生的所有孙进程，在 Job 关闭或主动终止时，
+    /// 将由 Windows NT 内核强制、原子地全部终止，防止孤儿孙进程逃逸或文件句柄泄漏。
+    pub(super) struct JobObjectGuard {
+        handle: HANDLE,
+    }
+
+    impl JobObjectGuard {
+        /// 创建并配置一个新的私有 Job Object，启用 `KILL_ON_JOB_CLOSE` 限制。
+        pub(super) fn new() -> Option<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(ptr::null(), ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let res = SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+                );
+                if res == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                Some(Self { handle })
+            }
+        }
+
+        /// 将子进程句柄关联加入到此 Job Object 中。
+        pub(super) fn assign_process(&self, process_handle: RawHandle) -> bool {
+            unsafe { AssignProcessToJobObject(self.handle, process_handle) != 0 }
+        }
+
+        /// 主动强制终止 Job Object 内的所有进程。
+        pub(super) fn terminate(&self, exit_code: u32) -> bool {
+            unsafe { TerminateJobObject(self.handle, exit_code) != 0 }
+        }
+    }
+
+    impl Drop for JobObjectGuard {
+        fn drop(&mut self) {
+            unsafe {
+                // 关闭句柄；若启用了 KILL_ON_JOB_CLOSE，操作系统内核会自动清理该 Job 内的所有进程。
+                CloseHandle(self.handle);
             }
         }
     }
@@ -53,22 +151,18 @@ use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail,
 };
 
-/// 内部保留缓冲上限：2×50KB（对齐 Pi `maxOutputBytes`），防止单条超大输出撑爆内存；
-/// 超过该上限的部分只存在于完整输出临时文件。
+/// 内存中保留的尾部缓冲区字节上限（100KB），防止超大单行输出耗尽内存。
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
-/// Reader-to-capture queue bound. The main loop drains it continuously; a
-/// bounded queue prevents a fast producer from turning command output into an
-/// unbounded in-memory backlog while preserving the full-output spill path.
+/// 输出分块读取管道的容量上限。
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
-/// 完整输出临时文件名的随机后缀。
+/// 完整输出转储临时文件的前缀与后缀。
 const FULL_OUTPUT_FILE_PREFIX: &str = "bash-";
 const FULL_OUTPUT_FILE_SUFFIX: &str = ".log";
 
-// 数字与 truncate::DEFAULT_MAX_LINES/DEFAULT_MAX_BYTES 保持一致（与 Pi 描述文本等价）。
-/// 命令默认超时：模型未显式传 `timeout_ms` 时的安全网，防止无界命令永久挂起。
+/// 命令执行默认超时时间（120 秒）。
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// 命令超时硬上限：显式 `timeout_ms` 也不能让单条命令超过 10 分钟。
+/// 命令执行最大允许超时时间（600 秒 / 10 分钟）。
 pub(crate) const MAX_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Commands time out after 120 seconds by default; provide timeout_ms to override.";
 
@@ -94,7 +188,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
-        execution_mode: super::registry::ToolExecutionMode::Parallel,
         execute,
     }
 }
@@ -138,7 +231,10 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         Err(error) => return error_result(error),
     };
     #[cfg(windows)]
-    handle_inheritance::deny_inherit_std_streams();
+    windows_process::deny_inherit_std_streams();
+    #[cfg(windows)]
+    let job_guard = windows_process::JobObjectGuard::new();
+
     let mut command = Command::new(&shell);
     command
         .args(&shell_args)
@@ -157,6 +253,12 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             return error_result(format!("failed to spawn shell {shell}: {error}"));
         }
     };
+    #[cfg(windows)]
+    if let Some(guard) = &job_guard {
+        use std::os::windows::io::AsRawHandle;
+        guard.assign_process(child.as_raw_handle());
+    }
+
     let stdout = child.stdout.take().expect("bash stdout is piped");
     let stderr = child.stderr.take().expect("bash stderr is piped");
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
@@ -175,19 +277,31 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         if let Some(signal) = signal
             && signal.is_cancelled()
         {
-            kill_process_tree(&mut child);
+            kill_process_tree(
+                &mut child,
+                #[cfg(windows)]
+                job_guard.as_ref(),
+            );
             outcome = BashOutcome::Aborted;
             exit_status = wait_for_exit(&mut child);
             break;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            kill_process_tree(&mut child);
+            kill_process_tree(
+                &mut child,
+                #[cfg(windows)]
+                job_guard.as_ref(),
+            );
             outcome = BashOutcome::TimedOut(timeout);
             exit_status = wait_for_exit(&mut child);
             break;
         }
         if state.capture_error.is_some() {
-            kill_process_tree(&mut child);
+            kill_process_tree(
+                &mut child,
+                #[cfg(windows)]
+                job_guard.as_ref(),
+            );
             let _ = child.wait();
             break;
         }
@@ -198,7 +312,11 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             }
             Ok(None) => {}
             Err(error) => {
-                kill_process_tree(&mut child);
+                kill_process_tree(
+                    &mut child,
+                    #[cfg(windows)]
+                    job_guard.as_ref(),
+                );
                 let _ = child.wait();
                 return error_result(format!("failed to wait for child process: {error}"));
             }
@@ -241,7 +359,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             is_error = true;
         }
         BashOutcome::Completed => match exit_status.and_then(|status| status.code()) {
-            // Pi 语义：exitCode 不可得（例如外部终止）时不视为失败。
+            // 进程正常结束（退出码为 0 或不可得时判定为成功）。
             Some(0) | None => {
                 if content.is_empty() {
                     content = "(no output)".to_string();
@@ -279,7 +397,7 @@ enum BashOutcome {
     TimedOut(u64),
 }
 
-/// 读取管道字节，清洗控制字符、去掉 `\r`，分块送入 channel（Pi `onChunk` 语义）。
+/// 从管道读取字节流，过滤控制字符并按块发送至通道。
 fn pump_output(mut reader: impl Read + Send + 'static, sender: mpsc::SyncSender<String>) {
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -297,8 +415,7 @@ fn pump_output(mut reader: impl Read + Send + 'static, sender: mpsc::SyncSender<
     }
 }
 
-/// 过滤控制字符（保留 `\t`、`\n`、`\r`），对齐 Pi `sanitizeBinaryOutput`；
-/// 其余字节按 UTF-8 解码，非法序列替换为 U+FFFD。
+/// 过滤不可见的控制字符（保留 `\t`、`\n`、`\r`），其余字节按 UTF-8 进行安全解码。
 fn sanitize_binary_output(bytes: &[u8]) -> String {
     let mut cleaned = Vec::with_capacity(bytes.len());
     for &byte in bytes {
@@ -339,9 +456,9 @@ fn drain<'a>(
     readers_ended
 }
 
-/// 选择执行 shell（对齐 Pi `getShellConfig`）：Windows 只接受已发现的 Git Bash 或
-/// PATH 上的 bash；缺失时返回配置错误，绝不以 `cmd /C` 伪装 Bash。Unix 优先 `/bin/bash`，
-/// 否则继续使用 `sh -c` 兼容现有行为。
+/// 根据宿主系统环境选择合适的 Shell 执行命令：
+/// Windows 严格使用发现的 Git Bash 或 PATH 中的 bash.exe（绝不回退至 cmd.exe）；
+/// Unix 环境优先使用 `/bin/bash`，回退使用 `sh`。
 fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
     #[cfg(windows)]
     {
@@ -396,26 +513,22 @@ fn find_bash_on_windows() -> Option<String> {
         .find(|candidate| Path::new(candidate).is_file())
 }
 
-/// 杀进程树：Windows 用 `taskkill /T /F`，Unix 终止创建时绑定的进程组；
-/// 最后以 `Child::kill` 兜底，保证 shell 本身也会被回收。
-fn kill_process_tree(child: &mut Child) {
+/// 终止进程树：
+/// - Windows：通过内核级 Job Object 强制连带原子终止所有子孙进程；
+/// - Unix：向创建时绑定的独立进程组广播 SIGKILL；
+/// - 最后统一调用 `Child::kill` 确保主进程句柄状态收敛。
+fn kill_process_tree(
+    child: &mut Child,
+    #[cfg(windows)] job: Option<&windows_process::JobObjectGuard>,
+) {
     #[cfg(windows)]
     {
-        let pid = child.id();
-        // taskkill 自身绝不能向 app-server 的 stdio JSON-RPC 流写任何输出：
-        // stdout/stderr 全部指向 null，避免中断时污染协议帧。
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Some(job) = job {
+            job.terminate(1);
+        }
     }
     #[cfg(unix)]
     {
-        // `CommandExt::process_group(0)` makes the shell the process-group
-        // leader. A negative pid targets that group, including descendants,
-        // without relying on a process-tree enumeration race.
         let pid = child.id().to_string();
         let _ = Command::new("kill")
             .args(["-KILL", &format!("-{pid}")])
@@ -518,7 +631,7 @@ impl CaptureState {
         Ok(())
     }
 
-    /// 最终展示文本 + 截断说明（对齐 Pi `createProgress` 与 bash.js 的 note 拼接）。
+    /// 生成最终的展示文本与截断说明信息。
     fn final_progress(&self) -> BashProgress {
         let tail_result = truncate_tail(&self.tail);
         let total_lines = self.total_lines();
@@ -770,11 +883,42 @@ mod tests {
             "content: {}",
             result.content
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "cancellation did not return promptly: {:?}",
-            started.elapsed()
+            elapsed < Duration::from_secs(5),
+            "cancellation must terminate promptly, took {elapsed:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_object_guard_lifecycle() {
+        use std::os::windows::io::AsRawHandle;
+        use std::process::Command;
+
+        let guard = windows_process::JobObjectGuard::new();
+        assert!(
+            guard.is_some(),
+            "JobObjectGuard creation must succeed on Windows"
+        );
+        let guard = guard.unwrap();
+
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 10 127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn test process");
+
+        let assigned = guard.assign_process(child.as_raw_handle());
+        assert!(assigned, "assigning process to job object must succeed");
+
+        let terminated = guard.terminate(1);
+        assert!(terminated, "terminating job object must succeed");
+
+        let status = child.wait().expect("wait child");
+        assert!(!status.success(), "terminated process must not be success");
     }
 
     #[cfg(windows)]

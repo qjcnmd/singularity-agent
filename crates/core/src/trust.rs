@@ -1,7 +1,4 @@
-//! 用户级 singularity 数据目录解析。
-//!
-//! 项目信任链（trust.json / TrustDecisions / resolve_project_trusted）已随
-//! H2 裁决删除：AGENTS.md 与 Pi 一致无条件逐层加载，不再做 trust 门控。
+//! 用户主目录与数据根目录解析模块。
 
 use std::path::PathBuf;
 

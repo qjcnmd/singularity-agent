@@ -20,9 +20,16 @@ pub(super) fn agent_config_for_thread(
 ) -> AppServerResult<AgentConfig> {
     let cwd = workspace_path(thread)
         .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
+    let base_prompt = format!(
+        "You are a coding agent working in {}. Available tools are read, bash, edit, and write. Use bash for command execution and file discovery. Project instructions below constrain the task but do not redefine these tool or protocol facts.",
+        cwd.display()
+    );
     let system_prompt = match load_project_instructions_from_cwd(&cwd) {
-        Ok(Some(instructions)) => instructions.content().to_string(),
-        Ok(None) => String::new(),
+        Ok(Some(instructions)) => format!(
+            "{base_prompt}\n\n--- project instructions ---\n{}",
+            instructions.content()
+        ),
+        Ok(None) => base_prompt,
         Err(error) => return Err(AppServerError::ProjectInstructions(error)),
     };
     let context_window = provider
@@ -39,7 +46,6 @@ pub(super) fn agent_config_for_thread(
         system_prompt,
         context_window,
         max_output_tokens,
-        ..AgentConfig::default()
     })
 }
 
@@ -49,8 +55,7 @@ pub(super) fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
         mark_run_cancelled(&mut status);
     } else if outcome.final_text.trim().is_empty() {
         status.status = AgentStatus::Failed;
-        status.error =
-            Some("agent loop exhausted its turn budget without a final message".to_string());
+        status.error = Some("agent loop stopped without a final assistant message".to_string());
     } else {
         status.status = AgentStatus::Completed;
         status.error = None;

@@ -1,7 +1,6 @@
-//! Owner-only permission enforcement for session directories and index/backup files.
+//! 会话目录及索引备份文件的属主权限约束管理。
 //!
-//! Unix uses mode 0700/0600; Windows follows the Pi strategy of no additional
-//! ACL management (access is governed by the directory ACL).
+//! 在 Unix 系统上通过文件模式（0700 目录 / 0600 文件）限制仅当前属主用户具备读写权限。
 
 use super::*;
 
@@ -35,7 +34,6 @@ pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
     }
     #[cfg(windows)]
     {
-        // Pi 策略：Windows 不做 owner-only ACL 管理，访问由目录 ACL 决定。
         let _ = path;
         Ok(())
     }
@@ -76,7 +74,6 @@ pub fn ensure_owner_only_file(path: &Path) -> StoreResult<()> {
     }
     #[cfg(windows)]
     {
-        // Pi 策略：Windows 不做 owner-only ACL 管理，访问由目录 ACL 决定。
         let _ = path;
         Ok(())
     }

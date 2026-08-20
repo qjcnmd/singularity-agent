@@ -1,9 +1,9 @@
-//! edit 工具：单文件精确文本替换（对齐 Pi edit 语义）。
+//! edit 工具：单文件精确文本块替换。
 //!
-//! - 参数 path/oldString/newString（本规格定稿的参数名）；oldString 必须在文件中恰好
-//!   匹配一次，否则 is_error（不匹配 / 多匹配都拒绝）。
-//! - 保留 BOM 与原始换行风格（CRLF/LF）；匹配在 LF 归一化空间进行。
-//! - 返回替换摘要 + unified patch 文本。
+//! - **唯一性匹配约束**：入参包含 `path`、`oldString` 与 `newString`；`oldString` 必须在目标文件中严格唯一匹配一次，
+//!   若未找到匹配或匹配到多个位置，均返回明确错误并拒绝修改。
+//! - **编码与换行符保持**：自动识别并保留文件原始的 UTF-8 BOM 以及换行符风格（CRLF / LF）；匹配计算统一在 LF 归一化空间中执行。
+//! - **变更补丁反馈**：修改成功后返回替换统计摘要以及 Unified Diff 格式的补丁文本供模型核对。
 
 use std::fmt::Write as _;
 use std::fs;
@@ -32,7 +32,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "edit",
         description: DESCRIPTION,
         parameters: parameters(),
-        execution_mode: super::registry::ToolExecutionMode::Parallel,
         execute,
     }
 }
@@ -109,7 +108,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     })
 }
 
-/// 去掉 UTF-8 BOM，返回 BOM 与正文（对齐 Pi `stripBom`）。
+/// 分离 UTF-8 BOM 头，返回 BOM 前缀与文件文本正文。
 fn strip_bom(content: &str) -> (String, String) {
     if let Some(text) = content.strip_prefix('\u{FEFF}') {
         ("\u{FEFF}".to_string(), text.to_string())
@@ -118,7 +117,7 @@ fn strip_bom(content: &str) -> (String, String) {
     }
 }
 
-/// 检测原始换行风格：先出现的换行类型为准（对齐 Pi `detectLineEnding`）。
+/// 检测文件原始换行符风格（以首个出现的换行类型为准）。
 fn detect_line_ending(content: &str) -> &'static str {
     let crlf = content.find("\r\n");
     let lf = content.find('\n');
@@ -128,12 +127,12 @@ fn detect_line_ending(content: &str) -> &'static str {
     }
 }
 
-/// 统一为 LF（对齐 Pi `normalizeToLF`）。
+/// 将文本中的换行符统一归一化为 LF。
 fn normalize_to_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// 恢复原始换行风格（对齐 Pi `restoreLineEndings`）。
+/// 按照原始换行风格还原文本中的换行符。
 fn restore_line_endings(text: &str, ending: &str) -> String {
     if ending == "\r\n" {
         text.replace('\n', "\r\n")
@@ -142,8 +141,7 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
-/// 单块替换的 unified patch 文本（context 4 行），供模型阅读（对齐 Pi
-/// `generateUnifiedPatch` 的展示目的；不处理 "\ No newline at end of file" 标记）。
+/// 生成单文本块修改前后的 Unified Diff 补丁展示文本（包含前后各 4 行上下文）。
 fn generate_patch(path: &str, old_content: &str, new_content: &str) -> String {
     const CONTEXT_LINES: usize = 4;
     let old_lines: Vec<&str> = old_content.split('\n').collect();

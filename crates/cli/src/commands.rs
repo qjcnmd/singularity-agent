@@ -93,13 +93,24 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Continue {
             thread_id,
             instruction,
+            model,
+            json,
         } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             let _thread = client.thread_resume(&thread_id)?;
-            println!("thread {thread_id}");
-            let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
+            client.thread_settings(&thread_id, model)?;
+            if !json {
+                println!("thread {thread_id}");
+            }
+            let (turn, events) = client.turn_start(&thread_id, &instruction, !json)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({"thread": {"thread_id": thread_id}, "turn": turn, "events": protocol_events(events)})
+                );
+            }
             fail_for_failed_turn(&turn)?;
             Ok(())
         }
@@ -193,18 +204,5 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         },
-        Command::Eval {
-            config,
-            tasks,
-            models,
-            max_parallel,
-            timeout_secs,
-        } => eval::run_eval(
-            config,
-            tasks.as_deref(),
-            models.as_deref(),
-            max_parallel,
-            timeout_secs,
-        ),
     }
 }

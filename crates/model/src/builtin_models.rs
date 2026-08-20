@@ -1,8 +1,7 @@
-//! 内置模型静态能力表（Pi 式声明）。
+//! 内置常见模型静态能力表。
 //!
-//! 这张表只提供当前配置缺省时仍需要的协议、context window、输出上限和
-//! reasoning 能力；用户 config.json 或 SINGULARITY_MODELS_CONFIG 的显式
-//! capability 声明始终优先。价格和汇率不属于可靠 usage 事实，因此不在表中维护。
+//! 在用户未显式配置特定模型参数时，提供默认的协议类型、上下文窗口（Context Window）、
+//! 最大输出 Token 上限与推理能力（Reasoning）标志。用户配置中声明的模型参数具有更高优先级。
 
 /// 一个内置模型静态能力条目。
 #[derive(Debug, Clone, Copy, PartialEq)]

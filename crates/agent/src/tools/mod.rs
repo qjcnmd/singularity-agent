@@ -1,8 +1,8 @@
-//! 模型可见工具的单一注册事实源（Pi 式默认工具集：read/bash/edit/write）。
+//! Singularity 内建工具注册与执行模块。
 //!
-//! 工具在进程内执行并继承宿主权限：无沙箱、无权限投影、无审批链（Phase 3 范围）。
-//! Phase 2d 的 agent loop 从这里读取工具列表，把 `ToolSpec` 的 name/description/parameters
-//! 注册为模型可见 schema，并调用 `ToolRegistry::execute` 执行模型产生的工具调用。
+//! 提供面向代码研发的核心工具集：`read`、`bash`、`edit` 与 `write`。
+//! 工具在进程内执行并继承当前运行权限。AgentLoop 从此处读取工具定义并生成
+//! 模型协议的 Tool Schemas，并在收到模型 ToolCall 时通过 `ToolRegistry` 完成参数校验与安全分发。
 
 pub mod bash;
 pub mod edit;
@@ -13,8 +13,7 @@ pub mod write;
 mod truncate;
 
 pub use registry::{
-    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolExecutionMode, ToolPreflight,
-    ToolRegistry, ToolSpec,
+    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry, ToolSpec,
 };
 
 #[cfg(test)]

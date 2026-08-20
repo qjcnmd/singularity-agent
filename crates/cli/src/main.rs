@@ -11,7 +11,6 @@ use singularity_protocol::{
 
 mod client;
 mod commands;
-mod eval;
 mod render;
 mod session_reference;
 
@@ -55,6 +54,10 @@ enum Command {
     Continue {
         thread_id: String,
         instruction: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Read or delete a session (JSONL rollout + SQLite index).
     Session {
@@ -67,24 +70,6 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
-    },
-    /// Run the fixed task set against the configured model list (lightweight regression eval).
-    Eval {
-        /// Path to eval-config.json (default: evaluations/eval-config.json).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Comma-separated task id override.
-        #[arg(long)]
-        tasks: Option<String>,
-        /// Comma-separated model selector override.
-        #[arg(long)]
-        models: Option<String>,
-        /// Maximum parallel cells (default: config or 6).
-        #[arg(long)]
-        max_parallel: Option<usize>,
-        /// Per-cell timeout in seconds (default: config or 1800).
-        #[arg(long)]
-        timeout_secs: Option<u64>,
     },
 }
 

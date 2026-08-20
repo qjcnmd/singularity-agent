@@ -790,27 +790,28 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
 
 // 验证部分 capability 在 blocker 清除前仍不能启动 turn。
 #[test]
-fn cli_exposes_eval_subcommand_without_legacy_eval_args() {
-    // W7-2：`sg eval` 是正式评估子命令；旧的开发评估参数形态（run manifest.json）不再存在。
+fn cli_does_not_expose_product_eval_subcommand() {
     let help = Command::cargo_bin("sg")
         .expect("binary")
-        .args(["eval", "--help"])
+        .arg("--help")
         .output()
         .expect("sg cli");
     assert!(help.status.success());
     let help_text = stdout(&help);
-    assert!(help_text.contains("--config"));
-    assert!(help_text.contains("--models"));
+    assert!(
+        !help_text
+            .lines()
+            .any(|line| line.trim_start().starts_with("eval"))
+    );
 
     let legacy = Command::cargo_bin("sg")
         .expect("binary")
-        .args(["eval", "run", "manifest.json", "--run-id", "run"])
+        .arg("eval")
         .output()
         .expect("sg cli");
     assert!(!legacy.status.success());
     let error = stderr(&legacy);
-    assert!(error.contains("unrecognized subcommand") || error.contains("unexpected argument"));
-    assert!(error.contains("eval"));
+    assert!(error.contains("unrecognized subcommand"));
 }
 // 验证完成的 turn 会渲染 AgentLoop 状态与 assistant answer。
 #[test]

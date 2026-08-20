@@ -1010,8 +1010,7 @@ impl AppEvent {
         }
     }
 
-    /// 构造 turn 终态错误事件（失败 turn 的 turn 级终态；对齐 Codex
-    /// `ErrorNotification{error, willRetry, threadId, turnId}` 语义）。
+    /// 构造 Turn 执行错误终态事件。
     pub fn turn_error(
         turn_id: &str,
         thread_id: &str,
@@ -1067,7 +1066,7 @@ impl AppEvent {
         }
     }
 
-    /// 构造工具开始执行事件（对齐 Pi `tool_execution_start`）。
+    /// 构造工具开始执行事件通知。
     pub fn tool_execution_start(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -1083,7 +1082,7 @@ impl AppEvent {
         }
     }
 
-    /// 构造工具执行输出增量事件（对齐 Pi `tool_execution_update`）。
+    /// 构造工具执行流式输出增量更新通知。
     pub fn tool_execution_update(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -1101,7 +1100,7 @@ impl AppEvent {
         }
     }
 
-    /// 构造工具执行结束事件（对齐 Pi `tool_execution_end`）。
+    /// 构造工具执行完成事件通知。
     pub fn tool_execution_end(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
