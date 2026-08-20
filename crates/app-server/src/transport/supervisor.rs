@@ -591,11 +591,18 @@ pub(crate) fn run_turn_request(
         return Err(error);
     }
     if let Err(error) = result {
-        send_output(
-            &outputs,
-            &cancellation,
-            request_error_value(request_id, &error),
-        )?;
+        match &error {
+            AppServerError::TurnTerminalization { .. } => {
+                return Err(format!("fatal turn worker error: {error}"));
+            }
+            _ => {
+                send_output(
+                    &outputs,
+                    &cancellation,
+                    request_error_value(request_id, &error),
+                )?;
+            }
+        }
     }
     Ok(())
 }

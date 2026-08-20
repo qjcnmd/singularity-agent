@@ -1671,7 +1671,10 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
             events.push(value);
         },
     );
-    assert!(result.is_ok(), "turn start streaming returns ok");
+    assert!(
+        matches!(result, Err(AppServerError::TurnTerminalization { .. })),
+        "turn start streaming must return TurnTerminalization error on double failure"
+    );
     assert!(
         !events
             .iter()
@@ -1681,6 +1684,30 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
     assert!(
         !events.iter().any(|value| value["method"] == "turn/error"),
         "must not emit turn/error when metadata persistence fails"
+    );
+    assert!(
+        !events.iter().any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
+        "must not emit item terminal events when metadata persistence fails"
+    );
+    assert!(
+        events.iter().any(|value| {
+            value["method"] == "agent/diagnostic"
+                && value["params"]["severity"] == "error"
+                && value["params"]["code"] == "storage_fatal"
+        }),
+        "must emit sanitized storage_fatal diagnostic on double failure"
+    );
+
+    // After fail-stop, reopen/resume must repair un-terminalized turn_started to interrupted.
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":3,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume repairs session after fail-stop");
+    assert_eq!(
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "interrupted",
+        "reopen repair must converge uncompleted turn to interrupted"
     );
 }
 
@@ -1708,7 +1735,10 @@ fn agent_failure_metadata_double_failure_emits_no_terminal_event() {
             events.push(value);
         },
     );
-    assert!(result.is_ok(), "turn start streaming returns ok");
+    assert!(
+        matches!(result, Err(AppServerError::TurnTerminalization { .. })),
+        "turn start streaming must return TurnTerminalization error on agent failure double metadata failure"
+    );
     assert!(
         !events
             .iter()
@@ -1718,5 +1748,71 @@ fn agent_failure_metadata_double_failure_emits_no_terminal_event() {
     assert!(
         !events.iter().any(|value| value["method"] == "turn/error"),
         "must not emit turn/error when agent failure metadata persistence fails"
+    );
+    assert!(
+        !events.iter().any(|value| value["method"] == "item/completed" || value["method"] == "item/failed"),
+        "must not emit item terminal events when agent failure metadata persistence fails"
+    );
+    assert!(
+        events.iter().any(|value| {
+            value["method"] == "agent/diagnostic"
+                && value["params"]["severity"] == "error"
+                && value["params"]["code"] == "storage_fatal"
+        }),
+        "must emit sanitized storage_fatal diagnostic on double failure"
+    );
+
+    // Reopen/resume converges residual turn_started to interrupted
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":3,"params":{{"threadId":"{session_id}"}}}}"#
+        ))
+        .expect("resume repairs session after agent failure fail-stop");
+    assert_eq!(
+        resumed[0]["result"]["thread"]["lastTurnStatus"],
+        "interrupted"
+    );
+}
+
+#[test]
+fn single_metadata_failure_recovers_via_bounded_retry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "4f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("completed")],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+    // Inject 1 fault on first write; retry write succeeds.
+    server.inject_terminalization_faults(1, 0);
+
+    let mut events = Vec::new();
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
+            events.push(value);
+        },
+    );
+    assert!(result.is_ok(), "single failure with retry compensation returns ok");
+    assert!(
+        !events
+            .iter()
+            .any(|value| value["method"] == "turn/completed"),
+        "must not emit turn/completed when initial metadata write fails"
+    );
+    assert!(
+        events.iter().any(|value| value["method"] == "turn/error"),
+        "must emit turn/error when compensation writes terminal failure"
+    );
+    assert_eq!(
+        server.store().get_session(session_id).unwrap().status,
+        Some(SessionStatus::Failed),
+        "session status must be updated to Failed by compensation write"
     );
 }

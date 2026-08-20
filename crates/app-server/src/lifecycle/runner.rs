@@ -273,7 +273,7 @@ impl AppServer {
             // durable terminal metadata is authoritative. If the intended status
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
-            let (_metadata_error, durable) = self.persist_failure_state(
+            let (metadata_error, durable) = self.persist_failure_state(
                 &record.session_id,
                 &turn_id,
                 &status.model_usage,
@@ -287,8 +287,32 @@ impl AppServer {
                     &failure,
                     &mut emit,
                 );
+                return Ok(());
+            } else {
+                let message = metadata_error
+                    .as_deref()
+                    .unwrap_or("failed to persist terminal metadata");
+                let safe_message = if singularity_core::contains_sensitive_text(message) {
+                    "fatal storage error: failed to persist terminal metadata"
+                } else {
+                    message
+                };
+                if let Ok(event) = self.event_notification(AppEvent::agent_diagnostic(
+                    &record.session_id,
+                    &turn_id,
+                    "error",
+                    "storage_fatal",
+                    safe_message,
+                )) {
+                    emit(event);
+                }
+                return Err(AppServerError::TurnTerminalization {
+                    stage: TurnFailureStage::TerminalOutcome,
+                    cause: TurnFailureCause::Store,
+                    failure: TurnTerminalizationFailure::Store,
+                    original: metadata_error,
+                });
             }
-            return Ok(());
         }
         // Publication order: durable metadata first, then the in-process usage
         // projection used by the terminal event and RPC response.

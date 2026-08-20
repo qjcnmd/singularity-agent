@@ -133,7 +133,7 @@ impl AppServer {
             _ => (usage, usage_complete),
         };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
-        let (_metadata_error, durable) =
+        let (metadata_error, durable) =
             self.persist_failure_state(&record.session_id, turn_id, usage, usage_complete);
         if durable {
             let _ = self.emit_failure_terminal_events(
@@ -143,8 +143,32 @@ impl AppServer {
                 &failure,
                 emit,
             );
+            Ok(())
+        } else {
+            let message = metadata_error
+                .as_deref()
+                .unwrap_or("failed to persist terminal failure state");
+            let safe_message = if singularity_core::contains_sensitive_text(message) {
+                "fatal storage error: failed to persist terminal metadata"
+            } else {
+                message
+            };
+            if let Ok(event) = self.event_notification(AppEvent::agent_diagnostic(
+                &record.session_id,
+                turn_id,
+                "error",
+                "storage_fatal",
+                safe_message,
+            )) {
+                emit(event);
+            }
+            Err(AppServerError::TurnTerminalization {
+                stage: TurnFailureStage::AgentLoop,
+                cause: failure.cause,
+                failure: TurnTerminalizationFailure::Store,
+                original: metadata_error,
+            })
         }
-        Ok(())
     }
 
     /// 首次失败记录后最多重试一次，并在必要时降级为 interrupted；返回首次
