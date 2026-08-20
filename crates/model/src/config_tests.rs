@@ -123,9 +123,7 @@ fn models_file_capabilities_match_user_capability_projection() {
                         "capabilities": {
                             "supports_tools": false,
                             "supports_parallel_tool_calls": true,
-                            "supports_required_tool_choice": true,
                             "supports_strict_tool_schema": true,
-                            "supports_json_mode": true,
                             "supports_system_message": false,
                             "supports_developer_message": false,
                             "max_parallel_tool_calls": 3,
@@ -149,9 +147,7 @@ fn models_file_capabilities_match_user_capability_projection() {
     let contract = provider.protocol_contract();
     assert!(!contract.supports_tools);
     assert!(contract.supports_parallel_tool_calls);
-    assert!(contract.supports_required_tool_choice);
     assert!(contract.supports_strict_tool_schema);
-    assert!(contract.supports_json_mode);
     assert!(!contract.supports_system_message);
     assert!(!contract.supports_developer_message);
     assert_eq!(contract.max_parallel_tool_calls, 3);
@@ -161,9 +157,7 @@ fn models_file_capabilities_match_user_capability_projection() {
     let declared = ProviderCapabilityDeclaration {
         supports_tools: Some(false),
         supports_parallel_tool_calls: Some(true),
-        supports_required_tool_choice: Some(true),
         supports_strict_tool_schema: Some(true),
-        supports_json_mode: Some(true),
         supports_system_message: Some(false),
         supports_developer_message: Some(false),
         max_parallel_tool_calls: Some(3),

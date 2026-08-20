@@ -548,6 +548,43 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
 }
 
 #[test]
+fn read_only_open_rejects_repairable_tail_without_mutating_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "01914f6b-0000-7000-8000-000000000004";
+    let file = dir.path().join(format!("{id}.jsonl"));
+    let original = format!(
+        "{}\n{}\n{{\"type\":\"message\",\"id\":\"",
+        session_header(id),
+        session_message("entry-1", None, "one")
+    );
+    std::fs::write(&file, &original).unwrap();
+
+    let error = SessionManager::open_existing_read_only(&file)
+        .expect_err("discovery must reject a rollout requiring tail repair");
+    assert!(error.to_string().contains("read-only"), "{error}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+}
+
+#[test]
+fn read_only_open_preserves_header_creation_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "01914f6b-0000-7000-8000-000000000005";
+    let file = dir.path().join(format!("{id}.jsonl"));
+    std::fs::write(
+        &file,
+        format!(
+            "{}\n{}\n",
+            session_header(id),
+            session_message("entry-1", None, "one")
+        ),
+    )
+    .unwrap();
+
+    let opened = SessionManager::open_existing_read_only(&file).unwrap();
+    assert_eq!(opened.created_at(), "2026-08-20T00:00:00.000Z");
+}
+
+#[test]
 fn strict_open_rejects_duplicate_missing_parent_and_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let cases = [

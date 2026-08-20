@@ -31,7 +31,7 @@ mod migration;
 mod owner_only;
 mod session_index;
 
-pub use connection::{SessionStore, SessionStoreDescriptor};
+pub use connection::{SessionStore, SessionStoreDescriptor, quarantine_corrupted_store_files};
 pub use error::{StoreError, StoreResult};
 pub use owner_only::{ensure_owner_only_dir, ensure_owner_only_file};
 pub use session_index::{

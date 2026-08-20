@@ -286,6 +286,8 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "tool/execution/update",
             "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
                 "toolCallId": "call-1",
                 "toolName": "bash",
                 "args": {"command": "echo hi"},
@@ -296,6 +298,8 @@ mod tests {
         let projected = safe_protocol_event(message).expect("projected event");
 
         assert_eq!(projected["method"], "tool/execution/update");
+        assert_eq!(projected["params"]["thread_id"], "thread-1");
+        assert_eq!(projected["params"]["turn_id"], "turn-1");
         assert_eq!(projected["params"]["tool_call_id"], "call-1");
         assert_eq!(projected["params"]["tool_name"], "bash");
         assert_eq!(projected["params"]["args"]["command"], "echo hi");
@@ -308,6 +312,8 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "tool/execution/end",
             "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
                 "toolCallId": "call-1",
                 "toolName": "bash",
                 "result": {
@@ -320,9 +326,37 @@ mod tests {
         .expect("notification fixture");
         let projected = safe_protocol_event(message).expect("projected event");
 
+        assert_eq!(projected["params"]["thread_id"], "thread-1");
+        assert_eq!(projected["params"]["turn_id"], "turn-1");
         assert_eq!(projected["params"]["tool_call_id"], "call-1");
         assert_eq!(projected["params"]["tool_name"], "bash");
         assert_eq!(projected["params"]["result"]["content"][0]["text"], "done");
         assert_eq!(projected["params"]["is_error"], false);
+    }
+
+    #[test]
+    fn safe_protocol_event_preserves_turn_error_identity_and_diagnostic() {
+        let message: JsonRpcNotification = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "turn/error",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "error": {
+                    "stage": "agent_loop",
+                    "cause": "provider",
+                    "message": "provider failed",
+                    "willRetry": false
+                }
+            }
+        }))
+        .expect("notification fixture");
+        let projected = safe_protocol_event(message).expect("projected event");
+
+        assert_eq!(projected["params"]["thread_id"], "thread-1");
+        assert_eq!(projected["params"]["turn_id"], "turn-1");
+        assert_eq!(projected["params"]["error"]["stage"], "agent_loop");
+        assert_eq!(projected["params"]["error"]["message"], "provider failed");
+        assert_eq!(projected["params"]["error"]["willRetry"], false);
     }
 }

@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AgentCapabilityResult, EmptyParams, InitializeParams, InputItem, JsonRpcId, JsonRpcMessage,
-    JsonRpcNotification, Method, RpcMethod, SessionDeleteResult, SessionIdParams,
+    AgentCapabilityResult, EmptyParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId,
+    JsonRpcMessage, JsonRpcNotification, Method, RpcMethod, SessionDeleteResult, SessionIdParams,
     SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadSettingsParams,
-    ThreadStartParams, Turn, TurnStartParams, rpc_methods,
+    ThreadStartParams, Turn, TurnEventParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
 use crate::render::should_render_assistant_summary;
@@ -39,6 +39,7 @@ pub(super) struct AppServerClient {
 pub(super) struct RpcReply<R> {
     result: R,
     notifications: Vec<JsonRpcNotification>,
+    request_id: JsonRpcId,
 }
 
 #[derive(Debug, Clone)]
@@ -98,19 +99,135 @@ fn sibling_app_server_bin() -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
-// 渲染 turn 通知并打印终态行。turn/start 的响应始终在 AgentLoop 完成后返回，
-// 不再有跨进程 turn/status 轮询。
+// 渲染 turn 通知并等待对应 (thread_id, turn_id) 的终态事件。
+// turn/start 立即返回 running response，最终结果由 turn/completed 或 turn/error 交付。
 pub(super) fn render_and_wait_terminal(
-    _client: &mut AppServerClient,
-    turn: Turn,
-    notifications: Vec<JsonRpcNotification>,
+    client: &mut AppServerClient,
+    initial_turn: Turn,
+    mut notifications: Vec<JsonRpcNotification>,
+    request_id: &JsonRpcId,
     render: bool,
-) -> Result<Turn, String> {
+) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
+    let thread_id = initial_turn.thread_id.clone();
+    let turn_id = initial_turn.turn_id.clone();
+
     if render {
-        render_messages(&notifications, should_render_assistant_summary(&turn));
-        render_turn(&turn);
+        render_messages(&notifications, false);
     }
-    Ok(turn)
+
+    if initial_turn.status != TurnStatus::Running {
+        if render {
+            render_messages(
+                &notifications,
+                should_render_assistant_summary(&initial_turn),
+            );
+            render_turn(&initial_turn);
+        }
+        return Ok((initial_turn, notifications));
+    }
+
+    loop {
+        let message = client.read_message(client.response_timeout)?;
+        match message {
+            JsonRpcMessage::Notification(notification) => {
+                let method = notification.method.as_str();
+                match method {
+                    "turn/completed" => {
+                        if let Ok(params) =
+                            serde_json::from_value::<TurnEventParams>(notification.params.clone())
+                            && params.turn.thread_id == thread_id
+                            && params.turn.turn_id == turn_id
+                        {
+                            notifications.push(notification);
+                            if render {
+                                if should_render_assistant_summary(&params.turn) {
+                                    for n in &notifications {
+                                        if n.method == "item/agentMessage/delta"
+                                            && let Ok(item_params) =
+                                                serde_json::from_value::<ItemEventParams>(
+                                                    n.params.clone(),
+                                                )
+                                            && let Some(text) = item_params.delta
+                                        {
+                                            println!("assistant {text}");
+                                        }
+                                    }
+                                }
+                                render_turn(&params.turn);
+                            }
+                            return Ok((params.turn, notifications));
+                        }
+                        notifications.push(notification);
+                    }
+                    "turn/error" => {
+                        let params = &notification.params;
+                        let notif_thread =
+                            params.get("threadId").and_then(Value::as_str).unwrap_or("");
+                        let notif_turn = params.get("turnId").and_then(Value::as_str).unwrap_or("");
+                        if notif_thread == thread_id && notif_turn == turn_id {
+                            notifications.push(notification);
+                            let terminal_turn = Turn {
+                                turn_id: turn_id.clone(),
+                                thread_id: thread_id.clone(),
+                                status: TurnStatus::Failed,
+                                agent_loop_status: "failed".to_string(),
+                                model_usage: None,
+                            };
+                            if render {
+                                render_turn(&terminal_turn);
+                            }
+                            return Ok((terminal_turn, notifications));
+                        }
+                        notifications.push(notification);
+                    }
+                    _ => {
+                        if render {
+                            render_messages(std::slice::from_ref(&notification), false);
+                        }
+                        notifications.push(notification);
+                    }
+                }
+            }
+            JsonRpcMessage::Error(response) if response.id == *request_id => {
+                // A turn/start request can already have returned its Running response
+                // before a worker/transport failure is serialized as the matching JSON-RPC
+                // error. Do not discard that terminal signal and wait forever for a
+                // notification that cannot arrive; project it into the same failed-turn
+                // contract used by turn/error.
+                let diagnostic = response.error.message;
+                let event = JsonRpcMessage::notification(
+                    "turn/error",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "error": {
+                            "stage": "terminal_outcome",
+                            "cause": "internal",
+                            "message": diagnostic,
+                            "willRetry": false,
+                        },
+                    }),
+                )
+                .map_err(|error| format!("failed to project terminal turn error: {error}"))?;
+                if let JsonRpcMessage::Notification(event) = event {
+                    notifications.push(event);
+                }
+                let terminal_turn = Turn {
+                    turn_id: turn_id.clone(),
+                    thread_id: thread_id.clone(),
+                    status: TurnStatus::Failed,
+                    agent_loop_status: "failed".to_string(),
+                    model_usage: None,
+                };
+                if render {
+                    render_turn(&terminal_turn);
+                }
+                return Ok((terminal_turn, notifications));
+            }
+            JsonRpcMessage::Error(_) => {}
+            JsonRpcMessage::Success(_) | JsonRpcMessage::Request(_) => {}
+        }
+    }
 }
 
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
@@ -215,13 +332,13 @@ impl AppServerClient {
             }],
         };
         let reply = self.request::<rpc_methods::TurnStart>(&params)?;
-        let turn = render_and_wait_terminal(
+        render_and_wait_terminal(
             self,
-            reply.result.turn.clone(),
-            reply.notifications.clone(),
+            reply.result.turn,
+            reply.notifications,
+            &reply.request_id,
             render,
-        )?;
-        Ok((turn, reply.notifications))
+        )
     }
 
     // 请求 session/read 并返回服务端结果。
@@ -329,6 +446,7 @@ impl AppServerClient {
                     return Ok(RpcReply {
                         result,
                         notifications,
+                        request_id: id,
                     });
                 }
                 JsonRpcMessage::Error(response) if response.id == id => {

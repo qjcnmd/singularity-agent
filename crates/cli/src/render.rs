@@ -19,21 +19,37 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
         .as_ref()
         .map(|params| params.item.item_id.as_str())
         .unwrap_or("");
+    let thread_id = params.as_ref().map(|p| p.thread_id.as_str()).unwrap_or("");
+    let turn_id = params.as_ref().map(|p| p.turn_id.as_str()).unwrap_or("");
     let mut output = match method.as_str() {
         "item/agentMessage/delta" => Some(json!({
             "method": method,
             "params": {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
                 "item_id": item_id,
                 "delta": params.and_then(|params| params.delta).unwrap_or_default(),
             },
         })),
         "item/started" | "item/completed" => Some(json!({
             "method": method,
-            "params": {"item_id": item_id},
+            "params": {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "item_id": item_id,
+            },
         })),
         // 工具生命周期事件：投影 toolCallId、toolName、args、partialResult 与 result。
         "tool/execution/start" => {
             let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let thread_id = params
+                .as_ref()
+                .and_then(|p| p.get("threadId").and_then(Value::as_str))
+                .unwrap_or("");
+            let turn_id = params
+                .as_ref()
+                .and_then(|p| p.get("turnId").and_then(Value::as_str))
+                .unwrap_or("");
             let tool_call_id = params
                 .as_ref()
                 .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
@@ -50,6 +66,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             Some(json!({
                 "method": method,
                 "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "args": args,
@@ -58,6 +76,14 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
         }
         "tool/execution/update" => {
             let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let thread_id = params
+                .as_ref()
+                .and_then(|p| p.get("threadId").and_then(Value::as_str))
+                .unwrap_or("");
+            let turn_id = params
+                .as_ref()
+                .and_then(|p| p.get("turnId").and_then(Value::as_str))
+                .unwrap_or("");
             let tool_call_id = params
                 .as_ref()
                 .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
@@ -78,6 +104,8 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             Some(json!({
                 "method": method,
                 "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "args": args,
@@ -87,6 +115,14 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
         }
         "tool/execution/end" => {
             let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let thread_id = params
+                .as_ref()
+                .and_then(|p| p.get("threadId").and_then(Value::as_str))
+                .unwrap_or("");
+            let turn_id = params
+                .as_ref()
+                .and_then(|p| p.get("turnId").and_then(Value::as_str))
+                .unwrap_or("");
             let tool_call_id = params
                 .as_ref()
                 .and_then(|p| p.get("toolCallId").and_then(Value::as_str))
@@ -107,10 +143,38 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
             Some(json!({
                 "method": method,
                 "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "result": result,
                     "is_error": is_error,
+                },
+            }))
+        }
+        // 保留 turn/error 的匹配身份和脱敏诊断，JSON 模式可以据此审计
+        // 终态来源；客户端仍只把精确 threadId/turnId 视为本次 turn 的终态。
+        "turn/error" => {
+            let params = serde_json::from_value::<Value>(message.params.clone()).ok();
+            let thread_id = params
+                .as_ref()
+                .and_then(|p| p.get("threadId").and_then(Value::as_str))
+                .unwrap_or("");
+            let turn_id = params
+                .as_ref()
+                .and_then(|p| p.get("turnId").and_then(Value::as_str))
+                .unwrap_or("");
+            let error = params
+                .as_ref()
+                .and_then(|p| p.get("error"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Some(json!({
+                "method": method,
+                "params": {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "error": error,
                 },
             }))
         }

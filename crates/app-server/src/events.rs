@@ -14,6 +14,8 @@ const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 
 /// 一次 AgentLoop 调用预分配的 assistant item 事件状态（只用于实时协议事件）。
 pub(super) struct AssistantItemEventState {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
     pub(super) item_id: String,
     first_delta_observed: bool,
     started_generated: bool,
@@ -23,8 +25,10 @@ pub(super) struct AssistantItemEventState {
 }
 
 impl AssistantItemEventState {
-    pub(super) fn new(item_id: String) -> Self {
+    pub(super) fn new(thread_id: String, turn_id: String, item_id: String) -> Self {
         Self {
+            thread_id,
+            turn_id,
             item_id,
             first_delta_observed: false,
             started_generated: false,
@@ -187,7 +191,9 @@ impl AppServer {
             return Ok(None);
         }
         let event = self.event_notification(AppEvent::item_failed(
-            assistant_events.item_id.clone(),
+            &assistant_events.thread_id,
+            &assistant_events.turn_id,
+            &assistant_events.item_id,
             SAFE_ASSISTANT_ITEM_FAILURE,
         ))?;
         assistant_events.assistant_terminal_generated = true;
@@ -201,8 +207,11 @@ impl AppServer {
         if !assistant_events.appeared() || assistant_events.assistant_terminal_generated {
             return Ok(None);
         }
-        let event =
-            self.event_notification(AppEvent::item_completed(assistant_events.item_id.clone()))?;
+        let event = self.event_notification(AppEvent::item_completed(
+            &assistant_events.thread_id,
+            &assistant_events.turn_id,
+            &assistant_events.item_id,
+        ))?;
         assistant_events.assistant_terminal_generated = true;
         Ok(Some(event))
     }
@@ -221,9 +230,18 @@ impl AppServer {
             return Ok(None);
         }
         let event = if is_error {
-            AppEvent::item_failed(tool_call_id, "tool execution failed")
+            AppEvent::item_failed(
+                &assistant_events.thread_id,
+                &assistant_events.turn_id,
+                tool_call_id,
+                "tool execution failed",
+            )
         } else {
-            AppEvent::item_completed(tool_call_id)
+            AppEvent::item_completed(
+                &assistant_events.thread_id,
+                &assistant_events.turn_id,
+                tool_call_id,
+            )
         };
         let event = self.event_notification(event)?;
         if let Some(terminal) = assistant_events.tool_items.get_mut(tool_call_id) {
@@ -242,13 +260,17 @@ impl AppServer {
         if !assistant_events.first_delta_observed {
             assistant_events.first_delta_observed = true;
             assistant_events.started_generated = true;
-            messages.push(
-                self.event_notification(AppEvent::item_started(assistant_events.item_id.clone()))?,
-            );
+            messages.push(self.event_notification(AppEvent::item_started(
+                &assistant_events.thread_id,
+                &assistant_events.turn_id,
+                &assistant_events.item_id,
+            ))?);
         }
         assistant_events.delta_generated = true;
         messages.push(self.event_notification(AppEvent::item_agent_message_delta(
-            assistant_events.item_id.clone(),
+            &assistant_events.thread_id,
+            &assistant_events.turn_id,
+            &assistant_events.item_id,
             delta,
         ))?);
         Ok(messages)

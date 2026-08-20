@@ -159,8 +159,13 @@ pub struct AppServerProcess {
 
 impl AppServerProcess {
     pub fn spawn(cwd: &Path, home: &Path, base_url: &str) -> Self {
+        Self::spawn_with_db(cwd, home, base_url, None)
+    }
+
+    pub fn spawn_with_db(cwd: &Path, home: &Path, base_url: &str, database: Option<&Path>) -> Self {
         let binary = app_server_bin();
-        let mut child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .current_dir(cwd)
             .env("SINGULARITY_HOME", home)
             .env("SINGULARITY_MODEL_PROVIDER", "openai_compatible")
@@ -169,16 +174,18 @@ impl AppServerProcess {
             .env("SINGULARITY_API_KEY", "test-secret")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "spawn app-server failed: binary={} cwd={} SINGULARITY_HOME={} error={error}",
-                    binary.display(),
-                    cwd.display(),
-                    home.display(),
-                )
-            });
+            .stderr(Stdio::piped());
+        if let Some(database) = database {
+            command.env("SINGULARITY_APP_SERVER_DB", database);
+        }
+        let mut child = command.spawn().unwrap_or_else(|error| {
+            panic!(
+                "spawn app-server failed: binary={} cwd={} SINGULARITY_HOME={} error={error}",
+                binary.display(),
+                cwd.display(),
+                home.display(),
+            )
+        });
         let input = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");

@@ -9,8 +9,8 @@ mod transport;
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 fn main() {
-    // 单 stdin owner + 单 turn worker：current_thread runtime 足够，stdio 适配器
-    // 与 writer 在同一线程上协作，blocking 工作走 Tokio 阻塞池。
+    // 单 stdin owner；不同 session 的 turn 可并行运行，同一 session 只允许一个 active turn。
+    // current_thread runtime 负责 stdio/writer 协作，blocking 工作走 Tokio 阻塞池。
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

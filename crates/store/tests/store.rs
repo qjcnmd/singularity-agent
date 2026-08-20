@@ -60,7 +60,96 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
 }
 
 #[test]
-fn sqlite_store_rejects_legacy_turn_schema() {
+fn quarantine_corrupted_store_files_isolates_db_and_sidecars() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("index.sqlite3");
+    let wal = dir.path().join("index.sqlite3-wal");
+    let shm = dir.path().join("index.sqlite3-shm");
+
+    std::fs::write(&db, b"corrupted-main-db").expect("write db");
+    std::fs::write(&wal, b"corrupted-wal").expect("write wal");
+    std::fs::write(&shm, b"corrupted-shm").expect("write shm");
+
+    let backup_path =
+        singularity_store::quarantine_corrupted_store_files(&db).expect("quarantine files");
+    assert!(!db.exists(), "original db must be moved");
+    assert!(!wal.exists(), "original wal must be moved");
+    assert!(!shm.exists(), "original shm must be moved");
+
+    assert!(backup_path.exists(), "backup db must exist");
+    let mut backup_wal = backup_path.as_os_str().to_os_string();
+    backup_wal.push("-wal");
+    assert!(
+        std::path::Path::new(&backup_wal).exists(),
+        "backup wal must exist"
+    );
+    let mut backup_shm = backup_path.as_os_str().to_os_string();
+    backup_shm.push("-shm");
+    assert!(
+        std::path::Path::new(&backup_shm).exists(),
+        "backup shm must exist"
+    );
+}
+
+#[test]
+fn sqlite_store_quarantines_not_a_database_and_reinitializes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("index.sqlite3");
+    std::fs::write(&db, b"this is not an sqlite database header").expect("write garbage");
+
+    let store = SessionStore::open(&db).expect("open should recover and reinitialize");
+    assert_eq!(store.descriptor().schema_version, 1);
+
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("index.sqlite3.corrupt.")),
+        "quarantine backup must exist: {files:?}"
+    );
+}
+
+#[test]
+fn initialization_callback_failure_preserves_quarantine_and_partial_database() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("index.sqlite3");
+    std::fs::write(&db, b"corrupted-main-db").expect("write corrupt db");
+
+    let error = match SessionStore::open_with_initialization(&db, |_| {
+        Err(StoreError::InvalidState(
+            "session index rebuild failed at jsonl scan".to_string(),
+        ))
+    }) {
+        Ok(_) => panic!("rebuild failure must fail startup"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("session index rebuild failed"),
+        "stage-specific callback error: {error}"
+    );
+    assert!(db.is_file(), "fresh partial database remains diagnosable");
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.sqlite3.corrupt.")),
+        "corrupt backup must remain after rebuild failure"
+    );
+
+    // The stable init lock is released even on callback failure; the partial DB can
+    // be reopened by a later startup and classified normally.
+    let reopened = SessionStore::open(&db).expect("reopen after failed rebuild");
+    assert_eq!(reopened.descriptor().schema_version, 1);
+}
+
+#[test]
+fn sqlite_store_quarantines_unsupported_schema() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("legacy.sqlite3");
     let connection = rusqlite::Connection::open(&db).expect("legacy connection");
@@ -69,24 +158,43 @@ fn sqlite_store_rejects_legacy_turn_schema() {
             "create table schema_meta(schema_version integer not null check(schema_version = 13));
              create table schema_migrations(migration_id text primary key, applied_at text not null default current_timestamp);
              create table threads(thread_id text primary key, model text, cwd text, status text not null default 'active');
-             create table turns(turn_id text primary key, thread_id text not null, turn_sequence integer not null, status text not null, agent_loop_status text not null, pause_requested integer not null default 0);
-             create table items(item_id text primary key, turn_id text not null, item_sequence integer not null, kind text not null, payload text not null, status text not null, redacted integer not null);
              insert into schema_meta(schema_version) values (13);",
         )
         .expect("legacy schema");
     drop(connection);
 
-    let error = match SessionStore::open(&db) {
-        Err(error) => error,
-        Ok(_) => panic!("legacy turn schema must be rejected"),
-    };
-    assert!(matches!(
-        error,
-        StoreError::UnsupportedSchema {
-            found: 13,
-            supported: 1
-        }
-    ));
+    let store = SessionStore::open(&db).expect("open should recover legacy schema");
+    assert_eq!(store.descriptor().schema_version, 1);
+
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|f| f.starts_with("legacy.sqlite3.corrupt.")),
+        "quarantine backup must exist: {files:?}"
+    );
+}
+
+#[test]
+fn sqlite_store_quarantines_schema_structure_mismatch() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("mismatched.sqlite3");
+    let connection = rusqlite::Connection::open(&db).expect("connection");
+    connection
+        .execute_batch(
+            "create table schema_meta(schema_version integer not null check(schema_version = 1));
+             create table schema_migrations(migration_id text primary key, applied_at text not null default current_timestamp);
+             create table session_index(session_id text primary key, wrong_column text);
+             insert into schema_meta(schema_version) values (1);",
+        )
+        .expect("mismatched schema");
+    drop(connection);
+
+    let store = SessionStore::open(&db).expect("open should recover mismatched schema");
+    assert_eq!(store.descriptor().schema_version, 1);
 }
 
 #[test]

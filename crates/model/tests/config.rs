@@ -462,7 +462,6 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
             .supports_developer_message
     );
     assert!(default_config.protocol_contract().supports_system_message);
-    assert!(!default_config.protocol_contract().supports_json_mode);
     assert!(
         !default_config
             .protocol_contract()
@@ -604,58 +603,6 @@ fn model_request_validation_rejects_parallel_tool_calls_when_provider_does_not_s
 }
 
 #[test]
-fn required_tool_choice_requires_tools_and_negotiated_support() {
-    let mut request = ModelTurnRequest::new(
-        "request_required",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    request.tool_choice.mode = ToolChoiceMode::Required;
-
-    let missing_tools = validate_model_request(&request);
-    assert_eq!(
-        missing_tools.errors,
-        vec!["required_tool_choice_requires_tools"]
-    );
-
-    request.tools.push(ModelToolSchema {
-        name: "read".to_string(),
-        description: "read".to_string(),
-        parameters_schema: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        }),
-    });
-    let unsupported = validate_model_request_with_capabilities(
-        &request,
-        Some(&ProviderProtocolContract::default()),
-    );
-    assert_eq!(
-        unsupported.errors,
-        vec!["provider_does_not_support_required_tool_choice"]
-    );
-
-    let supported = ProviderProtocolContract {
-        supports_required_tool_choice: true,
-        ..ProviderProtocolContract::default()
-    };
-    assert!(validate_model_request_with_capabilities(&request, Some(&supported)).valid);
-
-    let missing_required_call = validate_model_response(
-        Some(&ModelMessage::text(ModelRole::Assistant, "text")),
-        &[],
-        &request.tool_choice,
-        &["read".to_string()],
-        Some(&supported),
-    );
-    assert_eq!(
-        missing_required_call.errors,
-        vec!["required_tool_call_missing"]
-    );
-}
-
-#[test]
 fn model_request_validation_rejects_tool_definitions_above_provider_capability() {
     let mut request = ModelTurnRequest::new(
         "request_1",
@@ -718,11 +665,9 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
             "additionalProperties": false
         }),
     });
-    request.model_preferences.json_mode = true;
     request.tool_choice.strict_tool_schema = true;
     let capabilities = ProviderProtocolContract {
         supports_tools: false,
-        supports_json_mode: false,
         supports_developer_message: false,
         ..ProviderProtocolContract::default()
     };
@@ -733,7 +678,6 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
         result.errors,
         vec![
             "provider_does_not_support_developer_messages",
-            "provider_does_not_support_json_mode",
             "provider_does_not_support_strict_tool_schema",
             "provider_does_not_support_tools",
         ]

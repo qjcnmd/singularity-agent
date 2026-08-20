@@ -122,7 +122,7 @@ impl AppServer {
         self.handle_with_output(message)
     }
 
-    /// 处理请求并返回生成的协议消息；单 worker 传输无需排序预留。
+    /// 处理请求并返回生成的协议消息；传输 writer 负责全局输出顺序，dispatch 不假设 turn 执行顺序。
     pub fn handle_with_output(
         &mut self,
         message: JsonRpcMessage,
@@ -202,7 +202,6 @@ impl AppServer {
                 self.initialized_acknowledged = true;
                 json_response(message.required_id(), singularity_protocol::EmptyResult {})
             }
-            Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
             Method::ThreadResume => self.thread_resume(message),
             Method::ThreadStart => self.thread_start(message),
@@ -243,31 +242,6 @@ impl AppServer {
             )
             .to_wire_value(),
         ])
-    }
-
-    pub(super) fn server_capabilities(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        json_response(
-            message.required_id(),
-            ServerCapabilitiesResult {
-                transports: vec![TransportCapability {
-                    transport: "stdio".to_string(),
-                    available: true,
-                    auth_token_required: false,
-                }],
-                protocol_version: "1".to_string(),
-                features: vec![
-                    "item_lifecycle".to_string(),
-                    "tool_items".to_string(),
-                    "thread_settings".to_string(),
-                    "interrupted_recovery".to_string(),
-                    "usage_history_projection".to_string(),
-                    "thinking_projection".to_string(),
-                ],
-            },
-        )
     }
 
     pub(super) fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {

@@ -4,9 +4,7 @@ use super::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
     ModelValidationResult, OpenAiProviderConfig, ProviderAttemptMetadata, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, REQUIRED_TOOL_CHOICE_MISSING_ERROR,
-    REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR, REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR,
-    TEXT_TOOL_CALL_ENVELOPE_ERROR, ToolChoiceMode, ToolChoicePolicy,
+    ProviderErrorStage, ProviderProtocolContract, TEXT_TOOL_CALL_ENVELOPE_ERROR, ToolChoicePolicy,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -86,12 +84,12 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
             matches!(
                 error.as_str(),
                 "provider_does_not_support_tools"
-                    | REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR
                     | "provider_does_not_support_strict_tool_schema"
                     | "provider_does_not_support_parallel_tool_calls"
             )
         })
 }
+
 /// 检查脱敏模型提供方配置是否包含全部必需值。
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
     let mut errors = Vec::new();
@@ -129,9 +127,6 @@ pub fn validate_model_request_with_capabilities(
     if !request.tools.is_empty() && request.tool_choice.max_tool_calls == 0 {
         errors.push("max_tool_calls_must_be_positive".to_string());
     }
-    if request.tool_choice.mode == ToolChoiceMode::Required && request.tools.is_empty() {
-        errors.push(REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR.to_string());
-    }
     let request_uses_nonportable_tool_name = request
         .tools
         .iter()
@@ -166,14 +161,6 @@ pub fn validate_model_request_with_capabilities(
     if let Some(capabilities) = capabilities {
         if !request.tools.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
-        }
-        if request.tool_choice.mode == ToolChoiceMode::Required
-            && !capabilities.supports_required_tool_choice
-        {
-            errors.push(REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR.to_string());
-        }
-        if request.model_preferences.json_mode && !capabilities.supports_json_mode {
-            errors.push("provider_does_not_support_json_mode".to_string());
         }
         if request
             .messages
@@ -388,19 +375,6 @@ fn validate_model_response_with_protocol_context(
         errors.push("tool_name_not_provider_portable".to_string());
     }
 
-    match tool_choice.mode {
-        ToolChoiceMode::None if !tool_calls.is_empty() => {
-            errors.push("tool_choice_none".to_string());
-        }
-        ToolChoiceMode::Required
-            if tool_calls.is_empty()
-                && capabilities
-                    .is_none_or(|capabilities| capabilities.supports_required_tool_choice) =>
-        {
-            errors.push(REQUIRED_TOOL_CHOICE_MISSING_ERROR.to_string());
-        }
-        _ => {}
-    }
     if tool_calls.len() > tool_choice.max_tool_calls as usize {
         // 响应超限降级为 warning：请求的并行上限在部分协议（如 Responses API）
         // 无法表达；Agent loop 会按 provider 声明的上限分窗口执行全部工具调用，
@@ -408,11 +382,6 @@ fn validate_model_response_with_protocol_context(
         warnings.push("max_tool_calls_exceeded".to_string());
     }
     if let Some(capabilities) = capabilities {
-        if tool_choice.mode == ToolChoiceMode::Required
-            && !capabilities.supports_required_tool_choice
-        {
-            errors.push(REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR.to_string());
-        }
         if !tool_calls.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
         }

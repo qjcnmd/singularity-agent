@@ -34,12 +34,11 @@ use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, Provid
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, HistoryItem,
     InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind,
-    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult,
-    SessionDeleteResult, SessionIdParams, SessionReadParams, SessionReadResult, Thread,
-    ThreadIdParams, ThreadListResult, ThreadResult, ThreadSettingsParams, ThreadSettingsResult,
-    ThreadStartParams, ThreadStartResult, TransportCapability, Turn, TurnIdParams,
-    TurnInjectionOutcome, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
-    TurnStartParams, TurnStartResult, TurnStatus,
+    ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult, SessionIdParams,
+    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
+    ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, Turn,
+    TurnIdParams, TurnInjectionOutcome, TurnInjectionParams, TurnInjectionResult,
+    TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,

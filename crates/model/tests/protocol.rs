@@ -567,11 +567,7 @@ fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history(
     let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
     tool_result.tool_call_id = Some("call_read".to_string());
     request.messages.push(tool_result);
-    request.tool_choice = ToolChoicePolicy {
-        mode: ToolChoiceMode::None,
-        max_tool_calls: 0,
-        strict_tool_schema: false,
-    };
+    request.tool_choice = ToolChoicePolicy::default();
 
     let envelope = "<tool_call><function=read></function></tool_call>";
     let response = ModelTurnResponse::completed(
@@ -617,19 +613,6 @@ fn model_error_serializes_redacted_boundary_fields() {
 #[test]
 fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
     let call = tool_call("call_1", "read_file");
-    let none_result = validate_model_response(
-        Some(&ModelMessage::text(ModelRole::Assistant, "")),
-        std::slice::from_ref(&call),
-        &ToolChoicePolicy {
-            mode: ToolChoiceMode::None,
-            ..Default::default()
-        },
-        &["read_file".to_string()],
-        None,
-    );
-
-    assert!(!none_result.valid);
-    assert_eq!(none_result.errors, vec!["tool_choice_none"]);
 
     let text_tool_call = validate_model_response(
         Some(&ModelMessage::text(

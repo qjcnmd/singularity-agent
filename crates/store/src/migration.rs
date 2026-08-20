@@ -80,7 +80,7 @@ pub(crate) fn validate_current_schema(connection: &Connection) -> StoreResult<()
         .map(str::to_string)
         .collect();
     if tables != expected {
-        return Err(StoreError::InvalidState(format!(
+        return Err(StoreError::SchemaStructure(format!(
             "session index has unexpected tables: {tables:?}"
         )));
     }
@@ -100,7 +100,7 @@ pub(crate) fn validate_current_schema(connection: &Connection) -> StoreResult<()
     .map(str::to_string)
     .collect();
     if columns != expected_columns {
-        return Err(StoreError::InvalidState(format!(
+        return Err(StoreError::SchemaStructure(format!(
             "session_index has unexpected columns: {columns:?}"
         )));
     }
@@ -114,7 +114,7 @@ pub(crate) fn validate_current_schema(connection: &Connection) -> StoreResult<()
         .filter(|name| !name.starts_with("sqlite_autoindex_"))
         .collect();
     if indexes != expected_indexes {
-        return Err(StoreError::InvalidState(format!(
+        return Err(StoreError::SchemaStructure(format!(
             "session_index has unexpected indexes: {indexes:?}"
         )));
     }

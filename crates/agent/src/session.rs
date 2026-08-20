@@ -1,7 +1,7 @@
 //! JSONL 会话管理器。
 //!
-//! 会话以 append-only 树存储在 JSONL 文件中：每条 entry 有 `id`/`parentId` 形成树，
-//! `leaf` 指针跟踪当前位置。
+//! 会话以 append-only 线性序列存储在 JSONL 文件中：每条 entry 有 `id`/`parentId`，
+//! 后一条 entry 必须直接引用前一条 entry；不提供 branch/tree 语义。
 //!
 //! 新格式定义为唯一支持的 `version: 1`，严格校验 Header 与 Entry，拒绝任何未知字段。
 
@@ -480,6 +480,7 @@ pub struct SessionManager {
     by_id: HashMap<String, usize>,
     leaf_id: Option<String>,
     session_id: String,
+    header_timestamp: String,
     append_lock: Arc<Mutex<()>>,
 }
 
@@ -489,6 +490,7 @@ impl std::fmt::Debug for SessionManager {
             .field("file", &self.file)
             .field("cwd", &self.cwd)
             .field("session_id", &self.session_id)
+            .field("header_timestamp", &self.header_timestamp)
             .field("leaf_id", &self.leaf_id)
             .field("entries_count", &self.entries.len())
             .finish()
@@ -535,6 +537,21 @@ impl SessionManager {
         Self::open(path)
     }
 
+    /// Open an existing rollout for a bounded discovery/index rebuild.
+    ///
+    /// This seam validates the complete file while holding the normal append
+    /// lock, but it never truncates a torn tail or adds a final newline. A
+    /// file that would require the normal reopen repair path is rejected.
+    pub fn open_existing_read_only(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Err(SessionError::InvalidSession(format!(
+                "session file does not exist: {}",
+                path.display()
+            )));
+        }
+        Self::open_read_only(path)
+    }
+
     /// 共用的新建会话实现：写入 header 并打开新文件。
     fn create_with_file(
         cwd: &Path,
@@ -564,6 +581,7 @@ impl SessionManager {
             by_id: HashMap::new(),
             leaf_id: None,
             session_id,
+            header_timestamp: timestamp,
             append_lock,
         })
     }
@@ -598,7 +616,7 @@ impl SessionManager {
             )));
         }
         let header = &parsed.entries[0];
-        let (session_id, _version, header_cwd) = validate_header(header)?;
+        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
         let entries = validate_entries(&parsed.entries, &parsed.lines)?;
         if !matches!(parsed.repair, TailRepair::None) {
             rewrite_file(&file, &parsed.entries)?;
@@ -621,6 +639,53 @@ impl SessionManager {
             by_id,
             leaf_id,
             session_id,
+            header_timestamp,
+            append_lock,
+        })
+    }
+
+    fn open_read_only(path: &Path) -> Result<Self> {
+        let append_lock = append_lock_for(path);
+        let _guard = lock_append(&append_lock);
+        let file = path.to_path_buf();
+        let metadata = std::fs::symlink_metadata(&file)?;
+        if metadata.len() == 0 {
+            return Err(SessionError::InvalidSession(format!(
+                "Session file is empty and cannot be opened: {}",
+                file.display()
+            )));
+        }
+        let parsed = parse_session_lines(&file)?;
+        if !matches!(parsed.repair, TailRepair::None) {
+            return Err(SessionError::InvalidSession(
+                "read-only session scan rejected a rollout requiring tail repair".to_string(),
+            ));
+        }
+        let header = parsed
+            .entries
+            .first()
+            .ok_or_else(|| SessionError::InvalidSession("session header is missing".to_string()))?;
+        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
+        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
+        let cwd = header_cwd
+            .map(|cwd| normalize_abs_path(Path::new(&cwd)))
+            .transpose()?
+            .unwrap_or(std::env::current_dir()?);
+        let mut by_id = HashMap::new();
+        let mut leaf_id: Option<String> = None;
+        for (index, entry) in entries.iter().enumerate() {
+            by_id.insert(entry.id.clone(), index);
+            leaf_id = Some(entry.id.clone());
+        }
+        drop(_guard);
+        Ok(Self {
+            file,
+            cwd,
+            entries,
+            by_id,
+            leaf_id,
+            session_id,
+            header_timestamp,
             append_lock,
         })
     }
@@ -651,6 +716,7 @@ impl SessionManager {
             by_id: HashMap::new(),
             leaf_id: None,
             session_id,
+            header_timestamp: timestamp,
             append_lock,
         })
     }
@@ -778,6 +844,11 @@ impl SessionManager {
         &self.session_id
     }
 
+    /// Header timestamp is the authoritative creation fact for index rebuilds.
+    pub fn created_at(&self) -> &str {
+        &self.header_timestamp
+    }
+
     pub fn leaf_id(&self) -> &str {
         self.leaf_id.as_deref().unwrap_or("")
     }
@@ -788,6 +859,10 @@ impl SessionManager {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn entries(&self) -> &[SessionEntry] {
+        &self.entries
     }
 
     /// 构建活跃的、compaction 感知的条目列表。
@@ -1168,6 +1243,7 @@ fn parse_session_lines_with_limits(
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             if !has_newline {
+                repair = TailRepair::AddFinalNewline;
                 break;
             }
             line_number += 1;
@@ -1273,7 +1349,7 @@ fn read_bounded_session_line<R: BufRead>(
     }
 }
 
-fn validate_header(value: &Value) -> Result<(String, u32, Option<String>)> {
+fn validate_header(value: &Value) -> Result<(String, u32, Option<String>, String)> {
     let object = value
         .as_object()
         .ok_or_else(|| SessionError::InvalidHeader("header is not a JSON object".into()))?;
@@ -1321,17 +1397,13 @@ fn validate_header(value: &Value) -> Result<(String, u32, Option<String>)> {
         }
         None => return Err(SessionError::InvalidHeader("header cwd is required".into())),
     };
-    if object
+    let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .is_none()
-    {
-        return Err(SessionError::InvalidHeader(
-            "header timestamp is required".into(),
-        ));
-    }
-    Ok((session_id, version, cwd))
+        .ok_or_else(|| SessionError::InvalidHeader("header timestamp is required".into()))?
+        .to_string();
+    Ok((session_id, version, cwd, timestamp))
 }
 
 fn validate_entries(raw_entries: &[Value], lines: &[usize]) -> Result<Vec<SessionEntry>> {
@@ -1356,15 +1428,6 @@ fn validate_entries(raw_entries: &[Value], lines: &[usize]) -> Result<Vec<Sessio
         .iter()
         .map(|entry| (entry.id.clone(), entry.parent_id.clone()))
         .collect();
-    let roots = entries
-        .iter()
-        .filter(|entry| entry.parent_id.is_empty())
-        .count();
-    if roots > 1 {
-        return Err(SessionError::InvalidStructure(format!(
-            "session tree has {roots} roots; at most one is allowed"
-        )));
-    }
     for entry in &entries {
         if !entry.parent_id.is_empty() && !parent_by_id.contains_key(&entry.parent_id) {
             return Err(SessionError::MissingParent {
@@ -1398,6 +1461,21 @@ fn validate_entries(raw_entries: &[Value], lines: &[usize]) -> Result<Vec<Sessio
             cursor = parent.clone();
         }
         resolved.extend(path);
+    }
+    // v1 is deliberately linear. The first content entry is the only root;
+    // every later entry must point at the immediately preceding durable entry.
+    for (index, entry) in entries.iter().enumerate() {
+        let expected_parent = index
+            .checked_sub(1)
+            .and_then(|previous| entries.get(previous))
+            .map(|previous| previous.id.as_str())
+            .unwrap_or("");
+        if entry.parent_id != expected_parent {
+            return Err(SessionError::InvalidStructure(format!(
+                "session rollout is not linear at entry {}: expected parent {:?}, got {:?}",
+                entry.id, expected_parent, entry.parent_id
+            )));
+        }
     }
     Ok(entries)
 }

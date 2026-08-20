@@ -173,6 +173,192 @@ fn jsonl_discovery_rejects_an_oversized_unterminated_header_without_indexing_it(
 }
 
 #[test]
+fn jsonl_discovery_recovers_all_fields_including_title_model_usage() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "d3f1e6a7-8b90-4c12-9e34-5f6a7b8c9d0e";
+    let mut session =
+        SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
+
+    session
+        .append_message(singularity_agent::message::AgentMessage::text(
+            singularity_agent::message::AgentMessageRole::User,
+            "Implement feature X for the system",
+        ))
+        .expect("user message");
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::thread_settings(
+                "anthropic",
+                "claude-3-7-sonnet",
+                Some("high".to_string()),
+            )
+            .expect("settings"),
+        )
+        .expect("settings metadata");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
+            "turn-1",
+        ))
+        .expect("turn completed");
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::usage(
+                "turn-1",
+                json!({"input_tokens": 120, "output_tokens": 45}),
+            )
+            .expect("usage"),
+        )
+        .expect("usage metadata");
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild index");
+    let record = store.get_session(session_id).expect("get session");
+    assert_eq!(
+        record.title.as_deref(),
+        Some("Implement feature X for the system")
+    );
+    assert_eq!(
+        record.model.as_deref(),
+        Some("anthropic/claude-3-7-sonnet#high")
+    );
+    assert_eq!(record.status, Some(SessionStatus::Completed));
+    assert_eq!(
+        record.token_usage,
+        json!({"input_tokens": 120, "output_tokens": 45})
+    );
+}
+
+#[test]
+fn jsonl_discovery_uses_header_creation_and_last_entry_fact_times() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "f4a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c";
+    let rollout = sessions_dir.join(format!("{session_id}.jsonl"));
+    let header_timestamp = "2020-01-01T00:00:00.000Z";
+    let entry_timestamp = "2024-04-05T06:07:08.000Z";
+    let header = json!({
+        "type": "session",
+        "version": 1,
+        "id": session_id,
+        "timestamp": header_timestamp,
+        "cwd": workspace.to_string_lossy(),
+    });
+    let message = json!({
+        "type": "message",
+        "id": "entry-1",
+        "parentId": null,
+        "timestamp": entry_timestamp,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "timestamp probe"}]
+        }
+    });
+    std::fs::write(&rollout, format!("{header}\n{message}\n")).expect("rollout");
+
+    store
+        .insert_session(&SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: rollout.to_string_lossy().to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: Some("stale title".to_string()),
+            model: None,
+            status: Some(SessionStatus::Failed),
+            created_at: "1999-01-01T00:00:00.000Z".to_string(),
+            updated_at: "1999-01-01T00:00:00.000Z".to_string(),
+            token_usage: json!({"stale": true}),
+        })
+        .expect("stale index");
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild");
+    let record = store.get_session(session_id).expect("rebuilt record");
+    assert_eq!(record.created_at, header_timestamp);
+    assert_eq!(record.updated_at, entry_timestamp);
+}
+
+#[test]
+fn jsonl_discovery_rejects_v1_branch_rollout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "a4a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c";
+    let rollout = sessions_dir.join(format!("{session_id}.jsonl"));
+    let header = json!({
+        "type": "session",
+        "version": 1,
+        "id": session_id,
+        "timestamp": "2026-08-20T00:00:00.000Z",
+        "cwd": workspace.to_string_lossy(),
+    });
+    let first = json!({
+        "type": "message",
+        "id": "entry-1",
+        "parentId": null,
+        "timestamp": "2026-08-20T00:00:01.000Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": "one"}]}
+    });
+    let branch = json!({
+        "type": "message",
+        "id": "entry-2",
+        "parentId": null,
+        "timestamp": "2026-08-20T00:00:02.000Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": "branch"}]}
+    });
+    std::fs::write(&rollout, format!("{header}\n{first}\n{branch}\n")).expect("rollout");
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild isolates branch");
+    assert!(store.list_sessions().expect("list sessions").is_empty());
+}
+
+#[test]
+fn jsonl_discovery_deletes_ghost_index_rows() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+
+    let valid_id = "e4a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c";
+    SessionManager::create_with_id(&workspace, &sessions_dir, valid_id).expect("session");
+
+    let ghost_id = "f5b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d";
+    store
+        .insert_session(&SessionRecord {
+            session_id: ghost_id.to_string(),
+            rollout_path: sessions_dir
+                .join(format!("{ghost_id}.jsonl"))
+                .to_string_lossy()
+                .to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: Some("Ghost session".to_string()),
+            model: None,
+            status: Some(SessionStatus::Completed),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            token_usage: json!({}),
+        })
+        .expect("insert ghost");
+
+    assert_eq!(store.list_sessions().expect("list").len(), 1);
+
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild index");
+
+    let sessions = store.list_sessions().expect("list after rebuild");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, valid_id);
+    assert!(store.get_session(ghost_id).is_err());
+}
+
+#[test]
 fn thread_settings_are_jsonl_first_and_never_store_credentials() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
@@ -231,7 +417,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
 }
 
 #[test]
-fn capabilities_expose_additive_camel_case_protocol_fields() {
+fn server_capabilities_method_is_removed() {
     let temp = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
     let mut server = app_server(store, &temp.path().join("sessions"));
@@ -239,8 +425,7 @@ fn capabilities_expose_additive_camel_case_protocol_fields() {
     let response = server
         .handle_json(r#"{"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}}"#)
         .expect("capabilities");
-    assert_eq!(response[0]["result"]["protocolVersion"], "1");
-    assert!(response[0]["result"].get("protocol_version").is_none());
+    assert_eq!(response[0]["error"]["code"], -32601);
 }
 
 #[test]
@@ -445,7 +630,12 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
         .iter()
         .find(|message| message["id"] == 2)
         .expect("turn response");
-    assert_eq!(result["result"]["turn"]["status"], "completed");
+    assert_eq!(result["result"]["turn"]["status"], "running");
+    let completed_event = responses
+        .iter()
+        .find(|message| message["method"] == "turn/completed")
+        .expect("turn completed event");
+    assert_eq!(completed_event["params"]["turn"]["status"], "completed");
 
     assert_eq!(
         std::fs::read_to_string(workspace.join("hello.txt")).expect("hello.txt"),
@@ -544,6 +734,13 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .expect("first turn");
     assert_eq!(
         first.iter().find(|m| m["id"] == 3).expect("response")["result"]["turn"]["status"],
+        "running"
+    );
+    assert_eq!(
+        first
+            .iter()
+            .find(|m| m["method"] == "turn/completed")
+            .expect("completed")["params"]["turn"]["status"],
         "completed"
     );
     assert_eq!(
@@ -577,11 +774,16 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"fail"}}]}}}}"#
         ))
-        .expect_err("failed turn");
-    assert!(matches!(
-        &failed,
-        AppServerError::TurnExecution { original: Some(text), .. } if text.contains("synthetic failure")
-    ));
+        .expect("turn start returns ok");
+    let error_notif = failed
+        .iter()
+        .find(|m| m["method"] == "turn/error")
+        .expect("turn/error notification");
+    assert!(
+        error_notif["params"]["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("synthetic failure"))
+    );
     assert_eq!(
         server
             .store()
@@ -604,6 +806,13 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .expect("third turn");
     assert_eq!(
         third.iter().find(|m| m["id"] == 7).expect("response")["result"]["turn"]["status"],
+        "running"
+    );
+    assert_eq!(
+        third
+            .iter()
+            .find(|m| m["method"] == "turn/completed")
+            .expect("completed")["params"]["turn"]["status"],
         "completed"
     );
 
@@ -1005,7 +1214,14 @@ fn steer_and_follow_up_after_turn_completion_are_rejected() {
         .as_str()
         .expect("turn id")
         .to_string();
-    assert_eq!(turn_one["result"]["turn"]["status"], "completed");
+    assert_eq!(turn_one["result"]["turn"]["status"], "running");
+    assert_eq!(
+        responses
+            .iter()
+            .find(|m| m["method"] == "turn/completed")
+            .expect("completed")["params"]["turn"]["status"],
+        "completed"
+    );
 
     // turn 已终态：steer / followUp 必须拒绝；客户端应发送新的 turn/start。
     for (method, text) in [
@@ -1035,6 +1251,13 @@ fn steer_and_follow_up_after_turn_completion_are_rejected() {
         .expect("turn two");
     assert_eq!(
         responses.iter().find(|m| m["id"] == 4).expect("turn two")["result"]["turn"]["status"],
+        "running"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .find(|m| m["method"] == "turn/completed")
+            .expect("completed")["params"]["turn"]["status"],
         "completed"
     );
     let seen = requests.lock().expect("seen requests");
@@ -1151,7 +1374,10 @@ fn turn_failure_emits_typed_error_event_with_provider_cause() {
     let result = server.handle_turn_start_streaming_with_output(message, |output| {
         collected.push(output);
     });
-    assert!(result.is_err(), "turn must fail");
+    assert!(
+        result.is_ok(),
+        "streaming turn start returns ok and delivers error via notification"
+    );
 
     let error_event = collected
         .iter()
@@ -1237,20 +1463,23 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
         }
 
         let mut events = Vec::new();
-        let error = server
-            .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+        let result = server.handle_turn_start_streaming_with_output(
+            turn_start_message(2, session_id),
+            |value| {
                 events.push(value);
-            })
-            .expect_err("project instruction failure");
+            },
+        );
         assert!(
-            matches!(
-                error,
-                AppServerError::TurnExecution {
-                    cause: TurnFailureCause::ProjectInstructions,
-                    ..
-                }
-            ),
-            "{name}: {error:?}"
+            result.is_ok(),
+            "{name}: turn start succeeds and emits turn/error"
+        );
+        let error_event = events
+            .iter()
+            .find(|value| value["method"] == "turn/error")
+            .expect("turn/error");
+        assert_eq!(
+            error_event["params"]["error"]["cause"], "project_instructions",
+            "{name}: {error_event:?}"
         );
         assert_eq!(seen.lock().expect("seen requests").len(), 0, "{name}");
         assert_eq!(
@@ -1261,10 +1490,6 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
                 .status,
             Some(SessionStatus::Failed),
             "{name}: instruction failure must not leave Active"
-        );
-        assert!(
-            events.iter().any(|value| value["method"] == "turn/error"),
-            "{name}: missing turn/error: {events:?}"
         );
         assert!(
             !events
@@ -1292,22 +1517,22 @@ fn terminal_metadata_failure_emits_error_and_never_completion() {
     server.inject_terminalization_faults(1, 0);
 
     let mut events = Vec::new();
-    let error = server
-        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
             events.push(value);
-        })
-        .expect_err("terminal metadata failure");
-    assert!(
-        matches!(
-            error,
-            AppServerError::TurnTerminalization {
-                stage: TurnFailureStage::TerminalOutcome,
-                failure: TurnTerminalizationFailure::Store,
-                ..
-            }
-        ),
-        "unexpected terminal metadata error: {error:?}"
+        },
     );
+    assert!(
+        result.is_ok(),
+        "terminal metadata failure returns ok and emits error"
+    );
+    let error_event = events
+        .iter()
+        .find(|value| value["method"] == "turn/error")
+        .expect("turn/error");
+    assert_eq!(error_event["params"]["error"]["stage"], "terminal_outcome");
+    assert_eq!(error_event["params"]["error"]["cause"], "store");
     let status = server
         .store()
         .get_session(session_id)
@@ -1319,7 +1544,6 @@ fn terminal_metadata_failure_emits_error_and_never_completion() {
             .iter()
             .any(|value| value["method"] == "turn/completed")
     );
-    assert!(events.iter().any(|value| value["method"] == "turn/error"));
 }
 
 #[test]
@@ -1340,21 +1564,18 @@ fn agent_failure_status_write_failure_still_converges_and_reports_terminalizatio
     server.inject_terminalization_faults(1, 0);
 
     let mut events = Vec::new();
-    let error = server
-        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
             events.push(value);
-        })
-        .expect_err("agent failure");
-    assert!(
-        matches!(
-            error,
-            AppServerError::TurnTerminalization {
-                failure: TurnTerminalizationFailure::Store,
-                ..
-            }
-        ),
-        "unexpected agent terminalization error: {error:?}"
+        },
     );
+    assert!(result.is_ok(), "agent failure returns ok and emits error");
+    let error_event = events
+        .iter()
+        .find(|value| value["method"] == "turn/error")
+        .expect("turn/error");
+    assert_eq!(error_event["params"]["error"]["stage"], "agent_loop");
     let status = server
         .store()
         .get_session(session_id)
@@ -1382,21 +1603,23 @@ fn terminal_event_failure_emits_fallback_error_and_reports_event_stage() {
     server.inject_terminalization_faults(0, 1);
 
     let mut events = Vec::new();
-    let error = server
-        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+    let result = server.handle_turn_start_streaming_with_output(
+        turn_start_message(2, session_id),
+        |value| {
             events.push(value);
-        })
-        .expect_err("terminal event failure");
+        },
+    );
     assert!(
-        matches!(
-            error,
-            AppServerError::TurnTerminalization {
-                stage: TurnFailureStage::EventNotification,
-                failure: TurnTerminalizationFailure::EventNotification,
-                ..
-            }
-        ),
-        "unexpected event terminalization error: {error:?}"
+        result.is_ok(),
+        "terminal event failure returns ok and emits fallback error"
+    );
+    let error_event = events
+        .iter()
+        .find(|value| value["method"] == "turn/error")
+        .expect("turn/error");
+    assert_eq!(
+        error_event["params"]["error"]["stage"],
+        "event_notification"
     );
     assert_eq!(
         server

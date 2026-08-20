@@ -729,7 +729,7 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
                 "turn/start",
                 vec![
                     send(json!({"method": "turn/started", "params": {"turn": turn.clone()}})),
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_json"}, "delta": "agent-loop-ok"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"threadId": "thread_json", "turnId": "turn_json", "item": {"item_id": "item_json"}, "delta": "agent-loop-ok"}})),
                     respond(json!({"turn": turn})),
                 ],
             )
@@ -754,6 +754,183 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
         .expect("agent delta event");
     assert_eq!(item_delta["params"]["delta"], "agent-loop-ok");
     assert!(!stdout(&output).contains("turn turn_json completed"));
+}
+
+// 验证 turn/start 返回 running 后，CLI 只接受精确匹配 (threadId, turnId)
+// 的异步终态通知；先到的其他 turn 终态不得提前结束命令。
+#[test]
+fn cli_run_waits_for_matching_terminal_after_running_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond("thread/start", json!({"thread": fake_thread("thread_live")}))
+            .interaction(
+                "turn/start",
+                vec![
+                    respond(json!({
+                        "turn": fake_turn("turn_live", "thread_live", "running", "running")
+                    })),
+                    sleep_ms(POST_RESPONSE_DELAY_MS),
+                    send(json!({
+                        "method": "turn/completed",
+                        "params": {"turn": fake_turn("turn_other", "thread_other", "completed", "completed")}
+                    })),
+                    send(json!({
+                        "method": "turn/error",
+                        "params": {
+                            "threadId": "thread_other",
+                            "turnId": "turn_other",
+                            "error": {"stage": "agent_loop", "cause": "internal", "message": "stale"}
+                        }
+                    })),
+                    send(json!({
+                        "id": 999,
+                        "error": {"code": -32603, "message": "unrelated request failed"}
+                    })),
+                    send(json!({
+                        "method": "turn/completed",
+                        "params": {"turn": fake_turn("turn_live", "thread_live", "completed", "completed")}
+                    })),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "wait for completion"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("turn turn_live completed agent_loop_status=completed"));
+    assert!(!stdout.contains("turn_other"));
+}
+
+// 验证 running response 后的匹配 turn/error 会保留 JSON 终态并使 CLI 非零退出。
+#[test]
+fn cli_run_json_waits_for_matching_error_after_running_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond("thread/start", json!({"thread": fake_thread("thread_live")}))
+            .interaction(
+                "turn/start",
+                vec![
+                    respond(json!({
+                        "turn": fake_turn("turn_live", "thread_live", "running", "running")
+                    })),
+                    sleep_ms(POST_RESPONSE_DELAY_MS),
+                    send(json!({
+                        "method": "turn/error",
+                        "params": {
+                            "threadId": "thread_other",
+                            "turnId": "turn_other",
+                            "error": {"stage": "agent_loop", "cause": "internal", "message": "stale"}
+                        }
+                    })),
+                    send(json!({
+                        "method": "turn/error",
+                        "params": {
+                            "threadId": "thread_live",
+                            "turnId": "turn_live",
+                            "error": {"stage": "agent_loop", "cause": "provider", "message": "provider failed"}
+                        }
+                    })),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "wait for failure", "--json"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
+    assert_eq!(value["thread"]["thread_id"], "thread_live");
+    assert_eq!(value["turn"]["turn_id"], "turn_live");
+    assert_eq!(value["turn"]["status"], "failed");
+    let events = value["events"].as_array().expect("events");
+    assert!(
+        events.iter().any(|event| {
+            event["method"] == "turn/error"
+                && event["params"]["thread_id"] == "thread_live"
+                && event["params"]["turn_id"] == "turn_live"
+        }),
+        "events={events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["method"] == "turn/error")
+            .count(),
+        2,
+        "stale error is retained as an unrelated event, but cannot become the result"
+    );
+}
+
+// 即使 worker 终态只能以同一 turn/start request 的 JSON-RPC error 返回，
+// CLI 也必须收敛为失败终态，而不能在 running response 后无限等待通知。
+#[test]
+fn cli_run_json_projects_matching_rpc_error_after_running_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .respond("thread/start", json!({"thread": fake_thread("thread_rpc_error")}))
+            .interaction(
+                "turn/start",
+                vec![
+                    respond(json!({
+                        "turn": fake_turn("turn_rpc_error", "thread_rpc_error", "running", "running")
+                    })),
+                    sleep_ms(POST_RESPONSE_DELAY_MS),
+                    json!({
+                        "respond": {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32603, "message": "worker terminalization failed"}
+                        }
+                    }),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "wait for worker failure", "--json"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
+    assert_eq!(value["thread"]["thread_id"], "thread_rpc_error");
+    assert_eq!(value["turn"]["turn_id"], "turn_rpc_error");
+    assert_eq!(value["turn"]["status"], "failed");
+    let error_event = value["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["method"] == "turn/error")
+        .expect("projected terminal error event");
+    assert_eq!(error_event["params"]["thread_id"], "thread_rpc_error");
+    assert_eq!(error_event["params"]["turn_id"], "turn_rpc_error");
+    assert_eq!(
+        error_event["params"]["error"]["message"],
+        "worker terminalization failed"
+    );
 }
 
 // 验证 JSON 模式保留 failed 状态并以失败退出。
@@ -836,7 +1013,7 @@ fn cli_renders_agent_loop_status_and_answer() {
                 "turn/start",
                 vec![
                     send(json!({"method": "turn/started", "params": {"turn": turn.clone()}})),
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "agent loop completed"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"threadId": "thread_fake", "turnId": "turn_fake", "item": {"item_id": "item_fake"}, "delta": "agent loop completed"}})),
                     respond(json!({"turn": turn})),
                 ],
             )
@@ -869,7 +1046,7 @@ fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
             .interaction(
                 "turn/start",
                 vec![
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "agent loop failed"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"threadId": "thread_fake", "turnId": "turn_failed", "item": {"item_id": "item_fake"}, "delta": "agent loop failed"}})),
                     respond(json!({"turn": fake_turn("turn_failed", "thread_fake", "failed", "failed")})),
                 ],
             )

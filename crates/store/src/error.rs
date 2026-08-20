@@ -20,12 +20,44 @@ pub enum StoreError {
     /// 数据库 schema 版本不是当前实现支持的版本。
     #[error("unsupported schema version {found}; supported version is {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    /// 当前 schema 结构校验失败（表、列、索引不匹配）。
+    #[error("schema structure mismatch: {0}")]
+    SchemaStructure(String),
     /// 数据违反索引或文件状态不变量。
     #[error("invalid store state: {0}")]
     InvalidState(String),
     /// 初始化锁无法获取或使用。
     #[error("store initialization lock error: {0}")]
     InitializationLock(#[source] std::io::Error),
+    /// 数据库损坏隔离与备份失败。
+    #[error("quarantine failure: {0}")]
+    Quarantine(#[source] std::io::Error),
+}
+
+impl StoreError {
+    /// 判断错误是否属于可自动隔离并重建的 SQLite 结构损坏。
+    /// 仅 malformed/not-a-database、unsupported schema、当前 schema 结构校验失败可恢复。
+    /// 权限、路径、no-follow/file identity、初始化锁、rename/backup、disk full、busy/lock timeout 和一般 I/O 错误显式失败。
+    pub fn is_recoverable_corruption(&self) -> bool {
+        match self {
+            StoreError::UnsupportedSchema { .. } => true,
+            StoreError::SchemaStructure(_) => true,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(ffi_err, _)) => {
+                matches!(
+                    ffi_err.extended_code,
+                    rusqlite::ffi::SQLITE_CORRUPT
+                        | rusqlite::ffi::SQLITE_NOTADB
+                        | rusqlite::ffi::SQLITE_CORRUPT_VTAB
+                        | rusqlite::ffi::SQLITE_CORRUPT_SEQUENCE
+                        | rusqlite::ffi::SQLITE_CORRUPT_INDEX
+                ) || matches!(
+                    ffi_err.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+            }
+            _ => false,
+        }
+    }
 }
 
 /// 所有会话索引操作返回的结果类型。

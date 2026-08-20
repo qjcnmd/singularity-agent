@@ -112,13 +112,13 @@ Desktop 接入前补齐 Codex 式 \`item/completed\` 生命周期：每个 \`ite
 
 并行工具的实时事件按实际完成顺序到达；Session 中的最终 tool result 仍按模型 source order 持久化。UI 获得低延迟进度，模型上下文保持稳定顺序。
 
-### D-027：能力声明
+### D-027：能力声明（已被当前协议取代）
 
-在现有 \`server/capabilities\` 中增加协议版本和固定 feature 列表，至少声明 item 生命周期、工具 item、thread 设置和 interrupted recovery。Desktop 按能力启用功能，不建立插件注册系统。
+历史提案：曾建议在 \`server/capabilities\` 中增加协议版本和固定 feature 列表。该表面未进入当前协议，当前客户端直接遵循稳定的请求/事件合同；本节仅保留决策历史，不是当前事实。
 
-### D-028：协议兼容
+### D-028：协议兼容（已被当前协议取代）
 
-采用能力先协商、协议只增不改、旧客户端继续基本运行、新客户端对旧 server 降级的兼容合同。新命令在能力缺失时返回 typed unsupported error，不依赖试错或内部崩溃。
+历史提案：曾采用能力先协商、协议只增不改的兼容合同。当前协议不再提供能力协商表面；新增请求按稳定 JSON-RPC/typed error 合同处理。本节仅保留决策历史，不是当前事实。
 
 ### D-029：Thread 设置接口
 

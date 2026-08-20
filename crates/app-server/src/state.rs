@@ -63,6 +63,11 @@ impl AppServerCancellationHandle {
         }
         Ok(())
     }
+
+    /// 返回连接级 execution stop 是否已经广播。
+    pub fn execution_stop_requested(&self) -> bool {
+        self.execution_stopped.load(Ordering::SeqCst)
+    }
 }
 
 pub(super) struct ActiveTurnGuard {
@@ -237,6 +242,15 @@ impl AppServer {
         turn_id: &str,
         thread_id: &str,
     ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
+        let mut turn_threads = self
+            .turn_threads
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        if turn_threads.values().any(|r| r.thread_id == thread_id) {
+            return Err(AppServerError::Workspace(
+                "another turn is already running for this session".to_string(),
+            ));
+        }
         let cancellation = CancellationToken::new();
         let mut active_turns = self
             .active_turns
@@ -251,16 +265,14 @@ impl AppServer {
             cancellation.cancel();
         }
         active_turns.insert(turn_id.to_string(), cancellation.clone());
+        turn_threads.insert(
+            turn_id.to_string(),
+            TurnReference {
+                thread_id: thread_id.to_string(),
+            },
+        );
         drop(active_turns);
-        self.turn_threads
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(
-                turn_id.to_string(),
-                TurnReference {
-                    thread_id: thread_id.to_string(),
-                },
-            );
+        drop(turn_threads);
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),

@@ -8,7 +8,7 @@ use super::{
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
     ModelUsage, OpenAiProviderConfig, ProviderError, ProviderErrorStage, ProviderProtocolContract,
     ProviderReasoningReplay, ProviderToolReasoningMode, RESPONSES_PATH, ThinkingWireFormat,
-    ToolChoiceMode, V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH, validate_model_turn_response,
+    V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH, validate_model_turn_response,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -120,9 +120,6 @@ pub(super) fn openai_request_payload(
     if let Some(top_p) = request.model_preferences.top_p {
         payload["top_p"] = json!(top_p);
     }
-    if request.model_preferences.json_mode {
-        payload["response_format"] = json!({"type": "json_object"});
-    }
     if reasoning_enabled {
         match thinking_wire_format {
             ThinkingWireFormat::ThinkingType => {
@@ -205,9 +202,6 @@ pub(super) fn openai_responses_request_payload(
     }
     if let Some(top_p) = request.model_preferences.top_p {
         payload["top_p"] = json!(top_p);
-    }
-    if request.model_preferences.json_mode {
-        payload["text"] = json!({"format": {"type": "json_object"}});
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -346,12 +340,8 @@ pub(super) fn openai_responses_input(
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-pub(super) fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Value {
-    match request.tool_choice.mode {
-        ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => json!("required"),
-        ToolChoiceMode::Auto => json!("auto"),
-    }
+pub(super) fn openai_responses_tool_choice_payload(_request: &ModelTurnRequest) -> Value {
+    json!("auto")
 }
 
 fn openai_message_payload_with_reasoning(
@@ -446,12 +436,8 @@ pub(super) fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bo
     payload
 }
 
-pub(super) fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
-    match request.tool_choice.mode {
-        ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => json!("required"),
-        ToolChoiceMode::Auto => json!("auto"),
-    }
+pub(super) fn openai_tool_choice_payload(_request: &ModelTurnRequest) -> Value {
+    json!("auto")
 }
 
 pub(super) struct OpenAiCompletion {

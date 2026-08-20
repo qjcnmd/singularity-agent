@@ -102,7 +102,6 @@ fn method_registry_keeps_only_converged_methods() {
     for expected in [
         "initialize",
         "initialized",
-        "server/capabilities",
         "thread/list",
         "thread/start",
         "thread/resume",
@@ -122,6 +121,7 @@ fn method_registry_keeps_only_converged_methods() {
         );
     }
     for removed in [
+        "server/capabilities",
         "thread/read",
         "thread/fork",
         "thread/archive",
@@ -140,6 +140,63 @@ fn method_registry_keeps_only_converged_methods() {
     }
     assert_eq!(Method::TurnSteer.spec().kind, MethodKind::Request);
     assert_eq!(Method::TurnFollowUp.spec().kind, MethodKind::Request);
+}
+
+#[test]
+fn item_and_tool_execution_events_carry_thread_and_turn_identity() {
+    let started = AppEvent::item_started("thread-1", "turn-1", "item-1");
+    assert_eq!(started.method, "item/started");
+    assert_eq!(started.params["threadId"], "thread-1");
+    assert_eq!(started.params["turnId"], "turn-1");
+    assert_eq!(started.params["item"]["item_id"], "item-1");
+
+    let delta = AppEvent::item_agent_message_delta("thread-1", "turn-1", "item-1", "chunk");
+    assert_eq!(delta.method, "item/agentMessage/delta");
+    assert_eq!(delta.params["threadId"], "thread-1");
+    assert_eq!(delta.params["turnId"], "turn-1");
+    assert_eq!(delta.params["delta"], "chunk");
+
+    let completed = AppEvent::item_completed("thread-1", "turn-1", "item-1");
+    assert_eq!(completed.method, "item/completed");
+    assert_eq!(completed.params["threadId"], "thread-1");
+    assert_eq!(completed.params["turnId"], "turn-1");
+
+    let failed = AppEvent::item_failed("thread-1", "turn-1", "item-1", "bad item");
+    assert_eq!(failed.method, "item/failed");
+    assert_eq!(failed.params["threadId"], "thread-1");
+    assert_eq!(failed.params["turnId"], "turn-1");
+    assert_eq!(failed.params["error"], "bad item");
+
+    let args = json!({"command": "echo hi"});
+    let start =
+        AppEvent::tool_execution_start("thread-1", "turn-1", "call-1", "bash", args.clone());
+    assert_eq!(start.method, "tool/execution/start");
+    assert_eq!(start.params["threadId"], "thread-1");
+    assert_eq!(start.params["turnId"], "turn-1");
+    assert_eq!(start.params["toolCallId"], "call-1");
+    assert_eq!(start.params["toolName"], "bash");
+    assert_eq!(start.params["args"], args);
+
+    let update = AppEvent::tool_execution_update(
+        "thread-1",
+        "turn-1",
+        "call-1",
+        "bash",
+        json!({"command": "echo hi"}),
+        "hi\n",
+    );
+    assert_eq!(update.params["threadId"], "thread-1");
+    assert_eq!(update.params["turnId"], "turn-1");
+    assert_eq!(update.params["partialResult"], "hi\n");
+    assert_eq!(update.params["toolName"], "bash");
+    assert_eq!(update.params["args"]["command"], "echo hi");
+
+    let end = AppEvent::tool_execution_end("thread-1", "turn-1", "call-1", "bash", "done", false);
+    assert_eq!(end.params["threadId"], "thread-1");
+    assert_eq!(end.params["turnId"], "turn-1");
+    assert_eq!(end.params["result"]["content"][0]["text"], "done");
+    assert_eq!(end.params["result"]["isError"], false);
+    assert_eq!(end.params["isError"], false);
 }
 
 #[test]
@@ -213,22 +270,12 @@ fn initialize_params_keep_client_info_contract() {
 }
 
 #[test]
-fn tool_execution_events_use_pi_wire_fields() {
-    let args = json!({"command": "echo hi"});
-    let start = AppEvent::tool_execution_start("call-1", "bash", args.clone());
-    assert_eq!(start.method, "tool/execution/start");
-    assert_eq!(start.params["toolCallId"], "call-1");
-    assert_eq!(start.params["toolName"], "bash");
-    assert_eq!(start.params["args"], args);
+fn event_metadata_has_no_gap_variant() {
+    let state = serde_json::to_value(singularity_protocol::EventClass::State).unwrap();
+    assert_eq!(state, "state");
+    let progress = serde_json::to_value(singularity_protocol::EventClass::Progress).unwrap();
+    assert_eq!(progress, "progress");
 
-    let update =
-        AppEvent::tool_execution_update("call-1", "bash", json!({"command": "echo hi"}), "hi\n");
-    assert_eq!(update.params["partialResult"], "hi\n");
-    assert_eq!(update.params["toolName"], "bash");
-    assert_eq!(update.params["args"]["command"], "echo hi");
-
-    let end = AppEvent::tool_execution_end("call-1", "bash", "done", false);
-    assert_eq!(end.params["result"]["content"][0]["text"], "done");
-    assert_eq!(end.params["result"]["isError"], false);
-    assert_eq!(end.params["isError"], false);
+    assert!(serde_json::from_str::<singularity_protocol::EventClass>("\"gap\"").is_err());
+    assert!(serde_json::from_str::<singularity_protocol::EventDelivery>("\"gap\"").is_err());
 }

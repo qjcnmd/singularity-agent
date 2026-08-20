@@ -1252,15 +1252,9 @@ impl Provider for OpenAiProvider {
             contract.supports_parallel_tool_calls = overrides
                 .supports_parallel_tool_calls
                 .unwrap_or(contract.supports_parallel_tool_calls);
-            contract.supports_required_tool_choice = overrides
-                .supports_required_tool_choice
-                .unwrap_or(contract.supports_required_tool_choice);
             contract.supports_strict_tool_schema = overrides
                 .supports_strict_tool_schema
                 .unwrap_or(contract.supports_strict_tool_schema);
-            contract.supports_json_mode = overrides
-                .supports_json_mode
-                .unwrap_or(contract.supports_json_mode);
             contract.supports_system_message = overrides
                 .supports_system_message
                 .unwrap_or(contract.supports_system_message);

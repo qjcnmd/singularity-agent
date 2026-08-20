@@ -61,10 +61,6 @@ const PROVIDER_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 /// Provider boundary code used when a protocol has no normalized text stream.
 pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
-const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
-const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
-const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
-    "provider_does_not_support_required_tool_choice";
 const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -137,13 +133,11 @@ impl ModelMessage {
     }
 }
 
-/// 控制模型提供方可以选择 tool、必须选择一个 tool，还是不得调用 tool。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// 控制模型提供方的 tool 选择模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceMode {
     Auto,
-    None,
-    Required,
 }
 
 /// 应用于一次模型请求的 tool 选择限制和模式严格程度。
@@ -586,11 +580,9 @@ pub struct UserConfigImportResult {
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
     pub supports_parallel_tool_calls: bool,
-    pub supports_required_tool_choice: bool,
     pub supports_strict_tool_schema: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub max_tools_per_request: u32,
-    pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
     /// 单次请求与本地工具工作窗口的最大并行调用数。
@@ -604,11 +596,9 @@ impl Default for ProviderProtocolContract {
         Self {
             supports_tools: true,
             supports_parallel_tool_calls: false,
-            supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
-            supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
             max_parallel_tool_calls: 1,
@@ -628,9 +618,7 @@ impl Default for ProviderProtocolContract {
 pub struct ProviderCapabilityDeclaration {
     pub supports_tools: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
-    pub supports_required_tool_choice: Option<bool>,
     pub supports_strict_tool_schema: Option<bool>,
-    pub supports_json_mode: Option<bool>,
     pub supports_system_message: Option<bool>,
     pub supports_developer_message: Option<bool>,
     pub supports_reasoning: Option<bool>,
@@ -647,7 +635,6 @@ pub struct ModelPreferences {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
-    pub json_mode: bool,
 }
 
 /// 脱敏的模型提供方配置存在性信息；这里永不存储敏感信息。

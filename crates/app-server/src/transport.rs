@@ -2,7 +2,8 @@
 //!
 //! CLI 每次命令启动独立 app-server 子进程，经 `tokio::io::stdin()`/`stdout()` 通信；
 //! 不保留 TCP daemon、连接复用或空闲自停。输入由 Tokio 单一 owner 读取；
-//! turn/start 由单一工作线程执行，其余请求在输入 owner 的 blocking 任务中直接处理。
+//! turn/start 为每个 active turn 创建独立 worker；同一连接可并发运行不同 session，
+//! 但每个 session 同时只允许一个 turn。其余请求在输入 owner 的 blocking 任务中直接处理。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
 //! 顺序性保证事件与响应天然有序，无需全局排序或 cursor/gap 机制。
 
@@ -25,11 +26,9 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
-const APP_ERROR_INVALID_STATE: i64 = -32005;
 /// 单条 JSON-Lines frame（含 JSON-RPC 请求/响应）的字节上限。
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const FILE_BACKED_STORE_REQUIRED: &str =
@@ -39,11 +38,16 @@ const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
 
 trait ExecutionStop: Send + Sync {
     fn request_execution_stop(&self);
+    fn execution_stop_requested(&self) -> bool;
 }
 
 impl ExecutionStop for AppServerCancellationHandle {
     fn request_execution_stop(&self) {
         let _ = AppServerCancellationHandle::request_execution_stop(self);
+    }
+
+    fn execution_stop_requested(&self) -> bool {
+        AppServerCancellationHandle::execution_stop_requested(self)
     }
 }
 
@@ -89,8 +93,8 @@ where
     let mut writer_result = None;
     let mut writer_timeout = false;
     let mut server = Some(server);
-    // 单 worker 槽位：同一时刻至多一个 turn/start 执行。
-    let mut turn_task: Option<JoinHandle<Result<(), String>>> = None;
+    // 支持不同 session 的多个 turn/start 并发执行。
+    let mut turn_tasks: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut reader = reader;
     let mut terminal_error = None;
 
@@ -107,11 +111,8 @@ where
                 });
                 break;
             }
-            result = async {
-                turn_task.as_mut().expect("active turn task").await
-            }, if turn_task.is_some() => {
-                turn_task = None;
-                match result {
+            Some(join_result) = turn_tasks.join_next(), if !turn_tasks.is_empty() => {
+                match join_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         terminal_error = Some(error);
@@ -189,19 +190,6 @@ where
                         .expect("stdio server owner")
                         .ready_for_turn_worker()
                 {
-                    if turn_task.is_some() {
-                        if let Err(error) = send_output_async(
-                            output_tx.clone(),
-                            cancellation.clone(),
-                            turn_slot_busy_value(request_id),
-                        )
-                        .await
-                        {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                        continue;
-                    }
                     let current_server = server.take().expect("stdio server owner");
                     let task = tokio::task::spawn_blocking(move || {
                         let worker = current_server.turn_worker();
@@ -219,9 +207,9 @@ where
                         Ok(worker) => {
                             let worker_outputs = output_tx.clone();
                             let worker_cancellation = cancellation.clone();
-                            turn_task = Some(tokio::task::spawn_blocking(move || {
+                            turn_tasks.spawn_blocking(move || {
                                 run_turn_request(worker, message, worker_outputs, worker_cancellation)
-                            }));
+                            });
                         }
                         Err(error) => {
                             if let Err(error) = send_output_async(
@@ -290,24 +278,65 @@ where
             result.map_err(|error| format!("failed to stop executions during shutdown: {error}"))
         });
     let mut worker_error = None;
-    if let Some(mut task) = turn_task.take() {
+    while !turn_tasks.is_empty() {
         if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
-            match tokio::time::timeout(remaining, &mut task).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => worker_error = Some(error),
-                Ok(Err(error)) => {
-                    worker_error = Some(format!("turn worker task failed: {error}"));
+            match tokio::time::timeout(remaining, turn_tasks.join_next()).await {
+                Ok(Some(Ok(Ok(())))) => {}
+                Ok(Some(Ok(Err(error)))) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(error);
+                    }
                 }
+                Ok(Some(Err(error))) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(format!("turn worker task failed: {error}"));
+                    }
+                }
+                Ok(None) => break,
                 Err(_) => {
-                    task.abort();
-                    worker_error =
-                        Some("timed out waiting for the turn worker during shutdown".to_string());
+                    // A started `spawn_blocking` job cannot be force-aborted. All
+                    // execution and output seams are cancellation-aware, so after the
+                    // bounded grace period keep owning and joining the workers rather
+                    // than detaching them from the AppServer lifecycle. The diagnostic
+                    // records that the normal deadline was exceeded while preserving
+                    // the stronger ownership invariant.
+                    worker_error = Some(
+                        "turn workers exceeded shutdown grace; waiting for cooperative quiescence"
+                            .to_string(),
+                    );
+                    while let Some(join_result) = turn_tasks.join_next().await {
+                        match join_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) if worker_error.is_none() => {
+                                worker_error = Some(error);
+                            }
+                            Ok(Err(_)) => {}
+                            Err(error) if worker_error.is_none() => {
+                                worker_error = Some(format!("turn worker task failed: {error}"));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    break;
                 }
             }
         } else {
-            task.abort();
-            worker_error =
-                Some("timed out waiting for the turn worker during shutdown".to_string());
+            worker_error = Some(
+                "turn workers exceeded shutdown grace; waiting for cooperative quiescence"
+                    .to_string(),
+            );
+            while let Some(join_result) = turn_tasks.join_next().await {
+                match join_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
+                    Ok(Err(_)) => {}
+                    Err(error) if worker_error.is_none() => {
+                        worker_error = Some(format!("turn worker task failed: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
+            break;
         }
     }
     drop(output_tx);
@@ -469,8 +498,15 @@ fn initialize_app_server(
             .map(str::to_string)
             .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?
     };
-    let store = SessionStore::open(&db_path)
-        .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
+    let store = SessionStore::open_with_initialization(&db_path, |store| {
+        singularity_app_server::rebuild_session_index_from_jsonl(store, &paths.sessions_dir)
+            .map_err(|error| {
+                singularity_store::StoreError::InvalidState(format!(
+                    "failed to rebuild app-server session index: {error}"
+                ))
+            })
+    })
+    .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
     // 收紧本次实际打开并创建的索引文件权限（在 Unix 系统上应用 0600/0700 权限）。
     if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
         singularity_store::ensure_owner_only_file(Path::new(&db_path)).map_err(|error| {
@@ -480,10 +516,6 @@ fn initialize_app_server(
         paths.ensure_index_owner_only()?;
     }
     validate_database_file(Path::new(&db_path), false)?;
-    // 启动只读取 JSONL header 建立可用索引；单个损坏 rollout 由 discovery 隔离，
-    // 不在这里追加 interrupted 或其它 repair 条目。目标 Session 真正打开时再 repair。
-    singularity_app_server::rebuild_session_index_from_jsonl(&store, &paths.sessions_dir)
-        .map_err(|error| format!("failed to rebuild app-server session index: {error}"))?;
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
     Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))
@@ -499,7 +531,7 @@ async fn send_output_async(
         .map_err(|error| format!("output dispatch task failed: {error}"))?
 }
 
-/// 判断单请求是否属于独占 turn 槽位的 long-running 方法。
+/// 判断单请求是否需要后台 turn worker。
 fn is_turn_request(message: &JsonRpcMessage) -> bool {
     !message.is_notification()
         && matches!(
@@ -518,14 +550,10 @@ fn run_turn_request(
     let request_id = message.id().cloned();
     let mut output_error = None;
     let mut emit = |output: AppServerOutput| {
-        if output_error.is_none() {
-            match outputs.blocking_send(output) {
-                Ok(()) => {}
-                Err(_) => {
-                    output_error = Some("stdout transport unavailable".to_string());
-                    let _ = cancellation.request_execution_stop();
-                }
-            }
+        if output_error.is_none()
+            && let Err(error) = send_output(&outputs, &cancellation, output)
+        {
+            output_error = Some(error);
         }
     };
     let result = match message.method_name() {
@@ -553,12 +581,24 @@ fn run_turn_request(
 fn send_output(
     outputs: &mpsc::Sender<Value>,
     cancellation: &dyn ExecutionStop,
-    message: Value,
+    mut message: Value,
 ) -> Result<(), String> {
-    outputs.blocking_send(message).map_err(|_| {
-        cancellation.request_execution_stop();
-        "stdout transport unavailable".to_string()
-    })
+    loop {
+        match outputs.try_send(message) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(next)) => {
+                if cancellation.execution_stop_requested() {
+                    return Err("stdout transport stopping".to_string());
+                }
+                message = next;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                cancellation.request_execution_stop();
+                return Err("stdout transport unavailable".to_string());
+            }
+        }
+    }
 }
 
 fn send_app_server_outputs(
@@ -626,15 +666,6 @@ fn request_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
         }
         error => transport_error_value(id, error),
     }
-}
-
-/// 单 worker 槽位被占用时拒绝第二个并发 turn 请求。
-fn turn_slot_busy_value(id: Option<JsonRpcId>) -> Value {
-    JsonRpcMessage::error(
-        id,
-        ErrorCode::new(APP_ERROR_INVALID_STATE, "another turn is already running"),
-    )
-    .to_wire_value()
 }
 
 fn internal_error_value(id: Option<JsonRpcId>, diagnostic: impl Into<String>) -> Value {
@@ -880,6 +911,10 @@ mod tests {
         fn request_execution_stop(&self) {
             self.requests.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn execution_stop_requested(&self) -> bool {
+            self.requests.load(Ordering::SeqCst) > 0
+        }
     }
 
     fn test_output_channel(capacity: usize) -> (mpsc::Sender<Value>, mpsc::Receiver<Value>) {
@@ -1056,6 +1091,36 @@ mod tests {
             true
         );
         assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn bounded_output_queue_unblocks_a_worker_when_shutdown_is_requested() {
+        let (outputs, _receiver) = test_output_channel(1);
+        let cancellation = CancellationProbe::default();
+        send_output(&outputs, &cancellation, serde_json::json!({"first": true}))
+            .expect("first output fits");
+
+        let (attempted_sender, attempted_receiver) = std_mpsc::channel();
+        let sender_outputs = outputs.clone();
+        let sender_cancellation = cancellation.clone();
+        let sender = thread::spawn(move || {
+            attempted_sender.send(()).expect("send attempted");
+            send_output(
+                &sender_outputs,
+                &sender_cancellation,
+                serde_json::json!({"second": true}),
+            )
+        });
+        attempted_receiver.recv().expect("send attempt");
+        assert!(
+            !sender.is_finished(),
+            "full queue must initially backpressure"
+        );
+        cancellation.request_execution_stop();
+        assert_eq!(
+            sender.join().expect("sender"),
+            Err("stdout transport stopping".to_string())
+        );
     }
 
     struct DisconnectedWriter;
@@ -1317,21 +1382,25 @@ mod tests {
         while let Some(value) = receiver.blocking_recv() {
             values.push(value);
         }
+        let rpc_response = values
+            .iter()
+            .position(|value| value["id"] == 3 && value["result"].is_object())
+            .expect("RPC running response");
         let turn_error = values
             .iter()
             .position(|value| value["method"] == "turn/error")
             .expect("turn/error event");
-        let rpc_error = values
-            .iter()
-            .position(|value| value["id"] == 3 && value["error"].is_object())
-            .expect("RPC error response");
         assert!(
-            turn_error < rpc_error,
-            "events must precede RPC: {values:?}"
+            rpc_response < turn_error,
+            "running RPC response must precede background terminal event: {values:?}"
         );
-        assert_eq!(values[rpc_error]["error"]["code"], -32603);
+        assert_eq!(values[rpc_response]["result"]["turn"]["status"], "running");
+        assert_eq!(
+            values[turn_error]["params"]["error"]["cause"],
+            "project_instructions"
+        );
         assert!(
-            values[rpc_error]["error"]["message"]
+            values[turn_error]["params"]["error"]["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("project_instruction_file_too_large"))
         );
@@ -1347,19 +1416,6 @@ mod tests {
         assert_eq!(response["error"]["code"], -32603);
         assert_eq!(response["error"]["message"], "Internal error");
         assert!(!response.to_string().contains("sk-shape"));
-    }
-
-    #[test]
-    fn turn_slot_busy_has_a_stable_typed_response() {
-        let response = turn_slot_busy_value(Some(JsonRpcId::String("request-7".into())));
-
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["id"], "request-7");
-        assert_eq!(response["error"]["code"], -32005);
-        assert_eq!(
-            response["error"]["message"],
-            "another turn is already running"
-        );
     }
 
     #[test]

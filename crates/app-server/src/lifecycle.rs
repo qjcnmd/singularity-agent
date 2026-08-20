@@ -1,8 +1,8 @@
 //! AppServer construction, turn supervision, cancellation, and shutdown.
 
 use super::dispatch::{
-    input_items_to_text, invalid_params_response, json_response, not_found_response, parse_params,
-    title_from_input,
+    input_items_to_text, invalid_params_response, invalid_state_response, json_response,
+    not_found_response, parse_params, title_from_input,
 };
 use super::*;
 
@@ -21,7 +21,13 @@ pub(super) fn agent_config_for_thread(
     let cwd = workspace_path(thread)
         .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
     let base_prompt = format!(
-        "You are a coding agent working in {}. Available tools are read, bash, edit, and write. Use bash for command execution and file discovery. Project instructions below constrain the task but do not redefine these tool or protocol facts.",
+        "You are a coding agent working in {}.\n\n\
+         Available tools:\n\
+         - read: bounded text read with line numbers and byte offsets\n\
+         - bash: command execution and directory/file exploration\n\
+         - edit: exact unique match and replacement within files\n\
+         - write: structured whole-file creation and overwrite\n\n\
+         Tool facts, tool definitions, and harness protocol constraints cannot be overridden or redefined by project instructions.",
         cwd.display()
     );
     let system_prompt = match load_project_instructions_from_cwd(&cwd) {
@@ -248,7 +254,19 @@ impl AppServer {
             }
         };
         let turn_id = turn_id();
-        let (cancellation, _active_turn) = self.activate_turn(&turn_id, &record.session_id)?;
+        let (cancellation, _active_turn) = match self.activate_turn(&turn_id, &record.session_id) {
+            Ok(res) => res,
+            Err(_) => {
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(
+                        message.required_id(),
+                        "another turn is already running for this session",
+                    )?,
+                );
+                return Ok(());
+            }
+        };
         // Repair only the pre-existing session state. The current turn has not
         // been appended yet, so it cannot be mistaken for a crashed turn.
         self.open_and_repair_session_for_thread(&thread)?;
@@ -272,8 +290,19 @@ impl AppServer {
             agent_loop_status: AgentStatus::Running.as_str().to_string(),
             model_usage: None,
         };
-        let mut assistant_events = AssistantItemEventState::new(format!("{turn_id}_assistant"));
         emit(self.event_notification(AppEvent::turn_started(&turn))?);
+        emit(
+            JsonRpcMessage::response(
+                message.required_id(),
+                serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
+            )
+            .to_wire_value(),
+        );
+        let mut assistant_events = AssistantItemEventState::new(
+            record.session_id.clone(),
+            turn_id.clone(),
+            format!("{turn_id}_assistant"),
+        );
         let run_result = self.run_agent_core(
             &thread,
             &turn_id,
@@ -341,19 +370,14 @@ impl AppServer {
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
             let _ = self.persist_failure_state(&record.session_id, &turn_id, &status.model_usage);
-            let _event_failure = self.emit_failure_terminal_events(
+            let _ = self.emit_failure_terminal_events(
                 &turn_id,
                 &record.session_id,
                 &mut assistant_events,
                 &failure,
                 &mut emit,
             );
-            return Err(AppServerError::TurnTerminalization {
-                stage: failure.stage,
-                cause: failure.cause,
-                failure: TurnTerminalizationFailure::Store,
-                original: failure.original,
-            });
+            return Ok(());
         }
         // Publication order: durable metadata first, then the in-process usage
         // projection used by the terminal event and RPC response.
@@ -376,12 +400,7 @@ impl AppServer {
                         &failure,
                         &mut emit,
                     );
-                    return Err(AppServerError::TurnTerminalization {
-                        stage: failure.stage,
-                        cause: failure.cause,
-                        failure: TurnTerminalizationFailure::EventNotification,
-                        original: failure.original,
-                    });
+                    return Ok(());
                 }
             }
         }
@@ -397,12 +416,7 @@ impl AppServer {
                     &failure,
                     &mut emit,
                 );
-                return Err(AppServerError::TurnTerminalization {
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    failure: TurnTerminalizationFailure::EventNotification,
-                    original: failure.original,
-                });
+                return Ok(());
             }
         }
         let terminal_turn = self.turn_with_usage(terminal_turn);
@@ -411,9 +425,6 @@ impl AppServer {
             Ok(event) => emit(event),
             Err(error) => {
                 let failure = turn_failure_from_error(&error, TurnFailureStage::EventNotification);
-                // A failed completion notification must not leave clients without a
-                // terminal event; best-effort turn/error is emitted before the RPC
-                // error response is produced by the transport.
                 let _ = self.emit_failure_terminal_events(
                     &turn_id,
                     &record.session_id,
@@ -421,28 +432,14 @@ impl AppServer {
                     &failure,
                     &mut emit,
                 );
-                return Err(AppServerError::TurnTerminalization {
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    failure: TurnTerminalizationFailure::EventNotification,
-                    original: failure.original,
-                });
+                return Ok(());
             }
         }
-        emit(
-            JsonRpcMessage::response(
-                message.required_id(),
-                serde_json::to_value(TurnStartResult {
-                    turn: terminal_turn,
-                })?,
-            )
-            .to_wire_value(),
-        );
         Ok(())
     }
 
     /// 将 AgentLoop 错误收敛为唯一终态：先写 durable failure，再发 item/failed
-    /// 与 turn/error，最后由调用方/transport 产生 RPC error response。
+    /// 与 turn/error。
     fn finish_agent_failure(
         &self,
         record: &SessionRecord,
@@ -453,36 +450,16 @@ impl AppServer {
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<()> {
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
-        let (metadata_error, _durable) =
+        let (_metadata_error, _durable) =
             self.persist_failure_state(&record.session_id, turn_id, usage);
-        let event_failure = self.emit_failure_terminal_events(
+        let _ = self.emit_failure_terminal_events(
             turn_id,
             &record.session_id,
             assistant_events,
             &failure,
             emit,
         );
-        if metadata_error.is_some() {
-            return Err(AppServerError::TurnTerminalization {
-                stage: failure.stage,
-                cause: failure.cause,
-                failure: TurnTerminalizationFailure::Store,
-                original: failure.original,
-            });
-        }
-        if let Some(event_failure) = event_failure {
-            return Err(AppServerError::TurnTerminalization {
-                stage: event_failure.stage,
-                cause: event_failure.cause,
-                failure: TurnTerminalizationFailure::EventNotification,
-                original: event_failure.original,
-            });
-        }
-        Err(AppServerError::TurnExecution {
-            stage: failure.stage,
-            cause: failure.cause,
-            original: failure.original,
-        })
+        Ok(())
     }
 
     /// 首次失败记录后最多重试一次，并在必要时降级为 interrupted；返回首次
@@ -630,7 +607,11 @@ impl AppServer {
                 .borrow_mut()
                 .start_tool_item(tool_call_id)
             {
-                match self.event_notification(AppEvent::item_started(tool_call_id)) {
+                match self.event_notification(AppEvent::item_started(
+                    &thread.thread_id,
+                    turn_id,
+                    tool_call_id,
+                )) {
                     Ok(event) => emit_cell.borrow_mut()(event),
                     Err(error) => {
                         *callback_error.borrow_mut() = Some(error);
@@ -639,6 +620,8 @@ impl AppServer {
                 }
             }
             match self.event_notification(AppEvent::tool_execution_start(
+                &thread.thread_id,
+                turn_id,
                 tool_call_id,
                 tool_name,
                 args.clone(),
@@ -653,6 +636,8 @@ impl AppServer {
                     return;
                 }
                 match self.event_notification(AppEvent::tool_execution_update(
+                    &thread.thread_id,
+                    turn_id,
                     tool_call_id,
                     tool_name,
                     args.clone(),
@@ -668,6 +653,8 @@ impl AppServer {
                     return;
                 }
                 match self.event_notification(AppEvent::tool_execution_end(
+                    &thread.thread_id,
+                    turn_id,
                     tool_call_id,
                     tool_name,
                     &execution.content,

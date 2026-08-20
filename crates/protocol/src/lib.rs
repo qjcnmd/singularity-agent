@@ -138,7 +138,6 @@ macro_rules! method_registry {
 method_registry! {
     Initialize => ("initialize", Request, InitializeParams, InitializeResult),
     Initialized => ("initialized", Notification, EmptyParams, EmptyResult),
-    ServerCapabilities => ("server/capabilities", Request, EmptyParams, ServerCapabilitiesResult),
     ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
     ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
     ThreadResume => ("thread/resume", Request, ThreadIdParams, ThreadResult),
@@ -534,26 +533,6 @@ impl InitializeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// 服务端支持的传输能力集合。
-pub struct ServerCapabilitiesResult {
-    pub transports: Vec<TransportCapability>,
-    /// 协议版本和固定能力名称为 additive 字段；旧客户端只读取 transports。
-    #[serde(rename = "protocolVersion", default)]
-    pub protocol_version: String,
-    #[serde(default)]
-    pub features: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// 单项传输能力及认证要求。
-pub struct TransportCapability {
-    pub transport: String,
-    pub available: bool,
-    #[serde(rename = "authTokenRequired")]
-    pub auth_token_required: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 创建 thread 的参数。
 pub struct ThreadStartParams {
@@ -927,7 +906,6 @@ pub struct AppEvent {
 pub enum EventClass {
     State,
     Progress,
-    Gap,
 }
 
 /// 事件在 stdio 传输上的交付合同。
@@ -936,17 +914,6 @@ pub enum EventClass {
 pub enum EventDelivery {
     Reliable,
     BestEffort,
-    Gap,
-}
-
-/// 事件 gap 的稳定原因分类。
-///
-/// 单 worker 传输不再产生 gap（无背压丢弃），此枚举保留为协议合同面。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EventGapReason {
-    CursorNotReplayed,
-    ProgressDropped,
 }
 
 /// JSON-RPC notification 中附带的严格事件元数据。
@@ -976,13 +943,18 @@ pub struct ItemReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 /// item notification 的公共可渲染参数。
 pub struct ItemEventParams {
+    pub thread_id: String,
+    pub turn_id: String,
     pub item: ItemReference,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl AppEvent {
@@ -1035,15 +1007,26 @@ impl AppEvent {
     }
 
     /// 构造 item started 事件。
-    pub fn item_started(item_id: impl Into<String>) -> Self {
-        Self::item_event("item/started", item_id)
+    pub fn item_started(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+    ) -> Self {
+        Self::item_event("item/started", thread_id, turn_id, item_id)
     }
 
     /// 构造 agent message 增量事件。
-    pub fn item_agent_message_delta(item_id: impl Into<String>, delta: impl Into<String>) -> Self {
+    pub fn item_agent_message_delta(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+        delta: impl Into<String>,
+    ) -> Self {
         Self {
             method: "item/agentMessage/delta".to_string(),
             params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
                 "item": {"item_id": item_id.into()},
                 "delta": delta.into(),
             }),
@@ -1051,15 +1034,26 @@ impl AppEvent {
     }
 
     /// 构造 item completed 事件。
-    pub fn item_completed(item_id: impl Into<String>) -> Self {
-        Self::item_event("item/completed", item_id)
+    pub fn item_completed(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+    ) -> Self {
+        Self::item_event("item/completed", thread_id, turn_id, item_id)
     }
 
     /// 构造 item failed 事件。
-    pub fn item_failed(item_id: impl Into<String>, error: impl Into<String>) -> Self {
+    pub fn item_failed(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             method: "item/failed".to_string(),
             params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
                 "item": {"item_id": item_id.into()},
                 "error": error.into(),
             }),
@@ -1068,6 +1062,8 @@ impl AppEvent {
 
     /// 构造工具开始执行事件通知。
     pub fn tool_execution_start(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         args: Value,
@@ -1075,6 +1071,8 @@ impl AppEvent {
         Self {
             method: "tool/execution/start".to_string(),
             params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
                 "toolCallId": tool_call_id.into(),
                 "toolName": tool_name.into(),
                 "args": args,
@@ -1084,6 +1082,8 @@ impl AppEvent {
 
     /// 构造工具执行流式输出增量更新通知。
     pub fn tool_execution_update(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         args: Value,
@@ -1092,6 +1092,8 @@ impl AppEvent {
         Self {
             method: "tool/execution/update".to_string(),
             params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
                 "toolCallId": tool_call_id.into(),
                 "toolName": tool_name.into(),
                 "args": args,
@@ -1102,6 +1104,8 @@ impl AppEvent {
 
     /// 构造工具执行完成事件通知。
     pub fn tool_execution_end(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         result: impl Into<String>,
@@ -1111,6 +1115,8 @@ impl AppEvent {
         Self {
             method: "tool/execution/end".to_string(),
             params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
                 "toolCallId": tool_call_id.into(),
                 "toolName": tool_name.into(),
                 "result": {
@@ -1122,10 +1128,19 @@ impl AppEvent {
         }
     }
 
-    fn item_event(method: &'static str, item_id: impl Into<String>) -> Self {
+    fn item_event(
+        method: &'static str,
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        item_id: impl Into<String>,
+    ) -> Self {
         Self {
             method: method.to_string(),
-            params: serde_json::json!({"item": {"item_id": item_id.into()}}),
+            params: serde_json::json!({
+                "threadId": thread_id.into(),
+                "turnId": turn_id.into(),
+                "item": {"item_id": item_id.into()},
+            }),
         }
     }
 

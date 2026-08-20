@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Condvar, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
@@ -248,6 +250,220 @@ fn write_response_completed(
     Ok(())
 }
 
+/// Fake provider that blocks both first model requests behind a real gate.
+/// This makes cross-session overlap observable instead of relying on timing.
+struct GatedProvider {
+    base_url: String,
+    started: Receiver<usize>,
+    errors: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    gate: Arc<RequestGate>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+struct RequestGate {
+    arrivals: StdMutex<usize>,
+    ready: Condvar,
+}
+
+impl RequestGate {
+    fn new() -> Self {
+        Self {
+            arrivals: StdMutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn arrive_and_wait(&self, stop: &AtomicBool) -> bool {
+        let mut arrivals = self.arrivals.lock().expect("request gate");
+        *arrivals += 1;
+        self.ready.notify_all();
+        while *arrivals < 2 && !stop.load(Ordering::SeqCst) {
+            let (updated, _) = self
+                .ready
+                .wait_timeout(arrivals, Duration::from_millis(20))
+                .expect("request gate wait");
+            arrivals = updated;
+        }
+        *arrivals >= 2 && !stop.load(Ordering::SeqCst)
+    }
+
+    fn wake(&self) {
+        self.ready.notify_all();
+    }
+}
+
+impl GatedProvider {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated provider");
+        listener
+            .set_nonblocking(true)
+            .expect("gated provider listener nonblocking");
+        let address = listener.local_addr().expect("gated provider address");
+        let (started_tx, started_rx) = mpsc::channel();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(RequestGate::new());
+        let worker_errors = Arc::clone(&errors);
+        let worker_stop = Arc::clone(&stop);
+        let worker_gate = Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            serve_gated_requests(
+                listener,
+                started_tx,
+                worker_errors,
+                worker_stop,
+                worker_gate,
+            )
+        });
+        Self {
+            base_url: format!("http://{address}/v1/responses"),
+            started: started_rx,
+            errors,
+            stop,
+            gate,
+            worker: Some(worker),
+        }
+    }
+
+    fn errors(&self) -> Vec<String> {
+        self.errors.lock().expect("provider errors").clone()
+    }
+}
+
+impl Drop for GatedProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.gate.wake();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn serve_gated_requests(
+    listener: TcpListener,
+    started_tx: Sender<usize>,
+    errors: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    gate: Arc<RequestGate>,
+) {
+    let mut handlers: Vec<thread::JoinHandle<()>> = Vec::new();
+    for index in 0..4 {
+        let (mut stream, _) = loop {
+            if stop.load(Ordering::SeqCst) {
+                for handler in handlers {
+                    let _ = handler.join();
+                }
+                return;
+            }
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    record_error(&errors, format!("accept gated request {index}"), error);
+                    for handler in handlers {
+                        let _ = handler.join();
+                    }
+                    return;
+                }
+            }
+        };
+        if let Err(error) = stream.set_nonblocking(false) {
+            record_error(&errors, format!("set gated blocking mode {index}"), error);
+            continue;
+        }
+        let worker_errors = Arc::clone(&errors);
+        let worker_stop = Arc::clone(&stop);
+        let worker_gate = Arc::clone(&gate);
+        let worker_started = started_tx.clone();
+        handlers.push(thread::spawn(move || {
+            if let Err(error) = stream.set_read_timeout(Some(STREAM_TIMEOUT)) {
+                record_error(
+                    &worker_errors,
+                    format!("set gated read timeout {index}"),
+                    error,
+                );
+                return;
+            }
+            if let Err(error) = stream.set_write_timeout(Some(STREAM_TIMEOUT)) {
+                record_error(
+                    &worker_errors,
+                    format!("set gated write timeout {index}"),
+                    error,
+                );
+                return;
+            }
+            let request = match read_http_json(&mut stream) {
+                Ok(request) => request,
+                Err(error) => {
+                    record_error(&worker_errors, format!("read gated request {index}"), error);
+                    return;
+                }
+            };
+            if worker_started.send(index).is_err() {
+                return;
+            }
+            if index < 2 && !worker_gate.arrive_and_wait(&worker_stop) {
+                return;
+            }
+            let response = if index < 2 {
+                gated_tool_response(index)
+            } else {
+                gated_final_response(index)
+            };
+            if let Err(error) = write_response_completed(&mut stream, response) {
+                record_error(
+                    &worker_errors,
+                    format!("write gated response {index}"),
+                    error,
+                );
+            }
+            let _ = request;
+        }));
+    }
+    for handler in handlers {
+        let _ = handler.join();
+    }
+}
+
+fn gated_tool_response(index: usize) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": format!("gated-tool-{index}"),
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "shared-tool-call",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo shared-tool\"}"
+            }],
+            "usage": usage_json()
+        }
+    })
+}
+
+fn gated_final_response(index: usize) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": format!("gated-final-{index}"),
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": format!("done {index}")}]
+            }],
+            "usage": usage_json()
+        }
+    })
+}
+
 fn read_http_json(stream: &mut TcpStream) -> Result<Value, std::io::Error> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -379,11 +595,14 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
     let interrupt = process.output.recv_id(5, Duration::from_secs(5));
     assert_eq!(interrupt["result"]["status"], "cancel_requested");
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
-    assert_eq!(turn_response["result"]["turn"]["status"], "interrupted");
-    assert_eq!(
-        turn_response["result"]["turn"]["agent_loop_status"],
-        "cancelled"
-    );
+    assert_eq!(turn_response["result"]["turn"]["status"], "running");
+    let terminal = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "turn/completed"
+        });
+    assert_eq!(terminal["params"]["turn"]["status"], "interrupted");
+    assert_eq!(terminal["params"]["turn"]["agent_loop_status"], "cancelled");
     let tool_terminal = process
         .output
         .recv_where(Duration::from_secs(5), |message| {
@@ -400,6 +619,44 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         provider.errors()
     );
     process.shutdown();
+}
+
+#[test]
+fn shutdown_requests_all_active_turns_and_reaps_workers_before_exit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
+    let provider = ScriptedProvider::start(interrupt_responses());
+    let mut process = spawn(&workspace, &home, &provider.base_url);
+    process.initialize();
+
+    process.send_request(3, "thread/start", json!({"cwd": workspace}));
+    let started = process.output.recv_id(3, Duration::from_secs(5));
+    let session_id = started["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    process.send_request(
+        4,
+        "turn/start",
+        json!({"threadId": session_id, "input": [{"type": "text", "text": "run long tool"}]}),
+    );
+    provider
+        .served
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request served");
+
+    // Shutdown arrives while the synchronous turn worker is inside a long-running
+    // tool. The transport must broadcast cancellation, unblock any output backpressure,
+    // and join the worker before the process exits; it must not detach a blocking task.
+    process.shutdown();
+    assert!(
+        provider.errors().is_empty(),
+        "provider worker must be error-free: {:?}",
+        provider.errors()
+    );
 }
 
 #[test]
@@ -464,8 +721,19 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
     assert_eq!(
         turn_response["result"]["turn"]["status"],
-        "completed",
+        "running",
         "turn/start response: {turn_response}; provider errors: {:?}",
+        provider.errors(),
+    );
+    let terminal = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "turn/completed"
+        });
+    assert_eq!(
+        terminal["params"]["turn"]["status"],
+        "completed",
+        "turn terminal event: {terminal}; provider errors: {:?}",
         provider.errors(),
     );
     assert_eq!(
@@ -541,6 +809,254 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     assert!(
         provider.errors().is_empty(),
         "provider worker must be error-free: {:?}",
+        provider.errors()
+    );
+    process.shutdown();
+}
+
+#[test]
+fn same_stdio_connection_runs_concurrent_turns_across_different_threads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace_a = dir.path().join("workspace_a");
+    let workspace_b = dir.path().join("workspace_b");
+    std::fs::create_dir(&workspace_a).expect("workspace a");
+    std::fs::create_dir(&workspace_b).expect("workspace b");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
+
+    let provider = ScriptedProvider::start(vec![
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_a",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello from a"}]
+                }],
+                "usage": usage_json()
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_b",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello from b"}]
+                }],
+                "usage": usage_json()
+            }
+        }),
+    ]);
+    let mut process = spawn(&workspace_a, &home, &provider.base_url);
+    process.initialize();
+
+    process.send_request(3, "thread/start", json!({"cwd": workspace_a}));
+    let started_a = process.output.recv_id(3, Duration::from_secs(5));
+    let thread_id_a = started_a["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id a")
+        .to_string();
+
+    process.send_request(4, "thread/start", json!({"cwd": workspace_b}));
+    let started_b = process.output.recv_id(4, Duration::from_secs(5));
+    let thread_id_b = started_b["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id b")
+        .to_string();
+
+    // 两个不同 thread 同时发起 turn/start
+    process.send_request(
+        5,
+        "turn/start",
+        json!({"threadId": thread_id_a, "input": [{"type": "text", "text": "run a"}]}),
+    );
+    process.send_request(
+        6,
+        "turn/start",
+        json!({"threadId": thread_id_b, "input": [{"type": "text", "text": "run b"}]}),
+    );
+
+    // 对同一 thread_a 发起第二个 turn/start -> 必须被立即拒绝
+    process.send_request(
+        7,
+        "turn/start",
+        json!({"threadId": thread_id_a, "input": [{"type": "text", "text": "conflict a"}]}),
+    );
+    let conflict = process.output.recv_id(7, Duration::from_secs(5));
+    assert_eq!(conflict["error"]["code"], -32005);
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("another turn is already running")
+    );
+
+    // 验证 turn 5 和 turn 6 的即时 running 响应
+    let resp_5 = process.output.recv_id(5, Duration::from_secs(5));
+    assert_eq!(resp_5["result"]["turn"]["status"], "running");
+    let turn_id_a = resp_5["result"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn_id_a")
+        .to_string();
+
+    let resp_6 = process.output.recv_id(6, Duration::from_secs(5));
+    assert_eq!(resp_6["result"]["turn"]["status"], "running");
+    let turn_id_b = resp_6["result"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn_id_b")
+        .to_string();
+
+    // 验证各自的 turn/completed 事件携带精确的 threadId 与 turnId
+    let term_a = process.output.recv_where(Duration::from_secs(10), |m| {
+        m["method"] == "turn/completed" && m["params"]["turn"]["thread_id"] == thread_id_a
+    });
+    assert_eq!(term_a["params"]["turn"]["turn_id"], turn_id_a);
+    assert_eq!(term_a["params"]["turn"]["status"], "completed");
+
+    let term_b = process.output.recv_where(Duration::from_secs(10), |m| {
+        m["method"] == "turn/completed" && m["params"]["turn"]["thread_id"] == thread_id_b
+    });
+    assert_eq!(term_b["params"]["turn"]["turn_id"], turn_id_b);
+    assert_eq!(term_b["params"]["turn"]["status"], "completed");
+
+    assert!(
+        provider.errors().is_empty(),
+        "provider worker must be error-free: {:?}",
+        provider.errors()
+    );
+    process.shutdown();
+}
+
+#[test]
+fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace_a = dir.path().join("workspace_a");
+    let workspace_b = dir.path().join("workspace_b");
+    std::fs::create_dir(&workspace_a).expect("workspace a");
+    std::fs::create_dir(&workspace_b).expect("workspace b");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
+    let provider = GatedProvider::start();
+    let mut process = spawn(&workspace_a, &home, &provider.base_url);
+    process.initialize();
+
+    process.send_request(3, "thread/start", json!({"cwd": workspace_a}));
+    let thread_a = process.output.recv_id(3, Duration::from_secs(5));
+    let thread_id_a = thread_a["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id a")
+        .to_string();
+    process.send_request(4, "thread/start", json!({"cwd": workspace_b}));
+    let thread_b = process.output.recv_id(4, Duration::from_secs(5));
+    let thread_id_b = thread_b["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id b")
+        .to_string();
+
+    process.send_request(
+        5,
+        "turn/start",
+        json!({"threadId": thread_id_a, "input": [{"type": "text", "text": "run a"}]}),
+    );
+    process.send_request(
+        6,
+        "turn/start",
+        json!({"threadId": thread_id_b, "input": [{"type": "text", "text": "run b"}]}),
+    );
+    process.send_request(
+        7,
+        "turn/start",
+        json!({"threadId": thread_id_a, "input": [{"type": "text", "text": "conflict"}]}),
+    );
+    let conflict = process.output.recv_id(7, Duration::from_secs(5));
+    assert_eq!(conflict["error"]["code"], -32005);
+
+    let response_a = process.output.recv_id(5, Duration::from_secs(5));
+    let response_b = process.output.recv_id(6, Duration::from_secs(5));
+    assert_eq!(response_a["result"]["turn"]["status"], "running");
+    assert_eq!(response_b["result"]["turn"]["status"], "running");
+    let turn_id_a = response_a["result"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn id a")
+        .to_string();
+    let turn_id_b = response_b["result"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn id b")
+        .to_string();
+    let expected = HashSet::from([
+        (thread_id_a.clone(), turn_id_a.clone()),
+        (thread_id_b.clone(), turn_id_b.clone()),
+    ]);
+
+    // Both first provider requests must arrive before either response is released.
+    let first = provider
+        .started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first gated request");
+    let second = provider
+        .started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second gated request");
+    assert_eq!(HashSet::from([first, second]), HashSet::from([0, 1]));
+
+    let mut terminal_threads = HashSet::new();
+    for _ in 0..2 {
+        let terminal = process
+            .output
+            .recv_where(Duration::from_secs(10), |message| {
+                message["method"] == "turn/completed"
+                    && message["params"]["turn"]["status"] == "completed"
+            });
+        let thread = terminal["params"]["turn"]["thread_id"]
+            .as_str()
+            .expect("terminal thread id");
+        let turn = terminal["params"]["turn"]["turn_id"]
+            .as_str()
+            .expect("terminal turn id");
+        assert!(expected.contains(&(thread.to_string(), turn.to_string())));
+        assert!(terminal_threads.insert((thread.to_string(), turn.to_string())));
+    }
+    assert_eq!(terminal_threads, expected);
+
+    for method in [
+        "item/started",
+        "tool/execution/start",
+        "tool/execution/end",
+        "item/completed",
+    ] {
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            let event = process
+                .output
+                .recv_where(Duration::from_secs(5), |message| {
+                    message["method"] == method
+                        && (message["params"]["toolCallId"] == "shared-tool-call"
+                            || message["params"]["item"]["item_id"] == "shared-tool-call")
+                });
+            let params = &event["params"];
+            let thread = params["threadId"].as_str().expect("event threadId");
+            let turn = params["turnId"].as_str().expect("event turnId");
+            assert!(expected.contains(&(thread.to_string(), turn.to_string())));
+            assert!(seen.insert((thread.to_string(), turn.to_string())));
+            if method.starts_with("tool/") {
+                assert_eq!(params["toolCallId"], "shared-tool-call");
+            } else {
+                assert_eq!(params["item"]["item_id"], "shared-tool-call");
+            }
+        }
+        assert_eq!(seen, expected, "event method {method}");
+    }
+
+    assert!(
+        provider.errors().is_empty(),
+        "provider errors: {:?}",
         provider.errors()
     );
     process.shutdown();

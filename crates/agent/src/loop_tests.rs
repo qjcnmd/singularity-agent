@@ -215,11 +215,9 @@ fn fake_contract() -> ProviderProtocolContract {
     ProviderProtocolContract {
         supports_tools: true,
         supports_parallel_tool_calls: true,
-        supports_required_tool_choice: false,
         supports_strict_tool_schema: false,
         tool_reasoning_mode: singularity_model::ProviderToolReasoningMode::Unspecified,
         max_tools_per_request: 8,
-        supports_json_mode: false,
         supports_system_message: false,
         supports_developer_message: true,
         max_parallel_tool_calls: 1,
