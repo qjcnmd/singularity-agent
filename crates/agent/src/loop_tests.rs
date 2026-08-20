@@ -894,7 +894,10 @@ fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
         let barrier_writer = Arc::clone(&barrier);
         let writer_thread = thread::spawn(move || {
             barrier_writer.wait();
-            inbox_writer.lock().unwrap().enqueue_follow_up("concurrent input")
+            inbox_writer
+                .lock()
+                .unwrap()
+                .enqueue_follow_up("concurrent input")
         });
 
         let inbox_reader = Arc::clone(&inbox);
@@ -1804,10 +1807,7 @@ fn inbox_handle_injects_steer_during_run() {
     let mut events = AgentEvents::new();
     // 工具执行开始时（run 期间）从外部句柄注入转向消息。
     let mut on_tool_execution_start = |_name: &str, _call_id: &str, _args: &Value| {
-        handle
-            .lock()
-            .unwrap()
-            .enqueue_steer("steer during run");
+        handle.lock().unwrap().enqueue_steer("steer during run");
     };
     events.on_tool_execution_start = Some(&mut on_tool_execution_start);
     let outcome = agent

@@ -848,9 +848,10 @@ fn cleanup_old_spills_at(directory: &Path, now: SystemTime) -> Option<String> {
             failures = failures.saturating_add(1);
             continue;
         };
-        let Ok(age) = metadata.modified().and_then(|modified| {
-            now.duration_since(modified).map_err(io::Error::other)
-        }) else {
+        let Ok(age) = metadata
+            .modified()
+            .and_then(|modified| now.duration_since(modified).map_err(io::Error::other))
+        else {
             continue;
         };
         if age > FULL_OUTPUT_MAX_AGE && fs::remove_file(entry.path()).is_err() {
@@ -1155,7 +1156,10 @@ mod tests {
         fs::write(&new_path, "new output").expect("write new");
         fs::write(&non_spill_path, "unrelated").expect("write unrelated");
 
-        let file_time = fs::metadata(&old_path).expect("meta").modified().expect("mod");
+        let file_time = fs::metadata(&old_path)
+            .expect("meta")
+            .modified()
+            .expect("mod");
 
         // 1. Current time = 1 hour after creation: all files retained
         let now_1h = file_time + Duration::from_secs(3600);

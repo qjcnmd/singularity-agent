@@ -19,10 +19,10 @@ use crate::provider::telemetry::ProviderAttemptStatus;
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelMessage,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, OpenAiProvider,
-    OpenAiProviderConfig, Provider, ProviderApiProtocol, ProviderConfigSource,
-    ProviderReasoningReplay, ProviderToolReasoningMode, SelectedModel, ThinkingWireFormat,
-    PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
-    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
+    OpenAiProviderConfig, PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
+    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, Provider, ProviderApiProtocol,
+    ProviderConfigSource, ProviderReasoningReplay, ProviderToolReasoningMode, SelectedModel,
+    ThinkingWireFormat,
 };
 
 fn tool_result_message(call_id: &str, text: &str) -> ModelMessage {
