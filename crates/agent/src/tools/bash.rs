@@ -4,7 +4,8 @@
 //! - **输出流式捕获与截断**：标准输出（stdout）与标准错误（stderr）合并捕获；结果输出保留尾部最后 2000 行 / 50KB；
 //!   超出部分自动完整转储至系统临时文件（`bash-<uuid>.log`），并在返回结果尾部附带日志路径提示。
 //! - **中断处理**：收到外部取消信号（`CancellationToken`）时立即终止进程树并返回 `Command aborted`。
-//! - **进程隔离与管道保护**：在 Windows 上启动子进程前清除句柄继承标志，避免残留子进程直写 stdout 管道破坏 JSON-RPC 流。
+//! - **进程隔离与管道保护**：Windows 启动时只把 stdout/stderr 写端列入显式继承白名单，
+//!   避免无关句柄或残留子进程直写宿主流。
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -757,7 +758,7 @@ fn find_bash_on_windows() -> Option<String> {
 /// 终止进程树：
 /// - Windows：通过内核级 Job Object 强制连带原子终止所有子孙进程；
 /// - Unix：向创建时绑定的独立进程组广播 SIGKILL；
-/// - 最后统一调用 `Child::kill` 确保主进程句柄状态收敛。
+/// - Unix 额外调用 `Child::kill`，确保主进程句柄状态收敛。
 #[cfg(windows)]
 fn kill_process_tree(child: &mut windows_process::ChildProcess) {
     child.terminate_tree(1);
