@@ -26,6 +26,7 @@ use session_reference::{
 };
 
 const AGENT_TURN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+const INTERRUPTED_ERROR_PREFIX: &str = "error interrupted:";
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -108,7 +109,9 @@ enum SessionCommand {
 fn main() {
     if let Err(error) = run_cli(Cli::parse()) {
         eprintln!("{error}");
-        std::process::exit(if error == FORCE_INTERRUPT_ERROR {
+        std::process::exit(if error == FORCE_INTERRUPT_ERROR
+            || error.starts_with(INTERRUPTED_ERROR_PREFIX)
+        {
             130
         } else {
             1
