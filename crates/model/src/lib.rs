@@ -613,8 +613,8 @@ impl Default for ProviderProtocolContract {
 /// 全部字段可选：顶层配置字段优先，其次本声明，最后 `ProviderProtocolContract`
 /// 默认值。`supports_reasoning` 只解析接受；`max_parallel_tool_calls` 同时约束
 /// 请求声明与 Agent 本地工具工作窗口。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub struct ProviderCapabilityDeclaration {
     pub supports_tools: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
@@ -626,6 +626,50 @@ pub struct ProviderCapabilityDeclaration {
     pub max_parallel_tool_calls: Option<u32>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
+}
+
+/// Wire form for the persisted capability block. The two underscored fields
+/// were removed from the active contract but remain in configurations written
+/// by earlier releases; accepting them here preserves those user files while
+/// keeping the removed concepts out of the runtime declaration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ProviderCapabilityDeclarationWire {
+    supports_tools: Option<bool>,
+    supports_parallel_tool_calls: Option<bool>,
+    #[serde(rename = "supports_required_tool_choice", default)]
+    _supports_required_tool_choice: Option<bool>,
+    supports_strict_tool_schema: Option<bool>,
+    #[serde(rename = "supports_json_mode", default)]
+    _supports_json_mode: Option<bool>,
+    supports_system_message: Option<bool>,
+    supports_developer_message: Option<bool>,
+    supports_reasoning: Option<bool>,
+    max_tools_per_request: Option<u32>,
+    max_parallel_tool_calls: Option<u32>,
+    max_context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+impl<'de> serde::Deserialize<'de> for ProviderCapabilityDeclaration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProviderCapabilityDeclarationWire::deserialize(deserializer)?;
+        Ok(Self {
+            supports_tools: wire.supports_tools,
+            supports_parallel_tool_calls: wire.supports_parallel_tool_calls,
+            supports_strict_tool_schema: wire.supports_strict_tool_schema,
+            supports_system_message: wire.supports_system_message,
+            supports_developer_message: wire.supports_developer_message,
+            supports_reasoning: wire.supports_reasoning,
+            max_tools_per_request: wire.max_tools_per_request,
+            max_parallel_tool_calls: wire.max_parallel_tool_calls,
+            max_context_tokens: wire.max_context_tokens,
+            max_output_tokens: wire.max_output_tokens,
+        })
+    }
 }
 
 /// `AgentLoop` 为完成请求提供的可选模型参数。
