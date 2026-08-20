@@ -307,7 +307,7 @@ sequenceDiagram
 - **CLI Session Reference**：`sg run --session-reference <id>` 将历史会话投影为 untrusted reference 文本；每个生成段落（header、summary、transcript、role line、current-request heading）各占一行，未信任内容中的换行折叠为字面量 `⏎`，统一受控于 16 KiB 与 4096-token 硬上限。
 
 **命令与事件集**：
-- 命令：`initialize`、`initialized`、`thread/start`、`thread/list`、`thread/resume`、`thread/settings`、`session/read`、`session/delete`、`turn/start`、`turn/steer`、`turn/followUp`、`turn/interrupt`、`server/shutdown`；
+- 命令：`initialize`、`initialized`、`agent/capability`、`thread/start`、`thread/list`、`thread/resume`、`thread/settings`、`session/read`、`session/delete`、`turn/start`、`turn/steer`、`turn/followUp`、`turn/interrupt`、`server/shutdown`；
 - 生命周期与执行事件：`thread/started`、`turn/started`、`item/started`、`item/agentMessage/delta`、`item/completed`、`item/failed`、`turn/completed`、`turn/error`、`tool/execution/start`、`tool/execution/update`、`tool/execution/end`；
 - 遥测与诊断事件：`agent/diagnostic`（结构化非致命告警）、`provider/attempt/started`、`provider/attempt/completed`（类型化 attempt 进度与 terminal aggregate）。
 

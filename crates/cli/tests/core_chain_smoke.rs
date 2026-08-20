@@ -345,10 +345,10 @@ fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
         .and_then(Value::as_object_mut)
         .and_then(|models| models.get_mut(&model_name))
         .ok_or_else(|| "smoke config does not contain the selected model".to_string())?;
-    // The isolated project instructions plus the normal request envelope need
-    // more than 26k tokens even after compaction. Two bounded tool reads
-    // exceed this window's 15,616-token trigger threshold, while the compacted
-    // follow-up request still fits.
+    // The isolated project instructions plus the normal request envelope expand
+    // across iterations. With 48,000 max context tokens, a 0.90 threshold ratio (43,200),
+    // and an 8,192 reserve ceiling, two bounded tool reads exceed the compaction trigger
+    // threshold, while the compacted follow-up request fits within budget.
     model["max_context_tokens"] = Value::from(48_000_u64);
     model["max_output_tokens"] = Value::from(8_192_u64);
     if let Some(capabilities) = model.get_mut("capabilities") {
