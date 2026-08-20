@@ -12,8 +12,42 @@ pub mod format;
 pub mod repair;
 pub mod repository;
 
-pub use manager::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionContext, SessionEntry,
-    SessionEntryFilter, SessionEntryType, SessionError, SessionManager, SessionMetadata,
-    SessionMetadataKind, SessionRead, SessionReadOptions, SessionRepository,
+pub use context::SessionContext;
+pub use format::{
+    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionEntryType, SessionError,
+    SessionMetadata, SessionMetadataKind,
 };
+pub use manager::SessionManager;
+pub use repository::{SessionEntryFilter, SessionRead, SessionReadOptions, SessionRepository};
+
+#[cfg(test)]
+pub(crate) use file::{AppendLimits, normalize_cwd_string};
+
+#[cfg(test)]
+fn parse_session_lines_with_limits(
+    file: &std::path::Path,
+    max_file_bytes: usize,
+    max_line_bytes: usize,
+    max_content_entries: usize,
+) -> Result<()> {
+    self::file::parse_session_lines_with_limits(
+        file,
+        max_file_bytes,
+        max_line_bytes,
+        max_content_entries,
+    )
+    .map(|_| ())
+}
+
+#[cfg(test)]
+use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+
+#[cfg(test)]
+use serde_json::{Map, Value, json};
+
+#[cfg(test)]
+use singularity_model::ModelToolParseStatus;
+
+#[cfg(test)]
+#[path = "../session_tests.rs"]
+mod tests;
