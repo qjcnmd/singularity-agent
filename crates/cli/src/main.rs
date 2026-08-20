@@ -359,4 +359,69 @@ mod tests {
         assert_eq!(projected["params"]["error"]["message"], "provider failed");
         assert_eq!(projected["params"]["error"]["willRetry"], false);
     }
+
+    #[test]
+    fn safe_protocol_event_projects_typed_diagnostic_and_attempt_without_raw_fields() {
+        for (method, params, expected_code) in [
+            (
+                "agent/diagnostic",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "severity": "warning",
+                    "code": "compaction_failed",
+                    "message": "compaction continued",
+                    "rawPayload": "must-not-leak"
+                }),
+                "compaction_failed",
+            ),
+            (
+                "provider/attempt",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "modelTurnOrdinal": 2,
+                    "operationPhase": "completion",
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "protocol": "chat_completions",
+                    "attemptIndex": 1,
+                    "status": "ok",
+                    "attemptDurationMs": 12,
+                    "rawReasoning": "must-not-leak",
+                    "toolArgs": {"command": "must-not-leak"}
+                }),
+                "test-provider",
+            ),
+        ] {
+            let message: JsonRpcNotification = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }))
+            .expect("notification fixture");
+            let projected = safe_protocol_event(message).expect("typed projection");
+            assert_eq!(projected["method"], method);
+            assert!(projected["params"].get("rawPayload").is_none());
+            assert!(projected["params"].get("rawReasoning").is_none());
+            assert!(projected["params"].get("toolArgs").is_none());
+            if method == "agent/diagnostic" {
+                assert_eq!(projected["params"]["code"], expected_code);
+            } else {
+                assert_eq!(projected["params"]["provider"], expected_code);
+                assert_eq!(projected["params"]["model_turn_ordinal"], 2);
+            }
+        }
+    }
+
+    #[test]
+    fn safe_protocol_event_omits_malformed_stable_params() {
+        let message: JsonRpcNotification = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "agent/diagnostic",
+            "params": {"threadId": "thread-1"}
+        }))
+        .expect("notification fixture");
+        assert!(safe_protocol_event(message).is_none());
+    }
 }

@@ -956,6 +956,120 @@ pub struct ItemEventParams {
     pub error: Option<String>,
 }
 
+/// 工具执行开始事件的类型化公共参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionStartParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// 工具调用参数是工具生命周期合同的一部分；CLI 仅将其作为 JSON 值投影，
+    /// 不把它重新解释为协议字段。
+    pub args: Value,
+}
+
+/// 工具执行增量事件的类型化公共参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionUpdateParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub args: Value,
+    pub partial_result: String,
+}
+
+/// 工具执行终态结果的类型化参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionEndParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub result: ToolExecutionResult,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionResult {
+    pub content: Vec<ToolExecutionContent>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: String,
+}
+
+/// turn/error 事件的严格类型化参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnErrorParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub error: TurnErrorDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnErrorDetail {
+    pub stage: String,
+    pub cause: String,
+    pub message: String,
+    #[serde(default)]
+    pub will_retry: bool,
+}
+
+/// 非致命 Agent 诊断事件；不进入 Session JSONL。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDiagnosticParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Provider 单次 HTTP attempt 的非敏感进度/终态观测。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttemptEventParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub model_turn_ordinal: u32,
+    pub operation_phase: String,
+    pub provider: String,
+    pub model: String,
+    pub protocol: String,
+    pub attempt_index: u32,
+    pub status: String,
+    pub attempt_duration_ms: Option<u64>,
+    pub retry_scheduled: Option<bool>,
+    pub retry_backoff_ms: Option<u64>,
+    pub error_category: Option<String>,
+    pub diagnostic_code: Option<String>,
+}
+
+/// Provider attempt aggregate，作为终态可靠投影使用。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttemptSummaryParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub model_turn_ordinal: u32,
+    pub attempt_count: u32,
+    pub retry_count: u32,
+    pub latency_ms: u64,
+}
+
 impl AppEvent {
     /// 构造 thread started 事件。
     pub fn thread_started(thread: &Thread) -> Self {
