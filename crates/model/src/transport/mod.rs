@@ -140,7 +140,6 @@ impl ProviderAttemptInProgress {
             diagnostic_code: error.and_then(|error| error.code.clone()),
             usage,
             model_turn_ordinal: None,
-            parent_occurrence_id: None,
         }
     }
 }

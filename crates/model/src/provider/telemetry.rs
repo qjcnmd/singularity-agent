@@ -104,8 +104,6 @@ pub struct ProviderAttemptOccurrence {
     pub usage: Option<ModelUsage>,
     /// Bound by AgentLoop at the model-response ownership boundary.
     pub model_turn_ordinal: Option<u32>,
-    /// Stable PromptAssembly parent occurrence bound by AgentLoop.
-    pub parent_occurrence_id: Option<String>,
 }
 
 /// 一次模型提供方操作记录的 aggregate 尝试次数、重试次数和运行期 occurrences。

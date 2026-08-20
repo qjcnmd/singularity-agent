@@ -1511,7 +1511,6 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
             diagnostic_code: None,
             usage: Some(ModelUsage::default()),
             model_turn_ordinal: None,
-            parent_occurrence_id: None,
         });
     let runtime_wire = serde_json::to_value(&runtime_attempt_metadata)
         .expect("serialize runtime attempt metadata");
