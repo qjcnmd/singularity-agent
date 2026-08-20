@@ -823,6 +823,10 @@ fn recognized_spill_name(name: &std::ffi::OsStr) -> bool {
 }
 
 fn cleanup_old_spills(directory: &Path) -> Option<String> {
+    cleanup_old_spills_at(directory, SystemTime::now())
+}
+
+fn cleanup_old_spills_at(directory: &Path, now: SystemTime) -> Option<String> {
     let mut failures = 0usize;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -844,9 +848,7 @@ fn cleanup_old_spills(directory: &Path) -> Option<String> {
             continue;
         };
         let Ok(age) = metadata.modified().and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(io::Error::other)
+            now.duration_since(modified).map_err(io::Error::other)
         }) else {
             continue;
         };
@@ -1135,6 +1137,45 @@ mod tests {
         assert!(!recognized_spill_name(std::ffi::OsStr::new(
             "other-018f4f4c-3f5f-7f1f-9f2a-9db4e2a7bf42.log"
         )));
+    }
+
+    #[test]
+    fn spill_cleanup_lifecycle_and_diagnostics() {
+        let dir = tempdir().expect("spill dir");
+        let valid_old_uuid = "bash-018f4f4c-3f5f-7f1f-9f2a-9db4e2a7bf41.log";
+        let valid_new_uuid = "bash-018f4f4c-3f5f-7f1f-9f2a-9db4e2a7bf42.log";
+        let non_spill = "other-file.txt";
+
+        let old_path = dir.path().join(valid_old_uuid);
+        let new_path = dir.path().join(valid_new_uuid);
+        let non_spill_path = dir.path().join(non_spill);
+
+        fs::write(&old_path, "old output").expect("write old");
+        fs::write(&new_path, "new output").expect("write new");
+        fs::write(&non_spill_path, "unrelated").expect("write unrelated");
+
+        let file_time = fs::metadata(&old_path).expect("meta").modified().expect("mod");
+
+        // 1. Current time = 1 hour after creation: all files retained
+        let now_1h = file_time + Duration::from_secs(3600);
+        let warning = cleanup_old_spills_at(dir.path(), now_1h);
+        assert!(warning.is_none());
+        assert!(old_path.exists());
+        assert!(new_path.exists());
+        assert!(non_spill_path.exists());
+
+        // 2. Current time = 25 hours after creation: valid spill older than 24h is deleted, unrelated file is preserved
+        let now_25h = file_time + Duration::from_secs(25 * 3600);
+        let warning = cleanup_old_spills_at(dir.path(), now_25h);
+        assert!(warning.is_none());
+        assert!(!old_path.exists(), "expired spill must be deleted");
+        assert!(!new_path.exists(), "expired spill must be deleted");
+        assert!(non_spill_path.exists(), "unrelated file must be preserved");
+
+        // 3. Scan non-existent directory returns scan diagnostic
+        let bad_dir = dir.path().join("does_not_exist");
+        let scan_error = cleanup_old_spills_at(&bad_dir, now_25h);
+        assert!(scan_error.is_some_and(|w| w.contains("could not scan old spill files")));
     }
 
     #[test]

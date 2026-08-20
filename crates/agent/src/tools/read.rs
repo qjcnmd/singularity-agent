@@ -324,6 +324,35 @@ mod tests {
     }
 
     #[test]
+    fn read_cancelled_during_large_scan_returns_aborted_error() {
+        use singularity_core::CancellationToken;
+
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("cancellation.txt");
+        let line = "x".repeat(1024);
+        let content = (0..20_000)
+            .map(|index| format!("{line}-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).expect("fixture");
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let ctx = ExecuteContext {
+            args: json!({ "path": "cancellation.txt", "offset": 10_000, "limit": 10 }),
+            cwd: dir.path(),
+            signal: Some(&cancellation),
+            on_update: None,
+            mutation_queue: None,
+        };
+
+        let result = ToolRegistry::new().execute("read", ctx).expect("execute");
+        assert!(result.is_error, "cancelled read must fail closed as error");
+        assert_eq!(result.content, "Operation aborted");
+    }
+
+    #[test]
     fn missing_file_is_error() {
         let dir = tempdir().expect("temp dir");
         let result = ToolRegistry::new()

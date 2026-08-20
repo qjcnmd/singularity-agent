@@ -384,7 +384,7 @@ fn range(start: usize, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::registry::ToolRegistry;
+    use crate::tools::registry::{FileMutationQueue, ToolRegistry};
     use crate::tools::test_support::context;
     use serde_json::json;
     use tempfile::tempdir;
@@ -467,6 +467,59 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("sample.txt")).expect("read back"),
             "a\r\nB\r\nc"
+        );
+    }
+
+    #[test]
+    fn utf8_bom_is_preserved_and_untouched_bytes_are_identical() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("bom_file.txt");
+        let prefix = "header_section\r\nkeep_this_line\r\n";
+        let target = "TARGET_LINE_TO_REPLACE";
+        let suffix = "\r\nfooter_section\r\nkeep_this_tail\r\n";
+
+        let mut raw_input = vec![0xEF, 0xBB, 0xBF];
+        raw_input.extend_from_slice(prefix.as_bytes());
+        raw_input.extend_from_slice(target.as_bytes());
+        raw_input.extend_from_slice(suffix.as_bytes());
+
+        fs::write(&path, &raw_input).expect("fixture with BOM");
+
+        let queue = std::sync::Arc::new(FileMutationQueue::default());
+        let ctx = ExecuteContext {
+            args: json!({
+                "path": "bom_file.txt",
+                "oldString": target,
+                "newString": "REPLACED_TARGET_LINE"
+            }),
+            cwd: dir.path(),
+            signal: None,
+            on_update: None,
+            mutation_queue: Some(queue),
+        };
+
+        let result = ToolRegistry::new().execute("edit", ctx).expect("execute");
+        assert!(!result.is_error, "edit failed: {}", result.content);
+
+        let modified_bytes = fs::read(&path).expect("read modified");
+        // 1. First 3 bytes MUST be UTF-8 BOM
+        assert_eq!(&modified_bytes[..3], &[0xEF, 0xBB, 0xBF]);
+
+        // 2. Untouched prefix bytes must be identical
+        let prefix_len = prefix.as_bytes().len();
+        assert_eq!(&modified_bytes[3..3 + prefix_len], prefix.as_bytes());
+
+        // 3. Replacement bytes
+        let rep_bytes = b"REPLACED_TARGET_LINE";
+        assert_eq!(
+            &modified_bytes[3 + prefix_len..3 + prefix_len + rep_bytes.len()],
+            rep_bytes
+        );
+
+        // 4. Untouched suffix bytes must be identical
+        assert_eq!(
+            &modified_bytes[3 + prefix_len + rep_bytes.len()..],
+            suffix.as_bytes()
         );
     }
 

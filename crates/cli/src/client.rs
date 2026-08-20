@@ -3,7 +3,7 @@
 use super::*;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{
     Arc,
@@ -36,7 +36,7 @@ pub(super) const FORCE_INTERRUPT_ERROR: &str = "forced exit after second Ctrl+C"
 
 pub(super) struct AppServerClient {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    stdin: Option<Box<dyn Write + Send>>,
     stdout: Receiver<Result<String, String>>,
     stdout_reader: Option<JoinHandle<()>>,
     pub(super) response_timeout: Duration,
@@ -318,7 +318,7 @@ impl AppServerClient {
         let (stdout, stdout_reader) = spawn_line_reader(stdout);
         Ok(Self {
             child: Some(child),
-            stdin: Some(stdin),
+            stdin: Some(Box::new(stdin)),
             stdout,
             stdout_reader: Some(stdout_reader),
             response_timeout: RESPONSE_TIMEOUT,
@@ -583,8 +583,8 @@ impl AppServerClient {
     pub(super) fn write_side_mut(&mut self) -> Result<&mut dyn Write, String> {
         self.stdin
             .as_mut()
+            .map(|writer| &mut **writer as &mut dyn Write)
             .ok_or_else(|| "app-server stdin unavailable".to_string())
-            .map(|writer| writer as &mut dyn Write)
     }
 
     // 写端失败时先确认 app-server 是否已经退出，避免以竞争性的 Broken pipe
@@ -759,4 +759,99 @@ fn canonical_current_dir() -> Result<String, String> {
     cwd.to_str()
         .map(str::to_string)
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use singularity_protocol::{Turn, TurnEventParams, TurnStatus};
+    use std::sync::atomic::AtomicU8;
+    use std::sync::mpsc;
+
+    #[test]
+    fn ctrl_c_monitor_first_signal_sends_interrupt_and_completes_gracefully() {
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let mut client = AppServerClient {
+            child: None,
+            stdin: Some(Box::new(std::io::Cursor::new(Vec::<u8>::new()))),
+            stdout: stdout_rx,
+            stdout_reader: None,
+            response_timeout: Duration::from_millis(100),
+            next_id: 1,
+        };
+
+        let initial_turn = Turn {
+            thread_id: "thread_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            status: TurnStatus::Running,
+            agent_loop_status: "running".to_string(),
+            model_usage: None,
+        };
+
+        let count = Arc::new(AtomicU8::new(1));
+        let monitor = CtrlCMonitor { count };
+
+        let completed_turn = Turn {
+            thread_id: "thread_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            status: TurnStatus::Interrupted,
+            agent_loop_status: "interrupted".to_string(),
+            model_usage: None,
+        };
+        let completed_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": TurnEventParams { turn: completed_turn }
+        });
+        stdout_tx
+            .send(Ok(serde_json::to_string(&completed_notification).unwrap()))
+            .unwrap();
+
+        let (terminal_turn, _) = render_and_wait_terminal(
+            &mut client,
+            initial_turn,
+            Vec::new(),
+            &JsonRpcId::Number(1),
+            false,
+            Some(monitor),
+        )
+        .expect("terminal turn");
+
+        assert_eq!(terminal_turn.status, TurnStatus::Interrupted);
+    }
+
+    #[test]
+    fn ctrl_c_monitor_second_signal_triggers_force_interrupt_error() {
+        let (_stdout_tx, stdout_rx) = mpsc::channel();
+        let mut client = AppServerClient {
+            child: None,
+            stdin: Some(Box::new(std::io::Cursor::new(Vec::<u8>::new()))),
+            stdout: stdout_rx,
+            stdout_reader: None,
+            response_timeout: Duration::from_millis(100),
+            next_id: 1,
+        };
+
+        let initial_turn = Turn {
+            thread_id: "thread_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            status: TurnStatus::Running,
+            agent_loop_status: "running".to_string(),
+            model_usage: None,
+        };
+
+        let count = Arc::new(AtomicU8::new(2));
+        let monitor = CtrlCMonitor { count };
+
+        let result = render_and_wait_terminal(
+            &mut client,
+            initial_turn,
+            Vec::new(),
+            &JsonRpcId::Number(1),
+            false,
+            Some(monitor),
+        );
+
+        assert_eq!(result.unwrap_err(), FORCE_INTERRUPT_ERROR);
+    }
 }

@@ -882,6 +882,59 @@ fn turn_inbox_stop_barrier_has_no_accepted_but_lost_state() {
 }
 
 #[test]
+fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    for _ in 0..100 {
+        let inbox = Arc::new(Mutex::new(TurnInbox::default()));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let inbox_writer = Arc::clone(&inbox);
+        let barrier_writer = Arc::clone(&barrier);
+        let writer_thread = thread::spawn(move || {
+            barrier_writer.wait();
+            inbox_writer.lock().unwrap().enqueue_follow_up("concurrent input")
+        });
+
+        let inbox_reader = Arc::clone(&inbox);
+        let barrier_reader = Arc::clone(&barrier);
+        let reader_thread = thread::spawn(move || {
+            barrier_reader.wait();
+            inbox_reader.lock().unwrap().take_at_stop()
+        });
+
+        let accepted = writer_thread.join().expect("writer thread finished");
+        let initial_taken = reader_thread.join().expect("reader thread finished");
+
+        let mut final_inbox = inbox.lock().unwrap();
+        let follow_up_taken = final_inbox.take_at_stop();
+
+        if accepted {
+            // If the input was accepted, it MUST either have been collected in the initial take_at_stop,
+            // or retained in the queue and collected in follow_up_taken. It must never be lost.
+            let found_in_initial = initial_taken
+                .as_ref()
+                .is_some_and(|inputs| inputs.iter().any(|i| i.text == "concurrent input"));
+            let found_in_follow_up = follow_up_taken
+                .as_ref()
+                .is_some_and(|inputs| inputs.iter().any(|i| i.text == "concurrent input"));
+            assert!(
+                found_in_initial || found_in_follow_up,
+                "accepted input was lost during concurrent take_at_stop!"
+            );
+        } else {
+            // If rejected, inbox was already closed, so initial_taken must have been None (or empty before close).
+            // Any further enqueue must also be rejected.
+            assert!(
+                !final_inbox.enqueue_steer("rejected after close"),
+                "closed inbox accepted new inputs!"
+            );
+        }
+    }
+}
+
+#[test]
 fn length_truncated_tool_calls_are_failed_without_execution() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
