@@ -3,7 +3,8 @@
 //! CLI 每次命令启动独立 app-server 子进程，经 `tokio::io::stdin()`/`stdout()` 通信；
 //! 不保留 TCP daemon、连接复用或空闲自停。输入由 Tokio 单一 owner 读取；
 //! turn/start 为每个 active turn 创建独立 worker；同一连接可并发运行不同 session，
-//! 但每个 session 同时只允许一个 turn。其余请求在输入 owner 的 blocking 任务中直接处理。
+//! 但每个 session 同时只允许一个 turn。普通请求排入有界单 owner 队列；
+//! `turn/interrupt`、`turn/steer`、`turn/followUp` 使用共享活动句柄的窄 control lane。
 //! 所有输出进入单一 mpsc 队列，由唯一 writer task 顺序写出 JSON 行——单生产者
 //! 顺序性保证事件与响应天然有序，无需全局排序或 cursor/gap 机制。
 
@@ -13,6 +14,8 @@ pub(crate) mod output;
 pub(crate) mod supervisor;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
@@ -88,6 +91,16 @@ where
     .await
     .map_err(|error| format!("app-server startup task failed: {error}"))??;
     let cancellation = server.cancellation_handle();
+    // The ordinary owner and the control lane each keep an independent SQLite
+    // connection, while all active-turn maps remain shared through Arcs.
+    // `turn_factory` is moved through each setup task and never handles
+    // ordinary requests, so a slow state operation cannot block controls.
+    let control_server = server
+        .turn_worker()
+        .map_err(|error| format!("app-server control lane setup failed: {error}"))?;
+    let turn_factory = server
+        .turn_worker()
+        .map_err(|error| format!("app-server turn factory setup failed: {error}"))?;
     let (output_tx, mut output_rx) = mpsc::channel::<Value>(OUTPUT_QUEUE_CAPACITY);
     let writer_cancellation = cancellation.clone();
     let mut output = writer;
@@ -97,7 +110,25 @@ where
     let mut writer_done = false;
     let mut writer_result = None;
     let mut writer_timeout = false;
-    let mut server = Some(server);
+    let ready_for_turn = Arc::new(AtomicBool::new(false));
+    let (ordinary_tx, ordinary_rx) = mpsc::channel::<JsonRpcMessage>(64);
+    let (control_tx, control_rx) = mpsc::channel::<JsonRpcMessage>(64);
+    let mut ordinary_task = tokio::spawn(run_ordinary_dispatch(
+        server,
+        ordinary_rx,
+        output_tx.clone(),
+        cancellation.clone(),
+        Arc::clone(&ready_for_turn),
+    ));
+    let mut control_task = tokio::spawn(run_control_dispatch(
+        control_server,
+        control_rx,
+        output_tx.clone(),
+        cancellation.clone(),
+    ));
+    let mut ordinary_done = false;
+    let mut control_done = false;
+    let mut turn_factory = turn_factory;
     // 支持不同 session 的多个 turn/start 并发执行。
     let mut turn_tasks: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut reader = reader;
@@ -128,6 +159,24 @@ where
                         break;
                     }
                 }
+            }
+            result = &mut ordinary_task, if !ordinary_done => {
+                ordinary_done = true;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => terminal_error = Some(error),
+                    Err(error) => terminal_error = Some(format!("ordinary dispatch task failed: {error}")),
+                }
+                break;
+            }
+            result = &mut control_task, if !control_done => {
+                control_done = true;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => terminal_error = Some(error),
+                    Err(error) => terminal_error = Some(format!("control dispatch task failed: {error}")),
+                }
+                break;
             }
             line = read_bounded_line(&mut reader) => {
                 let Some(line) = (match line {
@@ -189,25 +238,19 @@ where
                     }
                 };
                 let request_id = message.id().cloned();
-                if is_turn_request(&message)
-                    && server
-                        .as_ref()
-                        .expect("stdio server owner")
-                        .ready_for_turn_worker()
-                {
-                    let current_server = server.take().expect("stdio server owner");
+                if is_turn_request(&message) && ready_for_turn.load(Ordering::SeqCst) {
                     let task = tokio::task::spawn_blocking(move || {
-                        let worker = current_server.turn_worker();
-                        (current_server, worker)
+                        let worker = turn_factory.turn_worker();
+                        (turn_factory, worker)
                     });
-                    let (next_server, worker_result) = match task.await {
+                    let (next_factory, worker_result) = match task.await {
                         Ok(result) => result,
                         Err(error) => {
                             terminal_error = Some(format!("turn worker setup failed: {error}"));
                             break;
                         }
                     };
-                    server = Some(next_server);
+                    turn_factory = next_factory;
                     match worker_result {
                         Ok(worker) => {
                             let worker_outputs = output_tx.clone();
@@ -229,59 +272,53 @@ where
                             }
                         }
                     }
-                } else {
-                    let direct_outputs = output_tx.clone();
-                    let direct_cancellation = cancellation.clone();
-                    let current_server = server.take().expect("stdio server owner");
-                    let task = tokio::task::spawn_blocking(move || {
-                        let mut server = current_server;
-                        let notification = message.is_notification();
-                        let request_id = message.id().cloned();
-                        let result = server.handle_with_output(message);
-                        let dispatch_result = match result {
-                            Ok(messages) => send_app_server_outputs(
-                                &direct_outputs,
-                                &direct_cancellation,
-                                messages,
-                            ),
-                            Err(error) if !notification => send_output(
-                                &direct_outputs,
-                                &direct_cancellation,
-                                transport_error_value(request_id, &error),
+                } else if is_turn_control(&message) && ready_for_turn.load(Ordering::SeqCst) {
+                    if let Err(error) = control_tx.try_send(message) {
+                        if let Some(id) = error.into_inner().id().cloned() {
+                            if let Err(error) = send_output_async(
+                                output_tx.clone(),
+                                cancellation.clone(),
+                                internal_error_value(
+                                    Some(id),
+                                    "control request queue is full",
+                                ),
                             )
-                            .map(|_| ()),
-                            Err(_) => Ok(()),
-                        };
-                        (server, dispatch_result)
-                    });
-                    let (next_server, result) = match task.await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            terminal_error = Some(format!("request dispatch task failed: {error}"));
-                            break;
+                            .await
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
                         }
-                    };
-                    server = Some(next_server);
-                    if let Err(error) = result {
-                        terminal_error = Some(error);
-                        break;
                     }
-                }
-                if server.as_ref().expect("stdio server owner").shutdown_requested() {
-                    break;
+                } else {
+                    if let Err(error) = ordinary_tx.try_send(message) {
+                        if let Some(id) = error.into_inner().id().cloned() {
+                            if let Err(error) = send_output_async(
+                                output_tx.clone(),
+                                cancellation.clone(),
+                                internal_error_value(
+                                    Some(id),
+                                    "ordinary request queue is full",
+                                ),
+                            )
+                            .await
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     let shutdown_deadline = Instant::now() + SHUTDOWN_GRACE;
-    let current_server = server.take().expect("stdio server owner");
-    let stop_result = tokio::task::spawn_blocking(move || current_server.request_execution_stop())
-        .await
-        .map_err(|error| format!("failed to stop executions during shutdown: {error}"))
-        .and_then(|result| {
-            result.map_err(|error| format!("failed to stop executions during shutdown: {error}"))
-        });
+    drop(ordinary_tx);
+    drop(control_tx);
+    let stop_result = cancellation
+        .request_execution_stop()
+        .map_err(|error| format!("failed to stop executions during shutdown: {error}"));
     let mut worker_error = None;
     while !turn_tasks.is_empty() {
         if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
@@ -342,6 +379,42 @@ where
                 }
             }
             break;
+        }
+    }
+    if !ordinary_done {
+        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
+            match tokio::time::timeout(remaining, &mut ordinary_task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    worker_error.get_or_insert(error);
+                }
+                Ok(Err(error)) => {
+                    worker_error.get_or_insert(format!("ordinary dispatch task failed: {error}"));
+                }
+                Err(_) => {
+                    worker_error.get_or_insert(
+                        "timed out waiting for ordinary dispatch during shutdown".to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if !control_done {
+        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
+            match tokio::time::timeout(remaining, &mut control_task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    worker_error.get_or_insert(error);
+                }
+                Ok(Err(error)) => {
+                    worker_error.get_or_insert(format!("control dispatch task failed: {error}"));
+                }
+                Err(_) => {
+                    worker_error.get_or_insert(
+                        "timed out waiting for control dispatch during shutdown".to_string(),
+                    );
+                }
+            }
         }
     }
     drop(output_tx);
@@ -543,6 +616,104 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
             message.method_name(),
             Some(method) if method == Method::TurnStart.as_str()
         )
+}
+
+/// 三个活动 turn 控制请求走独立 lane；它们只触碰 active-turn maps，
+/// 不读取 SessionStore，也不等待 ordinary owner。
+fn is_turn_control(message: &JsonRpcMessage) -> bool {
+    matches!(
+        message.method_name(),
+        Some(method)
+            if matches!(
+                method,
+                "turn/interrupt" | "turn/steer" | "turn/followUp"
+            )
+    )
+}
+
+/// 唯一 ordinary AppServer owner。输入 reader 只把普通请求排入有界队列；
+/// 此任务按到达顺序处理队列并持有该 owner 的 SQLite 连接。
+async fn run_ordinary_dispatch(
+    mut server: AppServer,
+    mut requests: mpsc::Receiver<JsonRpcMessage>,
+    outputs: mpsc::Sender<Value>,
+    cancellation: AppServerCancellationHandle,
+    ready_for_turn: Arc<AtomicBool>,
+) -> Result<(), String> {
+    while let Some(message) = requests.recv().await {
+        let direct_outputs = outputs.clone();
+        let direct_cancellation = cancellation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let notification = message.is_notification();
+            let request_id = message.id().cloned();
+            let result = server.handle_with_output(message);
+            let dispatch_result = match result {
+                Ok(messages) => {
+                    send_app_server_outputs(&direct_outputs, &direct_cancellation, messages)
+                }
+                Err(error) if !notification => send_output(
+                    &direct_outputs,
+                    &direct_cancellation,
+                    transport_error_value(request_id, &error),
+                )
+                .map(|_| ()),
+                Err(_) => Ok(()),
+            };
+            let ready = server.ready_for_turn_worker();
+            let shutdown = server.shutdown_requested();
+            (server, dispatch_result, ready, shutdown)
+        });
+        let (next_server, result, ready, shutdown) = task
+            .await
+            .map_err(|error| format!("request dispatch task failed: {error}"))?;
+        server = next_server;
+        if ready {
+            ready_for_turn.store(true, Ordering::SeqCst);
+        }
+        result?;
+        if shutdown {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// 独立 control owner。它使用 AppServer 的共享活动-turn句柄，因而控制
+/// 请求不会排在 session/read、thread/list 等 ordinary state request 后面。
+async fn run_control_dispatch(
+    mut server: AppServer,
+    mut requests: mpsc::Receiver<JsonRpcMessage>,
+    outputs: mpsc::Sender<Value>,
+    cancellation: AppServerCancellationHandle,
+) -> Result<(), String> {
+    while let Some(message) = requests.recv().await {
+        let direct_outputs = outputs.clone();
+        let direct_cancellation = cancellation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let notification = message.is_notification();
+            let request_id = message.id().cloned();
+            let result = server.handle_with_output(message);
+            let dispatch_result = match result {
+                Ok(messages) => {
+                    send_app_server_outputs(&direct_outputs, &direct_cancellation, messages)
+                }
+                Err(error) if !notification => send_output(
+                    &direct_outputs,
+                    &direct_cancellation,
+                    transport_error_value(request_id, &error),
+                )
+                .map(|_| ()),
+                Err(_) => Ok(()),
+            };
+            (server, dispatch_result)
+        });
+        let (next_server, result) = task
+            .await
+            .map_err(|error| format!("control dispatch task failed: {error}"))?;
+        server = next_server;
+        result?;
+    }
+    Ok(())
 }
 
 /// 在单一 turn 工作线程内执行 turn/start，事件与最终响应顺序入队。
