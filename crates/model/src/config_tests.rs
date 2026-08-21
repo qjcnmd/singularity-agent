@@ -1,5 +1,8 @@
 use super::*;
-use crate::{Provider, USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
+use crate::{
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, Provider, USER_AUTH_SCHEMA_VERSION,
+    USER_CONFIG_FILE_NAME,
+};
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
 fn test_runtime_handle() -> tokio::runtime::Handle {
@@ -44,7 +47,6 @@ fn user_config_with_two_providers(auth: UserAuthFile) -> UserConfigData {
             version: 1,
             default_provider: Some("primary".to_string()),
             default_model: Some("primary/gpt-test".to_string()),
-            auth_generation: None,
             providers: BTreeMap::from([
                 ("primary".to_string(), user_provider()),
                 ("secondary".to_string(), user_provider()),
@@ -244,20 +246,83 @@ fn persisted_capability_block_is_rejected() {
 }
 
 #[test]
-fn unknown_model_without_limits_still_fails_closed() {
+fn unknown_model_without_limits_falls_back_to_runtime_defaults() {
     let model = UserConfigModel {
         api_protocol: Some("chat".to_string()),
         ..UserConfigModel::default()
     };
-    let error = match configured_model_from_user_file("unknown-provider", "unknown-model", &model) {
-        Ok(_) => panic!("no builtin fallback for an unknown model"),
+    let resolved = configured_model_from_user_file("unknown-provider", "unknown-model", &model)
+        .expect("missing limits are filled from the runtime defaults");
+    assert_eq!(
+        resolved.max_context_tokens,
+        Some(DEFAULT_MAX_CONTEXT_TOKENS)
+    );
+    assert_eq!(resolved.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+}
+
+#[test]
+fn user_model_override_without_api_protocol_still_fails_closed() {
+    let model = UserConfigModel {
+        max_context_tokens: Some(128_000),
+        max_output_tokens: Some(4_096),
+        ..UserConfigModel::default()
+    };
+    let error = match configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model) {
+        Ok(_) => panic!("api_protocol cannot be guessed"),
         Err(error) => error,
     };
-    assert!(error.message.contains("incomplete"));
+    assert!(error.message.contains("api_protocol"));
     assert_eq!(
         error.error.code.as_deref(),
         Some("provider_configuration_invalid")
     );
+}
+
+#[test]
+fn capture_fills_runtime_metadata_for_model_without_declared_limits() {
+    let data = UserConfigData {
+        directory: PathBuf::from("C:/singularity-test"),
+        config: UserConfigFile {
+            version: 1,
+            default_provider: Some("primary".to_string()),
+            default_model: Some("primary/gpt-test".to_string()),
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                UserConfigProvider {
+                    base_url: "https://example.invalid/v1".to_string(),
+                    models: BTreeMap::from([(
+                        "gpt-test".to_string(),
+                        UserConfigModel {
+                            api_protocol: Some("chat".to_string()),
+                            ..UserConfigModel::default()
+                        },
+                    )]),
+                },
+            )]),
+        },
+        auth: UserAuthFile {
+            schema_version: USER_AUTH_SCHEMA_VERSION,
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                UserAuthProvider {
+                    api_key: "sk-primary".to_string(),
+                },
+            )]),
+        },
+    };
+    let (snapshot, _) = capture_user_model_selection(
+        &data,
+        Some(ProviderConfigSource::UserConfigFile),
+        &test_provider_factory(),
+    )
+    .expect("a protocol-only override is executable after metadata fill");
+    let provider = provider_for_selection(&snapshot, None).expect("default provider is configured");
+    let contract = provider.protocol_contract();
+    assert_eq!(
+        contract.max_context_tokens,
+        Some(DEFAULT_MAX_CONTEXT_TOKENS)
+    );
+    assert_eq!(contract.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
 }
 
 #[test]
@@ -578,12 +643,8 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
             .contains(&config_path.display().to_string())
     );
 
-    let auth_path = write_new_auth_generation(
-        directory.path(),
-        "auth.v1-00000000000000000000000000000000.json",
-        &oversized_contents,
-    )
-    .expect("write oversized private auth");
+    let auth_path = directory.path().join(crate::USER_AUTH_FILE_NAME);
+    write_json_file(&auth_path, &oversized_contents, true).expect("write oversized private auth");
     let auth_error =
         read_private_auth_file(&auth_path).expect_err("oversized private auth must fail");
     assert_eq!(
@@ -641,6 +702,74 @@ fn config_json_write_is_atomic() {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".config.json.tmp-"))
+    );
+}
+
+#[test]
+fn auth_file_replaces_atomically_as_the_single_credential_file() {
+    let directory = tempfile::tempdir().expect("user config directory");
+    let config = serde_json::json!({
+        "version": 1,
+        "default_provider": "primary",
+        "default_model": "primary/gpt-test",
+        "providers": {
+            "primary": {
+                "base_url": "https://example.invalid/v1",
+                "models": {
+                    "gpt-test": { "api_protocol": "chat", "max_output_tokens": 2048 }
+                }
+            }
+        }
+    });
+    write_json_file(
+        &directory.path().join(USER_CONFIG_FILE_NAME),
+        &config.to_string(),
+        false,
+    )
+    .expect("write user config");
+    let auth_path = directory.path().join(crate::USER_AUTH_FILE_NAME);
+    let credentials = |api_key: &str| {
+        serde_json::json!({
+            "schema_version": USER_AUTH_SCHEMA_VERSION,
+            "providers": { "primary": { "api_key": api_key } }
+        })
+        .to_string()
+    };
+    write_json_file(&auth_path, &credentials("sk-primary"), true).expect("write private auth file");
+    let data = read_user_config_data_from_directory(directory.path().to_path_buf())
+        .expect("read user config")
+        .expect("user config present");
+    assert_eq!(data.auth.providers["primary"].api_key, "sk-primary");
+
+    // 同一路径重复写入即原子替换：内容整体翻新，读侧永远看到完整 JSON。
+    write_json_file(&auth_path, &credentials("sk-rotated"), true)
+        .expect("replace private auth file");
+    let data = read_user_config_data_from_directory(directory.path().to_path_buf())
+        .expect("read replaced user config")
+        .expect("user config present");
+    assert_eq!(data.auth.providers["primary"].api_key, "sk-rotated");
+
+    // 凭据目录只保留唯一 auth 文件，且原子替换不残留临时文件。
+    let names = directory
+        .path()
+        .read_dir()
+        .expect("read credential directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("directory entries")
+        .into_iter()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with("auth."))
+            .count(),
+        1,
+        "exactly one auth file must exist: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name.contains(".tmp-")),
+        "atomic replacement must not leave temporary files: {names:?}"
     );
 }
 

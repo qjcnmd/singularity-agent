@@ -1,7 +1,7 @@
 //! Opt-in real-provider smoke cases for the core chain.
 //!
 //! These tests are ignored by default. They copy the selected persistent user
-//! configuration and its private auth generation into a temporary home before
+//! configuration and its private auth file into a temporary home before
 //! starting `sg`; the source files are never modified or logged.
 
 use std::env;
@@ -53,14 +53,9 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
             .map_err(|_| "persistent smoke config could not be read".to_string())?,
     )
     .map_err(|_| "persistent smoke config is not valid JSON".to_string())?;
-    let auth_generation = config
-        .get("auth_generation")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "persistent smoke config must declare auth_generation".to_string())?
-        .to_string();
-    let source_auth = auth_generation_path(&source_home, &auth_generation)?;
+    let source_auth = source_home.join("auth.v1.json");
     if !source_auth.is_file() {
-        return Err("persistent smoke auth generation is unavailable".to_string());
+        return Err("persistent smoke auth file is unavailable".to_string());
     }
     let selector = match scenario {
         SmokeScenario::LongCat => select_longcat_selector(&config)?,
@@ -78,9 +73,9 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
         serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,
     )
     .map_err(|_| "could not copy smoke config".to_string())?;
-    let isolated_auth = home.join(&auth_generation);
+    let isolated_auth = home.join("auth.v1.json");
     fs::copy(&source_auth, &isolated_auth)
-        .map_err(|_| "could not copy smoke auth generation".to_string())?;
+        .map_err(|_| "could not copy smoke auth file".to_string())?;
     set_owner_only_permissions(&config_path)?;
     set_owner_only_permissions(&isolated_auth)?;
 
@@ -122,20 +117,6 @@ fn smoke_source_home() -> Result<PathBuf, String> {
         return Err("persistent smoke home must be an absolute path".to_string());
     }
     Ok(source)
-}
-
-fn auth_generation_path(home: &Path, generation: &str) -> Result<PathBuf, String> {
-    let path = Path::new(generation);
-    if !generation.starts_with("auth.v1-")
-        || !generation.ends_with(".json")
-        || generation.contains(['/', '\\', ':'])
-        || path.is_absolute()
-        || path.components().count() != 1
-        || path.file_name().and_then(|name| name.to_str()) != Some(generation)
-    {
-        return Err("persistent smoke auth_generation is invalid".to_string());
-    }
-    Ok(home.join(path))
 }
 
 fn set_default_selector(config: &mut Value, selector: &str) -> Result<(), String> {
@@ -666,21 +647,4 @@ fn responses_replay_selector_fails_closed_without_one_matching_model() {
 
     assert!(select_responses_replay_selector(&no_match).is_err());
     assert!(select_responses_replay_selector(&multiple_matches).is_err());
-}
-
-#[test]
-fn auth_generation_is_limited_to_a_single_expected_filename() {
-    let home = Path::new("C:/smoke-home");
-    assert_eq!(
-        auth_generation_path(home, "auth.v1-abc.json").expect("safe filename"),
-        home.join("auth.v1-abc.json")
-    );
-    for invalid in [
-        "../auth.v1-abc.json",
-        "auth.v1-abc.txt",
-        "other.json",
-        "auth.v1-a/b.json",
-    ] {
-        assert!(auth_generation_path(home, invalid).is_err(), "{invalid}");
-    }
 }

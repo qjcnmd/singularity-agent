@@ -65,6 +65,14 @@ pub(crate) fn discover_provider_models(
             ),
         )
     })?;
+    parse_discovery_payload(&payload)
+}
+
+/// Parse a `/models` JSON payload into validated model ids.
+///
+/// 响应级缺陷（缺 `data` 数组、条目数超限、全部条目无效）fail closed；
+/// 单个坏条目（缺 id、id 非法、重复 id）只被跳过，不拖垮整个发现结果。
+pub(crate) fn parse_discovery_payload(payload: &Value) -> Result<Vec<String>, ProviderError> {
     let data = payload
         .get("data")
         .and_then(Value::as_array)
@@ -95,46 +103,19 @@ pub(crate) fn discover_provider_models(
     let mut model_ids = Vec::with_capacity(data.len());
     let mut seen_ids = HashSet::with_capacity(data.len());
     for item in data {
-        let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
-            ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::JsonSchemaViolation,
-                    "provider models response contained an entry without a model id",
-                )
-                .with_provider_diagnostic(
-                    "provider_models_schema_invalid",
-                    ProviderErrorStage::ResponseValidation,
-                ),
-            )
-        })?;
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
         if id.is_empty()
             || id.chars().count() > MAX_MODEL_ID_LENGTH
             || id
                 .chars()
                 .any(|character| character.is_control() || character.is_whitespace())
         {
-            return Err(ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::JsonSchemaViolation,
-                    "provider models response contained a malformed model id",
-                )
-                .with_provider_diagnostic(
-                    "provider_models_schema_invalid",
-                    ProviderErrorStage::ResponseValidation,
-                ),
-            ));
+            continue;
         }
         if !seen_ids.insert(id) {
-            return Err(ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::JsonSchemaViolation,
-                    "provider models response contained duplicate model ids",
-                )
-                .with_provider_diagnostic(
-                    "provider_models_schema_invalid",
-                    ProviderErrorStage::ResponseValidation,
-                ),
-            ));
+            continue;
         }
         model_ids.push(id.to_string());
     }
@@ -151,4 +132,52 @@ pub(crate) fn discover_provider_models(
         ));
     }
     Ok(model_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(entries: Value) -> Value {
+        serde_json::json!({ "data": entries })
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped_without_failing_discovery() {
+        let parsed = parse_discovery_payload(&payload(serde_json::json!([
+            { "id": "gpt-valid" },
+            {},
+            { "id": 42 },
+            { "id": "" },
+            { "id": "has space" },
+            { "id": "gpt-valid" },
+            { "other": true },
+            { "id": "gpt-also-valid" }
+        ])))
+        .expect("valid entries survive malformed siblings");
+
+        assert_eq!(
+            parsed,
+            vec!["gpt-valid".to_string(), "gpt-also-valid".to_string()]
+        );
+    }
+
+    #[test]
+    fn response_level_defects_still_fail_closed() {
+        let error = parse_discovery_payload(&serde_json::json!({ "models": [] }))
+            .expect_err("missing data array must fail");
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_models_schema_invalid")
+        );
+
+        let all_malformed = parse_discovery_payload(&payload(serde_json::json!([
+            {}, { "id": "" }
+        ])))
+        .expect_err("a response with no usable entry must fail");
+        assert_eq!(
+            all_malformed.error.code.as_deref(),
+            Some("provider_models_empty")
+        );
+    }
 }

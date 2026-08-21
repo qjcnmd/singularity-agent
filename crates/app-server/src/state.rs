@@ -321,7 +321,7 @@ impl AppServer {
     pub(super) fn provider_and_config_for_thread(
         &self,
         thread: &Thread,
-    ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig)> {
+    ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool)> {
         let provider: Arc<dyn Provider + Send + Sync> =
             if let Some(test_provider) = &self.test_provider_override {
                 Arc::clone(test_provider)
@@ -334,8 +334,9 @@ impl AppServer {
                     }
                 })?)
             };
-        let config = agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
-        Ok((provider, config))
+        let (config, instructions_truncated) =
+            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
+        Ok((provider, config, instructions_truncated))
     }
 
     pub(crate) fn open_session_for_thread(

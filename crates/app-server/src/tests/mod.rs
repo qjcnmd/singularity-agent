@@ -1505,6 +1505,88 @@ fn project_instructions_load_from_workspace_root_to_cwd() {
 }
 
 #[test]
+fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
+    // 超限不再报错：截断前缀纳入系统提示词并附模型可见尾注，客户端在
+    // turn/started 之后收到 project_instructions_truncated 告警诊断。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        vec![b'~'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
+    )
+    .expect("oversized agents");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = StaticProvider {
+        responses: vec![completed_response("truncated_instructions_turn")],
+        seen_requests: Arc::clone(&requests),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(
+        &server,
+        &sessions_dir,
+        "3d4e5f6a-9b8c-4d1e-a2f3-b4c5d6e7f8a9",
+        &workspace,
+    );
+
+    let responses = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"3d4e5f6a-9b8c-4d1e-a2f3-b4c5d6e7f8a9","input":[{"type":"text","text":"do it"}]}}"#,
+        )
+        .expect("oversized instructions must not fail the turn");
+    assert_eq!(
+        responses
+            .iter()
+            .find(|m| m["id"] == 2)
+            .expect("turn response")["result"]["turn"]["status"],
+        "running"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .find(|m| m["method"] == "turn/completed")
+            .expect("completed")["params"]["turn"]["status"],
+        "completed"
+    );
+    let started_position = responses
+        .iter()
+        .position(|m| m["method"] == "turn/started")
+        .expect("turn started");
+    let warning_position = responses
+        .iter()
+        .position(|m| {
+            m["method"] == "agent/diagnostic"
+                && m["params"]["code"] == "project_instructions_truncated"
+                && m["params"]["severity"] == "warning"
+        })
+        .expect("client receives the truncation warning");
+    assert!(
+        warning_position > started_position,
+        "warning must arrive after turn/started"
+    );
+    let seen = requests.lock().expect("seen requests");
+    let request = seen.last().expect("provider request");
+    let joined: String = request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        joined.matches('~').count(),
+        singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+        "exactly the file budget prefix reaches the model"
+    );
+    assert!(
+        joined.contains("[warning] project instructions were truncated"),
+        "truncation must be visible to the model: {joined}"
+    );
+}
+
+#[test]
 fn terminal_turn_usage_matches_provider_usage() {
     // 1c 回归：终态 turn 的 model_usage 直接来自 AgentLoop 返回值（不再经由
     // 运行时缓存表转手），数值必须与 provider 上报逐字段一致。
@@ -1623,23 +1705,14 @@ fn turn_start_message(id: i64, session_id: &str) -> JsonRpcMessage {
 
 #[test]
 fn project_instruction_errors_fail_closed_before_provider_call() {
-    for name in [
-        "oversize",
-        "invalid_utf8",
-        "unsupported_type",
-        "cwd_unavailable",
-    ] {
+    // 预算超限不在其中：超限走截断 + 告警路径
+    // （oversized_project_instructions_truncate_with_warning_instead_of_failing），
+    // 只有真 I/O 错误仍直接使 turn/start 失败。
+    for name in ["invalid_utf8", "unsupported_type", "cwd_unavailable"] {
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         match name {
-            "oversize" => {
-                std::fs::write(
-                    workspace.join("AGENTS.md"),
-                    vec![b'x'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
-                )
-                .expect("oversize AGENTS.md");
-            }
             "invalid_utf8" => {
                 std::fs::write(workspace.join("AGENTS.md"), [0xff, 0xfe, 0xfd])
                     .expect("invalid UTF-8 AGENTS.md");
@@ -1658,7 +1731,6 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
             seen_requests: Arc::clone(&seen),
         };
         let session_id = match name {
-            "oversize" => "9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
             "invalid_utf8" => "8f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
             "unsupported_type" => "7f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
             "cwd_unavailable" => "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
@@ -2042,8 +2114,9 @@ fn agent_prompt_tool_list_matches_registry_names_only() {
         },
         test_runtime_handle(),
     );
-    let config = crate::lifecycle::agent_config_for_thread(&thread, &PromptOnlyProvider, &snapshot)
-        .expect("agent config resolves");
+    let (config, _) =
+        crate::lifecycle::agent_config_for_thread(&thread, &PromptOnlyProvider, &snapshot)
+            .expect("agent config resolves");
     let names = ToolRegistry::new().names();
     assert_eq!(names, ["bash", "edit", "read", "write"]);
     for name in &names {

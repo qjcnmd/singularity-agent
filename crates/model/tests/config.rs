@@ -17,8 +17,8 @@ fn model_turn_request_serializes_provider_boundary_fields() {
 }
 
 #[test]
-fn model_discovery_rejects_any_invalid_model_entry() {
-    let invalid_payloads = [
+fn model_discovery_skips_invalid_model_entries_without_failing_the_catalog() {
+    let tolerated_payloads = [
         ("missing id", r#"{"data":[{"id":"gpt-valid"},{}]}"#),
         ("empty id", r#"{"data":[{"id":"gpt-valid"},{"id":""}]}"#),
         (
@@ -34,24 +34,13 @@ fn model_discovery_rejects_any_invalid_model_entry() {
             r#"{"data":[{"id":"gpt-valid"},{"id":"gpt-valid"}]}"#,
         ),
     ];
-    for (label, payload) in invalid_payloads {
+    for (label, payload) in tolerated_payloads {
         let (base_url, request) = models_server(payload.to_string());
         let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
-        let error = provider.discover_model_ids().expect_err(label);
         assert_eq!(
-            error.error.kind,
-            ModelErrorKind::JsonSchemaViolation,
-            "{label}"
-        );
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_models_schema_invalid"),
-            "{label}"
-        );
-        assert_eq!(
-            error.error.stage,
-            Some(ProviderErrorStage::ResponseValidation),
-            "{label}"
+            provider.discover_model_ids().expect(label),
+            vec!["gpt-valid"],
+            "the valid sibling entry must survive: {label}"
         );
         assert!(
             request
@@ -1593,8 +1582,29 @@ fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() 
     assert!(std::path::Path::new(&imported.config_path).exists());
     assert!(std::path::Path::new(&imported.auth_path).exists());
     assert!(imported.config_path.ends_with("config.json"));
-    assert!(imported.auth_path.contains("auth.v1-"));
+    assert!(imported.auth_path.ends_with("auth.v1.json"));
     assert_eq!(imported.provider_name, "openai_compatible");
+
+    // 凭据目录只保留唯一 auth.v1.json：重复导入原子替换，无世代/临时残留。
+    let credential_names = std::fs::read_dir(home.path())
+        .expect("read user home")
+        .collect::<Result<Vec<std::fs::DirEntry>, _>>()
+        .expect("directory entries")
+        .into_iter()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        credential_names
+            .iter()
+            .filter(|name| name.starts_with("auth."))
+            .count(),
+        1,
+        "exactly one auth file must exist: {credential_names:?}"
+    );
+    assert!(
+        !credential_names.iter().any(|name| name.contains(".tmp-")),
+        "atomic replacement must not leave temporary files: {credential_names:?}"
+    );
 
     // 相同 endpoint 重复导入幂等成功；endpoint 变更被拒绝。
     singularity_model::import_env_to_user_config(Some(&env_path))

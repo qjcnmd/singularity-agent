@@ -1,14 +1,22 @@
-//! 用户鉴权文件与安全保护（`auth.json` 读写、generation 轮转与权限校验）。
+//! 用户鉴权文件与安全保护（`auth.v1.json` 读写与权限校验）。
+//!
+//! 凭据目录里只有一个 `auth.v1.json`：写入方先落临时文件再同卷原子改名，
+//! 读侧只认这一个文件名，任何时刻磁盘上看到的都是完整 JSON。
+//!
+//! 历史世代文件处置指引：早期布局按每次导入写入 `auth.v1-<uuid>.json`
+//! 并由 config.json 的 `auth_generation` 字段指向最新一代。该机制已移除；
+//! 残留的世代文件与本文件 schema 相同，仅含 api_key 明文，可由主代理或
+//! 用户在确认新文件就绪后直接归档删除，运行时不再读取它们。
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::{ensure_no_reparse_components, path_exists_or_missing, user_config_error};
+use super::{ensure_no_reparse_components, user_config_error};
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
-use crate::{USER_AUTH_GENERATION_PREFIX, USER_AUTH_SCHEMA_VERSION};
+use crate::{USER_AUTH_FILE_NAME, USER_AUTH_SCHEMA_VERSION};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde::{Deserialize, Serialize};
@@ -186,60 +194,10 @@ pub(crate) fn create_private_secret_file(path: &Path) -> Result<std::fs::File, P
         .map_err(|_| user_config_error("user provider auth file could not be created"))
 }
 
-pub(crate) fn auth_generation_path(
-    directory: &Path,
-    generation: &str,
-) -> Result<PathBuf, ProviderError> {
-    if !generation.starts_with(USER_AUTH_GENERATION_PREFIX)
-        || !generation.ends_with(".json")
-        || generation.contains(['/', '\\', ':'])
-        || generation
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-    {
-        return Err(user_config_error(
-            "user provider auth generation reference is invalid",
-        ));
-    }
-    let path = directory.join(generation);
+/// 返回凭据目录下唯一的 `auth.v1.json` 路径；目录边界先经 reparse 校验。
+pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
     ensure_no_reparse_components(directory, false)?;
-    if path_exists_or_missing(&path, "user provider auth path could not be inspected")? {
-        ensure_no_reparse_components(&path, false)?;
-    }
-    Ok(path)
-}
-
-pub(crate) fn new_auth_generation_name() -> String {
-    format!(
-        "{}{}.json",
-        USER_AUTH_GENERATION_PREFIX,
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-pub(crate) fn write_new_auth_generation(
-    directory: &Path,
-    generation: &str,
-    contents: &str,
-) -> Result<PathBuf, ProviderError> {
-    let path = auth_generation_path(directory, generation)?;
-    let mut file = create_private_secret_file(&path)?;
-    let created = true;
-    let result = (|| {
-        ensure_private_secret_handle(&file)?;
-        use std::io::Write;
-        file.write_all(contents.as_bytes())
-            .map_err(|_| user_config_error("user provider auth could not be written"))?;
-        file.sync_all()
-            .map_err(|_| user_config_error("user provider auth could not be synced"))?;
-        ensure_private_secret_handle(&file)?;
-        Ok(())
-    })();
-    drop(file);
-    if result.is_err() && created {
-        let _ = std::fs::remove_file(&path);
-    }
-    result.map(|()| path)
+    Ok(directory.join(USER_AUTH_FILE_NAME))
 }
 
 pub(crate) struct ConfigWriterLock {

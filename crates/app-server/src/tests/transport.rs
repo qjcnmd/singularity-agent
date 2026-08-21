@@ -488,16 +488,12 @@ fn transport_error_carries_original_terminalization_text() {
 
 #[test]
 fn turn_start_prepare_failure_returns_direct_error_response() {
-    // 准备阶段（project instructions 加载）失败：turn/start 直接回错误响应，
-    // 不发 turn/started、不写 turn_started、也不制造 turn/error 终态事件。
+    // 准备阶段（project instructions 真 I/O 错误：AGENTS.md 不是常规文件）失败：
+    // turn/start 直接回错误响应，不发 turn/started、不写 turn_started、
+    // 也不制造 turn/error 终态事件。预算超限不在此路径——超限走截断 + 告警。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    std::fs::write(
-        workspace.join("AGENTS.md"),
-        vec![b'x'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
-    )
-    .expect("oversize AGENTS.md");
+    std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("AGENTS.md as a directory");
     let sessions_dir = temp.path().join("sessions");
     let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
     let snapshot = ProviderConfigSnapshot::capture(
@@ -561,7 +557,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     assert!(
         values[0]["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("project_instruction_file_too_large")),
+            .is_some_and(|message| message.contains("project_instruction_unsupported_file_type")),
         "error must carry the project instruction cause: {values:?}"
     );
     // 会话行与 JSONL 均无 turn 痕迹：直接错误响应是唯一事实。

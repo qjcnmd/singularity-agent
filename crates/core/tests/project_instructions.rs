@@ -156,7 +156,7 @@ fn rejects_cwd_outside_workspace() {
 }
 
 #[test]
-fn rejects_single_agents_file_over_named_limit() {
+fn truncates_single_agents_file_to_file_budget() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -166,14 +166,16 @@ fn rejects_single_agents_file_over_named_limit() {
     )
     .expect("oversized agents");
 
-    let error = load_project_instructions(&workspace, &workspace).expect_err("file too large");
+    let loaded = load_project_instructions(&workspace, &workspace)
+        .expect("oversized loads via truncation")
+        .expect("instructions present");
 
-    assert_eq!(error.code, ProjectInstructionErrorCode::FileTooLarge);
-    assert_eq!(error.path.as_deref(), Some(Path::new("AGENTS.md")));
+    assert_eq!(loaded.content().len(), PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    assert!(loaded.truncated(), "truncation fact must be observable");
 }
 
 #[test]
-fn rejects_hierarchy_over_named_total_limit() {
+fn truncates_hierarchy_to_total_budget_and_stops() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let first = workspace.join("first");
@@ -181,16 +183,41 @@ fn rejects_hierarchy_over_named_total_limit() {
     std::fs::create_dir_all(&cwd).expect("nested cwd");
     let per_file_bytes = (PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES / 3) + 1;
     assert!(per_file_bytes <= PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
-    for directory in [&workspace, &first, &cwd] {
-        std::fs::write(directory.join("AGENTS.md"), vec![b'x'; per_file_bytes])
-            .expect("agents file");
-    }
+    std::fs::write(workspace.join("AGENTS.md"), vec![b'a'; per_file_bytes]).expect("root agents");
+    std::fs::write(first.join("AGENTS.md"), vec![b'b'; per_file_bytes]).expect("first agents");
+    std::fs::write(cwd.join("AGENTS.md"), vec![b'c'; per_file_bytes]).expect("cwd agents");
 
-    let error = load_project_instructions(&workspace, &cwd).expect_err("total too large");
+    let loaded = load_project_instructions(&workspace, &cwd)
+        .expect("over-budget hierarchy loads via truncation")
+        .expect("instructions present");
 
-    assert_eq!(error.code, ProjectInstructionErrorCode::TotalTooLarge);
+    // 前两个文件全部纳入，第三个文件被截断到剩余预算，之后停止。
     assert_eq!(
-        error.path.as_deref(),
-        Some(Path::new("first/second/AGENTS.md"))
+        loaded.content().matches('a').count(),
+        per_file_bytes,
+        "root file fully incorporated"
     );
+    assert_eq!(
+        loaded.content().matches('b').count(),
+        per_file_bytes,
+        "first file fully incorporated"
+    );
+    assert_eq!(
+        loaded.content().matches('c').count(),
+        per_file_bytes - 2,
+        "cwd file limited to remaining total budget"
+    );
+    assert!(loaded.truncated(), "truncation fact must be observable");
+}
+
+#[test]
+fn rejects_unsupported_file_type() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("agents-as-directory");
+
+    let error = load_project_instructions(&workspace, &workspace).expect_err("dir is not a file");
+
+    assert_eq!(error.code, ProjectInstructionErrorCode::UnsupportedFileType);
+    assert_eq!(error.path.as_deref(), Some(Path::new("AGENTS.md")));
 }

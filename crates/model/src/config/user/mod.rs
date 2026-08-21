@@ -38,8 +38,6 @@ pub(crate) struct UserConfigFile {
     pub(crate) default_provider: Option<String>,
     #[serde(default)]
     pub(crate) default_model: Option<String>,
-    #[serde(default)]
-    pub(crate) auth_generation: Option<String>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
 }
@@ -333,15 +331,14 @@ pub(crate) fn read_user_config_data_from_directory(
             "unsupported user provider config version",
         ));
     }
-    let auth = if let Some(generation) = config.auth_generation.as_deref() {
-        let auth_path = auth_generation_path(&directory, generation)?;
-        read_private_auth_file(&auth_path)?
-    } else {
-        UserAuthFile {
-            schema_version: crate::USER_AUTH_SCHEMA_VERSION,
-            providers: BTreeMap::new(),
-        }
-    };
+    let auth_path = user_auth_file_path(&directory)?;
+    let auth =
+        if path_exists_or_missing(&auth_path, "user provider auth path could not be inspected")? {
+            ensure_no_reparse_components(&auth_path, false)?;
+            read_private_auth_file(&auth_path)?
+        } else {
+            UserAuthFile::default()
+        };
     Ok(Some(UserConfigData {
         directory,
         config,
