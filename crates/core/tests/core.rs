@@ -1,11 +1,9 @@
 //! core 公共类型、脱敏和 JSON-RPC 基础合同测试。
 
-use singularity_core::{
-    CancellationToken, ClientInfo, ErrorCode, RequestId, Timestamp, contains_sensitive_text,
-};
+use singularity_core::{CancellationToken, ClientInfo, ErrorCode, contains_sensitive_text};
 
 #[test]
-fn client_metadata_and_ids_round_trip_as_json() {
+fn client_metadata_round_trips_as_json() {
     let client = ClientInfo::new("singularity_cli", "Singularity CLI", "0.1.0");
     let value = serde_json::to_value(&client).expect("serialize client info");
 
@@ -13,25 +11,7 @@ fn client_metadata_and_ids_round_trip_as_json() {
     assert_eq!(value["title"], "Singularity CLI");
     assert_eq!(value["version"], "0.1.0");
 
-    let request_id = RequestId::from("request_1");
-    assert_eq!(request_id.as_str(), "request_1");
-
-    let timestamp = Timestamp::parse("2026-01-01T00:00:00Z").expect("parse timestamp");
-    assert_eq!(timestamp.to_string(), "2026-01-01T00:00:00Z");
     assert_eq!(ErrorCode::not_initialized().message(), "Not initialized");
-}
-
-#[test]
-fn timestamp_exposes_bounded_unix_milliseconds() {
-    let timestamp = Timestamp::parse("1970-01-01T00:00:01.234Z").expect("parse timestamp");
-
-    assert_eq!(timestamp.unix_ms(), 1_234);
-    assert_eq!(
-        Timestamp::from_unix_ms(1_234)
-            .expect("timestamp from unix milliseconds")
-            .to_string(),
-        "1970-01-01T00:00:01.234Z"
-    );
 }
 
 #[test]

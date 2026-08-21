@@ -64,7 +64,7 @@ pub fn openai_responses_request_payload(
                 .collect::<Vec<_>>()
         );
         if supports_tool_choice {
-            payload["tool_choice"] = openai_responses_tool_choice_payload(request);
+            payload["tool_choice"] = openai_responses_tool_choice_payload();
             payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
         }
     }
@@ -465,6 +465,6 @@ pub fn openai_responses_input(
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-pub fn openai_responses_tool_choice_payload(_request: &ModelTurnRequest) -> Value {
+pub fn openai_responses_tool_choice_payload() -> Value {
     json!("auto")
 }

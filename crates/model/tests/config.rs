@@ -367,7 +367,7 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
 }
 
 #[test]
-fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
+fn openai_provider_config_uses_endpoint_rules() {
     assert_eq!(
         chat_completions_endpoint("https://provider.example/v1"),
         "https://provider.example/v1/chat/completions"
@@ -400,15 +400,9 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
         _ => None,
     })
     .expect("provider config");
-    let status = config.redacted_status();
-    let serialized = serde_json::to_string(&status).expect("serialize status");
 
     assert_eq!(config.provider_name, "openai_compatible");
     assert_eq!(config.source, ProviderConfigSource::ProcessEnvironment);
-    assert!(status.configured);
-    assert_eq!(status.api_key_status, "present(redacted)");
-    assert!(!serialized.contains("sk-secret-value"));
-    assert!(!serialized.contains("provider.example"));
 }
 
 #[test]

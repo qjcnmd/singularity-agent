@@ -8,9 +8,7 @@ use singularity_app_server::{
     AppServer, AppServerCancellationHandle, AppServerControlHandle, AppServerError, AppServerOutput,
 };
 use singularity_model::ProviderConfigSnapshot;
-use singularity_protocol::{
-    JsonRpcBatchItem, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
-};
+use singularity_protocol::{JsonRpcInbound, JsonRpcMessage, Method, parse_json_rpc_payload};
 use singularity_store::SessionStore;
 use std::path::Path;
 use std::sync::Arc;
@@ -161,8 +159,8 @@ where
                 if line.trim().is_empty() {
                     continue;
                 }
-                let payload = match parse_json_rpc_payload(&line) {
-                    Ok(payload) => payload,
+                let inbound = match parse_json_rpc_payload(&line) {
+                    Ok(inbound) => inbound,
                     Err(_) => {
                         if let Err(error) = send_output_async(
                             output_tx.clone(),
@@ -177,23 +175,9 @@ where
                         continue;
                     }
                 };
-                let JsonRpcPayload::Single(item) = payload else {
-                    // JSON-RPC batch 没有 stdio 消费者；直接拒绝，避免输入批量扩容。
-                    if let Err(error) = send_output_async(
-                        output_tx.clone(),
-                        cancellation.clone(),
-                        JsonRpcMessage::invalid_request(None).to_wire_value(),
-                    )
-                    .await
-                    {
-                        terminal_error = Some(error);
-                        break;
-                    }
-                    continue;
-                };
-                let message = match item {
-                    JsonRpcBatchItem::Message(message) => message,
-                    JsonRpcBatchItem::Invalid { id } => {
+                let message = match inbound {
+                    JsonRpcInbound::Message(message) => message,
+                    JsonRpcInbound::Invalid { id } => {
                         if let Err(error) = send_output_async(
                             output_tx.clone(),
                             cancellation.clone(),

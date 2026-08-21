@@ -16,7 +16,6 @@ rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 singularity_protocol = { path = "../protocol" }
 thiserror.workspace = true
 time.workspace = true

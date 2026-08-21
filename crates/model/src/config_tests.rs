@@ -232,54 +232,6 @@ fn models_file_rejects_unknown_capability_fields() {
 }
 
 #[test]
-fn persisted_capability_block_accepts_removed_flags() {
-    let directory = tempfile::tempdir().expect("user config directory");
-    let config = serde_json::json!({
-        "version": 1,
-        "default_provider": "primary",
-        "default_model": "primary/gpt-test",
-        "providers": {
-            "primary": {
-                "base_url": "https://example.invalid/v1",
-                "models": {
-                    "gpt-test": {
-                        "api_protocol": "chat",
-                        "max_output_tokens": 2048,
-                        "capabilities": {
-                            "supports_tools": true,
-                            "supports_required_tool_choice": false,
-                            "supports_json_mode": false
-                        }
-                    }
-                }
-            }
-        }
-    });
-    write_json_file(
-        &directory.path().join(USER_CONFIG_FILE_NAME),
-        &config.to_string(),
-        false,
-    )
-    .expect("write persisted user config");
-
-    let data = read_user_config_data_from_directory(directory.path().to_path_buf())
-        .expect("legacy capability flags remain readable")
-        .expect("persisted user config");
-    let capabilities = data.config.providers["primary"].models["gpt-test"]
-        .capabilities
-        .as_ref()
-        .expect("capability block");
-    assert_eq!(capabilities.supports_tools, Some(true));
-    let projected = serde_json::to_value(capabilities).expect("serialize active capabilities");
-    assert!(
-        !projected
-            .as_object()
-            .expect("capability object")
-            .contains_key("supports_json_mode")
-    );
-}
-
-#[test]
 fn unknown_model_without_limits_still_fails_closed() {
     let model = UserConfigModel {
         api_protocol: Some("chat".to_string()),

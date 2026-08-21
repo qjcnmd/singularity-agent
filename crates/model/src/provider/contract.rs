@@ -94,20 +94,14 @@ pub struct ProviderCapabilityDeclaration {
     pub max_output_tokens: Option<u32>,
 }
 
-/// Wire form for the persisted capability block. The two underscored fields
-/// were removed from the active contract but remain in configurations written
-/// by earlier releases; accepting them here preserves those user files while
-/// keeping the removed concepts out of the runtime declaration.
+/// 持久化能力块（config.json `capabilities`）的 wire form；
+/// `deny_unknown_fields` 让未登记的能力键在解析期直接失败。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ProviderCapabilityDeclarationWire {
     supports_tools: Option<bool>,
     supports_parallel_tool_calls: Option<bool>,
-    #[serde(rename = "supports_required_tool_choice", default)]
-    _supports_required_tool_choice: Option<bool>,
     supports_strict_tool_schema: Option<bool>,
-    #[serde(rename = "supports_json_mode", default)]
-    _supports_json_mode: Option<bool>,
     supports_system_message: Option<bool>,
     supports_developer_message: Option<bool>,
     supports_reasoning: Option<bool>,
