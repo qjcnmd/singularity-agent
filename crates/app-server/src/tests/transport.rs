@@ -605,6 +605,8 @@ fn stdout_writer_join_obeys_the_shutdown_deadline() {
 struct TestProvider {
     response: ModelTurnResponse,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    started: std_mpsc::SyncSender<()>,
+    release: Mutex<std_mpsc::Receiver<()>>,
 }
 
 impl Provider for TestProvider {
@@ -615,6 +617,12 @@ impl Provider for TestProvider {
     ) -> Result<ModelTurnResponse, ProviderError> {
         let mut seen_requests = self.seen_requests.lock().expect("lock");
         seen_requests.push(request.clone());
+        self.started.send(()).expect("signal provider start");
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv()
+            .expect("release provider");
         let mut response = self.response.clone();
         response.request_id = request.request_id.clone();
         Ok(response)
@@ -635,15 +643,22 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     let store = SessionStore::open(&index_path).expect("store");
 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let (provider_started_tx, provider_started_rx) = std_mpsc::sync_channel(1);
+    let (provider_release_tx, provider_release_rx) = std_mpsc::sync_channel(1);
     let provider = Arc::new(TestProvider {
         response: ModelTurnResponse::completed("request_1", "response_1", "all done"),
         seen_requests: Arc::clone(&seen_requests),
+        started: provider_started_tx,
+        release: Mutex::new(provider_release_rx),
     });
 
     let session_id = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
         .expect("create session");
     let session_path = session.path().to_path_buf();
+    let original_session_permissions = std::fs::metadata(&session_path)
+        .expect("session metadata before storage fault")
+        .permissions();
     store
         .insert_session(&singularity_store::SessionRecord {
             session_id: session_id.to_string(),
@@ -661,6 +676,8 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
 
     let server_sessions_dir = sessions_dir.clone();
     let server_provider = Arc::clone(&provider);
+    let server_session_path = session_path.clone();
+    let server_original_permissions = original_session_permissions.clone();
     let (server_result, wire_bytes) = block_on(async move {
         let handle = tokio::runtime::Handle::current();
         let snapshot = ProviderConfigSnapshot::capture(
@@ -677,9 +694,6 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         let server = AppServer::new(store, snapshot)
             .with_sessions_dir(&server_sessions_dir)
             .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
-
-        // 1. turn terminal metadata 首次写入和 fallback terminal metadata 都失败
-        server.inject_terminalization_faults(3, 0);
 
         let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
         let (client_stdout, server_stdout) = tokio::io::duplex(65536);
@@ -734,6 +748,18 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             .await
             .expect("write turn/start");
 
+        tokio::task::spawn_blocking(move || provider_started_rx.recv())
+            .await
+            .expect("join provider start wait")
+            .expect("provider started");
+        let mut permissions = server_original_permissions;
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&server_session_path, permissions)
+            .expect("make session read-only for terminalization fault");
+        provider_release_tx
+            .send(())
+            .expect("release provider after storage fault setup");
+
         let mut wire_bytes = Vec::new();
         wire_bytes.extend_from_slice(init_response_line.as_bytes());
         let _ = client_reader.read_to_end(&mut wire_bytes).await;
@@ -747,6 +773,9 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         server_result.is_err(),
         "supervisor must exit with error when turn worker experiences fatal terminal storage failure"
     );
+
+    std::fs::set_permissions(&session_path, original_session_permissions)
+        .expect("restore session writability after storage fault");
 
     // 6. 客户端观察到 EOF/连接关闭并读取全部 wire frames
     let wire_output = String::from_utf8(wire_bytes).expect("UTF-8 wire output");
