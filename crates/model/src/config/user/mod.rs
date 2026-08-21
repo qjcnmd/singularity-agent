@@ -260,7 +260,7 @@ pub(crate) fn ensure_no_reparse_components(
         ) {
             continue;
         }
-        let metadata = match std::fs::symlink_metadata(&current) {
+        let _metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if allow_missing_tail && error.kind() == std::io::ErrorKind::NotFound => {
                 break;
@@ -274,7 +274,7 @@ pub(crate) fn ensure_no_reparse_components(
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes()
+            if _metadata.file_attributes()
                 & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
                 != 0
             {
