@@ -171,6 +171,10 @@ impl AppServer {
         // Repair only the pre-existing session state. The current turn has not
         // been appended yet, so it cannot be mistaken for a crashed turn.
         self.open_and_repair_session_for_thread(&thread)?;
+        // 注册前置：会话/Provider/Agent/收件箱全部就绪后才发布 turn/started 与
+        // RPC 响应，保证 started 后立即 steer/followUp 必成功；准备阶段失败 =
+        // turn/start 直接回错误响应。
+        let mut agent = self.prepare_agent_for_turn(&thread, &turn_id)?;
         let title = title_from_input(&input_text);
         // JSONL is the authoritative lifecycle source: commit turn_started before
         // projecting Active into SQLite or publishing turn/started.
@@ -205,6 +209,7 @@ impl AppServer {
             format!("{turn_id}_assistant"),
         );
         let run_result = self.run_agent_core(
+            &mut agent,
             &thread,
             &turn_id,
             &input_text,
@@ -314,9 +319,8 @@ impl AppServer {
                 });
             }
         }
-        // Publication order: durable metadata first, then the in-process usage
-        // projection used by the terminal event and RPC response.
-        self.remember_usage(&turn_id, &status.model_usage, status.usage_complete);
+        // Publication order: durable metadata first, then the terminal turn
+        // projection carrying the run result's own usage.
         // Cancellation can interrupt a side-effecting tool after its item has
         // started but before the tool callback emits an execution-end event.
         // Close every such item before the turn terminal event; never leave a
@@ -354,7 +358,11 @@ impl AppServer {
                 return Ok(());
             }
         }
-        let terminal_turn = self.turn_with_usage(terminal_turn);
+        let terminal_turn = self.terminal_turn_with_usage(
+            terminal_turn,
+            &status.model_usage,
+            status.usage_complete,
+        );
         let completion = self.event_notification(AppEvent::turn_completed(&terminal_turn));
         match completion {
             Ok(event) => emit(event),
@@ -373,13 +381,29 @@ impl AppServer {
         Ok(())
     }
 
-    /// 将 AgentLoop 错误收敛为唯一终态：先写 durable failure，再发 item/failed
-    /// 与 turn/error。
+    /// 准备一个 turn 的执行体：打开会话、构建 Provider/Agent 并注册收件箱。
+    ///
+    /// 全部就绪后才允许发布 turn/started；任一准备失败时调用方直接回错误响应，
+    /// 不遗留任何 turn 语义（不写 turn_started、不投影 Active）。
+    pub(crate) fn prepare_agent_for_turn(
+        &self,
+        thread: &Thread,
+        turn_id: &str,
+    ) -> AppServerResult<Agent> {
+        let session = self.open_session_for_thread(thread)?;
+        let (provider, config) = self.provider_and_config_for_thread(thread)?;
+        let agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
+        let inbox_handle = agent.inbox_handle();
+        self.register_turn_inbox(turn_id, inbox_handle)?;
+        Ok(agent)
+    }
+
+    /// 用 headless core 执行一个 turn：会话与 Agent 已在准备阶段构建，
+    /// 这里只运行 AgentLoop 并实时映射事件。
     #[allow(clippy::too_many_arguments)]
-    /// 用 headless core 执行一个 turn：会话文件 open/create 已在 thread/start 完成，
-    /// 这里只打开既有 rollout、执行 AgentLoop 并实时映射事件。
     pub(crate) fn run_agent_core(
         &self,
+        agent: &mut Agent,
         thread: &Thread,
         turn_id: &str,
         input_text: &str,
@@ -387,14 +411,6 @@ impl AppServer {
         assistant_events: &mut AssistantItemEventState,
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<RunStatus> {
-        let session = self.open_session_for_thread(thread)?;
-        let (provider, config) = self.provider_and_config_for_thread(thread)?;
-        let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
-        let inbox_handle = agent.inbox_handle();
-        self.turn_inboxes
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(turn_id.to_string(), inbox_handle);
         let callback_error = RefCell::new(None);
         let assistant_events_cell = RefCell::new(assistant_events);
         // 回调闭包共享 emit 的可变借用：RefCell 包装（单线程 turn 内串行使用）。
@@ -768,7 +784,7 @@ impl AppServerControlHandle {
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .get(&params.turn_id)
-            .cloned();
+            .map(|active_turn| active_turn.cancellation.clone());
         let Some(cancellation) = cancellation else {
             return not_found_response(message.required_id(), TURN_NOT_FOUND);
         };
@@ -802,36 +818,33 @@ impl AppServerControlHandle {
         let params: TurnInjectionParams = parse_params(&message)?;
         let payload = serde_json::to_value(&params.input)?;
         let text = input_items_to_text(&payload)?;
-        let references = self
-            .turn_threads
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
-        let Some(reference) = references.get(&params.turn_id).cloned() else {
-            return not_found_response(message.required_id(), TURN_NOT_FOUND);
+        // 单一注册表锁内取 reference 与 inbox：guard drop 只移除整条记录，
+        // 不存在跨表的锁顺序或半清理窗口。
+        let (accepted, thread_id) = {
+            let active_turns = self
+                .active_turns
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+            let Some(active_turn) = active_turns.get(&params.turn_id) else {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            };
+            let thread_id = active_turn.thread_id.clone();
+            let Some(handle) = active_turn.inbox.as_ref().cloned() else {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            };
+            let accepted = handle
+                .lock()
+                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+                .enqueue(
+                    if follow_up {
+                        singularity_agent::agent::TurnInputKind::FollowUp
+                    } else {
+                        singularity_agent::agent::TurnInputKind::Steer
+                    },
+                    text,
+                );
+            (accepted, thread_id)
         };
-        // Release the reference lock before acquiring the inbox lock. The
-        // ActiveTurnGuard removes inboxes before references during cleanup.
-        drop(references);
-        let handle = self
-            .turn_inboxes
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(&params.turn_id)
-            .cloned();
-        let Some(handle) = handle else {
-            return not_found_response(message.required_id(), TURN_NOT_FOUND);
-        };
-        let accepted = handle
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .enqueue(
-                if follow_up {
-                    singularity_agent::agent::TurnInputKind::FollowUp
-                } else {
-                    singularity_agent::agent::TurnInputKind::Steer
-                },
-                text,
-            );
         if !accepted {
             return invalid_state_response(
                 message.required_id(),
@@ -843,7 +856,7 @@ impl AppServerControlHandle {
             TurnInjectionResult {
                 turn: Turn {
                     turn_id: params.turn_id,
-                    thread_id: reference.thread_id,
+                    thread_id,
                     status: TurnStatus::Running,
                     agent_loop_status: AgentStatus::Running.as_str().to_string(),
                     model_usage: None,

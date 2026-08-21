@@ -590,7 +590,7 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         .as_str()
         .expect("turn id")
         .to_string();
-    thread::sleep(Duration::from_millis(200));
+    // 注册前置保证：turn/started 回执之后立即中断必成功，无需人为等待。
     process.send_request(5, "turn/interrupt", json!({"turnId": turn_id}));
     let interrupt = process.output.recv_id(5, Duration::from_secs(5));
     assert_eq!(interrupt["result"]["status"], "cancel_requested");
@@ -660,6 +660,98 @@ fn shutdown_requests_all_active_turns_and_reaps_workers_before_exit() {
 }
 
 #[test]
+fn steer_immediately_after_started_is_accepted() {
+    // 1b 回归：收件箱在 turn/started 发布前注册完毕；客户端收到 started 回执后
+    // 立即 steer（无 sleep）必须成功。
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
+    let provider = ScriptedProvider::start(steer_responses());
+    let mut process = spawn(&workspace, &home, &provider.base_url);
+    process.initialize();
+
+    process.send_request(3, "thread/start", json!({"cwd": workspace}));
+    let started = process.output.recv_id(3, Duration::from_secs(5));
+    let session_id = started["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    process.send_request(
+        4,
+        "turn/start",
+        json!({"threadId": session_id, "input": [{"type": "text", "text": "initial"}]}),
+    );
+    assert_eq!(
+        provider
+            .served
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first request served"),
+        0
+    );
+    let turn_id = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "turn/started"
+        })["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("turn id")
+        .to_string();
+    // started 回执之后立即 steer：注册前置保证必成功。
+    process.send_request(
+        5,
+        "turn/steer",
+        json!({"turnId": turn_id, "input": [{"type": "text", "text": "steer after tools"}]}),
+    );
+    let steer = process.output.recv_id(5, Duration::from_secs(5));
+    assert_eq!(
+        steer["result"]["outcome"], "active",
+        "steer right after started must be accepted: {steer}"
+    );
+    assert_eq!(steer["result"]["turn"]["status"], "running");
+
+    let turn_response = process.output.recv_id(4, Duration::from_secs(30));
+    assert_eq!(
+        turn_response["result"]["turn"]["status"],
+        "running",
+        "turn/start response: {turn_response}; provider errors: {:?}",
+        provider.errors(),
+    );
+    let terminal = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "turn/completed"
+        });
+    assert_eq!(terminal["params"]["turn"]["status"], "completed");
+    assert_eq!(
+        provider
+            .served
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second request served"),
+        1
+    );
+
+    let second = provider.request(1);
+    let second_inputs = second["input"].as_array().expect("second input");
+    assert!(
+        second_inputs
+            .iter()
+            .any(|item| item["role"] == "user"
+                && item["content"].as_str() == Some("steer after tools")),
+        "steer must appear before the second model request: {second_inputs:?}"
+    );
+
+    assert!(
+        provider.errors().is_empty(),
+        "provider worker must be error-free: {:?}",
+        provider.errors()
+    );
+    process.shutdown();
+}
+
+#[test]
 fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
@@ -690,7 +782,8 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
             .expect("first request served"),
         0
     );
-    thread::sleep(Duration::from_millis(200));
+    // 先验证未知 turn 的负向路径，随后以真实 turn id 立即 steer：
+    // turn/started 回执之后收件箱必已注册（注册前置），无需人为 sleep。
     process.send_request(
         5,
         "turn/steer",

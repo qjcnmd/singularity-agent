@@ -300,6 +300,8 @@ sequenceDiagram
 - **静默拒绝无 ID 请求**：Request-only method 作为无 id notification 到达时，**不产生任何副作用，且不发送任何 wire response**；Notification-only method 携带 id 时返回 typed error。
 - **严格 Initialize**：`InitializeParams` 仅包含 `clientInfo`，使用 `deny_unknown_fields` 严格拒绝任何未知字段或旧版 capabilities，不增加协议版本协商。
 - **双管道调度**：stdio reader 将消息分类为 ordinary request 与 realtime turn control。普通状态请求排入单 owner 队列按序处理；`turn/interrupt`、`turn/steer`、`turn/followUp` 通过共享活动 turn 句柄即时处理，不被耗时的普通请求阻塞。所有响应与事件统一通过单一有界 output writer 发送。
+- **turn lane 就绪点**：`ready_for_turn` 在 initialize 请求处理完成（回执已写出）后置位，置位动作发生在 ordinary 处理任务内部、响应写出之后（同一任务内的先后序构成 happens-before）；客户端收到 initialize 回执即可立即发送 `turn/start` 进入流式 turn lane。`initialized` 通知继续把守 ordinary 门禁：initialize 与 initialized 均未完成前，落入普通管线的请求返回 not_initialized。
+- **注册前置发布**：`turn/start` 仅在打开会话、构建 Provider/Agent、注册 steer/followUp 收件箱全部成功后，才落盘 `turn_started` 并发布 `turn/started` 与 running 响应；收到 `turn/started` 后立即 steer/followUp 必成功。准备阶段失败则 turn/start 直接回错误响应，不产生任何 turn 痕迹。
 - **CLI 信号处理与优雅退出**：第一次收到 Ctrl+C 信号时，CLI 发送 `turn/interrupt` 请求，停止接收新输入，继续读取并排空 terminal events，等待 app-server 子进程有界退出并返回常规 interrupted 退出码；第二次 Ctrl+C 强制退出。
 - **CLI Session Reference**：`sg run --session-reference <id>` 将历史会话投影为 untrusted reference 文本；每个生成段落（header、summary、transcript、role line、current-request heading）各占一行，未信任内容中的换行折叠为字面量 `⏎`，统一受控于 16 KiB 与 4096-token 硬上限。
 

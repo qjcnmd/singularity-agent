@@ -496,21 +496,14 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
-        // 只统计仍持有取消令牌且仍有活动 turn→thread 映射的 turn。
         let turn_active = {
             let active_turns = self
                 .active_turns
                 .lock()
                 .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-            let turn_threads = self
-                .turn_threads
-                .lock()
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-            active_turns.keys().any(|turn_id| {
-                turn_threads
-                    .get(turn_id)
-                    .is_some_and(|reference| reference.thread_id == params.session_id)
-            })
+            active_turns
+                .values()
+                .any(|turn| turn.thread_id == params.session_id)
         };
         if turn_active {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);

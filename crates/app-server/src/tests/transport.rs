@@ -481,7 +481,9 @@ fn transport_error_carries_original_terminalization_text() {
 }
 
 #[test]
-fn turn_failure_events_are_queued_before_rpc_error_response() {
+fn turn_start_prepare_failure_returns_direct_error_response() {
+    // 准备阶段（project instructions 加载）失败：turn/start 直接回错误响应，
+    // 不发 turn/started、不写 turn_started、也不制造 turn/error 终态事件。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -543,27 +545,32 @@ fn turn_failure_events_are_queued_before_rpc_error_response() {
     while let Some(value) = receiver.blocking_recv() {
         values.push(value);
     }
-    let rpc_response = values
-        .iter()
-        .position(|value| value["id"] == 3 && value["result"].is_object())
-        .expect("RPC running response");
-    let turn_error = values
-        .iter()
-        .position(|value| value["method"] == "turn/error")
-        .expect("turn/error event");
-    assert!(
-        rpc_response < turn_error,
-        "running RPC response must precede background terminal event: {values:?}"
-    );
-    assert_eq!(values[rpc_response]["result"]["turn"]["status"], "running");
     assert_eq!(
-        values[turn_error]["params"]["error"]["cause"],
-        "project_instructions"
+        values.len(),
+        1,
+        "only the direct error response: {values:?}"
     );
+    assert_eq!(values[0]["id"], 3);
+    assert_eq!(values[0]["error"]["code"], -32603);
     assert!(
-        values[turn_error]["params"]["error"]["message"]
+        values[0]["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("project_instruction_file_too_large"))
+            .is_some_and(|message| message.contains("project_instruction_file_too_large")),
+        "error must carry the project instruction cause: {values:?}"
+    );
+    // 会话行与 JSONL 均无 turn 痕迹：直接错误响应是唯一事实。
+    let reopen = SessionStore::open(temp.path().join("index.sqlite3")).expect("store reopen");
+    let record = reopen.get_session(&session_id).expect("session record");
+    assert_eq!(
+        record.status, None,
+        "prepare failure must not activate session"
+    );
+    let session_on_disk =
+        SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))
+            .expect("open session file");
+    assert!(
+        session_on_disk.metadata_entries().is_empty(),
+        "prepare failure must not persist turn_started"
     );
 }
 
@@ -886,4 +893,165 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         initial_requests,
         "reopen/resume must not re-execute provider calls or tools"
     );
+}
+
+fn insert_session_record(store: &SessionStore, session_id: &str, rollout_path: &Path, cwd: &Path) {
+    store
+        .insert_session(&singularity_store::SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: rollout_path.to_string_lossy().to_string(),
+            cwd: cwd.to_string_lossy().to_string(),
+            title: None,
+            model: Some("gpt-test".to_string()),
+            status: None,
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+            updated_at: "2026-08-20T00:00:00Z".to_string(),
+            token_usage: json!({}),
+        })
+        .expect("insert session");
+}
+
+#[test]
+fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
+    // 1a 回归：就绪点前移到 initialize 请求处理完成。客户端收到 initialize
+    // 回执后（不等待、也不发送 initialized）立即发 turn/start，必须走 turn
+    // lane 流式路径；旧实现会把它留在 ordinary 管线并被 not_initialized 拒绝。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let index_path = temp.path().join("index.sqlite3");
+    let store = SessionStore::open(&index_path).expect("store");
+    let session_id = "aa1b2c3d-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
+        .expect("create session");
+    insert_session_record(&store, session_id, session.path(), &workspace);
+    drop(session);
+
+    let (provider_started_tx, provider_started_rx) = std_mpsc::sync_channel(1);
+    let (provider_release_tx, provider_release_rx) = std_mpsc::sync_channel(1);
+    let provider = Arc::new(TestProvider {
+        response: ModelTurnResponse::completed("request_1", "response_1", "all done"),
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+        started: provider_started_tx,
+        release: Mutex::new(provider_release_rx),
+    });
+
+    let server_provider = Arc::clone(&provider);
+    let sessions_dir_inside = sessions_dir.clone();
+    let result = block_on(async move {
+        let handle = tokio::runtime::Handle::current();
+        let snapshot = ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key".to_string()),
+                _ => None,
+            },
+            Some(handle),
+        );
+        let server = AppServer::new(store, snapshot)
+            .with_sessions_dir(&sessions_dir_inside)
+            .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
+
+        let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
+        let (client_stdout, server_stdout) = tokio::io::duplex(65536);
+        let mut reader = tokio::io::BufReader::new(server_stdin);
+        let mut client_reader = tokio::io::BufReader::new(client_stdout);
+        let server_task =
+            tokio::spawn(
+                async move { run_server_with_io(server, &mut reader, server_stdout).await },
+            );
+
+        // 1. Send initialize and read its response.
+        client_stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"test\",\"title\":\"Test\",\"version\":\"0.1.0\"}}}\n")
+            .await
+            .expect("write initialize");
+        let mut line = String::new();
+        client_reader
+            .read_line(&mut line)
+            .await
+            .expect("read initialize response");
+        assert!(line.contains("\"result\""), "{line}");
+
+        // 2. Immediately send turn/start — no initialized notification, no sleep.
+        let turn_start_line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"turn/start\",\"id\":2,\"params\":{{\"threadId\":\"{session_id}\",\"input\":[{{\"type\":\"text\",\"text\":\"run task\"}}]}}}}\n"
+        );
+        client_stdin
+            .write_all(turn_start_line.as_bytes())
+            .await
+            .expect("write turn/start");
+
+        // 3. The provider being called proves the turn lane accepted the request.
+        tokio::task::spawn_blocking(move || provider_started_rx.recv())
+            .await
+            .expect("join provider start wait")
+            .expect("provider started without initialized notification");
+        let mut running_line = String::new();
+        let mut saw_started_notification = false;
+        loop {
+            running_line.clear();
+            client_reader
+                .read_line(&mut running_line)
+                .await
+                .expect("read streaming frames");
+            assert!(!running_line.is_empty(), "connection ended early");
+            let value: Value = serde_json::from_str(&running_line).expect("JSONL frame");
+            if value["method"] == "turn/started" {
+                saw_started_notification = true;
+            }
+            if value["id"] == 2 && value["result"].is_object() {
+                break;
+            }
+        }
+        assert!(
+            saw_started_notification,
+            "turn/started must precede running response"
+        );
+        assert!(
+            running_line.contains("\"status\":\"running\""),
+            "running response: {running_line}"
+        );
+
+        // 4. Release the provider and drain to the terminal event.
+        provider_release_tx.send(()).expect("release provider");
+        loop {
+            running_line.clear();
+            client_reader
+                .read_line(&mut running_line)
+                .await
+                .expect("read terminal frames");
+            assert!(
+                !running_line.is_empty(),
+                "connection ended before turn/completed"
+            );
+            let value: Value = serde_json::from_str(&running_line).expect("JSONL frame");
+            if value["method"] == "turn/completed" {
+                assert_eq!(value["params"]["turn"]["status"], "completed");
+                break;
+            }
+        }
+        drop(client_stdin);
+        let server_result = server_task.await.expect("join server task");
+        (saw_started_notification, server_result)
+    });
+
+    let (saw_started, server_result) = result;
+    assert!(saw_started);
+    assert!(
+        server_result.is_ok(),
+        "supervisor must exit cleanly after stdin EOF: {server_result:?}"
+    );
+    let reopened = SessionStore::open(&index_path).expect("store reopen");
+    assert_eq!(
+        reopened.get_session(session_id).expect("record").status,
+        Some(singularity_store::SessionStatus::Completed)
+    );
+    let session_on_disk =
+        SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))
+            .expect("open session file");
+    assert_eq!(session_on_disk.metadata_entries().len(), 3);
 }

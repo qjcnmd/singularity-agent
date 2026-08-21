@@ -14,14 +14,9 @@ pub struct AppServer {
     pub(super) initialized_acknowledged: bool,
     pub(super) shutdown_requested: bool,
     pub(super) provider_snapshot: ProviderConfigSnapshot,
-    pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    /// 当前活动 turn id -> thread。终态后移除，避免把输入误认为已排队。
-    pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
-    /// 每个活动 turn 的 steer/follow-up 注入句柄（turn/steer、turn/followUp）。
-    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
-    /// 已提交 turn 的运行时 usage 缓存；权威副本是同一 session JSONL 的 usage metadata。
-    pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
-    pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
+    /// 活动 turn 的单一注册表：取消令牌、线程归属与实时输入箱合一；
+    /// 终态化完成后由 guard drop 移除。
+    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
     #[cfg(test)]
     pub(super) terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
@@ -31,8 +26,11 @@ pub struct AppServer {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct TurnReference {
+pub(super) struct ActiveTurn {
     pub(super) thread_id: String,
+    pub(super) cancellation: CancellationToken,
+    /// steer/follow-up 注入句柄；准备阶段注册，关闭一次后永不复用。
+    pub(super) inbox: Option<TurnInboxHandle>,
 }
 
 #[cfg(test)]
@@ -45,33 +43,31 @@ pub(super) struct TerminalizationFaults {
 /// 由请求工作线程与 stdio 传输层共享的可克隆停止句柄。
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
-    pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
 }
 
 /// Narrow cloneable control seam for active-turn cancellation and input.
 ///
-/// It deliberately contains only the in-memory active-turn maps; ordinary
+/// It deliberately contains only the in-memory active-turn registry; ordinary
 /// state requests continue to run through the single `AppServer` owner and
 /// its SQLite connection.
 #[derive(Clone)]
 pub struct AppServerControlHandle {
-    pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
-    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
+    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
 }
 
 impl AppServerCancellationHandle {
     /// 停止后续执行，并将取消传播到每个活动 turn。
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.execution_stopped.store(true, Ordering::SeqCst);
-        for cancellation in self
+        for active_turn in self
             .active_turns
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .values()
         {
-            cancellation.cancel();
+            active_turn.cancellation.cancel();
         }
         Ok(())
     }
@@ -84,29 +80,13 @@ impl AppServerCancellationHandle {
 
 pub(super) struct ActiveTurnGuard {
     pub(super) turn_id: String,
-    pub(super) active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    pub(super) turn_inboxes: Arc<Mutex<HashMap<String, TurnInboxHandle>>>,
-    pub(super) turn_threads: Arc<Mutex<HashMap<String, TurnReference>>>,
-    pub(super) usage_by_turn: Arc<Mutex<HashMap<String, singularity_model::ModelUsage>>>,
-    pub(super) usage_complete_by_turn: Arc<Mutex<HashMap<String, bool>>>,
+    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
-        }
-        if let Ok(mut turn_inboxes) = self.turn_inboxes.lock() {
-            turn_inboxes.remove(&self.turn_id);
-        }
-        if let Ok(mut usage_by_turn) = self.usage_by_turn.lock() {
-            usage_by_turn.remove(&self.turn_id);
-        }
-        if let Ok(mut usage_complete_by_turn) = self.usage_complete_by_turn.lock() {
-            usage_complete_by_turn.remove(&self.turn_id);
-        }
-        if let Ok(mut turn_threads) = self.turn_threads.lock() {
-            turn_threads.remove(&self.turn_id);
         }
     }
 }
@@ -124,10 +104,6 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
-            turn_threads: Arc::new(Mutex::new(HashMap::new())),
-            turn_inboxes: Arc::new(Mutex::new(HashMap::new())),
-            usage_by_turn: Arc::new(Mutex::new(HashMap::new())),
-            usage_complete_by_turn: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
@@ -214,7 +190,9 @@ impl AppServer {
     }
 
     pub fn ready_for_turn_worker(&self) -> bool {
-        self.initialized_acknowledged
+        // 就绪点 = initialize 请求处理完成（回执已发出）；`initialized` 通知
+        // 继续把守 ordinary 门禁，不再作为 turn lane 的前置条件。
+        self.initialized
     }
 
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
@@ -238,10 +216,6 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
-            turn_threads: Arc::clone(&self.turn_threads),
-            turn_inboxes: Arc::clone(&self.turn_inboxes),
-            usage_by_turn: Arc::clone(&self.usage_by_turn),
-            usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
             execution_stopped: Arc::clone(&self.execution_stopped),
             #[cfg(test)]
             terminalization_faults: Arc::clone(&self.terminalization_faults),
@@ -254,46 +228,61 @@ impl AppServer {
         turn_id: &str,
         thread_id: &str,
     ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
-        let mut turn_threads = self
-            .turn_threads
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
-        if turn_threads.values().any(|r| r.thread_id == thread_id) {
-            return Err(AppServerError::Workspace(
-                "another turn is already running for this session".to_string(),
-            ));
-        }
-        let cancellation = CancellationToken::new();
         let mut active_turns = self
             .active_turns
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        if active_turns
+            .values()
+            .any(|turn| turn.thread_id == thread_id)
+        {
+            return Err(AppServerError::Workspace(
+                "another turn is already running for this session".to_string(),
+            ));
+        }
         if active_turns.contains_key(turn_id) {
             return Err(AppServerError::Workspace(format!(
                 "turn {turn_id} is already active"
             )));
         }
+        let cancellation = CancellationToken::new();
         if self.execution_stopped.load(Ordering::SeqCst) {
             cancellation.cancel();
         }
-        active_turns.insert(turn_id.to_string(), cancellation.clone());
-        turn_threads.insert(
+        active_turns.insert(
             turn_id.to_string(),
-            TurnReference {
+            ActiveTurn {
                 thread_id: thread_id.to_string(),
+                cancellation: cancellation.clone(),
+                inbox: None,
             },
         );
         drop(active_turns);
-        drop(turn_threads);
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
-            turn_inboxes: Arc::clone(&self.turn_inboxes),
-            turn_threads: Arc::clone(&self.turn_threads),
-            usage_by_turn: Arc::clone(&self.usage_by_turn),
-            usage_complete_by_turn: Arc::clone(&self.usage_complete_by_turn),
         };
         Ok((cancellation, guard))
+    }
+
+    /// 把 steer/follow-up 注入句柄注册进活动 turn；必须在发布 turn/started
+    /// 之前完成，保证 started 后立即注入必成功。
+    pub(crate) fn register_turn_inbox(
+        &self,
+        turn_id: &str,
+        inbox: TurnInboxHandle,
+    ) -> AppServerResult<()> {
+        let mut active_turns = self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        let Some(active_turn) = active_turns.get_mut(turn_id) else {
+            return Err(AppServerError::Workspace(format!(
+                "turn {turn_id} is not active"
+            )));
+        };
+        active_turn.inbox = Some(inbox);
+        Ok(())
     }
 }
 
@@ -477,43 +466,31 @@ impl AppServer {
     }
 
     fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        // 活跃判定同时要求取消令牌和当前 turn→thread 映射存在。
-        let active = self.active_turns.lock();
-        let threads = self.turn_threads.lock();
-        match (active, threads) {
-            (Ok(active), Ok(turn_threads)) => active.keys().any(|turn_id| {
-                turn_threads
-                    .get(turn_id)
-                    .is_some_and(|reference| reference.thread_id == session_id)
-            }),
+        // 单一注册表：存在归属该会话的活动 turn 即视为存活。
+        self.active_turns
+            .lock()
             // 锁中毒视为没有存活 turn：宁可投影为终态也不伪装运行中。
-            _ => false,
-        }
+            .ok()
+            .is_some_and(|turns| turns.values().any(|turn| turn.thread_id == session_id))
     }
 
-    pub(crate) fn turn_with_usage(&self, turn: Turn) -> Turn {
-        let usage = self
-            .usage_by_turn
-            .lock()
-            .ok()
-            .and_then(|cache| {
-                cache.get(&turn.turn_id).cloned().map(|usage| {
-                    let usage_complete = self
-                        .usage_complete_by_turn
-                        .lock()
-                        .ok()
-                        .and_then(|complete| complete.get(&turn.turn_id).copied())
-                        .unwrap_or(true);
-                    (usage, usage_complete)
-                })
-            })
-            .or_else(|| self.persisted_usage_for_turn(&turn));
-        match usage {
-            Some((usage, usage_complete)) => Turn {
-                model_usage: Some(usage_to_wire_with_completeness(&usage, usage_complete)),
-                ..turn
-            },
-            None => turn,
+    /// 终态 turn 的 usage 投影：优先使用本轮已在手的 model_usage；真正缺失
+    /// （provider 未上报 usage）时回退到 JSONL 已持久化的 usage metadata。
+    pub(crate) fn terminal_turn_with_usage(
+        &self,
+        turn: Turn,
+        usage: &ModelUsage,
+        usage_complete: bool,
+    ) -> Turn {
+        let model_usage = if usage.usage_present {
+            Some(usage_to_wire_with_completeness(usage, usage_complete))
+        } else {
+            self.persisted_usage_for_turn(&turn)
+                .map(|(persisted, complete)| usage_to_wire_with_completeness(&persisted, complete))
+        };
+        Turn {
+            model_usage,
+            ..turn
         }
     }
 
@@ -526,8 +503,6 @@ impl AppServer {
     pub fn control_handle(&self) -> AppServerControlHandle {
         AppServerControlHandle {
             active_turns: Arc::clone(&self.active_turns),
-            turn_threads: Arc::clone(&self.turn_threads),
-            turn_inboxes: Arc::clone(&self.turn_inboxes),
         }
     }
 
@@ -558,20 +533,13 @@ impl AppServer {
         ))
     }
 
-    pub(crate) fn remember_usage(&self, turn_id: &str, usage: &ModelUsage, usage_complete: bool) {
-        let _ = self.usage_by_turn.lock().map(|mut cache| {
-            cache.insert(turn_id.to_string(), usage.clone());
-        });
-        let _ = self.usage_complete_by_turn.lock().map(|mut cache| {
-            cache.insert(turn_id.to_string(), usage_complete);
-        });
-    }
-
     /// 关闭已结束 turn 的实时注入窗口；活动映射保留到 guard drop，
     /// 让并发 session/delete 仍能观察到终态化 worker。终态后的输入必须通过新的 turn/start。
     pub(crate) fn close_turn_inputs(&self, turn_id: &str) {
-        if let Ok(mut inboxes) = self.turn_inboxes.lock() {
-            inboxes.remove(turn_id);
+        if let Ok(mut active_turns) = self.active_turns.lock()
+            && let Some(active_turn) = active_turns.get_mut(turn_id)
+        {
+            active_turn.inbox = None;
         }
     }
 }

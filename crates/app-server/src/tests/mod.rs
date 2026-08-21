@@ -6,8 +6,8 @@ use singularity_agent::agent::TurnInbox;
 use singularity_agent::session::SessionManager;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, Provider, ProviderError, ProviderProtocolContract,
-    ProviderReasoningReplay,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
+    ProviderProtocolContract, ProviderReasoningReplay,
 };
 
 fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
@@ -516,7 +516,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
 }
 
 #[test]
-fn completed_turn_runtime_indexes_are_released_and_usage_is_released() {
+fn completed_turn_runtime_registry_is_released() {
     let temp = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
     let sessions_dir = temp.path().join("sessions");
@@ -526,11 +526,9 @@ fn completed_turn_runtime_indexes_are_released_and_usage_is_released() {
         let (_cancellation, guard) = server
             .activate_turn(&turn_id, "thread-1")
             .expect("activate");
-        server.remember_usage(&turn_id, &ModelUsage::default(), true);
         drop(guard);
     }
-    assert!(server.turn_threads.lock().unwrap().is_empty());
-    assert!(server.usage_by_turn.lock().unwrap().is_empty());
+    assert!(server.active_turns.lock().unwrap().is_empty());
 }
 
 #[derive(Clone)]
@@ -1043,10 +1041,12 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
         .expect("activate turn");
     let inbox = Arc::new(Mutex::new(TurnInbox::default()));
     server
-        .turn_inboxes
+        .active_turns
         .lock()
-        .expect("turn inboxes")
-        .insert("turn_live".to_string(), Arc::clone(&inbox));
+        .expect("active turns")
+        .get_mut("turn_live")
+        .expect("active turn")
+        .inbox = Some(Arc::clone(&inbox));
 
     let steer_response = server
         .handle_json(
@@ -1142,6 +1142,41 @@ fn notification_only_method_with_id_returns_typed_invalid_request() {
     assert_eq!(response[0]["id"], 9);
     assert_eq!(response[0]["error"]["code"], -32600);
     assert!(!server.initialized_acknowledged);
+}
+
+#[test]
+fn turn_start_before_initialize_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "5b5c6d7e-8f90-4a1b-9c2d-3e4f5a6b7c8d";
+    let mut server = app_server(store, &sessions_dir);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    // initialize 之前发 turn/start：普通管线门禁拒绝，不产生任何 turn 语义。
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"early"}}]}}}}"#
+        ))
+        .expect("turn/start before initialize");
+    assert_eq!(responses[0]["error"]["code"], -32002);
+    assert_eq!(
+        server
+            .store()
+            .get_session(session_id)
+            .expect("record")
+            .status,
+        None,
+        "rejected turn must not activate the session"
+    );
+    let session = SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))
+        .expect("session file");
+    assert!(
+        session.metadata_entries().is_empty(),
+        "rejected turn must not write turn_started"
+    );
 }
 
 #[test]
@@ -1346,6 +1381,52 @@ fn project_instructions_load_from_workspace_root_to_cwd() {
 }
 
 #[test]
+fn terminal_turn_usage_matches_provider_usage() {
+    // 1c 回归：终态 turn 的 model_usage 直接来自 AgentLoop 返回值（不再经由
+    // 运行时缓存表转手），数值必须与 provider 上报逐字段一致。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "e9f2e1d0-8b7a-4654-9e3d-2c1b0a9f8e7d";
+    let mut completed = ModelTurnResponse::completed("usage_request", "usage_response", "done");
+    completed.usage = ModelUsage {
+        input_tokens: 111,
+        output_tokens: 22,
+        total_tokens: 133,
+        cached_input_tokens: 5,
+        reasoning_tokens: 3,
+        usage_present: true,
+    };
+    let provider = StaticProvider {
+        responses: vec![completed],
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"usage"}}]}}}}"#
+        ))
+        .expect("turn start");
+    let completed_event = responses
+        .iter()
+        .find(|message| message["method"] == "turn/completed")
+        .expect("turn completed event");
+    let usage = &completed_event["params"]["turn"]["model_usage"];
+    assert_eq!(usage["input_tokens"], 111);
+    assert_eq!(usage["output_tokens"], 22);
+    assert_eq!(usage["total_tokens"], 133);
+    assert_eq!(usage["cached_input_tokens"], 5);
+    assert_eq!(usage["reasoning_tokens"], 3);
+    assert_eq!(usage["usage_present"], true);
+    assert_eq!(usage["usage_complete"], true);
+}
+
+#[test]
 fn turn_failure_emits_typed_error_event_with_provider_cause() {
     // H4/M1：provider 边界失败（429）→ turn/error 终态事件携带 typed cause，
     // willRetry=false（N3 后循环层不再重试）。
@@ -1466,24 +1547,12 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
             std::fs::remove_dir_all(&workspace).expect("remove workspace for read failure");
         }
 
-        let mut events = Vec::new();
-        let result = server.handle_turn_start_streaming_with_output(
-            turn_start_message(2, session_id),
-            |value| {
-                events.push(value);
-            },
-        );
+        // 准备阶段失败：turn/start 直接回错误响应，不产生任何 turn 语义。
+        let result = server
+            .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |_| {});
         assert!(
-            result.is_ok(),
-            "{name}: turn start succeeds and emits turn/error"
-        );
-        let error_event = events
-            .iter()
-            .find(|value| value["method"] == "turn/error")
-            .expect("turn/error");
-        assert_eq!(
-            error_event["params"]["error"]["cause"], "project_instructions",
-            "{name}: {error_event:?}"
+            result.is_err(),
+            "{name}: prepare failure must error turn/start directly: {result:?}"
         );
         assert_eq!(seen.lock().expect("seen requests").len(), 0, "{name}");
         assert_eq!(
@@ -1492,13 +1561,8 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
                 .get_session(session_id)
                 .expect("session record")
                 .status,
-            Some(SessionStatus::Failed),
-            "{name}: instruction failure must not leave Active"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|value| value["method"] == "turn/completed")
+            None,
+            "{name}: instruction failure must not leave any turn state"
         );
     }
 }

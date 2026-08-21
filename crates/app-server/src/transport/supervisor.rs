@@ -504,6 +504,7 @@ async fn run_ordinary_dispatch(
     while let Some(message) = requests.recv().await {
         let direct_outputs = outputs.clone();
         let direct_cancellation = cancellation.clone();
+        let ready_for_turn = Arc::clone(&ready_for_turn);
         let task = tokio::task::spawn_blocking(move || {
             let notification = message.is_notification();
             let request_id = message.id().cloned();
@@ -520,17 +521,19 @@ async fn run_ordinary_dispatch(
                 .map(|_| ()),
                 Err(_) => Ok(()),
             };
-            let ready = server.ready_for_turn_worker();
+            // 就绪点 = initialize 请求处理完成（回执已发出）：与响应写出在同一
+            // 处理任务内先后发生，消除就绪标志晚于回执的窗口。`initialized`
+            // 通知仍把守 ordinary 门禁，不再延迟 turn lane 的就绪。
+            if server.ready_for_turn_worker() {
+                ready_for_turn.store(true, Ordering::SeqCst);
+            }
             let shutdown = server.shutdown_requested();
-            (server, dispatch_result, ready, shutdown)
+            (server, dispatch_result, shutdown)
         });
-        let (next_server, result, ready, shutdown) = task
+        let (next_server, result, shutdown) = task
             .await
             .map_err(|error| format!("request dispatch task failed: {error}"))?;
         server = next_server;
-        if ready {
-            ready_for_turn.store(true, Ordering::SeqCst);
-        }
         result?;
         if shutdown {
             break;
