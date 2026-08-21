@@ -57,7 +57,6 @@ fn selected_provider() -> OpenAiProvider {
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: true,
             requires_assistant_content_for_tool_calls: false,
-            capability_overrides: None,
         })
 }
 
@@ -614,7 +613,6 @@ fn streaming_response_timeout_is_idle_not_total() {
         supports_tool_choice: true,
         requires_reasoning_content_for_tool_calls: false,
         requires_assistant_content_for_tool_calls: false,
-        capability_overrides: None,
     });
     let request = ModelTurnRequest::new(
         "slow_streaming_response",
@@ -675,7 +673,6 @@ fn protocol_contract_exposes_selected_tool_reasoning_mode() {
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: true,
             requires_assistant_content_for_tool_calls: false,
-            capability_overrides: None,
         });
     assert_eq!(
         provider.protocol_contract().tool_reasoning_mode,

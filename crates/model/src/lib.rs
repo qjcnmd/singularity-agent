@@ -69,10 +69,10 @@ mod types;
 
 pub use config::{
     ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus, ModelProviderConfig,
-    ProviderConfigResolution, ProviderConfigSnapshot, ProviderConfigSource,
+    ModelSelectorParts, ProviderConfigResolution, ProviderConfigSnapshot, ProviderConfigSource,
     ProviderConfigurationStatus, UserConfigImportResult, UserModelCatalog, UserModelCatalogEntry,
     UserProviderModelCatalog, import_env_to_user_config, read_user_model_catalog,
-    resolve_provider_config,
+    resolve_provider_config, split_model_selector,
 };
 pub use error::*;
 pub use openai::{
@@ -80,8 +80,8 @@ pub use openai::{
 };
 pub use provider::Provider;
 pub use provider::contract::{
-    ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderProtocolContract,
-    ThinkingWireFormat, is_strict_tool_schema_compatible, validate_model_request,
+    ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
+    is_strict_tool_schema_compatible, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };

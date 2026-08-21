@@ -59,12 +59,14 @@ pub(super) fn project_session_reference(read: &SessionReadResult) -> String {
     ) {
         return reference;
     }
-    for entry in &read.recent_entries {
-        let Some(line) = reference_transcript_line(entry) else {
-            continue;
-        };
-        if !push_reference_line(&mut reference, &mut budget, &line) {
-            return reference;
+    for turn in &read.turns {
+        for entry in &turn.items {
+            let Some(line) = reference_transcript_line(entry) else {
+                continue;
+            };
+            if !push_reference_line(&mut reference, &mut budget, &line) {
+                return reference;
+            }
         }
     }
     if !push_reference_line(

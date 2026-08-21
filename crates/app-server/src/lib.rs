@@ -20,11 +20,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use singularity_agent::{
     agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, TurnInboxHandle},
-    session::{
-        SessionEntryFilter, SessionError, SessionManager, SessionMetadataKind, SessionReadOptions,
-        SessionRepository,
-    },
-    tools::{ToolExecution, ToolRegistry},
+    session::{SessionError, SessionManager, SessionMetadataKind, SessionRepository},
+    tools::ToolRegistry,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, load_project_instructions_from_cwd,
@@ -33,12 +30,12 @@ use singularity_core::{
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, HistoryItem,
-    InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method, MethodKind,
-    ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult, SessionIdParams,
-    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadListResult, ThreadResult,
-    ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, Turn,
-    TurnIdParams, TurnInjectionOutcome, TurnInjectionParams, TurnInjectionResult,
-    TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
+    HistorySortDirection, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
+    MethodKind, ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult,
+    SessionIdParams, SessionReadParams, SessionReadResult, SessionTurn, Thread, ThreadIdParams,
+    ThreadListResult, ThreadResult, ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams,
+    ThreadStartResult, ThreadStatus, Turn, TurnDetail, TurnIdParams, TurnInjectionParams,
+    TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{
     SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
@@ -193,51 +190,17 @@ impl fmt::Display for TurnTerminalizationFailure {
     }
 }
 
-/// 一次 agent 运行的稳定生命周期状态（app-server 本地枚举）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentStatus {
-    Running,
-    CancelRequested,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-impl AgentStatus {
-    /// 返回稳定的生命周期状态字符串。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::CancelRequested => "cancel_requested",
-            Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-/// agent 运行终态（app-server 内部类型）。
+/// 一次 agent 运行的稳定终态投影：直接从 `AgentOutcome` 产出协议 turn 状态
+/// 与会话索引状态，不再经过独立生命周期中间枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunStatus {
-    pub status: AgentStatus,
+    pub turn_status: TurnStatus,
+    pub session_status: SessionStatus,
     pub final_answer: Option<String>,
     pub model_turns: u32,
     pub model_usage: ModelUsage,
     pub usage_complete: bool,
     pub error: Option<String>,
-}
-
-impl RunStatus {
-    pub fn failed(message: impl Into<String>) -> Self {
-        Self {
-            status: AgentStatus::Failed,
-            final_answer: None,
-            model_turns: 0,
-            model_usage: ModelUsage::default(),
-            usage_complete: false,
-            error: Some(message.into()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,7 +246,7 @@ impl From<TurnFailureStage> for TurnFailure {
 pub type AppServerOutput = Value;
 
 use events::AssistantItemEventState;
-use events::project_public_history;
+use events::project_turn_history;
 pub use paths::rebuild_session_index_from_jsonl;
 pub use paths::thread_from_record;
 use paths::{canonical_thread_cwd, refresh_session_index_from_open_session, workspace_path};

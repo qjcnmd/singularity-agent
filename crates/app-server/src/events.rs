@@ -168,6 +168,86 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     }
 }
 
+fn terminal_turn_status(kind: SessionMetadataKind) -> TurnStatus {
+    match kind {
+        SessionMetadataKind::TurnCompleted => TurnStatus::Completed,
+        SessionMetadataKind::TurnFailed => TurnStatus::Failed,
+        _ => TurnStatus::Interrupted,
+    }
+}
+
+/// session/read 的按轮分组投影。
+///
+/// turn 开始 metadata 划定轮次边界；同 id 的终态 metadata 写入轮次身份而
+/// 不是条目，message/compaction/settings/usage 全部投影为轮内条目。首个
+/// 开始标记之前存在落盘条目时，它们构成一个无归属 turn 的前导组
+/// （turnId/status 为 null）；没有任何条目时不产生空组。
+///
+/// 崩溃遗留的未终止轮：非末组直接按 interrupted 投影（与 reopen repair 的
+/// 落盘结果一致）；末组保持 running，由调用方依据整体状态投影修正——只有
+/// 本进程存在该会话的存活 turn 时 running 才成立。
+pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<SessionTurn> {
+    // 前导组按需创建：一旦出现过 turn 开始标记，后续条目都归属当前组。
+    fn leading_or_last(turns: &mut Vec<SessionTurn>) -> &mut SessionTurn {
+        if turns.is_empty() {
+            turns.push(SessionTurn {
+                turn_id: None,
+                status: None,
+                items: Vec::new(),
+            });
+        }
+        turns.last_mut().expect("group just ensured")
+    }
+
+    let mut turns: Vec<SessionTurn> = Vec::new();
+    for entry in entries {
+        match &entry.entry_type {
+            SessionEntryType::Metadata(metadata) => match metadata.kind() {
+                SessionMetadataKind::TurnStarted => turns.push(SessionTurn {
+                    turn_id: metadata.turn_id().map(str::to_string),
+                    status: None,
+                    items: Vec::new(),
+                }),
+                kind if kind.matches_turn_terminal() => {
+                    let last = leading_or_last(&mut turns);
+                    let matched = last.status.is_none()
+                        && last.turn_id.is_some()
+                        && last.turn_id.as_deref() == metadata.turn_id();
+                    if matched {
+                        last.status = Some(terminal_turn_status(kind));
+                    } else {
+                        // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。
+                        let items = project_public_history(entry);
+                        last.items.extend(items);
+                    }
+                }
+                _ => leading_or_last(&mut turns)
+                    .items
+                    .extend(project_public_history(entry)),
+            },
+            _ => leading_or_last(&mut turns)
+                .items
+                .extend(project_public_history(entry)),
+        }
+    }
+    // 末组未终止轮保持 running 投影（本进程存活 turn 的真实状态）；
+    // 调用方依据整体状态投影把崩溃遗留修正为 interrupted。
+    if let Some(last) = turns.last_mut()
+        && last.turn_id.is_some()
+        && last.status.is_none()
+    {
+        last.status = Some(TurnStatus::Running);
+    }
+    // 非末组的未终止轮只能是崩溃或损坏遗留，不伪装成运行中。
+    let trailing = turns.len().saturating_sub(1);
+    for turn in &mut turns[..trailing] {
+        if turn.turn_id.is_some() && turn.status.is_none() {
+            turn.status = Some(TurnStatus::Interrupted);
+        }
+    }
+    turns
+}
+
 impl AppServer {
     /// 将应用事件包装为带类型化元数据的 JSON-RPC notification。
     pub(super) fn event_notification(&self, event: AppEvent) -> AppServerResult<Value> {

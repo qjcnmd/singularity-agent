@@ -79,7 +79,26 @@ fn injection_and_session_read_params_are_bounded_by_registry() {
 
     let read = json!({"sessionId":"session-id"});
     let params: SessionReadParams = serde_json::from_value(read).expect("session read params");
-    assert_eq!(params.recent_limit, 20);
+    assert_eq!(params.limit, 20);
+    assert_eq!(params.cursor, None);
+    assert_eq!(params.sort_direction, None);
+    assert_eq!(params.detail, None);
+    assert!(params.kinds.is_empty());
+    let explicit: SessionReadParams = serde_json::from_value(json!({
+        "sessionId":"session-id",
+        "cursor":"sg1t3",
+        "limit":5,
+        "sortDirection":"asc",
+        "detail":"summary",
+        "kinds":["message","turn"]
+    }))
+    .expect("explicit session read params");
+    let wire = serde_json::to_value(&explicit).expect("serialize session read params");
+    assert_eq!(wire["sessionId"], "session-id");
+    assert_eq!(wire["cursor"], "sg1t3");
+    assert_eq!(wire["sortDirection"], "asc");
+    assert_eq!(wire["detail"], "summary");
+    assert_eq!(wire["kinds"][0], "message");
     assert!(
         Method::SessionRead
             .spec()
@@ -149,7 +168,7 @@ fn item_and_tool_execution_events_carry_thread_and_turn_identity() {
     assert_eq!(started.method, "item/started");
     assert_eq!(started.params["threadId"], "thread-1");
     assert_eq!(started.params["turnId"], "turn-1");
-    assert_eq!(started.params["item"]["item_id"], "item-1");
+    assert_eq!(started.params["item"]["itemId"], "item-1");
 
     let delta = AppEvent::item_agent_message_delta("thread-1", "turn-1", "item-1", "chunk");
     assert_eq!(delta.method, "item/agentMessage/delta");
@@ -197,7 +216,6 @@ fn item_and_tool_execution_events_carry_thread_and_turn_identity() {
     assert_eq!(end.params["turnId"], "turn-1");
     assert_eq!(end.params["result"]["content"][0]["text"], "done");
     assert_eq!(end.params["result"]["isError"], false);
-    assert_eq!(end.params["isError"], false);
 }
 
 #[test]

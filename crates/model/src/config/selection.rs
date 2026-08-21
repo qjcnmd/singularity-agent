@@ -19,6 +19,33 @@ pub(super) struct ParsedModelSelector<'a> {
     pub(super) reasoning_effort: Option<&'a str>,
 }
 
+/// 模型选择器各段：`provider/model#effort`。宽松拆分时任一段都可能缺省，
+/// 不在此处校验合法性（校验由 `parse_model_selector` 与上游配置层负责）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSelectorParts<'a> {
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
+/// 宽松拆分 `provider/model#effort` 选择器：分隔符为 `/` 与 `#`，`#` 优先于 `/`
+/// 拆分 effort。缺省字段在对应位返回 `None`，空字符串视为缺省。
+pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
+    let (without_effort, effort) = selector
+        .rsplit_once('#')
+        .map_or((selector, None), |(model, effort)| (model, Some(effort)));
+    let (provider, model) = without_effort
+        .split_once('/')
+        .map_or((None, without_effort), |(provider, model)| {
+            (Some(provider), model)
+        });
+    ModelSelectorParts {
+        provider: provider.filter(|value| !value.is_empty()),
+        model: Some(model).filter(|value| !value.is_empty()),
+        effort: effort.filter(|value| !value.is_empty()),
+    }
+}
+
 pub(super) fn parse_model_selector(
     selector: &str,
 ) -> Result<ParsedModelSelector<'_>, ProviderError> {
@@ -100,7 +127,6 @@ pub(super) fn provider_for_selection(
                 requires_reasoning_content_for_tool_calls: false,
                 requires_assistant_content_for_tool_calls: model
                     .requires_assistant_content_for_tool_calls,
-                capability_overrides: model.capability_overrides.clone(),
             }),
         );
     };
@@ -143,7 +169,6 @@ pub(super) fn provider_for_selection(
             requires_reasoning_content_for_tool_calls,
             requires_assistant_content_for_tool_calls: model
                 .requires_assistant_content_for_tool_calls,
-            capability_overrides: model.capability_overrides.clone(),
         }),
     )
 }

@@ -342,7 +342,6 @@ pub(super) fn render_and_wait_terminal(
                                 turn_id: turn_id.clone(),
                                 thread_id: thread_id.clone(),
                                 status: TurnStatus::Failed,
-                                agent_loop_status: "failed".to_string(),
                                 model_usage: None,
                             };
                             if render {
@@ -388,7 +387,6 @@ pub(super) fn render_and_wait_terminal(
                     turn_id: turn_id.clone(),
                     thread_id: thread_id.clone(),
                     status: TurnStatus::Failed,
-                    agent_loop_status: "failed".to_string(),
                     model_usage: None,
                 };
                 if render {
@@ -522,14 +520,16 @@ impl AppServerClient {
     ) -> Result<SessionReadResult, String> {
         let reply = self.request::<rpc_methods::SessionRead>(&SessionReadParams {
             session_id: session_id.to_string(),
-            recent_limit: limit.unwrap_or(20),
-            offset: None,
+            cursor: None,
+            limit: limit.unwrap_or(20),
+            sort_direction: None,
+            detail: None,
             kinds: Vec::new(),
         })?;
         Ok(reply.result)
     }
 
-    // 读取会话摘要 + 最近片段，按稳定文本渲染。
+    // 读取会话摘要 + 按 turn 分页的历史，按稳定文本渲染。
     pub(super) fn session_read(
         &mut self,
         session_id: &str,
@@ -538,8 +538,8 @@ impl AppServerClient {
         let result = self.fetch_session_read(session_id, limit)?;
         println!("session {}", result.session_id);
         println!("cwd {}", result.cwd);
-        match result.status.as_deref() {
-            Some(status) => println!("status {status}"),
+        match result.status {
+            Some(status) => println!("status {}", status.as_storage_text()),
             None => println!("status none"),
         }
         if let Some(title) = result.title {
@@ -550,16 +550,32 @@ impl AppServerClient {
         }
         println!("created_at {}", result.created_at);
         println!("updated_at {}", result.updated_at);
-        println!("total_entries {}", result.total_entries);
+        println!("total_turns {}", result.total_turns);
         match result.summary {
             Some(summary) => println!("summary {summary}"),
             None => println!("summary none"),
         }
-        println!(
-            "recent_entries {}",
-            serde_json::to_string_pretty(&result.recent_entries)
-                .map_err(|error| format!("failed to render session entries: {error}"))?
-        );
+        match result.next_cursor {
+            Some(cursor) => println!("next_cursor {cursor}"),
+            None => println!("next_cursor none"),
+        }
+        match result.backwards_cursor {
+            Some(cursor) => println!("backwards_cursor {cursor}"),
+            None => println!("backwards_cursor none"),
+        }
+        for turn in &result.turns {
+            let turn_id = turn.turn_id.as_deref().unwrap_or("none");
+            let status = turn
+                .status
+                .map(|status| status.as_storage_text())
+                .unwrap_or("none");
+            println!("turn {turn_id} {status}");
+            println!(
+                "items {}",
+                serde_json::to_string_pretty(&turn.items)
+                    .map_err(|error| format!("failed to render session entries: {error}"))?
+            );
+        }
         Ok(())
     }
 
@@ -899,7 +915,6 @@ mod tests {
             thread_id: "thread_1".to_string(),
             turn_id: "turn_1".to_string(),
             status: TurnStatus::Running,
-            agent_loop_status: "running".to_string(),
             model_usage: None,
         }
     }
@@ -924,7 +939,7 @@ mod tests {
             "params": {
                 "threadId": "thread_1",
                 "turnId": "turn_1",
-                "item": {"item_id": "item_1"},
+                "item": {"itemId": "item_1"},
                 "delta": "drain this item"
             }
         });
@@ -934,8 +949,7 @@ mod tests {
             "params": {"turn": {
                 "thread_id": "thread_1",
                 "turn_id": "turn_1",
-                "status": "interrupted",
-                "agent_loop_status": "cancelled"
+                "status": "interrupted"
             }}
         });
         stdout_tx

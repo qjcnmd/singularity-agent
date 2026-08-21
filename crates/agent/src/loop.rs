@@ -21,6 +21,7 @@ use singularity_model::{
     PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
     ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
+    split_model_selector,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -36,13 +37,6 @@ use crate::session::{SessionEntry, SessionEntryType, SessionError, SessionManage
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
-
-/// 工具开始执行时的回调签名：接收工具名称、调用 ID 与结构化参数。
-pub type ToolExecutionCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value);
-/// 工具执行输出增量更新时的回调签名：接收工具名称、调用 ID、结构化参数与部分输出文本。
-pub type ToolExecutionUpdateCallback<'a> = &'a mut dyn FnMut(&str, &str, &Value, &str);
-/// 工具执行结束时的回调签名：接收工具名称、调用 ID 与最终执行结果。
-pub type ToolExecutionEndCallback<'a> = &'a mut dyn FnMut(&str, &str, &ToolExecution);
 
 /// Typed severity for non-fatal runtime diagnostics emitted by the AgentLoop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,38 +65,55 @@ impl AgentDiagnostic {
     }
 }
 
-/// Provider-attempt observer.  The callback is deliberately non-vetoing: its
-/// return value is ignored by the AgentLoop and cannot turn a provider success
-/// into a transport failure.
-pub type ProviderAttemptCallback<'a> = &'a mut dyn FnMut(ProviderAttemptEvent);
-pub type AgentDiagnosticCallback<'a> = &'a mut dyn FnMut(&AgentDiagnostic);
-
-/// Agent 运行生命周期事件监听回调集合。
-pub struct AgentEvents<'a> {
+/// Agent 运行生命周期事件，统一经 `AgentEvents::on_event` 出口流式投递。
+///
+/// tool 事件按执行完成顺序投递；持久化的 toolResult 顺序不受影响。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
-    pub on_message_update: Option<&'a mut dyn FnMut(&str)>,
+    MessageUpdate { delta: String },
     /// 工具开始执行事件。
-    pub on_tool_execution_start: Option<ToolExecutionCallback<'a>>,
+    ToolExecutionStarted {
+        tool_name: String,
+        tool_call_id: String,
+        arguments: Value,
+    },
     /// 工具执行中产生的流式增量输出事件。
-    pub on_tool_execution_update: Option<ToolExecutionUpdateCallback<'a>>,
+    ToolExecutionUpdate {
+        tool_name: String,
+        tool_call_id: String,
+        arguments: Value,
+        partial_result: String,
+    },
     /// 工具执行完成事件。
-    pub on_tool_execution_end: Option<ToolExecutionEndCallback<'a>>,
+    ToolExecutionEnded {
+        tool_name: String,
+        tool_call_id: String,
+        execution: ToolExecution,
+    },
     /// 非致命、脱敏 Agent 诊断；不会写入 Session JSONL。
-    pub on_diagnostic: Option<AgentDiagnosticCallback<'a>>,
-    /// provider HTTP attempt 生命周期观测；回调不能否决 provider 结果。
-    pub on_provider_attempt: Option<ProviderAttemptCallback<'a>>,
+    Diagnostic(AgentDiagnostic),
+    /// provider HTTP attempt 生命周期观测；model-turn 序号已在循环内绑定。
+    ///
+    /// 投影失败即中止本轮，并丢弃当轮 provider 结果。
+    ProviderAttempt {
+        model_turn_ordinal: u32,
+        event: ProviderAttemptEvent,
+    },
+}
+
+/// Agent 运行生命周期事件出口。
+///
+/// 单一回调统一承载全部事件。诊断事件为尽力而为：投递失败被忽略，
+/// 不改变轮次结果；其余事件的投影失败会使循环立即中止本轮并丢弃
+/// 当轮结果，错误经 `run` 返回。
+pub struct AgentEvents<'a> {
+    pub on_event: Option<&'a mut dyn FnMut(AgentEvent) -> Result<()>>,
 }
 
 impl<'a> AgentEvents<'a> {
     pub fn new() -> Self {
-        Self {
-            on_message_update: None,
-            on_tool_execution_start: None,
-            on_tool_execution_update: None,
-            on_tool_execution_end: None,
-            on_diagnostic: None,
-            on_provider_attempt: None,
-        }
+        Self { on_event: None }
     }
 }
 
@@ -292,30 +303,12 @@ enum ToolRuntimeEvent {
     },
 }
 
-fn emit_tool_start(events: &mut AgentEvents<'_>, call: &singularity_model::ModelToolCall) {
-    if let Some(callback) = events.on_tool_execution_start.as_deref_mut() {
-        callback(&call.tool_name, &call.tool_call_id, &call.arguments);
+/// 通过单一事件出口投递一个事件；回调返回错误时向上传播以中止本轮。
+fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) -> Result<()> {
+    if let Some(callback) = events.on_event.as_deref_mut() {
+        callback(event)?;
     }
-}
-
-fn emit_tool_update(
-    events: &mut AgentEvents<'_>,
-    call: &singularity_model::ModelToolCall,
-    text: &str,
-) {
-    if let Some(callback) = events.on_tool_execution_update.as_deref_mut() {
-        callback(&call.tool_name, &call.tool_call_id, &call.arguments, text);
-    }
-}
-
-fn emit_tool_end(
-    events: &mut AgentEvents<'_>,
-    call: &singularity_model::ModelToolCall,
-    execution: &ToolExecution,
-) {
-    if let Some(callback) = events.on_tool_execution_end.as_deref_mut() {
-        callback(&call.tool_name, &call.tool_call_id, execution);
-    }
+    Ok(())
 }
 
 fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecution {
@@ -355,14 +348,21 @@ fn execute_tool_batch_parallel(
     cancellation: &CancellationToken,
     max_parallel_tool_calls: u32,
     events: &mut AgentEvents<'_>,
-) -> Vec<ToolExecution> {
+) -> Result<Vec<ToolExecution>> {
     let mut results = vec![None; calls.len()];
     let mut runnable_indices = Vec::with_capacity(calls.len());
 
     // Preflight rejections are already complete and do not enter a worker.
     for (index, item) in calls.iter().enumerate() {
         if let Some(execution) = &item.preflight_execution {
-            emit_tool_end(events, &item.call, execution);
+            emit(
+                events,
+                AgentEvent::ToolExecutionEnded {
+                    tool_name: item.call.tool_name.clone(),
+                    tool_call_id: item.call.tool_call_id.clone(),
+                    execution: execution.clone(),
+                },
+            )?;
             results[index] = Some(execution.clone());
         } else {
             runnable_indices.push(index);
@@ -386,11 +386,26 @@ fn execute_tool_batch_parallel(
             let call = &item.call;
             let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute_prepared_tool(registry, prepared, call, cwd, cancellation, |text| {
-                    emit_tool_update(events, call, text);
+                    let _ = emit(
+                        events,
+                        AgentEvent::ToolExecutionUpdate {
+                            tool_name: call.tool_name.clone(),
+                            tool_call_id: call.tool_call_id.clone(),
+                            arguments: call.arguments.clone(),
+                            partial_result: text.to_string(),
+                        },
+                    );
                 })
             }))
             .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
-            emit_tool_end(events, call, &execution);
+            emit(
+                events,
+                AgentEvent::ToolExecutionEnded {
+                    tool_name: call.tool_name.clone(),
+                    tool_call_id: call.tool_call_id.clone(),
+                    execution: execution.clone(),
+                },
+            )?;
             results[index] = Some(execution);
         }
     } else {
@@ -401,6 +416,9 @@ fn execute_tool_batch_parallel(
         for window in runnable_indices.chunks(worker_limit) {
             let (sender, receiver): (Sender<ToolRuntimeEvent>, Receiver<ToolRuntimeEvent>) =
                 mpsc::channel();
+            // 主线程在 join 全部 worker 后检查首个投影错误；工具 worker 本身
+            // 只通过 channel 回传，不在子线程内直接投递事件。
+            let mut projected_error: Option<AgentError> = None;
             thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(window.len());
                 for &index in window {
@@ -435,21 +453,48 @@ fn execute_tool_batch_parallel(
                 let mut finished = 0usize;
                 while finished < window.len() {
                     match receiver.recv() {
-                        Ok(ToolRuntimeEvent::Update { index, text }) => {
-                            emit_tool_update(events, &calls[index].call, &text);
+                        Ok(ToolRuntimeEvent::Update { index, text })
+                            if projected_error.is_none() =>
+                        {
+                            if let Err(error) = emit(
+                                events,
+                                AgentEvent::ToolExecutionUpdate {
+                                    tool_name: calls[index].call.tool_name.clone(),
+                                    tool_call_id: calls[index].call.tool_call_id.clone(),
+                                    arguments: calls[index].call.arguments.clone(),
+                                    partial_result: text,
+                                },
+                            ) {
+                                projected_error = Some(error);
+                            }
                         }
                         Ok(ToolRuntimeEvent::End { index, execution }) => {
-                            emit_tool_end(events, &calls[index].call, &execution);
+                            if projected_error.is_none()
+                                && let Err(error) = emit(
+                                    events,
+                                    AgentEvent::ToolExecutionEnded {
+                                        tool_name: calls[index].call.tool_name.clone(),
+                                        tool_call_id: calls[index].call.tool_call_id.clone(),
+                                        execution: execution.clone(),
+                                    },
+                                )
+                            {
+                                projected_error = Some(error);
+                            }
                             results[index] = Some(execution);
                             finished += 1;
                         }
                         Err(_) => break,
+                        _ => {}
                     }
                 }
                 for handle in handles {
                     let _ = handle.join();
                 }
             });
+            if let Some(error) = projected_error {
+                return Err(error);
+            }
         }
     }
 
@@ -458,14 +503,21 @@ fn execute_tool_batch_parallel(
     for (index, result) in results.iter_mut().enumerate() {
         if result.is_none() {
             let execution = tool_error_execution("tool worker did not produce a result");
-            emit_tool_end(events, &calls[index].call, &execution);
+            emit(
+                events,
+                AgentEvent::ToolExecutionEnded {
+                    tool_name: calls[index].call.tool_name.clone(),
+                    tool_call_id: calls[index].call.tool_call_id.clone(),
+                    execution: execution.clone(),
+                },
+            )?;
             *result = Some(execution);
         }
     }
-    results
+    Ok(results
         .into_iter()
         .map(|result| result.expect("tool batch result must be present"))
-        .collect()
+        .collect())
 }
 
 /// 按 provider 声明把系统/开发者指令投影为请求首条消息。
@@ -779,7 +831,16 @@ impl Agent {
                         })
                         .collect::<Vec<_>>();
                     for item in &prepared_calls {
-                        emit_tool_start(events, &item.call);
+                        if let Err(error) = emit(
+                            events,
+                            AgentEvent::ToolExecutionStarted {
+                                tool_name: item.call.tool_name.clone(),
+                                tool_call_id: item.call.tool_call_id.clone(),
+                                arguments: item.call.arguments.clone(),
+                            },
+                        ) {
+                            return self.fail_after_progress(error, outcome);
+                        }
                     }
                     let executions = execute_tool_batch_parallel(
                         &self.registry,
@@ -788,7 +849,7 @@ impl Agent {
                         cancellation,
                         effective_max_parallel_tool_calls,
                         events,
-                    );
+                    )?;
                     // Durable toolResult entries are always appended in assistant source order,
                     // regardless of completion/event order.
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
@@ -977,7 +1038,16 @@ impl Agent {
         entries: &[SessionEntry],
     ) -> Vec<ProviderReasoningReplay> {
         let tool_reasoning_mode = self.provider.protocol_contract().tool_reasoning_mode;
-        let selector = parse_model_selector(&self.config.model);
+        // 三段齐全语义：缺任一字段时无法可靠重建 reasoning 绑定，安全跳过投影。
+        let selector = {
+            let parts = split_model_selector(&self.config.model);
+            match (parts.provider, parts.model, parts.effort) {
+                (Some(provider_name), Some(model_name), Some(variant)) => {
+                    Some((provider_name, model_name, variant))
+                }
+                _ => None,
+            }
+        };
         let mut replays = Vec::new();
         for entry in entries {
             let SessionEntryType::Message(message) = &entry.entry_type else {
@@ -1070,44 +1140,67 @@ impl Agent {
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> Result<ModelTurnResponse> {
-        let on_message_update = &mut events.on_message_update;
-        let on_provider_attempt = &mut events.on_provider_attempt;
-        let mut on_stream = |event: ProviderStreamEvent| match event {
-            ProviderStreamEvent::OutputTextDelta { delta } => {
-                if let Some(on_update) = on_message_update.as_deref_mut() {
-                    on_update(&delta);
+        // provider 回调与 on_attempt 共享同一个事件出口与投影错误位；用本地
+        // RefCell 承接两个异签名回调的可变借用（单线程 turn 内串行使用）。
+        // 全部本地状态装进一个块：块结束时回调与其 RefCell 借用一并释放，
+        // 随后消费投影错误位。
+        let (result, projected_error) = {
+            let events_cell = std::cell::RefCell::new(events);
+            let events_ref = &events_cell;
+            let projected_error = std::cell::RefCell::new(None::<AgentError>);
+            let projected_ref = &projected_error;
+            let mut on_stream = |event: ProviderStreamEvent| {
+                let ProviderStreamEvent::OutputTextDelta { delta } = event;
+                if projected_ref.borrow().is_none() {
+                    let mut events = events_ref.borrow_mut();
+                    if let Err(error) = emit(&mut events, AgentEvent::MessageUpdate { delta }) {
+                        *projected_ref.borrow_mut() = Some(error);
+                    }
                 }
-            }
-        };
-        let mut on_attempt = |event: ProviderAttemptEvent| {
-            let event = bind_attempt_ordinal(event, model_turn_ordinal);
-            if let Some(on_attempt) = on_provider_attempt.as_deref_mut() {
+            };
+            let on_attempt = |event: ProviderAttemptEvent| {
+                if projected_ref.borrow().is_none() {
+                    let mut events = events_ref.borrow_mut();
+                    if let Err(error) = emit(
+                        &mut events,
+                        AgentEvent::ProviderAttempt {
+                            model_turn_ordinal,
+                            event,
+                        },
+                    ) {
+                        *projected_ref.borrow_mut() = Some(error);
+                    }
+                }
+            };
+            let mut observed_attempt = |event: ProviderAttemptEvent| {
                 on_attempt(event);
-            }
+                true
+            };
+            let result = match self.provider.complete_stream_observed(
+                request,
+                cancellation,
+                &mut on_stream,
+                &mut observed_attempt,
+            ) {
+                Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
+                Err(error)
+                    if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
+                {
+                    self.provider
+                        .complete_observed(request, cancellation, &mut observed_attempt)
+                        .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
+                        .map_err(AgentError::Provider)
+                }
+                Err(error) => {
+                    // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
+                    Err(AgentError::Provider(error))
+                }
+            };
+            (result, projected_error.into_inner())
         };
-        let mut observed_attempt = |event: ProviderAttemptEvent| {
-            on_attempt(event);
-            true
-        };
-        match self.provider.complete_stream_observed(
-            request,
-            cancellation,
-            &mut on_stream,
-            &mut observed_attempt,
-        ) {
-            Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
-            Err(error)
-                if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
-            {
-                self.provider
-                    .complete_observed(request, cancellation, &mut observed_attempt)
-                    .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
-                    .map_err(AgentError::Provider)
-            }
-            Err(error) => {
-                // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
-                Err(AgentError::Provider(error))
-            }
+        match projected_error {
+            Some(error) => Err(error),
+            None => result,
         }
     }
 
@@ -1231,21 +1324,6 @@ fn is_context_overflow_error(error: &ModelError) -> bool {
     error.kind == ModelErrorKind::ContextLengthExceeded
 }
 
-/// 解析 `provider/model#variant` 模型选择器。仅当 provider/model/variant 三段
-/// 都显式存在时返回（transport 对 reasoning replay 做绑定校验，缺 variant 时
-/// 无法可靠重建绑定，安全跳过投影）。
-fn parse_model_selector(selector: &str) -> Option<(&str, &str, &str)> {
-    let (provider_name, model_and_effort) = selector.split_once('/')?;
-    if provider_name.is_empty() || model_and_effort.is_empty() {
-        return None;
-    }
-    let (model_name, variant) = model_and_effort.rsplit_once('#')?;
-    if model_name.is_empty() || variant.is_empty() {
-        return None;
-    }
-    Some((provider_name, model_name, variant))
-}
-
 /// 逐轮聚合 provider 返回的真实 token/cache usage。
 fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
     aggregate_usage(&mut outcome.usage, response);
@@ -1324,19 +1402,6 @@ fn record_provider_attempts(
     );
 }
 
-fn bind_attempt_ordinal(
-    event: ProviderAttemptEvent,
-    model_turn_ordinal: u32,
-) -> ProviderAttemptEvent {
-    match event {
-        ProviderAttemptEvent::Finished(mut occurrence) => {
-            occurrence.model_turn_ordinal = Some(model_turn_ordinal);
-            ProviderAttemptEvent::Finished(occurrence)
-        }
-        other => other,
-    }
-}
-
 fn bind_response_attempt_ordinal(
     mut response: ModelTurnResponse,
     model_turn_ordinal: u32,
@@ -1350,9 +1415,8 @@ fn bind_response_attempt_ordinal(
 }
 
 fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
-    if let Some(callback) = events.on_diagnostic.as_deref_mut() {
-        callback(&diagnostic);
-    }
+    // 诊断是尽力而为的观测侧信道：回调失败不中止本轮。
+    let _ = emit(events, AgentEvent::Diagnostic(diagnostic));
 }
 
 #[cfg(test)]

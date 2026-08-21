@@ -39,29 +39,6 @@ pub(super) fn title_from_input(input: &str) -> String {
         .collect()
 }
 
-pub(super) fn split_model_selector(
-    selector: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let Some(selector) = selector.filter(|selector| !selector.trim().is_empty()) else {
-        return (None, None, None);
-    };
-    let (without_reasoning, reasoning) = selector
-        .rsplit_once('#')
-        .map_or((selector, None), |(model, reasoning)| {
-            (model, Some(reasoning))
-        });
-    let (provider, model) = without_reasoning
-        .split_once('/')
-        .map_or((None, without_reasoning), |(provider, model)| {
-            (Some(provider), model)
-        });
-    (
-        provider.map(str::to_string),
-        Some(model.to_string()),
-        reasoning.map(str::to_string),
-    )
-}
-
 pub(super) fn compose_model_selector(
     provider: &str,
     model: &str,
@@ -108,6 +85,78 @@ pub(super) fn invalid_state_response(
 
 pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
     json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
+}
+
+/// 不透明游标的版本化编码前缀；未知前缀按无效参数拒绝。
+const TURN_CURSOR_PREFIX: &str = "sg1t";
+
+/// 游标内部只编码 turn 边界的物理位置，客户端必须原样回传。
+fn encode_turn_cursor(index: usize) -> String {
+    format!("{TURN_CURSOR_PREFIX}{index}")
+}
+
+fn decode_turn_cursor(raw: &str) -> Option<usize> {
+    raw.strip_prefix(TURN_CURSOR_PREFIX)?.parse::<usize>().ok()
+}
+
+/// 在物理轮次序列上选取一页。
+///
+/// `is_survivor` 标记 kinds 过滤后的候选位置；`anchor` 为包含语义的物理
+/// 下标（来自游标），缺省时 asc 从最旧端、desc 从最新端开始。扫描沿物理
+/// 顺序推进并收集幸存者直到填满 limit 或耗尽，因此被过滤掉的轮次不占用
+/// 每页配额。返回升序的页内物理下标、同方向续页锚点（已越过本页远端，
+/// 耗尽为 None）与反向锚点（本页远端轮次，供相反方向包含式重读；空页为
+/// None）。
+pub(crate) fn select_turn_page(
+    physical_len: usize,
+    is_survivor: impl Fn(usize) -> bool,
+    direction: HistorySortDirection,
+    limit: usize,
+    anchor: Option<usize>,
+) -> (Vec<usize>, Option<usize>, Option<usize>) {
+    let mut selected = Vec::new();
+    if physical_len == 0 || limit == 0 {
+        return (selected, None, None);
+    }
+    match direction {
+        HistorySortDirection::Asc => {
+            let mut index = anchor.unwrap_or(0);
+            while index < physical_len && selected.len() < limit {
+                if is_survivor(index) {
+                    selected.push(index);
+                }
+                index += 1;
+            }
+            // 扫描耗尽时（含恰好填满的情况）不再发放续页锚点。
+            let next = ((index < physical_len && selected.len() == limit)
+                && (index..physical_len).any(&is_survivor))
+            .then_some(index);
+            let backwards = selected.last().copied();
+            (selected, next, backwards)
+        }
+        HistorySortDirection::Desc => {
+            let mut index = anchor.unwrap_or(physical_len - 1);
+            loop {
+                if selected.len() == limit {
+                    break;
+                }
+                if is_survivor(index) {
+                    selected.push(index);
+                }
+                if index == 0 {
+                    selected.reverse();
+                    let backwards = selected.first().copied();
+                    return (selected, None, backwards);
+                }
+                index -= 1;
+            }
+            let next = (0..=index).any(&is_survivor).then_some(index);
+            selected.reverse();
+            // 反转后升序；desc 页的远端是本页最旧一轮，即升序首元素。
+            let backwards = selected.first().copied();
+            (selected, next, backwards)
+        }
+    }
 }
 
 impl AppServer {
@@ -295,8 +344,10 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let (current_provider, current_model, current_reasoning) =
-            split_model_selector(record.model.as_deref());
+        let parts = singularity_model::split_model_selector(record.model.as_deref().unwrap_or(""));
+        let current_provider = parts.provider.map(str::to_string);
+        let current_model = parts.model.map(str::to_string);
+        let current_reasoning = parts.effort.map(str::to_string);
         let changed =
             params.provider.is_some() || params.model.is_some() || params.reasoning.is_some();
         let provider = params
@@ -400,7 +451,7 @@ impl AppServer {
 
     pub(super) fn session_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: SessionReadParams = parse_params(&message)?;
-        if !(1..=200).contains(&params.recent_limit) {
+        if !(1..=200).contains(&params.limit) {
             return invalid_params_response(message.required_id());
         }
         if params.kinds.iter().any(|kind| {
@@ -425,45 +476,67 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let range = params.offset.map(|offset| {
-            let start = offset as usize;
-            (start, start.saturating_add(params.recent_limit as usize))
-        });
         let repository = SessionRepository::new(self.sessions_dir.clone());
         let read = repository
-            .read(
-                &record.session_id,
-                &SessionReadOptions {
-                    recent_limit: params.recent_limit as usize,
-                    filter: SessionEntryFilter::All,
-                    range,
-                },
-            )
+            .read(&record.session_id)
             .map_err(AppServerError::Session)?;
-        let recent_entries = read
-            .entries
-            .iter()
-            .flat_map(project_public_history)
-            .filter(|item| {
-                params.kinds.is_empty()
-                    || params.kinds.iter().any(|kind| match item {
-                        HistoryItem::Message { .. } => kind == "message",
-                        HistoryItem::Thinking { .. } => kind == "thinking",
-                        HistoryItem::ToolCall { .. } => kind == "tool_call",
-                        HistoryItem::ToolResult { .. } => kind == "tool_result",
-                        HistoryItem::Turn { .. } => kind == "turn",
-                        HistoryItem::Settings { .. } => kind == "settings",
-                        HistoryItem::Usage { .. } => kind == "usage",
-                        HistoryItem::Compaction { .. } => kind == "compaction",
-                    })
-            })
-            .collect::<Vec<_>>();
         // 与 thread/list、thread/resume 复用同一 last-turn 投影，
         // 三个读取接口不得显示互相矛盾的状态。
-        let status = self
-            .project_thread(&record)
-            .last_turn_status
-            .map(|status| status.as_storage_text().to_string());
+        let overall_status = self.project_thread(&record).last_turn_status;
+        let mut turns = project_turn_history(&read.entries);
+        // 整体状态一致性：末组 running 只有在整体 active（存在存活 turn）
+        // 时保留；崩溃遗留投影为 interrupted。
+        if overall_status != Some(ThreadStatus::Active)
+            && turns
+                .last_mut()
+                .is_some_and(|last| last.status == Some(TurnStatus::Running))
+        {
+            turns.last_mut().expect("checked above").status = Some(TurnStatus::Interrupted);
+        }
+        // 先过滤后分页：kinds 命中轮内条目，`turn` 命中轮次本身；
+        // 未命中过滤的轮次不进入候选序列，也不占用每页配额。
+        let mut survivor = vec![false; turns.len()];
+        for (index, turn) in turns.iter_mut().enumerate() {
+            turn.items.retain(|item| {
+                params.kinds.is_empty() || params.kinds.iter().any(|kind| kind == item.kind())
+            });
+            survivor[index] = params.kinds.is_empty()
+                || (turn.turn_id.is_some() && params.kinds.iter().any(|kind| kind == "turn"))
+                || !turn.items.is_empty();
+        }
+        let direction = params.sort_direction.unwrap_or(HistorySortDirection::Desc);
+        // 无效或越界游标一律按 invalid params 拒绝，不静默钳位。
+        let anchor = match params.cursor.as_deref() {
+            None => None,
+            Some(raw) => match decode_turn_cursor(raw) {
+                Some(index) if index < turns.len() => Some(index),
+                _ => return invalid_params_response(message.required_id()),
+            },
+        };
+        let (page_indices, next_anchor, backwards_anchor) = select_turn_page(
+            turns.len(),
+            |index| survivor[index],
+            direction,
+            params.limit as usize,
+            anchor,
+        );
+        let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
+        let detail = params.detail.unwrap_or(TurnDetail::Full);
+        let page: Vec<usize> = page_indices.into_iter().collect();
+        let page_turns = turns
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| page.binary_search(index).is_ok())
+            .map(|(_, turn)| {
+                if detail == TurnDetail::Summary {
+                    return SessionTurn {
+                        items: Vec::new(),
+                        ..turn
+                    };
+                }
+                turn
+            })
+            .collect();
         json_response(
             message.required_id(),
             SessionReadResult {
@@ -471,13 +544,15 @@ impl AppServer {
                 cwd: record.cwd,
                 title: record.title,
                 model: record.model,
-                status,
+                status: overall_status,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 token_usage: record.token_usage,
                 summary: read.summary,
-                recent_entries,
-                total_entries: read.total_entries,
+                turns: page_turns,
+                total_turns,
+                next_cursor: next_anchor.map(encode_turn_cursor),
+                backwards_cursor: backwards_anchor.map(encode_turn_cursor),
             },
         )
     }

@@ -313,33 +313,15 @@ where
         for (model_name, model_file) in provider_file.models {
             validate_model_id(&model_name, "model id")?;
             let protocol = parse_catalog_protocol(&model_file.api_protocol)?;
-            let declared_capabilities = model_file.capabilities.clone();
-            let capabilities = declared_capabilities.clone().unwrap_or_default();
-            let max_context_tokens = model_file
-                .max_context_tokens
-                .or(capabilities.max_context_tokens);
-            let max_output_tokens = model_file
-                .max_output_tokens
-                .or(capabilities.max_output_tokens)
-                .ok_or_else(|| {
-                    configuration_error(
-                        "model configuration must declare max_output_tokens or capabilities.max_output_tokens",
-                        "provider_configuration_invalid",
-                    )
-                })?;
-            let supports_developer_role = model_file
-                .supports_developer_role
-                .or(capabilities.supports_developer_message)
-                .unwrap_or(true);
+            let max_context_tokens = model_file.max_context_tokens;
+            let max_output_tokens = model_file.max_output_tokens.ok_or_else(|| {
+                configuration_error(
+                    "model configuration must declare max_output_tokens",
+                    "provider_configuration_invalid",
+                )
+            })?;
+            let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
             let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
-            let capability_overrides = declared_capabilities.map(|mut overrides| {
-                overrides.max_context_tokens = max_context_tokens;
-                overrides.max_output_tokens = Some(max_output_tokens);
-                if model_file.supports_developer_role.is_some() {
-                    overrides.supports_developer_message = None;
-                }
-                overrides
-            });
             let reasoning_variants = model_file
                 .reasoning_variants
                 .into_iter()
@@ -422,7 +404,6 @@ where
                         .requires_reasoning_content_for_tool_calls,
                     requires_assistant_content_for_tool_calls: model_file
                         .requires_assistant_content_for_tool_calls,
-                    capability_overrides,
                 },
             );
         }

@@ -92,24 +92,34 @@ fn user_declared_limits_win_over_builtin_table() {
 }
 
 #[test]
-fn capabilities_limits_take_priority_over_builtin_table() {
-    let model = UserConfigModel {
-        api_protocol: Some("responses".to_string()),
-        capabilities: Some(ProviderCapabilityDeclaration {
-            max_context_tokens: Some(32_000),
-            max_output_tokens: Some(2_048),
-            ..ProviderCapabilityDeclaration::default()
-        }),
-        ..UserConfigModel::default()
-    };
-    let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
-        .expect("capabilities declaration resolves");
-    assert_eq!(resolved.max_context_tokens, Some(32_000));
-    assert_eq!(resolved.max_output_tokens, 2_048);
+fn user_config_rejects_capabilities_block() {
+    let error = serde_json::from_value::<UserConfigModel>(serde_json::json!({
+        "api_protocol": "responses",
+        "max_output_tokens": 2048,
+        "capabilities": {
+            "max_context_tokens": 32000,
+            "max_output_tokens": 2048
+        }
+    }))
+    .expect_err("capabilities must be rejected as an unknown field");
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn models_file_capabilities_match_user_capability_projection() {
+fn user_model_top_level_limits_project_with_builtin_fallback() {
+    let model = UserConfigModel {
+        api_protocol: Some("responses".to_string()),
+        max_context_tokens: Some(400_000),
+        ..UserConfigModel::default()
+    };
+    let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
+        .expect("top-level and builtin fallback resolve");
+    assert_eq!(resolved.max_context_tokens, Some(400_000));
+    assert_eq!(resolved.max_output_tokens, 384_000);
+}
+
+#[test]
+fn models_file_projects_only_from_top_level_fields() {
     let file: ModelsFile = serde_json::from_value(serde_json::json!({
         "default_model": "primary/gpt-test",
         "providers": {
@@ -120,22 +130,14 @@ fn models_file_capabilities_match_user_capability_projection() {
                 "models": {
                     "gpt-test": {
                         "api_protocol": "chat",
-                        "capabilities": {
-                            "supports_tools": false,
-                            "supports_parallel_tool_calls": true,
-                            "supports_strict_tool_schema": true,
-                            "supports_system_message": false,
-                            "supports_developer_message": false,
-                            "max_parallel_tool_calls": 3,
-                            "max_context_tokens": 32000,
-                            "max_output_tokens": 2048
-                        }
+                        "max_context_tokens": 32000,
+                        "max_output_tokens": 2048
                     }
                 }
             }
         }
     }))
-    .expect("models file capability declaration");
+    .expect("models file with top-level limits");
     let (snapshot, _) = capture_models_file(
         file,
         &mut |name| (name == "PRIMARY_KEY").then(|| "sk-primary".to_string()),
@@ -145,71 +147,14 @@ fn models_file_capabilities_match_user_capability_projection() {
     .expect("models file capture");
     let provider = provider_for_selection(&snapshot, None).expect("selected provider");
     let contract = provider.protocol_contract();
-    assert!(!contract.supports_tools);
-    assert!(contract.supports_parallel_tool_calls);
-    assert!(contract.supports_strict_tool_schema);
-    assert!(!contract.supports_system_message);
-    assert!(!contract.supports_developer_message);
-    assert_eq!(contract.max_parallel_tool_calls, 3);
     assert_eq!(contract.max_context_tokens, Some(32000));
     assert_eq!(contract.max_output_tokens, 2048);
-
-    let declared = ProviderCapabilityDeclaration {
-        supports_tools: Some(false),
-        supports_parallel_tool_calls: Some(true),
-        supports_strict_tool_schema: Some(true),
-        supports_system_message: Some(false),
-        supports_developer_message: Some(false),
-        max_parallel_tool_calls: Some(3),
-        max_context_tokens: Some(32000),
-        max_output_tokens: Some(2048),
-        ..ProviderCapabilityDeclaration::default()
-    };
-    let user_data = UserConfigData {
-        directory: PathBuf::from("C:/singularity-test"),
-        config: UserConfigFile {
-            version: 1,
-            default_provider: Some("primary".to_string()),
-            default_model: Some("primary/gpt-test".to_string()),
-            auth_generation: None,
-            providers: BTreeMap::from([(
-                "primary".to_string(),
-                UserConfigProvider {
-                    base_url: "https://example.invalid/v1".to_string(),
-                    models: BTreeMap::from([(
-                        "gpt-test".to_string(),
-                        UserConfigModel {
-                            api_protocol: Some("chat".to_string()),
-                            capabilities: Some(declared),
-                            ..UserConfigModel::default()
-                        },
-                    )]),
-                },
-            )]),
-        },
-        auth: UserAuthFile {
-            schema_version: USER_AUTH_SCHEMA_VERSION,
-            providers: BTreeMap::from([(
-                "primary".to_string(),
-                UserAuthProvider {
-                    api_key: "sk-primary".to_string(),
-                },
-            )]),
-        },
-    };
-    let (user_snapshot, _) = capture_user_model_selection(
-        &user_data,
-        Some(ProviderConfigSource::UserConfigFile),
-        &OpenAiProvider::new,
-    )
-    .expect("user config capture");
-    let user_provider =
-        provider_for_selection(&user_snapshot, None).expect("user selected provider");
-    assert_eq!(contract, user_provider.protocol_contract());
+    assert!(contract.supports_tools);
+    assert!(contract.supports_developer_message);
 }
 
 #[test]
-fn models_file_rejects_unknown_capability_fields() {
+fn models_file_rejects_capabilities_block() {
     let error = serde_json::from_value::<ModelsFile>(serde_json::json!({
         "default_model": "primary/gpt-test",
         "providers": {
@@ -221,18 +166,20 @@ fn models_file_rejects_unknown_capability_fields() {
                     "gpt-test": {
                         "api_protocol": "chat",
                         "max_output_tokens": 2048,
-                        "capabilities": {"unknown_capability": true}
+                        "capabilities": {
+                            "supports_tools": true
+                        }
                     }
                 }
             }
         }
     }))
-    .expect_err("unknown capability must be rejected");
+    .expect_err("capabilities block must be rejected as an unknown field");
     assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn persisted_capability_block_accepts_removed_flags() {
+fn persisted_capability_block_is_rejected() {
     let directory = tempfile::tempdir().expect("user config directory");
     let config = serde_json::json!({
         "version": 1,
@@ -262,20 +209,17 @@ fn persisted_capability_block_accepts_removed_flags() {
     )
     .expect("write persisted user config");
 
-    let data = read_user_config_data_from_directory(directory.path().to_path_buf())
-        .expect("legacy capability flags remain readable")
-        .expect("persisted user config");
-    let capabilities = data.config.providers["primary"].models["gpt-test"]
-        .capabilities
-        .as_ref()
-        .expect("capability block");
-    assert_eq!(capabilities.supports_tools, Some(true));
-    let projected = serde_json::to_value(capabilities).expect("serialize active capabilities");
+    let error = match read_user_config_data_from_directory(directory.path().to_path_buf()) {
+        Ok(_) => panic!("config with a capabilities block must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_configuration_invalid")
+    );
     assert!(
-        !projected
-            .as_object()
-            .expect("capability object")
-            .contains_key("supports_json_mode")
+        error.message.contains("invalid JSON"),
+        "capabilities is an unknown field"
     );
 }
 
@@ -517,6 +461,28 @@ fn endpoint_validation_rejects_ambiguous_provider_urls() {
             "endpoint must be rejected: {invalid}"
         );
     }
+}
+
+#[test]
+fn split_model_selector_lazily_splits_each_segment() {
+    let parts = split_model_selector("provider/model#high");
+    assert_eq!(parts.provider, Some("provider"));
+    assert_eq!(parts.model, Some("model"));
+    assert_eq!(parts.effort, Some("high"));
+}
+
+#[test]
+fn split_model_selector_allows_partial_selectors() {
+    assert_eq!(split_model_selector("provider/model").effort, None);
+    assert_eq!(split_model_selector("model").provider, None);
+    assert_eq!(split_model_selector("model").model, Some("model"));
+    assert_eq!(
+        split_model_selector("provider/model/extra#high").model,
+        Some("model/extra")
+    );
+    assert_eq!(split_model_selector("provider/").model, None);
+    assert_eq!(split_model_selector("").provider, None);
+    assert_eq!(split_model_selector("").model, None);
 }
 
 #[test]

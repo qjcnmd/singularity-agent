@@ -576,21 +576,50 @@ pub struct SessionIdParams {
     pub session_id: String,
 }
 
-fn default_session_recent_limit() -> u32 {
+fn default_session_turn_limit() -> u32 {
     20
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// session/read 的翻页方向：asc 从最旧轮向新翻，desc 从最新轮向旧翻。
+/// 页内轮次始终按会话顺序（旧→新）排列，方向只决定窗口选取。
+pub enum HistorySortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// 每个返回轮次的条目细节级别。
+pub enum TurnDetail {
+    /// 只返回轮次身份（turnId/status），不携带条目内容。
+    Summary,
+    /// 返回该轮全部通过 kinds 过滤的公开条目。
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 查看会话的参数：默认返回摘要 + 最近片段，不返回全文。
+/// 查看会话历史：按 turn 为单位分页返回，游标锚定 turn 边界位置。
 pub struct SessionReadParams {
     pub session_id: String,
-    #[serde(default = "default_session_recent_limit")]
-    pub recent_limit: u32,
-    /// 过滤后的路径条目起始偏移（默认从 0 开始）。
+    /// 不透明翻页游标：来自上一次响应的 nextCursor 或 backwardsCursor；
+    /// 缺省时按 sortDirection 从最新/最旧一端开始。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u32>,
-    /// 稳定公开 history kind 过滤；空数组 = 全部。
+    pub cursor: Option<String>,
+    /// 每页最多返回的轮数（1..=200）。
+    #[serde(default = "default_session_turn_limit")]
+    pub limit: u32,
+    /// 翻页方向；缺省 desc（从最新一轮往历史方向）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<HistorySortDirection>,
+    /// 每轮条目细节级别；缺省 full。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<TurnDetail>,
+    /// 稳定公开 history kind 过滤；空数组 = 全部。`turn` 选择的是轮次本身：
+    /// 命中时该轮无论其条目是否命中都会出现在结果中，其余 kind 只匹配
+    /// 轮内条目。过滤先于分页，未命中过滤的轮次不占用每页配额。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
 }
@@ -640,9 +669,39 @@ pub enum HistoryItem {
     },
 }
 
+impl HistoryItem {
+    /// kinds 过滤使用的稳定公开 kind 名；与 session/read 参数校验共用同一词表。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Message { .. } => "message",
+            Self::Thinking { .. } => "thinking",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+            Self::Turn { .. } => "turn",
+            Self::Settings { .. } => "settings",
+            Self::Usage { .. } => "usage",
+            Self::Compaction { .. } => "compaction",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-/// session/read 的响应：摘要 + 最近片段（不携带完整 rollout）。
+/// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 turn 开始 metadata
+/// 划定；首个开始标记之前落盘的前导条目（settings 等）没有归属 turn，
+/// turnId/status 为 null。
+pub struct SessionTurn {
+    pub turn_id: Option<String>,
+    /// 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
+    /// 投影修正为 interrupted），前导组为 null。
+    pub status: Option<TurnStatus>,
+    /// 该轮通过 kinds 过滤的公开条目，按会话顺序排列。
+    pub items: Vec<HistoryItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// session/read 的响应：摘要 + 一页按 turn 组织的历史。
 pub struct SessionReadResult {
     pub session_id: String,
     pub cwd: String,
@@ -651,16 +710,21 @@ pub struct SessionReadResult {
     /// 最近一次 turn 状态的投影，与 thread/list、thread/resume 的
     /// `lastTurnStatus` 来自同一投影：尚无 turn 为 None，运行中 active，
     /// 终态 completed/failed/interrupted。
-    pub status: Option<String>,
+    pub status: Option<ThreadStatus>,
     pub created_at: String,
     pub updated_at: String,
     pub token_usage: Value,
     /// 最近一次 compaction 摘要；无 compaction 时为 None。
     pub summary: Option<String>,
-    /// 当前 leaf 路径上最近 `recent_limit` 条会话条目。
-    pub recent_entries: Vec<HistoryItem>,
-    /// 会话文件中的条目总数（不含 header）。
-    pub total_entries: usize,
+    /// 本页轮次，按会话顺序（旧→新）排列。
+    pub turns: Vec<SessionTurn>,
+    /// 会话中真实 turn 的总数（不含无归属 turn 的前导组）。
+    pub total_turns: usize,
+    /// 同方向继续翻页的不透明游标；None 表示当前方向已无更多轮次。
+    pub next_cursor: Option<String>,
+    /// 反向翻页锚点游标：以相反 sortDirection 传入时从本页远端重新读取
+    /// 并包含该锚点轮；仅在本页非空时返回。
+    pub backwards_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -764,7 +828,6 @@ pub struct Turn {
     pub turn_id: String,
     pub thread_id: String,
     pub status: TurnStatus,
-    pub agent_loop_status: String,
     /// provider usage 投影（评估工具数据源）。
     ///
     /// 可选字段保持协议向后兼容：旧客户端读新响应时忽略未知字段，
@@ -868,29 +931,19 @@ pub struct AgentCapabilityResult {
     pub provider_configuration: ProviderConfigurationStatus,
 }
 
-/// turn/steer 或 turn/followUp 的交付结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnInjectionOutcome {
-    /// 输入已注入仍在执行的 turn。
-    Active,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// turn/steer 或 turn/followUp 的响应。
 pub struct TurnInjectionResult {
     pub turn: Turn,
-    pub outcome: TurnInjectionOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// turn/interrupt 的响应。
+/// turn/interrupt 的响应。回执确认中断请求已受理并给出目标终态，不制造
+/// 独立的中间请求状态。
 pub struct TurnInterruptResult {
     #[serde(rename = "turnId")]
     pub turn_id: String,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_loop_status: Option<String>,
+    pub status: TurnStatus,
 }
 
 /// server/shutdown 的类型化响应。
@@ -943,6 +996,7 @@ pub struct TurnEventParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 /// item notification 中的最小 item 引用。
 pub struct ItemReference {
     pub item_id: String,
@@ -997,7 +1051,6 @@ pub struct ToolExecutionEndParams {
     pub tool_call_id: String,
     pub tool_name: String,
     pub result: ToolExecutionResult,
-    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1228,7 +1281,7 @@ impl AppEvent {
             params: serde_json::json!({
                 "threadId": thread_id.into(),
                 "turnId": turn_id.into(),
-                "item": {"item_id": item_id.into()},
+                "item": {"itemId": item_id.into()},
                 "delta": delta.into(),
             }),
         }
@@ -1255,7 +1308,7 @@ impl AppEvent {
             params: serde_json::json!({
                 "threadId": thread_id.into(),
                 "turnId": turn_id.into(),
-                "item": {"item_id": item_id.into()},
+                "item": {"itemId": item_id.into()},
                 "error": error.into(),
             }),
         }
@@ -1324,7 +1377,6 @@ impl AppEvent {
                     "content": [{"type": "text", "text": result}],
                     "isError": is_error,
                 },
-                "isError": is_error,
             }),
         }
     }
@@ -1340,7 +1392,7 @@ impl AppEvent {
             params: serde_json::json!({
                 "threadId": thread_id.into(),
                 "turnId": turn_id.into(),
-                "item": {"item_id": item_id.into()},
+                "item": {"itemId": item_id.into()},
             }),
         }
     }

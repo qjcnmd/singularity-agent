@@ -27,7 +27,6 @@ use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::config::{ProviderConfigLayer, parse_model_selector};
 use crate::error::ProviderError;
-use crate::provider::contract::ProviderCapabilityDeclaration;
 use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -78,8 +77,6 @@ pub(crate) struct UserConfigModel {
     pub(crate) requires_assistant_content_for_tool_calls: bool,
     #[serde(default)]
     pub(crate) thinking_wire_format: Option<String>,
-    #[serde(default)]
-    pub(crate) capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
 pub(crate) fn default_user_config_version() -> u32 {

@@ -236,12 +236,11 @@ pub fn thread(thread_id: &str) -> Value {
 }
 
 /// 构造测试用 turn 对象。
-pub fn turn(turn_id: &str, thread_id: &str, status: &str, agent_loop_status: &str) -> Value {
+pub fn turn(turn_id: &str, thread_id: &str, status: &str) -> Value {
     json!({
         "turn_id": turn_id,
         "thread_id": thread_id,
         "status": status,
-        "agent_loop_status": agent_loop_status,
     })
 }
 

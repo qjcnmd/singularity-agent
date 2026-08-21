@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
+#[cfg(test)]
+use singularity_protocol::SessionTurn;
 use singularity_protocol::{
     EventMetadata, HistoryItem, ItemEventParams, JsonRpcNotification, SessionReadResult,
 };
@@ -94,10 +96,10 @@ enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 // 会话查看/删除命令。
 enum SessionCommand {
-    /// Print session summary + recent rollout entries (not the full file).
+    /// Print session summary + one turn-organized history page.
     Read {
         session_id: String,
-        /// Recent leaf entries to return (default 20, max 200).
+        /// Recent turns to return (default 20, max 200).
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -123,23 +125,30 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
+    use singularity_protocol::ThreadStatus;
 
-    fn session_read(recent_entries: Vec<Value>) -> SessionReadResult {
+    fn session_read(items: Vec<Value>) -> SessionReadResult {
         SessionReadResult {
             session_id: "6f27b1b8-2b30-4b83-9d94-6e2d57d3e0a1".to_string(),
             cwd: "/tmp/work".to_string(),
             title: None,
             model: None,
-            status: Some("completed".to_string()),
+            status: Some(ThreadStatus::Completed),
             created_at: "2026-08-15T00:00:00Z".to_string(),
             updated_at: "2026-08-15T00:01:00Z".to_string(),
             token_usage: json!({}),
             summary: None,
-            recent_entries: recent_entries
-                .into_iter()
-                .filter_map(legacy_or_public_history_item)
-                .collect(),
-            total_entries: 0,
+            turns: vec![SessionTurn {
+                turn_id: None,
+                status: None,
+                items: items
+                    .into_iter()
+                    .filter_map(legacy_or_public_history_item)
+                    .collect(),
+            }],
+            total_turns: 0,
+            next_cursor: None,
+            backwards_cursor: None,
         }
     }
 
@@ -324,8 +333,7 @@ mod tests {
                 "result": {
                     "content": [{"type": "text", "text": "done"}],
                     "isError": false
-                },
-                "isError": false
+                }
             }
         }))
         .expect("notification fixture");

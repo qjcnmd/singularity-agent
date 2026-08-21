@@ -5,7 +5,4 @@ mod runner;
 mod terminal;
 
 pub(crate) use runner::agent_config_for_thread;
-pub(crate) use terminal::{
-    mark_run_cancelled, session_status_for_agent, terminal_metadata_for_status,
-    turn_failure_from_error, turn_status_for_agent,
-};
+pub(crate) use terminal::{terminal_metadata_for_status, turn_failure_from_error};

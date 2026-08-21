@@ -272,7 +272,7 @@ fn build_session_context_replays_assistant_tool_calls() {
 }
 
 #[test]
-fn repository_read_is_bounded_and_filtered() {
+fn repository_read_returns_full_leaf_sequence_with_summary() {
     let dir = tempfile::tempdir().unwrap();
     let repo = SessionRepository::new(dir.path());
     let mut manager = SessionManager::create_with_id(
@@ -282,51 +282,16 @@ fn repository_read_is_bounded_and_filtered() {
     )
     .unwrap();
     let m1 = manager.append_message(user("one")).unwrap();
-    let _c1 = manager.append_compaction(compaction("sum1", None)).unwrap();
+    let c1 = manager.append_compaction(compaction("sum1", None)).unwrap();
     let m2 = manager.append_message(assistant("two")).unwrap();
-    let _s1 = manager
-        .append_metadata(SessionMetadata::turn_completed("turn-1"))
-        .unwrap();
     let m3 = manager.append_message(user("three")).unwrap();
     drop(manager);
 
-    let read_all = repo
-        .read(
-            "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-            &SessionReadOptions {
-                recent_limit: 2,
-                filter: SessionEntryFilter::All,
-                range: None,
-            },
-        )
-        .unwrap();
-    assert_eq!(read_all.total_entries, 5);
-    assert_eq!(read_all.summary.as_deref(), Some("sum1"));
-    assert_eq!(read_all.entries.len(), 2);
-
-    let read_messages = repo
-        .read(
-            "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-            &SessionReadOptions {
-                recent_limit: 10,
-                filter: SessionEntryFilter::Messages,
-                range: Some((1, 3)),
-            },
-        )
-        .unwrap();
-    assert_eq!(entry_ids(&read_messages.entries), vec![m2, m3]);
-
-    let read_first = repo
-        .read(
-            "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-            &SessionReadOptions {
-                recent_limit: 1,
-                filter: SessionEntryFilter::Messages,
-                range: Some((0, 1)),
-            },
-        )
-        .unwrap();
-    assert_eq!(entry_ids(&read_first.entries), vec![m1]);
+    let read = repo.read("a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d").unwrap();
+    assert_eq!(read.summary.as_deref(), Some("sum1"));
+    // 完整 leaf 序列按落盘顺序返回（含 compaction 标记，供上层 kinds 过滤与
+    // 摘要投影消费）；窗口裁剪只发生在其上的分页层。
+    assert_eq!(entry_ids(&read.entries), vec![m1, c1, m2, m3]);
 }
 
 #[test]

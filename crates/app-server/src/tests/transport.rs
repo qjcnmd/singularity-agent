@@ -87,7 +87,7 @@ fn progress_event() -> Value {
     JsonRpcMessage::notification(
         "item/agentMessage/delta",
         serde_json::json!({
-            "item": {"item_id": "item_progress"},
+            "item": {"itemId": "item_progress"},
             "delta": "progress",
             "event": singularity_protocol::EventMetadata {
                 class: singularity_protocol::EventClass::Progress,

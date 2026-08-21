@@ -604,7 +604,7 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     let tool_started = responses
         .iter()
         .position(|value| {
-            value["method"] == "item/started" && value["params"]["item"]["item_id"] == "call_1"
+            value["method"] == "item/started" && value["params"]["item"]["itemId"] == "call_1"
         })
         .expect("tool item started");
     let execution_started = responses
@@ -618,7 +618,7 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     let tool_completed = responses
         .iter()
         .position(|value| {
-            value["method"] == "item/completed" && value["params"]["item"]["item_id"] == "call_1"
+            value["method"] == "item/completed" && value["params"]["item"]["itemId"] == "call_1"
         })
         .expect("tool item completed");
     assert!(tool_started < execution_started && execution_started < execution_ended);
@@ -923,7 +923,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
     fn read_status(server: &mut AppServer, id: i64, session_id: &str) -> serde_json::Value {
         server
             .handle_json(&format!(
-                r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{{"sessionId":"{session_id}","recentLimit":5}}}}"#
+                r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{{"sessionId":"{session_id}"}}}}"#
             ))
             .expect("session read")[0]["result"]["status"]
             .clone()
@@ -1091,14 +1091,12 @@ fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
             r#"{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{"turnId":"turn_live","input":[{"type":"text","text":"change direction"}]}}"#,
         )
         .expect("turn steer");
-    assert_eq!(steer_response[0]["result"]["outcome"], "active");
     assert_eq!(steer_response[0]["result"]["turn"]["status"], "running");
     let follow_up_response = server
         .handle_json(
             r#"{"jsonrpc":"2.0","method":"turn/followUp","id":4,"params":{"turnId":"turn_live","input":[{"type":"text","text":"keep going"}]}}"#,
         )
         .expect("turn followUp");
-    assert_eq!(follow_up_response[0]["result"]["outcome"], "active");
     assert_eq!(follow_up_response[0]["result"]["turn"]["status"], "running");
 
     // The production handles are typed atomic TurnInbox values rather than
@@ -1916,5 +1914,568 @@ fn single_metadata_failure_recovers_via_bounded_retry() {
         server.store().get_session(session_id).unwrap().status,
         Some(SessionStatus::Failed),
         "session status must be updated to Failed by compensation write"
+    );
+}
+
+/// 仅暴露 generator 契约的最小 Provider 假件，供 prompt 装配测试使用。
+struct PromptOnlyProvider;
+
+impl Provider for PromptOnlyProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        Err(ProviderError::from_model_error(ModelError::new(
+            ModelErrorKind::NetworkError,
+            "unused",
+        )))
+    }
+}
+
+#[test]
+fn agent_prompt_tool_list_matches_registry_names_only() {
+    let temp = tempfile::tempdir().expect("workspace dir");
+    let thread = singularity_protocol::Thread {
+        thread_id: "thread_prompt".to_string(),
+        model: None,
+        cwd: Some(temp.path().to_string_lossy().to_string()),
+        last_turn_status: None,
+    };
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| match name {
+            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            _ => None,
+        },
+        None,
+    );
+    let config = crate::lifecycle::agent_config_for_thread(&thread, &PromptOnlyProvider, &snapshot)
+        .expect("agent config resolves");
+    let names = ToolRegistry::new().names();
+    assert_eq!(names, ["bash", "edit", "read", "write"]);
+    for name in &names {
+        assert!(
+            config.system_prompt.contains(&format!("- {name}")),
+            "tool list must include {name}"
+        );
+    }
+    for tool_description in [
+        "bounded text read with line numbers and byte offsets",
+        "command execution and directory/file exploration",
+        "exact unique match and replacement within files",
+        "structured whole-file creation and overwrite",
+    ] {
+        assert!(
+            !config.system_prompt.contains(tool_description),
+            "prompt must list tool names only, not descriptions"
+        );
+    }
+}
+
+// ===== session/read turn+游标分页 =====
+
+use crate::dispatch::select_turn_page;
+
+/// 建一个带 settings 前导组的多轮会话：每轮一条 user 消息，偶数索引轮
+/// 额外带一条 toolResult 消息（供 kinds 过滤用例区分轮次）。
+fn seed_turned_session(
+    server: &AppServer,
+    sessions_dir: &Path,
+    session_id: &str,
+    turn_ids: &[&str],
+) -> String {
+    let sid = insert_session(server, sessions_dir, session_id, sessions_dir);
+    let path = sessions_dir.join(format!("{sid}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("reopen session");
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::thread_settings(
+                "openai_compatible",
+                "gpt-test",
+                None,
+            )
+            .expect("settings"),
+        )
+        .expect("append settings");
+    for (index, turn_id) in turn_ids.iter().enumerate() {
+        session
+            .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+                *turn_id,
+            ))
+            .expect("turn started");
+        session
+            .append_message(singularity_agent::message::AgentMessage::text(
+                singularity_agent::message::AgentMessageRole::User,
+                format!("user-{index}"),
+            ))
+            .expect("user message");
+        if index % 2 == 0 {
+            session
+                .append_message(singularity_agent::message::AgentMessage {
+                    role: singularity_agent::message::AgentMessageRole::ToolResult,
+                    content: vec![singularity_agent::message::ContentBlock::Text {
+                        text: format!("tool-output-{index}"),
+                    }],
+                    provider_reasoning_replay: None,
+                    tool_call_id: Some(format!("call-{index}")),
+                    tool_name: Some("bash".to_string()),
+                    is_error: None,
+                    timestamp: None,
+                })
+                .expect("tool result");
+        }
+        session
+            .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
+                *turn_id,
+            ))
+            .expect("turn completed");
+    }
+    // 生产顺序是终态 metadata 先落盘、索引后更新；fixture 保持同一不变量。
+    server
+        .store()
+        .update_session(
+            &sid,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Completed),
+                ..SessionMetadataUpdate::default()
+            },
+        )
+        .expect("mark session completed");
+    sid
+}
+
+fn session_read_response(server: &mut AppServer, id: i64, params: &str) -> serde_json::Value {
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{params}}}"#
+        ))
+        .expect("session read")[0]
+        .clone()
+}
+
+fn turn_page(result: &serde_json::Value) -> Vec<String> {
+    result["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .map(|turn| match turn["turnId"].as_str() {
+            Some(turn_id) => turn_id.to_string(),
+            None => "<prelude>".to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn session_read_pages_forward_and_backward_by_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = seed_turned_session(
+        &server,
+        &sessions_dir,
+        "1f0a2b3c-4d5e-4f60-8a92-b3c4d5e6f708",
+        &["t1", "t2", "t3"],
+    );
+
+    // 正向翻页：物理单元为 [前导组, t1, t2, t3]，limit=2。
+    let page1 = session_read_response(
+        &mut server,
+        10,
+        &format!(r#"{{"sessionId":"{sid}","limit":2,"sortDirection":"asc"}}"#),
+    );
+    let result1 = &page1["result"];
+    assert_eq!(
+        turn_page(result1),
+        vec!["<prelude>".to_string(), "t1".to_string()]
+    );
+    assert_eq!(result1["totalTurns"], 3);
+    assert_eq!(result1["status"], "completed");
+    let next_cursor = result1["nextCursor"].as_str().expect("next cursor");
+    let backwards1 = result1["backwardsCursor"]
+        .as_str()
+        .expect("backwards cursor");
+
+    let page2 = session_read_response(
+        &mut server,
+        11,
+        &format!(
+            r#"{{"sessionId":"{sid}","limit":2,"sortDirection":"asc","cursor":"{next_cursor}"}}"#
+        ),
+    );
+    let result2 = &page2["result"];
+    assert_eq!(turn_page(result2), vec!["t2".to_string(), "t3".to_string()]);
+    assert!(
+        result2["nextCursor"].is_null(),
+        "exhausted forward scan must not hand out a cursor"
+    );
+    assert!(
+        page2["result"]["turns"][1]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["type"] == "message" && item["text"] == "user-2")
+    );
+
+    // 反向翻页：默认 desc 从最新端开始，页内保持会话顺序。
+    let back1 = session_read_response(
+        &mut server,
+        12,
+        &format!(r#"{{"sessionId":"{sid}","limit":2}}"#),
+    );
+    let back_result = &back1["result"];
+    assert_eq!(
+        turn_page(back_result),
+        vec!["t2".to_string(), "t3".to_string()]
+    );
+    let back_next = back_result["nextCursor"].as_str().expect("desc next");
+    // 反向续页覆盖剩余的 [前导组, t1] 窗口。
+    let back2 = session_read_response(
+        &mut server,
+        13,
+        &format!(r#"{{"sessionId":"{sid}","limit":2,"cursor":"{back_next}"}}"#),
+    );
+    assert_eq!(
+        turn_page(&back2["result"]),
+        vec!["<prelude>".to_string(), "t1".to_string()]
+    );
+    assert!(back2["result"]["nextCursor"].is_null());
+
+    // backwards_cursor 以相反方向包含式重读同一窗口：锚点轮再次出现，
+    // 窗口内容与原页一致。
+    let reread = session_read_response(
+        &mut server,
+        14,
+        &format!(
+            r#"{{"sessionId":"{sid}","limit":2,"sortDirection":"desc","cursor":"{backwards1}"}}"#
+        ),
+    );
+    assert_eq!(
+        turn_page(&reread["result"]),
+        vec!["<prelude>".to_string(), "t1".to_string()],
+        "opposite-direction read from backwards_cursor includes the anchor turn"
+    );
+}
+
+#[test]
+fn session_read_rejects_invalid_and_out_of_range_cursors() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = seed_turned_session(
+        &server,
+        &sessions_dir,
+        "2c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5",
+        &["t1"],
+    );
+
+    for bad_cursor in ["garbage", "sg1t", "sg1tx", "sg1t-1", "sg1t99"] {
+        let response = session_read_response(
+            &mut server,
+            20,
+            &format!(r#"{{"sessionId":"{sid}","cursor":"{bad_cursor}"}}"#),
+        );
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "cursor {bad_cursor:?} must be rejected as invalid params"
+        );
+    }
+}
+
+#[test]
+fn session_read_kinds_filter_composes_with_pagination() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = seed_turned_session(
+        &server,
+        &sessions_dir,
+        "3d2e3f4a-5b6c-4d7e-8f90-a1b2c3d4e5f6",
+        &["t1", "t2", "t3", "t4"],
+    );
+
+    // kinds=["tool_result"]：只有 t1/t3 携带命中条目；被过滤掉的轮次
+    // 不占用每页配额，游标仍锚定物理位置。
+    let page1 = session_read_response(
+        &mut server,
+        30,
+        &format!(r#"{{"sessionId":"{sid}","limit":1,"kinds":["tool_result"]}}"#),
+    );
+    let result1 = &page1["result"];
+    assert_eq!(turn_page(result1), vec!["t3".to_string()]);
+    let items1 = result1["turns"][0]["items"].as_array().expect("items");
+    assert_eq!(items1.len(), 1);
+    assert_eq!(items1[0]["type"], "tool_result");
+    let next_cursor = result1["nextCursor"].as_str().expect("next cursor");
+
+    let page2 = session_read_response(
+        &mut server,
+        31,
+        &format!(
+            r#"{{"sessionId":"{sid}","limit":1,"kinds":["tool_result"],"cursor":"{next_cursor}"}}"#
+        ),
+    );
+    let result2 = &page2["result"];
+    assert_eq!(turn_page(result2), vec!["t1".to_string()]);
+    assert!(result2["nextCursor"].is_null());
+
+    // kind=turn 命中轮次本身：全部真实轮入选且条目为空，前导组出局。
+    let identity = session_read_response(
+        &mut server,
+        32,
+        &format!(r#"{{"sessionId":"{sid}","limit":10,"kinds":["turn"],"detail":"summary"}}"#),
+    );
+    let identity_result = &identity["result"];
+    assert_eq!(turn_page(identity_result), vec!["t1", "t2", "t3", "t4"]);
+    for turn in identity_result["turns"].as_array().unwrap() {
+        assert_eq!(
+            turn["items"].as_array().expect("items").len(),
+            0,
+            "summary detail keeps identity only"
+        );
+    }
+}
+
+#[test]
+fn session_read_detail_summary_keeps_identity_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = seed_turned_session(
+        &server,
+        &sessions_dir,
+        "4e3f4a5b-6c7d-4e8f-9a01-b2c3d4e5f6a7",
+        &["t1", "t2"],
+    );
+
+    let response = session_read_response(
+        &mut server,
+        40,
+        &format!(r#"{{"sessionId":"{sid}","detail":"summary"}}"#),
+    );
+    let result = &response["result"];
+    assert_eq!(
+        turn_page(result),
+        vec!["<prelude>".to_string(), "t1".to_string(), "t2".to_string()]
+    );
+    for turn in result["turns"].as_array().unwrap() {
+        assert!(turn["items"].as_array().expect("items").is_empty());
+    }
+    assert_eq!(result["turns"][1]["status"], "completed");
+    assert_eq!(result["totalTurns"], 2);
+
+    // 缺省 detail=full 时同请求携带完整条目。
+    let full = session_read_response(&mut server, 41, &format!(r#"{{"sessionId":"{sid}"}}"#));
+    let full_items = full["result"]["turns"][2]["items"]
+        .as_array()
+        .expect("items");
+    assert!(
+        full_items
+            .iter()
+            .any(|item| item["type"] == "message" && item["text"] == "user-1")
+    );
+}
+
+#[test]
+fn session_read_empty_session_returns_empty_page() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = insert_session(
+        &server,
+        &sessions_dir,
+        "5f4a5b6c-7d8e-4f90-8a12-c3d4e5f6a7b8",
+        &sessions_dir,
+    );
+
+    let response = session_read_response(&mut server, 50, &format!(r#"{{"sessionId":"{sid}"}}"#));
+    let result = &response["result"];
+    assert_eq!(result["turns"].as_array().expect("turns").len(), 0);
+    assert_eq!(result["totalTurns"], 0);
+    assert!(result["nextCursor"].is_null());
+    assert!(result["backwardsCursor"].is_null());
+    assert!(result["status"].is_null());
+}
+
+#[test]
+fn session_read_projects_crash_leftover_turn_as_interrupted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+    let sid = insert_session(
+        &server,
+        &sessions_dir,
+        "6a5b6c7d-8e9f-4a01-9b23-d4e5f6a7b8c9",
+        &workspace,
+    );
+    let path = sessions_dir.join(format!("{sid}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("reopen");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+            "t9",
+        ))
+        .expect("turn started");
+    session
+        .append_message(singularity_agent::message::AgentMessage::text(
+            singularity_agent::message::AgentMessageRole::User,
+            "crashed mid-turn",
+        ))
+        .expect("user message");
+    drop(session);
+    // 模拟崩溃遗留：索引行停在 active，但本进程没有存活 turn。
+    server
+        .store()
+        .update_session(
+            &sid,
+            SessionMetadataUpdate {
+                status: Some(SessionStatus::Active),
+                ..SessionMetadataUpdate::default()
+            },
+        )
+        .expect("force active row");
+
+    let response = session_read_response(&mut server, 60, &format!(r#"{{"sessionId":"{sid}"}}"#));
+    let result = &response["result"];
+    assert_eq!(result["status"], "interrupted");
+    assert_eq!(result["turns"][0]["turnId"], "t9");
+    assert_eq!(
+        result["turns"][0]["status"], "interrupted",
+        "trailing running turn must not contradict the overall projection"
+    );
+    assert!(!result["turns"][0]["items"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn select_turn_page_covers_direction_and_boundary_edges() {
+    let all = |_: usize| true;
+    // 恰好填满且同时耗尽：不发续页锚点。
+    let (page, next, backwards) = select_turn_page(3, all, HistorySortDirection::Asc, 3, None);
+    assert_eq!(page, vec![0, 1, 2]);
+    assert_eq!(next, None);
+    assert_eq!(backwards, Some(2));
+    // 填满且有剩余：续页锚点指向首个未检查位置。
+    let (page, next, _) = select_turn_page(5, all, HistorySortDirection::Asc, 2, None);
+    assert_eq!(page, vec![0, 1]);
+    assert_eq!(next, Some(2));
+    // 尾端无幸存者时不发续页锚点。
+    let head_only = |index: usize| index < 3;
+    let (page, next, backwards) =
+        select_turn_page(5, head_only, HistorySortDirection::Asc, 3, None);
+    assert_eq!(page, vec![0, 1, 2]);
+    assert_eq!(next, None);
+    assert_eq!(backwards, Some(2));
+    // desc 从最新端开始、升序返回；远端锚点为本页最旧一轮。
+    let (page, next, backwards) = select_turn_page(4, all, HistorySortDirection::Desc, 2, None);
+    assert_eq!(page, vec![2, 3]);
+    assert_eq!(next, Some(1));
+    assert_eq!(backwards, Some(2));
+    // 空序列与零 limit 直接返回空页。
+    for limit in [0usize, 2] {
+        let (page, next, backwards) =
+            select_turn_page(0, all, HistorySortDirection::Desc, limit, None);
+        assert!(page.is_empty());
+        assert_eq!(next, None);
+        assert_eq!(backwards, None);
+    }
+}
+
+#[test]
+fn project_turn_history_groups_boundaries_and_marks_leftovers() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut session = SessionManager::create_with_id(
+        temp.path(),
+        temp.path(),
+        "7b6c7d8e-9fa0-4b12-8c34-e5f6a7b8c9d0",
+    )
+    .expect("session file");
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::thread_settings(
+                "openai_compatible",
+                "gpt-test",
+                None,
+            )
+            .expect("settings"),
+        )
+        .expect("settings");
+    // t1 崩溃遗留：只有开始标记，后面又开了新轮。
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+            "t1",
+        ))
+        .expect("t1 started");
+    session
+        .append_message(singularity_agent::message::AgentMessage::text(
+            singularity_agent::message::AgentMessageRole::User,
+            "one",
+        ))
+        .expect("msg one");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
+            "t2",
+        ))
+        .expect("t2 started");
+    session
+        .append_message(singularity_agent::message::AgentMessage::text(
+            singularity_agent::message::AgentMessageRole::User,
+            "two",
+        ))
+        .expect("msg two");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
+            "t2",
+        ))
+        .expect("t2 completed");
+    // 异常布局：无开始标记的终态标记保真为条目而不是改写身份。
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_failed(
+            "ghost", "boom",
+        ))
+        .expect("ghost terminal");
+    let entries = session.entries().to_vec();
+    drop(session);
+
+    let turns = project_turn_history(&entries);
+    assert_eq!(turns.len(), 3);
+    assert!(turns[0].turn_id.is_none() && turns[0].status.is_none());
+    assert_eq!(
+        turns[0]
+            .items
+            .iter()
+            .map(|item| item.kind())
+            .collect::<Vec<_>>(),
+        vec!["settings"]
+    );
+    // 非末组的未终止轮按崩溃遗留投影为 interrupted。
+    assert_eq!(turns[1].turn_id.as_deref(), Some("t1"));
+    assert_eq!(turns[1].status, Some(TurnStatus::Interrupted));
+    assert_eq!(turns[2].turn_id.as_deref(), Some("t2"));
+    assert_eq!(turns[2].status, Some(TurnStatus::Completed));
+    assert_eq!(
+        turns[2]
+            .items
+            .iter()
+            .map(|item| item.kind())
+            .collect::<Vec<_>>(),
+        vec!["message", "turn"],
+        "unmatched terminal marker stays visible as a turn item"
     );
 }

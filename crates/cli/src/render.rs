@@ -99,7 +99,7 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
                     "tool_call_id": params.tool_call_id,
                     "tool_name": params.tool_name,
                     "result": params.result,
-                    "is_error": params.is_error,
+                    "is_error": params.result.is_error,
                 },
             }))
         }
@@ -228,7 +228,7 @@ pub(super) fn render_messages(messages: &[JsonRpcNotification], render_assistant
 
 // 判断是否应额外输出已完成的 assistant 摘要。
 pub(super) fn should_render_assistant_summary(turn: &Turn) -> bool {
-    turn.status == TurnStatus::Completed && turn.agent_loop_status == "completed"
+    turn.status == TurnStatus::Completed
 }
 
 // 渲染 turn 的稳定状态行。
@@ -236,21 +236,13 @@ pub(super) fn render_turn(turn: &Turn) {
     if turn.turn_id.is_empty() {
         return;
     }
-    println!(
-        "turn {} {} agent_loop_status={}",
-        turn.turn_id,
-        turn.status.as_storage_text(),
-        turn.agent_loop_status
-    );
+    println!("turn {} {}", turn.turn_id, turn.status.as_storage_text(),);
 }
 
 // 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。
 pub(super) fn fail_for_failed_turn(turn: &Turn) -> Result<(), String> {
     let status = turn.status.as_storage_text();
-    let agent_loop_status = turn.agent_loop_status.as_str();
-    if matches!(turn.status, TurnStatus::Failed | TurnStatus::Interrupted)
-        || matches!(agent_loop_status, "failed" | "cancelled")
-    {
+    if matches!(turn.status, TurnStatus::Failed | TurnStatus::Interrupted) {
         if turn.turn_id.is_empty() {
             return Err(format!("error {status}: turn {status}"));
         }

@@ -593,7 +593,7 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
     // 注册前置保证：turn/started 回执之后立即中断必成功，无需人为等待。
     process.send_request(5, "turn/interrupt", json!({"turnId": turn_id}));
     let interrupt = process.output.recv_id(5, Duration::from_secs(5));
-    assert_eq!(interrupt["result"]["status"], "cancel_requested");
+    assert_eq!(interrupt["result"]["status"], "interrupted");
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
     assert_eq!(turn_response["result"]["turn"]["status"], "running");
     let terminal = process
@@ -602,15 +602,14 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
             message["method"] == "turn/completed"
         });
     assert_eq!(terminal["params"]["turn"]["status"], "interrupted");
-    assert_eq!(terminal["params"]["turn"]["agent_loop_status"], "cancelled");
     let tool_terminal = process
         .output
         .recv_where(Duration::from_secs(5), |message| {
             message["method"] == "item/failed"
-                && message["params"]["item"]["item_id"] == "call_interrupt_0"
+                && message["params"]["item"]["itemId"] == "call_interrupt_0"
         });
     assert_eq!(
-        tool_terminal["params"]["item"]["item_id"],
+        tool_terminal["params"]["item"]["itemId"],
         "call_interrupt_0"
     );
     assert!(
@@ -706,10 +705,7 @@ fn steer_immediately_after_started_is_accepted() {
         json!({"turnId": turn_id, "input": [{"type": "text", "text": "steer after tools"}]}),
     );
     let steer = process.output.recv_id(5, Duration::from_secs(5));
-    assert_eq!(
-        steer["result"]["outcome"], "active",
-        "steer right after started must be accepted: {steer}"
-    );
+    // steer right after started must be accepted (non-error response with running turn).
     assert_eq!(steer["result"]["turn"]["status"], "running");
 
     let turn_response = process.output.recv_id(4, Duration::from_secs(30));
@@ -1131,7 +1127,7 @@ fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
                 .recv_where(Duration::from_secs(5), |message| {
                     message["method"] == method
                         && (message["params"]["toolCallId"] == "shared-tool-call"
-                            || message["params"]["item"]["item_id"] == "shared-tool-call")
+                            || message["params"]["item"]["itemId"] == "shared-tool-call")
                 });
             let params = &event["params"];
             let thread = params["threadId"].as_str().expect("event threadId");
@@ -1141,7 +1137,7 @@ fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
             if method.starts_with("tool/") {
                 assert_eq!(params["toolCallId"], "shared-tool-call");
             } else {
-                assert_eq!(params["item"]["item_id"], "shared-tool-call");
+                assert_eq!(params["item"]["itemId"], "shared-tool-call");
             }
         }
         assert_eq!(seen, expected, "event method {method}");

@@ -67,24 +67,6 @@ pub(crate) fn turn_failure_from_error(
     }
 }
 
-pub(crate) fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
-    match status {
-        AgentStatus::Completed => TurnStatus::Completed,
-        AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
-        AgentStatus::Running => TurnStatus::Running,
-        AgentStatus::Failed => TurnStatus::Failed,
-    }
-}
-
-pub(crate) fn session_status_for_agent(status: &AgentStatus) -> SessionStatus {
-    match status {
-        AgentStatus::Completed => SessionStatus::Completed,
-        AgentStatus::CancelRequested | AgentStatus::Cancelled => SessionStatus::Interrupted,
-        AgentStatus::Running => SessionStatus::Active,
-        AgentStatus::Failed => SessionStatus::Failed,
-    }
-}
-
 pub(crate) fn terminal_metadata_for_status(
     turn_id: &str,
     status: SessionStatus,
@@ -106,12 +88,6 @@ pub(crate) fn terminal_metadata_for_status(
         ),
         SessionStatus::Active => None,
     }
-}
-
-pub(crate) fn mark_run_cancelled(status: &mut RunStatus) {
-    status.status = AgentStatus::Cancelled;
-    status.final_answer = None;
-    status.error = None;
 }
 
 impl AppServer {

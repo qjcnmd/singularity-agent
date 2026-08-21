@@ -12,8 +12,8 @@ use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    OpenAiProvider, ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderError,
-    ProviderToolReasoningMode, ThinkingWireFormat, configuration_error,
+    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderToolReasoningMode,
+    ThinkingWireFormat, configuration_error,
 };
 
 /// 脱敏的模型提供方配置存在性信息；这里永不存储敏感信息。
@@ -115,8 +115,6 @@ pub(crate) struct ConfiguredModel {
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-    /// 合并后的显式能力声明（config.json 或 models.json `capabilities` 块）。
-    pub(crate) capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,8 +160,6 @@ pub(crate) struct ModelsFileModel {
     pub(crate) requires_assistant_content_for_tool_calls: bool,
     #[serde(default)]
     pub(crate) thinking_wire_format: Option<String>,
-    #[serde(default)]
-    pub(crate) capabilities: Option<ProviderCapabilityDeclaration>,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]

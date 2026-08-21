@@ -28,8 +28,8 @@ use super::{
     ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
     ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig,
     PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage, ProviderToolReasoningMode,
-    ThinkingWireFormat, validate_provider_config,
+    ProviderError, ProviderErrorStage, ProviderToolReasoningMode, ThinkingWireFormat,
+    validate_provider_config,
 };
 
 #[cfg(test)]
@@ -39,6 +39,7 @@ use filesystem::write_json_file;
 #[cfg(test)]
 pub(crate) use runtime::capture_models_file;
 pub(super) use selection::model_selector_error;
+pub use selection::{ModelSelectorParts, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
@@ -286,36 +287,40 @@ pub(crate) struct ResolvedProviderValues {
     pub(crate) user_config_error: Option<ProviderError>,
 }
 
-fn configured_model_from_file(
-    model_file: ModelsFileModel,
-    capability_overrides: Option<ProviderCapabilityDeclaration>,
+fn configured_model_from_user_file(
+    provider_name: &str,
+    model_name: &str,
+    model_file: &UserConfigModel,
 ) -> Result<ConfiguredModel, ProviderError> {
-    let protocol = parse_catalog_protocol(&model_file.api_protocol)?;
-    let max_context_tokens = model_file.max_context_tokens;
-    let max_output_tokens = model_file
-        .max_output_tokens
-        .or_else(|| {
-            capability_overrides
-                .as_ref()
-                .and_then(|capabilities| capabilities.max_output_tokens)
-        })
-        .ok_or_else(|| {
-            configuration_error(
-                "model configuration must declare max_output_tokens",
-                "provider_configuration_invalid",
-            )
-        })?;
+    // 顶层字段为唯一权威；内置表只兜底缺省的 max_context_tokens/max_output_tokens。
+    // api_protocol 和 max_output_tokens 必须由用户显式声明。
+    let builtin = super::builtin_models::builtin_model(provider_name, model_name);
+    let (Some(api_protocol), Some(max_output_tokens)) = (
+        model_file.api_protocol.as_deref(),
+        model_file
+            .max_output_tokens
+            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
+    ) else {
+        return Err(configuration_error(
+            "model override is incomplete; api_protocol and max_output_tokens are required",
+            "provider_configuration_invalid",
+        ));
+    };
+    let protocol = parse_catalog_protocol(api_protocol)?;
+    let max_context_tokens = model_file
+        .max_context_tokens
+        .or_else(|| builtin.map(|entry| entry.context_window));
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = model_file
         .reasoning_variants
-        .into_iter()
+        .iter()
         .map(|(variant, descriptor)| {
             (
-                variant,
+                variant.clone(),
                 ReasoningVariant {
                     enabled: descriptor.enabled,
-                    wire_effort: descriptor.wire_effort,
+                    wire_effort: descriptor.wire_effort.clone(),
                 },
             )
         })
@@ -376,7 +381,7 @@ fn configured_model_from_file(
         max_context_tokens,
         max_output_tokens,
         reasoning_variants,
-        default_variant: model_file.default_variant,
+        default_variant: model_file.default_variant.clone(),
         thinking_wire_format,
         tool_reasoning_mode,
         supports_developer_role,
@@ -385,74 +390,7 @@ fn configured_model_from_file(
             .requires_reasoning_content_for_tool_calls,
         requires_assistant_content_for_tool_calls: model_file
             .requires_assistant_content_for_tool_calls,
-        capability_overrides,
     })
-}
-
-fn configured_model_from_user_file(
-    provider_name: &str,
-    model_name: &str,
-    model_file: &UserConfigModel,
-) -> Result<ConfiguredModel, ProviderError> {
-    // 合并优先级：顶层字段 > capabilities 内嵌 > 内置模型表 > 默认值。capabilities 块
-    // 是旧 probe 时代 config.json 的显式声明残留，接受并投影到静态契约。内置表只兜
-    // 底缺省的 context_window/max_output_tokens；api_protocol 仍必须由用户声明。
-    let capabilities = model_file.capabilities.clone().unwrap_or_default();
-    let builtin = super::builtin_models::builtin_model(provider_name, model_name);
-    let (Some(api_protocol), Some(max_output_tokens)) = (
-        model_file.api_protocol.as_deref(),
-        model_file
-            .max_output_tokens
-            .or(capabilities.max_output_tokens)
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
-    ) else {
-        return Err(configuration_error(
-            "model override is incomplete; api_protocol and max_output_tokens are required",
-            "provider_configuration_invalid",
-        ));
-    };
-    let capability_overrides = ProviderCapabilityDeclaration {
-        supports_tools: capabilities.supports_tools,
-        supports_parallel_tool_calls: capabilities.supports_parallel_tool_calls,
-        supports_strict_tool_schema: capabilities.supports_strict_tool_schema,
-        supports_system_message: capabilities.supports_system_message,
-        supports_developer_message: capabilities.supports_developer_message,
-        supports_reasoning: capabilities.supports_reasoning,
-        max_tools_per_request: capabilities.max_tools_per_request,
-        max_parallel_tool_calls: capabilities.max_parallel_tool_calls,
-        max_context_tokens: model_file
-            .max_context_tokens
-            .or(capabilities.max_context_tokens)
-            .or_else(|| builtin.map(|entry| entry.context_window)),
-        max_output_tokens: model_file
-            .max_output_tokens
-            .or(capabilities.max_output_tokens)
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
-    };
-    configured_model_from_file(
-        ModelsFileModel {
-            api_protocol: api_protocol.to_string(),
-            max_context_tokens: capability_overrides.max_context_tokens,
-            max_output_tokens: Some(max_output_tokens),
-            reasoning_variants: model_file.reasoning_variants.clone(),
-            default_variant: model_file.default_variant.clone(),
-            tool_reasoning_history: model_file.tool_reasoning_history.clone(),
-            supports_developer_role: Some(
-                model_file
-                    .supports_developer_role
-                    .or(capabilities.supports_developer_message)
-                    .unwrap_or(true),
-            ),
-            supports_tool_choice: Some(model_file.supports_tool_choice.unwrap_or(true)),
-            requires_reasoning_content_for_tool_calls: model_file
-                .requires_reasoning_content_for_tool_calls,
-            requires_assistant_content_for_tool_calls: model_file
-                .requires_assistant_content_for_tool_calls,
-            thinking_wire_format: model_file.thinking_wire_format.clone(),
-            capabilities: None,
-        },
-        Some(capability_overrides),
-    )
 }
 
 fn capture_user_model_selection<P>(

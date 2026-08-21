@@ -14,8 +14,8 @@ use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
     DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
     ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
-    ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderConfigSource, ProviderError,
-    ProviderToolReasoningMode, RESPONSES_PATH, ThinkingWireFormat,
+    ProviderApiProtocol, ProviderConfigSource, ProviderError, ProviderToolReasoningMode,
+    RESPONSES_PATH, ThinkingWireFormat,
 };
 use std::fmt;
 use std::future::Future;
@@ -227,8 +227,6 @@ pub(crate) struct SelectedModel {
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-    /// 合并后的用户显式能力声明；协议契约构造时叠加到静态基线。
-    pub(crate) capability_overrides: Option<ProviderCapabilityDeclaration>,
 }
 
 /// Provider transport runtime ownership: an app-server borrows its existing handle, while

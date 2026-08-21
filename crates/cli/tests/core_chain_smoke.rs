@@ -351,10 +351,6 @@ fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
     // threshold, while the compacted follow-up request fits within budget.
     model["max_context_tokens"] = Value::from(48_000_u64);
     model["max_output_tokens"] = Value::from(8_192_u64);
-    if let Some(capabilities) = model.get_mut("capabilities") {
-        capabilities["max_context_tokens"] = Value::from(48_000_u64);
-        capabilities["max_output_tokens"] = Value::from(8_192_u64);
-    }
     fs::write(
         &fixture.config_path,
         serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,

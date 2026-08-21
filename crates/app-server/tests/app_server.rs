@@ -172,7 +172,7 @@ fn removed_thread_and_turn_methods_return_stable_errors() {
 }
 
 #[test]
-fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
+fn session_read_returns_turn_page_then_delete_removes_both() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -188,7 +188,7 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
         .expect("session id")
         .to_string();
     let rollout = home.join("sessions").join(format!("{session_id}.jsonl"));
-    // 追加两条 message 条目，验证 read 返回“最近片段”而非空/全文。
+    // 追加两条无轮次标记的 message 条目，验证 read 把它们归入前导组返回。
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&rollout)
@@ -205,25 +205,42 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
     .expect("append entry");
     drop(file);
 
-    process.send_request(
-        4,
-        "session/read",
-        json!({"sessionId": session_id, "recentLimit": 1}),
-    );
+    process.send_request(4, "session/read", json!({"sessionId": session_id}));
     let read = process.output.recv_id(4, Duration::from_secs(5));
     assert_eq!(read["result"]["sessionId"], session_id);
-    assert_eq!(read["result"]["totalEntries"], 2);
+    assert_eq!(read["result"]["totalTurns"], 0);
+    let turns = read["result"]["turns"].as_array().expect("turns");
+    assert_eq!(turns.len(), 1, "prelude entries form one leading group");
+    assert!(turns[0]["turnId"].is_null());
+    assert!(turns[0]["status"].is_null());
+    assert_eq!(turns[0]["items"].as_array().expect("items").len(), 2);
+    assert!(read["result"]["nextCursor"].is_null());
+    // 页非空时反向锚点可用：以相反方向重读应包含锚点所在的同一窗口。
+    let backwards = read["result"]["backwardsCursor"]
+        .as_str()
+        .expect("backwards cursor");
+    process.send_request(
+        5,
+        "session/read",
+        json!({"sessionId": session_id, "cursor": backwards, "sortDirection": "asc"}),
+    );
+    let reread = process.output.recv_id(5, Duration::from_secs(5));
     assert_eq!(
-        read["result"]["recentEntries"]
+        reread["result"]["turns"].as_array().expect("turns").len(),
+        1,
+        "opposite-direction reread from backwards_cursor includes the anchor turn"
+    );
+    assert_eq!(
+        reread["result"]["turns"][0]["items"]
             .as_array()
-            .expect("entries")
+            .expect("items")
             .len(),
-        1
+        2
     );
     assert!(read["result"]["summary"].is_null());
 
-    process.send_request(5, "session/delete", json!({"sessionId": session_id}));
-    let deleted = process.output.recv_id(5, Duration::from_secs(5));
+    process.send_request(6, "session/delete", json!({"sessionId": session_id}));
+    let deleted = process.output.recv_id(6, Duration::from_secs(5));
     assert_eq!(deleted["result"]["deleted"], true);
     assert!(
         !rollout.exists(),

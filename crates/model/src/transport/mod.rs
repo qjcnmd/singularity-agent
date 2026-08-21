@@ -1376,8 +1376,6 @@ fn validate_response_tool_reasoning_contract(
 impl Provider for OpenAiProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         let mut contract = self.config.protocol_contract();
-        // Catalog 克隆：用户显式能力声明（config.json `capabilities` 块）叠加到静态基线；
-        // 顶层字段优先的合并已在配置解析时完成，这里只做声明 → 契约投影。
         // reasoning 变体关闭时 selection.tool_reasoning_mode 已收敛为
         // DisabledForToolCalls（config.rs 选择器解析），契约直接透传。
         contract.tool_reasoning_mode = self
@@ -1385,36 +1383,6 @@ impl Provider for OpenAiProvider {
             .as_ref()
             .map(|selection| selection.tool_reasoning_mode)
             .unwrap_or(ProviderToolReasoningMode::Unspecified);
-        if let Some(overrides) = self
-            .selected_model
-            .as_ref()
-            .and_then(|selection| selection.capability_overrides.as_ref())
-        {
-            contract.supports_tools = overrides.supports_tools.unwrap_or(contract.supports_tools);
-            contract.supports_parallel_tool_calls = overrides
-                .supports_parallel_tool_calls
-                .unwrap_or(contract.supports_parallel_tool_calls);
-            contract.supports_strict_tool_schema = overrides
-                .supports_strict_tool_schema
-                .unwrap_or(contract.supports_strict_tool_schema);
-            contract.supports_system_message = overrides
-                .supports_system_message
-                .unwrap_or(contract.supports_system_message);
-            contract.supports_developer_message = overrides
-                .supports_developer_message
-                .unwrap_or(contract.supports_developer_message);
-            contract.max_tools_per_request = overrides
-                .max_tools_per_request
-                .unwrap_or(contract.max_tools_per_request);
-            contract.max_parallel_tool_calls = overrides
-                .max_parallel_tool_calls
-                .unwrap_or(contract.max_parallel_tool_calls);
-            contract.max_context_tokens =
-                overrides.max_context_tokens.or(contract.max_context_tokens);
-            contract.max_output_tokens = overrides
-                .max_output_tokens
-                .unwrap_or(contract.max_output_tokens);
-        }
         contract
     }
 
