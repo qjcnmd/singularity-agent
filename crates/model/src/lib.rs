@@ -29,7 +29,8 @@ pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub(crate) const V1_RESPONSES_PATH: &str = "/v1/responses";
 pub(crate) const USER_CONFIG_DIR_NAME: &str = ".singularity";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
-pub(crate) const USER_AUTH_GENERATION_PREFIX: &str = "auth.v1-";
+/// 用户凭据唯一文件：写入走临时文件 + 同卷原子改名，读侧只认这一个文件名。
+pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.v1.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const USER_MODELS_CACHE_FILE_NAME: &str = "models-cache.json";
 pub(crate) const USER_MODELS_CACHE_SCHEMA_VERSION: u32 = 1;

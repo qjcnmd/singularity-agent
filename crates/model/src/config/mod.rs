@@ -24,12 +24,12 @@ pub use user::{
 };
 
 use super::{
-    DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
-    ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
-    ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig,
-    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage, ProviderToolReasoningMode,
-    ThinkingWireFormat, validate_provider_config,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME, ENV_API_KEY,
+    ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS, ENV_MODEL, ENV_PROVIDER,
+    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
+    OpenAiProvider, OpenAiProviderConfig, PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
+    PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderError,
+    ProviderErrorStage, ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
 };
 
 #[cfg(test)]
@@ -394,23 +394,23 @@ fn configured_model_from_user_file(
     model_name: &str,
     model_file: &UserConfigModel,
 ) -> Result<ConfiguredModel, ProviderError> {
-    // 合并优先级：顶层字段 > capabilities 内嵌 > 内置模型表 > 默认值。capabilities 块
-    // 是旧 probe 时代 config.json 的显式声明残留，接受并投影到静态契约。内置表只兜
-    // 底缺省的 context_window/max_output_tokens；api_protocol 仍必须由用户声明。
+    // 合并优先级：顶层字段 > capabilities 内嵌 > 内置模型表 > 运行时默认值。
+    // capabilities 块是旧 probe 时代 config.json 的显式声明残留，接受并投影到
+    // 静态契约。内置表与默认值只兜底缺省的 context_window/max_output_tokens；
+    // api_protocol 仍必须由用户声明，协议无法安全猜测。
     let capabilities = model_file.capabilities.clone().unwrap_or_default();
     let builtin = super::builtin_models::builtin_model(provider_name, model_name);
-    let (Some(api_protocol), Some(max_output_tokens)) = (
-        model_file.api_protocol.as_deref(),
-        model_file
-            .max_output_tokens
-            .or(capabilities.max_output_tokens)
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
-    ) else {
+    let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
-            "model override is incomplete; api_protocol and max_output_tokens are required",
+            "model override is incomplete; api_protocol is required",
             "provider_configuration_invalid",
         ));
     };
+    let max_output_tokens = model_file
+        .max_output_tokens
+        .or(capabilities.max_output_tokens)
+        .or_else(|| builtin.map(|entry| entry.max_output_tokens))
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let capability_overrides = ProviderCapabilityDeclaration {
         supports_tools: capabilities.supports_tools,
         supports_parallel_tool_calls: capabilities.supports_parallel_tool_calls,
@@ -423,11 +423,9 @@ fn configured_model_from_user_file(
         max_context_tokens: model_file
             .max_context_tokens
             .or(capabilities.max_context_tokens)
-            .or_else(|| builtin.map(|entry| entry.context_window)),
-        max_output_tokens: model_file
-            .max_output_tokens
-            .or(capabilities.max_output_tokens)
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
+            .or_else(|| builtin.map(|entry| entry.context_window))
+            .or(Some(DEFAULT_MAX_CONTEXT_TOKENS)),
+        max_output_tokens: Some(max_output_tokens),
     };
     configured_model_from_file(
         ModelsFileModel {

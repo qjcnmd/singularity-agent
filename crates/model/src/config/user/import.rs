@@ -7,8 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{
-    UserAuthFile, UserAuthProvider, acquire_config_writer_lock, new_auth_generation_name,
-    write_new_auth_generation,
+    UserAuthFile, UserAuthProvider, acquire_config_writer_lock, user_auth_file_path,
 };
 use super::catalog::user_model_override_is_selectable;
 use super::{
@@ -92,7 +91,6 @@ pub fn import_env_to_user_config(
             version: 1,
             default_provider: None,
             default_model: None,
-            auth_generation: None,
             providers: BTreeMap::new(),
         },
         auth: UserAuthFile {
@@ -139,16 +137,15 @@ pub fn import_env_to_user_config(
     );
     let auth_text = serde_json::to_string_pretty(&auth)
         .map_err(|_| user_config_error("user provider auth could not be serialized"))?;
-    let generation = new_auth_generation_name();
-    config.auth_generation = Some(generation.clone());
     let config_text = serde_json::to_string_pretty(&config)
         .map_err(|_| user_config_error("user provider config could not be serialized"))?;
     let config_path = directory.join(USER_CONFIG_FILE_NAME);
-    let auth_path = write_new_auth_generation(&directory, &generation, &auth_text)?;
-    if let Err(error) = write_json_file(&config_path, &config_text, false) {
-        let _ = std::fs::remove_file(&auth_path);
-        return Err(error);
-    }
+    let auth_path = user_auth_file_path(&directory)?;
+    // 两个文件各自经临时文件 + 同卷原子改名落盘。auth 先写：config 写入失败时
+    // 保留新凭据（同 provider 的 api_key 更新对旧 config 无害），重试导入即可收敛；
+    // 绝不删除唯一凭据文件回滚，否则会连带丢弃既有凭据。
+    write_json_file(&auth_path, &auth_text, true)?;
+    write_json_file(&config_path, &config_text, false)?;
     Ok(UserConfigImportResult {
         config_path: config_path.to_string_lossy().to_string(),
         auth_path: auth_path.to_string_lossy().to_string(),

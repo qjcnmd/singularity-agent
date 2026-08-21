@@ -1,7 +1,10 @@
 //! 项目级指令文件（`AGENTS.md`）加载与合并模块。
 //!
 //! 支持从工作区根目录（Workspace Root）逐层向下检索至当前工作目录（CWD），
-//! 并按照层级顺序合并指令内容，附加最大单文件（32KB）与总文件大小（64KB）的安全限制。
+//! 并按照层级顺序合并指令内容。单文件超 32KB 时按预算截断为前缀纳入；合并总
+//! 预算 64KB 用尽即停止纳入后续文件。预算导致的截断通过
+//! [`ProjectInstructions::truncated()`] 暴露而非报错；
+//! 真正的 I/O 错误（读取失败、非法 UTF-8 等）仍 fail closed。
 
 use std::fmt::{Display, Formatter};
 use std::io;
@@ -21,12 +24,19 @@ const PROJECT_ROOT_MARKER: &str = ".git";
 pub struct ProjectInstructions {
     /// 按 workspace root 到 cwd 顺序合并、且唯一发送给模型的正文。
     content: String,
+    /// 是否因单文件超限或合并预算用尽而截断了项目指令正文。
+    truncated: bool,
 }
 
 impl ProjectInstructions {
     /// Returns the model-visible merged instruction text.
     pub fn content(&self) -> &str {
         &self.content
+    }
+
+    /// 项目指令是否因预算超限而被截断。
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -40,8 +50,6 @@ pub enum ProjectInstructionErrorCode {
     WorkingDirectoryOutsideWorkspace,
     MetadataReadFailed,
     UnsupportedFileType,
-    FileTooLarge,
-    TotalTooLarge,
     FileReadFailed,
     InvalidUtf8,
 }
@@ -63,8 +71,6 @@ impl ProjectInstructionErrorCode {
             }
             Self::MetadataReadFailed => "project_instruction_metadata_read_failed",
             Self::UnsupportedFileType => "project_instruction_unsupported_file_type",
-            Self::FileTooLarge => "project_instruction_file_too_large",
-            Self::TotalTooLarge => "project_instruction_total_too_large",
             Self::FileReadFailed => "project_instruction_file_read_failed",
             Self::InvalidUtf8 => "project_instruction_invalid_utf8",
         }
@@ -160,7 +166,8 @@ pub fn load_project_instructions(
 
     let mut content = String::new();
     let mut found = false;
-    let mut total_bytes = 0usize;
+    let mut truncated = false;
+    let mut remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES;
     for directory in instruction_directories(&workspace_root, &cwd) {
         let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let instruction_file = read_project_instruction_file(
@@ -171,20 +178,29 @@ pub fn load_project_instructions(
         let Some(instruction_file) = instruction_file else {
             continue;
         };
-        total_bytes = total_bytes
-            .checked_add(instruction_file.byte_len)
-            .ok_or_else(|| {
-                ProjectInstructionError::at_path(
-                    ProjectInstructionErrorCode::TotalTooLarge,
-                    instruction_file.relative_path.clone(),
-                )
-            })?;
-        if total_bytes > PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES {
-            return Err(ProjectInstructionError::at_path(
-                ProjectInstructionErrorCode::TotalTooLarge,
-                instruction_file.relative_path.clone(),
-            ));
+        if instruction_file.truncated {
+            truncated = true;
         }
+        // 预算制：剩余合并预算用尽即停止纳入后续文件。
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let byte_len = instruction_file.byte_len;
+        if byte_len > remaining {
+            // 该文件只能纳入剩余预算内的有效 UTF-8 前缀。
+            let (take, _) = budget_prefix(&instruction_file.text, remaining);
+            if !take.trim().is_empty() {
+                if !content.is_empty() {
+                    content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
+                }
+                content.push_str(take);
+                found = true;
+            }
+            truncated = true;
+            break;
+        }
+        remaining -= byte_len;
         if instruction_file.text.trim().is_empty() {
             continue;
         }
@@ -198,14 +214,17 @@ pub fn load_project_instructions(
     if !found {
         Ok(None)
     } else {
-        Ok(Some(ProjectInstructions { content }))
+        Ok(Some(ProjectInstructions { content, truncated }))
     }
 }
 
 struct ProjectInstructionFile {
-    relative_path: PathBuf,
+    /// 纳入模型视图的文件文本（已按文件预算截断为有效 UTF-8 前缀）。
     text: String,
+    /// 纳入文本的字节长度（≤ 文件预算）。
     byte_len: usize,
+    /// 该文件是否因超过文件预算而被截断。
+    truncated: bool,
 }
 
 /// 待检查指令的目录：`dir` 为绝对路径（读取用），`relative_path` 为 workspace 相对路径（provenance 用）。
@@ -261,12 +280,6 @@ fn read_project_instruction_file(
             relative_path.to_path_buf(),
         ));
     }
-    if metadata.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES as u64 {
-        return Err(ProjectInstructionError::at_path(
-            ProjectInstructionErrorCode::FileTooLarge,
-            relative_path.to_path_buf(),
-        ));
-    }
     let bytes = std::fs::read(&path).map_err(|error| {
         ProjectInstructionError::with_io_kind(
             ProjectInstructionErrorCode::FileReadFailed,
@@ -274,24 +287,31 @@ fn read_project_instruction_file(
             &error,
         )
     })?;
-    if bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES {
-        return Err(ProjectInstructionError::at_path(
-            ProjectInstructionErrorCode::FileTooLarge,
-            relative_path.to_path_buf(),
-        ));
-    }
-    let byte_len = bytes.len();
-    let text = String::from_utf8(bytes).map_err(|_| {
+    let full_text = String::from_utf8(bytes).map_err(|_| {
         ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::InvalidUtf8,
             relative_path.to_path_buf(),
         )
     })?;
+    let (text, truncated) = budget_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    let byte_len = text.len();
     Ok(Some(ProjectInstructionFile {
-        relative_path: relative_path.to_path_buf(),
-        text,
+        text: text.to_string(),
         byte_len,
+        truncated,
     }))
+}
+
+/// 返回不超过 `max_bytes` 字节的有效 UTF-8 文本前缀；`text` 超长则截断并返回 `true`。
+fn budget_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
 }
 
 fn canonicalize_directory(
