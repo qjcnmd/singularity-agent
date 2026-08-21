@@ -113,6 +113,22 @@ fn custom_spec(
         name,
         description: "parallelism test tool",
         parameters,
+        supports_parallel: true,
+        execute,
+    }
+}
+
+/// 顺序测试工具按名称构造，标记为 sequential（supports_parallel=false）。
+fn sequential_spec(
+    name: &'static str,
+    execute: for<'a> fn(ExecuteContext<'a>) -> std::result::Result<ToolExecution, ToolError>,
+    parameters: Value,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        description: "sequential test tool",
+        parameters,
+        supports_parallel: false,
         execute,
     }
 }
@@ -1653,7 +1669,9 @@ fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
 }
 
 #[test]
-fn same_file_edits_are_serialized_and_preserve_both_changes() {
+fn batch_with_sequential_tool_runs_serially_and_preserves_both_edits() {
+    // edit 会被声明为 sequential；即使 provider 允许并行（max_parallel_tool_calls=8），
+    // 含 edit 的整批也按模型原始顺序串行执行，两次编辑都成功且互不覆盖。
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("shared.txt"), "a\nb").unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
@@ -1710,6 +1728,129 @@ fn same_file_edits_are_serialized_and_preserve_both_changes() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
         "A\nB"
+    );
+}
+
+#[test]
+fn bash_and_edit_in_same_batch_run_serially_and_apply_both() {
+    // bash 与 edit 都声明为 sequential：即使 provider 声明可并行（max=8），
+    // 含任一个 sequential 工具的整批也必须串行运行，且结果按模型原始顺序落盘。
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("target.txt"), "before").unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let mut contract = fake_contract();
+    contract.max_parallel_tool_calls = 8;
+    let provider = Arc::new(FakeProvider::new(
+        contract,
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![
+                    tool_call("bash_call", "bash", json!({ "command": "echo serial-hi" })),
+                    tool_call(
+                        "edit_call",
+                        "edit",
+                        json!({
+                            "path": "target.txt",
+                            "oldString": "before",
+                            "newString": "after"
+                        }),
+                    ),
+                ],
+                usage: usage(50, 10),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(100, 20),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    agent
+        .run(
+            "serial bash and edit",
+            &mut AgentEvents::new(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+        "after",
+        "edit must be applied"
+    );
+    let requests = provider.requests.lock().unwrap();
+    let tool_results = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Tool)
+        .map(|message| {
+            (
+                message.tool_call_id.clone().unwrap(),
+                message.content.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 2);
+    assert_eq!(tool_results[0].0, "bash_call");
+    assert!(tool_results[0].1.contains("serial-hi"));
+    assert_eq!(tool_results[1].0, "edit_call");
+    assert!(tool_results[1].1.contains("Successfully replaced"));
+}
+
+#[test]
+fn batch_with_sequential_tools_never_overlaps() {
+    let _guard = PARALLEL_TEST_LOCK.lock().unwrap();
+    PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
+    PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(sequential_spec(
+        "seq_delay",
+        counted_delay_execute,
+        delay_parameters(),
+    ));
+    let mut contract = fake_contract();
+    contract.max_parallel_tool_calls = 8;
+    let provider = Arc::new(FakeProvider::new(
+        contract,
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![
+                    tool_call("call_a", "seq_delay", json!({ "id": "a" })),
+                    tool_call("call_b", "seq_delay", json!({ "id": "b" })),
+                    tool_call("call_c", "seq_delay", json!({ "id": "c" })),
+                ],
+                usage: usage(50, 10),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(100, 20),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(provider, registry, AgentConfig::default(), session).unwrap();
+    let outcome = agent
+        .run(
+            "sequential batch",
+            &mut AgentEvents::new(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(outcome.final_text, "done");
+    assert_eq!(
+        PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst),
+        1,
+        "a batch containing a sequential tool must never overlap"
     );
 }
 

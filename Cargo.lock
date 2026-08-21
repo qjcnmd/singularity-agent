@@ -1244,6 +1244,7 @@ dependencies = [
 name = "singularity_agent"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "singularity_core",
@@ -1284,13 +1285,13 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "singularity_core",
  "singularity_model",
  "singularity_protocol",
  "tempfile",
- "tokio",
 ]
 
 [[package]]

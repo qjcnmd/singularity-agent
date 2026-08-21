@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -363,6 +365,13 @@ use super::truncate::{
 const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 /// 输出分块读取管道的容量上限。
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
+/// pump 有界读的等待切片：无数据且未 EOF 时按此周期醒来检查停止标志。
+const OUTPUT_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// 子进程退出后排空残留缓冲输出的宽限，超时则停止 pump 并截断输出。
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(2_000);
+/// 后台进程仍持有管道写端导致输出被截断时的可见标记。
+const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
+    "[output truncated: a background process is still writing]";
 
 /// 完整输出转储临时文件的前缀与后缀。
 const FULL_OUTPUT_FILE_PREFIX: &str = "bash-";
@@ -398,6 +407,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
+        supports_parallel: false,
         execute,
     }
 }
@@ -408,7 +418,6 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         cwd,
         signal,
         mut on_update,
-        mutation_queue: _,
     } = ctx;
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return error_result("missing required parameter \"command\"");
@@ -475,10 +484,29 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let stderr = child.stderr.take().expect("bash stderr is piped");
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
-    // 读取线程在 EOF 时自行退出；JoinHandle 直接丢弃（detach），不 join，
-    // 避免被残留子进程持有的管道句柄无限阻塞。
-    thread::spawn(move || pump_output(stdout, sender));
-    thread::spawn(move || pump_output(stderr, stderr_sender));
+    // 每个 pump 线程做有界读（见 pump_output）：即使后台进程拿住管道写端造成
+    // 阻塞，stop 标志也会让线程在宽限后确定收敛；JoinHandle 仍被丢弃（detach）。
+    let stop = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdout_wait = stdout.as_raw_fd();
+        let stderr_wait = stderr.as_raw_fd();
+        let stdout_stop = Arc::clone(&stop);
+        let stderr_stop = Arc::clone(&stop);
+        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait));
+        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let stdout_wait = stdout.as_raw_handle() as isize;
+        let stderr_wait = stderr.as_raw_handle() as isize;
+        let stdout_stop = Arc::clone(&stop);
+        let stderr_stop = Arc::clone(&stop);
+        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait));
+        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
+    }
 
     let mut state = CaptureState::default();
     let deadline = Some(Instant::now() + Duration::from_millis(timeout));
@@ -520,15 +548,28 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         thread::sleep(Duration::from_millis(5));
     }
     // 子进程已退出，但管道中可能仍有缓冲输出（或子进程树仍持有管道句柄）。
-    // 读到所有发送端关闭（EOF）为止，最长宽限 2 秒，避免被残留子进程无限阻塞。
-    let grace = Instant::now() + Duration::from_millis(2_000);
+    // 读至所有发送端关闭（EOF）为止，最长宽限 OUTPUT_DRAIN_GRACE；超时表示后台
+    // 进程仍持有写端，此时停止 pump 并标记输出被截断，线程随后确定收敛。
+    let grace = Instant::now() + OUTPUT_DRAIN_GRACE;
+    let mut readers_ended;
     loop {
-        let readers_ended = drain(&receiver, &mut state, &mut on_update);
+        readers_ended = drain(&receiver, &mut state, &mut on_update);
         if readers_ended || Instant::now() >= grace {
             break;
         }
         thread::sleep(Duration::from_millis(5));
     }
+    let output_truncated_by_background = if readers_ended {
+        false
+    } else {
+        // 后台进程仍在写：请 pump 让出并把已到数据排空，输出已在此截断。
+        stop.store(true, Ordering::SeqCst);
+        let converge = Instant::now() + OUTPUT_DRAIN_GRACE;
+        while Instant::now() < converge && !drain(&receiver, &mut state, &mut on_update) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    };
     // 理论不可达的兜底：已超限但临时文件尚未创建（例如极端截断路径），补建。
     if state.capture_error.is_none()
         && state.is_truncated()
@@ -574,6 +615,10 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         );
         is_error = true;
     }
+    if output_truncated_by_background {
+        // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
+        append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
+    }
     if let Some(callback) = on_update.as_mut() {
         callback(&state.current_output());
     }
@@ -593,11 +638,66 @@ enum BashOutcome {
     TimedOut(u64),
 }
 
+/// 用于有界等待管道可读性的平台句柄。
+#[cfg(unix)]
+type PipeWait = std::os::unix::io::RawFd;
+#[cfg(windows)]
+type PipeWait = isize;
+
+/// 有界等待管道可读性：返回 true 表示可立即读取（有数据或已 EOF/断开），
+/// false 表示在 `timeout` 内既无数据也未 EOF（后台进程可能仍持有写端）。
+#[cfg(unix)]
+#[allow(unsafe_code)] // Unix 使用 libc::poll 做有界读等待，与平台的底层能力一致。
+fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: wait,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX) as libc::c_int;
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor as *mut _, 1, timeout_ms) };
+        if result < 0 {
+            // EINTR 后重试；其余错误交由随后的 read() 报告真实原因。
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return true;
+        }
+        return result > 0;
+    }
+}
+
+/// 有界等待管道可读性（Windows：等待管道句柄可读或写端已关闭）。
+#[cfg(windows)]
+#[allow(unsafe_code)] // Windows 管道句柄等待与 JobObject 兜底一致，集中在此处。
+fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let wait_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    unsafe { WaitForSingleObject(wait, wait_ms) == WAIT_OBJECT_0 }
+}
+
 /// 从管道读取字节流，过滤控制字符并按块发送至通道。
-fn pump_output(mut reader: impl Read + Send + 'static, sender: mpsc::SyncSender<String>) {
+///
+/// 每次读取前有界等待管道可读性；`stop` 置位后在线程下一个等待切片内收敛，
+/// 因此即使后台进程一直持有管道写端，线程也必会结束而不会无限阻塞。
+fn pump_output(
+    mut reader: impl Read + Send + 'static,
+    sender: mpsc::SyncSender<String>,
+    stop: Arc<AtomicBool>,
+    wait: PipeWait,
+) {
     let mut decoder = Utf8Decoder::default();
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if !wait_pipe_readable(wait, OUTPUT_PIPE_READ_TIMEOUT) {
+            // 无数据且未 EOF：回到循环头重新检查停止标志。
+            continue;
+        }
         match reader.read(&mut buffer) {
             Ok(0) => {
                 let text = decoder.decode(&[], true);
@@ -1352,7 +1452,6 @@ mod tests {
                     cwd: &cwd,
                     signal: Some(&worker_token),
                     on_update: None,
-                    mutation_queue: None,
                 },
             )
         });
@@ -1369,6 +1468,24 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "cancellation must terminate promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn background_process_holding_pipe_truncates_output_boundedly() {
+        // 主 shell 退出后一个孙进程仍持有 stdout 写端：pump 做有界读，宽限后
+        // 截断输出并给出标记，而非无限阻塞；后台进程本身不受强杀影响。
+        let result = run("echo captured; (sleep 3) &", None);
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("captured"),
+            "content: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains(OUTPUT_TRUNCATED_BACKGROUND_NOTE),
+            "truncation note missing, content: {}",
+            result.content
         );
     }
 

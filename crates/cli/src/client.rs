@@ -6,11 +6,11 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, Ordering},
-};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -53,10 +53,15 @@ pub(super) struct RpcReply<R> {
 }
 
 /// First Ctrl+C is graceful; a second one is an explicit force escape hatch.
-/// The signal handler only records intent. The client thread remains the sole
-/// owner of stdin and sends the JSON-RPC interrupt at the active-turn seam.
+/// The one-shot signal handler only records a press into a process-wide counter;
+/// the caller's turn poll loop is the sole reader and remains the owner of
+/// stdin, sending the JSON-RPC interrupt at the active-turn seam. No per-turn
+/// listener thread or runtime is involved.
 #[derive(Clone)]
 pub(super) struct CtrlCMonitor {
+    // Tests substitute scripted presses; production reads the shared signal
+    // counter directly.
+    #[cfg(test)]
     count: Arc<AtomicU8>,
     #[cfg(test)]
     scripted_counts: Option<Arc<std::sync::Mutex<VecDeque<u8>>>>,
@@ -65,15 +70,21 @@ pub(super) struct CtrlCMonitor {
 impl CtrlCMonitor {
     fn count(&self) -> u8 {
         #[cfg(test)]
-        if let Some(scripted_counts) = &self.scripted_counts
-            && let Some(next) = scripted_counts
+        if let Some(scripted_counts) = &self.scripted_counts {
+            // Offer scripted presses one at a time; the per-instance counter
+            // retains the latest press so the two-stage force logic sees a
+            // stable value when `count` is re-read, without touching the shared
+            // signal counter that other concurrently running unit tests use.
+            if let Some(next) = scripted_counts
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pop_front()
-        {
-            self.count.store(next, Ordering::SeqCst);
+            {
+                self.count.store(next, Ordering::SeqCst);
+            }
+            return self.count.load(Ordering::SeqCst);
         }
-        self.count.load(Ordering::SeqCst)
+        signal::count()
     }
 
     #[cfg(test)]
@@ -87,55 +98,95 @@ impl CtrlCMonitor {
     }
 }
 
-fn spawn_ctrl_c_monitor() -> Option<CtrlCMonitor> {
-    let count = Arc::new(AtomicU8::new(0));
-    let handler_count = Arc::clone(&count);
-    thread::Builder::new()
-        .name("sg-ctrl-c".to_string())
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            while runtime.block_on(wait_for_ctrl_c()).is_ok() {
-                let previous = handler_count
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                        Some(value.saturating_add(1))
-                    })
-                    .unwrap_or(2);
-                if previous >= 1 {
-                    break;
-                }
-            }
-        })
-        .ok()?;
-    Some(CtrlCMonitor {
-        count,
+// Returns a monitor for the current turn. The signal handler is registered at
+// most once per process; the shared press counter is reset so a turn observes
+// only presses that arrive while it is active.
+fn ctrl_c_monitor() -> CtrlCMonitor {
+    let _ = signal::ensure_installed();
+    signal::reset();
+    CtrlCMonitor {
+        #[cfg(test)]
+        count: Arc::new(AtomicU8::new(0)),
         #[cfg(test)]
         scripted_counts: None,
-    })
+    }
 }
 
-async fn wait_for_ctrl_c() -> std::io::Result<()> {
+// Platform signal handling. Each `install` registers a single one-shot handler
+// that only records a press via `AtomicU8`; it never blocks or allocates.
+mod signal {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static COUNT: AtomicU8 = AtomicU8::new(0);
+    static HANDLER: OnceLock<Result<(), &'static str>> = OnceLock::new();
+
+    // Registers the one-shot handler at most once per process (Windows installs
+    // exactly one console control handler); a failure is terminal for signal
+    // handling and a turn then simply waits for the normal terminal path.
+    pub(super) fn ensure_installed() -> &'static Result<(), &'static str> {
+        HANDLER.get_or_init(install)
+    }
+
+    pub(super) fn count() -> u8 {
+        COUNT.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn reset() {
+        COUNT.store(0, Ordering::SeqCst);
+    }
+
+    fn record_press() {
+        let _ = COUNT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
     #[cfg(windows)]
-    {
-        let ctrl_c = tokio::signal::ctrl_c();
-        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
-        tokio::select! {
-            result = ctrl_c => result,
-            event = ctrl_break.recv() => event
-                .map(|_| Ok(()))
-                .unwrap_or_else(|| Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Ctrl+Break signal stream closed",
-                ))),
+    fn install() -> Result<(), &'static str> {
+        // The console control handler sees every Ctrl+C (0) and Ctrl+Break (1)
+        // console event; either requests a cancellation, so both record a press.
+        // Returning TRUE marks the event handled so the default process exit
+        // does not race the graceful-then-forced handling in the turn loop.
+        const CTRL_C_EVENT: u32 = 0;
+        const CTRL_BREAK_EVENT: u32 = 1;
+        unsafe extern "system" fn on_control_event(ctrl_type: u32) -> i32 {
+            match ctrl_type {
+                CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                    record_press();
+                    1
+                }
+                _ => 0,
+            }
+        }
+
+        unsafe extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        if unsafe { SetConsoleCtrlHandler(Some(on_control_event), 1) == 0 } {
+            Err("SetConsoleCtrlHandler failed")
+        } else {
+            Ok(())
         }
     }
+
     #[cfg(not(windows))]
-    {
-        tokio::signal::ctrl_c().await
+    fn install() -> Result<(), &'static str> {
+        unsafe extern "C" fn on_sigint(_signum: i32) {
+            record_press();
+        }
+
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        if unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0 } {
+            Ok(())
+        } else {
+            Err("sigaction(SIGINT) failed")
+        }
     }
 }
 
@@ -451,7 +502,7 @@ impl AppServerClient {
                 text: text.to_string(),
             }],
         };
-        let ctrl_c = spawn_ctrl_c_monitor();
+        let ctrl_c = Some(ctrl_c_monitor());
         let reply = self.request::<rpc_methods::TurnStart>(&params)?;
         render_and_wait_terminal(
             self,

@@ -12,7 +12,7 @@
   - `AgentLoop`（核心执行循环）：双层循环状态机，持有单一原子 `TurnInbox`、输入/终态事实聚合与诊断事件派发；
   - `session` 子系统：按职责划分为 `format`（严格 JSONL v1 格式与 schema 校验）、`file`（有界文件 I/O、路径 append 锁与增量尾部校验）、`manager`（可变生命周期与追加）、`context`（上下文条目与 LLM 投影）、`repair`（中断与孤立 tool call 修复）、`repository`（会话定位）；公开 API 由 `session/mod.rs` 保持稳定；
   - `Compaction`：上下文自动压缩引擎，以 `thresholdRatio` 与 `retainRatio` 控制切点，聚合每次摘要調用的 Provider usage；
-  - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，`FileMutationQueue` 保护同路径文件修改窗口；
+  - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，并声明各工具执行模式（read=parallel，bash/edit/write=sequential）；
   - 消息与事件流：`AgentEvents` 提供类型化、非裁决性的 Provider attempt 与诊断观察回调；
   - 资源加载：`AGENTS.md` root→cwd 逐层加载与角色适配；
   - `singularity_model`：按职责划分为 `types`（消息/工具/请求/响应/usage/reasoning）、`error`、`provider`（contract/runtime/telemetry）、`openai`（wire/chat/responses 适配）、`transport`（HTTP/retry/stream 解码）、`discovery` 以及整层原子选择的 `config`。
@@ -103,7 +103,7 @@ sequenceDiagram
 ## 3. AgentLoop 循环（图 c）
 
 双层循环状态机结构，内嵌单一原子 `TurnInbox`。内层每轮迭代：检查取消 → 从 `TurnInbox` 取出并清空 steer 消息注入上下文 → compaction preflight → 模型调用（流式 assistant 消息）→ 根据 typed `stopReason`（`Stop` / `Length`）分支处理：
-- 成功且含工具调用：按 source order 完成参数校验，批次内工具并行分发执行（`write`/`edit` 经由 `FileMutationQueue` 针对同路径串行化，不同路径并行），durable ToolResult 始终按 assistant source order 写入并回传；
+- 成功且含工具调用：按 source order 完成参数校验，按执行模式调度（批内含任一 sequential 工具则整批按模型原始顺序串行；全 parallel 则按 provider 并发上限分批并行），durable ToolResult 始终按 assistant source order 写入并回传；
 - 成功无工具调用：持久化终态 assistant 消息；
 - `stopReason=length` 截断：若为纯文本，持久化 partial text 与已知 usage 并形成正常终态；若截断响应包含 tool calls，**零执行任何工具调用**，为已解析调用写入模型可见的 synthetic failed ToolResult（`[execution skipped: tool call was truncated by output token limit]`），交由下一模型轮次处理；
 - 显式上下文溢出（`ContextLengthExceeded`）：以 `CompactionReason::ContextOverflow` 强制压缩一次并同轮重试；二次失败原样返回；
@@ -143,22 +143,23 @@ flowchart TD
 
 ## 4. 工具执行链（图 d）
 
-模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验 → 批次内并发执行 → 进程内工具继承宿主权限执行（`write`/`edit` 经 `FileMutationQueue` 串行化同文件修改窗口）→ 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
+模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验 → 按执行模式调度：批内全部为 parallel 工具时按 provider 并发上限分批并发执行，批内含任一 sequential 工具（bash/edit/write）时整批按模型原始顺序串行 → 进程内工具继承宿主权限执行 → 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
 
 **工具面**：`ToolRegistry::new()` 只注册 `read`、`bash`、`edit`、`write` 4 个固定内建工具；无未注册工具，无动态工具开关、MCP 或扩展。工具 schema 见第 12.2 节。
 
 **执行可靠性与资源边界**：
 
-- **read**：以有界内存流式扫描至真实 EOF；移除 64 MiB aggregate scan cap，保留单行 ≤ 4 MiB 与返回输出 ≤ 2000 行 / 50 KiB 限制；支持基于 1-indexed 行号的 `offset` 续读，不产生磁盘临时文件。
-- **edit**：输入文件与 projected replacement 均实施 20 MiB 硬上限预检；仅在 normalized view 下查找唯一匹配并映射回原始 byte offsets，未修改的前缀与后缀字节 100% 原样保留；替换行尾风格优先沿用被替换区域、邻近上下文或文件多数派，平票回退 LF；保持直接 in-place 写入。
-- **write**：直接 in-place 写入，由 `FileMutationQueue` 串行化写操作。
+- **read**：收集满 `limit`（缺省 2000 行）即停止，不再扫描至 EOF 统计全文行数；保留单行 ≤ 4 MiB 与返回输出 ≤ 2000 行 / 50 KiB 限制；截断提示给出 `File continues; use offset=Z to continue.`；支持基于 1-indexed 行号的 `offset` 续读，不产生磁盘临时文件。
+- **edit**：输入文件与 projected replacement 均实施 20 MiB 硬上限预检；无 `\r` 文件走零映射恒等快路径，含 `\r` 时仅对命中区做局部边界换算，不再构建全量映射表；仅在 normalized view 下查找唯一匹配并映射回原始 byte offsets，未修改的前缀与后缀字节 100% 原样保留；替换行尾风格优先沿用被替换区域、邻近上下文或文件多数派，平票回退 LF；patch 展示为仅围绕命中区的局部上下文 diff；保持直接 in-place 写入。
+- **write**：直接 in-place 写入；声明为 sequential，含 write 的批按模型原始顺序串行。
 - **bash**：
   - 缺省 `timeout_ms` 为 120000 ms，显式范围 `1..=600000` ms；
   - stdout 与 stderr 分别持有独立的增量 UTF-8 carry buffer，跨 chunk 保留未完成 code point，仅在各自真实 EOF 时替换最终残缺字节；
   - 控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出写入私有临时目录 `~/.singularity/tmp/bash/bash-<uuid>.log`；
   - 单个 spill artifact 上限 64 MiB；创建新 spill 时惰性清理同目录中名称与身份匹配且超过 24 小时的旧 spill；超限时删除未完成 spill 并报告 full output 不可用；
+  - 输出读取线程有界停机：主子进程退出后最长 2s 排空宽限，超时（后台进程仍持管道写端）即截断并附信息标记 `[output truncated: a background process is still writing]`，线程必收敛；后台进程不受影响；
   - 进程树终止：Windows 在进程创建时通过 `STARTUPINFOEXW` 与 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 强制绑定内核 Job Object，杜绝孙进程逃逸；Unix 使用独立进程组发送 SIGKILL。
-- **FileMutationQueue 保护**：key 为规范化执行环境身份与规范化绝对路径；Windows 平台对 key 执行大小写不敏感归一化（传给文件系统的路径保持原样），确保大小写别名安全共享同一 mutation lease；Unix 保持大小写敏感。
+- **执行模式 contract**：每个 ToolSpec 声明 `supports_parallel`（read=true；bash/edit/write=false）。批内含任一 sequential 工具时整批按模型原始顺序串行执行；全部为 parallel 时按 provider 并发上限分批并发。默认契约 `max_parallel_tool_calls=1` 行为不变。
 
 ```mermaid
 flowchart TD
@@ -167,9 +168,9 @@ flowchart TD
     C -- 否 --> R1["registry error → loop 写失败 toolResult<br/>(不执行, 不猜测不改写)"]
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
-    D -- "合法" --> F1["批次并发分发"]
-    F1 --> F["进程内执行<br/>bash: Job Object / 增量 UTF-8 / 64 MiB spill<br/>read: 流式至 true EOF / 4 MiB 单行<br/>cwd 绑定工作区"]
-    F --> G["write/edit: FileMutationQueue 串行同文件<br/>edit 实施 20 MiB 门限与未触及字节保留"]
+    D -- "合法" --> F1["按执行模式调度<br/>含 sequential 工具 → 整批串行<br/>全 parallel → 按上限并发"]
+    F1 --> F["进程内执行<br/>bash: Job Object / 增量 UTF-8 / 64 MiB spill / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>cwd 绑定工作区"]
+    F --> G["write/edit: sequential 串行同批<br/>edit 实施 20 MiB 门限与未触及字节保留"]
     G --> H["输出截断与回传<br/>ToolExecution {content, is_error}<br/>assistant source order 写入"]
 ```
 
@@ -315,17 +316,17 @@ sequenceDiagram
 ### 12.1 脱敏与工具输出合同
 
 - 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id），并在公开 history 中投影为带 `isError` 的 `tool_result` item；没有把流式 delta 永久化为独立事件。
-- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出写入私有临时目录并通过 `fullOutputPath` 标记返回。read 实施有界流式读取至 true EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限仅提示 `offset` 续读，不写临时文件。edit 实施 20 MiB 输入与输出上限，未触及字节 100% 保持原样。
+- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出写入私有临时目录并通过 `fullOutputPath` 标记返回。read 收集满 `limit`（缺省 2000 行）即停、不扫描至 EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限提示 `File continues; use offset=Z to continue.`，不写临时文件。edit 实施 20 MiB 输入与输出上限，无 `\r` 时零映射恒等、含 `\r` 时仅对命中区局部换算并产出局部上下文 diff，未触及字节 100% 保持原样。
 - 工具结果文本不包含 provider 原始响应；raw tool arguments 仅存在于 assistant 的 `tool_call` 内容块及工具生命周期事件中。密钥边界由 provider 错误脱敏承担。
 
 ### 12.2 工具 schema
 
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
-| read | `{path, offset?, limit?}` | 文本文件有界读取；单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB；流式读取至 true EOF；超限提示 offset 续读，不写临时文件；offset 1-indexed，limit 上限 2000 |
-| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 120000；显式 integer `1..=600000`；预览保留最后 2000 行 / 50 KiB；完整输出写入私有 64 MiB spill 文件并支持 24h 惰性清理；Windows Job Object / Unix 进程组终止整树 |
-| edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；20 MiB 大小上限；未触及字节原样保留；保持行尾风格；返回 diff / firstChangedLine；in-place 写入 |
-| write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入；受 FileMutationQueue 串行化保护 |
+| read | `{path, offset?, limit?}` | 文本文件有界读取；单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB；收集满 limit（缺省 2000 行）即停，超限提示 `File continues; use offset=Z to continue.`，不写临时文件；offset 1-indexed，limit 上限 2000 |
+| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 120000；显式 integer `1..=600000`；预览保留最后 2000 行 / 50 KiB；完整输出写入私有 64 MiB spill 文件并支持 24h 惰性清理；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object / Unix 进程组终止整树 |
+| edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；20 MiB 大小上限；无 `\r` 零映射恒等、含 `\r` 仅命中区局部换算；未触及字节原样保留；保持行尾风格；返回局部 diff / firstChangedLine；in-place 写入 |
+| write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入；sequential 工具，所在批按模型原始顺序串行 |
 
 ### 12.3 会话落盘细节
 

@@ -36,6 +36,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "edit",
         description: DESCRIPTION,
         parameters: parameters(),
+        supports_parallel: false,
         execute,
     }
 }
@@ -54,13 +55,6 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         return error_result("Operation aborted");
     }
     let full_path = resolve_path(ctx.cwd, path);
-    let Some(queue) = ctx.mutation_queue.as_ref() else {
-        return error_result("file mutation queue is unavailable");
-    };
-    let _mutation_lease = match queue.lock(ctx.cwd, path) {
-        Ok(lease) => lease,
-        Err(error) => return error_result(format!("Could not edit file: {path}. {error}")),
-    };
     if full_path.is_dir() {
         return error_result(format!("Could not edit file: {path}. Path is not a file."));
     }
@@ -86,7 +80,8 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     if old_normalized.is_empty() {
         return error_result(format!("oldString must not be empty in {path}."));
     }
-    let mut matches = normalized.text.match_indices(old_normalized.as_ref());
+    let normalized_str: &str = &normalized.text;
+    let mut matches = normalized_str.match_indices(old_normalized.as_ref());
     let Some((match_start, match_end)) = matches
         .next()
         .map(|(start, value)| (start, start.saturating_add(value.len())))
@@ -101,16 +96,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
         ));
     }
-    let original_start = normalized
-        .boundaries
-        .get(match_start)
-        .copied()
-        .unwrap_or_default();
-    let original_end = normalized
-        .boundaries
-        .get(match_end)
-        .copied()
-        .unwrap_or(text.len());
+    let (original_start, original_end) = normalized.original_range(text, match_start, match_end);
     let ending = choose_replacement_ending(text, original_start, original_end);
     let replacement = restore_line_endings(new_normalized.as_ref(), ending);
     let bom_bytes = if bom { '\u{FEFF}'.len_utf8() } else { 0 };
@@ -138,14 +124,22 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
     let mut projected_text = String::with_capacity(
-        text.len()
-            .saturating_sub(original_end.saturating_sub(original_start))
+        normalized_str
+            .len()
+            .saturating_sub(match_end.saturating_sub(match_start))
             .saturating_add(new_normalized.len()),
     );
-    projected_text.push_str(&normalized.text[..match_start]);
+    projected_text.push_str(&normalized_str[..match_start]);
     projected_text.push_str(new_normalized.as_ref());
-    projected_text.push_str(&normalized.text[match_end..]);
-    let patch = generate_patch(path, &normalized.text, &projected_text);
+    projected_text.push_str(&normalized_str[match_end..]);
+    let patch = generate_patch(
+        path,
+        normalized_str,
+        &projected_text,
+        new_normalized.as_ref(),
+        match_start,
+        match_end,
+    );
     Ok(ToolExecution {
         content: format!("Successfully replaced 1 block(s) in {path}.\n\n{patch}"),
         is_error: false,
@@ -191,28 +185,44 @@ fn read_bounded_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-struct NormalizedText {
-    text: String,
-    /// Each normalized byte boundary maps to the corresponding original byte
-    /// boundary. CRLF therefore maps one normalized byte to two source bytes.
-    boundaries: Vec<usize>,
+struct NormalizedText<'a> {
+    /// LF 归一化后的文本。无 `\r` 时直接借用原文（零拷贝、零映射）。
+    text: std::borrow::Cow<'a, str>,
+    /// 原文是否含 `\r`，决定边界换算是否需要局部映射。
+    had_cr: bool,
 }
 
-fn normalize_with_map(text: &str) -> NormalizedText {
+impl<'a> NormalizedText<'a> {
+    /// 把归一化命中的原始区间映射回原文件字节区间。
+    ///
+    /// 无 `\r` 时归一化即恒等，直接用归一化索引作为原始索引（零映射）；
+    /// 有 `\r` 时仅对命中区做局部换算，不构建全量边界表。
+    fn original_range(&self, raw: &str, match_start: usize, match_end: usize) -> (usize, usize) {
+        if !self.had_cr {
+            (match_start, match_end)
+        } else {
+            map_match_region(raw, match_start, match_end)
+        }
+    }
+}
+
+fn normalize_with_map(text: &str) -> NormalizedText<'_> {
+    if !text.contains('\r') {
+        return NormalizedText {
+            text: std::borrow::Cow::Borrowed(text),
+            had_cr: false,
+        };
+    }
     let mut normalized = String::with_capacity(text.len());
-    let mut boundaries = Vec::with_capacity(text.len().saturating_add(1));
-    boundaries.push(0);
     let bytes = text.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
-        let original_start = index;
         if bytes[index] == b'\r' {
             index += 1;
             if bytes.get(index) == Some(&b'\n') {
                 index += 1;
             }
             normalized.push('\n');
-            boundaries.push(index);
             continue;
         }
         let character = text[index..]
@@ -221,14 +231,50 @@ fn normalize_with_map(text: &str) -> NormalizedText {
             .expect("byte index must be a character boundary");
         index += character.len_utf8();
         normalized.push(character);
-        for offset in 1..=character.len_utf8() {
-            boundaries.push(original_start + offset);
-        }
     }
     NormalizedText {
-        text: normalized,
-        boundaries,
+        text: std::borrow::Cow::Owned(normalized),
+        had_cr: true,
     }
+}
+
+/// 计算归一化字节区间 [match_start, match_end) 对应的原始字节区间。
+///
+/// 按序转换原文直到命中区结束，逐一记录命中起止处的原始偏移；不做全量映射，
+/// 因此仅消耗命中区及其之前前缀的扫描量。匹配索引必为字符边界。
+fn map_match_region(raw: &str, match_start: usize, match_end: usize) -> (usize, usize) {
+    let bytes = raw.as_bytes();
+    let mut original_index = 0usize;
+    let mut normalized_len = 0usize;
+    let mut original_start = 0usize;
+    let mut original_end = match_end;
+    loop {
+        if normalized_len == match_end {
+            original_end = original_index;
+            break;
+        }
+        if original_index >= bytes.len() {
+            break;
+        }
+        if normalized_len == match_start {
+            original_start = original_index;
+        }
+        if bytes[original_index] == b'\r' {
+            original_index += 1;
+            if bytes.get(original_index) == Some(&b'\n') {
+                original_index += 1;
+            }
+            normalized_len += 1;
+        } else {
+            let character = raw[original_index..]
+                .chars()
+                .next()
+                .expect("byte index must be a character boundary");
+            original_index += character.len_utf8();
+            normalized_len += character.len_utf8();
+        }
+    }
+    (original_start, original_end)
 }
 
 /// 将文本中的换行符统一归一化为 LF，避免无意义的副本。
@@ -327,26 +373,44 @@ fn restore_line_endings(text: &str, ending: LineEnding) -> String {
 }
 
 /// 生成单文本块修改前后的 Unified Diff 补丁展示文本（包含前后各 4 行上下文）。
-fn generate_patch(path: &str, old_content: &str, new_content: &str) -> String {
+///
+/// 仅围绕已知命中区做局部上下文 diff，不对整份文件做全量双端 split。
+fn generate_patch(
+    path: &str,
+    old: &str,
+    new: &str,
+    new_block: &str,
+    match_start: usize,
+    match_end: usize,
+) -> String {
     const CONTEXT_LINES: usize = 4;
-    let old_lines: Vec<&str> = old_content.split('\n').collect();
-    let new_lines: Vec<&str> = new_content.split('\n').collect();
-    let mut first = 0;
-    while first < old_lines.len() && first < new_lines.len() && old_lines[first] == new_lines[first]
-    {
-        first += 1;
-    }
-    let mut old_end = old_lines.len();
-    let mut new_end = new_lines.len();
-    while old_end > first && new_end > first && old_lines[old_end - 1] == new_lines[new_end - 1] {
-        old_end -= 1;
-        new_end -= 1;
-    }
-    let before = first.min(CONTEXT_LINES);
-    let after_old = (old_lines.len() - old_end).min(CONTEXT_LINES);
-    let after_new = (new_lines.len() - new_end).min(CONTEXT_LINES);
-    let old_count = (old_end - first) + before + after_old;
-    let new_count = (new_end - first) + before + after_new;
+    let removed_line_start = line_start_before(old, match_start);
+    let removed_line_end = line_end_after(old, match_end.saturating_sub(1));
+    let before_start = back_n_line_start(old, removed_line_start, CONTEXT_LINES);
+    let after_end = forward_n_line_end(old, removed_line_end, CONTEXT_LINES);
+
+    let replacement_len = new_block.len();
+    let new_added_end = if replacement_len > 0 {
+        line_end_after(
+            new,
+            match_start.saturating_add(replacement_len.saturating_sub(1)),
+        )
+    } else {
+        match_start
+    };
+
+    let context_before = &old[before_start..removed_line_start];
+    let removed = &old[removed_line_start..removed_line_end];
+    let added = &new[removed_line_start..new_added_end];
+    let context_after = &old[removed_line_end..after_end];
+
+    let old_start = line_number_at(old, before_start);
+    let old_count = split_lines(context_before).len()
+        + split_lines(removed).len()
+        + split_lines(context_after).len();
+    let new_count = split_lines(context_before).len()
+        + split_lines(added).len()
+        + split_lines(context_after).len();
 
     let mut patch = String::new();
     let _ = writeln!(patch, "--- {path}");
@@ -354,22 +418,103 @@ fn generate_patch(path: &str, old_content: &str, new_content: &str) -> String {
     let _ = writeln!(
         patch,
         "@@ -{} +{} @@",
-        range(first - before + 1, old_count),
-        range(first - before + 1, new_count)
+        range(old_start, old_count),
+        range(old_start, new_count)
     );
-    for line in &old_lines[first - before..first] {
+    for line in split_lines(context_before) {
         let _ = writeln!(patch, " {line}");
     }
-    for line in &old_lines[first..old_end] {
+    for line in split_lines(removed) {
         let _ = writeln!(patch, "-{line}");
     }
-    for line in &new_lines[first..new_end] {
+    for line in split_lines(added) {
         let _ = writeln!(patch, "+{line}");
     }
-    for line in &old_lines[old_end..old_end + after_old] {
+    for line in split_lines(context_after) {
         let _ = writeln!(patch, " {line}");
     }
     patch
+}
+
+/// 按 `\n` 切分为行；`\n` 结尾的尾随空串不计为额外行。空切片返回零行。
+fn split_lines(slice: &str) -> Vec<&str> {
+    if slice.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = slice.split('\n').collect();
+    if slice.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+/// `position` 所在行（从 0 起）的行首字节偏移。
+fn line_start_before(text: &str, position: usize) -> usize {
+    let prefix = &text[..position.min(text.len())];
+    prefix
+        .rfind('\n')
+        .map_or(0, |index| index.saturating_add(1))
+}
+
+/// `position` 所在行（含其换行，若存在）的结束偏移；无换行则到文本末尾。
+fn line_end_after(text: &str, position: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = position.min(bytes.len());
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    if end < bytes.len() { end + 1 } else { end }
+}
+
+/// 从 `position` 所在行（第 1 行计）再往前 `lines` 个整行的行首偏移（下限为文件开头）。
+fn back_n_line_start(text: &str, position: usize, lines: usize) -> usize {
+    if lines == 0 {
+        return position;
+    }
+    let prefix = &text[..position.min(text.len())];
+    let current_line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let target_line = current_line.saturating_sub(lines).max(1);
+    if target_line == 1 {
+        return 0;
+    }
+    let target = target_line.saturating_sub(1);
+    let mut seen = 0usize;
+    for (index, byte) in prefix.bytes().enumerate() {
+        if byte == b'\n' {
+            seen += 1;
+            if seen == target {
+                return index + 1;
+            }
+        }
+    }
+    0
+}
+
+/// 从 `position` 起前进 `lines` 个完整行（含各自换行），返回结束偏移。
+fn forward_n_line_end(text: &str, position: usize, lines: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = position.min(bytes.len());
+    for _ in 0..lines {
+        if end >= bytes.len() {
+            break;
+        }
+        while end < bytes.len() && bytes[end] != b'\n' {
+            end += 1;
+        }
+        if end < bytes.len() {
+            end += 1;
+        }
+    }
+    end
+}
+
+/// 文本中 `position` 处所在行（1 起）的绝对行号。
+fn line_number_at(text: &str, position: usize) -> usize {
+    text[..position.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1)
 }
 
 /// unified patch hunk 头中的行号范围（count 为 1 时省略 ",1"）。
@@ -384,7 +529,7 @@ fn range(start: usize, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::registry::{FileMutationQueue, ToolRegistry};
+    use crate::tools::registry::ToolRegistry;
     use crate::tools::test_support::context;
     use serde_json::json;
     use tempfile::tempdir;
@@ -485,20 +630,19 @@ mod tests {
 
         fs::write(&path, &raw_input).expect("fixture with BOM");
 
-        let queue = std::sync::Arc::new(FileMutationQueue::default());
-        let ctx = ExecuteContext {
-            args: json!({
-                "path": "bom_file.txt",
-                "oldString": target,
-                "newString": "REPLACED_TARGET_LINE"
-            }),
-            cwd: dir.path(),
-            signal: None,
-            on_update: None,
-            mutation_queue: Some(queue),
-        };
-
-        let result = ToolRegistry::new().execute("edit", ctx).expect("execute");
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({
+                        "path": "bom_file.txt",
+                        "oldString": target,
+                        "newString": "REPLACED_TARGET_LINE"
+                    }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
         assert!(!result.is_error, "edit failed: {}", result.content);
 
         let modified_bytes = fs::read(&path).expect("read modified");
@@ -658,5 +802,57 @@ mod tests {
             .expect("execute");
         assert!(!result.is_error, "content: {}", result.content);
         assert_eq!(fs::read(&path).expect("read back"), b"x\ny");
+    }
+
+    #[test]
+    fn no_cr_normalization_is_identity_without_mapping() {
+        let raw = "line1\nline2\nline3";
+        let normalized = normalize_with_map(raw);
+        assert!(
+            !normalized.had_cr,
+            "LF-only files must take the zero-mapping identity path"
+        );
+        assert_eq!(normalized.text.as_ref(), raw);
+        let (start, end) = normalized.original_range(raw, 6, 11);
+        assert_eq!((start, end), (6, 11));
+    }
+
+    #[test]
+    fn crlf_normalization_maps_only_match_region() {
+        let raw = "aa\r\nbb\r\ncc";
+        let normalized = normalize_with_map(raw);
+        assert!(normalized.had_cr);
+        assert_eq!(normalized.text.as_ref(), "aa\nbb\ncc");
+        // 归一化空间中 "bb" 位于 [3,5)，映射回原始 "bb" 的 [4,6)。
+        let (start, end) = normalized.original_range(raw, 3, 5);
+        assert_eq!((start, end), (4, 6));
+    }
+
+    #[test]
+    fn crlf_match_region_edit_produces_valid_patch() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("crlf-mid.txt");
+        fs::write(&path, "first\r\nsecond\r\nthird").expect("fixture");
+        // 命中的 "second" 位于文件中部，验证局部换算与局部补丁。
+        let result = ToolRegistry::new()
+            .execute(
+                "edit",
+                context(
+                    json!({ "path": "crlf-mid.txt", "oldString": "second", "newString": "S2" }),
+                    dir.path(),
+                ),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("-second"),
+            "patch shows removed line: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("+S2"),
+            "patch shows added line: {}",
+            result.content
+        );
     }
 }

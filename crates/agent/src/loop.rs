@@ -340,7 +340,6 @@ fn execute_prepared_tool(
             cwd,
             signal: Some(cancellation),
             on_update: Some(&mut update),
-            mutation_queue: None,
         },
     ) {
         Ok(execution) => execution,
@@ -357,7 +356,6 @@ fn execute_tool_batch_parallel(
     events: &mut AgentEvents<'_>,
 ) -> Vec<ToolExecution> {
     let mut results = vec![None; calls.len()];
-    let worker_limit = usize::try_from(max_parallel_tool_calls.max(1)).unwrap_or(usize::MAX);
     let mut runnable_indices = Vec::with_capacity(calls.len());
 
     // Preflight rejections are already complete and do not enter a worker.
@@ -370,60 +368,88 @@ fn execute_tool_batch_parallel(
         }
     }
 
-    // 只为当前窗口创建 worker；窗口之间顺序推进，避免模型一次返回大量
-    // tool call 时不受控地创建线程。preflight 项不在 runnable_indices 中，
-    // 因此不会占用并发名额。
-    for window in runnable_indices.chunks(worker_limit) {
-        let (sender, receiver): (Sender<ToolRuntimeEvent>, Receiver<ToolRuntimeEvent>) =
-            mpsc::channel();
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(window.len());
-            for &index in window {
-                let prepared = calls[index]
-                    .prepared
-                    .expect("runnable tool call must have a prepared tool");
-                let sender = sender.clone();
-                let call = calls[index].call.clone();
-                handles.push(scope.spawn(move || {
-                    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_prepared_tool(
-                            registry,
-                            prepared,
-                            &call,
-                            cwd,
-                            cancellation,
-                            |text| {
-                                let _ = sender.send(ToolRuntimeEvent::Update {
-                                    index,
-                                    text: text.to_string(),
-                                });
-                            },
-                        )
-                    }))
-                    .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
-                    let _ = sender.send(ToolRuntimeEvent::End { index, execution });
-                }));
-            }
-            drop(sender);
-
-            let mut finished = 0usize;
-            while finished < window.len() {
-                match receiver.recv() {
-                    Ok(ToolRuntimeEvent::Update { index, text }) => {
-                        emit_tool_update(events, &calls[index].call, &text);
-                    }
-                    Ok(ToolRuntimeEvent::End { index, execution }) => {
-                        emit_tool_end(events, &calls[index].call, &execution);
-                        results[index] = Some(execution);
-                        finished += 1;
-                    }
-                    Err(_) => break,
+    // 批内含任一 sequential 工具（supports_parallel=false）时，整批按模型原始
+    // 顺序串行执行，不创建 worker 线程。
+    let force_serial = runnable_indices.iter().any(|&index| {
+        !calls[index]
+            .prepared
+            .expect("runnable tool call must have a prepared tool")
+            .supports_parallel
+    });
+    if force_serial {
+        for &index in &runnable_indices {
+            let item = &calls[index];
+            let prepared = item
+                .prepared
+                .expect("runnable tool call must have a prepared tool");
+            let call = &item.call;
+            let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_prepared_tool(registry, prepared, call, cwd, cancellation, |text| {
+                    emit_tool_update(events, call, text);
+                })
+            }))
+            .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
+            emit_tool_end(events, call, &execution);
+            results[index] = Some(execution);
+        }
+    } else {
+        let worker_limit = usize::try_from(max_parallel_tool_calls.max(1)).unwrap_or(usize::MAX);
+        // 只为当前窗口创建 worker；窗口之间顺序推进，避免模型一次返回大量
+        // tool call 时不受控地创建线程。preflight 项不在 runnable_indices 中，
+        // 因此不会占用并发名额。
+        for window in runnable_indices.chunks(worker_limit) {
+            let (sender, receiver): (Sender<ToolRuntimeEvent>, Receiver<ToolRuntimeEvent>) =
+                mpsc::channel();
+            thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(window.len());
+                for &index in window {
+                    let prepared = calls[index]
+                        .prepared
+                        .expect("runnable tool call must have a prepared tool");
+                    let sender = sender.clone();
+                    let call = calls[index].call.clone();
+                    handles.push(scope.spawn(move || {
+                        let execution =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                execute_prepared_tool(
+                                    registry,
+                                    prepared,
+                                    &call,
+                                    cwd,
+                                    cancellation,
+                                    |text| {
+                                        let _ = sender.send(ToolRuntimeEvent::Update {
+                                            index,
+                                            text: text.to_string(),
+                                        });
+                                    },
+                                )
+                            }))
+                            .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
+                        let _ = sender.send(ToolRuntimeEvent::End { index, execution });
+                    }));
                 }
-            }
-            for handle in handles {
-                let _ = handle.join();
-            }
-        });
+                drop(sender);
+
+                let mut finished = 0usize;
+                while finished < window.len() {
+                    match receiver.recv() {
+                        Ok(ToolRuntimeEvent::Update { index, text }) => {
+                            emit_tool_update(events, &calls[index].call, &text);
+                        }
+                        Ok(ToolRuntimeEvent::End { index, execution }) => {
+                            emit_tool_end(events, &calls[index].call, &execution);
+                            results[index] = Some(execution);
+                            finished += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for handle in handles {
+                    let _ = handle.join();
+                }
+            });
+        }
     }
 
     // A worker must always send End, but preserve a fail-closed result if a

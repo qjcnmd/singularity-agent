@@ -25,6 +25,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
+        supports_parallel: false,
         execute,
     }
 }
@@ -40,13 +41,6 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         return error_result("Operation aborted");
     }
     let full_path = resolve_path(ctx.cwd, path);
-    let Some(queue) = ctx.mutation_queue.as_ref() else {
-        return error_result("file mutation queue is unavailable");
-    };
-    let _mutation_lease = match queue.lock(ctx.cwd, path) {
-        Ok(lease) => lease,
-        Err(error) => return error_result(format!("Could not write file: {path}. {error}")),
-    };
     if let Some(parent) = full_path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = fs::create_dir_all(parent)

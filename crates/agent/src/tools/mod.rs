@@ -28,7 +28,6 @@ pub(crate) mod test_support {
             cwd,
             signal: None,
             on_update: None,
-            mutation_queue: None,
         }
     }
 }

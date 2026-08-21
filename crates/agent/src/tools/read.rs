@@ -31,6 +31,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
+        supports_parallel: true,
         execute,
     }
 }
@@ -67,8 +68,12 @@ fn execute_reader(
     }
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
+    let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(DEFAULT_MAX_LINES)
+            .min(DEFAULT_MAX_LINES)
+    });
     let mut state = ReadState {
-        total_lines: 0,
         selected: Vec::new(),
         selected_bytes: 0,
         selected_truncated: false,
@@ -100,35 +105,37 @@ fn execute_reader(
         if selected_position == 1 && line.len() > DEFAULT_MAX_BYTES {
             state.first_line_exceeds_limit = true;
             state.first_line_len = Some(line.len());
+            break;
         }
-        if state.first_line_exceeds_limit || state.selected_truncated {
-            continue;
+        // 选中窗口已满（例如 limit 为 0）时无需再读取或换算后续行。
+        if state.selected.len() >= user_line_limit {
+            break;
         }
         let next_bytes = state
             .selected_bytes
             .saturating_add(line.len())
             .saturating_add(usize::from(!state.selected.is_empty()));
-        let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
-            usize::try_from(limit)
-                .unwrap_or(DEFAULT_MAX_LINES)
-                .min(DEFAULT_MAX_LINES)
-        });
         if next_bytes > DEFAULT_MAX_BYTES {
             state.selected_truncated = true;
-            continue;
-        }
-        if state.selected.len() >= user_line_limit {
-            if limit.is_none() {
-                state.selected_truncated = true;
-            }
-            continue;
+            break;
         }
         state
             .selected
             .push(String::from_utf8_lossy(&line).into_owned());
         state.selected_bytes = next_bytes;
+        if state.selected.len() >= user_line_limit {
+            // 收集满 limit 即停：只需确认文件是否还有后续，不再扫到 EOF 统计行数。
+            state.selected_truncated = match read_bounded_line(reader, signal) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
+                Err(error) => {
+                    return error_result(format!("Could not read file: {path}. {error}"));
+                }
+            };
+            break;
+        }
     }
-    state.total_lines = line_number;
 
     if line_number == 0 {
         if offset.is_some_and(|offset| offset > 1) {
@@ -149,7 +156,7 @@ fn execute_reader(
             offset.unwrap_or(0)
         ));
     }
-    let output_text = render_read_output(path, start_line_display, limit, &state);
+    let output_text = render_read_output(path, start_line_display, &state);
     Ok(ToolExecution {
         content: output_text,
         is_error: false,
@@ -157,7 +164,6 @@ fn execute_reader(
 }
 
 struct ReadState {
-    total_lines: usize,
     selected: Vec<String>,
     selected_bytes: usize,
     selected_truncated: bool,
@@ -165,12 +171,7 @@ struct ReadState {
     first_line_len: Option<usize>,
 }
 
-fn render_read_output(
-    path: &str,
-    start_line_display: usize,
-    limit: Option<u64>,
-    state: &ReadState,
-) -> String {
+fn render_read_output(path: &str, start_line_display: usize, state: &ReadState) -> String {
     let selected_content = state.selected.join("\n");
     if state.first_line_exceeds_limit {
         let line_len = state
@@ -183,33 +184,13 @@ fn render_read_output(
             DEFAULT_MAX_BYTES
         );
     }
-    let end_line_display =
-        start_line_display.saturating_add(state.selected.len().saturating_sub(1));
-    if state.selected_truncated {
+    if state.selected_truncated && !state.selected.is_empty() {
+        let end_line_display =
+            start_line_display.saturating_add(state.selected.len().saturating_sub(1));
         let next_offset = end_line_display.saturating_add(1);
-        let remainder = format!(
-            "{} more lines in file",
-            state.total_lines.saturating_sub(end_line_display)
-        );
         return format!(
-            "{selected_content}\n\n[Showing lines {start_line_display}-{end_line_display} ({} limit). {remainder}. Use offset={next_offset} to continue.]",
-            format_size(DEFAULT_MAX_BYTES)
+            "{selected_content}\n\n[Showing lines {start_line_display}-{end_line_display}. File continues; use offset={next_offset} to continue.]"
         );
-    }
-    if let Some(limit) = limit {
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        let end = start_line_display.saturating_add(state.selected.len().saturating_sub(1));
-        if end < state.total_lines {
-            let remainder = format!(
-                "{} more lines in file",
-                state.total_lines.saturating_sub(end)
-            );
-            let next_offset = end.saturating_add(1);
-            return format!(
-                "{selected_content}\n\n[{remainder}. Use offset={next_offset} to continue.]"
-            );
-        }
-        let _ = limit;
     }
     selected_content
 }
@@ -326,7 +307,103 @@ mod tests {
         assert!(!result.is_error, "content: {}", result.content);
         assert_eq!(
             result.content,
-            "line3\nline4\n\n[6 more lines in file. Use offset=5 to continue.]"
+            "line3\nline4\n\n[Showing lines 3-4. File continues; use offset=5 to continue.]"
+        );
+    }
+
+    #[test]
+    fn reading_stops_at_limit_on_large_file_with_continue_hint() {
+        let dir = tempdir().expect("temp dir");
+        write_lines(dir.path(), "large.txt", 5000);
+        let result = ToolRegistry::new()
+            .execute("read", context(json!({ "path": "large.txt" }), dir.path()))
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result
+                .content
+                .contains("[Showing lines 1-2000. File continues; use offset=2001 to continue.]"),
+            "content: {}",
+            result.content
+        );
+        assert_eq!(result.content.lines().next(), Some("line1"));
+    }
+
+    #[test]
+    fn reading_exactly_limit_lines_does_not_claim_file_continues() {
+        let dir = tempdir().expect("temp dir");
+        write_lines(dir.path(), "exact.txt", 5);
+        let result = ToolRegistry::new()
+            .execute(
+                "read",
+                context(json!({ "path": "exact.txt", "limit": 5 }), dir.path()),
+            )
+            .expect("execute");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(!result.content.contains("File continues"));
+        assert!(result.content.contains("line5"));
+    }
+
+    /// 有界读取：收集满 limit 后不再向后读取更多字节。
+    ///
+    /// 该 reader 一旦被读取/消费到超过 `fail_at` 的偏移就返回 I/O 错误；读取整份
+    /// 文件会撞上该边界，而按 limit 提前停止则不会。以此可观测地证明"达限即停"。
+    struct FailPastBoundReader {
+        cursor: io::Cursor<Vec<u8>>,
+        fail_at: usize,
+    }
+
+    impl FailPastBoundReader {
+        fn new(content: Vec<u8>, fail_at: usize) -> Self {
+            Self {
+                cursor: io::Cursor::new(content),
+                fail_at,
+            }
+        }
+    }
+
+    impl Read for FailPastBoundReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let position = self.cursor.position() as usize;
+            if position >= self.fail_at {
+                return Err(io::Error::other("read past bound"));
+            }
+            let allowed = (self.fail_at - position).min(buffer.len());
+            let limited = &mut buffer[..allowed];
+            self.cursor.read(limited)
+        }
+    }
+
+    impl BufRead for FailPastBoundReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            let position = self.cursor.position() as usize;
+            if position >= self.fail_at {
+                return Err(io::Error::other("read past bound"));
+            }
+            Ok(&self.cursor.get_ref()[position..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.cursor
+                .set_position(self.cursor.position() + amount as u64);
+        }
+    }
+
+    #[test]
+    fn read_breaks_at_limit_without_scanning_to_eof() {
+        // "a\nb\nc\nd\ne"：读取 3 行（含确认文件继续的一行）即到 6 字节。
+        let content = b"a\nb\nc\nd\ne".to_vec();
+        // fail_at = 6 意味着第 4 行起报错；按 limit 提前停止则不会触达。
+        let mut reader = FailPastBoundReader::new(content, 6);
+        let result = execute_reader("probe.txt", None, Some(2), &mut reader, None)
+            .expect("read must not trip the bound");
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result
+                .content
+                .contains("File continues; use offset=3 to continue."),
+            "content: {}",
+            result.content
         );
     }
 
