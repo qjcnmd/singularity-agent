@@ -105,7 +105,7 @@ sequenceDiagram
 双层循环状态机结构，内嵌单一原子 `TurnInbox`。内层每轮迭代：检查取消 → 从 `TurnInbox` 取出并清空 steer 消息注入上下文 → 单次装配本轮请求上下文（消息 + reasoning replay + 预算估算同一成品上完成）→ 模型调用（流式 assistant 消息）→ 根据 typed `stopReason`（`Stop` / `Length`）分支处理，并在响应后按实测 usage 判定压缩（见第 6 节）：
 - 成功且含工具调用：按 source order 完成参数校验，按执行模式调度（批内含任一 sequential 工具则整批按模型原始顺序串行；全 parallel 则按 provider 并发上限分批并行），durable ToolResult 始终按 assistant source order 写入并回传；
 - 成功无工具调用：持久化终态 assistant 消息；
-- `stopReason=length` 截断：若为纯文本，持久化 partial text 与已知 usage 并形成正常终态；若截断响应包含 tool calls，**零执行任何工具调用**，为已解析调用写入模型可见的 synthetic failed ToolResult（`[execution skipped: tool call was truncated by output token limit]`），交由下一模型轮次处理；
+- `stopReason=length` 截断：若为纯文本，持久化 partial text 与已知 usage 并形成正常终态；若截断响应包含 tool calls，**零执行任何工具调用**，为已解析调用写入模型可见的 synthetic failed ToolResult（`model output was truncated before the tool call completed`），交由下一模型轮次处理；
 - 显式上下文溢出（`ContextLengthExceeded`）：以 `CompactionReason::ContextOverflow` 强制压缩一次并同轮重试；二次失败原样返回；
 - 取消与错误：typed `ModelErrorKind::Cancelled` 规范化为携带已确认累计 usage 的 aborted 终态（标记 `usage_complete=false`）；其他错误保留真实 cause。
 

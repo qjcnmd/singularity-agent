@@ -34,12 +34,8 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
     }
 }
 
-use std::fmt::{Display, Formatter};
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 /// JSON-RPC 请求结构无效。
 pub const JSON_RPC_INVALID_REQUEST: i64 = -32600;
@@ -55,8 +51,6 @@ pub const APP_ERROR_NOT_INITIALIZED: i64 = -32002;
 pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
 /// 请求的持久化对象不存在。
 pub const APP_ERROR_NOT_FOUND: i64 = -32004;
-/// AppServer 请求工作线程容量已满。
-pub const APP_ERROR_REQUEST_CAPACITY_EXCEEDED: i64 = -32006;
 const TOKEN_VALUE_MIN_BODY_CHARS: usize = 8;
 const SECRET_ASSIGNMENT_MIN_VALUE_CHARS: usize = 1;
 const AWS_ACCESS_KEY_ID_BODY_CHARS: usize = 16;
@@ -64,12 +58,8 @@ const GOOGLE_API_KEY_BODY_MIN_CHARS: usize = 30;
 const GOOGLE_API_KEY_BODY_MAX_CHARS: usize = 45;
 const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
-/// Protected metadata directories whose names are reserved by the workspace/runtime contract.
-///
-/// Keep this list in `core` so tools and runtime path validation
-/// cannot silently diverge. Windows may materialize a missing `.git` sentinel only when
-/// no ancestor repository marker exists; nested markers are rejected by the adapter so Git uses
-/// its existing ancestor discovery semantics.
+/// 视为敏感内容的文本标记：凭证与私钥标签、provider 请求/响应载荷字段名、环境变量引用。
+/// `contains_sensitive_text` 用它在文本进入会话或对外输出前识别敏感内容。
 const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     ".aws",
     ".azure",
@@ -152,99 +142,6 @@ impl ClientInfo {
     }
 }
 
-/// JSON-RPC 请求或持久化对象使用的字符串 ID。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct RequestId(String);
-
-impl RequestId {
-    /// 返回 ID 字符串视图。
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for RequestId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for RequestId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-/// RFC 3339 时间戳。
-pub struct Timestamp(OffsetDateTime);
-
-impl Timestamp {
-    /// 创建当前 UTC 时间戳。
-    pub fn now_utc() -> Self {
-        Self(OffsetDateTime::now_utc())
-    }
-
-    /// 解析 RFC 3339 时间戳。
-    pub fn parse(value: &str) -> Result<Self, time::error::Parse> {
-        OffsetDateTime::parse(value, &Rfc3339).map(Self)
-    }
-
-    /// Construct an RFC 3339 timestamp from non-negative Unix milliseconds.
-    pub fn from_unix_ms(value: u64) -> Option<Self> {
-        let nanos = i128::from(value).checked_mul(1_000_000)?;
-        OffsetDateTime::from_unix_timestamp_nanos(nanos)
-            .ok()
-            .map(Self)
-    }
-
-    /// Return a non-negative Unix timestamp in milliseconds, saturating at `u64::MAX`.
-    pub fn unix_ms(self) -> u64 {
-        let nanos = self.0.unix_timestamp_nanos();
-        if nanos <= 0 {
-            return 0;
-        }
-        u64::try_from(nanos / 1_000_000).unwrap_or(u64::MAX)
-    }
-}
-
-impl Display for Timestamp {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        let formatted = self.0.format(&Rfc3339).map_err(|_| std::fmt::Error)?;
-        formatter.write_str(&formatted)
-    }
-}
-
-impl Serialize for Timestamp {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for Timestamp {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl JsonSchema for Timestamp {
-    fn schema_name() -> String {
-        "Timestamp".to_string()
-    }
-
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        String::json_schema(generator)
-    }
-}
-
 /// JSON-RPC 错误码和脱敏错误消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
@@ -292,14 +189,6 @@ impl ErrorCode {
     /// 构造资源不存在错误。
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(APP_ERROR_NOT_FOUND, message)
-    }
-
-    /// 构造请求容量已满错误。
-    pub fn request_capacity_exceeded() -> Self {
-        Self::new(
-            APP_ERROR_REQUEST_CAPACITY_EXCEEDED,
-            "Request capacity exceeded",
-        )
     }
 
     /// 返回错误消息。

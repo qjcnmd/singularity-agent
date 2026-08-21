@@ -1,7 +1,4 @@
-use crate::config::schema::{
-    ModelProviderConfig, ProviderConfigurationStatus, validate_model_id,
-    validate_provider_identifier,
-};
+use crate::config::schema::{validate_model_id, validate_provider_identifier};
 use crate::config::{
     ResolvedProviderValues, configuration_error, missing_provider_config_error,
     parse_provider_limit, provider_source_missing_error, resolve_provider_values,
@@ -159,16 +156,6 @@ impl OpenAiProviderConfig {
             source,
             max_context_tokens,
             max_output_tokens,
-        })
-    }
-
-    /// 返回脱敏 provider 配置状态。
-    pub fn redacted_status(&self) -> ProviderConfigurationStatus {
-        ProviderConfigurationStatus::from_config(&ModelProviderConfig {
-            provider_name: Some(self.provider_name.clone()),
-            model_name: Some(self.model_name.clone()),
-            base_url_present: true,
-            api_key_present: true,
         })
     }
 

@@ -2,7 +2,6 @@
 
 //! stdio JSON-RPC 方法、生命周期事件和公共协议对象。
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use singularity_core::{ClientInfo, ErrorCode, JSON_RPC_METHOD_NOT_FOUND};
@@ -23,8 +22,6 @@ pub struct MethodSpec {
     pub method: Method,
     pub name: &'static str,
     pub kind: MethodKind,
-    params_schema: fn() -> Value,
-    result_schema: fn() -> Value,
     validate_params: fn(Value) -> Result<(), String>,
 }
 
@@ -40,24 +37,10 @@ impl std::fmt::Debug for MethodSpec {
 }
 
 impl MethodSpec {
-    /// 返回 params 的 JSON Schema。
-    pub fn params_schema(self) -> Value {
-        (self.params_schema)()
-    }
-
-    /// 返回 result 的 JSON Schema。
-    pub fn result_schema(self) -> Value {
-        (self.result_schema)()
-    }
-
     /// 按该 method 唯一登记的参数合同校验 params。
     pub fn validate_params(self, params: Value) -> Result<(), String> {
         (self.validate_params)(params)
     }
-}
-
-fn schema_value<T: JsonSchema>() -> Value {
-    serde_json::to_value(schemars::schema_for!(T)).expect("JSON schema serializes")
 }
 
 fn validate_params<T: DeserializeOwned>(params: Value) -> Result<(), String> {
@@ -87,8 +70,6 @@ macro_rules! method_registry {
                 method: Method::$variant,
                 name: $name,
                 kind: MethodKind::$kind,
-                params_schema: schema_value::<$params>,
-                result_schema: schema_value::<$result>,
                 validate_params: validate_params::<$params>,
             }, )+
         ];
@@ -150,7 +131,7 @@ method_registry! {
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 /// JSON-RPC id；请求仅允许字符串或合法整数，无法关联的错误响应使用 null。
 pub enum JsonRpcId {
@@ -196,13 +177,13 @@ impl From<&str> for JsonRpcId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum JsonRpcVersion {
     #[serde(rename = "2.0")]
     V2,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 带 id 的 JSON-RPC 请求。
 pub struct JsonRpcRequest {
@@ -214,7 +195,7 @@ pub struct JsonRpcRequest {
     pub params: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 不带 id 的 JSON-RPC notification。
 pub struct JsonRpcNotification {
@@ -224,7 +205,7 @@ pub struct JsonRpcNotification {
     pub params: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// JSON-RPC success response。
 pub struct JsonRpcSuccess {
@@ -233,7 +214,7 @@ pub struct JsonRpcSuccess {
     pub result: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// JSON-RPC error response。
 pub struct JsonRpcErrorResponse {
@@ -242,7 +223,7 @@ pub struct JsonRpcErrorResponse {
     pub error: JsonRpcError,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 /// 互斥的 JSON-RPC request、notification、success 或 error envelope。
 pub enum JsonRpcMessage {
@@ -253,18 +234,10 @@ pub enum JsonRpcMessage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// batch 中一项已解析消息或结构无效项。
-pub enum JsonRpcBatchItem {
+/// 一条 JSONL frame 解析得到的入站消息，或结构无效但可恢复 id 的帧。
+pub enum JsonRpcInbound {
     Message(JsonRpcMessage),
     Invalid { id: Option<JsonRpcId> },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-/// 一条 JSONL frame 携带的单消息或 batch payload。
-pub enum JsonRpcPayload {
-    Single(JsonRpcBatchItem),
-    Batch(Vec<JsonRpcBatchItem>),
-    EmptyBatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,24 +252,15 @@ impl std::fmt::Display for JsonRpcParseError {
 
 impl std::error::Error for JsonRpcParseError {}
 
-/// 解析单个 JSONL frame，同时保留 batch 内逐项无效请求语义。
-pub fn parse_json_rpc_payload(input: &str) -> Result<JsonRpcPayload, JsonRpcParseError> {
+/// 解析单个 JSONL frame；有效消息作为 `Message`，无法形成消息的对象保留可恢复 id。
+/// 顶层数组（JSON-RPC batch）没有 stdio 消费者，按结构无效拒绝，且数组无法携带 id。
+pub fn parse_json_rpc_payload(input: &str) -> Result<JsonRpcInbound, JsonRpcParseError> {
     let value: Value = serde_json::from_str(input).map_err(|_| JsonRpcParseError)?;
-    match value {
-        Value::Array(values) if values.is_empty() => Ok(JsonRpcPayload::EmptyBatch),
-        Value::Array(values) => Ok(JsonRpcPayload::Batch(
-            values.into_iter().map(parse_batch_item).collect(),
-        )),
-        value => Ok(JsonRpcPayload::Single(parse_batch_item(value))),
-    }
-}
-
-fn parse_batch_item(value: Value) -> JsonRpcBatchItem {
     match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
-        Ok(message) => JsonRpcBatchItem::Message(message),
-        Err(_) => JsonRpcBatchItem::Invalid {
+        Ok(message) => Ok(JsonRpcInbound::Message(message)),
+        Err(_) => Ok(JsonRpcInbound::Invalid {
             id: recover_typed_id(&value),
-        },
+        }),
     }
 }
 
@@ -480,7 +444,7 @@ fn empty_params() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// JSON-RPC 错误对象；data 仅允许调用方显式提供已脱敏内容。
 pub struct JsonRpcError {
     pub code: i64,
@@ -489,17 +453,17 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 无参数 method 的严格空对象。
 pub struct EmptyParams {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 无结果 notification 或永不成功 method 的占位合同。
 pub struct EmptyResult {}
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 初始化请求参数。
 pub struct InitializeParams {
@@ -507,7 +471,7 @@ pub struct InitializeParams {
     pub client_info: ClientInfo,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// 初始化响应及平台摘要。
 pub struct InitializeResult {
     #[serde(rename = "userAgent")]
@@ -529,7 +493,7 @@ impl InitializeResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 创建 thread 的参数。
 pub struct ThreadStartParams {
@@ -537,7 +501,7 @@ pub struct ThreadStartParams {
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 只包含 thread id 的请求参数。
 pub struct ThreadIdParams {
@@ -545,7 +509,7 @@ pub struct ThreadIdParams {
     pub thread_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 更新一个 thread 的非敏感 provider/model/reasoning 选择。
 pub struct ThreadSettingsParams {
@@ -558,7 +522,7 @@ pub struct ThreadSettingsParams {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// thread/settings 的脱敏结果；不包含 key、header 或其他认证材料。
 pub struct ThreadSettingsResult {
@@ -569,7 +533,7 @@ pub struct ThreadSettingsResult {
     pub updated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 只包含 session id 的请求参数。
 pub struct SessionIdParams {
@@ -580,7 +544,7 @@ fn default_session_turn_limit() -> u32 {
     20
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// session/read 的翻页方向：asc 从最旧轮向新翻，desc 从最新轮向旧翻。
 /// 页内轮次始终按会话顺序（旧→新）排列，方向只决定窗口选取。
@@ -589,7 +553,7 @@ pub enum HistorySortDirection {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// 每个返回轮次的条目细节级别。
 pub enum TurnDetail {
@@ -599,7 +563,7 @@ pub enum TurnDetail {
     Full,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 查看会话历史：按 turn 为单位分页返回，游标锚定 turn 边界位置。
 pub struct SessionReadParams {
@@ -624,7 +588,7 @@ pub struct SessionReadParams {
     pub kinds: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// `session/read` 的公开历史 item；不暴露 SessionEntry 的 parent/tree、迁移或
 /// provider-private replay 字段。
@@ -685,7 +649,7 @@ impl HistoryItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 turn 开始 metadata
 /// 划定；首个开始标记之前落盘的前导条目（settings 等）没有归属 turn，
@@ -699,7 +663,7 @@ pub struct SessionTurn {
     pub items: Vec<HistoryItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// session/read 的响应：摘要 + 一页按 turn 组织的历史。
 pub struct SessionReadResult {
@@ -727,7 +691,7 @@ pub struct SessionReadResult {
     pub backwards_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// session/delete 的响应。
 pub struct SessionDeleteResult {
@@ -736,7 +700,7 @@ pub struct SessionDeleteResult {
 }
 
 /// 持久化 thread（session）的公开摘要。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
@@ -748,7 +712,7 @@ pub struct Thread {
     pub last_turn_status: Option<ThreadStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// `session_index.status` 的协议投影：最近一次/当前一次 turn 的状态。
 pub enum ThreadStatus {
@@ -779,25 +743,25 @@ impl ThreadStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// thread/start 的响应。
 pub struct ThreadStartResult {
     pub thread: Thread,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// thread/list 的响应。
 pub struct ThreadListResult {
     pub threads: Vec<Thread>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// 返回单个 thread 的响应。
 pub struct ThreadResult {
     pub thread: Thread,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 启动 turn 的参数。
 pub struct TurnStartParams {
@@ -806,14 +770,14 @@ pub struct TurnStartParams {
     pub input: Vec<InputItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 用户提交给 turn 的输入项。
 pub enum InputItem {
     Text { text: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 向仍在运行的 turn 注入输入；终态后的用户输入必须通过新的 turn/start 发送。
 /// 未知 turn id 返回 not found；turn/steer 与 turn/followUp 共用此参数。
@@ -822,7 +786,7 @@ pub struct TurnInjectionParams {
     pub input: Vec<InputItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// 持久化 turn 的公开摘要。
 pub struct Turn {
     pub turn_id: String,
@@ -839,7 +803,7 @@ pub struct Turn {
 
 /// 模型 usage 的协议线格式（与 `singularity_model::ModelUsage` 同构，
 /// 避免 protocol 依赖 model crate）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TurnModelUsage {
     pub input_tokens: u64,
@@ -866,7 +830,7 @@ fn default_usage_complete_protocol() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// turn 的生命周期状态；暂停/挂起状态机已删除。
 pub enum TurnStatus {
@@ -897,20 +861,20 @@ impl TurnStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// 只包含 turn id 的请求参数。
 pub struct TurnIdParams {
     #[serde(rename = "turnId")]
     pub turn_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// turn/start 的响应。
 pub struct TurnStartResult {
     pub turn: Turn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// 当前 provider 配置的脱敏状态。
 pub struct ProviderConfigurationStatus {
@@ -923,7 +887,7 @@ pub struct ProviderConfigurationStatus {
     pub model_present: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// agent capability 查询的响应（仅保留 provider 就绪报告；AgentLoop 恒可用，
 /// 由 headless core 直接承担，不再作为 capability 门控）。
 pub struct AgentCapabilityResult {
@@ -931,13 +895,13 @@ pub struct AgentCapabilityResult {
     pub provider_configuration: ProviderConfigurationStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// turn/steer 或 turn/followUp 的响应。
 pub struct TurnInjectionResult {
     pub turn: Turn,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// turn/interrupt 的响应。回执确认中断请求已受理并给出目标终态，不制造
 /// 独立的中间请求状态。
 pub struct TurnInterruptResult {
@@ -947,20 +911,20 @@ pub struct TurnInterruptResult {
 }
 
 /// server/shutdown 的类型化响应。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerShutdownResult {
     pub shutdown: bool,
 }
 
 /// 对外广播的应用事件。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppEvent {
     pub method: String,
     pub params: Value,
 }
 
 /// 事件的稳定语义分类；客户端据此选择可靠处理或可观察丢弃。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventClass {
     State,
@@ -968,7 +932,7 @@ pub enum EventClass {
 }
 
 /// 事件在 stdio 传输上的交付合同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventDelivery {
     Reliable,
@@ -976,33 +940,33 @@ pub enum EventDelivery {
 }
 
 /// JSON-RPC notification 中附带的严格事件元数据。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventMetadata {
     pub class: EventClass,
     pub delivery: EventDelivery,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// thread 生命周期 notification 的类型化参数。
 pub struct ThreadEventParams {
     pub thread: Thread,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// turn 生命周期 notification 的类型化参数。
 pub struct TurnEventParams {
     pub turn: Turn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// item notification 中的最小 item 引用。
 pub struct ItemReference {
     pub item_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// item notification 的公共可渲染参数。
 pub struct ItemEventParams {
@@ -1018,7 +982,7 @@ pub struct ItemEventParams {
 }
 
 /// 工具执行开始事件的类型化公共参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionStartParams {
     pub thread_id: String,
@@ -1031,7 +995,7 @@ pub struct ToolExecutionStartParams {
 }
 
 /// 工具执行增量事件的类型化公共参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionUpdateParams {
     pub thread_id: String,
@@ -1043,7 +1007,7 @@ pub struct ToolExecutionUpdateParams {
 }
 
 /// 工具执行终态结果的类型化参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionEndParams {
     pub thread_id: String,
@@ -1053,14 +1017,14 @@ pub struct ToolExecutionEndParams {
     pub result: ToolExecutionResult,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionResult {
     pub content: Vec<ToolExecutionContent>,
     pub is_error: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExecutionContent {
     #[serde(rename = "type")]
@@ -1069,7 +1033,7 @@ pub struct ToolExecutionContent {
 }
 
 /// turn/error 事件的严格类型化参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnErrorParams {
     pub thread_id: String,
@@ -1077,7 +1041,7 @@ pub struct TurnErrorParams {
     pub error: TurnErrorDetail,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnErrorDetail {
     pub stage: String,
@@ -1088,7 +1052,7 @@ pub struct TurnErrorDetail {
 }
 
 /// 非致命 Agent 诊断事件；不进入 Session JSONL。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDiagnosticParams {
     pub thread_id: String,
@@ -1099,7 +1063,7 @@ pub struct AgentDiagnosticParams {
 }
 
 /// Provider 单次 HTTP attempt 的非敏感进度/终态观测。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAttemptEventParams {
     pub thread_id: String,
@@ -1119,7 +1083,7 @@ pub struct ProviderAttemptEventParams {
 }
 
 /// Provider attempt aggregate，作为终态可靠投影使用。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAttemptSummaryParams {
     pub thread_id: String,

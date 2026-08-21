@@ -3,7 +3,7 @@
 use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AgentDiagnosticParams, AppEvent, EmptyParams, InitializeParams, JsonRpcMessage, JsonRpcPayload,
+    AgentDiagnosticParams, AppEvent, EmptyParams, InitializeParams, JsonRpcInbound, JsonRpcMessage,
     Method, MethodKind, ProviderAttemptEventParams, ProviderAttemptSummaryParams,
     SessionReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
     TurnStatus, parse_json_rpc_payload, rpc_methods,
@@ -219,16 +219,26 @@ fn item_and_tool_execution_events_carry_thread_and_turn_identity() {
 }
 
 #[test]
-fn json_rpc_payload_still_distinguishes_batches_at_parser_boundary() {
+fn json_rpc_payload_yields_single_message_or_invalid_marker() {
+    let message =
+        parse_json_rpc_payload(r#"{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}}"#)
+            .expect("single request");
+    assert!(matches!(
+        message,
+        JsonRpcInbound::Message(ref msg) if msg.method() == Some(Method::ThreadList)
+    ));
+
+    let invalid =
+        parse_json_rpc_payload(r#"{"jsonrpc":"2.0","id":42,"method":[]}"#).expect("invalid object");
     assert_eq!(
-        parse_json_rpc_payload("[]").expect("empty"),
-        JsonRpcPayload::EmptyBatch
+        invalid,
+        JsonRpcInbound::Invalid {
+            id: Some(singularity_protocol::JsonRpcId::Number(42))
+        }
     );
-    let mixed = parse_json_rpc_payload(
-        r#"[{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}}, {"jsonrpc":"2.0","method":"unknown","id":2,"params":{}}]"#,
-    )
-    .expect("batch");
-    assert!(matches!(mixed, JsonRpcPayload::Batch(items) if items.len() == 2));
+
+    let array = parse_json_rpc_payload(r#"[]"#).expect("empty array");
+    assert_eq!(array, JsonRpcInbound::Invalid { id: None });
 }
 
 #[test]

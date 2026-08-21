@@ -1261,10 +1261,8 @@ name = "singularity_app_server"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
- "schemars",
  "serde",
  "serde_json",
- "sha2",
  "singularity_agent",
  "singularity_core",
  "singularity_model",
@@ -1301,7 +1299,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "time",
 ]
 
 [[package]]
@@ -1328,7 +1325,6 @@ dependencies = [
 name = "singularity_protocol"
 version = "0.1.0"
 dependencies = [
- "schemars",
  "serde",
  "serde_json",
  "singularity_core",
@@ -1342,7 +1338,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
  "singularity_protocol",
  "tempfile",
  "thiserror",
