@@ -1113,7 +1113,11 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
     );
     assert_eq!(metadata.attempt_count, 6);
     assert_eq!(metadata.retry_count, 5);
-    assert!(metadata.latency_ms >= 1550);
+    // Full Jitter samples each backoff independently from [0, window], so the
+    // summed wait is random; the window arithmetic is covered by the pure
+    // function unit tests. Keep a small floor that still fails if retries do
+    // not wait at all, without a statistically reachable flaky ceiling.
+    assert!(metadata.latency_ms >= 100);
     assert_eq!(metadata.occurrences.len(), 6);
     for (index, occurrence) in metadata.occurrences.iter().enumerate() {
         assert_eq!(occurrence.attempt_index, index as u32 + 1);
