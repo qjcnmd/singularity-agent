@@ -31,7 +31,8 @@ use crate::compaction::{
 use crate::message::{
     AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message, user_message,
 };
-use crate::session::{SessionEntryType, SessionError, SessionManager};
+use crate::session::context::entry_to_llm_messages;
+use crate::session::{SessionEntry, SessionEntryType, SessionError, SessionManager};
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
@@ -554,6 +555,17 @@ impl Agent {
         Arc::clone(&self.inbox)
     }
 
+    /// 回收本轮持有的会话写者；一轮 turn 只打开一次会话文件，终态落盘必须
+    /// 复用这里返回的同一 `SessionManager`，而不是再次全量打开。
+    pub fn into_session(self) -> SessionManager {
+        self.session
+    }
+
+    /// 轮次运行结束后借出会话，供终态 metadata / usage 落盘复用同一个写者。
+    pub fn session_mut(&mut self) -> &mut SessionManager {
+        &mut self.session
+    }
+
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
     pub fn steer(&mut self, text: &str) -> bool {
         lock_inbox(&self.inbox).enqueue_steer(text.to_string())
@@ -630,18 +642,7 @@ impl Agent {
                         return self.fail_after_progress(AgentError::Session(error), outcome);
                     }
                 }
-                let preflight_compaction = match self.compact_before_request(
-                    &capabilities,
-                    &tools,
-                    max_output_tokens,
-                    cancellation,
-                    events,
-                ) {
-                    Ok(result) => result,
-                    Err(error) => return self.fail_after_progress(error, outcome),
-                };
-                record_compaction(&mut outcome, &preflight_compaction);
-                let request = match self.build_request(
+                let (request, assembled_estimate, assembled_entries) = match self.build_request(
                     &preferences,
                     &capabilities,
                     &tools,
@@ -740,6 +741,8 @@ impl Agent {
                     if let Err(error) = self.maybe_compact(
                         &mut outcome,
                         Some(&response.usage),
+                        assembled_estimate,
+                        assembled_entries,
                         cancellation,
                         events,
                     ) {
@@ -806,6 +809,8 @@ impl Agent {
                     if let Err(error) = self.maybe_compact(
                         &mut outcome,
                         Some(&response.usage),
+                        assembled_estimate,
+                        assembled_entries,
                         cancellation,
                         events,
                     ) {
@@ -821,9 +826,14 @@ impl Agent {
                     return self.fail_after_progress(AgentError::Session(error), outcome);
                 }
                 outcome.final_text = assistant_text;
-                if let Err(error) =
-                    self.maybe_compact(&mut outcome, Some(&response.usage), cancellation, events)
-                {
+                if let Err(error) = self.maybe_compact(
+                    &mut outcome,
+                    Some(&response.usage),
+                    assembled_estimate,
+                    assembled_entries,
+                    cancellation,
+                    events,
+                ) {
                     return self.fail_after_progress(error, outcome);
                 }
                 break;
@@ -838,55 +848,6 @@ impl Agent {
                 }
             }
         }
-    }
-
-    /// 每轮模型请求前的 compaction preflight：把 system/developer 指令、会话
-    /// 消息、tool schema 和 max output reserve 都计入预算；超窗则先强制 compact。
-    fn compact_before_request(
-        &mut self,
-        capabilities: &ProviderProtocolContract,
-        tools: &[ModelToolSchema],
-        max_output_tokens: u32,
-        cancellation: &CancellationToken,
-        events: &mut AgentEvents,
-    ) -> Result<CompactionOutcome> {
-        let estimated = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
-        if estimated <= self.config.context_window {
-            return Ok(CompactionOutcome::NotNeeded);
-        }
-        let budget =
-            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        let context_tokens = self.estimate_context_tokens(None)?;
-        let result = match self.compaction.compact_with_reason(
-            &mut self.session,
-            &budget,
-            context_tokens,
-            CompactionReason::ContextOverflow,
-            cancellation,
-        ) {
-            Ok(result) => result,
-            Err(crate::compaction::CompactionError::Session(error)) => {
-                return Err(AgentError::Session(error));
-            }
-            Err(error) => {
-                emit_diagnostic(
-                    events,
-                    AgentDiagnostic::warning(
-                        "compaction_failed",
-                        "automatic context compaction failed".to_string(),
-                    ),
-                );
-                return Err(AgentError::Compaction(error));
-            }
-        };
-        let after = self.estimated_request_tokens(capabilities, tools, max_output_tokens)?;
-        if after > self.config.context_window {
-            return Err(AgentError::Loop(format!(
-                "request context still exceeds window after compaction (estimated {after} > {})",
-                self.config.context_window
-            )));
-        }
-        Ok(result)
     }
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
@@ -904,7 +865,7 @@ impl Agent {
         // normal recent-content ratio when the provider has already rejected
         // the request for exceeding its context window.
         budget.retain_ratio = 0.0;
-        let tokens_before = self.estimate_context_tokens(None)?;
+        let tokens_before = self.estimate_context_tokens(None, 0, 0)?;
         match self.compaction.compact_with_reason(
             &mut self.session,
             &budget,
@@ -929,19 +890,17 @@ impl Agent {
         }
     }
 
-    fn estimated_request_tokens(
+    /// 在本轮已装配的请求成品上做 Token 估算（压缩判定兜底基线）。
+    ///
+    /// 覆盖最终 wire 请求：除 content 外，provider 还会重放每条 tool 消息的
+    /// tool_call_id 与 assistant tool_calls 的 id/name/raw_arguments。
+    fn estimate_assembled(
         &self,
-        capabilities: &ProviderProtocolContract,
+        messages: &[ModelMessage],
         tools: &[ModelToolSchema],
         max_output_tokens: u32,
-    ) -> Result<u64> {
+    ) -> u64 {
         let estimate = |text: &str| self.compaction.estimate_tokens(text);
-        let instruction_tokens = instruction_message(capabilities, &self.config.system_prompt)
-            .map(|message| estimate(&message.content))
-            .unwrap_or(0);
-        let messages = self.session.build_session_context()?.messages;
-        // 预算必须覆盖最终 wire 请求：除 content 外，provider 还会重放每条
-        // tool 消息的 tool_call_id 与 assistant tool_calls 的 id/name/raw_arguments。
         let message_tokens = messages
             .iter()
             .map(|message| {
@@ -960,15 +919,17 @@ impl Agent {
             .sum::<u64>();
         let tool_tokens =
             estimate(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
-        Ok(instruction_tokens
-            .saturating_add(message_tokens)
+        message_tokens
             .saturating_add(tool_tokens)
             .saturating_add(max_output_tokens as u64)
-            .saturating_add(32))
+            .saturating_add(32)
     }
 
     /// 组装单轮 provider 请求：system prompt（按能力选择 developer/system 角色，
     /// 均不支持时以 user 前缀注入）+ 会话历史（compaction 感知）。
+    ///
+    /// 上下文条目只装配一次：messages、reasoning replay 与预算估算全部在
+    /// 同一份装配成品上完成；返回 (请求, 装配成品估算, 装配时的条目数)。
     fn build_request(
         &self,
         preferences: &ModelPreferences,
@@ -977,25 +938,32 @@ impl Agent {
         tool_choice: &ToolChoicePolicy,
         max_output_tokens: u32,
         turn: u32,
-    ) -> Result<ModelTurnRequest> {
-        let mut messages = Vec::new();
+    ) -> Result<(ModelTurnRequest, u64, usize)> {
+        let entries = self.session.build_context_entries()?;
+        let context_messages = entries
+            .iter()
+            .flat_map(entry_to_llm_messages)
+            .collect::<Vec<_>>();
+        let replays = self.reasoning_replays_from_entries(&entries);
+        let mut messages = Vec::with_capacity(context_messages.len() + 1);
         if let Some(instruction) = instruction_message(capabilities, &self.config.system_prompt) {
             messages.push(instruction);
         }
-        messages.extend(self.session.build_session_context()?.messages);
+        messages.extend(context_messages);
+        let assembled_estimate = self.estimate_assembled(&messages, tools, max_output_tokens);
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), turn),
             messages,
         );
         request.tools = tools.to_vec();
         request.tool_choice = tool_choice.clone();
-        request.provider_reasoning_history = self.reasoning_history_for_request();
+        request.provider_reasoning_history = replays;
         request.model_preferences = ModelPreferences {
             model_name: preferences.model_name.clone(),
             max_output_tokens: Some(max_output_tokens),
             ..ModelPreferences::default()
         };
-        Ok(request)
+        Ok((request, assembled_estimate, entries.len()))
     }
 
     /// 从 durable assistant entries 恢复 provider-private continuation。
@@ -1004,14 +972,14 @@ impl Agent {
     /// reasoning summary 只作为可见投影，绝不用于重建 Responses state。
     /// Chat 旧条目若没有 private replay，仍可从 thinking block 重建
     /// `reasoning_content`，以保持已存在会话的兼容性。
-    fn reasoning_history_for_request(&self) -> Vec<ProviderReasoningReplay> {
+    fn reasoning_replays_from_entries(
+        &self,
+        entries: &[SessionEntry],
+    ) -> Vec<ProviderReasoningReplay> {
         let tool_reasoning_mode = self.provider.protocol_contract().tool_reasoning_mode;
-        let Ok(context) = self.session.build_context_entries() else {
-            return Vec::new();
-        };
         let selector = parse_model_selector(&self.config.model);
         let mut replays = Vec::new();
-        for entry in &context {
+        for entry in entries {
             let SessionEntryType::Message(message) = &entry.entry_type else {
                 continue;
             };
@@ -1152,12 +1120,15 @@ impl Agent {
         &mut self,
         outcome: &mut AgentOutcome,
         last_usage: Option<&ModelUsage>,
+        assembled_estimate: u64,
+        assembled_entries: usize,
         cancellation: &CancellationToken,
         events: &mut AgentEvents,
     ) -> Result<()> {
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        let context_tokens = self.estimate_context_tokens(last_usage)?;
+        let context_tokens =
+            self.estimate_context_tokens(last_usage, assembled_estimate, assembled_entries)?;
         if !self.compaction.should_compact(context_tokens, &budget) {
             return Ok(());
         }
@@ -1183,24 +1154,38 @@ impl Agent {
         Ok(())
     }
 
-    /// 估算当前会话累积的上下文 Token 总量：若存在模型返回的精确 Usage 则基于基线增量累加，否则全量启发式估算。
-    fn estimate_context_tokens(&self, last_usage: Option<&ModelUsage>) -> Result<u64> {
-        let messages = self.session.build_session_context()?.messages;
-        let estimate_all: u64 = messages
+    /// 估算压缩判定用的上下文 Token 总量。
+    ///
+    /// 以 Provider 对上一请求的实测 usage 为基线，叠加装配后新增的尾部条目
+    /// 估算；usage 缺失时以本轮装配成品的估算兜底（首轮/无用量场景）。尾部
+    /// 从线性条目末尾反向累计至最近一条 assistant 消息为止（其内容已计入
+    /// provider 输出侧 usage）。估算直接在装配成品与条目上完成，不做第二次
+    /// 上下文装配。
+    fn estimate_context_tokens(
+        &self,
+        last_usage: Option<&ModelUsage>,
+        assembled_estimate: u64,
+        assembled_entries: usize,
+    ) -> Result<u64> {
+        let entries = self.session.entries();
+        let trailing = entries
             .iter()
+            .rev()
+            .take(entries.len().saturating_sub(assembled_entries))
+            .take_while(|entry| {
+                !matches!(
+                    &entry.entry_type,
+                    SessionEntryType::Message(message)
+                        if message.role == AgentMessageRole::Assistant
+                )
+            })
+            .flat_map(entry_to_llm_messages)
             .map(|message| self.compaction.estimate_tokens(&message.content))
-            .sum();
-        let Some(usage) = last_usage.filter(|usage| usage.total_tokens > 0) else {
-            return Ok(estimate_all);
-        };
-        let mut trailing = 0u64;
-        for message in messages.iter().rev() {
-            if message.role == ModelRole::Assistant {
-                break;
-            }
-            trailing += self.compaction.estimate_tokens(&message.content);
+            .sum::<u64>();
+        match last_usage.filter(|usage| usage.total_tokens > 0) {
+            Some(usage) => Ok(usage.total_tokens.saturating_add(trailing)),
+            None => Ok(assembled_estimate.saturating_add(trailing)),
         }
-        Ok(usage.total_tokens + trailing)
     }
 
     fn fail_after_progress(

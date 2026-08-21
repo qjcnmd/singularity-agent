@@ -1,10 +1,8 @@
-//! Bounded file I/O, append locking, identity checks, and JSONL tail parsing.
+//! Bounded file I/O, identity checks, and JSONL tail parsing.
 
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -16,7 +14,6 @@ use time::macros::format_description;
 use uuid::Uuid;
 
 pub use super::format::{Result, SessionError};
-use super::format::{SessionEntry, strict_entry_from_value};
 pub use super::manager::SessionManager;
 /// 单条 session JSONL 行（含 header）的字节硬上限。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -227,69 +224,6 @@ pub(crate) fn parse_session_lines_with_limits(
     })
 }
 
-/// Parse only complete JSONL lines appended after a previously validated byte
-/// offset.  Any torn/invalid tail is returned as an error so the caller can
-/// use the existing bounded full reopen/repair path.
-pub(super) fn parse_session_tail(
-    path: &Path,
-    offset: u64,
-    current_entries: usize,
-) -> Result<Vec<SessionEntry>> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    let mut line_number = current_entries.saturating_add(2);
-    while let Some(bounded_line) = read_bounded_session_line(&mut reader, MAX_SESSION_LINE_BYTES)? {
-        if bounded_line.too_long {
-            return Err(SessionError::InvalidSession(format!(
-                "session entry exceeds {MAX_SESSION_LINE_BYTES} bytes at line {line_number}"
-            )));
-        }
-        if !bounded_line.has_newline {
-            return Err(SessionError::InvalidSession(
-                "session tail is incomplete and requires repair".to_string(),
-            ));
-        }
-        let mut line = bounded_line.bytes.as_slice();
-        if line.ends_with(b"\r") {
-            line = &line[..line.len() - 1];
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            line_number += 1;
-            continue;
-        }
-        let text = std::str::from_utf8(line).map_err(|error| SessionError::MalformedLine {
-            line: line_number,
-            cause: format!("invalid UTF-8: {error}"),
-        })?;
-        let value =
-            serde_json::from_str::<Value>(text).map_err(|error| SessionError::MalformedLine {
-                line: line_number,
-                cause: error.to_string(),
-            })?;
-        if value.get("type").and_then(Value::as_str) == Some("session") {
-            return Err(SessionError::InvalidStructure(format!(
-                "intermediate session header at line {line_number}"
-            )));
-        }
-        let entry =
-            strict_entry_from_value(&value).map_err(|cause| SessionError::InvalidEntry {
-                line: line_number,
-                cause,
-            })?;
-        entries.push(entry);
-        if current_entries.saturating_add(entries.len()) > MAX_SESSION_ENTRIES {
-            return Err(SessionError::InvalidSession(format!(
-                "session file exceeds bounded parse limits ({} bytes / {MAX_SESSION_ENTRIES} entries)",
-                MAX_SESSION_FILE_BYTES
-            )));
-        }
-        line_number += 1;
-    }
-    Ok(entries)
-}
-
 struct BoundedSessionLine {
     bytes: Vec<u8>,
     has_newline: bool,
@@ -373,27 +307,6 @@ fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(not(any(unix, windows)))]
     {
         (0, 0)
-    }
-}
-
-pub(super) fn append_lock_for(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
-}
-
-pub(super) fn lock_append(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
-    match lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

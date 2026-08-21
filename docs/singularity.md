@@ -10,8 +10,8 @@
 
 - **headless core**：
   - `AgentLoop`（核心执行循环）：双层循环状态机，持有单一原子 `TurnInbox`、输入/终态事实聚合与诊断事件派发；
-  - `session` 子系统：按职责划分为 `format`（严格 JSONL v1 格式与 schema 校验）、`file`（有界文件 I/O、路径 append 锁与增量尾部校验）、`manager`（可变生命周期与追加）、`context`（上下文条目与 LLM 投影）、`repair`（中断与孤立 tool call 修复）、`repository`（会话定位）；公开 API 由 `session/mod.rs` 保持稳定；
-  - `Compaction`：上下文自动压缩引擎，以 `thresholdRatio` 与 `retainRatio` 控制切点，聚合每次摘要調用的 Provider usage；
+  - `session` 子系统：按职责划分为 `format`（严格 JSONL v1 格式与 schema 校验）、`file`（有界文件 I/O 与 JSONL 尾部解析）、`manager`（单写者生命周期与追加）、`context`（上下文条目与 LLM 投影）、`repair`（中断与孤立 tool call 修复）、`repository`（会话定位）；公开 API 由 `session/mod.rs` 保持稳定；
+  - `Compaction`：上下文自动压缩引擎，以 `thresholdRatio` 与 `retainRatio` 控制切点；判定在每轮响应后基于 Provider 实测 usage（首轮/无 usage 时用装配成品估算兜底），聚合每次摘要調用的 Provider usage；
   - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，并声明各工具执行模式（read=parallel，bash/edit/write=sequential）；
   - 消息与事件流：`AgentEvents` 提供类型化、非裁决性的 Provider attempt 与诊断观察回调；
   - 资源加载：`AGENTS.md` root→cwd 逐层加载与角色适配；
@@ -102,7 +102,7 @@ sequenceDiagram
 
 ## 3. AgentLoop 循环（图 c）
 
-双层循环状态机结构，内嵌单一原子 `TurnInbox`。内层每轮迭代：检查取消 → 从 `TurnInbox` 取出并清空 steer 消息注入上下文 → compaction preflight → 模型调用（流式 assistant 消息）→ 根据 typed `stopReason`（`Stop` / `Length`）分支处理：
+双层循环状态机结构，内嵌单一原子 `TurnInbox`。内层每轮迭代：检查取消 → 从 `TurnInbox` 取出并清空 steer 消息注入上下文 → 单次装配本轮请求上下文（消息 + reasoning replay + 预算估算同一成品上完成）→ 模型调用（流式 assistant 消息）→ 根据 typed `stopReason`（`Stop` / `Length`）分支处理，并在响应后按实测 usage 判定压缩（见第 6 节）：
 - 成功且含工具调用：按 source order 完成参数校验，按执行模式调度（批内含任一 sequential 工具则整批按模型原始顺序串行；全 parallel 则按 provider 并发上限分批并行），durable ToolResult 始终按 assistant source order 写入并回传；
 - 成功无工具调用：持久化终态 assistant 消息；
 - `stopReason=length` 截断：若为纯文本，持久化 partial text 与已知 usage 并形成正常终态；若截断响应包含 tool calls，**零执行任何工具调用**，为已解析调用写入模型可见的 synthetic failed ToolResult（`[execution skipped: tool call was truncated by output token limit]`），交由下一模型轮次处理；
@@ -120,11 +120,11 @@ flowchart TD
     A(["prompt / continue"]) --> B{"内层循环:<br/>取消?"}
     B -- 是 --> Z(["返回 AgentOutcome<br/>(aborted + 已知 usage)"])
     B -- 否 --> C["从 TurnInbox 取出 steer<br/>(原子 Open 检查)"]
-    C --> D["compaction preflight<br/>(ratio 门限判定)"]
+    C --> D["单次装配请求上下文<br/>(messages + replay + 预算估算)"]
     D --> E["模型调用<br/>(Chat SSE / Responses)"]
     E --> F{"response.status & stopReason"}
     F -- "Success + Stop + toolCalls" --> G["source-order 参数校验"]
-    G --> G3["批次内并发执行<br/>(write/edit 经 mutation queue 保护)"]
+    G --> G3["按执行模式调度<br/>(含 sequential 工具 → 整批串行)"]
     G3 --> H["toolResult 按 assistant source order 回传"]
     H --> B
     F -- "Success + Stop (无 toolCalls)" --> I["终态 assistant 落盘"]
@@ -178,9 +178,9 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式采用干净的 **version: 1** 格式：JSONL 严格线性序列，每个 entry 有 `id` 与 `parentId`（带时间戳），后一条 entry 只能直接引用前一条 entry，不提供 branch/tree 语义，严格拒绝任何未知字段。消息 role 仅包含 user / assistant / toolResult，另有 compaction 和不进入模型上下文的 metadata entry（`turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`、`thread_settings`、`usage`）。**会话 JSONL 是唯一持久事实源**。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage 等轻量投影，不保存对话正文。
+会话格式采用干净的 **version: 1** 格式：JSONL 严格线性序列，每个 entry 有 `id` 与 `timestamp`，条目的物理顺序即事实源顺序；不提供 branch/tree 语义，**不写 `parentId`**（旧格式文件作废硬切），重复 id、未知字段（含 `parentId`）与中间 header 一律严格拒绝。消息 role 仅包含 user / assistant / toolResult，另有 compaction 和不进入模型上下文的 metadata entry（`turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`、`thread_settings`、`usage`）。**会话 JSONL 是唯一持久事实源**。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage 等轻量投影，不保存对话正文。
 
-- **增量尾部追加与校验**：`SessionManager` 持有 validated byte offset 与 file identity；在 append lock 内只增量读取自上次已知 offset 后的新增字节；当检测到文件截断、替换、header 不兼容、残缺尾部或 identity 变化时，安全回退至全量 reopen/repair。
+- **单写者追加**：一轮 turn 只打开一次 `SessionManager` 并独占贯穿全程（开始标记 → 对话 → 工具 → 压缩 → 终态 → 用量）；`activate_turn` 保证同一会话至多一个存活写者（D-005）。append 基于内存态直接校验（行长/文件字节/条目数）并落盘，不做跨写者增量尾部合并；会话重开与崩溃恢复仍走有界解析与 repair。
 - **持久化发布次序与 Fail-Stop 合同**：终态发布顺序固定为 **durable JSONL metadata → SQLite 索引更新 → 公开终态通知**。当 turn terminal metadata 经有界重试后仍无法持久化时，**绝不发布任何虚假的 turn terminal event**；立即发出连接级致命存储诊断并终止 app-server 连接/进程，由重连后的 JSONL 恢复路径收敛状态。
 - **崩溃恢复与 Orphan ToolResult**：重开文件时，未终态的 `turn_started` 追加 synthetic `turn_interrupted`；孤立的 assistant tool call 在文件尾部追加 synthetic failed ToolResult（`[previous execution outcome unknown; do not retry]`），绝不重新执行工具，保证 Provider 观察到的序列严格为 `assistant tool call → failed ToolResult → new user message`。
 
@@ -208,6 +208,8 @@ flowchart TD
   - `retainRatio`（默认 `0.20`）：压缩后保留最近约 `contextWindow * retainRatio` 的上下文；
   - `summary.maxTokens`（默认 `8192`）：单次摘要请求的最大输出 token 上限；
   - 配置约束：必须满足 `0 < retainRatio < thresholdRatio < 1`，摘要上限必须为正且不超过模型输出能力，配置非法时 fail closed。
+- **响应后判定**：压缩判定只发生在每轮模型响应之后——以 Provider 对上一请求的实测 usage 为基线，叠加响应后新增的尾部条目估算（从末尾反向累计至最近一条 assistant 消息）；首轮或 usage 缺失时以本轮装配成品的估算兜底。请求前不再做独立的全量重建判定；Provider 显式报 `ContextLengthExceeded` 时仍走强制恢复路径。
+- **单次装配**：每个模型轮次的上下文（消息、reasoning replay 与预算估算）只装配一次，后续压缩判定与请求复用这一成品与装配时的条目界标。
 - **显式 Reason 与真实 tokensBefore**：Compaction 执行时携带显式 `CompactionReason`（`Threshold` 或 `ContextOverflow`）；强制压缩（`ContextOverflow`）的持久化 `tokensBefore` 来自当前真实重建上下文估算，禁止写入控制哨兵值。
 - **Usage 聚合**：每次用于生成摘要的 Provider 调用均计量并持久化其已知 usage；split-turn 产生的多次摘要调用全部计入 `CompactionEntry.usage` 并累加进当前 turn 总 usage。
 - **切点与结构化摘要**：`findCutPoint` 从最新往回累积估计 token 直到满足 retention 预算，取其后最近合法切点（非 toolResult 的 message）；**toolResult 永不切**；有 previousSummary 时通过 UPDATE prompt 合并更新，文件操作记录跨多次压缩累积。
@@ -215,22 +217,19 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A(["每次模型请求前"]) --> B{"preflight 估算 > window * thresholdRatio?"}
-    B -- 否 --> P["发送请求"]
+    A(["模型响应后"]) --> B{"实测 usage + 尾部增量 > window * thresholdRatio?"}
+    B -- 否 --> P["进入下一轮\r（复用本轮装配成品）"]
     B -- 是 --> C["prepareCompaction<br/>(CompactionReason::Threshold)"]
-    C --> C2{"压缩后 preflight 仍超窗?"}
-    C2 -- 是 --> FAIL(["fail closed"])
-    C2 -- 否 --> P
+    C --> P
     P --> Q{"Provider 显式 ContextLengthExceeded?"}
     Q -- 是 --> O1{"本次 turn 已强制压缩过?"}
     O1 -- 否 --> O2["以 ContextOverflow 强制 compact<br/>计算真实 tokensBefore<br/>(toolResult 永不切)"]
     O2 --> P
     O1 -- 是 --> FAIL2(["原样返回 overflow 错误"])
-    Q -- 否 --> R["成功响应后 maybe_compact<br/>(window * thresholdRatio)"]
-    R --> D["findCutPoint (保留 window * retainRatio)<br/>非 toolResult message 为合法切点"]
-    D --> E["LLM 摘要生成调用<br/>聚合 summary usage"]
-    E --> F["追加 CompactionEntry<br/>(summary + usage + tokensBefore)"]
-    F --> G["后续请求用 buildSessionContext() 重建"]
+    Q -- 否 --> R["findCutPoint (保留 window * retainRatio)<br/>非 toolResult message 为合法切点"]
+    R --> D["LLM 摘要生成调用<br/>聚合 summary usage"]
+    D --> E["追加 CompactionEntry<br/>(summary + usage + tokensBefore)"]
+    E --> F["后续请求用 buildSessionContext() 重建"]
 ```
 
 （图 f：Compaction 数据流）

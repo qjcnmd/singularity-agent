@@ -168,17 +168,17 @@ impl AppServer {
                 return Ok(());
             }
         };
-        // Repair only the pre-existing session state. The current turn has not
-        // been appended yet, so it cannot be mistaken for a crashed turn.
-        self.open_and_repair_session_for_thread(&thread)?;
-        // 注册前置：会话/Provider/Agent/收件箱全部就绪后才发布 turn/started 与
-        // RPC 响应，保证 started 后立即 steer/followUp 必成功；准备阶段失败 =
-        // turn/start 直接回错误响应。
-        let mut agent = self.prepare_agent_for_turn(&thread, &turn_id)?;
+        // 单写者所有权：本轮只打开一次会话文件，并把同一个 `SessionManager`
+        // 从 repair、turn_started、Agent 运行到终态/用量落盘全程贯穿。Repair
+        // 只处理已存在的旧会话状态；当前 turn 尚未 append，不可能被误判为崩溃 turn。
+        let mut session = self.open_and_repair_session_for_thread(&thread)?;
         let title = title_from_input(&input_text);
+        // fail-fast 准备：加载 provider/config 并预校验 compaction。此步骤在写任何
+        // turn 状态之前完成，任一失败都直接回错误响应，不遗留 turn_started 或 Active。
+        let (provider, config) = self.resolve_agent_runtime(&thread)?;
         // JSONL is the authoritative lifecycle source: commit turn_started before
         // projecting Active into SQLite or publishing turn/started.
-        self.append_turn_started_metadata(&record.session_id, &turn_id)?;
+        self.append_turn_started_metadata(&mut session, &turn_id)?;
         let mut metadata = SessionMetadataUpdate {
             status: Some(SessionStatus::Active),
             ..SessionMetadataUpdate::default()
@@ -188,6 +188,10 @@ impl AppServer {
         }
         // turn 真正开始后才把索引切到 active；resume 不提前制造 active。
         self.store.update_session(&record.session_id, metadata)?;
+        // 注册前置：会话/Provider/Agent/收件箱全部就绪后才发布 turn/started 与
+        // RPC 响应，保证 started 后立即 steer/followUp 必成功；已打开的会话移交
+        // Agent 独占持有。compaction 已预校验，Agent::new 不会再次失败。
+        let mut agent = self.prepare_agent_for_turn(&turn_id, session, provider, config)?;
         let turn = Turn {
             turn_id: turn_id.clone(),
             thread_id: record.session_id.clone(),
@@ -220,6 +224,8 @@ impl AppServer {
         // AgentLoop 已停止后立即关闭实时注入窗口；终态后的输入必须由客户端
         // 通过新的 turn/start 发送，不能在内存中静默排队。
         self.close_turn_inputs(&turn_id);
+        // 回收本轮唯一会话写者，供终态 metadata / usage 落盘复用，不再重开。
+        let mut session = agent.into_session();
         let status = match run_result {
             Ok(status)
                 if matches!(
@@ -235,7 +241,7 @@ impl AppServer {
                         || "agent loop did not reach a terminal result".to_string(),
                     )));
                 return self.finish_agent_failure(
-                    &record,
+                    &mut session,
                     &turn_id,
                     &mut assistant_events,
                     &error,
@@ -246,7 +252,7 @@ impl AppServer {
             }
             Err(error) => {
                 return self.finish_agent_failure(
-                    &record,
+                    &mut session,
                     &turn_id,
                     &mut assistant_events,
                     &error,
@@ -264,7 +270,7 @@ impl AppServer {
             model_usage: None,
         };
         if let Err(error) = self.update_session_status_and_usage(
-            &record.session_id,
+            &mut session,
             Some(&turn_id),
             session_status_for_agent(&status.status),
             &status.model_usage,
@@ -279,7 +285,7 @@ impl AppServer {
             // cannot be written, converge to failed/interrupted before exposing
             // any terminal event, then report the metadata failure to the client.
             let (metadata_error, durable) = self.persist_failure_state(
-                &record.session_id,
+                &mut session,
                 &turn_id,
                 &status.model_usage,
                 status.usage_complete,
@@ -359,6 +365,7 @@ impl AppServer {
             }
         }
         let terminal_turn = self.terminal_turn_with_usage(
+            &session,
             terminal_turn,
             &status.model_usage,
             status.usage_complete,
@@ -381,17 +388,41 @@ impl AppServer {
         Ok(())
     }
 
-    /// 准备一个 turn 的执行体：打开会话、构建 Provider/Agent 并注册收件箱。
-    ///
-    /// 全部就绪后才允许发布 turn/started；任一准备失败时调用方直接回错误响应，
-    /// 不遗留任何 turn 语义（不写 turn_started、不投影 Active）。
-    pub(crate) fn prepare_agent_for_turn(
+    /// 解析 Provider 与 AgentConfig，并在写任何 turn 状态之前预校验 compaction。
+    /// 任一失败都直接回错误响应，不留 turn_started / Active 痕迹（fail-fast）。
+    pub(crate) fn resolve_agent_runtime(
         &self,
         thread: &Thread,
-        turn_id: &str,
-    ) -> AppServerResult<Agent> {
-        let session = self.open_session_for_thread(thread)?;
+    ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig)> {
         let (provider, config) = self.provider_and_config_for_thread(thread)?;
+        // 与 Agent::new 内部校验保持一致：先按默认配置与 provider 输出上限钳制
+        // summary_max_tokens，再 validate，保证 prepare_agent_for_turn 的
+        // Agent::new 在 turn_started 已落盘后不会再次失败。
+        let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
+        let mut config = config;
+        if config.compaction == singularity_agent::compaction::CompactionConfig::default()
+            && provider_max_output_tokens < config.compaction.summary_max_tokens
+        {
+            config.compaction.summary_max_tokens = provider_max_output_tokens;
+        }
+        config
+            .compaction
+            .validate(provider_max_output_tokens)
+            .map_err(AgentError::Compaction)?;
+        Ok((provider, config))
+    }
+
+    /// 用已打开并 repair 的会话构建 Agent 并注册收件箱。
+    ///
+    /// 会话在调用前已打开（单写者所有权），Agent::new 独占持有。全部就绪后才
+    /// 允许发布 turn/started；准备失败时调用方直接回错误响应。
+    pub(crate) fn prepare_agent_for_turn(
+        &self,
+        turn_id: &str,
+        session: SessionManager,
+        provider: Arc<dyn Provider + Send + Sync>,
+        config: AgentConfig,
+    ) -> AppServerResult<Agent> {
         let agent = Agent::new(provider, ToolRegistry::new(), config, session)?;
         let inbox_handle = agent.inbox_handle();
         self.register_turn_inbox(turn_id, inbox_handle)?;

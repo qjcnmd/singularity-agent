@@ -1,6 +1,6 @@
 //! Session JSONL schema, strict validation, and public format types.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::ser::Error as _;
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,6 @@ pub enum SessionError {
     InvalidEntry { line: usize, cause: String },
     #[error("session entry id is duplicated: {0}")]
     DuplicateId(String),
-    #[error("session entry {entry_id} refers to missing parent {parent_id}")]
-    MissingParent { entry_id: String, parent_id: String },
-    #[error("session parent cycle detected at entry {0}")]
-    ParentCycle(String),
     #[error("session entry structure is invalid: {0}")]
     InvalidStructure(String),
     #[error("session repair failed: {0}")]
@@ -266,15 +262,12 @@ fn is_sensitive_metadata_key(key: &str) -> bool {
 }
 
 fn is_reserved_metadata_key(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "parentId" | "timestamp" | "type" | "metadataType"
-    )
+    matches!(key, "id" | "timestamp" | "type" | "metadataType")
 }
 
 fn metadata_payload(value: &Value) -> Value {
     let mut payload = value.as_object().cloned().unwrap_or_default();
-    for key in ["id", "parentId", "timestamp", "type"] {
+    for key in ["id", "timestamp", "type"] {
         payload.remove(key);
     }
     Value::Object(payload)
@@ -297,11 +290,11 @@ impl SessionEntryType {
     }
 }
 
-/// 一条会话树 entry。`parent_id` 为空串表示根条目。
+/// 一条会话顺序条目。会话是严格的线性序列：文件行的物理顺序即模型上下文
+/// 顺序，条目按其落盘次序推进；不再存储 parentId。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionEntry {
     pub id: String,
-    pub parent_id: String,
     pub timestamp: Option<String>,
     pub entry_type: SessionEntryType,
 }
@@ -313,14 +306,6 @@ impl Serialize for SessionEntry {
     {
         let mut map = Map::new();
         map.insert("id".to_string(), json!(self.id));
-        map.insert(
-            "parentId".to_string(),
-            if self.parent_id.is_empty() {
-                Value::Null
-            } else {
-                json!(self.parent_id)
-            },
-        );
         if let Some(timestamp) = &self.timestamp {
             map.insert("timestamp".to_string(), json!(timestamp));
         }
@@ -427,6 +412,8 @@ pub(super) fn validate_entries(
     raw_entries: &[Value],
     lines: &[usize],
 ) -> Result<Vec<SessionEntry>> {
+    // 会话是严格的线性序列：单趟相邻检查 = 逐条严格解析并保证 id 唯一、
+    // 无中间 header。文件行的物理顺序就是事实源顺序。
     let mut entries = Vec::with_capacity(raw_entries.len().saturating_sub(1));
     let mut ids = HashSet::new();
     for (index, raw) in raw_entries.iter().enumerate().skip(1) {
@@ -443,60 +430,6 @@ pub(super) fn validate_entries(
         }
         entries.push(entry);
     }
-
-    let parent_by_id: HashMap<String, String> = entries
-        .iter()
-        .map(|entry| (entry.id.clone(), entry.parent_id.clone()))
-        .collect();
-    for entry in &entries {
-        if !entry.parent_id.is_empty() && !parent_by_id.contains_key(&entry.parent_id) {
-            return Err(SessionError::MissingParent {
-                entry_id: entry.id.clone(),
-                parent_id: entry.parent_id.clone(),
-            });
-        }
-    }
-    let mut resolved = HashSet::new();
-    for entry in &entries {
-        if resolved.contains(&entry.id) {
-            continue;
-        }
-        let mut cursor = entry.id.clone();
-        let mut path = Vec::new();
-        let mut path_set = HashSet::new();
-        loop {
-            if resolved.contains(&cursor) {
-                break;
-            }
-            if !path_set.insert(cursor.clone()) {
-                return Err(SessionError::ParentCycle(cursor));
-            }
-            path.push(cursor.clone());
-            let parent = parent_by_id
-                .get(&cursor)
-                .expect("entry ids were collected before parent traversal");
-            if parent.is_empty() {
-                break;
-            }
-            cursor = parent.clone();
-        }
-        resolved.extend(path);
-    }
-    // v1 is deliberately linear. The first content entry is the only root;
-    // every later entry must point at the immediately preceding durable entry.
-    for (index, entry) in entries.iter().enumerate() {
-        let expected_parent = index
-            .checked_sub(1)
-            .and_then(|previous| entries.get(previous))
-            .map(|previous| previous.id.as_str())
-            .unwrap_or("");
-        if entry.parent_id != expected_parent {
-            return Err(SessionError::InvalidStructure(format!(
-                "session rollout is not linear at entry {}: expected parent {:?}, got {:?}",
-                entry.id, expected_parent, entry.parent_id
-            )));
-        }
-    }
     Ok(entries)
 }
 
@@ -507,8 +440,7 @@ pub(super) fn strict_entry_from_value(value: &Value) -> std::result::Result<Sess
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "id" | "parentId"
-                | "timestamp"
+            "id" | "timestamp"
                 | "type"
                 | "message"
                 | "summary"
@@ -535,12 +467,6 @@ pub(super) fn strict_entry_from_value(value: &Value) -> std::result::Result<Sess
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| "session entry id must be a non-empty string".to_string())?
         .to_string();
-    let parent_id = match object.get("parentId") {
-        Some(Value::Null) => String::new(),
-        Some(Value::String(parent)) => parent.clone(),
-        Some(_) => return Err("session entry parentId is not a string".into()),
-        None => return Err("session entry parentId is required".into()),
-    };
     let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)
@@ -570,7 +496,6 @@ pub(super) fn strict_entry_from_value(value: &Value) -> std::result::Result<Sess
     };
     Ok(SessionEntry {
         id,
-        parent_id,
         timestamp: Some(timestamp),
         entry_type,
     })

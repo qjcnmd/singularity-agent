@@ -195,12 +195,12 @@ fn session_read_returns_summary_and_recent_entries_then_delete_removes_both() {
         .expect("open rollout");
     writeln!(
         file,
-        "{{\"id\":\"e1\",\"parentId\":null,\"timestamp\":\"2026-08-20T00:00:01.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"one\"}}]}}}}"
+        "{{\"id\":\"e1\",\"timestamp\":\"2026-08-20T00:00:01.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"one\"}}]}}}}"
     )
     .expect("append entry");
     writeln!(
         file,
-        "{{\"id\":\"e2\",\"parentId\":\"e1\",\"timestamp\":\"2026-08-20T00:00:02.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"two\"}}]}}}}"
+        "{{\"id\":\"e2\",\"timestamp\":\"2026-08-20T00:00:02.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"two\"}}]}}}}"
     )
     .expect("append entry");
     drop(file);

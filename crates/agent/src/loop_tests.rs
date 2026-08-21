@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::AgentMessage;
+use crate::session::context::entry_to_llm_messages;
 use crate::session::{CompactionEntry, SessionEntryType};
 use crate::tools::ToolSpec;
 use std::collections::VecDeque;
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_model::{
-    ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
+    ModelMessage, ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
     ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderStreamingCapability,
 };
 
@@ -2032,14 +2033,24 @@ fn session_file_roundtrip_after_run() {
     assert!(messages[2].content_text().contains("Successfully wrote"));
     assert_eq!(messages[3].role, AgentMessageRole::Assistant);
     assert_eq!(messages[3].content_text(), "finished");
-    // 树链：每条 parent = 前一条 id，首条为根。
-    for (index, entry) in entries.iter().enumerate() {
-        if index == 0 {
-            assert_eq!(entry.parent_id, "");
-        } else {
-            assert_eq!(entry.parent_id, entries[index - 1].id);
-        }
-    }
+    // 线性序列：会话事实源按落盘次序推进，条目 id 必须唯一且顺序与上下文一致。
+    let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "session entry ids must be unique");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        reopened
+            .entries()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        "context entries preserve linear file order"
+    );
 }
 
 /// 7. compaction 触发：极小 context_window + 超过 keep_recent 的上下文
@@ -2120,9 +2131,9 @@ fn tiny_context_window_triggers_compaction() {
     assert!(compaction_entries[0].summary.contains("compacted summary"));
     assert!(compaction_entries[0].first_kept_entry_id.is_some());
     let context = agent.session.build_session_context().unwrap();
-    assert_eq!(context.messages[0].role, ModelRole::User);
+    assert_eq!(context[0].role, ModelRole::User);
     assert!(
-        context.messages[0]
+        context[0]
             .content
             .starts_with(crate::message::COMPACTION_SUMMARY_PREFIX)
     );
@@ -2504,21 +2515,24 @@ fn failed_force_compaction_returns_original_overflow_error() {
 }
 
 #[test]
-fn preflight_compacts_before_first_normal_request() {
+fn compaction_judgment_happens_after_first_response() {
+    // 3c：压缩判定移到响应后——即使首轮请求已显著超窗，第一个 provider 请求
+    // 仍以正常 turn 请求发出；压缩在响应返回后按装配成品估算触发。
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let big_text = "x".repeat(100_000);
     let provider = Arc::new(FakeProvider::new(
         fake_contract(),
         vec![
             FakeStep {
-                text: "summary".to_string(),
+                text: "first answer".to_string(),
                 tool_calls: Vec::new(),
                 usage: usage(0, 0),
             },
             FakeStep {
-                text: "never sent".to_string(),
+                text: "## Goal\ncompacted summary".to_string(),
                 tool_calls: Vec::new(),
-                usage: usage(0, 0),
+                usage: usage(100, 20),
             },
         ],
     ));
@@ -2526,33 +2540,52 @@ fn preflight_compacts_before_first_normal_request() {
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
-            context_window: 500,
+            context_window: 30_000,
             max_output_tokens: 1,
+            compaction: CompactionConfig {
+                threshold_ratio: 0.5,
+                summary_max_tokens: 4_096,
+                ..CompactionConfig::default()
+            },
             ..AgentConfig::default()
         },
         session,
     )
     .unwrap();
-    let error = agent
+    agent
+        .session
+        .append_message(user_message("warmup"))
+        .expect("warmup message");
+    agent
+        .session
+        .append_message(user_message(&big_text))
+        .expect("large history");
+    let outcome = agent
         .run("task", &mut AgentEvents::new(), &CancellationToken::new())
-        .expect_err("request does not fit even after compaction");
-    assert!(error.to_string().contains("still exceeds window"));
+        .unwrap();
+    assert!(outcome.compacted);
+    assert_eq!(outcome.final_text, "first answer");
     let requests = provider.requests.lock().unwrap();
     assert!(
-        requests
-            .iter()
-            .all(|request| request.request_id.starts_with("compaction-")),
-        "no normal turn request may be sent: {requests:?}"
+        requests[0].request_id.starts_with("turn_"),
+        "first request must be a normal turn request (judgment is post-response): {:?}",
+        requests[0].request_id
+    );
+    assert!(
+        requests[1].request_id.starts_with("compaction-"),
+        "second request must be the compaction summary call: {:?}",
+        requests[1].request_id
     );
 }
 
 #[test]
-fn preflight_budgets_historical_tool_call_raw_arguments() {
+fn assembled_estimate_budgets_historical_tool_call_raw_arguments() {
+    // 3c：装配成品上的预算估算必须核算历史 tool call 的 id/name/raw_arguments。
+    // content 很小但 raw_arguments 巨大：content-only 估算看不见它，而 provider
+    // 会按 wire 重放这些字段。直接在装配成品上断言估算放大。
     let dir = tempfile::tempdir().unwrap();
     let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    // 历史 tool call：content 很小，raw_arguments 巨大。content-only 预算
-    // 看不见它，但 provider 会按 wire 重放 id/name/raw_arguments。
-    let big_arguments = "x".repeat(20_000);
+    let big_arguments = "x".repeat(40_000);
     session
         .append_message(AgentMessage {
             role: AgentMessageRole::Assistant,
@@ -2586,42 +2619,27 @@ fn preflight_budgets_historical_tool_call_raw_arguments() {
             timestamp: None,
         })
         .unwrap();
-    let provider = Arc::new(FakeProvider::new(
-        fake_contract(),
-        vec![
-            FakeStep {
-                text: "summary".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(0, 0),
-            },
-            FakeStep {
-                text: "never sent".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(0, 0),
-            },
-        ],
-    ));
-    let mut agent = Agent::new(
+    let provider = Arc::new(FakeProvider::new(fake_contract(), vec![]));
+    let agent = Agent::new(
         provider.clone(),
         ToolRegistry::new(),
-        AgentConfig {
-            context_window: 3000,
-            max_output_tokens: 1,
-            ..AgentConfig::default()
-        },
+        AgentConfig::default(),
         session,
     )
     .unwrap();
-    let error = agent
-        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
-        .expect_err("large tool-call arguments must be budgeted before the request");
-    assert!(error.to_string().contains("still exceeds window"));
-    let requests = provider.requests.lock().unwrap();
+
+    let contract = fake_contract();
+    let tools = agent.tool_schemas(&contract);
+    let entries = agent.session.build_context_entries().unwrap();
+    let messages: Vec<ModelMessage> = entries.iter().flat_map(entry_to_llm_messages).collect();
+    let content_only: u64 = messages
+        .iter()
+        .map(|message| agent.compaction.estimate_tokens(&message.content))
+        .sum();
+    let assembled = agent.estimate_assembled(&messages, &tools, 1);
     assert!(
-        requests
-            .iter()
-            .all(|request| request.request_id.starts_with("compaction-")),
-        "no normal turn request may carry un-budgeted tool arguments: {requests:?}"
+        assembled > content_only + 8_000,
+        "assembled estimate must include wire-replayed raw arguments: assembled={assembled} content_only={content_only}"
     );
 }
 
@@ -2675,7 +2693,11 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
         session,
     )
     .unwrap();
-    assert_eq!(agent.reasoning_history_for_request(), vec![replay.clone()]);
+    let entries = agent.session.build_context_entries().unwrap();
+    assert_eq!(
+        agent.reasoning_replays_from_entries(&entries),
+        vec![replay.clone()]
+    );
 
     let mut incompatible_session = SessionManager::create(
         &dir.path().join("other-project"),
@@ -2707,7 +2729,12 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
         incompatible_session,
     )
     .unwrap();
-    assert!(incompatible.reasoning_history_for_request().is_empty());
+    let incompatible_entries = incompatible.session.build_context_entries().unwrap();
+    assert!(
+        incompatible
+            .reasoning_replays_from_entries(&incompatible_entries)
+            .is_empty()
+    );
 }
 
 #[test]

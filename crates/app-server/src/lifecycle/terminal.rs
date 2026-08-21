@@ -118,7 +118,7 @@ impl AppServer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_agent_failure(
         &self,
-        record: &SessionRecord,
+        session: &mut SessionManager,
         turn_id: &str,
         assistant_events: &mut AssistantItemEventState,
         error: &AppServerError,
@@ -134,11 +134,11 @@ impl AppServer {
         };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
         let (metadata_error, durable) =
-            self.persist_failure_state(&record.session_id, turn_id, usage, usage_complete);
+            self.persist_failure_state(session, turn_id, usage, usage_complete);
         if durable {
             let _ = self.emit_failure_terminal_events(
                 turn_id,
-                &record.session_id,
+                session.session_id(),
                 assistant_events,
                 &failure,
                 emit,
@@ -154,7 +154,7 @@ impl AppServer {
                 message
             };
             if let Ok(event) = self.event_notification(AppEvent::agent_diagnostic(
-                &record.session_id,
+                session.session_id(),
                 turn_id,
                 "error",
                 "storage_fatal",
@@ -175,13 +175,13 @@ impl AppServer {
     /// durable 写失败文本，供 typed terminalization error 保留真实原因。
     pub(crate) fn persist_failure_state(
         &self,
-        session_id: &str,
+        session: &mut SessionManager,
         turn_id: &str,
         usage: &ModelUsage,
         usage_complete: bool,
     ) -> (Option<String>, bool) {
         let first_error = match self.update_session_status_and_usage(
-            session_id,
+            session,
             Some(turn_id),
             SessionStatus::Failed,
             usage,
@@ -192,7 +192,7 @@ impl AppServer {
         };
         if self
             .update_session_status_and_usage(
-                session_id,
+                session,
                 Some(turn_id),
                 SessionStatus::Failed,
                 usage,

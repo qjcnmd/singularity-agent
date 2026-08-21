@@ -254,7 +254,6 @@ fn jsonl_discovery_uses_header_creation_and_last_entry_fact_times() {
     let message = json!({
         "type": "message",
         "id": "entry-1",
-        "parentId": null,
         "timestamp": entry_timestamp,
         "message": {
             "role": "user",
@@ -284,7 +283,8 @@ fn jsonl_discovery_uses_header_creation_and_last_entry_fact_times() {
 }
 
 #[test]
-fn jsonl_discovery_rejects_v1_branch_rollout() {
+fn jsonl_discovery_isolates_legacy_parent_field_rollout() {
+    // 线性化硬切后 parentId 不再合法：任何旧格式 rollout 按坏文件隔离，不建索引。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -303,20 +303,19 @@ fn jsonl_discovery_rejects_v1_branch_rollout() {
     let first = json!({
         "type": "message",
         "id": "entry-1",
-        "parentId": null,
         "timestamp": "2026-08-20T00:00:01.000Z",
         "message": {"role": "user", "content": [{"type": "text", "text": "one"}]}
     });
-    let branch = json!({
+    let legacy = json!({
         "type": "message",
         "id": "entry-2",
-        "parentId": null,
+        "parentId": "entry-1",
         "timestamp": "2026-08-20T00:00:02.000Z",
-        "message": {"role": "user", "content": [{"type": "text", "text": "branch"}]}
+        "message": {"role": "user", "content": [{"type": "text", "text": "old format"}]}
     });
-    std::fs::write(&rollout, format!("{header}\n{first}\n{branch}\n")).expect("rollout");
+    std::fs::write(&rollout, format!("{header}\n{first}\n{legacy}\n")).expect("rollout");
 
-    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild isolates branch");
+    rebuild_session_index_from_jsonl(&store, &sessions_dir).expect("rebuild isolates legacy");
     assert!(store.list_sessions().expect("list sessions").is_empty());
 }
 
@@ -660,6 +659,45 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     assert_eq!(
         metadata[2].kind(),
         singularity_agent::session::SessionMetadataKind::Usage
+    );
+}
+
+#[test]
+fn a_single_turn_opens_the_session_file_exactly_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let session_id = "3a0e99f1-8b2c-47d6-9f3e-2a1b0c8d7e6f";
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("single-turn")],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    // 单写者所有权：一轮 turn（开始标记→对话→工具→终态→用量）只打开一次
+    // SessionManager。计数放在 state.rs 的 open_session_for_thread（open_existing
+    // 的唯一 turn 入口），开始时清零观察一轮内的增量。
+    server.session_opens.store(0, Ordering::SeqCst);
+    let mut events = Vec::new();
+    server
+        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+            events.push(value);
+        })
+        .expect("turn start");
+    assert!(
+        events
+            .iter()
+            .any(|value| value["method"] == "turn/completed"),
+        "single completed turn"
+    );
+    assert_eq!(
+        server.session_opens.load(Ordering::SeqCst),
+        1,
+        "a single turn must open the session file exactly once"
     );
 }
 

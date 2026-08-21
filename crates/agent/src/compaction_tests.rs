@@ -70,7 +70,6 @@ fn message_entry(message: AgentMessage) -> SessionEntry {
             .chars()
             .take(8)
             .collect(),
-        parent_id: String::new(),
         timestamp: None,
         entry_type: SessionEntryType::Message(message),
     }
@@ -267,7 +266,6 @@ fn find_cut_point_metadata_scan() {
     // thread_settings 元数据无上下文消息：切点从 u0（index 1）回扫吸收该元数据条目。
     let thread_settings = SessionEntry {
         id: "m0000001".to_string(),
-        parent_id: String::new(),
         timestamp: None,
         entry_type: SessionEntryType::Metadata(
             SessionMetadata::thread_settings("openai", "gpt-4o", None).unwrap(),

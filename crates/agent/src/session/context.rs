@@ -1,7 +1,5 @@
 //! Session context projection and LLM message conversion.
 
-use std::collections::HashSet;
-
 use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus};
 
 use crate::message::{
@@ -9,15 +7,8 @@ use crate::message::{
     LlmMessage,
 };
 
-use super::format::{Result, SessionEntry, SessionEntryType, SessionMetadataKind};
+use super::format::{Result, SessionEntry, SessionEntryType};
 use super::manager::SessionManager;
-/// 会话上下文的 LLM 消息序列与恢复所需的模型设置。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionContext {
-    pub messages: Vec<LlmMessage>,
-    pub model: Option<String>,
-    pub thinking_level: Option<String>,
-}
 
 impl SessionManager {
     /// 构建活跃的、compaction 感知的条目列表。
@@ -62,67 +53,23 @@ impl SessionManager {
         Ok(context)
     }
 
-    /// 构建发送给 LLM 的会话上下文。
-    pub fn build_session_context(&self) -> Result<SessionContext> {
-        let mut model = None;
-        for entry_index in self.session_path() {
-            if let SessionEntryType::Metadata(metadata) = &self.entries[entry_index].entry_type
-                && metadata.kind() == SessionMetadataKind::ThreadSettings
-                && let (Some(provider), Some(model_id)) = (
-                    metadata.field_string("provider"),
-                    metadata.field_string("model"),
-                )
-            {
-                model = Some(if provider.is_empty() {
-                    model_id.to_string()
-                } else {
-                    format!("{provider}/{model_id}")
-                });
-            }
-        }
-        let messages = self
+    /// 构建发送给 LLM 的会话上下文消息序列。
+    pub fn build_session_context(&self) -> Result<Vec<LlmMessage>> {
+        Ok(self
             .build_context_entries()?
             .iter()
             .flat_map(entry_to_llm_messages)
-            .collect();
-        Ok(SessionContext {
-            messages,
-            model,
-            thinking_level: None,
-        })
+            .collect())
     }
 
     pub(super) fn session_path(&self) -> Vec<usize> {
-        let Some(leaf_id) = &self.leaf_id else {
-            return Vec::new();
-        };
-        let current = self
-            .by_id
-            .get(leaf_id)
-            .copied()
-            .or_else(|| self.entries.len().checked_sub(1));
-        let Some(mut current) = current else {
-            return Vec::new();
-        };
-        let mut path = Vec::new();
-        let mut visited = HashSet::new();
-        loop {
-            if !visited.insert(current) {
-                break;
-            }
-            path.push(current);
-            let parent = &self.entries[current].parent_id;
-            current = match self.by_id.get(parent) {
-                Some(&next) => next,
-                None => break,
-            };
-        }
-        path.reverse();
-        path
+        // 会话是严格的线性序列：事实源 `entries` 的物理顺序就是路径顺序，
+        // 不存在回溯/分叉，直接从 0 到末尾。
+        (0..self.entries.len()).collect()
     }
 }
 
-pub(super) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
+pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
     match &entry.entry_type {
         SessionEntryType::Message(message) => match message.role {
             AgentMessageRole::User => {

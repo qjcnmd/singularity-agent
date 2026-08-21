@@ -190,7 +190,6 @@ mod tests {
         let read = session_read(vec![
             json!({
                 "id": "entry-user",
-                "parentId": "parent",
                 "timestamp": "2026-08-15T00:00:00Z",
                 "type": "message",
                 "message": {
@@ -236,7 +235,6 @@ mod tests {
         assert!(!reference.contains("metadata-only"));
         assert!(!reference.contains("toolCallId"));
         assert!(!reference.contains("toolName"));
-        assert!(!reference.contains("parentId"));
         assert!(!reference.contains("\"args\""));
     }
 

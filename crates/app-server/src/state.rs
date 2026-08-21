@@ -5,6 +5,8 @@
 
 use super::lifecycle::{agent_config_for_thread, terminal_metadata_for_status};
 use super::*;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 /// 协调 session 索引、信任和活动 turn 的有状态 JSON-RPC 服务。
 pub struct AppServer {
@@ -18,6 +20,9 @@ pub struct AppServer {
     /// 终态化完成后由 guard drop 移除。
     pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
+    /// 测试/诊断：统计本轮会话文件打开次数（每次 open_existing）。
+    #[cfg(test)]
+    pub(super) session_opens: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(super) terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
     #[doc(hidden)]
@@ -105,6 +110,8 @@ impl AppServer {
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            session_opens: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
             test_provider_override: None,
@@ -217,6 +224,8 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
+            #[cfg(test)]
+            session_opens: Arc::clone(&self.session_opens),
             #[cfg(test)]
             terminalization_faults: Arc::clone(&self.terminalization_faults),
             test_provider_override: self.test_provider_override.clone(),
@@ -334,6 +343,8 @@ impl AppServer {
         thread: &Thread,
     ) -> AppServerResult<SessionManager> {
         let record = self.store.get_session(&thread.thread_id)?;
+        #[cfg(test)]
+        self.session_opens.fetch_add(1, Ordering::SeqCst);
         let session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         if session.session_id() != record.session_id {
             return Err(AppServerError::Store(StoreError::InvalidState(format!(
@@ -360,9 +371,11 @@ impl AppServer {
         Ok(session)
     }
 
+    /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘 terminal metadata 与
+    /// usage（JSONL 是事实源），再更新索引投影（D-011 先持久再索引）。
     pub(crate) fn update_session_status_and_usage(
         &self,
-        session_id: &str,
+        session: &mut SessionManager,
         turn_id: Option<&str>,
         status: SessionStatus,
         usage: &ModelUsage,
@@ -380,15 +393,15 @@ impl AppServer {
         if let Some(turn_id) = turn_id
             && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
         {
-            self.append_terminal_metadata_if_missing(session_id, turn_id, metadata)?;
+            self.append_terminal_metadata_if_missing(session, turn_id, metadata)?;
             let usage_value =
                 serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
-            self.append_usage_metadata_if_missing(session_id, turn_id, usage_value)?;
+            self.append_usage_metadata_if_missing(session, turn_id, usage_value)?;
         }
         let token_usage =
             serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
         Ok(self.store.update_session(
-            session_id,
+            session.session_id(),
             SessionMetadataUpdate {
                 status: Some(status),
                 token_usage: Some(&token_usage),
@@ -399,12 +412,10 @@ impl AppServer {
 
     fn append_terminal_metadata_if_missing(
         &self,
-        session_id: &str,
+        session: &mut SessionManager,
         turn_id: &str,
         metadata: singularity_agent::session::SessionMetadata,
     ) -> AppServerResult<()> {
-        let record = self.store.get_session(session_id)?;
-        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         let already_terminal = session
             .metadata_entries()
             .iter()
@@ -417,12 +428,10 @@ impl AppServer {
 
     fn append_usage_metadata_if_missing(
         &self,
-        session_id: &str,
+        session: &mut SessionManager,
         turn_id: &str,
         usage: Value,
     ) -> AppServerResult<()> {
-        let record = self.store.get_session(session_id)?;
-        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         let already_persisted = session.metadata_entries().iter().any(|entry| {
             entry.kind() == SessionMetadataKind::Usage && entry.turn_id() == Some(turn_id)
         });
@@ -434,13 +443,12 @@ impl AppServer {
         Ok(())
     }
 
+    /// turn_started 通过本轮已打开的同一 `SessionManager` 落盘（开始标记）。
     pub(crate) fn append_turn_started_metadata(
         &self,
-        session_id: &str,
+        session: &mut SessionManager,
         turn_id: &str,
     ) -> AppServerResult<()> {
-        let record = self.store.get_session(session_id)?;
-        let mut session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         let already_started = session.metadata_entries().iter().any(|entry| {
             entry.turn_id() == Some(turn_id) && entry.kind() == SessionMetadataKind::TurnStarted
         });
@@ -475,9 +483,10 @@ impl AppServer {
     }
 
     /// 终态 turn 的 usage 投影：优先使用本轮已在手的 model_usage；真正缺失
-    /// （provider 未上报 usage）时回退到 JSONL 已持久化的 usage metadata。
+    /// （provider 未上报 usage）时回退到同一会话 JSONL 已持久化的 usage metadata。
     pub(crate) fn terminal_turn_with_usage(
         &self,
+        session: &SessionManager,
         turn: Turn,
         usage: &ModelUsage,
         usage_complete: bool,
@@ -485,7 +494,7 @@ impl AppServer {
         let model_usage = if usage.usage_present {
             Some(usage_to_wire_with_completeness(usage, usage_complete))
         } else {
-            self.persisted_usage_for_turn(&turn)
+            self.persisted_usage_for_turn(session, &turn)
                 .map(|(persisted, complete)| usage_to_wire_with_completeness(&persisted, complete))
         };
         Turn {
@@ -506,9 +515,11 @@ impl AppServer {
         }
     }
 
-    fn persisted_usage_for_turn(&self, turn: &Turn) -> Option<(ModelUsage, bool)> {
-        let record = self.store.get_session(&turn.thread_id).ok()?;
-        let session = SessionManager::open_existing(Path::new(&record.rollout_path)).ok()?;
+    fn persisted_usage_for_turn(
+        &self,
+        session: &SessionManager,
+        turn: &Turn,
+    ) -> Option<(ModelUsage, bool)> {
         let value = session
             .metadata_entries()
             .into_iter()
