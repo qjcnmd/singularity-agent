@@ -12,7 +12,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     }"#;
     let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut tool_message = ModelMessage::text(
         ModelRole::Tool,
         serde_json::json!({
@@ -91,7 +91,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
         }]
     }"#;
     let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -163,7 +163,7 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         }]
     }"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "read a file")],
@@ -227,7 +227,7 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
         "HTTP/1.1 401 Unauthorized",
         r#"{"error":{"message":"bad key sk-secret-value"}}"#,
     );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -283,7 +283,7 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
                 vec![(status_line, body); 6]
             };
         let (base_url, attempts) = sequence_response_server(responses);
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let provider = test_provider(provider_test_config(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
             "request_1",
             vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -342,7 +342,7 @@ fn openai_provider_recovers_native_argument_parse_errors_for_agent_repair() {
         })
         .to_string();
         let base_url = single_response_server("HTTP/1.1 200 OK", Box::leak(body.into_boxed_str()));
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let provider = test_provider(provider_test_config(base_url)).expect("provider");
         let mut request = ModelTurnRequest::new(
             format!("request_{case_name}"),
             vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -393,7 +393,7 @@ fn openai_provider_rejects_unknown_native_tool_even_when_arguments_are_repairabl
         }]
     }"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_unknown_tool",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -447,7 +447,7 @@ fn openai_provider_rejects_missing_or_non_string_chat_argument_fields() {
         })
         .to_string();
         let base_url = single_response_server("HTTP/1.1 200 OK", Box::leak(body.into_boxed_str()));
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let provider = test_provider(provider_test_config(base_url)).expect("provider");
         let mut request = ModelTurnRequest::new(
             format!("request_{case_name}_arguments"),
             vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -761,7 +761,7 @@ fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_rep
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -859,7 +859,7 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -965,7 +965,7 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -1060,7 +1060,7 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -1136,7 +1136,7 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -1221,7 +1221,7 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
@@ -1310,7 +1310,7 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -1405,7 +1405,7 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -1500,7 +1500,7 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -1599,7 +1599,7 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -1691,7 +1691,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
@@ -1798,7 +1798,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
             "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))

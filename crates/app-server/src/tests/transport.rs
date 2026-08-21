@@ -7,7 +7,9 @@ use crate::state_paths::{
 use serde_json::{Value, json};
 use singularity_agent::agent::AgentError;
 use singularity_agent::session::{SessionManager, SessionMetadataKind};
-use singularity_app_server::{AppServer, AppServerError, TurnFailureCause, TurnFailureStage};
+use singularity_app_server::{
+    AppServer, AppServerCancellationHandle, AppServerError, TurnFailureCause, TurnFailureStage,
+};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, Provider, ProviderConfigSnapshot, ProviderError,
@@ -73,14 +75,32 @@ impl ExecutionStop for CancellationProbe {
     fn request_execution_stop(&self) {
         self.requests.fetch_add(1, Ordering::SeqCst);
     }
-
-    fn execution_stop_requested(&self) -> bool {
-        self.requests.load(Ordering::SeqCst) > 0
-    }
 }
 
 fn test_output_channel(capacity: usize) -> (mpsc::Sender<Value>, mpsc::Receiver<Value>) {
     mpsc::channel(capacity)
+}
+
+fn test_cancellation_handle() -> AppServerCancellationHandle {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let snapshot = ProviderConfigSnapshot::capture(|_| None, shared_provider_runtime_handle());
+    AppServer::new(store, snapshot).cancellation_handle()
+}
+
+/// transport 测试共享的注入 runtime：provider 异步执行一律由上层提供。
+/// 本模块同时被 lib 与 bin 两个 crate root 编译，不能引用 lib 的 tests 模块。
+fn shared_provider_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("shared test provider runtime")
+        })
+        .handle()
+        .clone()
 }
 
 fn progress_event() -> Value {
@@ -159,21 +179,6 @@ fn prepared_state_paths_use_the_canonical_directory() {
 }
 
 #[test]
-fn state_path_rejects_database_hard_link_before_store_open() {
-    let directory = tempfile::tempdir().expect("state directory");
-    let parent = directory.path().join("state");
-    std::fs::create_dir(&parent).expect("create state directory");
-    let source = directory.path().join("source.sqlite3");
-    let database = parent.join("sessions.sqlite3");
-    std::fs::write(&source, b"not a sqlite database").expect("source file");
-    std::fs::hard_link(&source, &database).expect("database hard link");
-
-    let error = prepare_app_server_state_paths(database.to_str().expect("database path"))
-        .expect_err("hard-linked database rejected");
-    assert_eq!(error, SAFE_FILE_BACKED_STATE_REQUIRED);
-}
-
-#[test]
 fn sqlite_uri_rejection_has_no_directory_side_effect() {
     let directory = tempfile::tempdir().expect("state directory");
     let missing_parent = directory.path().join("must-not-be-created");
@@ -182,42 +187,6 @@ fn sqlite_uri_rejection_has_no_directory_side_effect() {
         .expect_err("SQLite URI rejected before preparation");
     assert_eq!(error, FILE_BACKED_STORE_REQUIRED);
     assert!(!missing_parent.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn state_path_rejects_database_symlink_before_store_open() {
-    let directory = tempfile::tempdir().expect("state directory");
-    let parent = directory.path().join("state");
-    std::fs::create_dir(&parent).expect("create state directory");
-    let source = directory.path().join("source.sqlite3");
-    let database = parent.join("sessions.sqlite3");
-    std::fs::write(&source, b"not a sqlite database").expect("source file");
-    std::os::unix::fs::symlink(&source, &database).expect("database symlink");
-
-    let error = prepare_app_server_state_paths(database.to_str().expect("database path"))
-        .expect_err("symlinked database rejected");
-    assert_eq!(error, SAFE_FILE_BACKED_STATE_REQUIRED);
-}
-
-#[cfg(windows)]
-#[test]
-fn state_path_rejects_database_reparse_link_before_store_open() {
-    let directory = tempfile::tempdir().expect("state directory");
-    let parent = directory.path().join("state");
-    std::fs::create_dir(&parent).expect("create state directory");
-    let source = directory.path().join("source.sqlite3");
-    let database = parent.join("sessions.sqlite3");
-    std::fs::write(&source, b"not a sqlite database").expect("source file");
-    match std::os::windows::fs::symlink_file(&source, &database) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(1314) => return,
-        Err(error) => panic!("database reparse link: {error}"),
-    }
-
-    let error = prepare_app_server_state_paths(database.to_str().expect("database path"))
-        .expect_err("reparse-linked database rejected");
-    assert_eq!(error, SAFE_FILE_BACKED_STATE_REQUIRED);
 }
 
 #[test]
@@ -255,8 +224,44 @@ fn bounded_output_queue_backpressures_without_stopping_execution() {
 }
 
 #[test]
-fn bounded_output_queue_unblocks_a_worker_when_shutdown_is_requested() {
-    let (outputs, _receiver) = test_output_channel(1);
+fn bounded_output_queue_backpressures_async_sender_without_stopping_execution() {
+    // async 入口走纯 `send().await`：队列满时 future 保持 pending 形成背压，
+    // writer 正常消费后完成，全程不触发全局停止。
+    let (outputs, mut receiver) = test_output_channel(1);
+    let cancellation = test_cancellation_handle();
+    block_on(async move {
+        send_output_async(
+            outputs.clone(),
+            cancellation.clone(),
+            serde_json::json!({"first": true}),
+        )
+        .await
+        .expect("first output fits");
+
+        let sender = tokio::spawn(send_output_async(
+            outputs,
+            cancellation.clone(),
+            serde_json::json!({"second": true}),
+        ));
+        // 队列仍满：让步后 sender 必须还在等待，且未触发停止。
+        tokio::task::yield_now().await;
+        assert!(!sender.is_finished(), "full queue must backpressure");
+        assert!(!cancellation.execution_stop_requested());
+        assert_eq!(receiver.recv().await.expect("first output")["first"], true);
+        sender.await.expect("sender task").expect("bounded send");
+        assert_eq!(
+            receiver.recv().await.expect("second output")["second"],
+            true
+        );
+        assert!(!cancellation.execution_stop_requested());
+    });
+}
+
+#[test]
+fn bounded_output_queue_unblocks_a_worker_when_receiver_closes() {
+    // 同步入队没有 stop 标志轮询逃逸；唯一解除阻塞的路径是 writer 侧消失：
+    // receiver drop 后阻塞的 blocking_send 以 channel 关闭失败并触发全局停止。
+    let (outputs, receiver) = test_output_channel(1);
     let cancellation = CancellationProbe::default();
     send_output(&outputs, &cancellation, serde_json::json!({"first": true}))
         .expect("first output fits");
@@ -277,11 +282,12 @@ fn bounded_output_queue_unblocks_a_worker_when_shutdown_is_requested() {
         !sender.is_finished(),
         "full queue must initially backpressure"
     );
-    cancellation.request_execution_stop();
+    drop(receiver);
     assert_eq!(
         sender.join().expect("sender"),
-        Err("stdout transport stopping".to_string())
+        Err("stdout transport unavailable".to_string())
     );
+    assert_eq!(cancellation.request_count(), 1);
 }
 
 struct DisconnectedWriter;
@@ -502,7 +508,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
             "SINGULARITY_API_KEY" => Some("test-key".to_string()),
             _ => None,
         },
-        None,
+        shared_provider_runtime_handle(),
     );
     let mut server = AppServer::new(store, snapshot).with_sessions_dir(&sessions_dir);
     server
@@ -700,7 +706,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,
             },
-            Some(handle),
+            handle,
         );
 
         let server = AppServer::new(store, snapshot)
@@ -861,7 +867,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             "SINGULARITY_API_KEY" => Some("test-key".to_string()),
             _ => None,
         },
-        None,
+        shared_provider_runtime_handle(),
     );
     let mut new_server = AppServer::new(new_store, new_snapshot)
         .with_sessions_dir(&sessions_dir)
@@ -949,7 +955,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,
             },
-            Some(handle),
+            handle,
         );
         let server = AppServer::new(store, snapshot)
             .with_sessions_dir(&sessions_dir_inside)

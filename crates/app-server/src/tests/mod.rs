@@ -10,6 +10,20 @@ use singularity_model::{
     ProviderProtocolContract, ProviderReasoningReplay,
 };
 
+/// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
+pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test provider runtime")
+        })
+        .handle()
+        .clone()
+}
+
 fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
     AppServer::new(
         store,
@@ -21,7 +35,7 @@ fn app_server(store: SessionStore, sessions_dir: &Path) -> AppServer {
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,
             },
-            None,
+            test_runtime_handle(),
         ),
     )
     .with_sessions_dir(sessions_dir)
@@ -146,6 +160,80 @@ fn jsonl_discovery_isolates_one_corrupt_rollout() {
     let sessions = store.list_sessions().expect("list sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session_id, valid_id);
+}
+
+#[test]
+fn corrupted_index_reopens_with_quarantine_and_jsonl_rebuild() {
+    // D-037：JSONL rollout 是权威正文，SQLite 索引损坏不允许永久不一致。
+    // 人为把索引写成非数据库垃圾后，走与 supervisor 启动相同的重开路径
+    // （quarantine + 当前 schema 创建 + JSONL 重建回调）打开：会话投影从
+    // JSONL 恢复，损坏库保留为审计备份。
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let index_path = temp.path().join("index.sqlite3");
+    let session_id = "c3d4e5f6-a7b8-4c9d-8e1f-2a3b4c5d6e7f";
+    let mut session =
+        SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
+    session
+        .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
+            "turn-1",
+        ))
+        .expect("terminal metadata");
+    drop(session);
+
+    let store = SessionStore::open(&index_path).expect("initial store");
+    store
+        .insert_session(&SessionRecord {
+            session_id: session_id.to_string(),
+            rollout_path: sessions_dir
+                .join(format!("{session_id}.jsonl"))
+                .to_string_lossy()
+                .to_string(),
+            cwd: workspace.to_string_lossy().to_string(),
+            title: None,
+            model: None,
+            status: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            token_usage: json!({}),
+        })
+        .expect("insert session");
+    drop(store);
+
+    std::fs::write(&index_path, b"this is not an sqlite database header")
+        .expect("corrupt the index");
+
+    let reopened = SessionStore::open_with_initialization(&index_path, |store| {
+        rebuild_session_index_from_jsonl(store, &sessions_dir).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "failed to rebuild app-server session index: {error}"
+            ))
+        })
+    })
+    .expect("reopen must quarantine and rebuild from JSONL");
+    let record = reopened.get_session(session_id).expect("rebuilt record");
+    assert_eq!(
+        record.rollout_path,
+        sessions_dir
+            .join(format!("{session_id}.jsonl"))
+            .to_string_lossy()
+    );
+    assert_eq!(record.cwd, workspace.to_string_lossy());
+    assert_eq!(record.status, Some(SessionStatus::Completed));
+
+    let files: Vec<String> = std::fs::read_dir(temp.path())
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|name| name.starts_with("index.sqlite3.corrupt.")),
+        "corrupted index must remain as audit backup: {files:?}"
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ use crate::{MAX_DISCOVERED_MODEL_IDS, MAX_DISCOVERY_RESPONSE_BYTES, MAX_MODEL_ID
 pub(crate) fn discover_provider_models(
     config: &OpenAiProviderConfig,
     client: &reqwest::Client,
-    runtime: &crate::provider::runtime::ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     request_timeout_seconds: u64,
 ) -> Result<Vec<String>, ProviderError> {
     let endpoint = models_endpoint(&config.base_url);

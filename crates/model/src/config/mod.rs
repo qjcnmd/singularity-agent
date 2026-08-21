@@ -26,10 +26,9 @@ pub use user::{
 use super::{
     DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
     ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
-    ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig,
-    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage, ProviderToolReasoningMode,
-    ThinkingWireFormat, validate_provider_config,
+    ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig, PROVIDER_SNAPSHOT_ID_PREFIX,
+    ProviderApiProtocol, ProviderCapabilityDeclaration, ProviderError, ProviderErrorStage,
+    ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
 };
 
 #[cfg(test)]

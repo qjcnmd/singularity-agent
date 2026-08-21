@@ -10,7 +10,7 @@ pub(crate) mod supervisor;
 
 pub(crate) use crate::state_paths::{
     SAFE_FILE_BACKED_STATE_REQUIRED, ensure_home_outside_current_repo,
-    prepare_app_server_state_paths, validate_database_file,
+    prepare_app_server_state_paths,
 };
 pub(crate) use error::{internal_error_value, request_error_value, transport_error_value};
 pub(crate) use framing::read_bounded_line;
@@ -29,16 +29,11 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) trait ExecutionStop: Send + Sync {
     fn request_execution_stop(&self);
-    fn execution_stop_requested(&self) -> bool;
 }
 
 impl ExecutionStop for AppServerCancellationHandle {
     fn request_execution_stop(&self) {
         let _ = AppServerCancellationHandle::request_execution_stop(self);
-    }
-
-    fn execution_stop_requested(&self) -> bool {
-        AppServerCancellationHandle::execution_stop_requested(self)
     }
 }
 

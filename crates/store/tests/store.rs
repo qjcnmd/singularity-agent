@@ -43,7 +43,7 @@ fn sqlite_store_persists_and_lists_session_metadata() {
 }
 
 #[test]
-fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
+fn file_backed_store_sets_schema_version_and_uses_wal_journal() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("index.sqlite3");
     let store = SessionStore::open(&db).expect("open store");
@@ -142,8 +142,8 @@ fn initialization_callback_failure_preserves_quarantine_and_partial_database() {
         "corrupt backup must remain after rebuild failure"
     );
 
-    // The stable init lock is released even on callback failure; the partial DB can
-    // be reopened by a later startup and classified normally.
+    // The callback runs after quarantine and current-schema creation, so a later
+    // startup reopens the partial DB normally and classifies it as current.
     let reopened = SessionStore::open(&db).expect("reopen after failed rebuild");
     assert_eq!(reopened.descriptor().schema_version, 1);
 }
@@ -154,13 +154,8 @@ fn sqlite_store_quarantines_unsupported_schema() {
     let db = dir.path().join("legacy.sqlite3");
     let connection = rusqlite::Connection::open(&db).expect("legacy connection");
     connection
-        .execute_batch(
-            "create table schema_meta(schema_version integer not null check(schema_version = 13));
-             create table schema_migrations(migration_id text primary key, applied_at text not null default current_timestamp);
-             create table threads(thread_id text primary key, model text, cwd text, status text not null default 'active');
-             insert into schema_meta(schema_version) values (13);",
-        )
-        .expect("legacy schema");
+        .pragma_update(None, "user_version", 13)
+        .expect("legacy version");
     drop(connection);
 
     let store = SessionStore::open(&db).expect("open should recover legacy schema");
@@ -176,25 +171,6 @@ fn sqlite_store_quarantines_unsupported_schema() {
             .any(|f| f.starts_with("legacy.sqlite3.corrupt.")),
         "quarantine backup must exist: {files:?}"
     );
-}
-
-#[test]
-fn sqlite_store_quarantines_schema_structure_mismatch() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = dir.path().join("mismatched.sqlite3");
-    let connection = rusqlite::Connection::open(&db).expect("connection");
-    connection
-        .execute_batch(
-            "create table schema_meta(schema_version integer not null check(schema_version = 1));
-             create table schema_migrations(migration_id text primary key, applied_at text not null default current_timestamp);
-             create table session_index(session_id text primary key, wrong_column text);
-             insert into schema_meta(schema_version) values (1);",
-        )
-        .expect("mismatched schema");
-    drop(connection);
-
-    let store = SessionStore::open(&db).expect("open should recover mismatched schema");
-    assert_eq!(store.descriptor().schema_version, 1);
 }
 
 #[test]
@@ -215,26 +191,4 @@ fn session_delete_and_update_fail_closed_for_missing_rows() {
         ),
         Err(StoreError::NotFound(_))
     ));
-}
-
-#[test]
-fn store_open_rejects_parent_symlinks() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let target = dir.path().join("target");
-    std::fs::create_dir(&target).expect("target");
-    let link = dir.path().join("link");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    #[cfg(windows)]
-    match std::os::windows::fs::symlink_dir(&target, &link) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(1314) => return,
-        Err(error) => panic!("symlink: {error}"),
-    }
-
-    let error = match SessionStore::open(link.join("index.sqlite3")) {
-        Err(error) => error,
-        Ok(_) => panic!("symlink parent must be rejected"),
-    };
-    assert!(matches!(error, StoreError::InvalidState(_)));
 }

@@ -7,14 +7,12 @@ use singularity_core::CancellationToken;
 use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
 };
-use crate::provider::runtime::ProviderRuntime;
 use crate::provider::telemetry::ProviderAttemptMetadata;
 use crate::types::{ModelTurnResponse, ProviderToolReasoningMode};
 use crate::{
     HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
     MAX_PROVIDER_RESPONSE_BODY_BYTES, PROVIDER_CANCELLATION_POLL_MS,
-    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
 };
 
 pub(super) fn duration_millis(duration: Duration) -> u64 {
@@ -82,19 +80,6 @@ pub(super) fn provider_transport_error(
     ProviderError::from_model_error(model_error)
 }
 
-pub(crate) fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::UnknownProviderError,
-            "provider runtime initialization failed",
-        )
-        .with_provider_diagnostic(
-            PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
-            ProviderErrorStage::ClientInitialization,
-        ),
-    )
-}
-
 pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
     provider_transport_error(
         error,
@@ -153,7 +138,7 @@ pub(super) fn provider_attempt_metadata(
 }
 
 pub(crate) fn block_on_provider_future<C, F, T>(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     error_code: &'static str,
     error_stage: ProviderErrorStage,
@@ -164,16 +149,8 @@ where
     C: FnOnce() -> F,
     F: Future<Output = Result<T, reqwest::Error>>,
 {
-    let mut future = match runtime {
-        ProviderRuntime::External(handle) => {
-            let _runtime_context = handle.enter();
-            Box::pin(create_future())
-        }
-        ProviderRuntime::Owned(runtime) => {
-            let _runtime_context = runtime.enter();
-            Box::pin(create_future())
-        }
-    };
+    let _runtime_context = runtime.enter();
+    let mut future = Box::pin(create_future());
     loop {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
@@ -196,7 +173,7 @@ where
 }
 
 pub(crate) fn read_bounded_provider_response_body(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
     mut response: Response,

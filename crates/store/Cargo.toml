@@ -10,8 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-cap-fs-ext.workspace = true
-cap-std.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true

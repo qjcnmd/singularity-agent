@@ -48,20 +48,14 @@ impl fmt::Debug for ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
-    /// 从环境读取并固定一份 provider 配置快照。
-    ///
-    /// runtime_handle 由已有异步宿主提供时复用该 runtime；否则 provider 自己拥有
-    /// runtime。
-    pub fn capture<F>(get_env: F, runtime_handle: Option<tokio::runtime::Handle>) -> Self
+    /// 从环境读取并固定一份 provider 配置快照；异步执行使用调用方注入的 runtime。
+    pub fn capture<F>(get_env: F, runtime_handle: tokio::runtime::Handle) -> Self
     where
         F: FnMut(&str) -> Option<String>,
     {
+        let runtime_handle = runtime_handle.clone();
         Self::capture_with_provider(get_env, move |config| {
-            if let Some(runtime_handle) = runtime_handle.as_ref() {
-                OpenAiProvider::new_with_runtime_handle(config, runtime_handle.clone())
-            } else {
-                OpenAiProvider::new(config)
-            }
+            OpenAiProvider::new(config, runtime_handle.clone())
         })
     }
 
@@ -484,9 +478,6 @@ where
 }
 
 pub(crate) fn provider_initialization_blocker(error: &ModelError) -> Option<ModelBlockerKind> {
-    if error.code.as_deref() == Some(PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE) {
-        return Some(ModelBlockerKind::ProviderRuntimeUnavailable);
-    }
     match error.category() {
         ModelErrorCategory::Authentication => Some(ModelBlockerKind::AuthenticationProviderError),
         ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {

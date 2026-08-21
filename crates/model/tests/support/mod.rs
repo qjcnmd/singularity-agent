@@ -9,7 +9,7 @@ pub(crate) use singularity_model::{
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderConfigSource, ProviderConfigurationStatus, ProviderError, ProviderErrorStage,
     ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
     ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, responses_endpoint, validate_model_request,
@@ -39,6 +39,25 @@ pub(crate) fn tool_call(id: &str, name: &str) -> ModelToolCall {
 
 pub(crate) fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
     provider_config_with_base_url(chat_completions_endpoint(&base_url))
+}
+
+/// 测试共享的注入 runtime：provider 的异步执行一律由上层提供。
+pub(crate) fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("shared test provider runtime")
+        })
+        .handle()
+        .clone()
+}
+
+/// 构造注入共享测试 runtime 的 provider；返回 Result 以保持调用点 `.expect` 形状。
+pub(crate) fn test_provider(config: OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError> {
+    OpenAiProvider::new(config, test_runtime_handle())
 }
 
 pub(crate) fn provider_auto_test_config(base_url: String) -> OpenAiProviderConfig {

@@ -1,6 +1,8 @@
-//! SQLite connection configuration and protected file opening.
+//! SQLite connection configuration and opening.
 
 use super::*;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// SQLite 索引的公开描述及其支持的模式版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -18,22 +20,21 @@ pub struct SessionStore {
     pub(crate) connection: Connection,
     pub(crate) descriptor: SessionStoreDescriptor,
     pub(crate) runtime_path: Option<PathBuf>,
-    pub(crate) identity_guard: Option<StoreIdentityGuard>,
 }
 
 impl SessionStore {
     /// 打开 SQLite 索引，配置安全失败的 `pragma`，并执行模式检查/初始化。
-    /// 若检测到可恢复的结构损坏（malformed/not-a-database、unsupported schema、schema structure mismatch），
+    /// 若检测到可恢复的结构损坏（malformed/not-a-database、unsupported schema），
     /// 将损坏库与 sidecar 文件原子隔离备份并创建新库。
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         Self::open_with_initialization(path, |_| Ok(()))
     }
 
-    /// Open an index and run the caller's rebuild/initialization callback while
-    /// the same stable `<db>.init.lock` remains held. The callback is invoked
-    /// after any quarantine and current-schema creation, so a failed rebuild
-    /// leaves both the quarantine evidence and the new partial database
-    /// visible to diagnostics instead of reporting a false successful startup.
+    /// Open an index and run the caller's rebuild/initialization callback after
+    /// any quarantine and current-schema creation. The callback is invoked with
+    /// the freshly initialized store, so a failed rebuild leaves both the
+    /// quarantine evidence and the new partial database visible to diagnostics
+    /// instead of reporting a false successful startup.
     pub fn open_with_initialization<F>(path: impl AsRef<Path>, initialize: F) -> StoreResult<Self>
     where
         F: FnOnce(&SessionStore) -> StoreResult<()>,
@@ -44,7 +45,6 @@ impl SessionStore {
             initialize(&store)?;
             return Ok(store);
         }
-        let _initialization_lock = acquire_store_initialization_lock(path)?;
         let store = match Self::open_file_backed(path) {
             Ok(store) => store,
             Err(error) if error.is_recoverable_corruption() => {
@@ -60,7 +60,6 @@ impl SessionStore {
     fn open_in_memory() -> StoreResult<Self> {
         let connection = Connection::open(":memory:")?;
         configure_connection(&connection)?;
-        validate_connection_pragmas(&connection, true)?;
         let store = Self {
             connection,
             descriptor: SessionStoreDescriptor {
@@ -69,22 +68,19 @@ impl SessionStore {
                 schema_version: SCHEMA_VERSION,
             },
             runtime_path: None,
-            identity_guard: None,
         };
         migration::initialize_or_validate_schema(&store.connection)?;
         Ok(store)
     }
 
     fn open_file_backed(path: &Path) -> StoreResult<Self> {
-        let identity_guard = StoreIdentityGuard::open(path, true)?;
-        let runtime_path = identity_guard.path.clone();
         let connection = Connection::open_with_flags(
-            &runtime_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        identity_guard.verify()?;
         configure_connection(&connection)?;
-        validate_connection_pragmas(&connection, false)?;
         let store = Self {
             connection,
             descriptor: SessionStoreDescriptor {
@@ -92,19 +88,15 @@ impl SessionStore {
                 path: path.to_string_lossy().to_string(),
                 schema_version: SCHEMA_VERSION,
             },
-            runtime_path: Some(runtime_path),
-            identity_guard: Some(identity_guard),
+            runtime_path: Some(path.to_path_buf()),
         };
         migration::initialize_or_validate_schema(&store.connection)?;
-        if let Some(identity_guard) = &store.identity_guard {
-            identity_guard.verify()?;
-        }
         Ok(store)
     }
 
     /// 从已经初始化的 file-backed store 派生 worker 专用连接。
     ///
-    /// 该入口不接受路径，只能使用当前 store 已固定的规范路径；它执行结构校验。
+    /// 该入口不接受路径，只能使用当前 store 已固定的规范路径；它执行模式版本校验。
     /// `:memory:` store 没有可安全派生的独立连接。
     pub fn trusted_reopen(&self) -> StoreResult<Self> {
         let runtime_path = self.runtime_path.clone().ok_or_else(|| {
@@ -112,34 +104,16 @@ impl SessionStore {
                 "trusted store reopen requires a file-backed initialized store".to_string(),
             )
         })?;
-        let original_guard = self.identity_guard.as_ref().ok_or_else(|| {
-            StoreError::InvalidState(
-                "trusted store reopen requires a protected file identity".to_string(),
-            )
-        })?;
-        original_guard.verify()?;
-        let identity_guard = StoreIdentityGuard::open(&runtime_path, false)?;
-        if identity_guard.identity != original_guard.identity {
-            return Err(StoreError::InvalidState(
-                "trusted store reopen resolved a different file identity".to_string(),
-            ));
-        }
         let connection = Connection::open_with_flags(
             &runtime_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        identity_guard.verify()?;
-        original_guard.verify()?;
         configure_connection(&connection)?;
-        validate_connection_pragmas(&connection, false)?;
         migration::validate_current_schema(&connection)?;
-        identity_guard.verify()?;
-        original_guard.verify()?;
         Ok(Self {
             connection,
             descriptor: self.descriptor.clone(),
             runtime_path: Some(runtime_path),
-            identity_guard: Some(identity_guard),
         })
     }
 
@@ -155,78 +129,6 @@ pub(crate) fn configure_connection(connection: &Connection) -> StoreResult<()> {
     connection.pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
     connection.pragma_update(None, SQLITE_JOURNAL_MODE_PRAGMA, SQLITE_JOURNAL_MODE_WAL)?;
     Ok(())
-}
-
-// 确认每个 store connection 都处于受支持的 SQLite 运行时配置。
-pub(crate) fn validate_connection_pragmas(
-    connection: &Connection,
-    in_memory: bool,
-) -> StoreResult<()> {
-    let busy_timeout: i64 = connection.query_row("pragma busy_timeout", [], |row| row.get(0))?;
-    if busy_timeout != SQLITE_BUSY_TIMEOUT_MS as i64 {
-        return Err(StoreError::InvalidState(
-            "store busy_timeout pragma is invalid".to_string(),
-        ));
-    }
-    let foreign_keys: i64 = connection.query_row("pragma foreign_keys", [], |row| row.get(0))?;
-    if foreign_keys != 1 {
-        return Err(StoreError::InvalidState(
-            "store foreign_keys pragma is disabled".to_string(),
-        ));
-    }
-    let secure_delete: i64 = connection.query_row("pragma secure_delete", [], |row| row.get(0))?;
-    if secure_delete == 0 {
-        return Err(StoreError::InvalidState(
-            "store secure_delete pragma is disabled".to_string(),
-        ));
-    }
-    let journal_mode: String = connection.query_row("pragma journal_mode", [], |row| row.get(0))?;
-    let expected_journal_mode = if in_memory {
-        "memory"
-    } else {
-        SQLITE_JOURNAL_MODE_WAL
-    };
-    if !journal_mode.eq_ignore_ascii_case(expected_journal_mode) {
-        return Err(StoreError::InvalidState(format!(
-            "store journal_mode pragma is {journal_mode:?}, expected {expected_journal_mode:?}"
-        )));
-    }
-    Ok(())
-}
-
-// 在 schema 初始化期间以独占文件锁串行化同一数据库。
-pub(crate) fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
-    if path == Path::new(":memory:") {
-        return Ok(None);
-    }
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".init.lock");
-    let lock_path = PathBuf::from(lock_path);
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .map_err(StoreError::InitializationLock)?;
-    let deadline = Instant::now() + Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS);
-    loop {
-        match lock_file.try_lock() {
-            Ok(()) => return Ok(Some(lock_file)),
-            Err(error) => {
-                let error = std::io::Error::from(error);
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(StoreError::InitializationLock(error));
-                }
-                if Instant::now() >= deadline {
-                    return Err(StoreError::InvalidState(
-                        "timed out waiting for store initialization lock".to_string(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(STORE_INITIALIZATION_LOCK_RETRY_MS));
-            }
-        }
-    }
 }
 
 /// 原子隔离损坏的 SQLite 主库与 sidecar 文件（`-wal`, `-shm`）。

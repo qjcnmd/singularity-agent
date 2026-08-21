@@ -235,7 +235,10 @@ fn public_diagnostic(error: &ProviderError) -> String {
 }
 
 /// Read and, when stale or requested, refresh the user-level `/models` ids.
-pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, ProviderError> {
+pub fn read_user_model_catalog(
+    refresh: bool,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<UserModelCatalog, ProviderError> {
     let Some(user_config) = read_user_config_data()? else {
         return Ok(UserModelCatalog {
             default_selector: None,
@@ -351,7 +354,7 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
                     max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
                     max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 };
-                match OpenAiProvider::new(discovery_config)
+                match OpenAiProvider::new(discovery_config, runtime_handle.clone())
                     .and_then(|provider| provider.discover_model_ids())
                     .and_then(validate_discovered_model_ids)
                 {

@@ -34,7 +34,7 @@ fn openai_responses_stream_aggregates_deltas_and_ignores_ping_after_completion()
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_stream_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -148,8 +148,7 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             .map(|chunk| chunk.to_vec())
             .collect();
         let (base_url, requests) = responses_stream_server(chunks, None);
-        let provider =
-            OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+        let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
             format!("request_stream_{name}"),
             vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -197,7 +196,7 @@ fn openai_responses_stream_length_preserves_partial_response() {
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_stream_incomplete",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -237,7 +236,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_stream_oversized",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -293,7 +292,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_tool_stream",
         vec![ModelMessage::text(ModelRole::User, "call read")],
@@ -337,7 +336,7 @@ fn openai_chat_streaming_normalizes_visible_deltas_and_tool_fragments() {
             .collect(),
         None,
     );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_chat_stream",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -400,7 +399,7 @@ fn streaming_capability_is_bound_to_the_selected_protocol() {
         ProviderStreamingCapability::Unsupported
     );
 
-    let provider = OpenAiProvider::new(provider_config_with_base_url(
+    let provider = test_provider(provider_config_with_base_url(
         "http://127.0.0.1:1/v1/responses".to_string(),
     ))
     .expect("provider");
@@ -467,7 +466,7 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
             }
         }
     });
-    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+    let provider = test_provider(provider_config_with_base_url(format!(
         "http://{address}/v1/responses"
     )))
     .expect("provider");
@@ -533,7 +532,7 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
         )
         .expect("write truncated post-delta body");
     });
-    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+    let provider = test_provider(provider_config_with_base_url(format!(
         "http://{address}/v1/responses"
     )))
     .expect("provider");
@@ -592,7 +591,7 @@ fn openai_responses_stream_cancellation_reaches_inflight_body_read() {
             .expect("signal stream cancellation start");
         thread::sleep(Duration::from_millis(500));
     });
-    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+    let provider = test_provider(provider_config_with_base_url(format!(
         "http://{address}/v1/responses"
     )))
     .expect("provider");
@@ -649,7 +648,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
         }],
         "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
     }));
-    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_auto_test_config(base_url)).expect("provider");
     let response = provider
         .complete(
             &capability_test_request(None, false, 1),
@@ -691,7 +690,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     }"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -737,7 +736,7 @@ fn openai_chat_request_output_cap_remains_on_wire() {
         "HTTP/1.1 200 OK",
         r#"{"id":"request_cap","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_cap",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -771,7 +770,7 @@ fn openai_chat_response_wire_discriminators_fail_closed_before_normalization() {
     ];
     for (body, expected_code) in cases {
         let base_url = single_response_server("HTTP/1.1 200 OK", body);
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let provider = test_provider(provider_test_config(base_url)).expect("provider");
         let error = provider
             .complete(
                 &ModelTurnRequest::new(
@@ -801,7 +800,7 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
         "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}
     }"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", length_body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let mut request = capability_test_request(None, false, 1);
     request.request_id = "chat_length_with_tool_call".to_string();
     let response = provider
@@ -815,7 +814,7 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
 
     let filter_body = r#"{"id":"chat_filter","choices":[{"message":{"role":"assistant","content":"blocked"},"finish_reason":"content_filter"}]}"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", filter_body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let error = provider
         .complete(
             &ModelTurnRequest::new(
@@ -843,7 +842,7 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
         ("HTTP/1.1 503 Service Unavailable", "{}"),
         ("HTTP/1.1 200 OK", success_body),
     ]);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_retry",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -919,7 +918,7 @@ fn openai_provider_honors_retry_after_ms_before_retrying() {
         ),
         ("HTTP/1.1 200 OK", success_body, ""),
     ]);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_retry_header",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -951,7 +950,7 @@ fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
         ("HTTP/1.1 503 Service Unavailable", "{}"),
         ("HTTP/1.1 200 OK", success_body),
     ]);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_observed_retry",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -997,7 +996,7 @@ fn openai_provider_rejects_observer_start_before_network_side_effect() {
         .expect("set nonblocking observer rejection provider");
     let address = listener.local_addr().expect("observer rejection address");
     let provider =
-        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+        test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
         "request_observer_rejected",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1043,11 +1042,8 @@ fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
         .enable_all()
         .build()
         .expect("external Tokio runtime");
-    let provider = OpenAiProvider::new_with_runtime_handle(
-        provider_test_config(base_url),
-        runtime.handle().clone(),
-    )
-    .expect("provider");
+    let provider = OpenAiProvider::new(provider_test_config(base_url), runtime.handle().clone())
+        .expect("provider");
     let request = ModelTurnRequest::new(
         "request_external_runtime",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1095,7 +1091,7 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
         }
     });
     let provider =
-        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+        test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
         "request_transport_retry",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1142,7 +1138,7 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
     let address = listener.local_addr().expect("unused provider address");
     drop(listener);
     let provider =
-        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+        test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
         "request_send_failure",
         vec![ModelMessage::text(
@@ -1189,7 +1185,7 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
 fn openai_provider_cancels_during_retry_backoff() {
     let (base_url, attempts) =
         sequence_response_server(vec![("HTTP/1.1 429 Too Many Requests", "{}")]);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_retry_cancel",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1263,7 +1259,7 @@ fn openai_provider_rejects_multiple_choices_without_retrying_or_selecting_one() 
         ]
     }"#;
     let base_url = single_response_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_multiple_choices",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1307,7 +1303,7 @@ fn openai_provider_cancels_an_inflight_http_request() {
         );
     });
     let provider =
-        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+        test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
         "request_cancel",
         vec![ModelMessage::text(ModelRole::User, "wait")],

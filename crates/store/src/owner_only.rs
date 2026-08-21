@@ -3,6 +3,7 @@
 //! 在 Unix 系统上通过文件模式（0700 目录 / 0600 文件）限制仅当前属主用户具备读写权限。
 
 use super::*;
+use std::path::Path;
 
 pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
     #[cfg(unix)]

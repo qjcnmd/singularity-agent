@@ -1,12 +1,13 @@
 use reqwest::header::HeaderMap;
 use singularity_core::CancellationToken;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc2822;
 
 use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
 };
-use crate::provider::runtime::ProviderRuntime;
 use crate::{
     HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
     PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
@@ -34,8 +35,23 @@ pub(crate) fn provider_retry_backoff(retry_count: u32) -> Duration {
     // Full jitter avoids synchronized retries across independent provider
     // clients while retaining the bounded exponential window. Retry-After
     // is handled by `record_provider_retry` and remains authoritative.
-    let sample = Uuid::new_v4().as_u128() as u64;
-    Duration::from_millis(full_jitter_delay_ms(retry_count, sample))
+    Duration::from_millis(full_jitter_delay_ms(retry_count, next_jitter_sample()))
+}
+
+/// 退避抖动的轻量随机源：进程内单调序列与时钟种子经 splitmix64 终结器混合。
+/// 只用于抖动采样，不需要密码学强度，也不引入专门的随机依赖。
+fn next_jitter_sample() -> u64 {
+    static JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let clock_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut mixed = JITTER_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(clock_seed | 1);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
 }
 
 pub(crate) fn retry_backoff_window_ms(retry_count: u32) -> u64 {
@@ -76,68 +92,16 @@ pub(crate) fn parse_retry_after_value(value: &str) -> Option<Duration> {
 }
 
 pub(crate) fn parse_http_date_delay(value: &str) -> Option<Duration> {
-    // HTTP-date's current wire form is IMF-fixdate, e.g.
-    // "Wed, 21 Oct 2015 07:28:00 GMT". Invalid or obsolete forms are
-    // ignored and fall back to the bounded local exponential delay.
-    let parts = value.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 6 || !parts[5].eq_ignore_ascii_case("GMT") {
-        return None;
-    }
-    let day = parts[1].parse::<u32>().ok()?;
-    let month = match parts[2] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year = parts[3].parse::<i64>().ok()?;
-    let time = parts[4];
-    let mut clock = time.split(':');
-    let hour = clock.next()?.parse::<u64>().ok()?;
-    let minute = clock.next()?.parse::<u64>().ok()?;
-    let second = clock.next()?.parse::<u64>().ok()?;
-    if clock.next().is_some() || day == 0 || day > 31 || hour >= 24 || minute >= 60 || second >= 60
-    {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    let unix_seconds = days
-        .checked_mul(86_400)?
-        .checked_add(i64::try_from(hour * 3_600 + minute * 60 + second).ok()?)?;
-    if unix_seconds < 0 {
-        return Some(Duration::ZERO);
-    }
-    let target = UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(unix_seconds).ok()?))?;
-    let remaining = target.duration_since(SystemTime::now()).unwrap_or_default();
+    // HTTP-date 的现行 wire 形态是 IMF-fixdate（RFC 2822 固定格式，GMT 零区），
+    // 交给 `time` crate 的 Rfc2822 解析器处理；无效或过时形态回退到有界本地
+    // 指数退避。
+    let target = OffsetDateTime::parse(value.trim(), &Rfc2822).ok()?;
+    let remaining = Duration::try_from(target - OffsetDateTime::now_utc()).unwrap_or_default();
     Some(remaining.min(Duration::from_millis(PROVIDER_RETRY_MAX_BACKOFF_MS)))
 }
 
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > 31 {
-        return None;
-    }
-    let year = year.checked_sub(if month <= 2 { 1 } else { 0 })?;
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era.checked_mul(146_097)?
-        .checked_add(day_of_era)?
-        .checked_sub(719_468)
-}
-
 pub(super) fn wait_provider_backoff(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     duration: Duration,
 ) -> Result<(), ProviderError> {
