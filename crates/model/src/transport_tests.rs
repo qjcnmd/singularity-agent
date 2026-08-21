@@ -17,13 +17,39 @@ use crate::error::{
 };
 use crate::provider::telemetry::ProviderAttemptStatus;
 use crate::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelMessage,
-    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, OpenAiProvider,
-    OpenAiProviderConfig, PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
-    PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, Provider, ProviderApiProtocol,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelTurnRequest, OpenAiProvider, OpenAiProviderConfig,
+    PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS, Provider, ProviderApiProtocol,
     ProviderConfigSource, ProviderReasoningReplay, ProviderToolReasoningMode, SelectedModel,
     ThinkingWireFormat,
 };
+
+/// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
+fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test provider runtime")
+        })
+        .handle()
+        .clone()
+}
+
+/// 构造注入共享测试 runtime 的 provider；返回 Result 以保持调用点 `.expect` 形状。
+fn test_provider(config: OpenAiProviderConfig) -> Result<OpenAiProvider, crate::ProviderError> {
+    OpenAiProvider::new(config, test_runtime_handle())
+}
+
+/// 同 [`test_provider`]，但覆盖请求超时秒数。
+fn test_provider_with_timeout(
+    config: OpenAiProviderConfig,
+    request_timeout_seconds: u64,
+) -> Result<OpenAiProvider, crate::ProviderError> {
+    OpenAiProvider::new_with_request_timeout(config, request_timeout_seconds, test_runtime_handle())
+}
 
 fn tool_result_message(call_id: &str, text: &str) -> ModelMessage {
     let mut message = ModelMessage::text(ModelRole::Tool, text);
@@ -41,7 +67,7 @@ fn selected_provider() -> OpenAiProvider {
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
     };
-    OpenAiProvider::new(config)
+    test_provider(config)
         .expect("provider")
         .with_selected_model(SelectedModel {
             model_name: "gpt-test".to_string(),
@@ -294,7 +320,7 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
         }
         thread::sleep(Duration::from_secs(2));
     });
-    let provider = OpenAiProvider::new_with_request_timeout(
+    let provider = test_provider_with_timeout(
         OpenAiProviderConfig {
             provider_name: "openai_compatible".to_string(),
             model_name: "gpt-test".to_string(),
@@ -383,7 +409,7 @@ fn oversized_success_body_is_rejected_before_buffering() {
         )
         .expect("write oversized response headers");
     });
-    let provider = OpenAiProvider::new(OpenAiProviderConfig {
+    let provider = test_provider(OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
         base_url: format!("http://{address}"),
@@ -427,9 +453,9 @@ fn oversized_success_body_is_rejected_before_buffering() {
 #[test]
 fn provider_clones_share_a_runtime_and_requests_progress_concurrently() {
     let (base_url, maximum_rx, server) = concurrent_provider_server();
-    let provider = OpenAiProvider::new(test_provider_config(base_url)).expect("provider");
-    let cloned = provider.clone();
-    assert!(Arc::ptr_eq(&provider.runtime, &cloned.runtime));
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    // 注入的 runtime 是廉价共享句柄：clone 必然绑定同一 runtime；
+    // 下方的并发请求断言（maximum=2）从行为上验证两条 clone 同时执行。
 
     let provider = Arc::new(provider);
     let start = Arc::new(std::sync::Barrier::new(3));
@@ -474,7 +500,7 @@ fn provider_clones_share_a_runtime_and_requests_progress_concurrently() {
 #[test]
 fn cancelled_request_does_not_poison_followup_on_the_shared_runtime() {
     let (base_url, first_request_rx, server) = cancellation_followup_server();
-    let provider = OpenAiProvider::new(test_provider_config(base_url)).expect("provider");
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let worker_provider = provider.clone();
@@ -523,11 +549,8 @@ fn timed_out_request_does_not_poison_followup_on_the_shared_runtime() {
         write_test_provider_response(&mut followup_stream);
         drop(hanging_streams);
     });
-    let provider = OpenAiProvider::new_with_request_timeout(
-        test_provider_config(format!("http://{address}")),
-        1,
-    )
-    .expect("provider");
+    let provider = test_provider_with_timeout(test_provider_config(format!("http://{address}")), 1)
+        .expect("provider");
     let timed_out_request = ModelTurnRequest::new(
         "request_timeout_shared_runtime",
         vec![ModelMessage::text(ModelRole::User, "wait")],
@@ -594,26 +617,24 @@ fn streaming_response_timeout_is_idle_not_total() {
         write!(stream, "0\r\n\r\n").expect("write streaming terminator");
     });
 
-    let provider = OpenAiProvider::new_with_request_timeout(
-        test_provider_config(format!("http://{address}/v1")),
-        1,
-    )
-    .expect("provider")
-    .with_selected_model(SelectedModel {
-        model_name: "gpt-test".to_string(),
-        api_protocol: ProviderApiProtocol::OpenAiResponses,
-        max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
-        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-        reasoning_variant: None,
-        reasoning_enabled: false,
-        wire_reasoning_effort: None,
-        thinking_wire_format: ThinkingWireFormat::ThinkingType,
-        tool_reasoning_mode: ProviderToolReasoningMode::DisabledForToolCalls,
-        supports_developer_role: true,
-        supports_tool_choice: true,
-        requires_reasoning_content_for_tool_calls: false,
-        requires_assistant_content_for_tool_calls: false,
-    });
+    let provider =
+        test_provider_with_timeout(test_provider_config(format!("http://{address}/v1")), 1)
+            .expect("provider")
+            .with_selected_model(SelectedModel {
+                model_name: "gpt-test".to_string(),
+                api_protocol: ProviderApiProtocol::OpenAiResponses,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                reasoning_variant: None,
+                reasoning_enabled: false,
+                wire_reasoning_effort: None,
+                thinking_wire_format: ThinkingWireFormat::ThinkingType,
+                tool_reasoning_mode: ProviderToolReasoningMode::DisabledForToolCalls,
+                supports_developer_role: true,
+                supports_tool_choice: true,
+                requires_reasoning_content_for_tool_calls: false,
+                requires_assistant_content_for_tool_calls: false,
+            });
     let request = ModelTurnRequest::new(
         "slow_streaming_response",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -638,26 +659,11 @@ fn streaming_response_timeout_is_idle_not_total() {
     server.join().expect("join slow streaming provider");
 }
 
-#[test]
-fn runtime_initialization_failure_maps_to_a_stable_provider_blocker() {
-    let error = crate::transport::http::provider_runtime_error(std::io::Error::other(
-        "synthetic runtime initialization failure",
-    ));
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some(PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE)
-    );
-    assert_eq!(
-        crate::config::runtime::provider_initialization_blocker(&error.error),
-        Some(ModelBlockerKind::ProviderRuntimeUnavailable)
-    );
-}
-
 /// 契约透传：选中模型的 tool_reasoning_mode 必须反映到 protocol_contract()。
 #[test]
 fn protocol_contract_exposes_selected_tool_reasoning_mode() {
     let config = test_provider_config("http://127.0.0.1:1/v1".to_string());
-    let provider = OpenAiProvider::new(config)
+    let provider = test_provider(config)
         .expect("provider")
         .with_selected_model(SelectedModel {
             model_name: "gpt-test".to_string(),

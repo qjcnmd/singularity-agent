@@ -36,8 +36,7 @@ fn model_discovery_rejects_any_invalid_model_entry() {
     ];
     for (label, payload) in invalid_payloads {
         let (base_url, request) = models_server(payload.to_string());
-        let provider =
-            OpenAiProvider::new(provider_auto_test_config(base_url)).expect("models provider");
+        let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
         let error = provider.discover_model_ids().expect_err(label);
         assert_eq!(
             error.error.kind,
@@ -68,8 +67,7 @@ fn model_discovery_rejects_any_invalid_model_entry() {
 fn model_discovery_accepts_complete_unique_model_entries() {
     let (base_url, request) =
         models_server(r#"{"data":[{"id":"gpt-test"},{"id":"o4-mini"}]}"#.to_string());
-    let provider =
-        OpenAiProvider::new(provider_auto_test_config(base_url)).expect("models provider");
+    let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
     assert_eq!(
         provider.discover_model_ids().expect("complete catalog"),
         vec!["gpt-test", "o4-mini"]
@@ -160,7 +158,7 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
                 _ => None,
             }
         },
-        None,
+        test_runtime_handle(),
     );
 
     assert_eq!(
@@ -188,7 +186,7 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
             "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     assert_ne!(snapshot.snapshot_id(), same_config.snapshot_id());
 }
@@ -221,7 +219,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
                 }),
                 _ => None,
             },
-            None,
+            test_runtime_handle(),
         );
 
         assert!(!snapshot.configuration().configured);
@@ -287,8 +285,7 @@ fn process_env_provider_values_reject_boundary_whitespace() {
 #[test]
 fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics() {
     let malformed_url = single_response_server("HTTP/1.1 200 OK", "not-json");
-    let malformed =
-        OpenAiProvider::new(provider_test_config(malformed_url)).expect("malformed provider");
+    let malformed = test_provider(provider_test_config(malformed_url)).expect("malformed provider");
     let request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -329,8 +326,8 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
     assert!(decode_occurrence.time_to_first_text_delta_ms.is_none());
 
     let missing_choices_url = single_response_server("HTTP/1.1 200 OK", r#"{"id":"response_1"}"#);
-    let missing_choices = OpenAiProvider::new(provider_test_config(missing_choices_url))
-        .expect("missing choices provider");
+    let missing_choices =
+        test_provider(provider_test_config(missing_choices_url)).expect("missing choices provider");
     let envelope_error = missing_choices
         .complete(&request, &singularity_core::CancellationToken::new())
         .expect_err("envelope failure");
@@ -488,7 +485,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     assert!(!capabilities.supports_parallel_tool_calls);
     assert!(!capabilities.supports_strict_tool_schema);
 
-    let provider = OpenAiProvider::new(configured).expect("provider");
+    let provider = test_provider(configured).expect("provider");
     assert_eq!(Provider::protocol_contract(&provider), capabilities);
 }
 
@@ -687,7 +684,7 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
 #[test]
 fn openai_provider_debug_redacts_secret_configuration() {
     let config = provider_test_config("https://provider.example/v1".to_string());
-    let provider = OpenAiProvider::new(config.clone()).expect("provider");
+    let provider = test_provider(config.clone()).expect("provider");
     let config_debug = format!("{config:?}");
     let provider_debug = format!("{provider:?}");
 
@@ -750,7 +747,7 @@ fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
                 _ => None,
             }
         },
-        None,
+        test_runtime_handle(),
     );
 
     assert!(snapshot.configuration().configured);
@@ -849,7 +846,7 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
             "DEEP_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("deep/chat#high"))
@@ -937,7 +934,7 @@ fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_pro
             "CATALOG_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("catalog/model"))
@@ -981,7 +978,7 @@ fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model(
             "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot.provider().expect("env provider");
     let request = ModelTurnRequest::new(
@@ -1050,7 +1047,7 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
             "DASHSCOPE_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("dashscope/deepseek-v4-flash-0731#max"))
@@ -1114,7 +1111,7 @@ fn missing_provider_usage_remains_unknown() {
             "OPENCODE_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
@@ -1149,7 +1146,7 @@ fn provider_usage_above_configured_output_limit_remains_accountable() {
         "HTTP/1.1 200 OK",
         r#"{"id":"usage_over_limit","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":9999,"total_tokens":10002}}"#,
     );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let response = provider
         .complete(
             &ModelTurnRequest::new(
@@ -1205,7 +1202,7 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
             "UNKNOWN_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("unknown/model#max"))
@@ -1269,7 +1266,7 @@ fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
             "INVALID_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let error = snapshot
         .provider()
@@ -1326,7 +1323,7 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
             "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let provider = snapshot
         .provider_for_selector(Some("longcat/responses#high"))
@@ -1422,7 +1419,7 @@ fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
             "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
             _ => None,
         },
-        None,
+        test_runtime_handle(),
     );
     let error = snapshot
         .provider()
@@ -1658,7 +1655,7 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     )
     .expect("models cache file");
 
-    let catalog = singularity_model::read_user_model_catalog(false)
+    let catalog = singularity_model::read_user_model_catalog(false, test_runtime_handle())
         .expect("catalog read must not require network on a fresh cache");
     assert_eq!(
         catalog.cache_status,
@@ -1692,7 +1689,8 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     assert!(!gpt_test.discovered);
 
     // 再次读取仍命中同一新鲜缓存。
-    let again = singularity_model::read_user_model_catalog(false).expect("second catalog read");
+    let again = singularity_model::read_user_model_catalog(false, test_runtime_handle())
+        .expect("second catalog read");
     let again_provider = again
         .providers
         .iter()

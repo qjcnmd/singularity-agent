@@ -9,7 +9,6 @@ pub(crate) use retry::*;
 pub(crate) use stream::*;
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -29,7 +28,7 @@ use crate::provider::contract::{
     provider_request_validation_error, request_uses_tool_protocol, validate_model_request,
     validate_model_request_with_capabilities,
 };
-use crate::provider::runtime::{OpenAiProviderConfig, ProviderRuntime, SelectedModel};
+use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
     ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
@@ -138,7 +137,7 @@ pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: Option<SelectedModel>,
     client: reqwest::Client,
-    runtime: Arc<ProviderRuntime>,
+    runtime: tokio::runtime::Handle,
     request_timeout_seconds: u64,
 }
 
@@ -148,7 +147,7 @@ impl Clone for OpenAiProvider {
             config: self.config.clone(),
             selected_model: self.selected_model.clone(),
             client: self.client.clone(),
-            runtime: Arc::clone(&self.runtime),
+            runtime: self.runtime.clone(),
             request_timeout_seconds: self.request_timeout_seconds,
         }
     }
@@ -167,43 +166,18 @@ impl fmt::Debug for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 创建并校验 OpenAI-compatible provider。
-    pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
-        Self::new_with_request_timeout(config, crate::PROVIDER_TIMEOUT_SECONDS)
-    }
-
-    /// 创建 provider，并绑定调用方已经拥有的 Tokio runtime handle。
-    pub fn new_with_runtime_handle(
+    /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的 runtime。
+    pub fn new(
         config: OpenAiProviderConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
-        Self::new_with_runtime(
-            config,
-            crate::PROVIDER_TIMEOUT_SECONDS,
-            ProviderRuntime::External(runtime_handle),
-        )
+        Self::new_with_request_timeout(config, crate::PROVIDER_TIMEOUT_SECONDS, runtime_handle)
     }
 
     pub(crate) fn new_with_request_timeout(
         config: OpenAiProviderConfig,
         request_timeout_seconds: u64,
-    ) -> Result<Self, ProviderError> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(crate::PROVIDER_RUNTIME_WORKER_THREADS)
-            .enable_all()
-            .build()
-            .map_err(provider_runtime_error)?;
-        Self::new_with_runtime(
-            config,
-            request_timeout_seconds,
-            ProviderRuntime::Owned(Arc::new(runtime)),
-        )
-    }
-
-    fn new_with_runtime(
-        config: OpenAiProviderConfig,
-        request_timeout_seconds: u64,
-        runtime: ProviderRuntime,
+        runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .read_timeout(Duration::from_secs(request_timeout_seconds))
@@ -214,17 +188,20 @@ impl OpenAiProvider {
             config,
             selected_model: None,
             client,
-            runtime: Arc::new(runtime),
+            runtime: runtime_handle,
             request_timeout_seconds,
         })
     }
 
     /// 从环境加载 OpenAI-compatible provider。
-    pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
+    pub fn from_env<F>(
+        get_env: F,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ProviderError>
     where
         F: FnMut(&str) -> Option<String>,
     {
-        crate::config::ProviderConfigSnapshot::capture(get_env, None).provider()
+        crate::config::ProviderConfigSnapshot::capture(get_env, runtime_handle).provider()
     }
 
     /// Discover public model ids from the provider's standard `/models` endpoint.
@@ -232,7 +209,7 @@ impl OpenAiProvider {
         crate::discovery::discover_provider_models(
             &self.config,
             &self.client,
-            self.runtime.as_ref(),
+            &self.runtime,
             self.request_timeout_seconds,
         )
     }
@@ -547,7 +524,7 @@ impl OpenAiProvider {
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         self.validate_reasoning_history(request)?;
-        let runtime = self.runtime.as_ref();
+        let runtime = &self.runtime;
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = self.config.endpoint();
@@ -794,7 +771,7 @@ impl OpenAiProvider {
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         self.validate_reasoning_history(request)?;
-        let runtime = self.runtime.as_ref();
+        let runtime = &self.runtime;
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = responses_endpoint(&self.config.base_url);
@@ -1030,7 +1007,7 @@ impl OpenAiProvider {
         model_name: &str,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
-        let runtime = self.runtime.as_ref();
+        let runtime = &self.runtime;
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = match api_protocol {
@@ -1496,7 +1473,7 @@ impl Provider for OpenAiProvider {
 }
 
 fn wait_stream_retry_backoff(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     duration: Duration,
     metadata: &ProviderAttemptMetadata,

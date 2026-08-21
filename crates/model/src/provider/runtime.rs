@@ -18,8 +18,6 @@ use crate::{
     RESPONSES_PATH, ThinkingWireFormat,
 };
 use std::fmt;
-use std::future::Future;
-use std::sync::Arc;
 
 /// 已解析的兼容 OpenAI 连接设置；敏感信息仅为传输使用而保留。
 #[derive(Clone, PartialEq, Eq)]
@@ -227,21 +225,4 @@ pub(crate) struct SelectedModel {
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-}
-
-/// Provider transport runtime ownership: an app-server borrows its existing handle, while
-/// independent consumers own a dedicated runtime shared by provider clones.
-#[derive(Clone)]
-pub(crate) enum ProviderRuntime {
-    External(tokio::runtime::Handle),
-    Owned(Arc<tokio::runtime::Runtime>),
-}
-
-impl ProviderRuntime {
-    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::External(handle) => handle.block_on(future),
-            Self::Owned(runtime) => runtime.block_on(future),
-        }
-    }
 }

@@ -57,7 +57,6 @@ pub enum ModelBlockerKind {
     AuthenticationProviderError,
     BaseUrlNetworkError,
     ModelNameConfigError,
-    ProviderRuntimeUnavailable,
 }
 
 impl ModelBlockerKind {
@@ -68,7 +67,6 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication_provider_error",
             Self::BaseUrlNetworkError => "base_url_network_error",
             Self::ModelNameConfigError => "model_name_config_error",
-            Self::ProviderRuntimeUnavailable => "provider_runtime_unavailable",
         }
     }
 
@@ -79,7 +77,6 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication/provider error",
             Self::BaseUrlNetworkError => "base_url/network error",
             Self::ModelNameConfigError => "model name/config error",
-            Self::ProviderRuntimeUnavailable => "provider runtime unavailable",
         }
     }
 }

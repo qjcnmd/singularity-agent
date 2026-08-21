@@ -9,7 +9,6 @@ use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
-use crate::provider::runtime::ProviderRuntime;
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::http::{block_on_provider_future, duration_millis};
 
@@ -28,7 +27,7 @@ pub(super) struct StreamAttemptSuccess {
 
 /// Decode one Chat Completions body while preserving arbitrary HTTP chunk and SSE frame boundaries.
 pub(super) fn read_openai_chat_sse(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
     mut response: Response,
@@ -364,7 +363,7 @@ impl<'a> ChatSseDecoder<'a> {
 
 /// Decode one Responses body while preserving arbitrary HTTP chunk and SSE frame boundaries.
 pub(super) fn read_openai_responses_sse(
-    runtime: &ProviderRuntime,
+    runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
     mut response: Response,

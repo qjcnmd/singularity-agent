@@ -464,9 +464,8 @@ fn initialize_app_server(
     } else {
         paths.ensure_index_owner_only()?;
     }
-    validate_database_file(Path::new(&db_path), false)?;
     let provider_snapshot =
-        ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), Some(runtime_handle));
+        ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), runtime_handle);
     Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))
 }
 

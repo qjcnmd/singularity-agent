@@ -1260,8 +1260,6 @@ dependencies = [
 name = "singularity_app_server"
 version = "0.1.0"
 dependencies = [
- "cap-fs-ext",
- "cap-std",
  "rusqlite",
  "schemars",
  "serde",
@@ -1292,6 +1290,7 @@ dependencies = [
  "singularity_model",
  "singularity_protocol",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1319,6 +1318,7 @@ dependencies = [
  "singularity_core",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "uuid",
  "windows-sys 0.52.0",
@@ -1338,8 +1338,6 @@ dependencies = [
 name = "singularity_store"
 version = "0.1.0"
 dependencies = [
- "cap-fs-ext",
- "cap-std",
  "rusqlite",
  "schemars",
  "serde",

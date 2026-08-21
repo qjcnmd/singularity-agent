@@ -1,6 +1,26 @@
 use super::*;
 use crate::{Provider, USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
 
+/// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
+fn test_runtime_handle() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test provider runtime")
+        })
+        .handle()
+        .clone()
+}
+
+/// 注入共享测试 runtime 的 provider 工厂，替代直接传递构造函数指针。
+fn test_provider_factory()
+-> impl Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, crate::ProviderError> {
+    |config| OpenAiProvider::new(config, test_runtime_handle())
+}
+
 fn executable_user_model() -> UserConfigModel {
     UserConfigModel {
         api_protocol: Some("chat".to_string()),
@@ -49,7 +69,7 @@ fn unselected_provider_without_auth_does_not_block_capture() {
     let (snapshot, redacted) = capture_user_model_selection(
         &data,
         Some(ProviderConfigSource::UserConfigFile),
-        &OpenAiProvider::new,
+        &test_provider_factory(),
     )
     .expect("selected provider is configured");
     assert!(redacted.api_key_present);
@@ -142,7 +162,7 @@ fn models_file_projects_only_from_top_level_fields() {
         file,
         &mut |name| (name == "PRIMARY_KEY").then(|| "sk-primary".to_string()),
         Some(ProviderConfigSource::UserConfigFile),
-        &OpenAiProvider::new,
+        &test_provider_factory(),
     )
     .expect("models file capture");
     let provider = provider_for_selection(&snapshot, None).expect("selected provider");
@@ -244,7 +264,7 @@ fn unknown_model_without_limits_still_fails_closed() {
 fn provider_config_snapshot_preserves_the_original_configuration_error() {
     let snapshot = ProviderConfigSnapshot::capture_with_provider_and_sources(
         |_| None,
-        OpenAiProvider::new,
+        test_provider_factory(),
         || None,
     );
 
@@ -276,7 +296,7 @@ fn partial_process_environment_is_authoritative_over_user_config_layer() {
             ENV_MODEL => Some("process-model".to_string()),
             _ => None,
         },
-        OpenAiProvider::new,
+        test_provider_factory(),
         || {
             user_layer_read = true;
             Some(ProviderConfigLayer {
@@ -313,7 +333,7 @@ fn selected_provider_without_auth_fails_closed_as_auth_error() {
     let result = capture_user_model_selection(
         &data,
         Some(ProviderConfigSource::UserConfigFile),
-        &OpenAiProvider::new,
+        &test_provider_factory(),
     );
     let error = match result {
         Ok(_) => panic!("default provider auth is required"),
@@ -496,7 +516,7 @@ fn selected_invalid_endpoint_precedes_missing_auth() {
     let error = match capture_user_model_selection(
         &data,
         Some(ProviderConfigSource::UserConfigFile),
-        &OpenAiProvider::new,
+        &test_provider_factory(),
     ) {
         Ok(_) => panic!("invalid endpoint must fail before missing auth"),
         Err(error) => error,

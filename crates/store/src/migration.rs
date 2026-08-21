@@ -1,21 +1,12 @@
-//! Session index schema creation and structural validation.
+//! Session index schema creation and schema-version validation.
 //!
 //! SQLite 只保存会话元数据；会话正文唯一权威是 JSONL rollout 文件。
+//! 模式版本只通过 `PRAGMA user_version` 标记，不做表结构内省比对。
 
 use super::*;
-use std::collections::BTreeSet;
-
-pub(crate) const EXPECTED_MIGRATIONS: &[&str] = &["0001_session_index"];
 
 pub(crate) const CURRENT_SCHEMA_SQL: &str = r#"
-create table schema_meta(
-schema_version integer not null check(schema_version = 1)
-);
-create table schema_migrations(
-migration_id text primary key,
-applied_at text not null default current_timestamp
-);
-create table session_index(
+create table if not exists session_index(
 session_id text primary key,
 rollout_path text not null,
 cwd text not null,
@@ -30,26 +21,31 @@ token_usage text not null
 "#;
 
 pub(crate) const CURRENT_INDEX_SQL: &str = r#"
-create index session_index_updated_at on session_index(updated_at);
-create index session_index_cwd on session_index(cwd);
+create index if not exists session_index_updated_at on session_index(updated_at);
+create index if not exists session_index_cwd on session_index(cwd);
 "#;
 
+/// 在新库或空库上创建当前 schema，并把版本标记写入 `PRAGMA user_version`。
 pub(crate) fn initialize_or_validate_schema(connection: &Connection) -> StoreResult<()> {
-    let tables = user_tables(connection)?;
-    if tables.is_empty() {
-        create_current_schema(connection)?;
-        return Ok(());
+    match user_version(connection)? {
+        0 => create_current_schema(connection),
+        SCHEMA_VERSION => Ok(()),
+        found => Err(StoreError::UnsupportedSchema {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
     }
-    match schema_meta_version(connection)? {
-        Some(SCHEMA_VERSION) => {}
-        found => {
-            return Err(StoreError::UnsupportedSchema {
-                found: found.unwrap_or(0),
-                supported: SCHEMA_VERSION,
-            });
-        }
+}
+
+/// 校验已初始化库的 schema 版本标记是当前实现的版本（不创建 schema）。
+pub(crate) fn validate_current_schema(connection: &Connection) -> StoreResult<()> {
+    match user_version(connection)? {
+        SCHEMA_VERSION => Ok(()),
+        found => Err(StoreError::UnsupportedSchema {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
     }
-    validate_current_schema(connection)
 }
 
 fn create_current_schema(connection: &Connection) -> StoreResult<()> {
@@ -57,107 +53,12 @@ fn create_current_schema(connection: &Connection) -> StoreResult<()> {
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
     transaction.execute_batch(CURRENT_SCHEMA_SQL)?;
     transaction.execute_batch(CURRENT_INDEX_SQL)?;
-    for migration in EXPECTED_MIGRATIONS {
-        transaction.execute(
-            "insert into schema_migrations(migration_id) values(?1)",
-            params![migration],
-        )?;
-    }
-    transaction.execute(
-        "insert into schema_meta(schema_version) values(?1)",
-        params![SCHEMA_VERSION],
-    )?;
-    validate_current_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION as i64)?;
     transaction.commit()?;
     Ok(())
 }
 
-/// 校验当前 schema 的表、列和索引结构（防止旧/损坏库被当作索引使用）。
-pub(crate) fn validate_current_schema(connection: &Connection) -> StoreResult<()> {
-    let tables = user_tables(connection)?;
-    let expected: BTreeSet<String> = ["schema_meta", "schema_migrations", "session_index"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    if tables != expected {
-        return Err(StoreError::SchemaStructure(format!(
-            "session index has unexpected tables: {tables:?}"
-        )));
-    }
-    let columns = table_columns(connection, "session_index")?;
-    let expected_columns: BTreeSet<String> = [
-        "session_id",
-        "rollout_path",
-        "cwd",
-        "title",
-        "model",
-        "status",
-        "created_at",
-        "updated_at",
-        "token_usage",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    if columns != expected_columns {
-        return Err(StoreError::SchemaStructure(format!(
-            "session_index has unexpected columns: {columns:?}"
-        )));
-    }
-    let indexes = table_indexes(connection, "session_index")?;
-    let expected_indexes: BTreeSet<String> = ["session_index_cwd", "session_index_updated_at"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let indexes: BTreeSet<String> = indexes
-        .into_iter()
-        .filter(|name| !name.starts_with("sqlite_autoindex_"))
-        .collect();
-    if indexes != expected_indexes {
-        return Err(StoreError::SchemaStructure(format!(
-            "session_index has unexpected indexes: {indexes:?}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn user_tables(connection: &Connection) -> StoreResult<BTreeSet<String>> {
-    let mut statement = connection.prepare(
-        "select name from sqlite_master
-         where type = 'table' and name not like 'sqlite_%'
-         order by name",
-    )?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok(names)
-}
-
-fn schema_meta_version(connection: &Connection) -> StoreResult<Option<u32>> {
-    let Ok(version) = connection.query_row(
-        "select schema_version from schema_meta limit 1",
-        [],
-        |row| row.get::<_, u32>(0),
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(version))
-}
-
-fn table_columns(connection: &Connection, table: &str) -> StoreResult<BTreeSet<String>> {
-    let mut statement = connection.prepare(&format!("pragma table_info({table})"))?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok(names)
-}
-
-fn table_indexes(connection: &Connection, table: &str) -> StoreResult<BTreeSet<String>> {
-    let mut statement = connection.prepare(&format!("pragma index_list({table})"))?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-    let mut indexes = BTreeSet::new();
-    for name in rows {
-        indexes.insert(name?);
-    }
-    Ok(indexes)
+fn user_version(connection: &Connection) -> StoreResult<u32> {
+    let version: i64 = connection.query_row("pragma user_version", [], |row| row.get(0))?;
+    Ok(version as u32)
 }

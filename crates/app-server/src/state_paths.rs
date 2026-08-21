@@ -2,8 +2,6 @@
 //!
 //! This module owns configured database path validation, canonical directory preparation,
 //! owner/link checks, and repository-home containment checks.
-use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
-use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use std::path::{Path, PathBuf};
 
 pub(crate) const FILE_BACKED_STORE_REQUIRED: &str =
@@ -102,7 +100,6 @@ pub(crate) fn prepare_app_server_state_paths(configured_db_path: &str) -> Result
         .file_name()
         .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
     let database_path = canonical_parent.join(database_name);
-    validate_database_file(&database_path, true)?;
     database_path
         .to_str()
         .map(str::to_string)
@@ -174,70 +171,4 @@ pub(crate) fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
         let _ = metadata;
         false
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StateFileIdentity {
-    device: u64,
-    inode: u64,
-    links: u64,
-}
-
-fn state_file_identity(metadata: &cap_std::fs::Metadata) -> Result<StateFileIdentity, String> {
-    let identity = StateFileIdentity {
-        device: CapMetadataExt::dev(metadata),
-        inode: CapMetadataExt::ino(metadata),
-        links: CapMetadataExt::nlink(metadata),
-    };
-    (identity.links == 1)
-        .then_some(identity)
-        .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())
-}
-
-fn open_state_file(path: &Path) -> Result<(std::fs::File, StateFileIdentity), String> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
-    let directory = CapabilityDir::open_ambient_dir(parent, cap_std::ambient_authority())
-        .map_err(|_| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
-    let mut options = CapabilityOpenOptions::new();
-    options.read(true).write(true).follow(FollowSymlinks::No);
-    let file = directory
-        .open_with(name, &options)
-        .map_err(|_| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
-    let identity = state_file_identity(
-        &file
-            .metadata()
-            .map_err(|_| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?,
-    )?;
-    Ok((file.into_std(), identity))
-}
-
-pub(crate) fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(_) => return Err(SAFE_FILE_BACKED_STATE_REQUIRED.to_string()),
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
-        return Err(SAFE_FILE_BACKED_STATE_REQUIRED.to_string());
-    }
-    let (file, identity) = open_state_file(path)?;
-    let opened = file
-        .metadata()
-        .map_err(|_| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?;
-    if !opened.is_file() || metadata_is_reparse(&opened) {
-        return Err(SAFE_FILE_BACKED_STATE_REQUIRED.to_string());
-    }
-    let (_, reopened_identity) = open_state_file(path)?;
-    if identity != reopened_identity {
-        return Err(SAFE_FILE_BACKED_STATE_REQUIRED.to_string());
-    }
-    Ok(())
 }
