@@ -253,37 +253,6 @@ impl SessionStore {
     }
 }
 
-/// 只读盘点旧项目 SQLite，供迁移前判定“是否只含空状态表”。
-pub struct LegacySqliteReport {
-    pub user_rows: u64,
-}
-
-pub fn inspect_legacy_sqlite(path: &Path) -> StoreResult<LegacySqliteReport> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    let mut statement = connection.prepare(
-        "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'",
-    )?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    let mut user_rows = 0u64;
-    for name in names {
-        if name.starts_with("schema_") {
-            continue;
-        }
-        let rows: i64 =
-            connection.query_row(&format!("select count(*) from \"{name}\""), [], |row| {
-                row.get(0)
-            })?;
-        user_rows = user_rows.saturating_add(rows as u64);
-    }
-    Ok(LegacySqliteReport { user_rows })
-}
-
 pub fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

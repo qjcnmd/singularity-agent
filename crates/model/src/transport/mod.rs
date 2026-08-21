@@ -135,11 +135,11 @@ impl ProviderAttemptInProgress {
 }
 
 pub struct OpenAiProvider {
-    pub(crate) config: OpenAiProviderConfig,
-    pub(crate) selected_model: Option<SelectedModel>,
-    pub(crate) client: reqwest::Client,
-    pub(crate) runtime: Arc<ProviderRuntime>,
-    pub(crate) request_timeout_seconds: u64,
+    config: OpenAiProviderConfig,
+    selected_model: Option<SelectedModel>,
+    client: reqwest::Client,
+    runtime: Arc<ProviderRuntime>,
+    request_timeout_seconds: u64,
 }
 
 impl Clone for OpenAiProvider {

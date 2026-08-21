@@ -517,10 +517,8 @@ impl Provider for FailingProvider {
 }
 
 /// 从 `complete_stream` 直接返回 `Err(ProviderError)` 的假 provider：
-/// 模拟传输层重试（`MAX_PROVIDER_ATTEMPTS`）耗尽后仍失败的路径——在修复前这部分
-/// 是死代码，`stream_completion` 直接以 `Err(AgentError::Provider)` 向外传播，
-/// AgentLoop 不做整轮重试；脚本按序在若干次失败后返回一次成功，用于覆盖
-/// provider 传输层耗尽后仍失败的 typed 传播路径。
+/// 脚本按序在若干次失败后返回一次成功，用于覆盖 provider 传输层
+/// 重试耗尽后仍失败的 typed 传播路径。
 struct ErrReturningProvider {
     /// 每次 `complete_stream` 弹出的结果：`Err(model_error)` 或 `Ok(text)`。
     steps: Mutex<VecDeque<std::result::Result<String, ModelError>>>,
@@ -929,6 +927,10 @@ fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
         } else {
             // If rejected, inbox was already closed, so initial_taken must have been None (or empty before close).
             // Any further enqueue must also be rejected.
+            assert!(
+                initial_taken.is_none(),
+                "rejected enqueue implies the stop barrier already closed the inbox"
+            );
             assert!(
                 !final_inbox.enqueue_steer("rejected after close"),
                 "closed inbox accepted new inputs!"

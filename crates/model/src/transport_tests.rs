@@ -655,8 +655,7 @@ fn runtime_initialization_failure_maps_to_a_stable_provider_blocker() {
     );
 }
 
-/// 契约透传：选中模型的 tool_reasoning_mode 必须反映到 protocol_contract()
-/// （修复前硬编码 Unspecified，agent 侧续接投影永远被跳过）。
+/// 契约透传：选中模型的 tool_reasoning_mode 必须反映到 protocol_contract()。
 #[test]
 fn protocol_contract_exposes_selected_tool_reasoning_mode() {
     let config = test_provider_config("http://127.0.0.1:1/v1".to_string());

@@ -635,6 +635,11 @@ impl Provider for TestProvider {
 
 #[test]
 fn terminal_storage_fail_stop_over_stdio_supervisor() {
+    // 真实文件系统只读故障：Provider 开始后锁死会话 JSONL 再放行。首个失败
+    // 点可能是执行期 item append 或终态 metadata append（SessionManager 每次
+    // 写都重开文件）；两者同属 terminalize/persist_failure_state 的 fail-stop
+    // 合同，断言只依赖该合同：无假终态事件、storage_fatal 诊断、连接 EOF、
+    // Provider 恰好执行一次、重连后由 JSONL 恢复路径收敛。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");

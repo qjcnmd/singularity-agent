@@ -9,8 +9,6 @@ use singularity_core::{ClientInfo, ErrorCode, JSON_RPC_METHOD_NOT_FOUND};
 
 /// JSON-RPC 2.0 parse error code。
 pub const JSON_RPC_PARSE_ERROR: i64 = -32700;
-/// Stable application error for a negotiated feature that this server does not support.
-pub const APP_ERROR_UNSUPPORTED: i64 = -32007;
 
 /// JSON-RPC method 的调用类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

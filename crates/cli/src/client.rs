@@ -34,6 +34,7 @@ const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const CTRL_C_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const FORCE_INTERRUPT_ERROR: &str = "forced exit after second Ctrl+C";
 
 pub(super) struct AppServerClient {
@@ -224,6 +225,7 @@ pub(super) fn render_and_wait_terminal(
     }
 
     let mut interrupt_sent = false;
+    let mut interrupt_deadline = None;
     loop {
         if let Some(monitor) = ctrl_c.as_ref() {
             match monitor.count() {
@@ -231,10 +233,16 @@ pub(super) fn render_and_wait_terminal(
                 1 if !interrupt_sent => {
                     client.send_turn_interrupt(&turn_id)?;
                     interrupt_sent = true;
+                    interrupt_deadline = Some(Instant::now() + INTERRUPT_DRAIN_TIMEOUT);
                 }
                 _ if monitor.count() >= 2 => return Err(FORCE_INTERRUPT_ERROR.to_string()),
                 _ => {}
             }
+        }
+        if interrupt_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // 排空阶段总时限：与第二次 Ctrl+C 相同的 force 路径，避免等待永不
+            // 到来的终态事件；子进程回收由 Drop 的有界 shutdown/kill 兜底。
+            return Err(FORCE_INTERRUPT_ERROR.to_string());
         }
         let message = match client.read_message(CTRL_C_POLL_INTERVAL) {
             Ok(message) => message,

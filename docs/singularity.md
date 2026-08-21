@@ -2,9 +2,6 @@
 
 > **本文档描述 Singularity 当前有效架构事实**，以当前源码与协议为权威依据。
 >
-> - **交互式全景链路图**：直接用浏览器打开 [`docs/architecture-graph.html`](architecture-graph.html) 体验支持拖拽缩放、模块下钻深度看板与瑞士极简美学的全景拓扑图；
-> - **全生命周期流程图文档**：详见 [`docs/singularity-flowchart.md`](singularity-flowchart.md)。
->
 > **维护规则**：修改以下任一事实时同步更新本文：进程边界、协议 transport/命令/事件、会话格式、Compaction、工具面与工具语义、Provider/模型能力声明、配置 schema、评估工具、发布二进制。
 
 ## 1. 总览与进程架构（图 a）
@@ -309,7 +306,7 @@ sequenceDiagram
 **命令与事件集**：
 - 命令：`initialize`、`initialized`、`agent/capability`、`thread/start`、`thread/list`、`thread/resume`、`thread/settings`、`session/read`、`session/delete`、`turn/start`、`turn/steer`、`turn/followUp`、`turn/interrupt`、`server/shutdown`；
 - 生命周期与执行事件：`thread/started`、`turn/started`、`item/started`、`item/agentMessage/delta`、`item/completed`、`item/failed`、`turn/completed`、`turn/error`、`tool/execution/start`、`tool/execution/update`、`tool/execution/end`；
-- 遥测与诊断事件：`agent/diagnostic`（结构化非致命告警）、`provider/attempt/started`、`provider/attempt/completed`（类型化 attempt 进度与 terminal aggregate）。
+- 遥测与诊断事件：`agent/diagnostic`（结构化非致命告警）、`provider/attempt`（类型化 attempt 进度）、`provider/attempt/summary`（终态聚合）。
 
 ## 12. 技术细节速查
 
