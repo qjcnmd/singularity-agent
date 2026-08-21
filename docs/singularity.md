@@ -112,8 +112,8 @@ sequenceDiagram
 内层循环结束后进入外层：若 `TurnInbox` 仍有 follow-up 消息则继续内层，否则在同一临界区内原子关闭 inbox 并退出，返回携带累计 usage、`usage_complete` 和 typed terminal reason 的 `AgentOutcome`。
 
 - **原子 TurnInbox**：统一维护 `Open`/`Closed` 状态与 steer/followUp 队列。关闭点前到达的输入必定被接受并执行；关闭点后到达的输入明确返回 rejected 错误，不存在“已接受但丢失”的中间竞态。
-- **结构化诊断**：Compaction 非 Session 失败等非致命告警通过 `AgentDiagnostic { severity, code, message }` 和 `AgentEvents::on_diagnostic` 派发为协议层 `agent/diagnostic` 事件，不向 stderr 直接打印，不污染 Session JSONL。
-- **Provider 遥测**：Provider attempt 开始与结束通过 non-vetoing 回调派发，绑定真实 `model_turn_ordinal`，并在终态聚合 attempt/retry/latency summary，不产生持久化 transcript 垃圾。
+- **结构化诊断**：Compaction 非 Session 失败等非致命告警以 `AgentDiagnostic { severity, code, message }` 承载，经 `AgentEvent::Diagnostic` 投影为协议层 `agent/diagnostic` 事件；诊断投递为尽力而为，投递失败不改变轮次结果。不向 stderr 直接打印，不污染 Session JSONL。
+- **事件出口与遥测**：AgentLoop 全部生命周期事件收敛为单一 `AgentEvent` 枚举，经唯一 `AgentEvents::on_event` 回调流式投递；除诊断外，事件投影失败立即中止本轮并丢弃当轮 provider 结果，错误经 `run` 返回。Provider attempt 开始与结束作为 `AgentEvent::ProviderAttempt` 投递，绑定真实 `model_turn_ordinal`，并在终态聚合 attempt/retry/latency summary，不产生持久化 transcript 垃圾。
 
 ```mermaid
 flowchart TD
@@ -155,10 +155,9 @@ flowchart TD
 - **bash**：
   - 缺省 `timeout_ms` 为 120000 ms，显式范围 `1..=600000` ms；
   - stdout 与 stderr 分别持有独立的增量 UTF-8 carry buffer，跨 chunk 保留未完成 code point，仅在各自真实 EOF 时替换最终残缺字节；
-  - 控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出写入私有临时目录 `~/.singularity/tmp/bash/bash-<uuid>.log`；
-  - 单个 spill artifact 上限 64 MiB；创建新 spill 时惰性清理同目录中名称与身份匹配且超过 24 小时的旧 spill；超限时删除未完成 spill 并报告 full output 不可用；
+  - 输出仅保留内存尾部窗口：预览保留最后 2000 行 / 50 KiB，内部窗口上限为其两倍（100 KiB），超出窗口的更早输出即弃并在结果中标记截断；不写任何磁盘临时/spill 文件；
   - 输出读取线程有界停机：主子进程退出后最长 2s 排空宽限，超时（后台进程仍持管道写端）即截断并附信息标记 `[output truncated: a background process is still writing]`，线程必收敛；后台进程不受影响；
-  - 进程树终止：Windows 在进程创建时通过 `STARTUPINFOEXW` 与 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 强制绑定内核 Job Object，杜绝孙进程逃逸；Unix 使用独立进程组发送 SIGKILL。
+  - 进程树终止（D-004）：Windows 经 `JobObject` 封装模块以 `KILL_ON_JOB_CLOSE` 创建作业，子进程创建后立即绑定，其后代进程全部纳入作业范围；取消时整树 `TerminateJobObject`，句柄关闭兜底终止仍在运行的子孙进程；Unix 使用独立进程组发送 SIGKILL。
 - **执行模式 contract**：每个 ToolSpec 声明 `supports_parallel`（read=true；bash/edit/write=false）。批内含任一 sequential 工具时整批按模型原始顺序串行执行；全部为 parallel 时按 provider 并发上限分批并发。默认契约 `max_parallel_tool_calls=1` 行为不变。
 
 ```mermaid
@@ -266,7 +265,7 @@ sequenceDiagram
 
 ## 9. Provider 与模型
 
-**静态能力声明**：每个模型静态声明能力（context window、max output、reasoning 档位、工具支持），来源为内置模型表 + 用户 models/config 覆盖；不做网络探测或能力协商。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
+**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表 > 运行时默认值」解析。模型发现作为运行时组件为缺省项自动填充 context/max output 元数据：发现结果带 `models-cache.json` + TTL 刷新（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 最终未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
 
 - **Provider 协议适配**：
   - OpenAI Responses 协议：官方 OpenAI reasoning 模型通过 Responses wire 发送；
@@ -285,9 +284,9 @@ sequenceDiagram
 
 ## 10. 配置与项目指令
 
-**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件 `~/.singularity/auth.v1-*.json` 在 Unix 上设为 0600，Windows 上继承目录 ACL。会话目录 `~/.singularity/sessions/`、索引 `~/.singularity/index.sqlite3` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
+**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件为单一 `~/.singularity/auth.v1.json`，导入流程为写临时文件后同卷原子改名；Unix 上设为 0600，Windows 上继承目录 ACL。config 与 models 的模型条目不接受 `capabilities` 块，出现即按未知字段拒绝；能力以顶层字段为唯一权威。会话目录 `~/.singularity/sessions/`、索引 `~/.singularity/index.sqlite3` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
 
-**资源加载**：`AGENTS.md` 逐层加载（root→cwd），无 trust 门控。按 root→cwd 顺序逐层收集项目指令文件 `AGENTS.md`，合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB；无 override 或 sha2 额外结构。
+**资源加载**：`AGENTS.md` 逐层加载（root→cwd），无 trust 门控。按 root→cwd 顺序逐层收集项目指令文件 `AGENTS.md`，合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB 预算，超预算按预算截断纳入前缀并向模型追加截断尾注，同时向客户端发 `agent/diagnostic`（warning, `project_instructions_truncated`）；真 I/O 错误仍使 turn/start 失败。无 override 或 sha2 额外结构。
 
 ## 11. 客户端与协议
 
@@ -302,6 +301,8 @@ sequenceDiagram
 - **双管道调度**：stdio reader 将消息分类为 ordinary request 与 realtime turn control。普通状态请求排入单 owner 队列按序处理；`turn/interrupt`、`turn/steer`、`turn/followUp` 通过共享活动 turn 句柄即时处理，不被耗时的普通请求阻塞。所有响应与事件统一通过单一有界 output writer 发送。
 - **turn lane 就绪点**：`ready_for_turn` 在 initialize 请求处理完成（回执已写出）后置位，置位动作发生在 ordinary 处理任务内部、响应写出之后（同一任务内的先后序构成 happens-before）；客户端收到 initialize 回执即可立即发送 `turn/start` 进入流式 turn lane。`initialized` 通知继续把守 ordinary 门禁：initialize 与 initialized 均未完成前，落入普通管线的请求返回 not_initialized。
 - **注册前置发布**：`turn/start` 仅在打开会话、构建 Provider/Agent、注册 steer/followUp 收件箱全部成功后，才落盘 `turn_started` 并发布 `turn/started` 与 running 响应；收到 `turn/started` 后立即 steer/followUp 必成功。准备阶段失败则 turn/start 直接回错误响应，不产生任何 turn 痕迹。
+- **session/read 分页**：历史读取以 turn 为单位组织返回（`turns[]` + `totalTurns`），参数为 `cursor`/`limit`（1..=200）/`sortDirection`（asc|desc）/`detail`（summary|full）/`kinds`；不透明游标 `nextCursor`/`backwardsCursor` 支持双向翻页，无效或越界游标按 invalid params 拒绝；kinds 过滤先于分页（被过滤轮不占页配额），`turn` kind 命中轮次本身；页内轮次恒按会话顺序排列，首个 turn 标记前落盘的前导条目归入无身份前导组（turnId/status 为 null）。
+- **终态与回执形态**：协议 `Turn` 只携带单一 `status`；`turn/interrupt` 回执直接给出目标终态 `interrupted`；`turn/steer`/`turn/followUp` 响应为 `TurnInjectionResult{turn}`；item 引用以 camelCase `itemId` 暴露；`tool/execution/end` 仅在 result 内保留一处 `isError`。
 - **CLI 信号处理与优雅退出**：第一次收到 Ctrl+C 信号时，CLI 发送 `turn/interrupt` 请求，停止接收新输入，继续读取并排空 terminal events，等待 app-server 子进程有界退出并返回常规 interrupted 退出码；第二次 Ctrl+C 强制退出。
 - **CLI Session Reference**：`sg run --session-reference <id>` 将历史会话投影为 untrusted reference 文本；每个生成段落（header、summary、transcript、role line、current-request heading）各占一行，未信任内容中的换行折叠为字面量 `⏎`，统一受控于 16 KiB 与 4096-token 硬上限。
 
@@ -315,7 +316,7 @@ sequenceDiagram
 ### 12.1 脱敏与工具输出合同
 
 - 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id），并在公开 history 中投影为带 `isError` 的 `tool_result` item；没有把流式 delta 永久化为独立事件。
-- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出写入私有临时目录并通过 `fullOutputPath` 标记返回。read 收集满 `limit`（缺省 2000 行）即停、不扫描至 EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限提示 `File continues; use offset=Z to continue.`，不写临时文件。edit 实施 20 MiB 输入与输出上限，无 `\r` 时零映射恒等、含 `\r` 时仅对命中区局部换算并产出局部上下文 diff，未触及字节 100% 保持原样。
+- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出仅保留内存尾部窗口（100 KiB 上限，超出即弃并标记截断），不写磁盘临时文件。read 收集满 `limit`（缺省 2000 行）即停、不扫描至 EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限提示 `File continues; use offset=Z to continue.`，不写临时文件。edit 实施 20 MiB 输入与输出上限，无 `\r` 时零映射恒等、含 `\r` 时仅对命中区局部换算并产出局部上下文 diff，未触及字节 100% 保持原样。
 - 工具结果文本不包含 provider 原始响应；raw tool arguments 仅存在于 assistant 的 `tool_call` 内容块及工具生命周期事件中。密钥边界由 provider 错误脱敏承担。
 
 ### 12.2 工具 schema
@@ -323,7 +324,7 @@ sequenceDiagram
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
 | read | `{path, offset?, limit?}` | 文本文件有界读取；单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB；收集满 limit（缺省 2000 行）即停，超限提示 `File continues; use offset=Z to continue.`，不写临时文件；offset 1-indexed，limit 上限 2000 |
-| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 120000；显式 integer `1..=600000`；预览保留最后 2000 行 / 50 KiB；完整输出写入私有 64 MiB spill 文件并支持 24h 惰性清理；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object / Unix 进程组终止整树 |
+| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 120000；显式 integer `1..=600000`；预览保留最后 2000 行 / 50 KiB，完整输出仅保留内存尾部窗口（100 KiB，超出标记截断）；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object（KILL_ON_JOB_CLOSE + 子进程创建后立即绑定）/ Unix 进程组终止整树 |
 | edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；20 MiB 大小上限；无 `\r` 零映射恒等、含 `\r` 仅命中区局部换算；未触及字节原样保留；保持行尾风格；返回局部 diff / firstChangedLine；in-place 写入 |
 | write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入；sequential 工具，所在批按模型原始顺序串行 |
 
