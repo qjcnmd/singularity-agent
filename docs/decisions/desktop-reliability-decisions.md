@@ -184,6 +184,10 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 问题：是否增加协议级 heartbeat 保活。参考实现：Codex 无自定义心跳层，靠进程级存活检测与重连。当前代码事实：协议固定 14 个方法，无心跳；app-server 为 stdio 子进程；D-012 已确立 thread/resume 重连。选择：不加心跳，14 个方法保持不变。Desktop 端僵死检测用"请求超时 → 强杀 app-server 子进程 → D-012 thread/resume 重连"闭环。影响：协议表面保持最小；僵死恢复靠超时 + 重连，不留半开放协议面。验收方式：本决策记录本身；如 Desktop 相关代码已有超时兜底则确认即可，无代码改动。
 
+### D-045：模型限额的目录来源与 fail-closed 边界（演进 D-041）
+
+问题：D-041 裁决「发现结果喂给运行时元数据自动填充 context_window/max_output_tokens」，但发现缓存 schema 只含模型 id 清单，无数值限额来源；以编译期常量冒充填充会静默放宽校验合同。参考实现：Codex models-manager（策展目录 + 本地缓存 + TTL）；models.dev 公开模型目录 api.json。当前代码事实：未知模型缺限额一度收束为 fail closed；随后接入 models.dev 投影缓存作为限额第三级来源——捕获读路径只读 `metadata-cache.json`（TTL 24 小时）永不联网，刷新仅在模型目录发现成功后顺带拉取且网络失败 fail-soft；provider key 精确匹配 + base_url host 唯一归属回退，model id 精确 + 大小写回退。选择：限额解析优先级为用户顶层声明 > 内置表 > 目录投影缓存 > fail closed；不在目录覆盖内的 provider 保持显式声明。影响：公开目录覆盖内的未知模型可自动补齐限额；目录未覆盖或离线时维持拒绝而不是猜测。本条修订 D-041 中「发现结果自动填充数值限额」的实现路径，fail-soft、内置表兜底合并与 TTL 刷新语义不变。验收方式：E2E 断言无缓存 fail-closed、有缓存填充生效；真实拉取为 ignored 手动测试并留档 outputs/modelsdev-fill-check.log。
+
 ## 参考实现
 
 - Pi：小核心、Agent Loop、Session JSONL、compaction、工具输出截断与临时 spill。

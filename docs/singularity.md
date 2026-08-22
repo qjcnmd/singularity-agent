@@ -24,7 +24,7 @@
   - 命令/事件协议包含 thread/turn/item 生命周期、公开 history projection、settings、usage、`agent/diagnostic` 与 `provider/attempt` 遥测。
 - **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**；Desktop 可保持一个长驻 stdio 连接并在同一进程中执行多轮、并发运行不同 session 的 turn、切换设置、取消和重连。没有 TCP daemon、cursor/gap replay 或独立 Desktop UI。
 - **客户端**：`sg` CLI（一次性 stdio 子进程客户端，支持信号拦截优雅中断与 JSON 事件类型化投影）；Desktop 接入复用同一协议、配置和会话。
-- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1-*.json`（私有认证文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
+- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1.json`（私有认证单文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 绝不依赖 evaluation。
 
 ```mermaid
@@ -168,7 +168,7 @@ flowchart TD
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
     D -- "合法" --> F1["按执行模式调度<br/>含 sequential 工具 → 整批串行<br/>全 parallel → 按上限并发"]
-    F1 --> F["进程内执行<br/>bash: Job Object / 增量 UTF-8 / 64 MiB spill / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>cwd 绑定工作区"]
+    F1 --> F["进程内执行<br/>bash: Job Object 树杀 / 增量 UTF-8 / 内存尾部窗口 / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>cwd 绑定工作区"]
     F --> G["write/edit: sequential 串行同批<br/>edit 实施 20 MiB 门限与未触及字节保留"]
     G --> H["输出截断与回传<br/>ToolExecution {content, is_error}<br/>assistant source order 写入"]
 ```
