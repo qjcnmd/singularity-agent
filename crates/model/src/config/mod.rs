@@ -290,15 +290,18 @@ fn configured_model_from_user_file(
     provider_name: &str,
     model_name: &str,
     model_file: &UserConfigModel,
+    directory_limits: Option<ModelTokenLimits>,
 ) -> Result<ConfiguredModel, ProviderError> {
-    // 顶层字段为唯一权威；内置表只兜底缺省的 max_context_tokens/max_output_tokens。
-    // api_protocol 和 max_output_tokens 必须由用户显式声明。
+    // 顶层字段为唯一权威；内置表与 models.dev 目录元数据依次兜底缺省的
+    // max_context_tokens/max_output_tokens，任一级命中即停。
+    // api_protocol 必须由用户显式声明。
     let builtin = super::builtin_models::builtin_model(provider_name, model_name);
     let (Some(api_protocol), Some(max_output_tokens)) = (
         model_file.api_protocol.as_deref(),
         model_file
             .max_output_tokens
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens)),
+            .or_else(|| builtin.map(|entry| entry.max_output_tokens))
+            .or_else(|| directory_limits.map(|limits| limits.output)),
     ) else {
         return Err(configuration_error(
             "model override is incomplete; api_protocol and max_output_tokens are required",
@@ -308,7 +311,8 @@ fn configured_model_from_user_file(
     let protocol = parse_catalog_protocol(api_protocol)?;
     let max_context_tokens = model_file
         .max_context_tokens
-        .or_else(|| builtin.map(|entry| entry.context_window));
+        .or_else(|| builtin.map(|entry| entry.context_window))
+        .or_else(|| directory_limits.map(|limits| limits.context));
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = model_file
@@ -406,6 +410,9 @@ where
             "provider_selector_invalid",
         )
     })?;
+    // 读路径只读本地元数据缓存，永不联网；缓存缺失或过期时目录为空，
+    // 能力解析保持与无第三级来源时相同的 fail closed 行为。
+    let metadata_directory = load_user_metadata_directory(&user_config.directory);
     let parsed_default = parse_model_selector(&default_model)?;
     let default_provider_name = user_config
         .config
@@ -450,6 +457,7 @@ where
             return Err(error);
         }
         let mut models = BTreeMap::new();
+        let endpoint_host = http_endpoint_host(&provider_file.base_url);
         for (model_name, model_file) in &provider_file.models {
             if let Err(error) = validate_model_id(model_name, "model id") {
                 if provider_name.as_str() == default_provider_name
@@ -459,7 +467,14 @@ where
                 }
                 continue;
             }
-            match configured_model_from_user_file(provider_name, model_name, model_file) {
+            let directory_limits =
+                metadata_directory.limits_for(provider_name, model_name, endpoint_host.as_deref());
+            match configured_model_from_user_file(
+                provider_name,
+                model_name,
+                model_file,
+                directory_limits,
+            ) {
                 Ok(model) => {
                     models.insert(model_name.clone(), model);
                 }

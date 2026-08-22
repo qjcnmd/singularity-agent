@@ -35,6 +35,11 @@ pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const USER_MODELS_CACHE_FILE_NAME: &str = "models-cache.json";
 pub(crate) const USER_MODELS_CACHE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const USER_MODELS_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// models.dev 目录元数据的独立缓存文件名（投影子集，与发现缓存分离）。
+pub(crate) const METADATA_CACHE_FILE_NAME: &str = "metadata-cache.json";
+pub(crate) const METADATA_CACHE_SCHEMA_VERSION: u32 = 1;
+/// models.dev 公开模型目录的 api.json 端点。
+pub(crate) const METADATA_DIRECTORY_URL: &str = "https://models.dev/api.json";
 pub(crate) const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 pub(crate) const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;

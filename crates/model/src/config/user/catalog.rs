@@ -6,7 +6,10 @@ use std::path::Path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{UserConfigModel, read_user_config_data};
+use super::metadata::{
+    ModelTokenLimits, http_endpoint_host, load_user_metadata_directory, refresh_metadata_cache,
+};
+use super::{UserConfigModel, read_user_config_data, unix_timestamp_seconds};
 use crate::config::filesystem::{read_bounded_text, write_json_file};
 use crate::config::schema::{
     deserialize_unique_map, deserialize_unique_vec, validate_model_id, validate_provider_identifier,
@@ -110,14 +113,9 @@ pub fn user_model_override_is_selectable(
     provider_name: &str,
     model_name: &str,
     model: &UserConfigModel,
+    directory_limits: Option<ModelTokenLimits>,
 ) -> bool {
-    configured_model_from_user_file(provider_name, model_name, model).is_ok()
-}
-
-pub fn unix_timestamp_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
+    configured_model_from_user_file(provider_name, model_name, model, directory_limits).is_ok()
 }
 
 pub fn load_models_cache(path: &Path) -> ModelsCacheLoad {
@@ -251,7 +249,10 @@ pub fn read_user_model_catalog(
     let mut cache = cache_load.cache;
     let mut cache_status = cache_load.status;
     let mut cache_changed = false;
+    // 目录条目的 selectable 判定与捕获链路共用同一套三级限额来源。
+    let metadata_directory = load_user_metadata_directory(&user_config.directory);
     let now = unix_timestamp_seconds();
+    let mut discovery_refreshed = false;
     let mut provider_catalogs = Vec::new();
     for (provider_name, provider_file) in &user_config.config.providers {
         if validate_provider_identifier(provider_name, "provider id").is_err() {
@@ -287,11 +288,16 @@ pub fn read_user_model_catalog(
             diagnostics.push("provider authentication is invalid".to_string());
         }
         let explicit_ids = provider_file.models.keys().collect::<BTreeSet<_>>();
+        let endpoint_host = http_endpoint_host(&provider_file.base_url);
         if explicit_ids.iter().any(|id| {
-            provider_file
-                .models
-                .get(*id)
-                .is_some_and(|model| !user_model_override_is_selectable(provider_name, id, model))
+            provider_file.models.get(*id).is_some_and(|model| {
+                !user_model_override_is_selectable(
+                    provider_name,
+                    id,
+                    model,
+                    metadata_directory.limits_for(provider_name, id, endpoint_host.as_deref()),
+                )
+            })
         }) {
             diagnostics.push("one or more model overrides are incomplete or invalid".to_string());
         }
@@ -368,6 +374,7 @@ pub fn read_user_model_catalog(
                             },
                         );
                         cache_changed = true;
+                        discovery_refreshed = true;
                         (model_ids, ModelDiscoveryStatus::Fresh, None)
                     }
                     Err(error) => (
@@ -388,10 +395,13 @@ pub fn read_user_model_catalog(
         let mut model_entries = Vec::new();
         for id in &discovered_ids {
             let model_override = provider_file.models.get(id);
+            let directory_limits =
+                metadata_directory.limits_for(provider_name, id, endpoint_host.as_deref());
             let selectable = user_model_override_is_selectable(
                 provider_name,
                 id,
                 model_override.unwrap_or(&UserConfigModel::default()),
+                directory_limits,
             );
             model_entries.push(UserModelCatalogEntry {
                 id: id.clone(),
@@ -407,8 +417,12 @@ pub fn read_user_model_catalog(
         }
         for (id, model_override) in &provider_file.models {
             if !discovered_set.contains(id) {
-                let selectable =
-                    user_model_override_is_selectable(provider_name, id, model_override);
+                let selectable = user_model_override_is_selectable(
+                    provider_name,
+                    id,
+                    model_override,
+                    metadata_directory.limits_for(provider_name, id, endpoint_host.as_deref()),
+                );
                 model_entries.push(UserModelCatalogEntry {
                     id: id.clone(),
                     discovered: false,
@@ -431,6 +445,14 @@ pub fn read_user_model_catalog(
     }
     if cache_changed && let Ok(cache_text) = serde_json::to_string_pretty(&cache) {
         let _ = write_json_file(&cache_path, &cache_text, false);
+    }
+    // 发现刷新链路成功后顺带更新 models.dev 目录元数据缓存；网络或解析
+    // 失败 fail-soft，不影响目录读取主流程。
+    if discovery_refreshed {
+        let _ = refresh_metadata_cache(
+            &user_config.directory.join(crate::METADATA_CACHE_FILE_NAME),
+            &runtime_handle,
+        );
     }
     let default_selector = user_config.config.default_model.clone();
     Ok(UserModelCatalog {

@@ -6,6 +6,7 @@
 pub(crate) mod auth;
 pub(crate) mod catalog;
 pub(crate) mod import;
+pub(crate) mod metadata;
 
 pub(crate) use auth::*;
 #[cfg(test)]
@@ -17,9 +18,11 @@ pub use catalog::{
 #[cfg(test)]
 pub(crate) use import::parse_import_model_selector;
 pub use import::{UserConfigImportResult, import_env_to_user_config};
+pub(crate) use metadata::{ModelTokenLimits, http_endpoint_host, load_user_metadata_directory};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +31,12 @@ use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::config::{ProviderConfigLayer, parse_model_selector};
 use crate::error::ProviderError;
 use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
+
+pub(crate) fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

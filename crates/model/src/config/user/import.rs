@@ -10,6 +10,7 @@ use super::auth::{
     UserAuthFile, UserAuthProvider, acquire_config_writer_lock, user_auth_file_path,
 };
 use super::catalog::user_model_override_is_selectable;
+use super::metadata::{http_endpoint_host, load_user_metadata_directory};
 use super::{
     USER_CONFIG_FILE_NAME, UserConfigData, UserConfigFile, UserConfigProvider,
     ensure_no_reparse_components, read_user_config_data, user_config_directory_result,
@@ -131,6 +132,7 @@ pub fn import_env_to_user_config(
     let selectable = imported_model_is_selectable(
         &config,
         &auth,
+        &directory,
         &provider_name,
         &model_name,
         parse_model_selector(&default_selector)?.reasoning_effort,
@@ -257,6 +259,7 @@ fn validate_imported_user_config(
 fn imported_model_is_selectable(
     config: &UserConfigFile,
     auth: &UserAuthFile,
+    config_directory: &Path,
     provider_name: &str,
     model_name: &str,
     _reasoning_variant: Option<&str>,
@@ -292,5 +295,16 @@ fn imported_model_is_selectable(
     {
         return false;
     }
-    user_model_override_is_selectable(provider_name, model_name, model)
+    // 导入判定与捕获链路使用同一套三级限额来源；目录缓存缺失时行为不变。
+    let metadata_directory = load_user_metadata_directory(config_directory);
+    user_model_override_is_selectable(
+        provider_name,
+        model_name,
+        model,
+        metadata_directory.limits_for(
+            provider_name,
+            model_name,
+            http_endpoint_host(&provider.base_url).as_deref(),
+        ),
+    )
 }

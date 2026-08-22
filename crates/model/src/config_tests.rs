@@ -85,15 +85,79 @@ fn user_model_without_limits_falls_back_to_builtin_table() {
         api_protocol: Some("responses".to_string()),
         ..UserConfigModel::default()
     };
-    let opencode = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
-        .expect("builtin fallback resolves missing opencode-go limits");
+    let opencode =
+        configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model, None)
+            .expect("builtin fallback resolves missing opencode-go limits");
     assert_eq!(opencode.max_context_tokens, Some(1_000_000));
     assert_eq!(opencode.max_output_tokens, 384_000);
 
-    let longcat = configured_model_from_user_file("longcat", "LongCat-2.0", &model)
+    let longcat = configured_model_from_user_file("longcat", "LongCat-2.0", &model, None)
         .expect("builtin fallback resolves missing longcat limits");
     assert_eq!(longcat.max_context_tokens, Some(1_000_000));
     assert_eq!(longcat.max_output_tokens, 131_072);
+}
+
+/// models.dev 目录投影的限额值，用于第三级来源的判定测试。
+fn directory_limits() -> Option<crate::config::user::metadata::ModelTokenLimits> {
+    Some(super::user::metadata::ModelTokenLimits {
+        context: 500_000,
+        output: 65_536,
+    })
+}
+
+#[test]
+fn directory_metadata_fills_limits_only_after_user_and_builtin_sources() {
+    let model = UserConfigModel {
+        api_protocol: Some("chat".to_string()),
+        ..UserConfigModel::default()
+    };
+
+    // 用户与内置表都缺时限额由目录元数据填充。
+    let resolved = configured_model_from_user_file(
+        "unknown-provider",
+        "unknown-model",
+        &model,
+        directory_limits(),
+    )
+    .expect("directory metadata is the third limit source");
+    assert_eq!(resolved.max_context_tokens, Some(500_000));
+    assert_eq!(resolved.max_output_tokens, 65_536);
+
+    // 内置表命中即停，不消费目录值。
+    let resolved = configured_model_from_user_file(
+        "opencode-go",
+        "deepseek-v4-flash",
+        &model,
+        directory_limits(),
+    )
+    .expect("builtin entry resolves");
+    assert_eq!(resolved.max_context_tokens, Some(1_000_000));
+    assert_eq!(resolved.max_output_tokens, 384_000);
+
+    // 用户声明仍最高优先。
+    let declared = UserConfigModel {
+        api_protocol: Some("chat".to_string()),
+        max_context_tokens: Some(64_000),
+        max_output_tokens: Some(8_192),
+        ..UserConfigModel::default()
+    };
+    let resolved = configured_model_from_user_file(
+        "unknown-provider",
+        "unknown-model",
+        &declared,
+        directory_limits(),
+    )
+    .expect("user declaration resolves");
+    assert_eq!(resolved.max_context_tokens, Some(64_000));
+    assert_eq!(resolved.max_output_tokens, 8_192);
+
+    // 无任何来源时仍然 fail closed。
+    let error =
+        match configured_model_from_user_file("unknown-provider", "unknown-model", &model, None) {
+            Ok(_) => panic!("no limit source must keep failing closed"),
+            Err(error) => error,
+        };
+    assert!(error.message.contains("incomplete"));
 }
 
 #[test]
@@ -104,8 +168,9 @@ fn user_declared_limits_win_over_builtin_table() {
         max_output_tokens: Some(8_192),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
-        .expect("user declaration resolves");
+    let resolved =
+        configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model, None)
+            .expect("user declaration resolves");
     assert_eq!(resolved.max_context_tokens, Some(64_000));
     assert_eq!(resolved.max_output_tokens, 8_192);
 }
@@ -131,8 +196,9 @@ fn user_model_top_level_limits_project_with_builtin_fallback() {
         max_context_tokens: Some(400_000),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model)
-        .expect("top-level and builtin fallback resolve");
+    let resolved =
+        configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model, None)
+            .expect("top-level and builtin fallback resolve");
     assert_eq!(resolved.max_context_tokens, Some(400_000));
     assert_eq!(resolved.max_output_tokens, 384_000);
 }
@@ -248,10 +314,11 @@ fn unknown_model_without_limits_still_fails_closed() {
         api_protocol: Some("chat".to_string()),
         ..UserConfigModel::default()
     };
-    let error = match configured_model_from_user_file("unknown-provider", "unknown-model", &model) {
-        Ok(_) => panic!("no builtin fallback for an unknown model"),
-        Err(error) => error,
-    };
+    let error =
+        match configured_model_from_user_file("unknown-provider", "unknown-model", &model, None) {
+            Ok(_) => panic!("no builtin fallback for an unknown model"),
+            Err(error) => error,
+        };
     assert!(error.message.contains("incomplete"));
     assert_eq!(
         error.error.code.as_deref(),
@@ -266,10 +333,11 @@ fn user_model_override_without_api_protocol_still_fails_closed() {
         max_output_tokens: Some(4_096),
         ..UserConfigModel::default()
     };
-    let error = match configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model) {
-        Ok(_) => panic!("api_protocol cannot be guessed"),
-        Err(error) => error,
-    };
+    let error =
+        match configured_model_from_user_file("opencode-go", "deepseek-v4-flash", &model, None) {
+            Ok(_) => panic!("api_protocol cannot be guessed"),
+            Err(error) => error,
+        };
     assert!(error.message.contains("api_protocol"));
     assert_eq!(
         error.error.code.as_deref(),
@@ -318,6 +386,98 @@ fn capture_fails_closed_for_override_without_any_limit_source() {
         Err(error) => error,
     };
     assert!(error.message.contains("incomplete"));
+}
+
+#[test]
+fn capture_fills_directory_limits_from_cache_and_keeps_fail_closed_without_it() {
+    let protocol_only_model = || UserConfigModel {
+        api_protocol: Some("chat".to_string()),
+        ..UserConfigModel::default()
+    };
+    let data_in = |directory: &Path| UserConfigData {
+        directory: directory.to_path_buf(),
+        config: UserConfigFile {
+            version: 1,
+            default_provider: Some("primary".to_string()),
+            default_model: Some("primary/gpt-test".to_string()),
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                UserConfigProvider {
+                    base_url: "https://example.invalid/v1".to_string(),
+                    models: BTreeMap::from([("gpt-test".to_string(), protocol_only_model())]),
+                },
+            )]),
+        },
+        auth: UserAuthFile {
+            schema_version: USER_AUTH_SCHEMA_VERSION,
+            providers: BTreeMap::from([(
+                "primary".to_string(),
+                UserAuthProvider {
+                    api_key: "sk-primary".to_string(),
+                },
+            )]),
+        },
+    };
+    let write_metadata_cache = |directory: &Path, fetched_at_unix_seconds: u64| {
+        std::fs::write(
+            directory.join(crate::METADATA_CACHE_FILE_NAME),
+            serde_json::json!({
+                "schema_version": crate::METADATA_CACHE_SCHEMA_VERSION,
+                "fetched_at_unix_seconds": fetched_at_unix_seconds,
+                "providers": {
+                    "primary": {
+                        "hosts": ["example.invalid"],
+                        "models": { "gpt-test": { "context": 500_000u32, "output": 32_768u32 } }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write metadata cache");
+    };
+
+    // 无任何元数据缓存：同配置维持 fail closed。
+    let without_cache = tempfile::tempdir().expect("empty user config directory");
+    let error = match capture_user_model_selection(
+        &data_in(without_cache.path()),
+        Some(ProviderConfigSource::UserConfigFile),
+        &test_provider_factory(),
+    ) {
+        Ok(_) => panic!("a missing metadata cache must not fill limits"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("incomplete"));
+
+    // 过期缓存不参与填充。
+    let expired = tempfile::tempdir().expect("expired user config directory");
+    write_metadata_cache(
+        expired.path(),
+        crate::config::user::unix_timestamp_seconds() - crate::USER_MODELS_CACHE_TTL_SECONDS - 1,
+    );
+    assert!(
+        capture_user_model_selection(
+            &data_in(expired.path()),
+            Some(ProviderConfigSource::UserConfigFile),
+            &test_provider_factory(),
+        )
+        .is_err(),
+        "an expired metadata cache must keep the configuration fail closed"
+    );
+
+    // 注入新鲜缓存后未知模型捕获成功，contract 携带目录填充值。
+    let filled = tempfile::tempdir().expect("filled user config directory");
+    write_metadata_cache(filled.path(), crate::config::user::unix_timestamp_seconds());
+    let (snapshot, _) = capture_user_model_selection(
+        &data_in(filled.path()),
+        Some(ProviderConfigSource::UserConfigFile),
+        &test_provider_factory(),
+    )
+    .expect("fresh metadata cache fills the missing limits");
+    let contract = provider_for_selection(&snapshot, None)
+        .expect("selected provider")
+        .protocol_contract();
+    assert_eq!(contract.max_context_tokens, Some(500_000));
+    assert_eq!(contract.max_output_tokens, 32_768);
 }
 
 #[test]

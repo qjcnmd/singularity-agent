@@ -265,7 +265,7 @@ sequenceDiagram
 
 ## 9. Provider 与模型
 
-**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表」解析，两者均未提供时配置捕获 fail closed（api_protocol 与 max_output_tokens 必须有显式来源）。模型发现作为运行时组件维护 `models-cache.json` + TTL 刷新的已发现模型目录（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
+**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表 > models.dev 目录元数据」三级解析，任一级命中即停，三级均未提供限额时配置捕获 fail closed（api_protocol 必须由用户显式声明）；目录元数据来自 models.dev api.json 的投影缓存 `~/.singularity/metadata-cache.json`（TTL 24h），捕获读路径只读该文件、缺失或过期时不填充且行为不变，仅在模型目录发现刷新成功后顺带重新拉取落盘，网络失败 fail-soft。模型发现作为运行时组件维护 `models-cache.json` + TTL 刷新的已发现模型目录（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
 
 - **Provider 协议适配**：
   - OpenAI Responses 协议：官方 OpenAI reasoning 模型通过 Responses wire 发送；
