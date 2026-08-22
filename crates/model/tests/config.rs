@@ -1505,21 +1505,6 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let restored_runtime: ProviderAttemptMetadata =
         serde_json::from_value(runtime_wire).expect("deserialize aggregate attempt metadata");
     assert_eq!(restored_runtime, attempt_metadata);
-    let attempt_schema = schema_for!(ProviderAttemptMetadata);
-    assert!(
-        !attempt_schema
-            .schema
-            .object
-            .as_ref()
-            .expect("attempt metadata object schema")
-            .properties
-            .contains_key("occurrences")
-    );
-    assert!(
-        !attempt_schema
-            .definitions
-            .contains_key("ProviderAttemptOccurrence")
-    );
     let restored_schema: ModelToolSchema =
         serde_json::from_value(serde_json::to_value(&tool_schema).unwrap()).unwrap();
     let restored_config: ModelProviderConfig =
@@ -1533,29 +1518,6 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     assert_eq!(restored_config, provider_config);
     assert_eq!(restored_error, model_error);
     assert_eq!(restored_attempt_metadata, attempt_metadata);
-    assert_eq!(schema_title::<ModelToolSchema>(), "ModelToolSchema");
-    assert_eq!(schema_title::<ModelToolCall>(), "ModelToolCall");
-    assert_eq!(
-        schema_title::<ProviderProtocolContract>(),
-        "ProviderProtocolContract"
-    );
-    assert_eq!(schema_title::<ModelProviderConfig>(), "ModelProviderConfig");
-    assert_eq!(schema_title::<ModelUsage>(), "ModelUsage");
-    assert_eq!(
-        schema_title::<ProviderAttemptMetadata>(),
-        "ProviderAttemptMetadata"
-    );
-    assert_eq!(schema_title::<ModelTurnRequest>(), "ModelTurnRequest");
-    assert_eq!(schema_title::<ModelTurnResponse>(), "ModelTurnResponse");
-}
-
-fn schema_title<T: schemars::JsonSchema>() -> String {
-    schema_for!(T)
-        .schema
-        .metadata
-        .expect("schema metadata")
-        .title
-        .expect("schema title")
 }
 
 /// 矩阵项 7：DisabledForToolCalls。`openai_chat_tool_history_finalization_rejects_reasoning_content`
@@ -1659,7 +1621,7 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     )
     .expect("models cache file");
 
-    let catalog = singularity_model::read_user_model_catalog(false, test_runtime_handle())
+    let catalog = singularity_model::read_user_model_catalog(false)
         .expect("catalog read must not require network on a fresh cache");
     assert_eq!(
         catalog.cache_status,
@@ -1693,8 +1655,7 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     assert!(!gpt_test.discovered);
 
     // 再次读取仍命中同一新鲜缓存。
-    let again = singularity_model::read_user_model_catalog(false, test_runtime_handle())
-        .expect("second catalog read");
+    let again = singularity_model::read_user_model_catalog(false).expect("second catalog read");
     let again_provider = again
         .providers
         .iter()

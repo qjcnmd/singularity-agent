@@ -1,6 +1,5 @@
 //! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -21,7 +20,7 @@ use crate::{
 };
 
 /// 为模型提供方完成请求选定的线路协议。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     #[default]
@@ -32,7 +31,7 @@ pub enum ProviderApiProtocol {
 
 /// Chat Completions reasoning fields are selected explicitly by the model
 /// catalog. No provider or model name is interpreted to choose a wire shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingWireFormat {
     /// Existing `thinking: {"type": "enabled|disabled"}` fields.
@@ -42,7 +41,7 @@ pub enum ThinkingWireFormat {
 }
 
 /// 模型提供方必须遵守、用于构建请求和校验响应的能力。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
     pub supports_parallel_tool_calls: bool,

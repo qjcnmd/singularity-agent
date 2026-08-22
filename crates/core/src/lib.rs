@@ -34,7 +34,6 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
     }
 }
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC 请求结构无效。
@@ -120,7 +119,7 @@ const SECRET_FLAG_MARKERS: [&str; 6] = [
 ];
 
 /// 连接 AppServer 的客户端身份信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientInfo {
     pub name: String,
     pub title: String,
@@ -143,7 +142,7 @@ impl ClientInfo {
 }
 
 /// JSON-RPC 错误码和脱敏错误消息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCode {
     pub code: i64,
     pub message: String,

@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{
@@ -28,7 +27,7 @@ use crate::error::ProviderError;
 use crate::{DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_MODEL, USER_AUTH_SCHEMA_VERSION};
 
 /// Outcome of importing a dotenv file into the user-level split config.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserConfigImportResult {
     pub config_path: String,
     pub auth_path: String,

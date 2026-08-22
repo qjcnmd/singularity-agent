@@ -1,9 +1,8 @@
 use super::tool::ModelToolCall;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// 面向模型的对话历史支持的角色。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
     System,
@@ -14,7 +13,7 @@ pub enum ModelRole {
 }
 
 /// 面向模型提供方的消息，包括继续 turn 所需的 tool call 元数据。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,

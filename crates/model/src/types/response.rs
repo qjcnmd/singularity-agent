@@ -4,14 +4,13 @@ use super::tool::ModelToolCall;
 use super::usage::{ModelUsage, ModelValidationResult};
 use crate::error::ModelError;
 use crate::provider::ProviderAttemptMetadata;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Typed terminal reason normalized across Chat Completions and Responses.
 ///
 /// The wire-compatible `finish_reason` string remains serialized for v1
 /// callers; this enum is the only control-flow interpretation of that field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelStopReason {
     Stop,
@@ -19,7 +18,7 @@ pub enum ModelStopReason {
 }
 
 /// 模型提供方 turn 产生了有效完成，还是未通过校验。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTurnStatus {
     Success,
@@ -28,7 +27,7 @@ pub enum ModelTurnStatus {
 }
 
 /// 模型提供方完成结果及其配对的已解析 tool call、用量、校验和错误状态。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnResponse {
     pub request_id: String,
     pub response_id: String,
@@ -46,7 +45,6 @@ pub struct ModelTurnResponse {
     /// 内部 opaque reasoning continuation state；never serialized to the
     /// app-server or trace/evidence projections.
     #[serde(skip)]
-    #[schemars(skip)]
     pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }
 

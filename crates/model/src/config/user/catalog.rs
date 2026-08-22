@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::metadata::{
@@ -27,7 +26,7 @@ use crate::{
 };
 
 /// State of one provider's `/models` discovery record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDiscoveryStatus {
     Fresh,
@@ -37,7 +36,7 @@ pub enum ModelDiscoveryStatus {
 }
 
 /// Result of reading or refreshing the optional user model discovery cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelCacheStatus {
     NotPresent,
@@ -49,7 +48,7 @@ pub enum ModelCacheStatus {
 
 /// A discovered model id and whether an explicit capability override makes it
 /// safe to select for execution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserModelCatalogEntry {
     pub id: String,
     pub discovered: bool,
@@ -61,7 +60,7 @@ pub struct UserModelCatalogEntry {
 }
 
 /// Redacted user-level provider catalog returned by `sg config models`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserProviderModelCatalog {
     pub provider_name: String,
     pub base_url_present: bool,
@@ -72,7 +71,7 @@ pub struct UserProviderModelCatalog {
 }
 
 /// Redacted user-level model catalog. It never contains a base URL or secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserModelCatalog {
     pub default_selector: Option<String>,
     pub cache_status: ModelCacheStatus,
@@ -233,10 +232,7 @@ fn public_diagnostic(error: &ProviderError) -> String {
 }
 
 /// Read and, when stale or requested, refresh the user-level `/models` ids.
-pub fn read_user_model_catalog(
-    refresh: bool,
-    runtime_handle: tokio::runtime::Handle,
-) -> Result<UserModelCatalog, ProviderError> {
+pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, ProviderError> {
     let Some(user_config) = read_user_config_data()? else {
         return Ok(UserModelCatalog {
             default_selector: None,
@@ -244,6 +240,15 @@ pub fn read_user_model_catalog(
             providers: Vec::new(),
         });
     };
+    // 目录发现与 models.dev 刷新是本函数仅有的异步消费者：为一次性读取在
+    // 本地构建专用 runtime，不要求宿主注入 Tokio 句柄。
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            super::user_config_error(format!("failed to start catalog runtime: {error}"))
+        })?;
+    let runtime_handle = runtime.handle().clone();
     let cache_path = user_config.directory.join(USER_MODELS_CACHE_FILE_NAME);
     let cache_load = load_models_cache(&cache_path);
     let mut cache = cache_load.cache;

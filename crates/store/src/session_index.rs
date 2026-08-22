@@ -1,13 +1,12 @@
 //! Lightweight session metadata index over the authoritative JSONL rollouts.
 
 use super::*;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// 会话索引状态：最近一次 turn 的状态。`None` 表示尚无 turn（新会话或迁移
 /// 时终态未知）；`Active` 仅在 turn 真正运行期间写入，读取侧需要结合存活
 /// turn 判定，崩溃遗留的 `Active` 由消费方投影为终态而不是回写索引。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Active,
@@ -38,7 +37,7 @@ impl SessionStatus {
 }
 
 /// `session_index` 的一行：只保存定位与展示会话所需的元数据。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: String,
     pub rollout_path: String,

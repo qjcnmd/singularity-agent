@@ -1,6 +1,5 @@
 #![allow(dead_code, unused_imports)]
 
-pub(crate) use schemars::schema_for;
 pub(crate) use serde_json::{Value, json};
 pub(crate) use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_MODELS_CONFIG, ModelBlockerKind,

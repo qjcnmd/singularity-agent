@@ -1,8 +1,7 @@
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// 从模型提供方完成中累积的真实令牌与缓存计数器。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -21,7 +20,7 @@ fn default_usage_present() -> bool {
 }
 
 /// 模型侧请求或响应的校验错误和非致命警告。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelValidationResult {
     pub valid: bool,
     pub errors: Vec<String>,

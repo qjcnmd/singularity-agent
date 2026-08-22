@@ -1,5 +1,4 @@
 use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol, ProviderErrorStage};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Normalized provider stream data safe for the `AgentLoop` boundary.
@@ -30,7 +29,7 @@ pub struct ProviderAttemptStarted {
 }
 
 /// Typed normalized text-stream capability for one selected provider protocol.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStreamingCapability {
     /// The selected protocol has no normalized text stream at this boundary.
@@ -52,7 +51,7 @@ impl ProviderStreamingCapability {
 }
 
 /// 一次真实 provider HTTP attempt 所属的运行期操作阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptOperationPhase {
     /// A caller-requested model completion.
@@ -60,7 +59,7 @@ pub enum ProviderAttemptOperationPhase {
 }
 
 /// 一次真实 provider HTTP attempt 的终态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
     /// The attempt produced a valid provider response.
@@ -107,14 +106,13 @@ pub struct ProviderAttemptOccurrence {
 }
 
 /// 一次模型提供方操作记录的 aggregate 尝试次数、重试次数和运行期 occurrences。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAttemptMetadata {
     pub attempt_count: u32,
     pub retry_count: u32,
     pub latency_ms: u64,
     /// 运行期 typed observation；不进入公共 schema。
     #[serde(skip)]
-    #[schemars(skip)]
     pub occurrences: Vec<ProviderAttemptOccurrence>,
 }
 impl ProviderAttemptMetadata {

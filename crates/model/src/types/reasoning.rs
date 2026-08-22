@@ -1,11 +1,10 @@
 use super::message::{ModelMessage, ModelRole};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
 /// tool 推理内容是否符合模型提供方的 tool call 历史契约。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolReasoningMode {
     #[default]

@@ -1,11 +1,10 @@
 use crate::provider::ProviderAttemptMetadata;
 use crate::provider::contract;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// 从模型提供方边界保留下来的具体失败类型。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
     Cancelled,
@@ -25,7 +24,7 @@ pub enum ModelErrorKind {
 }
 
 /// 供调用方决定状态和恢复行为的较粗错误类别。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
     Cancelled,
@@ -44,7 +43,7 @@ pub enum ModelErrorCategory {
 }
 
 /// 模型提供方请求或响应发生失败的阶段。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorStage {
     ClientInitialization,
@@ -57,7 +56,7 @@ pub enum ProviderErrorStage {
 }
 
 /// 与模型或策略语义分开保留的传输层原因。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTransportCategory {
     Timeout,
@@ -68,7 +67,7 @@ pub enum ProviderTransportCategory {
 }
 
 /// 带类型分类和清理后模型提供方诊断信息的模型错误。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelError {
     pub kind: ModelErrorKind,
     pub message: String,
@@ -89,7 +88,7 @@ pub struct ModelError {
 }
 
 /// 模型错误中可以安全跨越模型提供方边界的诊断子集。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderDiagnostic {
     pub code: Option<String>,
     pub stage: Option<ProviderErrorStage>,

@@ -143,12 +143,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
             ConfigCommand::Models { refresh } => {
-                // CLI 是该命令的上层宿主：为本命令注入一个专用 runtime。
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("failed to start command runtime: {error}"))?;
-                let catalog = read_user_model_catalog(refresh, runtime.handle().clone())
+                let catalog = read_user_model_catalog(refresh)
                     .map_err(|error| format!("failed to read provider models: {error}"))?;
                 println!(
                     "default_selector={}",

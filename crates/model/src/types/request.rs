@@ -1,11 +1,10 @@
 use super::message::ModelMessage;
 use super::reasoning::ProviderReasoningReplay;
 use super::tool::{ModelToolSchema, ToolChoicePolicy};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// `AgentLoop` 为完成请求提供的可选模型参数。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelPreferences {
     pub model_name: Option<String>,
     pub temperature: Option<f32>,
@@ -14,7 +13,7 @@ pub struct ModelPreferences {
 }
 
 /// 传给模型提供方的完整模型请求，包括可见 tool 和 tool 策略。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
     pub request_id: String,
     pub messages: Vec<ModelMessage>,
@@ -24,7 +23,6 @@ pub struct ModelTurnRequest {
     /// Internal provider continuation state. It is deliberately omitted from
     /// all public/request schemas and is only consumed by the adapter.
     #[serde(skip)]
-    #[schemars(skip)]
     pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }
 

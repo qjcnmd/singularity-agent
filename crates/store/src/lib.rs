@@ -3,7 +3,6 @@
 //! 轻量会话索引：SQLite 只保存 `session_index` 元数据，JSONL rollout 是唯一权威正文。
 
 use rusqlite::{Connection, OpenFlags, params};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

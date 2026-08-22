@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
-use schemars::JsonSchema;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +16,7 @@ use super::{
 };
 
 /// 脱敏的模型提供方配置存在性信息；这里永不存储敏感信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProviderConfig {
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
@@ -50,7 +49,7 @@ pub struct ProviderConfigResolution {
 }
 
 /// 模型提供方初始化无法继续时报告的稳定阻塞类别。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBlockerKind {
     RequiredEnvMissing,
@@ -82,7 +81,7 @@ impl ModelBlockerKind {
 }
 
 /// 暴露给 `AppServer` 的脱敏模型提供方就绪状态和阻塞信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfigurationStatus {
     pub configured: bool,
     pub provider_name: Option<String>,
