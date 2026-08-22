@@ -1,6 +1,6 @@
 //! Crash recovery and orphan-tool-result repair.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
@@ -12,7 +12,8 @@ impl SessionManager {
     /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。
     pub fn repair_interrupted_turns(&mut self) -> Result<usize> {
         let path = self.session_path();
-        let mut started = HashSet::new();
+        // BTreeSet 保证 turn_interrupted 追加顺序确定（同输入同输出）。
+        let mut started = BTreeSet::new();
         let mut terminal = HashSet::new();
         for &entry_index in &path {
             let SessionEntryType::Metadata(metadata) = &self.entries[entry_index].entry_type else {
@@ -61,43 +62,44 @@ impl SessionManager {
 }
 
 impl SessionManager {
-    /// 修复活动路径中崩溃遗留的孤立 assistant tool call。
+    /// 修复活动路径中崩溃遗留的孤立 assistant tool call。单遍扫描：先收集
+    /// 全部已配对的 tool_result id，再按 assistant source order 补 synthetic
+    /// failed 结果（tool_call_id 在会话内全局唯一，全局配对与后缀配对等价）。
     pub fn repair_orphaned_tool_calls(&mut self) -> Result<usize> {
         let path = self.session_path();
-        let mut repaired = 0usize;
-        for &entry_index in &path {
-            let tool_call_ids: Vec<String> = match &self.entries[entry_index].entry_type {
+        let mut paired_tool_results: HashSet<String> = HashSet::new();
+        let mut assistant_tool_calls: Vec<(usize, Vec<String>)> = Vec::new();
+        for (position, &entry_index) in path.iter().enumerate() {
+            match &self.entries[entry_index].entry_type {
                 SessionEntryType::Message(message)
                     if message.role == AgentMessageRole::Assistant =>
                 {
-                    message
+                    let tool_call_ids: Vec<String> = message
                         .tool_calls()
                         .into_iter()
                         .filter_map(|block| match block {
                             ContentBlock::ToolCall { id, .. } => Some(id.clone()),
                             _ => None,
                         })
-                        .collect()
+                        .collect();
+                    if !tool_call_ids.is_empty() {
+                        assistant_tool_calls.push((position, tool_call_ids));
+                    }
                 }
-                _ => Vec::new(),
-            };
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::ToolResult =>
+                {
+                    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+                        paired_tool_results.insert(tool_call_id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut repaired = 0usize;
+        for (_position, tool_call_ids) in assistant_tool_calls {
             for tool_call_id in tool_call_ids {
-                let paired = path[path
-                    .iter()
-                    .position(|&index| index == entry_index)
-                    .expect("path index")
-                    + 1..]
-                    .iter()
-                    .any(|&later_index| {
-                        matches!(
-                            &self.entries[later_index].entry_type,
-                            SessionEntryType::Message(message)
-                                if message.role == AgentMessageRole::ToolResult
-                                    && message.tool_call_id.as_deref()
-                                        == Some(tool_call_id.as_str())
-                        )
-                    });
-                if paired {
+                if paired_tool_results.contains(&tool_call_id) {
                     continue;
                 }
                 self.append_entry(SessionEntryType::Message(AgentMessage {

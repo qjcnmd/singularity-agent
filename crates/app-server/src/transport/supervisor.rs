@@ -286,48 +286,18 @@ where
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    // A started `spawn_blocking` job cannot be force-aborted. All
-                    // execution and output seams are cancellation-aware, so after the
-                    // bounded grace period keep owning and joining the workers rather
-                    // than detaching them from the AppServer lifecycle. The diagnostic
-                    // records that the normal deadline was exceeded while preserving
-                    // the stronger ownership invariant.
-                    worker_error = Some(
-                        "turn workers exceeded shutdown grace; waiting for cooperative quiescence"
-                            .to_string(),
-                    );
-                    while let Some(join_result) = turn_tasks.join_next().await {
-                        match join_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) if worker_error.is_none() => {
-                                worker_error = Some(error);
-                            }
-                            Ok(Err(_)) => {}
-                            Err(error) if worker_error.is_none() => {
-                                worker_error = Some(format!("turn worker task failed: {error}"));
-                            }
-                            Err(_) => {}
-                        }
-                    }
+                    // 宽限到点后有界退出：放弃 join 剩余 worker。`spawn_blocking`
+                    // 任务无法在执行中途真正中止，进程退出即终结；bash 子树由
+                    // Job Object 句柄 Drop 兜底终止。
+                    worker_error =
+                        Some("turn workers exceeded shutdown grace; aborted".to_string());
+                    turn_tasks.abort_all();
                     break;
                 }
             }
         } else {
-            worker_error = Some(
-                "turn workers exceeded shutdown grace; waiting for cooperative quiescence"
-                    .to_string(),
-            );
-            while let Some(join_result) = turn_tasks.join_next().await {
-                match join_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
-                    Ok(Err(_)) => {}
-                    Err(error) if worker_error.is_none() => {
-                        worker_error = Some(format!("turn worker task failed: {error}"));
-                    }
-                    Err(_) => {}
-                }
-            }
+            worker_error = Some("turn workers exceeded shutdown grace; aborted".to_string());
+            turn_tasks.abort_all();
             break;
         }
     }

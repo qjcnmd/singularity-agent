@@ -106,7 +106,7 @@ pub enum AgentEvent {
 /// 不改变轮次结果；其余事件的投影失败会使循环立即中止本轮并丢弃
 /// 当轮结果，错误经 `run` 返回。
 pub struct AgentEvents<'a> {
-    pub on_event: Option<&'a mut dyn FnMut(AgentEvent) -> Result<()>>,
+    pub on_event: Option<&'a mut dyn FnMut(AgentEvent)>,
 }
 
 impl<'a> AgentEvents<'a> {
@@ -309,12 +309,12 @@ struct PreparedToolCall {
     preflight_execution: Option<ToolExecution>,
 }
 
-/// 通过单一事件出口投递一个事件；回调返回错误时向上传播以中止本轮。
-fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) -> Result<()> {
+/// 通过单一事件出口投递一个事件；事件投影是尽力而为的，回调不再返回
+/// 错误——投影失败由消费方（app-server/CLI）自行吸收诊断，不影响轮次结果。
+fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) {
     if let Some(callback) = events.on_event.as_deref_mut() {
-        callback(event)?;
+        callback(event);
     }
-    Ok(())
 }
 
 fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecution {
@@ -367,7 +367,7 @@ fn execute_tool_batch(
                     tool_call_id: item.call.tool_call_id.clone(),
                     execution: execution.clone(),
                 },
-            )?;
+            );
             results.push(execution.clone());
             continue;
         }
@@ -375,42 +375,29 @@ fn execute_tool_batch(
             .prepared
             .expect("runnable tool call must have a prepared tool");
         let call = item.call.clone();
-        // 与事件回调同一合同：首个投影错误中止本轮，其后的 Update/End 不再
-        // 投递，避免向客户端继续写出无效事件。
-        let projected_error = std::cell::RefCell::new(None::<AgentError>);
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
-                let mut slot = projected_error.borrow_mut();
-                if slot.is_none()
-                    && let Err(error) = emit(
-                        events,
-                        AgentEvent::ToolExecutionUpdate {
-                            tool_name: call.tool_name.clone(),
-                            tool_call_id: call.tool_call_id.clone(),
-                            arguments: call.arguments.clone(),
-                            partial_result: text.to_string(),
-                        },
-                    )
-                {
-                    *slot = Some(error);
-                }
+                emit(
+                    events,
+                    AgentEvent::ToolExecutionUpdate {
+                        tool_name: call.tool_name.clone(),
+                        tool_call_id: call.tool_call_id.clone(),
+                        arguments: call.arguments.clone(),
+                        partial_result: text.to_string(),
+                    },
+                );
             })
         }))
         .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
-        if projected_error.borrow().is_none() {
-            emit(
-                events,
-                AgentEvent::ToolExecutionEnded {
-                    tool_name: call.tool_name.clone(),
-                    tool_call_id: call.tool_call_id.clone(),
-                    execution: execution.clone(),
-                },
-            )?;
-        }
+        emit(
+            events,
+            AgentEvent::ToolExecutionEnded {
+                tool_name: call.tool_name.clone(),
+                tool_call_id: call.tool_call_id.clone(),
+                execution: execution.clone(),
+            },
+        );
         results.push(execution);
-        if let Some(error) = projected_error.into_inner() {
-            return Err(error);
-        }
     }
     Ok(results)
 }
@@ -703,16 +690,14 @@ impl Agent {
                         })
                         .collect::<Vec<_>>();
                     for item in &prepared_calls {
-                        if let Err(error) = emit(
+                        emit(
                             events,
                             AgentEvent::ToolExecutionStarted {
                                 tool_name: item.call.tool_name.clone(),
                                 tool_call_id: item.call.tool_call_id.clone(),
                                 arguments: item.call.arguments.clone(),
                             },
-                        ) {
-                            return self.fail_after_progress(error, outcome);
-                        }
+                        );
                     }
                     let executions = execute_tool_batch(
                         &self.registry,
@@ -797,7 +782,19 @@ impl Agent {
         // normal recent-content ratio when the provider has already rejected
         // the request for exceeding its context window.
         budget.retain_ratio = 0.0;
-        let tokens_before = self.estimate_context_tokens(None, 0, 0)?;
+        // 与正常请求同一装配 seam 重建全上下文并取真实估算：强制压缩记录的
+        // tokens_before 必须反映被 provider 拒绝的完整请求规模，而非退化占位。
+        let capabilities = self.provider.protocol_contract();
+        let tools = self.tool_schemas(&capabilities);
+        let entries = self.session.build_context_entries()?;
+        let mut messages = Vec::with_capacity(entries.len() + 1);
+        if let Some(instruction) = instruction_message(&capabilities, &self.config.system_prompt) {
+            messages.push(instruction);
+        }
+        messages.extend(entries.iter().flat_map(entry_to_llm_messages));
+        let max_output_tokens =
+            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
+        let tokens_before = self.estimate_assembled(&messages, &tools, max_output_tokens);
         match self.compaction.compact_with_reason(
             &mut self.session,
             &budget,
@@ -1012,67 +1009,49 @@ impl Agent {
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> Result<ModelTurnResponse> {
-        // provider 回调与 on_attempt 共享同一个事件出口与投影错误位；用本地
-        // RefCell 承接两个异签名回调的可变借用（单线程 turn 内串行使用）。
-        // 全部本地状态装进一个块：块结束时回调与其 RefCell 借用一并释放，
-        // 随后消费投影错误位。
-        let (result, projected_error) = {
-            let events_cell = std::cell::RefCell::new(events);
-            let events_ref = &events_cell;
-            let projected_error = std::cell::RefCell::new(None::<AgentError>);
-            let projected_ref = &projected_error;
-            let mut on_stream = |event: ProviderStreamEvent| {
-                let ProviderStreamEvent::OutputTextDelta { delta } = event;
-                if projected_ref.borrow().is_none() {
-                    let mut events = events_ref.borrow_mut();
-                    if let Err(error) = emit(&mut events, AgentEvent::MessageUpdate { delta }) {
-                        *projected_ref.borrow_mut() = Some(error);
-                    }
-                }
-            };
-            let on_attempt = |event: ProviderAttemptEvent| {
-                if projected_ref.borrow().is_none() {
-                    let mut events = events_ref.borrow_mut();
-                    if let Err(error) = emit(
-                        &mut events,
-                        AgentEvent::ProviderAttempt {
-                            model_turn_ordinal,
-                            event,
-                        },
-                    ) {
-                        *projected_ref.borrow_mut() = Some(error);
-                    }
-                }
-            };
-            let mut observed_attempt = |event: ProviderAttemptEvent| {
-                on_attempt(event);
-                true
-            };
-            let result = match self.provider.complete_stream_observed(
-                request,
-                cancellation,
-                &mut on_stream,
-                &mut observed_attempt,
-            ) {
-                Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
-                Err(error)
-                    if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
-                {
-                    self.provider
-                        .complete_observed(request, cancellation, &mut observed_attempt)
-                        .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
-                        .map_err(AgentError::Provider)
-                }
-                Err(error) => {
-                    // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
-                    Err(AgentError::Provider(error))
-                }
-            };
-            (result, projected_error.into_inner())
+        // provider 回调与 on_attempt 共享同一个事件出口；用本地 RefCell 承接
+        // 两个异签名回调的可变借用（单线程 turn 内串行使用）。事件投影尽力
+        // 而为，provider 结果不因投影失败丢弃。
+        let events_cell = std::cell::RefCell::new(events);
+        let events_ref = &events_cell;
+        let mut on_stream = |event: ProviderStreamEvent| {
+            let ProviderStreamEvent::OutputTextDelta { delta } = event;
+            let mut events = events_ref.borrow_mut();
+            emit(&mut events, AgentEvent::MessageUpdate { delta });
         };
-        match projected_error {
-            Some(error) => Err(error),
-            None => result,
+        let on_attempt = |event: ProviderAttemptEvent| {
+            let mut events = events_ref.borrow_mut();
+            emit(
+                &mut events,
+                AgentEvent::ProviderAttempt {
+                    model_turn_ordinal,
+                    event,
+                },
+            );
+        };
+        let mut observed_attempt = |event: ProviderAttemptEvent| {
+            on_attempt(event);
+            true
+        };
+        match self.provider.complete_stream_observed(
+            request,
+            cancellation,
+            &mut on_stream,
+            &mut observed_attempt,
+        ) {
+            Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
+            Err(error)
+                if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
+            {
+                self.provider
+                    .complete_observed(request, cancellation, &mut observed_attempt)
+                    .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
+                    .map_err(AgentError::Provider)
+            }
+            Err(error) => {
+                // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
+                Err(AgentError::Provider(error))
+            }
         }
     }
 
@@ -1287,8 +1266,8 @@ fn bind_response_attempt_ordinal(
 }
 
 fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
-    // 诊断是尽力而为的观测侧信道：回调失败不中止本轮。
-    let _ = emit(events, AgentEvent::Diagnostic(diagnostic));
+    // 诊断是尽力而为的观测侧信道。
+    emit(events, AgentEvent::Diagnostic(diagnostic));
 }
 
 #[cfg(test)]

@@ -787,11 +787,10 @@ fn provider_attempt_observer_is_non_vetoing_and_optional() {
         usage: usage(1, 1),
     }]);
     let mut seen = 0usize;
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         if matches!(event, AgentEvent::ProviderAttempt { .. }) {
             seen += 1;
         }
-        Ok(())
     };
     let mut events = AgentEvents::new();
     events.on_event = Some(on_event);
@@ -848,11 +847,10 @@ fn compaction_provider_failure_emits_safe_diagnostic_without_session_entry() {
     )
     .unwrap();
     let mut diagnostics = Vec::new();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         if let AgentEvent::Diagnostic(diagnostic) = event {
             diagnostics.push(diagnostic);
         }
-        Ok(())
     };
     let mut events = AgentEvents::new();
     events.on_event = Some(on_event);
@@ -1172,11 +1170,10 @@ fn single_text_turn_stops_with_usage() {
     .unwrap();
     let mut events = AgentEvents::new();
     let mut deltas = String::new();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         if let AgentEvent::MessageUpdate { delta } = event {
             deltas.push_str(&delta);
         }
-        Ok(())
     };
     events.on_event = Some(on_event);
     let outcome = agent
@@ -1199,9 +1196,10 @@ fn single_text_turn_stops_with_usage() {
     assert_eq!(requests[0].messages[1].content, "hi");
 }
 
-/// 1b. 事件投影失败立即中止本轮：成功的 provider 响应被丢弃，错误经 run 返回。
+/// 1b. 事件投影是尽力而为的观测侧信道：回调无错误通道，无法中止本轮；
+/// provider 结果与 session 落盘不受观测侧影响。
 #[test]
-fn event_projection_failure_aborts_turn_and_discards_result() {
+fn event_projection_cannot_abort_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let provider = Arc::new(FakeProvider::new(
@@ -1220,18 +1218,17 @@ fn event_projection_failure_aborts_turn_and_discards_result() {
     )
     .unwrap();
     let mut events = AgentEvents::new();
-    let on_event = &mut |_event: AgentEvent| -> Result<()> {
-        Err(AgentError::Loop("projection failed".to_string()))
+    let mut observed = 0usize;
+    let on_event = &mut |_event: AgentEvent| {
+        observed += 1;
     };
     events.on_event = Some(on_event);
-    let err = agent
+    let outcome = agent
         .run("hi", &mut events, &CancellationToken::new())
-        .expect_err("projection failure must abort the turn");
-    assert!(
-        err.to_string().contains("projection failed"),
-        "callback error must surface, got: {err:?}"
-    );
-    // 单次 provider 调用后即中止：响应被丢弃，不再发起新请求。
+        .unwrap();
+    assert_eq!(outcome.final_text, "hello from model");
+    assert!(observed > 0, "events still flow through the observer");
+    // 单次 provider 调用即完成：观测侧不会触发额外请求或重试。
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
 
@@ -1268,7 +1265,7 @@ fn tool_call_executes_and_results_feed_next_turn() {
     .unwrap();
     let mut events = AgentEvents::new();
     let mut started: Vec<(String, String)> = Vec::new();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         if let AgentEvent::ToolExecutionStarted {
             tool_name,
             arguments,
@@ -1277,7 +1274,6 @@ fn tool_call_executes_and_results_feed_next_turn() {
         {
             started.push((tool_name, arguments.to_string()));
         }
-        Ok(())
     };
     events.on_event = Some(on_event);
     let outcome = agent
@@ -1341,27 +1337,24 @@ fn tool_lifecycle_callbacks_carry_pi_fields() {
     let mut starts = Vec::new();
     let mut updates = Vec::new();
     let mut ends = Vec::new();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
-        match event {
-            AgentEvent::ToolExecutionStarted {
-                tool_name,
-                tool_call_id,
-                arguments,
-            } => starts.push((tool_name, tool_call_id, arguments)),
-            AgentEvent::ToolExecutionUpdate {
-                tool_name,
-                tool_call_id,
-                arguments,
-                partial_result,
-            } => updates.push((tool_name, tool_call_id, arguments, partial_result)),
-            AgentEvent::ToolExecutionEnded {
-                tool_name,
-                tool_call_id,
-                execution,
-            } => ends.push((tool_name, tool_call_id, execution)),
-            _ => {}
-        }
-        Ok(())
+    let on_event = &mut |event: AgentEvent| match event {
+        AgentEvent::ToolExecutionStarted {
+            tool_name,
+            tool_call_id,
+            arguments,
+        } => starts.push((tool_name, tool_call_id, arguments)),
+        AgentEvent::ToolExecutionUpdate {
+            tool_name,
+            tool_call_id,
+            arguments,
+            partial_result,
+        } => updates.push((tool_name, tool_call_id, arguments, partial_result)),
+        AgentEvent::ToolExecutionEnded {
+            tool_name,
+            tool_call_id,
+            execution,
+        } => ends.push((tool_name, tool_call_id, execution)),
+        _ => {}
     };
     events.on_event = Some(on_event);
 
@@ -1427,27 +1420,24 @@ fn serial_tool_batch_executes_all_calls_in_source_order() {
     let mut starts = Vec::new();
     let mut updates = Vec::new();
     let mut ends = Vec::new();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
-        match event {
-            AgentEvent::ToolExecutionStarted {
-                tool_name,
-                tool_call_id,
-                arguments,
-            } => starts.push((tool_name, tool_call_id, arguments)),
-            AgentEvent::ToolExecutionUpdate {
-                tool_name,
-                tool_call_id,
-                arguments,
-                partial_result,
-            } => updates.push((tool_name, tool_call_id, arguments, partial_result)),
-            AgentEvent::ToolExecutionEnded {
-                tool_name,
-                tool_call_id,
-                execution,
-            } => ends.push((tool_name, tool_call_id, execution)),
-            _ => {}
-        }
-        Ok(())
+    let on_event = &mut |event: AgentEvent| match event {
+        AgentEvent::ToolExecutionStarted {
+            tool_name,
+            tool_call_id,
+            arguments,
+        } => starts.push((tool_name, tool_call_id, arguments)),
+        AgentEvent::ToolExecutionUpdate {
+            tool_name,
+            tool_call_id,
+            arguments,
+            partial_result,
+        } => updates.push((tool_name, tool_call_id, arguments, partial_result)),
+        AgentEvent::ToolExecutionEnded {
+            tool_name,
+            tool_call_id,
+            execution,
+        } => ends.push((tool_name, tool_call_id, execution)),
+        _ => {}
     };
     events.on_event = Some(on_event);
     let outcome = agent
@@ -1958,11 +1948,10 @@ fn inbox_handle_injects_steer_during_run() {
     let handle = agent.inbox_handle();
     let mut events = AgentEvents::new();
     // 工具执行开始时（run 期间）从外部句柄注入转向消息。
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         if matches!(event, AgentEvent::ToolExecutionStarted { .. }) {
             handle.lock().unwrap().enqueue_steer("steer during run");
         }
-        Ok(())
     };
     events.on_event = Some(on_event);
     let outcome = agent
@@ -2989,7 +2978,7 @@ fn cancellation_during_tool_execution_aborts() {
     let mut events = AgentEvents::new();
     let mut ended = Vec::new();
     let canceller = cancellation.clone();
-    let on_event = &mut |event: AgentEvent| -> Result<()> {
+    let on_event = &mut |event: AgentEvent| {
         match event {
             // 工具执行开始时取消：bash 工具在信号检查点观察到取消。
             AgentEvent::ToolExecutionStarted { .. } => {
@@ -3004,7 +2993,6 @@ fn cancellation_during_tool_execution_aborts() {
             }
             _ => {}
         }
-        Ok(())
     };
     events.on_event = Some(on_event);
     let outcome = agent.run("go", &mut events, &cancellation).unwrap();

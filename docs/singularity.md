@@ -113,7 +113,7 @@ sequenceDiagram
 
 - **原子 TurnInbox**：统一维护 `Open`/`Closed` 状态与 steer/followUp 队列。关闭点前到达的输入必定被接受并执行；关闭点后到达的输入明确返回 rejected 错误，不存在“已接受但丢失”的中间竞态。
 - **结构化诊断**：Compaction 非 Session 失败等非致命告警以 `AgentDiagnostic { severity, code, message }` 承载，经 `AgentEvent::Diagnostic` 投影为协议层 `agent/diagnostic` 事件；诊断投递为尽力而为，投递失败不改变轮次结果。不向 stderr 直接打印，不污染 Session JSONL。
-- **事件出口与遥测**：AgentLoop 全部生命周期事件收敛为单一 `AgentEvent` 枚举，经唯一 `AgentEvents::on_event` 回调流式投递；除诊断外，事件投影失败立即中止本轮并丢弃当轮 provider 结果，错误经 `run` 返回。Provider attempt 开始与结束作为 `AgentEvent::ProviderAttempt` 投递，绑定真实 `model_turn_ordinal`，并在终态聚合 attempt/retry/latency summary，不产生持久化 transcript 垃圾。
+- **事件出口与遥测**：AgentLoop 全部生命周期事件收敛为单一 `AgentEvent` 枚举，经唯一 `AgentEvents::on_event` 回调（无错误通道）流式投递；事件投影是尽力而为的观测侧信道，投影失败只记诊断并丢弃该事件，不中止轮次、不丢弃 provider 结果。Provider attempt 开始与结束作为 `AgentEvent::ProviderAttempt` 投递，绑定真实 `model_turn_ordinal`，并在终态聚合 attempt/retry/latency summary，不产生持久化 transcript 垃圾。
 
 ```mermaid
 flowchart TD

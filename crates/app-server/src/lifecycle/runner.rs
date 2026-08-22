@@ -473,69 +473,57 @@ impl AppServer {
         assistant_events: &mut AssistantItemEventState,
         emit: &mut impl FnMut(Value),
     ) -> AppServerResult<RunStatus> {
-        // 投影失败经事件回调返回的错误立即中止本轮；model-turn 序号已由
-        // AgentLoop 绑定进事件本体，此处直接透传。
-        let mut projection_error: Option<AppServerError> = None;
+        // 事件投影是尽力而为的观测侧信道：投影/序列化失败只记 stderr 诊断
+        // 并丢弃该事件，不中止也不丢弃任务；model-turn 序号已由 AgentLoop
+        // 绑定进事件本体，此处直接透传。
         let run_result = {
             let mut events = AgentEvents::new();
-            // 闭包一次性借用 self/emit/assistant_events/projection_error；本块
-            // 结束后这些借用一并释放，随后才能消费 projection_error。
-            let mut on_event = |event: AgentEvent| -> std::result::Result<(), AgentError> {
-                if let Some(error) = &projection_error {
-                    return Err(AgentError::Loop(format!("{error}")));
-                }
-                let result = match event {
-                    AgentEvent::MessageUpdate { delta } => {
-                        match self.project_assistant_delta(assistant_events, &delta) {
-                            Ok(messages) => {
-                                for message in messages {
-                                    emit(message);
-                                }
-                                Ok(())
+            // 闭包一次性借用 self/emit/assistant_events；本块结束后这些借用
+            // 一并释放。
+            let mut on_event = |event: AgentEvent| match event {
+                AgentEvent::MessageUpdate { delta } => {
+                    match self.project_assistant_delta(assistant_events, &delta) {
+                        Ok(messages) => {
+                            for message in messages {
+                                emit(message);
                             }
-                            Err(error) => Err(error),
+                        }
+                        Err(error) => {
+                            eprintln!("app-server: assistant delta projection failed: {error}")
                         }
                     }
-                    AgentEvent::ToolExecutionStarted {
-                        tool_name,
-                        tool_call_id,
-                        arguments,
-                    } => {
-                        if assistant_events.start_tool_item(&tool_call_id) {
-                            match self.event_notification(AppEvent::item_started(
-                                &thread.thread_id,
-                                turn_id,
-                                &tool_call_id,
-                            )) {
-                                Ok(event) => emit(event),
-                                Err(error) => {
-                                    return Err(stash_projection_error(
-                                        &mut projection_error,
-                                        error,
-                                    ));
-                                }
-                            }
-                        }
-                        match self.event_notification(AppEvent::tool_execution_start(
+                }
+                AgentEvent::ToolExecutionStarted {
+                    tool_name,
+                    tool_call_id,
+                    arguments,
+                } => {
+                    if assistant_events.start_tool_item(&tool_call_id)
+                        && let Ok(event) = self.event_notification(AppEvent::item_started(
                             &thread.thread_id,
                             turn_id,
                             &tool_call_id,
-                            &tool_name,
-                            arguments,
-                        )) {
-                            Ok(event) => {
-                                emit(event);
-                                Ok(())
-                            }
-                            Err(error) => Err(error),
-                        }
+                        ))
+                    {
+                        emit(event);
                     }
-                    AgentEvent::ToolExecutionUpdate {
-                        tool_name,
-                        tool_call_id,
+                    if let Ok(event) = self.event_notification(AppEvent::tool_execution_start(
+                        &thread.thread_id,
+                        turn_id,
+                        &tool_call_id,
+                        &tool_name,
                         arguments,
-                        partial_result,
-                    } => match self.event_notification(AppEvent::tool_execution_update(
+                    )) {
+                        emit(event);
+                    }
+                }
+                AgentEvent::ToolExecutionUpdate {
+                    tool_name,
+                    tool_call_id,
+                    arguments,
+                    partial_result,
+                } => {
+                    if let Ok(event) = self.event_notification(AppEvent::tool_execution_update(
                         &thread.thread_id,
                         turn_id,
                         &tool_call_id,
@@ -543,84 +531,63 @@ impl AppServer {
                         arguments,
                         &partial_result,
                     )) {
-                        Ok(event) => {
-                            emit(event);
-                            Ok(())
-                        }
-                        Err(error) => Err(error),
-                    },
-                    AgentEvent::ToolExecutionEnded {
-                        tool_name,
-                        tool_call_id,
-                        execution,
-                    } => {
-                        match self.event_notification(AppEvent::tool_execution_end(
-                            &thread.thread_id,
-                            turn_id,
-                            &tool_call_id,
-                            &tool_name,
-                            &execution.content,
-                            execution.is_error,
-                        )) {
-                            Ok(event) => emit(event),
-                            Err(error) => {
-                                return Err(stash_projection_error(&mut projection_error, error));
-                            }
-                        }
-                        match self.realtime_tool_terminal_event(
-                            assistant_events,
-                            &tool_call_id,
-                            execution.is_error,
-                        ) {
-                            Ok(Some(event)) => {
-                                emit(event);
-                                Ok(())
-                            }
-                            Ok(None) => Ok(()),
-                            Err(error) => Err(error),
-                        }
+                        emit(event);
                     }
-                    AgentEvent::Diagnostic(diagnostic) => {
-                        let severity = match diagnostic.severity {
-                            AgentDiagnosticSeverity::Info => "info",
-                            AgentDiagnosticSeverity::Warning => "warning",
-                            AgentDiagnosticSeverity::Error => "error",
-                        };
-                        let event = AppEvent::agent_diagnostic(
-                            &thread.thread_id,
-                            turn_id,
-                            severity,
-                            &diagnostic.code,
-                            &diagnostic.message,
-                        );
-                        // Diagnostics are a best-effort observer side channel.
-                        // A failed projection must not convert an otherwise
-                        // valid Agent run into a failure.
-                        if let Ok(event) = self.event_notification(event) {
-                            emit(event);
-                        }
-                        Ok(())
+                }
+                AgentEvent::ToolExecutionEnded {
+                    tool_name,
+                    tool_call_id,
+                    execution,
+                } => {
+                    if let Ok(event) = self.event_notification(AppEvent::tool_execution_end(
+                        &thread.thread_id,
+                        turn_id,
+                        &tool_call_id,
+                        &tool_name,
+                        &execution.content,
+                        execution.is_error,
+                    )) {
+                        emit(event);
                     }
-                    AgentEvent::ProviderAttempt {
+                    if let Ok(Some(event)) = self.realtime_tool_terminal_event(
+                        assistant_events,
+                        &tool_call_id,
+                        execution.is_error,
+                    ) {
+                        emit(event);
+                    }
+                }
+                AgentEvent::Diagnostic(diagnostic) => {
+                    let severity = match diagnostic.severity {
+                        AgentDiagnosticSeverity::Info => "info",
+                        AgentDiagnosticSeverity::Warning => "warning",
+                        AgentDiagnosticSeverity::Error => "error",
+                    };
+                    let event = AppEvent::agent_diagnostic(
+                        &thread.thread_id,
+                        turn_id,
+                        severity,
+                        &diagnostic.code,
+                        &diagnostic.message,
+                    );
+                    if let Ok(event) = self.event_notification(event) {
+                        emit(event);
+                    }
+                }
+                AgentEvent::ProviderAttempt {
+                    model_turn_ordinal,
+                    event,
+                } => {
+                    // 序号已由 AgentLoop 绑定进事件本体，直接透传，无猜测。
+                    let event = provider_attempt_app_event(
+                        &thread.thread_id,
+                        turn_id,
                         model_turn_ordinal,
-                        event,
-                    } => {
-                        // 序号已由 AgentLoop 绑定进事件本体，直接透传，无猜测。
-                        let event = provider_attempt_app_event(
-                            &thread.thread_id,
-                            turn_id,
-                            model_turn_ordinal,
-                            &event,
-                        );
-                        if let Ok(event) = self.event_notification(event) {
-                            emit(event);
-                        }
-                        Ok(())
+                        &event,
+                    );
+                    if let Ok(event) = self.event_notification(event) {
+                        emit(event);
                     }
-                };
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(stash_projection_error(&mut projection_error, error)),
                 }
             };
             events.on_event = Some(&mut on_event);
@@ -629,15 +596,9 @@ impl AppServer {
         match run_result {
             Ok(outcome) => {
                 emit_provider_attempt_summaries(self, &thread.thread_id, turn_id, &outcome, emit);
-                if let Some(error) = projection_error {
-                    return Err(error);
-                }
                 Ok(outcome_to_run_status(outcome))
             }
             Err(error) => {
-                if let Some(projected) = projection_error.take() {
-                    return Err(projected);
-                }
                 // AgentLoop owns typed Provider cancellation.  Do not infer
                 // an aborted outcome from an unrelated concurrent error here.
                 if let AgentError::RunFailed { outcome, .. } = &error {
@@ -713,11 +674,6 @@ impl AppServer {
 
 /// 投影失败：暂存 typed 错误并向 AgentLoop 返回哨兵错误中止本轮；
 /// run 返回后由调用方优先读取暂存（投影失败即中止轮次）。
-fn stash_projection_error(stash: &mut Option<AppServerError>, error: AppServerError) -> AgentError {
-    *stash = Some(error);
-    AgentError::Loop("event projection failed".to_string())
-}
-
 fn serialized_enum_text<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()
