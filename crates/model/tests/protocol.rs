@@ -139,7 +139,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
 }
 
 #[test]
-fn openai_provider_rejects_calls_above_the_agent_request_limit() {
+fn openai_provider_accepts_multiple_tool_calls_in_one_response() {
     let body = r#"{
         "id": "resp_1",
         "choices": [{
@@ -179,45 +179,25 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         .complete(&request, &singularity_core::CancellationToken::new())
         .expect("provider response envelope");
 
-    assert_eq!(response.status, ModelTurnStatus::Invalid);
+    // 多工具调用响应是合法的：Agent loop 按模型给定顺序串行执行全部调用，
+    // 响应校验不再因调用数超过请求上限或并行能力声明而拒绝。
+    assert_eq!(response.status, ModelTurnStatus::Success);
     assert_eq!(response.tool_calls.len(), 2);
-    let metadata = response
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("contract violation attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
-    let [occurrence] = metadata.occurrences.as_slice() else {
-        panic!("one invalid response attempt occurrence expected");
-    };
-    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-    // 静态契约（parallel 未声明）下，超过 agent 上限的并行响应同时违反
-    // parallel 支持声明，parallel 拒绝优先映射为 UnsupportedCapability。
-    assert_eq!(
-        occurrence.error_category,
-        Some(ModelErrorCategory::UnsupportedCapability)
+    assert!(response.error.is_none());
+    assert!(
+        response
+            .validation
+            .as_ref()
+            .expect("validation attached")
+            .valid
     );
-    assert_eq!(
-        occurrence.error_stage,
-        Some(ProviderErrorStage::ResponseValidation)
-    );
-    assert_eq!(
-        occurrence.diagnostic_code.as_deref(),
-        Some("provider_does_not_support_parallel_tool_calls")
-    );
-    assert!(occurrence.usage.is_none());
-    let error = response.error.expect("contract violation error");
-    assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.code.as_deref(),
-        Some("provider_does_not_support_parallel_tool_calls")
-    );
-    assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
-    // 响应超限已降级为 warning（agent loop 按声明上限分窗口执行全部工具调用），
-    // 不再作为致命校验；parallel 未声明时 parallel 拒绝仍是唯一致命校验。
-    assert_eq!(
-        error.validation_errors,
-        vec!["provider_does_not_support_parallel_tool_calls"]
+    assert!(
+        response
+            .validation
+            .as_ref()
+            .unwrap()
+            .warnings
+            .contains(&"max_tool_calls_exceeded".to_string())
     );
 }
 
@@ -665,13 +645,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         Some(&ProviderProtocolContract::default()),
     );
 
-    assert_eq!(
-        duplicate_result.errors,
-        vec![
-            "duplicate_tool_call_id",
-            "provider_does_not_support_parallel_tool_calls"
-        ]
-    );
+    assert_eq!(duplicate_result.errors, vec!["duplicate_tool_call_id"]);
     // 超限（> 请求上限）只产生 warning，不阻止 agent 逐个执行。
     assert!(
         duplicate_result
@@ -1151,7 +1125,7 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
         provider_name: "reasoning_test".to_string(),
         model_name: "chat".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec!["call_1".to_string()],
         reasoning_content: "opaque-deepseek-state".to_string(),
     }];
@@ -1236,7 +1210,7 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
         provider_name: "reasoning_test".to_string(),
         model_name: "chat".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec!["call_1".to_string()],
         reasoning_content: "opaque-deepseek-state".to_string(),
     }];

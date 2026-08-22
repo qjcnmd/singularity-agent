@@ -444,16 +444,9 @@ impl OpenAiProvider {
                 selection.tool_reasoning_mode,
             ));
         }
-        let variant = selection.reasoning_variant.as_deref().ok_or_else(|| {
-            provider_tool_reasoning_history_error(
-                &ModelTurnResponse::completed(
-                    request.request_id.clone(),
-                    "provider_reasoning_history",
-                    "",
-                ),
-                selection.tool_reasoning_mode,
-            )
-        })?;
+        // 无变体选择（selection.reasoning_variant=None）同样是合法绑定侧；
+        // 变体一致性由 validate_for 的 Option 语义判定。
+        let variant = selection.reasoning_variant.as_deref();
         for replay in &request.provider_reasoning_history {
             if replay
                 .validate_for(

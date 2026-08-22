@@ -1,7 +1,7 @@
 //! Singularity 核心 Agent 执行循环。
 //!
 //! 采用双层状态机循环结构：
-//! - **内层循环**：处理单轮任务执行中的模型流式请求、工具批次安全并发执行、中间引导（Steer）注入与上下文压缩；
+//! - **内层循环**：处理单轮任务执行中的模型流式请求、工具批次按模型给定顺序串行执行、中间引导（Steer）注入与上下文压缩；
 //! - **外层循环**：当模型完成当前阶段工作（返回纯文本且无工具调用）准备收尾时，消费跟进（FollowUp）队列继续执行下一阶段目标。
 //!
 //! 会话状态持久化、上下文压缩、工具注册分发与模型调用分别由
@@ -9,15 +9,13 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use serde_json::Value;
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
+    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelMessage, ModelPreferences,
+    ModelRole, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
     PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
     ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
@@ -311,17 +309,6 @@ struct PreparedToolCall {
     preflight_execution: Option<ToolExecution>,
 }
 
-enum ToolRuntimeEvent {
-    Update {
-        index: usize,
-        text: String,
-    },
-    End {
-        index: usize,
-        execution: ToolExecution,
-    },
-}
-
 /// 通过单一事件出口投递一个事件；回调返回错误时向上传播以中止本轮。
 fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) -> Result<()> {
     if let Some(callback) = events.on_event.as_deref_mut() {
@@ -360,19 +347,18 @@ fn execute_prepared_tool(
     }
 }
 
-fn execute_tool_batch_parallel(
+/// 按模型给定的 source order 串行执行一批工具调用：每个工具保留
+/// `catch_unwind` panic 隔离与逐工具事件发射；preflight 拒绝项不进入执行，
+/// 直接以模型可见失败收尾。单个工具失败不影响其余调用继续执行。
+fn execute_tool_batch(
     registry: &ToolRegistry,
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
-    max_parallel_tool_calls: u32,
     events: &mut AgentEvents<'_>,
 ) -> Result<Vec<ToolExecution>> {
-    let mut results = vec![None; calls.len()];
-    let mut runnable_indices = Vec::with_capacity(calls.len());
-
-    // Preflight rejections are already complete and do not enter a worker.
-    for (index, item) in calls.iter().enumerate() {
+    let mut results = Vec::with_capacity(calls.len());
+    for item in calls {
         if let Some(execution) = &item.preflight_execution {
             emit(
                 events,
@@ -382,174 +368,51 @@ fn execute_tool_batch_parallel(
                     execution: execution.clone(),
                 },
             )?;
-            results[index] = Some(execution.clone());
-        } else {
-            runnable_indices.push(index);
+            results.push(execution.clone());
+            continue;
         }
-    }
-
-    // 批内含任一 sequential 工具（supports_parallel=false）时，整批按模型原始
-    // 顺序串行执行，不创建 worker 线程。
-    let force_serial = runnable_indices.iter().any(|&index| {
-        !calls[index]
+        let prepared = item
             .prepared
-            .expect("runnable tool call must have a prepared tool")
-            .supports_parallel
-    });
-    if force_serial {
-        for &index in &runnable_indices {
-            let item = &calls[index];
-            let prepared = item
-                .prepared
-                .expect("runnable tool call must have a prepared tool");
-            let call = &item.call;
-            // 与并行路径同一合同：首个投影错误中止本轮，其后的 Update/End
-            // 不再投递，避免向客户端继续写出无效事件。
-            let projected_error = std::cell::RefCell::new(None::<AgentError>);
-            let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_prepared_tool(registry, prepared, call, cwd, cancellation, |text| {
-                    let mut slot = projected_error.borrow_mut();
-                    if slot.is_none()
-                        && let Err(error) = emit(
-                            events,
-                            AgentEvent::ToolExecutionUpdate {
-                                tool_name: call.tool_name.clone(),
-                                tool_call_id: call.tool_call_id.clone(),
-                                arguments: call.arguments.clone(),
-                                partial_result: text.to_string(),
-                            },
-                        )
-                    {
-                        *slot = Some(error);
-                    }
-                })
-            }))
-            .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
-            if projected_error.borrow().is_none() {
-                emit(
-                    events,
-                    AgentEvent::ToolExecutionEnded {
-                        tool_name: call.tool_name.clone(),
-                        tool_call_id: call.tool_call_id.clone(),
-                        execution: execution.clone(),
-                    },
-                )?;
-            }
-            results[index] = Some(execution);
-            if let Some(error) = projected_error.into_inner() {
-                return Err(error);
-            }
-        }
-    } else {
-        let worker_limit = usize::try_from(max_parallel_tool_calls.max(1)).unwrap_or(usize::MAX);
-        // 只为当前窗口创建 worker；窗口之间顺序推进，避免模型一次返回大量
-        // tool call 时不受控地创建线程。preflight 项不在 runnable_indices 中，
-        // 因此不会占用并发名额。
-        for window in runnable_indices.chunks(worker_limit) {
-            let (sender, receiver): (Sender<ToolRuntimeEvent>, Receiver<ToolRuntimeEvent>) =
-                mpsc::channel();
-            // 主线程在 join 全部 worker 后检查首个投影错误；工具 worker 本身
-            // 只通过 channel 回传，不在子线程内直接投递事件。
-            let mut projected_error: Option<AgentError> = None;
-            thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(window.len());
-                for &index in window {
-                    let prepared = calls[index]
-                        .prepared
-                        .expect("runnable tool call must have a prepared tool");
-                    let sender = sender.clone();
-                    let call = calls[index].call.clone();
-                    handles.push(scope.spawn(move || {
-                        let execution =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                execute_prepared_tool(
-                                    registry,
-                                    prepared,
-                                    &call,
-                                    cwd,
-                                    cancellation,
-                                    |text| {
-                                        let _ = sender.send(ToolRuntimeEvent::Update {
-                                            index,
-                                            text: text.to_string(),
-                                        });
-                                    },
-                                )
-                            }))
-                            .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
-                        let _ = sender.send(ToolRuntimeEvent::End { index, execution });
-                    }));
+            .expect("runnable tool call must have a prepared tool");
+        let call = item.call.clone();
+        // 与事件回调同一合同：首个投影错误中止本轮，其后的 Update/End 不再
+        // 投递，避免向客户端继续写出无效事件。
+        let projected_error = std::cell::RefCell::new(None::<AgentError>);
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
+                let mut slot = projected_error.borrow_mut();
+                if slot.is_none()
+                    && let Err(error) = emit(
+                        events,
+                        AgentEvent::ToolExecutionUpdate {
+                            tool_name: call.tool_name.clone(),
+                            tool_call_id: call.tool_call_id.clone(),
+                            arguments: call.arguments.clone(),
+                            partial_result: text.to_string(),
+                        },
+                    )
+                {
+                    *slot = Some(error);
                 }
-                drop(sender);
-
-                let mut finished = 0usize;
-                while finished < window.len() {
-                    match receiver.recv() {
-                        Ok(ToolRuntimeEvent::Update { index, text })
-                            if projected_error.is_none() =>
-                        {
-                            if let Err(error) = emit(
-                                events,
-                                AgentEvent::ToolExecutionUpdate {
-                                    tool_name: calls[index].call.tool_name.clone(),
-                                    tool_call_id: calls[index].call.tool_call_id.clone(),
-                                    arguments: calls[index].call.arguments.clone(),
-                                    partial_result: text,
-                                },
-                            ) {
-                                projected_error = Some(error);
-                            }
-                        }
-                        Ok(ToolRuntimeEvent::End { index, execution }) => {
-                            if projected_error.is_none()
-                                && let Err(error) = emit(
-                                    events,
-                                    AgentEvent::ToolExecutionEnded {
-                                        tool_name: calls[index].call.tool_name.clone(),
-                                        tool_call_id: calls[index].call.tool_call_id.clone(),
-                                        execution: execution.clone(),
-                                    },
-                                )
-                            {
-                                projected_error = Some(error);
-                            }
-                            results[index] = Some(execution);
-                            finished += 1;
-                        }
-                        Err(_) => break,
-                        _ => {}
-                    }
-                }
-                for handle in handles {
-                    let _ = handle.join();
-                }
-            });
-            if let Some(error) = projected_error {
-                return Err(error);
-            }
-        }
-    }
-
-    // A worker must always send End, but preserve a fail-closed result if a
-    // thread or channel failure violates that invariant.
-    for (index, result) in results.iter_mut().enumerate() {
-        if result.is_none() {
-            let execution = tool_error_execution("tool worker did not produce a result");
+            })
+        }))
+        .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
+        if projected_error.borrow().is_none() {
             emit(
                 events,
                 AgentEvent::ToolExecutionEnded {
-                    tool_name: calls[index].call.tool_name.clone(),
-                    tool_call_id: calls[index].call.tool_call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    tool_call_id: call.tool_call_id.clone(),
                     execution: execution.clone(),
                 },
             )?;
-            *result = Some(execution);
+        }
+        results.push(execution);
+        if let Some(error) = projected_error.into_inner() {
+            return Err(error);
         }
     }
-    Ok(results
-        .into_iter()
-        .map(|result| result.expect("tool batch result must be present"))
-        .collect())
+    Ok(results)
 }
 
 /// 按 provider 声明把系统/开发者指令投影为请求首条消息。
@@ -675,17 +538,11 @@ impl Agent {
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
         let tools = self.tool_schemas(&capabilities);
-        let effective_max_parallel_tool_calls = if capabilities.supports_parallel_tool_calls {
-            capabilities.max_parallel_tool_calls.max(1)
-        } else {
-            1
-        };
         let tool_choice = ToolChoicePolicy {
             mode: ToolChoiceMode::Auto,
-            // 请求上限对齐 provider 静态声明的并行工具能力（无声明或声明不支持
-            // 并行时回退 1）；本地 worker 窗口使用同一有效上限。请求上限
-            // 低于 provider 声明会导致合法多调用响应被响应校验拒绝。
-            max_tool_calls: effective_max_parallel_tool_calls,
+            // 单条 assistant 消息允许的工具调用数上限；本地按模型给定顺序
+            // 串行执行全部调用，wire 侧 parallel_tool_calls 恒为 false。
+            max_tool_calls: DEFAULT_MAX_TOOLS_PER_REQUEST,
             strict_tool_schema: capabilities.supports_strict_tool_schema
                 && tools
                     .iter()
@@ -857,12 +714,11 @@ impl Agent {
                             return self.fail_after_progress(error, outcome);
                         }
                     }
-                    let executions = execute_tool_batch_parallel(
+                    let executions = execute_tool_batch(
                         &self.registry,
                         &prepared_calls,
                         self.session.cwd(),
                         cancellation,
-                        effective_max_parallel_tool_calls,
                         events,
                     )?;
                     // Durable toolResult entries are always appended in assistant source order,
@@ -1053,12 +909,13 @@ impl Agent {
         entries: &[SessionEntry],
     ) -> Vec<ProviderReasoningReplay> {
         let tool_reasoning_mode = self.provider.protocol_contract().tool_reasoning_mode;
-        // 三段齐全语义：缺任一字段时无法可靠重建 reasoning 绑定，安全跳过投影。
+        // (provider, model) 必须齐全；变体侧允许双侧同为空（Option 语义由
+        // replay 兼容检查判定），无 #variant 的选择器不再静默丢弃 replay。
         let selector = {
             let parts = split_model_selector(&self.config.model);
-            match (parts.provider, parts.model, parts.effort) {
-                (Some(provider_name), Some(model_name), Some(variant)) => {
-                    Some((provider_name, model_name, variant))
+            match (parts.provider, parts.model) {
+                (Some(provider_name), Some(model_name)) => {
+                    Some((provider_name, model_name, parts.effort))
                 }
                 _ => None,
             }
@@ -1120,7 +977,7 @@ impl Agent {
             replays.push(ProviderReasoningReplay::Chat {
                 provider_name: provider_name.to_string(),
                 model_name: model_name.to_string(),
-                reasoning_effort: variant.to_string(),
+                reasoning_effort: variant.map(str::to_string),
                 tool_call_ids,
                 reasoning_content: thinking,
             });

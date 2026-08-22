@@ -25,7 +25,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
-        supports_parallel: false,
         execute,
     }
 }

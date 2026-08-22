@@ -88,7 +88,8 @@ pub fn openai_request_payload(
         );
         if supports_tool_choice {
             payload["tool_choice"] = openai_tool_choice_payload();
-            payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+            // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
+            payload["parallel_tool_calls"] = json!(false);
         }
     }
     if request_uses_tool_protocol(request)
@@ -237,7 +238,9 @@ pub fn parse_openai_response(
             vec![ProviderReasoningReplay::Chat {
                 provider_name: config.provider_name.clone(),
                 model_name: model_name.to_string(),
-                reasoning_effort: reasoning_effort.unwrap_or("off").to_string(),
+                // 绑定请求时实际 selection 的 reasoning 变体；provider 不回显
+                // effort 时保持 None，不伪造禁用变体。
+                reasoning_effort: reasoning_effort.map(str::to_string),
                 tool_call_ids: tool_calls
                     .iter()
                     .map(|call| call.tool_call_id.clone())
@@ -334,23 +337,11 @@ pub fn finalize_provider_response(
     }
     if !validation.valid && !recoverable_tool_argument_validation(&response, &validation.errors) {
         response.status = ModelTurnStatus::Invalid;
-        let provider_rejected_parallelism = validation
-            .errors
-            .iter()
-            .any(|error| error == "provider_does_not_support_parallel_tool_calls");
-        let (kind, message, diagnostic_code) = if provider_rejected_parallelism {
-            (
-                ModelErrorKind::UnsupportedCapability,
-                "provider does not support parallel tool calls".to_string(),
-                "provider_does_not_support_parallel_tool_calls",
-            )
-        } else {
-            (
-                ModelErrorKind::JsonSchemaViolation,
-                format!("provider_response_invalid: {}", validation.errors.join(",")),
-                "provider_response_invalid",
-            )
-        };
+        let (kind, message, diagnostic_code) = (
+            ModelErrorKind::JsonSchemaViolation,
+            format!("provider_response_invalid: {}", validation.errors.join(",")),
+            "provider_response_invalid",
+        );
         response.error = Some(
             ModelError::new(kind, message)
                 .with_provider(config.provider_name.clone())
@@ -679,4 +670,132 @@ pub fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> 
 
 pub fn openai_tool_choice_payload() -> Value {
     json!("auto")
+}
+
+#[cfg(test)]
+mod replay_binding_tests {
+    use super::*;
+    use crate::ProviderConfigSource;
+    use crate::types::ProviderToolReasoningMode;
+
+    fn replay_test_config() -> OpenAiProviderConfig {
+        OpenAiProviderConfig {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "chat".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: "test-key-placeholder".to_string(),
+            source: ProviderConfigSource::ProcessEnvironment,
+            max_context_tokens: Some(crate::DEFAULT_MAX_CONTEXT_TOKENS),
+            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+
+    fn reasoning_tool_call_payload() -> Value {
+        json!({
+            "id": "chat_reasoning_no_variant",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "opaque chain of thought",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })
+    }
+
+    fn replay_test_request() -> ModelTurnRequest {
+        let mut request = ModelTurnRequest::new(
+            "request_replay_binding",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.tools.push(ModelToolSchema {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters_schema: json!({"type": "object"}),
+        });
+        request
+    }
+
+    /// provider 返回 reasoning_content + tool calls 且不回显 effort、请求时
+    /// selection 无变体 → replay 绑定 `None`，不伪造 `"off"`；绑定对无变体
+    /// 选择兼容，对带变体选择拒绝。
+    #[test]
+    fn chat_replay_binds_selection_none_when_provider_omits_effort() {
+        let response = parse_openai_response(
+            &replay_test_request(),
+            &replay_test_config(),
+            reasoning_tool_call_payload(),
+            &ProviderProtocolContract::default(),
+            "chat",
+            None,
+        )
+        .expect("parse response with reasoning_content");
+        assert_eq!(response.status, crate::types::ModelTurnStatus::Success);
+        assert_eq!(response.provider_reasoning_history.len(), 1);
+        let replay = &response.provider_reasoning_history[0];
+        match replay {
+            ProviderReasoningReplay::Chat {
+                reasoning_effort,
+                tool_call_ids,
+                reasoning_content,
+                ..
+            } => {
+                assert_eq!(reasoning_effort, &None);
+                assert_eq!(tool_call_ids, &vec!["call_1".to_string()]);
+                assert_eq!(reasoning_content, "opaque chain of thought");
+            }
+            other => panic!("expected Chat replay, got {other:?}"),
+        }
+        assert!(replay.is_valid());
+        assert!(replay.is_compatible_with(
+            "openai_compatible",
+            "chat",
+            None,
+            ProviderToolReasoningMode::ReplayReasoningContent
+        ));
+        assert!(!replay.is_compatible_with(
+            "openai_compatible",
+            "chat",
+            Some("high"),
+            ProviderToolReasoningMode::ReplayReasoningContent
+        ));
+    }
+
+    /// 有变体 selection 时 replay 绑定该变体；伪造的禁用变体 `"off"` 无法
+    /// 通过绑定校验。
+    #[test]
+    fn chat_replay_binds_requested_variant_and_rejects_disabled() {
+        let response = parse_openai_response(
+            &replay_test_request(),
+            &replay_test_config(),
+            reasoning_tool_call_payload(),
+            &ProviderProtocolContract::default(),
+            "chat",
+            Some("high"),
+        )
+        .expect("parse response with reasoning_content");
+        match &response.provider_reasoning_history[0] {
+            ProviderReasoningReplay::Chat {
+                reasoning_effort, ..
+            } => {
+                assert_eq!(reasoning_effort, &Some("high".to_string()));
+            }
+            other => panic!("expected Chat replay, got {other:?}"),
+        }
+        let disabled = ProviderReasoningReplay::Chat {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "chat".to_string(),
+            reasoning_effort: Some("off".to_string()),
+            tool_call_ids: vec!["call_1".to_string()],
+            reasoning_content: "opaque".to_string(),
+        };
+        assert!(!disabled.is_valid());
+    }
 }

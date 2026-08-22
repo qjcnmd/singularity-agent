@@ -122,7 +122,7 @@ fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
-        reasoning_effort: "on".to_string(),
+        reasoning_effort: Some("on".to_string()),
         tool_call_ids: vec!["fresh_call".to_string()],
         reasoning_content: "reasoning for fresh".to_string(),
     }];
@@ -137,7 +137,7 @@ fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
         ProviderReasoningReplay::Chat {
             provider_name: "openai_compatible".to_string(),
             model_name: "gpt-test".to_string(),
-            reasoning_effort: "on".to_string(),
+            reasoning_effort: Some("on".to_string()),
             tool_call_ids: vec!["fresh_call".to_string()],
             reasoning_content: "another replay for fresh".to_string(),
         },
@@ -377,7 +377,11 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
         assert!(!occurrence.retry_scheduled);
     }
     let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
-    for secret in ["test-key-placeholder", &address.to_string(), "authorization"] {
+    for secret in [
+        "test-key-placeholder",
+        &address.to_string(),
+        "authorization",
+    ] {
         assert!(
             !serialized
                 .to_ascii_lowercase()

@@ -24,8 +24,6 @@ pub struct ToolExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedTool {
     pub(crate) name: &'static str,
-    /// 是否允许与同批其他工具并行执行（false 表示该工具强制整批串行）。
-    pub(crate) supports_parallel: bool,
 }
 
 /// Preflight either produces an executable tool or a model-visible rejection.
@@ -58,14 +56,11 @@ pub struct ExecuteContext<'a> {
 }
 
 /// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实执行函数。
-/// `supports_parallel` 声明该工具是否可与同批其他工具并行执行；为 false 时，
-/// 前台批量调度器会强制整批按模型原始顺序串行。
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
-    pub supports_parallel: bool,
     pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
@@ -122,7 +117,7 @@ impl ToolRegistry {
     }
 
     /// Lookup and validate a call without executing it. Agent batches use this
-    /// before deciding whether the whole response can run in parallel.
+    /// before executing each call in model-given source order.
     pub fn preflight(&self, name: &str, args: &Value) -> Result<ToolPreflight, ToolError> {
         let spec = self
             .tools
@@ -134,10 +129,7 @@ impl ToolRegistry {
                 is_error: true,
             }));
         }
-        Ok(ToolPreflight::Ready(PreparedTool {
-            name: spec.name,
-            supports_parallel: spec.supports_parallel,
-        }))
+        Ok(ToolPreflight::Ready(PreparedTool { name: spec.name }))
     }
 
     /// Execute a call that has already passed [`Self::preflight`].
@@ -229,7 +221,6 @@ mod tests {
             name: "ping",
             description: "custom test tool",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
-            supports_parallel: true,
             execute: ping_execute,
         }
     }

@@ -181,13 +181,11 @@ impl OpenAiProviderConfig {
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract {
             supports_tools: true,
-            supports_parallel_tool_calls: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_system_message: true,
             supports_developer_message: true,
-            max_parallel_tool_calls: 1,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
         }

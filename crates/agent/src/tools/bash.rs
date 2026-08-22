@@ -1,11 +1,11 @@
 //! bash 工具：在当前工作目录下执行 Shell 命令行指令。
 //!
-//! - **超时控制**：默认超时 120 秒（支持参数 `timeout_ms` 覆盖，硬上限 600 秒）；超时后自动强制终止整棵子进程树并返回超时错误。
-//! - **输出流式捕获与截断**：标准输出（stdout）与标准错误（stderr）合并捕获；结果输出保留尾部最后 2000 行 / 50KB，超出部分直接在内存中截断丢弃。
+//! - **超时控制**：仅在显式提供 `timeout_ms` 时生效（正整数毫秒），到点强制终止整棵子进程树并返回超时错误；未提供时不主动超时。
+//! - **输出流式捕获与截断**：标准输出（stdout）与标准错误（stderr）合并捕获；结果输出保留尾部最后 2000 行 / 50KB，截断实际发生时完整输出写入临时文件并在结果尾部附 `Full output: <路径>`。
 //! - **中断处理**：收到外部取消信号（`CancellationToken`）时立即终止进程树并返回 `Command aborted`。
 //! - **进程树隔离**：Windows 将子进程绑定到 `KILL_ON_JOB_CLOSE` 的 Job Object，Unix 使用独立进程组；两条路径都支持内核级整树终止。
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use uuid::Uuid;
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -117,11 +119,8 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(2_000);
 const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
     "[output truncated: a background process is still writing]";
 
-/// 命令执行默认超时时间（120 秒）。
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// 命令执行最大允许超时时间（600 秒 / 10 分钟）。
-pub(crate) const MAX_TIMEOUT_MS: u64 = 600_000;
-pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Commands time out after 120 seconds by default; provide timeout_ms to override.";
+/// 命令执行超时仅在显式提供 `timeout_ms`（正整数毫秒）时生效；未提供时不主动超时。
+pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Provide timeout_ms to bound execution; without it a command runs until completion or interruption.";
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -131,8 +130,7 @@ pub(crate) fn parameters() -> Value {
             "timeout_ms": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 600000,
-                "description": "Timeout in milliseconds (optional, defaults to 120000)"
+                "description": "Timeout in milliseconds (optional; omit to run without a timeout)"
             },
         },
         "required": ["command"],
@@ -145,7 +143,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
-        supports_parallel: false,
         execute,
     }
 }
@@ -160,29 +157,16 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return error_result("missing required parameter \"command\"");
     };
-    // 只有字段缺失才使用 DEFAULT_TIMEOUT_MS；字段存在但类型错误/越界
-    // 必须返回 typed argument error，不能静默回退默认值。
+    // 只有字段缺失才表示不主动超时；字段存在但类型错误/非正数必须返回
+    // typed argument error，不能静默回退。
     let timeout = match args.get("timeout_ms") {
-        None => DEFAULT_TIMEOUT_MS,
+        None => None,
         Some(Value::Number(number)) => match number.as_u64() {
-            Some(timeout) => timeout,
-            None => {
-                return error_result(format!(
-                    "invalid timeout_ms: must be an integer between 1 and {MAX_TIMEOUT_MS}"
-                ));
-            }
+            Some(timeout) if timeout > 0 => Some(timeout),
+            _ => return error_result("invalid timeout_ms: must be a positive integer"),
         },
-        Some(_) => {
-            return error_result(format!(
-                "invalid timeout_ms: must be an integer between 1 and {MAX_TIMEOUT_MS}"
-            ));
-        }
+        Some(_) => return error_result("invalid timeout_ms: must be a positive integer"),
     };
-    if timeout == 0 || timeout > MAX_TIMEOUT_MS {
-        return error_result(format!(
-            "invalid timeout_ms: must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
-        ));
-    }
     let (shell, shell_args) = match shell_command(command) {
         Ok(command) => command,
         Err(error) => return error_result(error),
@@ -221,8 +205,11 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
     }
 
-    let mut state = CaptureState::default();
-    let deadline = Instant::now() + Duration::from_millis(timeout);
+    let mut state = CaptureState {
+        command_slug: command_slug(command),
+        ..CaptureState::default()
+    };
+    let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
     let exit_status;
     let mut outcome = BashOutcome::Completed;
@@ -248,9 +235,11 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             exit_status = wait_for_exit(&mut managed);
             break;
         }
-        if Instant::now() >= deadline {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
             managed.kill_tree();
-            outcome = BashOutcome::TimedOut(timeout);
+            outcome = BashOutcome::TimedOut(timeout.expect("deadline implies timeout"));
             exit_status = wait_for_exit(&mut managed);
             break;
         }
@@ -328,6 +317,15 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     if output_truncated_by_background {
         // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
         append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
+    }
+    // 截断实际发生（最终裁剪或内部窗口丢弃过字节）时，保证完整输出已落盘
+    // 并在结果尾部附路径；spill 创建失败时保持无路径的旧行为。
+    state.ensure_spill_for_final_truncation();
+    if let Some(spill_path) = state.spill_path() {
+        append_status(
+            &mut content,
+            &format!("Full output: {}", spill_path.display()),
+        );
     }
     if let Some(callback) = on_update.as_mut() {
         callback(&state.current_output());
@@ -683,8 +681,60 @@ fn find_bash_on_windows() -> Option<String> {
         .find(|candidate| Path::new(candidate).is_file())
 }
 
+/// 截断发生时保存完整输出的临时文件写入器。位于
+/// `<TEMP>/singularity-tool-output/<uuid>/<命令slug>.log`，不主动清理
+/// （生命周期交由 OS 临时目录策略负责）。
+struct SpillWriter {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+impl SpillWriter {
+    /// 以 `initial` 为完整初始内容创建 spill 文件。
+    fn create(slug: &str, initial: &str) -> io::Result<Self> {
+        let dir = std::env::temp_dir()
+            .join("singularity-tool-output")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{slug}.log"));
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(initial.as_bytes())?;
+        Ok(Self { path, file })
+    }
+
+    fn append(&mut self, text: &str) -> io::Result<()> {
+        self.file.write_all(text.as_bytes())
+    }
+}
+
+/// 把命令文本投影为文件名安全的 slug（ASCII 字母数字与 `-_.`，其余折叠为
+/// `-`，去除首尾 `-`，最长 40 字符）。
+fn command_slug(command: &str) -> String {
+    let mut slug: String = command
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.'
+            {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "command".to_string();
+    }
+    slug.truncate(40);
+    slug
+}
+
 /// 累计输出状态：尾部缓冲（上限 2×50KB）、行/字节计数。超出展示上限的输出
-/// 只保留尾部缓冲，其余在内存中截断。
+/// 只保留尾部缓冲；首次丢弃字节前创建 spill 文件保存完整输出，其后每个
+/// chunk 同步追加，保证截断时完整输出可从 spill 恢复。
 #[derive(Default)]
 struct CaptureState {
     tail: String,
@@ -692,6 +742,9 @@ struct CaptureState {
     completed_lines: usize,
     has_open_line: bool,
     current_line_bytes: usize,
+    spill: Option<SpillWriter>,
+    spill_failed: bool,
+    command_slug: String,
 }
 
 impl CaptureState {
@@ -701,6 +754,23 @@ impl CaptureState {
 
     fn is_truncated(&self) -> bool {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
+    }
+
+    /// spill 文件路径（已成功创建时）。
+    fn spill_path(&self) -> Option<&std::path::Path> {
+        self.spill.as_ref().map(|spill| spill.path.as_path())
+    }
+
+    /// 确保完整输出已在落盘通道中：成功一次后为 no-op，失败一次后不再重试。
+    /// 必须在尾部缓冲丢弃任何字节之前调用，写入的才是完整输出。
+    fn ensure_spill(&mut self, initial: &str) {
+        if self.spill.is_some() || self.spill_failed {
+            return;
+        }
+        match SpillWriter::create(&self.command_slug, initial) {
+            Ok(writer) => self.spill = Some(writer),
+            Err(_) => self.spill_failed = true,
+        }
     }
 
     /// 当前应展示给流式回调的输出（超限时为截断尾部）。
@@ -727,8 +797,23 @@ impl CaptureState {
                 self.has_open_line = true;
             }
         }
+        if let Some(spill) = self.spill.as_mut() {
+            let _ = spill.append(text);
+        }
         self.tail.push_str(text);
-        trim_to_last_bytes(&mut self.tail, INTERNAL_TAIL_MAX_BYTES);
+        if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
+            // 首次丢弃前保存完整窗口；此后完整输出只存在于 spill。
+            self.ensure_spill(&self.tail.clone());
+            trim_to_last_bytes(&mut self.tail, INTERNAL_TAIL_MAX_BYTES);
+        }
+    }
+
+    /// 截断已发生且 spill 尚未启用（最终裁剪型截断，尾部缓冲从未丢弃字节）
+    /// 时，把完整输出一次性写入 spill。
+    fn ensure_spill_for_final_truncation(&mut self) {
+        if self.is_truncated() {
+            self.ensure_spill(&self.tail.clone());
+        }
     }
 
     /// 生成最终的展示文本与截断说明信息。
@@ -867,10 +952,26 @@ mod tests {
     }
 
     #[test]
-    fn timeout_ms_upper_bound_is_accepted() {
-        let result = run("echo ok", Some(MAX_TIMEOUT_MS));
+    fn timeout_ms_large_values_are_accepted() {
+        let result = run("echo ok", Some(600_000_000));
         assert!(!result.is_error, "content: {}", result.content);
         assert!(result.content.contains("ok"));
+    }
+
+    #[test]
+    fn omitted_timeout_runs_to_completion() {
+        let started = Instant::now();
+        let result = run("sleep 2; echo late", None);
+        assert!(!result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("late"),
+            "content: {}",
+            result.content
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "command must not be killed by an implicit timeout"
+        );
     }
 
     #[test]
@@ -901,8 +1002,8 @@ mod tests {
     }
 
     #[test]
-    fn timeout_ms_above_upper_bound_is_rejected_before_spawn() {
-        let result = run("echo should-not-run", Some(MAX_TIMEOUT_MS + 1));
+    fn timeout_ms_zero_is_rejected_before_spawn() {
+        let result = run("echo should-not-run", Some(0));
         assert!(result.is_error, "content: {}", result.content);
         assert!(result.content.contains("invalid timeout_ms"));
     }
@@ -919,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn large_output_truncates_to_tail_in_memory() {
+    fn large_output_truncates_to_tail_and_spills_full_output() {
         let dir = tempdir().expect("temp dir");
         let content = (1..=2500)
             .map(|i| format!("line {i}"))
@@ -939,9 +1040,30 @@ mod tests {
             "tail starts at first kept line"
         );
         assert!(result.content.contains("[Showing lines"), "missing note");
+        // 截断发生时必须给出完整输出文件路径，且文件内容包含被截掉的头部。
+        let full_output_line = result
+            .content
+            .lines()
+            .find(|line| line.starts_with("Full output: "))
+            .expect("truncated output must carry a Full output path");
+        let spill_path = Path::new(full_output_line.trim_start_matches("Full output: "));
+        let spilled = std::fs::read_to_string(spill_path)
+            .unwrap_or_else(|error| panic!("read spill file {}: {error}", spill_path.display()));
+        for line in ["line 1", "line 2", "line 1250", "line 2500"] {
+            assert!(
+                spilled.lines().any(|candidate| candidate == line),
+                "spill file must contain {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn small_output_never_spills() {
+        let result = run("echo hello", None);
+        assert!(!result.is_error, "content: {}", result.content);
         assert!(
-            !result.content.to_ascii_lowercase().contains("full output"),
-            "truncation must stay in memory, content: {}",
+            !result.content.contains("Full output:"),
+            "untruncated output must not reference a spill file, content: {}",
             result.content
         );
     }

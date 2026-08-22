@@ -430,7 +430,7 @@ fn responses_private_replay_round_trips_exactly_through_jsonl() {
     let replay = ProviderReasoningReplay::Responses {
         provider_name: "provider".to_string(),
         model_name: "model".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec!["call_1".to_string()],
         items: vec![
             json!({

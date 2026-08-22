@@ -65,7 +65,8 @@ pub fn openai_responses_request_payload(
         );
         if supports_tool_choice {
             payload["tool_choice"] = openai_responses_tool_choice_payload();
-            payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+            // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
+            payload["parallel_tool_calls"] = json!(false);
         }
     }
     if reasoning_enabled {
@@ -259,7 +260,9 @@ pub fn parse_openai_responses_response(
         vec![ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            reasoning_effort: reasoning_effort.unwrap_or("off").to_string(),
+            // 绑定请求时实际 selection 的 reasoning 变体；provider 不回显
+            // effort 时保持 None，不伪造禁用变体。
+            reasoning_effort: reasoning_effort.map(str::to_string),
             tool_call_ids,
             items: replay_items,
         }]

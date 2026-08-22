@@ -445,11 +445,6 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     assert!(
         !default_config
             .protocol_contract()
-            .supports_parallel_tool_calls
-    );
-    assert!(
-        !default_config
-            .protocol_contract()
             .supports_strict_tool_schema
     );
 
@@ -465,7 +460,6 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let capabilities = configured.protocol_contract();
     assert_eq!(capabilities.max_context_tokens, Some(131_072));
     assert_eq!(capabilities.max_output_tokens, 8_192);
-    assert!(!capabilities.supports_parallel_tool_calls);
     assert!(!capabilities.supports_strict_tool_schema);
 
     let provider = test_provider(configured).expect("provider");
@@ -511,7 +505,6 @@ fn removed_tool_capability_envs_are_not_read_or_parsed() {
     })
     .expect("provider configuration");
 
-    assert!(!config.protocol_contract().supports_parallel_tool_calls);
     assert!(!config.protocol_contract().supports_strict_tool_schema);
 }
 
@@ -559,7 +552,7 @@ fn model_request_validation_rejects_output_above_provider_capability() {
 }
 
 #[test]
-fn model_request_validation_rejects_parallel_tool_calls_when_provider_does_not_support_them() {
+fn model_request_validation_accepts_multiple_tool_calls_per_message() {
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -576,10 +569,8 @@ fn model_request_validation_rejects_parallel_tool_calls_when_provider_does_not_s
         Some(&ProviderProtocolContract::default()),
     );
 
-    assert_eq!(
-        result.errors,
-        vec!["provider_does_not_support_parallel_tool_calls"]
-    );
+    assert!(result.valid);
+    assert!(result.errors.is_empty());
 }
 
 #[test]
@@ -845,7 +836,7 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
         provider_name: "deep".to_string(),
         model_name: "chat".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec![call.tool_call_id.clone()],
         reasoning_content: "opaque-deepseek-state".to_string(),
     }];
@@ -1326,7 +1317,7 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Responses {
         provider_name: "longcat".to_string(),
         model_name: "responses".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec![call.tool_call_id.clone()],
         items: vec![
             serde_json::json!({

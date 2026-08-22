@@ -890,7 +890,8 @@ fn auth_file_replaces_atomically_as_the_single_credential_file() {
         })
         .to_string()
     };
-    write_json_file(&auth_path, &credentials("test-primary-key"), true).expect("write private auth file");
+    write_json_file(&auth_path, &credentials("test-primary-key"), true)
+        .expect("write private auth file");
     let data = read_user_config_data_from_directory(directory.path().to_path_buf())
         .expect("read user config")
         .expect("user config present");

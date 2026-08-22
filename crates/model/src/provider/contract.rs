@@ -44,14 +44,11 @@ pub enum ThinkingWireFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
-    pub supports_parallel_tool_calls: bool,
     pub supports_strict_tool_schema: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub max_tools_per_request: u32,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
-    /// 单次请求与本地工具工作窗口的最大并行调用数。
-    pub max_parallel_tool_calls: u32,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -60,13 +57,11 @@ impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
-            supports_parallel_tool_calls: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_system_message: true,
             supports_developer_message: true,
-            max_parallel_tool_calls: 1,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
@@ -162,9 +157,7 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
         && validation.errors.iter().all(|error| {
             matches!(
                 error.as_str(),
-                "provider_does_not_support_tools"
-                    | "provider_does_not_support_strict_tool_schema"
-                    | "provider_does_not_support_parallel_tool_calls"
+                "provider_does_not_support_tools" | "provider_does_not_support_strict_tool_schema"
             )
         })
 }
@@ -261,12 +254,6 @@ pub fn validate_model_request_with_capabilities(
             && requested_output_tokens > capabilities.max_output_tokens
         {
             errors.push("requested_output_tokens_exceed_provider_limit".to_string());
-        }
-        if !request.tools.is_empty()
-            && request.tool_choice.max_tool_calls > 1
-            && !capabilities.supports_parallel_tool_calls
-        {
-            errors.push("provider_does_not_support_parallel_tool_calls".to_string());
         }
         if request.tools.len() > capabilities.max_tools_per_request as usize {
             errors.push("requested_tools_exceed_provider_limit".to_string());
@@ -441,18 +428,16 @@ fn validate_model_response_with_protocol_context(
     }
 
     if tool_calls.len() > tool_choice.max_tool_calls as usize {
-        // 响应超限降级为 warning：请求的并行上限在部分协议（如 Responses API）
-        // 无法表达；Agent loop 会按 provider 声明的上限分窗口执行全部工具调用，
+        // 响应超限降级为 warning：请求上限表达的是单条 assistant 消息允许的
+        // 工具调用数上限；Agent loop 会按模型给定顺序串行执行全部工具调用，
         // 作为致命校验会杀死本可正常完成的 turn。
         warnings.push("max_tool_calls_exceeded".to_string());
     }
-    if let Some(capabilities) = capabilities {
-        if !tool_calls.is_empty() && !capabilities.supports_tools {
-            errors.push("provider_does_not_support_tools".to_string());
-        }
-        if tool_calls.len() > 1 && !capabilities.supports_parallel_tool_calls {
-            errors.push("provider_does_not_support_parallel_tool_calls".to_string());
-        }
+    if let Some(capabilities) = capabilities
+        && !tool_calls.is_empty()
+        && !capabilities.supports_tools
+    {
+        errors.push("provider_does_not_support_tools".to_string());
     }
 
     let mut seen = HashSet::new();

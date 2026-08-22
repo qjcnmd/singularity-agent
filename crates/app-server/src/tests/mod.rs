@@ -540,7 +540,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
             provider_reasoning_replay: Some(ProviderReasoningReplay::Responses {
                 provider_name: "private-provider".to_string(),
                 model_name: "private-model".to_string(),
-                reasoning_effort: "high".to_string(),
+                reasoning_effort: Some("high".to_string()),
                 tool_call_ids: vec!["call-1".to_string()],
                 items: vec![
                     json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque-secret"}),

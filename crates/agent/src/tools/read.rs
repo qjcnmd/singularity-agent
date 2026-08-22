@@ -31,7 +31,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
-        supports_parallel: true,
         execute,
     }
 }

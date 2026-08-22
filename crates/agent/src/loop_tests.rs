@@ -112,24 +112,8 @@ fn custom_spec(
 ) -> ToolSpec {
     ToolSpec {
         name,
-        description: "parallelism test tool",
+        description: "custom test tool",
         parameters,
-        supports_parallel: true,
-        execute,
-    }
-}
-
-/// 顺序测试工具按名称构造，标记为 sequential（supports_parallel=false）。
-fn sequential_spec(
-    name: &'static str,
-    execute: for<'a> fn(ExecuteContext<'a>) -> std::result::Result<ToolExecution, ToolError>,
-    parameters: Value,
-) -> ToolSpec {
-    ToolSpec {
-        name,
-        description: "sequential test tool",
-        parameters,
-        supports_parallel: false,
         execute,
     }
 }
@@ -390,13 +374,11 @@ impl Provider for CompactionFailureProvider {
 fn fake_contract() -> ProviderProtocolContract {
     ProviderProtocolContract {
         supports_tools: true,
-        supports_parallel_tool_calls: true,
         supports_strict_tool_schema: false,
         tool_reasoning_mode: singularity_model::ProviderToolReasoningMode::Unspecified,
         max_tools_per_request: 8,
         supports_system_message: false,
         supports_developer_message: true,
-        max_parallel_tool_calls: 1,
         max_context_tokens: Some(128_000),
         max_output_tokens: 4_096,
     }
@@ -1409,7 +1391,7 @@ fn tool_lifecycle_callbacks_carry_pi_fields() {
 }
 
 #[test]
-fn parallel_tool_batch_overlaps_and_preserves_source_order() {
+fn serial_tool_batch_executes_all_calls_in_source_order() {
     let _guard = PARALLEL_TEST_LOCK.lock().unwrap();
     PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
     PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
@@ -1421,10 +1403,8 @@ fn parallel_tool_batch_overlaps_and_preserves_source_order() {
         counted_delay_execute,
         delay_parameters(),
     ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
@@ -1471,12 +1451,14 @@ fn parallel_tool_batch_overlaps_and_preserves_source_order() {
     };
     events.on_event = Some(on_event);
     let outcome = agent
-        .run("parallel", &mut events, &CancellationToken::new())
+        .run("serial", &mut events, &CancellationToken::new())
         .unwrap();
     assert_eq!(outcome.final_text, "done");
-    assert!(
-        PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst) >= 2,
-        "parallel tools did not overlap"
+    // 工具批次按模型给定顺序串行执行，任意时刻至多一个工具在执行。
+    assert_eq!(
+        PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst),
+        1,
+        "tool batch must execute serially"
     );
     assert_eq!(
         starts
@@ -1512,7 +1494,7 @@ fn parallel_tool_batch_overlaps_and_preserves_source_order() {
 }
 
 #[test]
-fn parallel_tool_batch_respects_provider_concurrency_limit() {
+fn five_consecutive_tool_calls_execute_serially_in_one_turn() {
     let _guard = PARALLEL_TEST_LOCK.lock().unwrap();
     PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
     PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
@@ -1524,17 +1506,15 @@ fn parallel_tool_batch_respects_provider_concurrency_limit() {
         counted_delay_execute,
         delay_parameters(),
     ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 2;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
                 tool_calls: (b'a'..=b'e')
                     .map(|suffix| {
                         let id = format!("call_{}", suffix as char);
-                        tool_call(&id, "overlap", json!({ "id": id, "delay_ms": 40 }))
+                        tool_call(&id, "overlap", json!({ "id": id }))
                     })
                     .collect(),
                 usage: usage(50, 10),
@@ -1546,39 +1526,52 @@ fn parallel_tool_batch_respects_provider_concurrency_limit() {
             },
         ],
     ));
-    let mut agent = Agent::new(provider, registry, AgentConfig::default(), session).unwrap();
+    let mut agent =
+        Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
     let outcome = agent
         .run(
-            "bounded parallel",
+            "five reads",
             &mut AgentEvents::new(),
             &CancellationToken::new(),
         )
         .unwrap();
     assert_eq!(outcome.final_text, "done");
+    // 单轮 5 个连续调用全部串行完成，结果按模型给定顺序落盘。
     assert_eq!(
         PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst),
-        2,
-        "parallel worker count must honor provider max_parallel_tool_calls"
+        1,
+        "five consecutive calls must never overlap"
     );
+    let requests = provider.requests.lock().unwrap();
+    let tool_results = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Tool)
+        .map(|message| {
+            (
+                message.tool_call_id.clone().unwrap(),
+                message.content.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_results
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_a", "call_b", "call_c", "call_d", "call_e"]
+    );
+    assert!(tool_results.iter().all(|(_, content)| !content.is_empty()));
 }
 
 #[test]
-fn preflight_rejection_does_not_consume_parallel_worker_slot() {
-    let _guard = PARALLEL_TEST_LOCK.lock().unwrap();
-    PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
-    PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
+fn preflight_rejection_still_runs_remaining_calls() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let mut registry = ToolRegistry::new();
-    registry.register(custom_spec(
-        "overlap",
-        counted_delay_execute,
-        delay_parameters(),
-    ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 2;
+    registry.register(custom_spec("overlap", delay_execute, delay_parameters()));
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
@@ -1596,7 +1589,8 @@ fn preflight_rejection_does_not_consume_parallel_worker_slot() {
             },
         ],
     ));
-    let mut agent = Agent::new(provider, registry, AgentConfig::default(), session).unwrap();
+    let mut agent =
+        Agent::new(provider.clone(), registry, AgentConfig::default(), session).unwrap();
     let outcome = agent
         .run(
             "preflight rejection",
@@ -1605,15 +1599,28 @@ fn preflight_rejection_does_not_consume_parallel_worker_slot() {
         )
         .unwrap();
     assert_eq!(outcome.final_text, "done");
-    assert_eq!(
-        PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst),
-        2,
-        "preflight rejection must not reduce the executable worker window"
-    );
+    let requests = provider.requests.lock().unwrap();
+    let results = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Tool)
+        .map(|message| {
+            (
+                message.tool_call_id.clone().unwrap(),
+                message.content.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // 未知工具的 preflight 拒绝以模型可见失败落盘，不影响其余调用继续执行。
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].0, "rejected");
+    assert!(results[0].1.contains("unknown tool"));
+    assert_eq!(results[1], ("call_a".to_string(), "a".to_string()));
+    assert_eq!(results[2], ("call_b".to_string(), "b".to_string()));
 }
 
 #[test]
-fn tool_failure_does_not_drop_other_parallel_results() {
+fn tool_failure_does_not_drop_other_results() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let mut registry = ToolRegistry::new();
@@ -1628,10 +1635,8 @@ fn tool_failure_does_not_drop_other_parallel_results() {
         }),
     ));
     registry.register(custom_spec("delay", delay_execute, delay_parameters()));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
@@ -1676,7 +1681,7 @@ fn tool_failure_does_not_drop_other_parallel_results() {
 }
 
 #[test]
-fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
+fn cancellation_persists_all_batched_tool_results() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let mut registry = ToolRegistry::new();
@@ -1690,10 +1695,8 @@ fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
             "additionalProperties": false
         }),
     ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![FakeStep {
             text: String::new(),
             tool_calls: vec![
@@ -1731,16 +1734,13 @@ fn cancellation_waits_for_all_parallel_tools_and_persists_results() {
 }
 
 #[test]
-fn batch_with_sequential_tool_runs_serially_and_preserves_both_edits() {
-    // edit 会被声明为 sequential；即使 provider 允许并行（max_parallel_tool_calls=8），
-    // 含 edit 的整批也按模型原始顺序串行执行，两次编辑都成功且互不覆盖。
+fn multi_edit_batch_applies_both_edits_in_source_order() {
+    // 同一批内的两次编辑按模型给定顺序串行应用，互不覆盖。
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("shared.txt"), "a\nb").unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
@@ -1794,16 +1794,13 @@ fn batch_with_sequential_tool_runs_serially_and_preserves_both_edits() {
 }
 
 #[test]
-fn bash_and_edit_in_same_batch_run_serially_and_apply_both() {
-    // bash 与 edit 都声明为 sequential：即使 provider 声明可并行（max=8），
-    // 含任一个 sequential 工具的整批也必须串行运行，且结果按模型原始顺序落盘。
+fn bash_and_edit_in_same_batch_apply_both() {
+    // bash 与 edit 在同一批内按模型给定顺序串行执行，结果按原始顺序落盘。
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("target.txt"), "before").unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
     let provider = Arc::new(FakeProvider::new(
-        contract,
+        fake_contract(),
         vec![
             FakeStep {
                 text: String::new(),
@@ -1864,56 +1861,6 @@ fn bash_and_edit_in_same_batch_run_serially_and_apply_both() {
     assert!(tool_results[0].1.contains("serial-hi"));
     assert_eq!(tool_results[1].0, "edit_call");
     assert!(tool_results[1].1.contains("Successfully replaced"));
-}
-
-#[test]
-fn batch_with_sequential_tools_never_overlaps() {
-    let _guard = PARALLEL_TEST_LOCK.lock().unwrap();
-    PARALLEL_ACTIVE.store(0, Ordering::SeqCst);
-    PARALLEL_MAX_ACTIVE.store(0, Ordering::SeqCst);
-    let dir = tempfile::tempdir().unwrap();
-    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let mut registry = ToolRegistry::new();
-    registry.register(sequential_spec(
-        "seq_delay",
-        counted_delay_execute,
-        delay_parameters(),
-    ));
-    let mut contract = fake_contract();
-    contract.max_parallel_tool_calls = 8;
-    let provider = Arc::new(FakeProvider::new(
-        contract,
-        vec![
-            FakeStep {
-                text: String::new(),
-                tool_calls: vec![
-                    tool_call("call_a", "seq_delay", json!({ "id": "a" })),
-                    tool_call("call_b", "seq_delay", json!({ "id": "b" })),
-                    tool_call("call_c", "seq_delay", json!({ "id": "c" })),
-                ],
-                usage: usage(50, 10),
-            },
-            FakeStep {
-                text: "done".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(100, 20),
-            },
-        ],
-    ));
-    let mut agent = Agent::new(provider, registry, AgentConfig::default(), session).unwrap();
-    let outcome = agent
-        .run(
-            "sequential batch",
-            &mut AgentEvents::new(),
-            &CancellationToken::new(),
-        )
-        .unwrap();
-    assert_eq!(outcome.final_text, "done");
-    assert_eq!(
-        PARALLEL_MAX_ACTIVE.load(Ordering::SeqCst),
-        1,
-        "a batch containing a sequential tool must never overlap"
-    );
 }
 
 /// 3. steer 注入：运行前队列注入 → 会话上下文持久化 → 后续轮次上下文中出现。
@@ -2723,7 +2670,7 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
     let replay = ProviderReasoningReplay::Responses {
         provider_name: "provider".to_string(),
         model_name: "model".to_string(),
-        reasoning_effort: "high".to_string(),
+        reasoning_effort: Some("high".to_string()),
         tool_call_ids: vec!["call_1".to_string()],
         items: vec![
             json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}),
@@ -2797,6 +2744,125 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
     assert!(
         incompatible
             .reasoning_replays_from_entries(&incompatible_entries)
+            .is_empty()
+    );
+}
+
+/// 无 `#variant` 选择器（provider/model 两段齐全）下，durable assistant entry
+/// 携带的 Chat replay（绑定无变体）必须在下一轮请求中存活，不再被静默丢弃；
+/// 变体侧双侧不一致（选择器带 #high、replay 绑定 None）时仍被拒绝。
+#[test]
+fn chat_replay_without_variant_selector_reaches_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut contract = fake_contract();
+    contract.tool_reasoning_mode = ProviderToolReasoningMode::ReplayReasoningContent;
+    let provider = Arc::new(FakeProvider::new(
+        contract,
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![tool_call("call_9", "bash", json!({ "command": "echo hi" }))],
+                usage: usage(50, 10),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(100, 20),
+            },
+        ],
+    ));
+    let replay = ProviderReasoningReplay::Chat {
+        provider_name: "fake".to_string(),
+        model_name: "fake-model".to_string(),
+        reasoning_effort: None,
+        tool_call_ids: vec!["call_1".to_string(), "call_2".to_string()],
+        reasoning_content: "opaque chain of thought".to_string(),
+    };
+    let mut session =
+        SessionManager::create(&dir.path().join("project"), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage {
+            role: AgentMessageRole::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "opaque chain of thought".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    args: json!({"path": "out.txt", "content": "x"}),
+                },
+                ContentBlock::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "read".to_string(),
+                    args: json!({"path": "out.txt"}),
+                },
+            ],
+            provider_reasoning_replay: Some(replay.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+            timestamp: None,
+        })
+        .unwrap();
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            model: "fake/fake-model".to_string(),
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let outcome = agent
+        .run("resume", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.final_text, "done");
+    let requests = provider.requests.lock().unwrap();
+    // 下一轮请求必须携带 replay：tool_call_ids 覆盖 durable entry 的调用序列。
+    assert_eq!(
+        requests[0].provider_reasoning_history,
+        vec![replay.clone()],
+        "replay must survive a variant-less selector"
+    );
+
+    // 变体不一致：选择器带 #high 而 replay 绑定 None → 丢弃。
+    let mut mismatch_session = SessionManager::create(
+        &dir.path().join("mismatch-project"),
+        &dir.path().join("mismatch-sessions"),
+    )
+    .unwrap();
+    mismatch_session
+        .append_message(AgentMessage {
+            role: AgentMessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                id: "call_1".to_string(),
+                name: "write".to_string(),
+                args: json!({"path": "out.txt", "content": "x"}),
+            }],
+            provider_reasoning_replay: Some(replay),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+            timestamp: None,
+        })
+        .unwrap();
+    let mismatch = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            model: "fake/fake-model#high".to_string(),
+            ..AgentConfig::default()
+        },
+        mismatch_session,
+    )
+    .unwrap();
+    let mismatch_entries = mismatch.session.build_context_entries().unwrap();
+    assert!(
+        mismatch
+            .reasoning_replays_from_entries(&mismatch_entries)
             .is_empty()
     );
 }

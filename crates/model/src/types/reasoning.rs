@@ -27,14 +27,16 @@ pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
-        reasoning_effort: String,
+        /// 绑定构造 replay 时请求侧实际选定的 reasoning 变体；无变体选择的
+        /// 模型为 `None`。仅作绑定标识，不发送到 wire。
+        reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         reasoning_content: String,
     },
     Responses {
         provider_name: String,
         model_name: String,
-        reasoning_effort: String,
+        reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         /// The complete provider output sequence is retained verbatim.  The
         /// adapter only appends later `function_call_output` items.
@@ -84,7 +86,7 @@ impl ProviderReasoningReplay {
                 tool_call_ids,
                 reasoning_content,
             } => {
-                validate_replay_binding(provider_name, model_name, reasoning_effort)?;
+                validate_replay_binding(provider_name, model_name, reasoning_effort.as_deref())?;
                 validate_replay_tool_call_ids(tool_call_ids)?;
                 if reasoning_content.is_empty() {
                     return Err("provider reasoning replay content is empty");
@@ -97,7 +99,7 @@ impl ProviderReasoningReplay {
                 tool_call_ids,
                 items,
             } => {
-                validate_replay_binding(provider_name, model_name, reasoning_effort)?;
+                validate_replay_binding(provider_name, model_name, reasoning_effort.as_deref())?;
                 validate_replay_tool_call_ids(tool_call_ids)?;
                 validate_responses_replay_items(items, tool_call_ids)?;
             }
@@ -116,26 +118,27 @@ impl ProviderReasoningReplay {
         &self,
         provider_name: &str,
         model_name: &str,
-        reasoning_effort: &str,
+        reasoning_variant: Option<&str>,
         mode: ProviderToolReasoningMode,
     ) -> bool {
-        self.validate_for(provider_name, model_name, reasoning_effort, mode)
+        self.validate_for(provider_name, model_name, reasoning_variant, mode)
             .is_ok()
     }
 
     /// Validate the replay against one selected provider/model/variant and mode.
+    /// 变体比较为 Option 语义：双侧同为空或 `Some` 相等即过。
     pub(crate) fn validate_for(
         &self,
         provider_name: &str,
         model_name: &str,
-        reasoning_effort: &str,
+        reasoning_variant: Option<&str>,
         mode: ProviderToolReasoningMode,
     ) -> Result<(), &'static str> {
         self.validate()?;
         let (replay_provider, replay_model, replay_variant) = self.binding_internal();
         if replay_provider != provider_name
             || replay_model != model_name
-            || replay_variant != reasoning_effort
+            || replay_variant != reasoning_variant
             || self.mode_internal() != mode
         {
             return Err("provider reasoning replay binding does not match selected model");
@@ -143,7 +146,7 @@ impl ProviderReasoningReplay {
         Ok(())
     }
 
-    fn binding_internal(&self) -> (&str, &str, &str) {
+    fn binding_internal(&self) -> (&str, &str, Option<&str>) {
         match self {
             Self::Chat {
                 provider_name,
@@ -156,7 +159,7 @@ impl ProviderReasoningReplay {
                 model_name,
                 reasoning_effort,
                 ..
-            } => (provider_name, model_name, reasoning_effort),
+            } => (provider_name, model_name, reasoning_effort.as_deref()),
         }
     }
 
@@ -213,9 +216,9 @@ impl ProviderReasoningReplay {
 fn validate_replay_binding(
     provider_name: &str,
     model_name: &str,
-    reasoning_effort: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<(), &'static str> {
-    for value in [provider_name, model_name, reasoning_effort] {
+    for value in [provider_name, model_name] {
         if value.is_empty()
             || value
                 .chars()
@@ -224,8 +227,19 @@ fn validate_replay_binding(
             return Err("provider reasoning replay binding is malformed");
         }
     }
-    if reasoning_effort == "off" {
-        return Err("provider reasoning replay cannot use disabled variant");
+    // 无变体选择的模型绑定 `None` 是合法的；有变体时 `"off"` 是真正的禁用
+    // 变体，不能作为 replay 绑定存活。
+    if let Some(effort) = reasoning_effort {
+        if effort.is_empty()
+            || effort
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err("provider reasoning replay binding is malformed");
+        }
+        if effort == "off" {
+            return Err("provider reasoning replay cannot use disabled variant");
+        }
     }
     Ok(())
 }

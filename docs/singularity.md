@@ -12,7 +12,7 @@
   - `AgentLoop`（核心执行循环）：双层循环状态机，持有单一原子 `TurnInbox`、输入/终态事实聚合与诊断事件派发；
   - `session` 子系统：按职责划分为 `format`（严格 JSONL v1 格式与 schema 校验）、`file`（有界文件 I/O 与 JSONL 尾部解析）、`manager`（单写者生命周期与追加）、`context`（上下文条目与 LLM 投影）、`repair`（中断与孤立 tool call 修复）、`repository`（会话定位）；公开 API 由 `session/mod.rs` 保持稳定；
   - `Compaction`：上下文自动压缩引擎，以 `thresholdRatio` 与 `retainRatio` 控制切点；判定在每轮响应后基于 Provider 实测 usage（首轮/无 usage 时用装配成品估算兜底），聚合每次摘要調用的 Provider usage；
-  - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，并声明各工具执行模式（read=parallel，bash/edit/write=sequential）；
+  - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，多工具调用批按模型给定顺序串行执行；
   - 消息与事件流：`AgentEvents` 提供类型化、非裁决性的 Provider attempt 与诊断观察回调；
   - 资源加载：`AGENTS.md` root→cwd 逐层加载与角色适配；
   - `singularity_model`：按职责划分为 `types`（消息/工具/请求/响应/usage/reasoning）、`error`、`provider`（contract/runtime/telemetry）、`openai`（wire/chat/responses 适配）、`transport`（HTTP/retry/stream 解码）、`discovery` 以及整层原子选择的 `config`。
@@ -103,7 +103,7 @@ sequenceDiagram
 ## 3. AgentLoop 循环（图 c）
 
 双层循环状态机结构，内嵌单一原子 `TurnInbox`。内层每轮迭代：检查取消 → 从 `TurnInbox` 取出并清空 steer 消息注入上下文 → 单次装配本轮请求上下文（消息 + reasoning replay + 预算估算同一成品上完成）→ 模型调用（流式 assistant 消息）→ 根据 typed `stopReason`（`Stop` / `Length`）分支处理，并在响应后按实测 usage 判定压缩（见第 6 节）：
-- 成功且含工具调用：按 source order 完成参数校验，按执行模式调度（批内含任一 sequential 工具则整批按模型原始顺序串行；全 parallel 则按 provider 并发上限分批并行），durable ToolResult 始终按 assistant source order 写入并回传；
+- 成功且含工具调用：按 source order 完成参数校验，多工具调用批按模型给定顺序串行执行全部调用（单个失败不影响其余），durable ToolResult 始终按 assistant source order 写入并回传；
 - 成功无工具调用：持久化终态 assistant 消息；
 - `stopReason=length` 截断：若为纯文本，持久化 partial text 与已知 usage 并形成正常终态；若截断响应包含 tool calls，**零执行任何工具调用**，为已解析调用写入模型可见的 synthetic failed ToolResult（`model output was truncated before the tool call completed`），交由下一模型轮次处理；
 - 显式上下文溢出（`ContextLengthExceeded`）：以 `CompactionReason::ContextOverflow` 强制压缩一次并同轮重试；二次失败原样返回；
@@ -124,7 +124,7 @@ flowchart TD
     D --> E["模型调用<br/>(Chat SSE / Responses)"]
     E --> F{"response.status & stopReason"}
     F -- "Success + Stop + toolCalls" --> G["source-order 参数校验"]
-    G --> G3["按执行模式调度<br/>(含 sequential 工具 → 整批串行)"]
+    G --> G3["按模型给定顺序串行执行<br/>(单个失败不影响其余)"]
     G3 --> H["toolResult 按 assistant source order 回传"]
     H --> B
     F -- "Success + Stop (无 toolCalls)" --> I["终态 assistant 落盘"]
@@ -143,7 +143,7 @@ flowchart TD
 
 ## 4. 工具执行链（图 d）
 
-模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验 → 按执行模式调度：批内全部为 parallel 工具时按 provider 并发上限分批并发执行，批内含任一 sequential 工具（bash/edit/write）时整批按模型原始顺序串行 → 进程内工具继承宿主权限执行 → 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
+模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验 → 按模型给定顺序串行执行全部调用（无并行 worker）→ 进程内工具继承宿主权限执行 → 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
 
 **工具面**：`ToolRegistry::new()` 只注册 `read`、`bash`、`edit`、`write` 4 个固定内建工具；无未注册工具，无动态工具开关、MCP 或扩展。工具 schema 见第 12.2 节。
 
@@ -151,14 +151,14 @@ flowchart TD
 
 - **read**：收集满 `limit`（缺省 2000 行）即停止，不再扫描至 EOF 统计全文行数；保留单行 ≤ 4 MiB 与返回输出 ≤ 2000 行 / 50 KiB 限制；截断提示给出 `File continues; use offset=Z to continue.`；支持基于 1-indexed 行号的 `offset` 续读，不产生磁盘临时文件。
 - **edit**：输入文件与 projected replacement 均实施 20 MiB 硬上限预检；无 `\r` 文件走零映射恒等快路径，含 `\r` 时仅对命中区做局部边界换算，不再构建全量映射表；仅在 normalized view 下查找唯一匹配并映射回原始 byte offsets，未修改的前缀与后缀字节 100% 原样保留；替换行尾风格优先沿用被替换区域、邻近上下文或文件多数派，平票回退 LF；patch 展示为仅围绕命中区的局部上下文 diff；保持直接 in-place 写入。
-- **write**：直接 in-place 写入；声明为 sequential，含 write 的批按模型原始顺序串行。
+- **write**：直接 in-place 写入。
 - **bash**：
-  - 缺省 `timeout_ms` 为 120000 ms，显式范围 `1..=600000` ms；
+  - `timeout_ms` 仅在显式提供时生效（正整数毫秒），到点杀整棵子进程树并报 timed out；未提供时不主动超时，interrupt/停机杀树路径不变；
   - stdout 与 stderr 分别持有独立的增量 UTF-8 carry buffer，跨 chunk 保留未完成 code point，仅在各自真实 EOF 时替换最终残缺字节；
-  - 输出仅保留内存尾部窗口：预览保留最后 2000 行 / 50 KiB，内部窗口上限为其两倍（100 KiB），超出窗口的更早输出即弃并在结果中标记截断；不写任何磁盘临时/spill 文件；
+  - 输出仅保留内存尾部窗口：预览保留最后 2000 行 / 50 KiB，内部窗口上限为其两倍（100 KiB）；截断实际发生（最终裁剪或内部窗口丢弃过字节）时，完整输出写入 `<TEMP>/singularity-tool-output/<uuid>/<命令slug>.log` 并在结果尾部附 `Full output: <绝对路径>` 行，spill 文件不主动清理（生命周期由 OS 临时目录策略负责）；spill 创建失败时保持无路径行为；
   - 输出读取线程有界停机：主子进程退出后最长 2s 排空宽限，超时（后台进程仍持管道写端）即截断并附信息标记 `[output truncated: a background process is still writing]`，线程必收敛；后台进程不受影响；
   - 进程树终止（D-004）：Windows 经 `JobObject` 封装模块以 `KILL_ON_JOB_CLOSE` 创建作业，子进程创建后立即绑定，其后代进程全部纳入作业范围；取消时整树 `TerminateJobObject`，句柄关闭兜底终止仍在运行的子孙进程；Unix 使用独立进程组发送 SIGKILL。
-- **执行模式 contract**：每个 ToolSpec 声明 `supports_parallel`（read=true；bash/edit/write=false）。批内含任一 sequential 工具时整批按模型原始顺序串行执行；全部为 parallel 时按 provider 并发上限分批并发。默认契约 `max_parallel_tool_calls=1` 行为不变。
+- **执行顺序**：多工具调用批始终按模型给定顺序串行执行；`parallel_tool_calls` wire 参数恒发送 `false`（诚实信号：本地执行是串行的）。单条 assistant 消息允许的工具调用数上限为 `DEFAULT_MAX_TOOLS_PER_REQUEST`（8）。
 
 ```mermaid
 flowchart TD
@@ -167,9 +167,9 @@ flowchart TD
     C -- 否 --> R1["registry error → loop 写失败 toolResult<br/>(不执行, 不猜测不改写)"]
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
-    D -- "合法" --> F1["按执行模式调度<br/>含 sequential 工具 → 整批串行<br/>全 parallel → 按上限并发"]
+    D -- "合法" --> F1["按模型给定顺序串行执行"]
     F1 --> F["进程内执行<br/>bash: Job Object 树杀 / 增量 UTF-8 / 内存尾部窗口 / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>cwd 绑定工作区"]
-    F --> G["write/edit: sequential 串行同批<br/>edit 实施 20 MiB 门限与未触及字节保留"]
+    F --> G["write/edit: in-place 写入<br/>edit 实施 20 MiB 门限与未触及字节保留"]
     G --> H["输出截断与回传<br/>ToolExecution {content, is_error}<br/>assistant source order 写入"]
 ```
 
@@ -324,9 +324,9 @@ sequenceDiagram
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
 | read | `{path, offset?, limit?}` | 文本文件有界读取；单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB；收集满 limit（缺省 2000 行）即停，超限提示 `File continues; use offset=Z to continue.`，不写临时文件；offset 1-indexed，limit 上限 2000 |
-| bash | `{command, timeout_ms?}` | 缺省 `timeout_ms` 120000；显式 integer `1..=600000`；预览保留最后 2000 行 / 50 KiB，完整输出仅保留内存尾部窗口（100 KiB，超出标记截断）；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object（KILL_ON_JOB_CLOSE + 子进程创建后立即绑定）/ Unix 进程组终止整树 |
+| bash | `{command, timeout_ms?}` | `timeout_ms` 显式提供时生效（正整数毫秒），未提供时不主动超时；预览保留最后 2000 行 / 50 KiB，完整输出保留内存尾部窗口（100 KiB），截断发生时完整输出写 `<TEMP>/singularity-tool-output/<uuid>/<slug>.log` 并附 `Full output:` 路径行；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object（KILL_ON_JOB_CLOSE + 子进程创建后立即绑定）/ Unix 进程组终止整树 |
 | edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；20 MiB 大小上限；无 `\r` 零映射恒等、含 `\r` 仅命中区局部换算；未触及字节原样保留；保持行尾风格；返回局部 diff / firstChangedLine；in-place 写入 |
-| write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入；sequential 工具，所在批按模型原始顺序串行 |
+| write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入 |
 
 ### 12.3 会话落盘细节
 
