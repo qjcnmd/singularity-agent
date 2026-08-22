@@ -1491,6 +1491,40 @@ fn cli_reports_interrupted_app_server_process() {
     assert_app_server_unavailable_error(&output);
 }
 
+// 验证 thread/start 被拒绝时 JSON 模式仍输出失败终态汇总行。
+#[test]
+fn cli_run_json_outputs_failure_summary_when_thread_start_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .error(
+                "thread/start",
+                JSON_RPC_SERVER_ERROR_CODE,
+                "invalid model selector",
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["run", "do the thing", "--json"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    let summary = jsonl_summary(&stdout(&output));
+    assert_eq!(summary["turn"]["status"], "failed");
+    assert_eq!(summary["thread"], serde_json::Value::Null);
+    assert!(
+        stderr(&output).contains("invalid model selector"),
+        "stderr={}",
+        stderr(&output)
+    );
+}
+
 // 验证没有 notification 的 turn 响应仍能正常完成。
 #[test]
 fn cli_run_returns_when_turn_response_has_no_notifications() {

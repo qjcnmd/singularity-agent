@@ -12,7 +12,7 @@ sg
      -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/glob/grep/bash/edit/write）
      -> OpenAiProvider
      -> 会话 JSONL（~/.singularity/sessions/<uuid>.jsonl，唯一权威正文）
-     -> SQLite 轻量索引（~/.singularity/index.sqlite3）
+     -> 进程内会话索引（启动时从 JSONL 重建，不落盘）
 ```
 
 详细边界、对象、状态流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。
@@ -111,10 +111,10 @@ sg continue <thread-id> "继续完成剩余修改"
 ```powershell
 sg threads                          # 列出全部会话（含 cwd）
 sg session read <session-id>        # 摘要 + 最近片段，不加载全文
-sg session delete <session-id>      # 同时删除 JSONL 与 SQLite 索引
+sg session delete <session-id>      # 同时删除 JSONL 与进程内索引引用
 ```
 
-会话正文位于 `~/.singularity/sessions/<uuid>.jsonl`，索引位于 `~/.singularity/index.sqlite3`；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
+会话正文位于 `~/.singularity/sessions/<uuid>.jsonl`（唯一事实源），进程内索引只缓存展示元数据并在启动时从 JSONL 重建，不落盘；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
 ## 安全边界
 

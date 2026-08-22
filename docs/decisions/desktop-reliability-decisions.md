@@ -188,6 +188,10 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 问题：D-041 裁决「发现结果喂给运行时元数据自动填充 context_window/max_output_tokens」，但发现缓存 schema 只含模型 id 清单，无数值限额来源；以编译期常量冒充填充会静默放宽校验合同。参考实现：Codex models-manager（策展目录 + 本地缓存 + TTL）；models.dev 公开模型目录 api.json。当前代码事实：未知模型缺限额一度收束为 fail closed；随后接入 models.dev 投影缓存作为限额第三级来源——捕获读路径只读 `metadata-cache.json`（TTL 24 小时）永不联网，刷新仅在模型目录发现成功后顺带拉取且网络失败 fail-soft；provider key 精确匹配 + base_url host 唯一归属回退，model id 精确 + 大小写回退。选择：限额解析优先级为用户顶层声明 > 内置表 > 目录投影缓存 > fail closed；不在目录覆盖内的 provider 保持显式声明。影响：公开目录覆盖内的未知模型可自动补齐限额；目录未覆盖或离线时维持拒绝而不是猜测。本条修订 D-041 中「发现结果自动填充数值限额」的实现路径，fail-soft、内置表兜底合并与 TTL 刷新语义不变。验收方式：E2E 断言无缓存 fail-closed、有缓存填充生效；真实拉取为 ignored 手动测试并留档 outputs/modelsdev-fill-check.log。
 
+### D-046：会话索引进程内化（取代 D-011/D-016/D-031/D-035/D-037 的 SQLite 面）
+
+问题：既有裁决（D-011 持久事实与发布顺序、D-016 thread 设置存储、D-031 usage 持久化、D-035 thread 模型投影、D-037 索引修复）以 SQLite 会话索引为前提；该 store 层独立于 JSONL 唯一权威之外形成第二落盘事实，增加崩溃恢复与修复路径。参考实现：无（项目内部收敛）。当前代码事实：会话正文 JSONL 是唯一权威，进程内 `SessionIndex` 启动时从 JSONL 重建；SQLite store 层已删除。选择：会话索引只存在于进程内（定位与展示元数据缓存，启动重建、退出不落盘），不再有第二持久化索引；D-011/D-016/D-031/D-035/D-037 中「先写 JSONL 再更新 SQLite 索引」的时序语义由「先写 JSONL 再更新进程内索引」承接，其余不变。影响：无索引修复路径、无 SQLite 依赖；`session/delete` 只删 JSONL 与备份。验收方式：删除 SQLite store 层与依赖；JSONL 唯一权威链路（终态事件通知前完成写盘 + 索引更新）测试全绿。
+
 ## 参考实现
 
 - Pi：小核心、Agent Loop、Session JSONL、compaction、工具输出截断与临时 spill。

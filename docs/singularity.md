@@ -258,7 +258,7 @@ sequenceDiagram
 
 评估系统是仓库外部的独立黑盒评估器，不作为产品内部子命令，也不包含在产品二进制发布中：
 
-- **黑盒调用接口**：通过外部评估运行器黑盒调用 `sg run <goal> --model <model> --json`，严格禁止在评估器中依赖 Harness Rust 内部 crate。`--json` 为逐行 JSONL 流：每个协议事件一行（notification 原样，含 thread 与 turn 生命周期、assistant delta、工具执行与 provider 遥测），终态收尾一行 `{"summary": {"thread": {...}, "turn": {...}}}` 供机器解析（turn.status/turn.usage/threadId 均取自此行）；旧单对象 `{thread, turn, events}` envelope 已废弃。
+- **黑盒调用接口**：通过外部评估运行器黑盒调用 `sg run <goal> --model <model> --json`，严格禁止在评估器中依赖 Harness Rust 内部 crate。`--json` 为逐行 JSONL 流：每个协议事件一行（notification 原样，含 thread 与 turn 生命周期、assistant delta、工具执行与 provider 遥测），终态收尾一行 `{"summary": {"thread": {...}, "turn": {...}}}` 供机器解析（turn.status/turn.usage/threadId 均取自此行）；thread/start 或 turn/start 被拒绝（如配置捕获失败）时同样输出失败终态汇总行（turn.status=failed）后退出非零，保证机器解析总能看到终态行；旧单对象 `{thread, turn, events}` envelope 已废弃。
 - **任务集格式**：`task_id` + `workspace/`（测试项目）+ `instruction.md` + `checker.sh`。
 - **流程与判定**：为每个评估 cell 准备干净 workspace 副本与独立 `SINGULARITY_HOME` → 子进程运行 `sg run --json` → 复制并脱敏 session rollout（剔除 private replay）→ 独立运行 `checker.sh` 判定（exit 0/1/2）→ 聚合指标生成 `results.json` 与 `cell.json`。turn 失败但 checker 通过时判 passed；checker 异常退出或超时判 failed；超时或崩溃杀死整棵进程树。
 
@@ -283,7 +283,7 @@ sequenceDiagram
 
 ## 10. 配置与项目指令
 
-**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件为单一 `~/.singularity/auth.v1.json`，导入流程为写临时文件后同卷原子改名；Unix 上设为 0600，Windows 上继承目录 ACL。config 与 models 的模型条目不接受 `capabilities` 块，出现即按未知字段拒绝；能力以顶层字段为唯一权威。会话目录 `~/.singularity/sessions/` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
+**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（持久化 providers / models / 默认设置）为运行时唯一配置面，进程启动时捕获一次配置快照；进程环境层（`SINGULARITY_MODEL_PROVIDER`/`SINGULARITY_MODEL`/`SINGULARITY_BASE_URL`/`SINGULARITY_API_KEY`/限额 env 覆盖）出现任一 provider 变量时整体短路用户配置。模型条目一次性录入经 `sg config add`（校验 → `/models` 发现 → 限额 enrichment → 持久化），也可直接手写。私有认证文件为单一 `~/.singularity/auth.v1.json`，写流程为临时文件 + 同卷原子改名；Unix 上设为 0600，Windows 上继承目录 ACL。config 与 auth 的模型条目不接受未知字段，出现即按未知字段拒绝；能力以顶层字段为唯一权威。会话目录 `~/.singularity/sessions/` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
 
 **资源加载**：`AGENTS.md` 逐层加载（root→cwd），无 trust 门控。按 root→cwd 顺序逐层收集项目指令文件 `AGENTS.md`，合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB 预算，超预算按预算截断纳入前缀并向模型追加截断尾注，同时向客户端发 `agent/diagnostic`（warning, `project_instructions_truncated`）；真 I/O 错误仍使 turn/start 失败。无 override 或 sha2 额外结构。
 

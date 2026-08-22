@@ -2,7 +2,7 @@
 
 后续工程技能探索此仓库时，按以下优先级读取资料：
 
-1. 根目录的 `AGENTS.md` 与 `.codex/repo-map.json`。
+1. 根目录的 `AGENTS.md`。
 2. `docs/singularity.md`：本仓库唯一的当前架构事实文档。
 3. 若存在且与当前任务相关，再读取根目录 `CONTEXT.md`、`CONTEXT-MAP.md` 与 `docs/adr/`。
 

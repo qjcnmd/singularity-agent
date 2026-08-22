@@ -83,13 +83,42 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                     );
                 }
             };
-            let (thread, _thread_events) =
-                client.thread_start(model, !json, &mut on_notification)?;
+            let (thread, _thread_events) = match client.thread_start(
+                model,
+                !json,
+                &mut on_notification,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            json!({"summary": {"thread": null, "turn": {"threadId": null, "turnId": null, "status": "failed"}}})
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             if !json {
                 println!("thread {}", thread.thread_id);
             }
-            let (turn, _turn_events) =
-                client.turn_start(&thread.thread_id, &goal, !json, &mut on_notification)?;
+            let (turn, _turn_events) = match client.turn_start(
+                &thread.thread_id,
+                &goal,
+                !json,
+                &mut on_notification,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            json!({"summary": {"thread": thread, "turn": {"threadId": thread.thread_id, "turnId": null, "status": "failed"}}})
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             if json {
                 println!("{}", json!({"summary": {"thread": thread, "turn": turn}}));
             }
@@ -118,8 +147,23 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                     );
                 }
             };
-            let (turn, _events) =
-                client.turn_start(&thread_id, &instruction, !json, &mut on_notification)?;
+            let (turn, _events) = match client.turn_start(
+                &thread_id,
+                &instruction,
+                !json,
+                &mut on_notification,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            json!({"summary": {"thread": {"threadId": thread_id}, "turn": {"threadId": thread_id, "turnId": null, "status": "failed"}}})
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             if json {
                 println!(
                     "{}",
