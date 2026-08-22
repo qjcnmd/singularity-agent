@@ -1513,7 +1513,9 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     std::fs::write(
         workspace.join("AGENTS.md"),
-        vec![b'~'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
+        // `#` 不会出现在 Windows 路径（含 8.3 短名）或提示词模板中，计数不受
+        // runner 环境影响。
+        vec![b'#'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
     )
     .expect("oversized agents");
     let sessions_dir = temp.path().join("sessions");
@@ -1575,9 +1577,9 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let tilde_count = joined.matches('~').count();
+    let marker_count = joined.matches('#').count();
     assert_eq!(
-        tilde_count,
+        marker_count,
         singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
         "exactly the file budget prefix reaches the model (joined_len={} head={:?} tail={:?})",
         joined.len(),
