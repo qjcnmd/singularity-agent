@@ -133,6 +133,64 @@ impl ProviderAttemptInProgress {
     }
 }
 
+/// Outcome of the protocol-specific work performed on a successful HTTP
+/// response inside one attempt. `Retry` asserts that this protocol side fully
+/// permits resending the request (for streams additionally that no visible
+/// delta has reached the caller yet); the shared loop only adds its
+/// remaining-attempts budget on top.
+enum AttemptBodyOutcome {
+    Completed {
+        completion: Box<OpenAiCompletion>,
+        wire_usage_present: bool,
+        time_to_first_text_delta_ms: Option<u64>,
+    },
+    Retry {
+        error: ProviderError,
+        time_to_first_text_delta_ms: Option<u64>,
+    },
+    Failed {
+        error: ProviderError,
+        time_to_first_text_delta_ms: Option<u64>,
+    },
+}
+
+/// Fold one streaming decode attempt into [`AttemptBodyOutcome`]. A stream
+/// failure stays retryable only before the first visible delta: afterwards a
+/// resend could duplicate already-emitted output.
+fn streaming_outcome(
+    attempt: Result<StreamAttemptSuccess, StreamAttemptFailure>,
+    parse_payload: impl FnOnce(Value) -> Result<(OpenAiCompletion, bool), ProviderError>,
+) -> AttemptBodyOutcome {
+    match attempt {
+        Ok(success) => {
+            let time_to_first_text_delta_ms = success.time_to_first_text_delta_ms;
+            match parse_payload(success.payload) {
+                Ok((completion, wire_usage_present)) => AttemptBodyOutcome::Completed {
+                    completion: Box::new(completion),
+                    wire_usage_present,
+                    time_to_first_text_delta_ms,
+                },
+                Err(error) => AttemptBodyOutcome::Failed {
+                    error,
+                    time_to_first_text_delta_ms,
+                },
+            }
+        }
+        Err(failure)
+            if !failure.emitted_text_delta && provider_error_is_retryable(&failure.error) =>
+        {
+            AttemptBodyOutcome::Retry {
+                error: failure.error,
+                time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
+            }
+        }
+        Err(failure) => AttemptBodyOutcome::Failed {
+            error: failure.error,
+            time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
+        },
+    }
+}
+
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: Option<SelectedModel>,
@@ -524,10 +582,6 @@ impl OpenAiProvider {
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         self.validate_reasoning_history(request)?;
-        let runtime = &self.runtime;
-        let started_at = Instant::now();
-        let mut metadata = ProviderAttemptMetadata::zero();
-        let endpoint = self.config.endpoint();
         let request_payload = openai_chat_stream_request_payload(
             request,
             model_name,
@@ -555,209 +609,51 @@ impl OpenAiProvider {
                 .as_ref()
                 .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
         );
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(provider_cancelled_error().with_provider_attempt_metadata(
-                    provider_attempt_metadata(&metadata, started_at),
-                ));
-            }
-            metadata.attempt_count += 1;
-            let mut occurrence = ProviderAttemptInProgress::new(
-                ProviderAttemptOperationPhase::Completion,
-                &self.config.provider_name,
-                model_name,
-                ProviderApiProtocol::OpenAiChatCompletions,
-                metadata.attempt_count,
-            );
-            emit_provider_attempt_started(&occurrence, on_attempt)?;
-            let response =
-                match block_on_provider_future(
-                    runtime,
-                    cancellation,
-                    "provider_request_send_failed",
-                    ProviderErrorStage::RequestSend,
-                    self.request_timeout_seconds,
-                    || {
-                        self.client
-                            .post(&endpoint)
-                            .bearer_auth(&self.config.api_key)
-                            .json(&request_payload)
-                            .send()
-                    },
-                ) {
-                    Ok(response) => {
-                        occurrence.mark_response_headers_received();
-                        response
-                    }
-                    Err(error)
-                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                            && provider_error_is_retryable(&error) =>
-                    {
-                        let retry_backoff = record_provider_retry(
-                            &mut metadata,
-                            occurrence,
-                            &error.error,
-                            None,
-                            on_attempt,
-                        )?;
-                        wait_stream_retry_backoff(
-                            runtime,
-                            cancellation,
-                            retry_backoff,
-                            &metadata,
-                            started_at,
-                        )?;
-                        continue;
-                    }
-                    Err(error) => {
-                        record_provider_attempt(
-                            &mut metadata,
-                            occurrence,
-                            Some(&error.error),
-                            None,
-                            on_attempt,
-                        )?;
-                        return Err(error.with_provider_attempt_metadata(
-                            provider_attempt_metadata(&metadata, started_at),
-                        ));
-                    }
-                };
-            let status = response.status();
-            if !status.is_success() {
-                let error = ProviderError::from_model_error(model_error_from_http_status(
-                    status.as_u16(),
-                    &self.config.provider_name,
-                    model_name,
-                ));
-                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                    && http_status_is_retryable(status.as_u16())
-                {
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &error.error,
-                        retry_after_delay(response.headers()),
-                        on_attempt,
-                    )?;
-                    wait_stream_retry_backoff(
-                        runtime,
+        let reasoning_variant = self
+            .selected_model
+            .as_ref()
+            .and_then(|selection| selection.reasoning_variant.as_deref());
+        self.complete_attempts(
+            cancellation,
+            ProviderApiProtocol::OpenAiChatCompletions,
+            model_name,
+            &self.config.endpoint(),
+            &request_payload,
+            on_attempt,
+            &mut |response, attempt_started_at| {
+                streaming_outcome(
+                    read_openai_chat_sse(
+                        &self.runtime,
                         cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
-                record_provider_attempt(
-                    &mut metadata,
-                    occurrence,
-                    Some(&error.error),
-                    None,
-                    on_attempt,
-                )?;
-                return Err(
-                    error.with_provider_attempt_metadata(provider_attempt_metadata(
-                        &metadata, started_at,
-                    )),
-                );
-            }
-            let response_retry_after = retry_after_delay(response.headers());
-            let attempt = read_openai_chat_sse(
-                runtime,
-                cancellation,
-                self.request_timeout_seconds,
-                response,
-                on_event,
-                occurrence.started_at,
-            );
-            let payload = match attempt {
-                Ok(success) => {
-                    occurrence.set_time_to_first_text_delta(success.time_to_first_text_delta_ms);
-                    success.payload
-                }
-                Err(failure)
-                    if !failure.emitted_text_delta
-                        && metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                        && provider_error_is_retryable(&failure.error) =>
-                {
-                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &failure.error.error,
-                        response_retry_after,
-                        on_attempt,
-                    )?;
-                    wait_stream_retry_backoff(
-                        runtime,
-                        cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
-                Err(failure) => {
-                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        Some(&failure.error.error),
-                        None,
-                        on_attempt,
-                    )?;
-                    return Err(failure.error.with_provider_attempt_metadata(
-                        provider_attempt_metadata(&metadata, started_at),
-                    ));
-                }
-            };
-            let reasoning_content_present = openai_reasoning_content_present(&payload);
-            let usage_available = payload.get("usage").is_some_and(Value::is_object);
-            let parsed = parse_openai_response(
-                request,
-                &self.config,
-                payload,
-                capabilities,
-                model_name,
-                self.selected_model
-                    .as_ref()
-                    .and_then(|selection| selection.reasoning_variant.as_deref()),
-            );
-            return match parsed {
-                Ok(mut response) => {
-                    let occurrence_error = response.error.as_ref();
-                    let usage = (usage_available && occurrence_error.is_none())
-                        .then(|| response.usage.clone());
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        occurrence_error,
-                        usage,
-                        on_attempt,
-                    )?;
-                    response.provider_attempt_metadata =
-                        Some(provider_attempt_metadata(&metadata, started_at));
-                    Ok(OpenAiCompletion {
+                        self.request_timeout_seconds,
                         response,
-                        reasoning_content_present,
-                    })
-                }
-                Err(error) => {
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        Some(&error.error),
-                        None,
-                        on_attempt,
-                    )?;
-                    Err(
-                        error.with_provider_attempt_metadata(provider_attempt_metadata(
-                            &metadata, started_at,
-                        )),
-                    )
-                }
-            };
-        }
+                        on_event,
+                        attempt_started_at,
+                    ),
+                    |payload| {
+                        let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
+                        let reasoning_content_present = openai_reasoning_content_present(&payload);
+                        parse_openai_response(
+                            request,
+                            &self.config,
+                            payload,
+                            capabilities,
+                            model_name,
+                            reasoning_variant,
+                        )
+                        .map(|response| {
+                            (
+                                OpenAiCompletion {
+                                    response,
+                                    reasoning_content_present,
+                                },
+                                wire_usage_present,
+                            )
+                        })
+                    },
+                )
+            },
+        )
     }
 
     /// Execute a bounded Responses SSE attempt sequence without exposing raw events.
@@ -771,10 +667,6 @@ impl OpenAiProvider {
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         self.validate_reasoning_history(request)?;
-        let runtime = &self.runtime;
-        let started_at = Instant::now();
-        let mut metadata = ProviderAttemptMetadata::zero();
-        let endpoint = responses_endpoint(&self.config.base_url);
         let request_payload = openai_responses_stream_request_payload(
             request,
             model_name,
@@ -792,212 +684,54 @@ impl OpenAiProvider {
                 .as_ref()
                 .is_none_or(|selection| selection.supports_tool_choice),
         );
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(provider_cancelled_error().with_provider_attempt_metadata(
-                    provider_attempt_metadata(&metadata, started_at),
-                ));
-            }
-            metadata.attempt_count += 1;
-            let mut occurrence = ProviderAttemptInProgress::new(
-                ProviderAttemptOperationPhase::Completion,
-                &self.config.provider_name,
-                model_name,
-                ProviderApiProtocol::OpenAiResponses,
-                metadata.attempt_count,
-            );
-            emit_provider_attempt_started(&occurrence, on_attempt)?;
-            let response =
-                match block_on_provider_future(
-                    runtime,
-                    cancellation,
-                    "provider_request_send_failed",
-                    ProviderErrorStage::RequestSend,
-                    self.request_timeout_seconds,
-                    || {
-                        self.client
-                            .post(&endpoint)
-                            .bearer_auth(&self.config.api_key)
-                            .json(&request_payload)
-                            .send()
-                    },
-                ) {
-                    Ok(response) => {
-                        occurrence.mark_response_headers_received();
-                        response
-                    }
-                    Err(error)
-                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                            && provider_error_is_retryable(&error) =>
-                    {
-                        let retry_backoff = record_provider_retry(
-                            &mut metadata,
-                            occurrence,
-                            &error.error,
-                            None,
-                            on_attempt,
-                        )?;
-                        wait_stream_retry_backoff(
-                            runtime,
-                            cancellation,
-                            retry_backoff,
-                            &metadata,
-                            started_at,
-                        )?;
-                        continue;
-                    }
-                    Err(error) => {
-                        record_provider_attempt(
-                            &mut metadata,
-                            occurrence,
-                            Some(&error.error),
-                            None,
-                            on_attempt,
-                        )?;
-                        return Err(error.with_provider_attempt_metadata(
-                            provider_attempt_metadata(&metadata, started_at),
-                        ));
-                    }
-                };
-            let status = response.status();
-            if !status.is_success() {
-                let error = ProviderError::from_model_error(model_error_from_http_status(
-                    status.as_u16(),
-                    &self.config.provider_name,
-                    model_name,
-                ));
-                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                    && http_status_is_retryable(status.as_u16())
-                {
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &error.error,
-                        retry_after_delay(response.headers()),
-                        on_attempt,
-                    )?;
-                    wait_stream_retry_backoff(
-                        runtime,
+        let reasoning_variant = self
+            .selected_model
+            .as_ref()
+            .and_then(|selection| selection.reasoning_variant.as_deref());
+        self.complete_attempts(
+            cancellation,
+            ProviderApiProtocol::OpenAiResponses,
+            model_name,
+            &responses_endpoint(&self.config.base_url),
+            &request_payload,
+            on_attempt,
+            &mut |response, attempt_started_at| {
+                streaming_outcome(
+                    read_openai_responses_sse(
+                        &self.runtime,
                         cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
-                record_provider_attempt(
-                    &mut metadata,
-                    occurrence,
-                    Some(&error.error),
-                    None,
-                    on_attempt,
-                )?;
-                return Err(
-                    error.with_provider_attempt_metadata(provider_attempt_metadata(
-                        &metadata, started_at,
-                    )),
-                );
-            }
-            let response_retry_after = retry_after_delay(response.headers());
-            let attempt = read_openai_responses_sse(
-                runtime,
-                cancellation,
-                self.request_timeout_seconds,
-                response,
-                on_event,
-                occurrence.started_at,
-            );
-            let payload = match attempt {
-                Ok(success) => {
-                    occurrence.set_time_to_first_text_delta(success.time_to_first_text_delta_ms);
-                    success.payload
-                }
-                Err(failure)
-                    if !failure.emitted_text_delta
-                        && metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                        && provider_error_is_retryable(&failure.error) =>
-                {
-                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &failure.error.error,
-                        response_retry_after,
-                        on_attempt,
-                    )?;
-                    wait_stream_retry_backoff(
-                        runtime,
-                        cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
-                Err(failure) => {
-                    occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        Some(&failure.error.error),
-                        None,
-                        on_attempt,
-                    )?;
-                    return Err(failure.error.with_provider_attempt_metadata(
-                        provider_attempt_metadata(&metadata, started_at),
-                    ));
-                }
-            };
-            let reasoning_content_present = openai_responses_reasoning_content_present(&payload);
-            let usage_available = payload.get("usage").is_some_and(Value::is_object);
-            let parsed = parse_openai_responses_response(
-                request,
-                &self.config,
-                payload,
-                capabilities,
-                model_name,
-                self.selected_model
-                    .as_ref()
-                    .and_then(|selection| selection.reasoning_variant.as_deref()),
-            );
-            return match parsed {
-                Ok(mut response) => {
-                    let occurrence_error = response.error.as_ref();
-                    let usage = (usage_available && occurrence_error.is_none())
-                        .then(|| response.usage.clone());
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        occurrence_error,
-                        usage,
-                        on_attempt,
-                    )?;
-                    response.provider_attempt_metadata =
-                        Some(provider_attempt_metadata(&metadata, started_at));
-                    Ok(OpenAiCompletion {
+                        self.request_timeout_seconds,
                         response,
-                        reasoning_content_present,
-                    })
-                }
-                Err(error) => {
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        Some(&error.error),
-                        None,
-                        on_attempt,
-                    )?;
-                    Err(
-                        error.with_provider_attempt_metadata(provider_attempt_metadata(
-                            &metadata, started_at,
-                        )),
-                    )
-                }
-            };
-        }
+                        on_event,
+                        attempt_started_at,
+                    ),
+                    |payload| {
+                        let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
+                        let reasoning_content_present =
+                            openai_responses_reasoning_content_present(&payload);
+                        parse_openai_responses_response(
+                            request,
+                            &self.config,
+                            payload,
+                            capabilities,
+                            model_name,
+                            reasoning_variant,
+                        )
+                        .map(|response| {
+                            (
+                                OpenAiCompletion {
+                                    response,
+                                    reasoning_content_present,
+                                },
+                                wire_usage_present,
+                            )
+                        })
+                    },
+                )
+            },
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn complete_with_contract_details_until(
         &self,
         request: &ModelTurnRequest,
@@ -1007,9 +741,6 @@ impl OpenAiProvider {
         model_name: &str,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
-        let runtime = &self.runtime;
-        let started_at = Instant::now();
-        let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = match api_protocol {
             ProviderApiProtocol::OpenAiResponses => responses_endpoint(&self.config.base_url),
             ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
@@ -1068,7 +799,118 @@ impl OpenAiProvider {
                 )
             }
         };
-        let operation_phase = ProviderAttemptOperationPhase::Completion;
+        let runtime = &self.runtime;
+        let request_timeout_seconds = self.request_timeout_seconds;
+        let reasoning_variant = self
+            .selected_model
+            .as_ref()
+            .and_then(|selection| selection.reasoning_variant.as_deref());
+        self.complete_attempts(
+            cancellation,
+            api_protocol,
+            model_name,
+            &endpoint,
+            &request_payload,
+            on_attempt,
+            &mut |response, _attempt_started_at| {
+                let body = match read_bounded_provider_response_body(
+                    runtime,
+                    cancellation,
+                    request_timeout_seconds,
+                    response,
+                ) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return if provider_error_is_retryable(&error) {
+                            AttemptBodyOutcome::Retry {
+                                error,
+                                time_to_first_text_delta_ms: None,
+                            }
+                        } else {
+                            AttemptBodyOutcome::Failed {
+                                error,
+                                time_to_first_text_delta_ms: None,
+                            }
+                        };
+                    }
+                };
+                let payload = match serde_json::from_slice::<Value>(&body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return AttemptBodyOutcome::Failed {
+                            error: ProviderError::from_model_error(provider_response_json_error()),
+                            time_to_first_text_delta_ms: None,
+                        };
+                    }
+                };
+                let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
+                let reasoning_content_present = match api_protocol {
+                    ProviderApiProtocol::OpenAiResponses => {
+                        openai_responses_reasoning_content_present(&payload)
+                    }
+                    ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                        openai_reasoning_content_present(&payload)
+                    }
+                };
+                let parsed = match api_protocol {
+                    ProviderApiProtocol::OpenAiResponses => parse_openai_responses_response(
+                        request,
+                        &self.config,
+                        payload,
+                        capabilities,
+                        model_name,
+                        reasoning_variant,
+                    ),
+                    ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                        parse_openai_response(
+                            request,
+                            &self.config,
+                            payload,
+                            capabilities,
+                            model_name,
+                            reasoning_variant,
+                        )
+                    }
+                };
+                match parsed {
+                    Ok(response) => AttemptBodyOutcome::Completed {
+                        completion: Box::new(OpenAiCompletion {
+                            response,
+                            reasoning_content_present,
+                        }),
+                        wire_usage_present,
+                        time_to_first_text_delta_ms: None,
+                    },
+                    Err(error) => AttemptBodyOutcome::Failed {
+                        error,
+                        time_to_first_text_delta_ms: None,
+                    },
+                }
+            },
+        )
+    }
+
+    /// Shared completion skeleton for both wire protocols and both streaming
+    /// shapes: one bounded attempt loop owning the cancellation check, attempt
+    /// telemetry, retry classification (`Retry-After` first, full-jitter
+    /// backoff otherwise) and the observable start/finish event pairs. The
+    /// protocol-specific body read, decode and parse run through
+    /// `read_response`; its `Retry` outcome carries everything needed to
+    /// schedule the next attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_attempts(
+        &self,
+        cancellation: &CancellationToken,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+        endpoint: &str,
+        request_payload: &Value,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        read_response: &mut dyn FnMut(reqwest::Response, Instant) -> AttemptBodyOutcome,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        let runtime = &self.runtime;
+        let started_at = Instant::now();
+        let mut metadata = ProviderAttemptMetadata::zero();
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -1077,7 +919,7 @@ impl OpenAiProvider {
             }
             metadata.attempt_count += 1;
             let mut occurrence = ProviderAttemptInProgress::new(
-                operation_phase,
+                ProviderAttemptOperationPhase::Completion,
                 &self.config.provider_name,
                 model_name,
                 api_protocol,
@@ -1093,9 +935,9 @@ impl OpenAiProvider {
                     self.request_timeout_seconds,
                     || {
                         self.client
-                            .post(&endpoint)
+                            .post(endpoint)
                             .bearer_auth(&self.config.api_key)
-                            .json(&request_payload)
+                            .json(request_payload)
                             .send()
                     },
                 ) {
@@ -1114,12 +956,12 @@ impl OpenAiProvider {
                             None,
                             on_attempt,
                         )?;
-                        wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
-                            |cancelled| {
-                                cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
-                                    &metadata, started_at,
-                                ))
-                            },
+                        wait_retry_backoff(
+                            runtime,
+                            cancellation,
+                            retry_backoff,
+                            &metadata,
+                            started_at,
                         )?;
                         continue;
                     }
@@ -1153,12 +995,12 @@ impl OpenAiProvider {
                         retry_after_delay(response.headers()),
                         on_attempt,
                     )?;
-                    wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
-                        |cancelled| {
-                            cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
-                                &metadata, started_at,
-                            ))
-                        },
+                    wait_retry_backoff(
+                        runtime,
+                        cancellation,
+                        retry_backoff,
+                        &metadata,
+                        started_at,
                     )?;
                     continue;
                 }
@@ -1176,102 +1018,16 @@ impl OpenAiProvider {
                 );
             }
             let response_retry_after = retry_after_delay(response.headers());
-            let body =
-                match read_bounded_provider_response_body(
-                    runtime,
-                    cancellation,
-                    self.request_timeout_seconds,
-                    response,
-                ) {
-                    Ok(body) => body,
-                    Err(error)
-                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                            && provider_error_is_retryable(&error) =>
-                    {
-                        let retry_backoff = record_provider_retry(
-                            &mut metadata,
-                            occurrence,
-                            &error.error,
-                            response_retry_after,
-                            on_attempt,
-                        )?;
-                        wait_provider_backoff(runtime, cancellation, retry_backoff).map_err(
-                            |cancelled| {
-                                cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
-                                    &metadata, started_at,
-                                ))
-                            },
-                        )?;
-                        continue;
-                    }
-                    Err(error) => {
-                        record_provider_attempt(
-                            &mut metadata,
-                            occurrence,
-                            Some(&error.error),
-                            None,
-                            on_attempt,
-                        )?;
-                        return Err(error.with_provider_attempt_metadata(
-                            provider_attempt_metadata(&metadata, started_at),
-                        ));
-                    }
-                };
-            let payload =
-                match serde_json::from_slice::<Value>(&body) {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        let error = ProviderError::from_model_error(provider_response_json_error());
-                        record_provider_attempt(
-                            &mut metadata,
-                            occurrence,
-                            Some(&error.error),
-                            None,
-                            on_attempt,
-                        )?;
-                        return Err(error.with_provider_attempt_metadata(
-                            provider_attempt_metadata(&metadata, started_at),
-                        ));
-                    }
-                };
-            let usage_available = payload.get("usage").is_some_and(Value::is_object);
-            let reasoning_content_present = match api_protocol {
-                ProviderApiProtocol::OpenAiResponses => {
-                    openai_responses_reasoning_content_present(&payload)
-                }
-                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                    openai_reasoning_content_present(&payload)
-                }
-            };
-            let parsed = match api_protocol {
-                ProviderApiProtocol::OpenAiResponses => parse_openai_responses_response(
-                    request,
-                    &self.config,
-                    payload,
-                    capabilities,
-                    model_name,
-                    self.selected_model
-                        .as_ref()
-                        .and_then(|selection| selection.reasoning_variant.as_deref()),
-                ),
-                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                    parse_openai_response(
-                        request,
-                        &self.config,
-                        payload,
-                        capabilities,
-                        model_name,
-                        self.selected_model
-                            .as_ref()
-                            .and_then(|selection| selection.reasoning_variant.as_deref()),
-                    )
-                }
-            };
-            return match parsed {
-                Ok(mut response) => {
-                    let occurrence_error = response.error.as_ref();
-                    let usage = (usage_available && occurrence_error.is_none())
-                        .then(|| response.usage.clone());
+            let failure = match read_response(response, occurrence.started_at) {
+                AttemptBodyOutcome::Completed {
+                    completion,
+                    wire_usage_present,
+                    time_to_first_text_delta_ms,
+                } => {
+                    occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+                    let occurrence_error = completion.response.error.as_ref();
+                    let usage = (wire_usage_present && occurrence_error.is_none())
+                        .then(|| completion.response.usage.clone());
                     record_provider_attempt(
                         &mut metadata,
                         occurrence,
@@ -1279,28 +1035,52 @@ impl OpenAiProvider {
                         usage,
                         on_attempt,
                     )?;
-                    response.provider_attempt_metadata =
+                    let mut completion = *completion;
+                    completion.response.provider_attempt_metadata =
                         Some(provider_attempt_metadata(&metadata, started_at));
-                    Ok(OpenAiCompletion {
-                        response,
-                        reasoning_content_present,
-                    })
+                    return Ok(completion);
                 }
-                Err(error) => {
-                    record_provider_attempt(
+                AttemptBodyOutcome::Retry {
+                    error,
+                    time_to_first_text_delta_ms,
+                } if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS => {
+                    occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+                    let retry_backoff = record_provider_retry(
                         &mut metadata,
                         occurrence,
-                        Some(&error.error),
-                        None,
+                        &error.error,
+                        response_retry_after,
                         on_attempt,
                     )?;
-                    Err(
-                        error.with_provider_attempt_metadata(provider_attempt_metadata(
-                            &metadata, started_at,
-                        )),
-                    )
+                    wait_retry_backoff(
+                        runtime,
+                        cancellation,
+                        retry_backoff,
+                        &metadata,
+                        started_at,
+                    )?;
+                    continue;
                 }
+                AttemptBodyOutcome::Retry {
+                    error,
+                    time_to_first_text_delta_ms,
+                }
+                | AttemptBodyOutcome::Failed {
+                    error,
+                    time_to_first_text_delta_ms,
+                } => (error, time_to_first_text_delta_ms),
             };
+            let (error, time_to_first_text_delta_ms) = failure;
+            occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+            record_provider_attempt(
+                &mut metadata,
+                occurrence,
+                Some(&error.error),
+                None,
+                on_attempt,
+            )?;
+            return Err(error
+                .with_provider_attempt_metadata(provider_attempt_metadata(&metadata, started_at)));
         }
     }
 }
@@ -1472,7 +1252,9 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn wait_stream_retry_backoff(
+/// Cancellation-aware backoff sleep that attaches the aggregate attempt
+/// telemetry when the wait is interrupted by cancellation.
+fn wait_retry_backoff(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     duration: Duration,
