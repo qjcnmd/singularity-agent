@@ -148,6 +148,25 @@ impl Default for AgentConfig {
     }
 }
 
+impl AgentConfig {
+    /// 按 provider 声明的输出上限钳制并校验 compaction 配置：默认 summary
+    /// 预算可被更小的 provider 上限安全下调，显式非默认预算保持 fail-closed。
+    /// turn 启动前的准备阶段与 `Agent::new` 必须共用这一个入口，使「准备阶段
+    /// 已校验」与「Agent 构造不再失败」成为同一事实而不是两份手工同步的逻辑。
+    pub fn prepare_for_provider_limits(
+        mut config: Self,
+        provider_max_output_tokens: u32,
+    ) -> Result<Self> {
+        if config.compaction == CompactionConfig::default()
+            && provider_max_output_tokens < config.compaction.summary_max_tokens
+        {
+            config.compaction.summary_max_tokens = provider_max_output_tokens;
+        }
+        config.compaction.validate(provider_max_output_tokens)?;
+        Ok(config)
+    }
+}
+
 /// Agent 循环错误。
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -384,29 +403,42 @@ fn execute_tool_batch_parallel(
                 .prepared
                 .expect("runnable tool call must have a prepared tool");
             let call = &item.call;
+            // 与并行路径同一合同：首个投影错误中止本轮，其后的 Update/End
+            // 不再投递，避免向客户端继续写出无效事件。
+            let projected_error = std::cell::RefCell::new(None::<AgentError>);
             let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute_prepared_tool(registry, prepared, call, cwd, cancellation, |text| {
-                    let _ = emit(
-                        events,
-                        AgentEvent::ToolExecutionUpdate {
-                            tool_name: call.tool_name.clone(),
-                            tool_call_id: call.tool_call_id.clone(),
-                            arguments: call.arguments.clone(),
-                            partial_result: text.to_string(),
-                        },
-                    );
+                    let mut slot = projected_error.borrow_mut();
+                    if slot.is_none()
+                        && let Err(error) = emit(
+                            events,
+                            AgentEvent::ToolExecutionUpdate {
+                                tool_name: call.tool_name.clone(),
+                                tool_call_id: call.tool_call_id.clone(),
+                                arguments: call.arguments.clone(),
+                                partial_result: text.to_string(),
+                            },
+                        )
+                    {
+                        *slot = Some(error);
+                    }
                 })
             }))
             .unwrap_or_else(|_| tool_error_execution("tool worker panicked"));
-            emit(
-                events,
-                AgentEvent::ToolExecutionEnded {
-                    tool_name: call.tool_name.clone(),
-                    tool_call_id: call.tool_call_id.clone(),
-                    execution: execution.clone(),
-                },
-            )?;
+            if projected_error.borrow().is_none() {
+                emit(
+                    events,
+                    AgentEvent::ToolExecutionEnded {
+                        tool_name: call.tool_name.clone(),
+                        tool_call_id: call.tool_call_id.clone(),
+                        execution: execution.clone(),
+                    },
+                )?;
+            }
             results[index] = Some(execution);
+            if let Some(error) = projected_error.into_inner() {
+                return Err(error);
+            }
         }
     } else {
         let worker_limit = usize::try_from(max_parallel_tool_calls.max(1)).unwrap_or(usize::MAX);
@@ -566,19 +598,7 @@ impl Agent {
         session: SessionManager,
     ) -> Result<Self> {
         let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
-        let mut config = config;
-        // The documented default is 8192, but a provider with a smaller
-        // declared output limit may safely clamp that implicit default. An
-        // explicit non-default cap remains fail-closed below.
-        if config.compaction == CompactionConfig::default()
-            && provider_max_output_tokens < config.compaction.summary_max_tokens
-        {
-            config.compaction.summary_max_tokens = provider_max_output_tokens;
-        }
-        config
-            .compaction
-            .validate(provider_max_output_tokens)
-            .map_err(AgentError::Compaction)?;
+        let config = AgentConfig::prepare_for_provider_limits(config, provider_max_output_tokens)?;
         // 摘要请求复用 provider/model 选择，但使用独立的摘要输出上限；
         // 正常 turn 的 max_output_tokens 不应把 8192-token 摘要压缩成 1 token。
         let mut compaction_preferences = ModelPreferences::default();
@@ -611,11 +631,6 @@ impl Agent {
     /// 复用这里返回的同一 `SessionManager`，而不是再次全量打开。
     pub fn into_session(self) -> SessionManager {
         self.session
-    }
-
-    /// 轮次运行结束后借出会话，供终态 metadata / usage 落盘复用同一个写者。
-    pub fn session_mut(&mut self) -> &mut SessionManager {
-        &mut self.session
     }
 
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。

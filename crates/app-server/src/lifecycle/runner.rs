@@ -433,20 +433,13 @@ impl AppServer {
     ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool)> {
         let (provider, config, instructions_truncated) =
             self.provider_and_config_for_thread(thread)?;
-        // 与 Agent::new 内部校验保持一致：先按默认配置与 provider 输出上限钳制
-        // summary_max_tokens，再 validate，保证 prepare_agent_for_turn 的
-        // Agent::new 在 turn_started 已落盘后不会再次失败。
+        // 与 Agent::new 共用同一钳制/校验入口：准备阶段在此验证后，turn_started
+        // 落盘后的 Agent 构造不会再因 compaction 配置失败。
         let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
-        let mut config = config;
-        if config.compaction == singularity_agent::compaction::CompactionConfig::default()
-            && provider_max_output_tokens < config.compaction.summary_max_tokens
-        {
-            config.compaction.summary_max_tokens = provider_max_output_tokens;
-        }
-        config
-            .compaction
-            .validate(provider_max_output_tokens)
-            .map_err(AgentError::Compaction)?;
+        let config = singularity_agent::agent::AgentConfig::prepare_for_provider_limits(
+            config,
+            provider_max_output_tokens,
+        )?;
         Ok((provider, config, instructions_truncated))
     }
 
