@@ -59,7 +59,7 @@ const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
 /// 视为敏感内容的文本标记：凭证与私钥标签、provider 请求/响应载荷字段名、环境变量引用。
 /// `contains_sensitive_text` 用它在文本进入会话或对外输出前识别敏感内容。
-const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
+const SENSITIVE_TEXT_MARKERS: [&str; 22] = [
     ".aws",
     ".azure",
     ".env",
@@ -67,12 +67,9 @@ const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     ".ssh",
     "api_key",
     "authorization",
-    "credential",
-    "cookie",
     "evaluator-only",
     "id_ed25519",
     "id_rsa",
-    "password",
     "private-key",
     "private key-----",
     "\"provider\"",
@@ -82,7 +79,6 @@ const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     "raw_arguments",
     "raw_prompt",
     "raw_response",
-    "secret",
     "\"env\"",
     "env:",
     "env=",

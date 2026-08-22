@@ -10,7 +10,7 @@ use crate::error::{
 };
 use crate::{
     HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
-    PROVIDER_CANCELLATION_POLL_MS, PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
+    PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS,
 };
 
 pub(super) fn provider_error_is_retryable(error: &ProviderError) -> bool {
@@ -120,9 +120,21 @@ pub(super) fn wait_provider_backoff(
         if remaining.is_zero() {
             return Ok(());
         }
-        let poll = remaining.min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
-        runtime.block_on(async {
-            tokio::time::sleep(poll).await;
+        // 睡眠与取消通知竞争：取消事件即时唤醒，不再按固定周期轮询。
+        let cancelled = runtime.block_on(async {
+            tokio::select! {
+                _ = cancellation.cancelled_notified() => true,
+                _ = tokio::time::sleep(remaining) => false,
+            }
         });
+        if cancelled {
+            return Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::Cancelled,
+                    "model request cancelled by client",
+                )
+                .with_provider_diagnostic("client_cancelled", ProviderErrorStage::Cancelled),
+            ));
+        }
     }
 }

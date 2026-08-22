@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use singularity_core::user_singularity_home;
 
-use super::session_index::{SessionRecord, SessionStatus};
+use super::session_index::SessionRecord;
 use crate::owner_only::ensure_owner_only_dir;
 
 pub(super) fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
@@ -40,15 +40,7 @@ pub fn thread_from_record(record: &SessionRecord) -> singularity_protocol::Threa
         thread_id: record.session_id.clone(),
         model: record.model.clone(),
         cwd: Some(record.cwd.clone()),
-        last_turn_status: match record.status {
-            None => None,
-            Some(SessionStatus::Active) => Some(singularity_protocol::ThreadStatus::Active),
-            Some(SessionStatus::Completed) => Some(singularity_protocol::ThreadStatus::Completed),
-            Some(SessionStatus::Failed) => Some(singularity_protocol::ThreadStatus::Failed),
-            Some(SessionStatus::Interrupted) => {
-                Some(singularity_protocol::ThreadStatus::Interrupted)
-            }
-        },
+        last_turn_status: record.status,
     }
 }
 

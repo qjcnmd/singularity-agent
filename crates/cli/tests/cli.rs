@@ -763,18 +763,39 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
         .expect("run cli");
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["threadId"], "thread_json");
-    assert_eq!(value["turn"]["turnId"], "turn_json");
-    assert_eq!(value["turn"]["status"], "completed");
-    let events = value["events"].as_array().expect("events");
-    assert!(events.iter().all(|event| event["method"].is_string()));
-    let item_delta = events
+    let lines = stdout(&output);
+    let events = lines
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(','))
+        .collect::<Vec<_>>();
+    let mut parsed = Vec::new();
+    for line in lines.lines() {
+        parsed.push(serde_json::from_str::<serde_json::Value>(line).expect("jsonl line"));
+    }
+    let summary = parsed
         .iter()
-        .find(|event| event["method"] == "item/agentMessage/delta")
+        .find(|value| value.get("summary").is_some())
+        .expect("summary line");
+    let summary_turn = &summary["summary"];
+    assert_eq!(summary_turn["thread"]["threadId"], "thread_json");
+    assert_eq!(summary_turn["turn"]["turnId"], "turn_json");
+    assert_eq!(summary_turn["turn"]["status"], "completed");
+    assert!(
+        parsed
+            .iter()
+            .all(|line| line.get("method").is_some() || line.get("summary").is_some()),
+        "every line must be a notification or the final summary"
+    );
+    let item_delta = parsed
+        .iter()
+        .find(|value| value["method"] == "item/agentMessage/delta")
         .expect("agent delta event");
     assert_eq!(item_delta["params"]["delta"], "agent-loop-ok");
-    assert!(!stdout(&output).contains("turn turn_json completed"));
+    assert!(
+        !events
+            .iter()
+            .any(|line| line.contains("turn turn_json completed"))
+    );
 }
 
 // 验证 turn/start 返回 running 后，CLI 只接受精确匹配 (threadId, turnId)
@@ -877,24 +898,23 @@ fn cli_run_json_waits_for_matching_error_after_running_response() {
         .expect("run cli");
 
     assert!(!output.status.success());
-    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["threadId"], "thread_live");
-    assert_eq!(value["turn"]["turnId"], "turn_live");
-    assert_eq!(value["turn"]["status"], "failed");
-    let events = value["events"].as_array().expect("events");
+    let parsed = jsonl_lines(&stdout(&output));
+    let summary = jsonl_summary(&stdout(&output));
+    assert_eq!(summary["thread"]["threadId"], "thread_live");
+    assert_eq!(summary["turn"]["turnId"], "turn_live");
+    assert_eq!(summary["turn"]["status"], "failed");
+    let error_events = parsed
+        .iter()
+        .filter(|value| value["method"] == "turn/error")
+        .collect::<Vec<_>>();
     assert!(
-        events.iter().any(|event| {
-            event["method"] == "turn/error"
-                && event["params"]["thread_id"] == "thread_live"
-                && event["params"]["turn_id"] == "turn_live"
+        error_events.iter().any(|event| {
+            event["params"]["threadId"] == "thread_live" && event["params"]["turnId"] == "turn_live"
         }),
-        "events={events:?}"
+        "events={parsed:?}"
     );
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["method"] == "turn/error")
-            .count(),
+        error_events.len(),
         2,
         "stale error is retained as an unrelated event, but cannot become the result"
     );
@@ -939,18 +959,17 @@ fn cli_run_json_projects_matching_rpc_error_after_running_response() {
         .expect("run cli");
 
     assert!(!output.status.success());
-    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["threadId"], "thread_rpc_error");
-    assert_eq!(value["turn"]["turnId"], "turn_rpc_error");
-    assert_eq!(value["turn"]["status"], "failed");
-    let error_event = value["events"]
-        .as_array()
-        .unwrap()
+    let parsed = jsonl_lines(&stdout(&output));
+    let summary = jsonl_summary(&stdout(&output));
+    assert_eq!(summary["thread"]["threadId"], "thread_rpc_error");
+    assert_eq!(summary["turn"]["turnId"], "turn_rpc_error");
+    assert_eq!(summary["turn"]["status"], "failed");
+    let error_event = parsed
         .iter()
-        .find(|event| event["method"] == "turn/error")
-        .expect("projected terminal error event");
-    assert_eq!(error_event["params"]["thread_id"], "thread_rpc_error");
-    assert_eq!(error_event["params"]["turn_id"], "turn_rpc_error");
+        .find(|value| value["method"] == "turn/error")
+        .expect("terminal error event");
+    assert_eq!(error_event["params"]["threadId"], "thread_rpc_error");
+    assert_eq!(error_event["params"]["turnId"], "turn_rpc_error");
     assert_eq!(
         error_event["params"]["error"]["message"],
         "worker terminalization failed"
@@ -984,8 +1003,8 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
         .expect("run cli");
 
     assert!(!output.status.success());
-    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["turn"]["status"], "failed");
+    let summary = jsonl_summary(&stdout(&output));
+    assert_eq!(summary["turn"]["status"], "failed");
 }
 
 // 验证部分 capability 在 blocker 清除前仍不能启动 turn。
@@ -1423,10 +1442,10 @@ fn cli_continue_forwards_model_and_projects_json_result() {
             .expect("settings params json");
     assert_eq!(settings["threadId"], "thread_continue_json");
     assert_eq!(settings["model"], "gpt-test");
-    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json output");
-    assert_eq!(result["thread"]["threadId"], "thread_continue_json");
-    assert_eq!(result["turn"]["turnId"], "turn_continue_json");
-    assert_eq!(result["turn"]["status"], "completed");
+    let summary = jsonl_summary(&stdout(&output));
+    assert_eq!(summary["thread"]["threadId"], "thread_continue_json");
+    assert_eq!(summary["turn"]["turnId"], "turn_continue_json");
+    assert_eq!(summary["turn"]["status"], "completed");
 }
 
 // 验证无效 thread id 由 app-server 错误原样归因。
@@ -1869,6 +1888,24 @@ fn is_app_server_unavailable_error(stderr: &str) -> bool {
 // 解码 CLI stdout，便于测试断言。
 fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+// 逐行解析 JSONL 输出（通知行 + 终态汇总行）。
+fn jsonl_lines(output: &str) -> Vec<serde_json::Value> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("jsonl line"))
+        .collect()
+}
+
+// 取 JSONL 流的终态汇总行（`{"summary": {...}}`）。
+fn jsonl_summary(output: &str) -> serde_json::Value {
+    jsonl_lines(output)
+        .into_iter()
+        .find(|value| value.get("summary").is_some())
+        .expect("summary line")["summary"]
+        .clone()
 }
 
 // 解码 CLI stderr，便于测试断言。

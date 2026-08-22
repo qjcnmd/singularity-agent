@@ -12,7 +12,7 @@ use crate::types::{ModelTurnResponse, ProviderToolReasoningMode};
 use crate::{
     HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
-    MAX_PROVIDER_RESPONSE_BODY_BYTES, PROVIDER_CANCELLATION_POLL_MS,
+    MAX_PROVIDER_RESPONSE_BODY_BYTES,
 };
 
 pub(super) fn duration_millis(duration: Duration) -> u64 {
@@ -150,26 +150,33 @@ where
     F: Future<Output = Result<T, reqwest::Error>>,
 {
     let _runtime_context = runtime.enter();
-    let mut future = Box::pin(create_future());
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
-        }
-        let poll = Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS);
-        match runtime.block_on(async { tokio::time::timeout(poll, future.as_mut()).await }) {
-            Ok(result) => {
-                return result.map_err(|error| {
-                    provider_transport_error(
-                        error,
-                        error_code,
-                        error_stage.clone(),
-                        Some(request_timeout_seconds),
-                    )
-                });
-            }
-            Err(_) => continue,
-        }
+    if cancellation.is_cancelled() {
+        return Err(provider_cancelled_error());
     }
+    let mut future = Box::pin(create_future());
+    let outcome = runtime.block_on(async {
+        tokio::select! {
+            _ = cancellation.cancelled_notified() => ProviderWaitOutcome::Cancelled,
+            result = &mut future => ProviderWaitOutcome::Done(result),
+        }
+    });
+    match outcome {
+        ProviderWaitOutcome::Cancelled => Err(provider_cancelled_error()),
+        ProviderWaitOutcome::Done(result) => result.map_err(|error| {
+            provider_transport_error(
+                error,
+                error_code,
+                error_stage.clone(),
+                Some(request_timeout_seconds),
+            )
+        }),
+    }
+}
+
+/// `block_on_provider_future` 的等待结果：取消事件或请求完成。
+enum ProviderWaitOutcome<T> {
+    Cancelled,
+    Done(Result<T, reqwest::Error>),
 }
 
 pub(crate) fn read_bounded_provider_response_body(

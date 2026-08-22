@@ -246,10 +246,14 @@ pub(super) fn render_and_wait_terminal(
     request_id: &JsonRpcId,
     render: bool,
     ctrl_c: Option<CtrlCMonitor>,
+    on_notification: &mut dyn FnMut(&JsonRpcNotification),
 ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
     let thread_id = initial_turn.thread_id.clone();
     let turn_id = initial_turn.turn_id.clone();
 
+    for notification in &notifications {
+        on_notification(notification);
+    }
     if render {
         render_messages(&notifications, false);
     }
@@ -292,6 +296,7 @@ pub(super) fn render_and_wait_terminal(
         };
         match message {
             JsonRpcMessage::Notification(notification) => {
+                on_notification(&notification);
                 let method = notification.method.as_str();
                 match method {
                     "turn/completed" => {
@@ -371,6 +376,7 @@ pub(super) fn render_and_wait_terminal(
                 )
                 .map_err(|error| format!("failed to project terminal turn error: {error}"))?;
                 if let JsonRpcMessage::Notification(event) = event {
+                    on_notification(&event);
                     notifications.push(event);
                 }
                 let terminal_turn = Turn {
@@ -432,11 +438,15 @@ impl AppServerClient {
         &mut self,
         model: Option<String>,
         render: bool,
+        on_notification: &mut dyn FnMut(&JsonRpcNotification),
     ) -> Result<(Thread, Vec<JsonRpcNotification>), String> {
         let reply = self.request::<rpc_methods::ThreadStart>(&ThreadStartParams {
             model,
             cwd: Some(canonical_current_dir()?),
         })?;
+        for notification in &reply.notifications {
+            on_notification(notification);
+        }
         if render {
             render_messages(&reply.notifications, false);
         }
@@ -472,6 +482,7 @@ impl AppServerClient {
         thread_id: &str,
         text: &str,
         render: bool,
+        on_notification: &mut dyn FnMut(&JsonRpcNotification),
     ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
         let params = TurnStartParams {
             thread_id: thread_id.to_string(),
@@ -488,6 +499,7 @@ impl AppServerClient {
             &reply.request_id,
             render,
             ctrl_c,
+            on_notification,
         )
     }
 
@@ -934,6 +946,7 @@ mod tests {
             &JsonRpcId::Number(1),
             false,
             Some(CtrlCMonitor::scripted([0, 1])),
+            &mut |_notification| {},
         )
         .expect("terminal turn");
 
@@ -980,6 +993,7 @@ mod tests {
             &JsonRpcId::Number(1),
             false,
             Some(CtrlCMonitor::scripted([2])),
+            &mut |_notification| {},
         );
 
         assert_eq!(result.unwrap_err(), FORCE_INTERRUPT_ERROR);

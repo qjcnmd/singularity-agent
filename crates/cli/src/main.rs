@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 #[cfg(test)]
 use singularity_protocol::SessionTurn;
-use singularity_protocol::{HistoryItem, ItemEventParams, JsonRpcNotification, SessionReadResult};
+use singularity_protocol::{HistoryItem, JsonRpcNotification, SessionReadResult};
 
 mod client;
 mod commands;
@@ -16,9 +16,7 @@ mod session_reference;
 
 use client::{AppServerClient, FORCE_INTERRUPT_ERROR};
 use commands::run_cli;
-#[cfg(test)]
-use render::safe_protocol_event;
-use render::{fail_for_failed_turn, protocol_events, render_messages, render_turn};
+use render::{fail_for_failed_turn, render_messages, render_turn};
 use session_reference::prepare_goal_with_session_reference;
 #[cfg(test)]
 use session_reference::{
@@ -130,6 +128,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::render::safe_protocol_event;
     use super::*;
     use serde_json::json;
     use singularity_protocol::ThreadStatus;

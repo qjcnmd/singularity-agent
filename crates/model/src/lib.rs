@@ -42,7 +42,6 @@ pub(crate) const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 pub(crate) const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
-pub(crate) const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
 pub(crate) const MAX_PROVIDER_ATTEMPTS: u32 = 6;

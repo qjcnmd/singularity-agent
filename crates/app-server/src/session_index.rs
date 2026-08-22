@@ -15,35 +15,10 @@ use thiserror::Error;
 /// 会话索引状态：最近一次 turn 的状态。`None` 表示尚无 turn（新会话）；`Active`
 /// 仅在 turn 真正运行期间写入，读取侧需要结合存活 turn 判定，崩溃遗留的 `Active`
 /// 由消费方投影为终态而不是回写索引。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionStatus {
-    Active,
-    Completed,
-    Failed,
-    Interrupted,
-}
-
-impl SessionStatus {
-    pub const fn as_storage_text(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "active" => Some(Self::Active),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "interrupted" => Some(Self::Interrupted),
-            _ => None,
-        }
-    }
-}
+///
+/// 该状态只有一份事实：协议层 `ThreadStatus`（同为 snake_case 存储文本），
+/// 索引存/取与协议投影共用同一枚举。
+pub use singularity_protocol::ThreadStatus as SessionStatus;
 
 /// 会话索引的一行：只保存定位与展示会话所需的元数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

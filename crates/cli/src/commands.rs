@@ -73,22 +73,25 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                 &goal,
                 session_reference.as_deref(),
             )?;
-            let (thread, thread_events) = client.thread_start(model, !json)?;
+            // JSON 模式：事件逐行 JSONL 输出（notification 原样），终态汇总行收尾。
+            let mut on_notification = |notification: &singularity_protocol::JsonRpcNotification| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(notification)
+                            .expect("notification serializes to JSON")
+                    );
+                }
+            };
+            let (thread, _thread_events) =
+                client.thread_start(model, !json, &mut on_notification)?;
             if !json {
                 println!("thread {}", thread.thread_id);
             }
-            let (turn, turn_events) = client.turn_start(&thread.thread_id, &goal, !json)?;
+            let (turn, _turn_events) =
+                client.turn_start(&thread.thread_id, &goal, !json, &mut on_notification)?;
             if json {
-                let mut events = protocol_events(thread_events);
-                events.extend(protocol_events(turn_events));
-                println!(
-                    "{}",
-                    json!({
-                        "thread": thread,
-                        "turn": turn,
-                        "events": events,
-                    })
-                );
+                println!("{}", json!({"summary": {"thread": thread, "turn": turn}}));
             }
             fail_for_failed_turn(&turn)?;
             Ok(())
@@ -106,11 +109,21 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             if !json {
                 println!("thread {thread_id}");
             }
-            let (turn, events) = client.turn_start(&thread_id, &instruction, !json)?;
+            let mut on_notification = |notification: &singularity_protocol::JsonRpcNotification| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(notification)
+                            .expect("notification serializes to JSON")
+                    );
+                }
+            };
+            let (turn, _events) =
+                client.turn_start(&thread_id, &instruction, !json, &mut on_notification)?;
             if json {
                 println!(
                     "{}",
-                    json!({"thread": {"threadId": thread_id}, "turn": turn, "events": protocol_events(events)})
+                    json!({"summary": {"thread": {"threadId": thread_id}, "turn": turn}})
                 );
             }
             fail_for_failed_turn(&turn)?;

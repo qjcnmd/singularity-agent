@@ -1,21 +1,17 @@
 //! CLI protocol event rendering and terminal projection.
 
 use super::*;
+#[cfg(test)]
 use singularity_protocol::{
     AgentDiagnosticParams, ProviderAttemptEventParams, ProviderAttemptSummaryParams,
-    ThreadEventParams, ToolExecutionEndParams, ToolExecutionStartParams, ToolExecutionUpdateParams,
-    Turn, TurnErrorParams, TurnEventParams, TurnStatus,
+    ToolExecutionEndParams, ToolExecutionStartParams, ToolExecutionUpdateParams, TurnErrorParams,
 };
-
-// 过滤并脱敏可公开渲染的协议事件。
-pub(super) fn protocol_events(messages: Vec<JsonRpcNotification>) -> Vec<Value> {
-    messages
-        .into_iter()
-        .filter_map(safe_protocol_event)
-        .collect()
-}
+use singularity_protocol::{ItemEventParams, ThreadEventParams, Turn, TurnEventParams, TurnStatus};
 
 // 将单条协议通知投影为约定事件字段，不透传未知 envelope 字段。
+// JSONL 模式下 CLI 直接输出原始 notification；本投影仅测试保留，作为
+// 稳定哨兵字段（threadId/turnId/isError/diagnostic）的过滤规则回归面。
+#[cfg(test)]
 pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
     let method = message.method;
     let output = match method.as_str() {
