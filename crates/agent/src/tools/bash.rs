@@ -386,13 +386,14 @@ impl ManagedChild {
         }
         #[cfg(unix)]
         {
-            let pid = self.child.id().to_string();
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // 负数 pid 定向 spawn 时绑定的独立进程组（process_group(0)），
+            // 直接经 libc 发信号，不依赖外部 kill 二进制与 PATH。
+            let pid = self.child.id() as i32;
+            #[allow(unsafe_code)]
+            // Unix 整树终止经 libc::kill 向进程组发 SIGKILL，与平台的底层能力一致。
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
         let _ = self.child.kill();
     }
