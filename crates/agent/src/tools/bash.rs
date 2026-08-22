@@ -489,14 +489,40 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
     }
 }
 
-/// 有界等待管道可读性（Windows：等待管道句柄可读或写端已关闭）。
+/// 有界等待管道可读性（Windows：`WaitForSingleObject` 对匿名管道句柄不是
+/// 可靠的可读信号——句柄并非可等待对象时调用直接失败，pump 将永远等不到
+/// 数据；改用 `PeekNamedPipe` 非破坏性查询待读字节与断开状态）。
 #[cfg(windows)]
-#[allow(unsafe_code)] // Windows 管道句柄等待与 JobObject 兜底一致，集中在此处。
+#[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
 fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    let wait_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-    unsafe { WaitForSingleObject(wait, wait_ms) == WAIT_OBJECT_0 }
+    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut available: u32 = 0;
+    let peek_result = unsafe {
+        let ok = PeekNamedPipe(
+            wait as _,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            &mut available,
+            core::ptr::null_mut(),
+        ) != 0;
+        if ok {
+            Ok(available)
+        } else {
+            Err(GetLastError())
+        }
+    };
+    match peek_result {
+        // 有待读字节：立即读取。
+        Ok(available) if available > 0 => return true,
+        // 写端已关闭或管道正在关闭：立即放行，由 read() 报告 EOF 或真实错误。
+        Err(error) if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA => return true,
+        _ => {}
+    }
+    // 无数据且未断开：按切片节奏轮询，保持 stop 标志的收敛语义。
+    thread::sleep(timeout);
+    false
 }
 
 /// 从管道读取字节流，过滤控制字符并按块发送至通道。
@@ -630,16 +656,26 @@ fn bash_shell_command(
 #[cfg(windows)]
 fn find_bash_on_windows() -> Option<String> {
     let mut candidates = Vec::new();
-    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
         if let Ok(program_files) = std::env::var(var) {
             candidates.push(format!("{program_files}\\Git\\bin\\bash.exe"));
         }
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(';') {
-            if !dir.is_empty() {
-                candidates.push(format!("{dir}\\bash.exe"));
+            if dir.is_empty() {
+                continue;
             }
+            let candidate = Path::new(dir).join("bash.exe");
+            // System32 下的 bash.exe 是 WSL 启动器存根：路径语义、进程模型与
+            // Unix shell 完全不同，且在无发行版/服务未运行的环境中静默无输出，
+            // 绝不能作为 bash 工具的执行后端。
+            if candidate.starts_with(std::env::var("SystemRoot").unwrap_or_default())
+                && candidate.ends_with("System32\\bash.exe")
+            {
+                continue;
+            }
+            candidates.push(candidate.display().to_string());
         }
     }
     candidates

@@ -1575,10 +1575,14 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
+    let tilde_count = joined.matches('~').count();
     assert_eq!(
-        joined.matches('~').count(),
+        tilde_count,
         singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
-        "exactly the file budget prefix reaches the model"
+        "exactly the file budget prefix reaches the model (joined_len={} head={:?} tail={:?})",
+        joined.len(),
+        &joined[..joined.len().min(60)],
+        &joined[joined.len().saturating_sub(60)..]
     );
     assert!(
         joined.contains("[warning] project instructions were truncated"),
