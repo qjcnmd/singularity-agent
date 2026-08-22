@@ -1,6 +1,6 @@
 # Singularity 仓库指令
 
-Singularity 是以 Rust 实现的、面向可靠 coding task 的最小 headless harness；CLI 是当前主要客户端，Desktop 通过同一核心能力接入。
+Singularity 是以 Rust 实现的、面向可靠 coding task 的最小 headless harness；一次性 CLI 是当前唯一客户端，交互式终端与 Desktop 是路线图内共用同一核心能力的客户端。
 
 ## 每个任务都适用
 
@@ -29,6 +29,12 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的最小 headless 
 - 理解仓库结构、查找定义/调用关系/影响面时，优先使用已配置的 `codebase-memory-mcp`（如 `search_graph`、`search_code`、`trace_path`、`get_code_snippet`）缩小范围；关键事实仍必须以当前源码、`rg`、Git 和可复现运行验证。
 - 检查图查询返回的 `total` 与 `has_more`，必要时分页或收窄查询；索引可能陈旧，代码图只是导航，不是事实源，也不要无目的输出完整仓库地图。
 - 每次成功创建 Git 提交后，调用 `index_repository` 使用当前工作树根目录的绝对路径刷新索引；索引失败不得回滚已验证提交，必须报告失败原因和当前索引状态。不要启用 `auto_watch`。
+
+### 评估基础设施
+
+- 行为回归评估套件位于 `C:\Users\Lenovo\Desktop\Singularity-Evaluator`（独立 git 仓库，不进入本仓库）：黑盒调用 `sg run <instruction> --model <model> --json`，以任务目录内的 `checker.sh` 判分，按模型汇总通过率、token、工具调用与耗时；`eval-config.json` 已配置专用测试模型。
+- 修改 AgentLoop、工具、提示词、输出截断、压缩或 Provider 链路等行为敏感层时，改动前后各跑一次对照，防止单元测试全绿但 Agent 实际变差；评估产生的模型调用花费不受限。
+- runner 依赖 `--json` 输出的终态汇总结构，本仓库改动 CLI 输出格式时必须同步更新评估器解析。评估失败的归因顺序见 docs/agents/provider-evaluation.md。
 
 ## 按需读取的项目指令
 
