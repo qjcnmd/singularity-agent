@@ -69,11 +69,12 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus, ModelProviderConfig,
-    ModelSelectorParts, ProviderConfigResolution, ProviderConfigSnapshot, ProviderConfigSource,
-    ProviderConfigurationStatus, UserConfigImportResult, UserModelCatalog, UserModelCatalogEntry,
-    UserProviderModelCatalog, import_env_to_user_config, read_user_model_catalog,
-    resolve_provider_config, split_model_selector,
+    AddProviderResult, ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus,
+    ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderConfigurationStatus, UserConfigImportResult, UserModelCatalog,
+    UserModelCatalogEntry, UserProviderModelCatalog, add_configured_provider,
+    discover_provider_model_ids, import_env_to_user_config, read_user_model_catalog,
+    refresh_model_metadata, resolve_provider_config, split_model_selector,
 };
 pub use error::*;
 pub use openai::{

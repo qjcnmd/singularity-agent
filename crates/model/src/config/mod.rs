@@ -18,9 +18,10 @@ pub use schema::{
 };
 pub(crate) use user::*;
 pub use user::{
-    ModelCacheStatus, ModelDiscoveryStatus, UserConfigImportResult, UserModelCatalog,
-    UserModelCatalogEntry, UserProviderModelCatalog, import_env_to_user_config,
-    read_user_model_catalog,
+    AddProviderResult, ModelCacheStatus, ModelDiscoveryStatus, UserConfigImportResult,
+    UserModelCatalog, UserModelCatalogEntry, UserProviderModelCatalog, add_configured_provider,
+    discover_provider_model_ids, import_env_to_user_config, read_user_model_catalog,
+    refresh_model_metadata,
 };
 
 use super::{
@@ -280,32 +281,24 @@ pub(crate) struct ResolvedProviderValues {
 }
 
 fn configured_model_from_user_file(
-    provider_name: &str,
-    model_name: &str,
     model_file: &UserConfigModel,
-    directory_limits: Option<ModelTokenLimits>,
 ) -> Result<ConfiguredModel, ProviderError> {
-    // 顶层字段为唯一权威；内置表与 models.dev 目录元数据依次兜底缺省的
-    // max_context_tokens/max_output_tokens，任一级命中即停。
+    // 运行时限额只取「持久化值 > 保守默认」：内置表与 models.dev 目录元数据
+    // 不再参与运行时解析（它们只作为 `config add` 录入时的 enrichment 兜底）。
     // api_protocol 必须由用户显式声明。
-    let builtin = super::builtin_models::builtin_model(provider_name, model_name);
-    let (Some(api_protocol), Some(max_output_tokens)) = (
-        model_file.api_protocol.as_deref(),
-        model_file
-            .max_output_tokens
-            .or_else(|| builtin.map(|entry| entry.max_output_tokens))
-            .or_else(|| directory_limits.map(|limits| limits.output)),
-    ) else {
+    let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
-            "model override is incomplete; api_protocol and max_output_tokens are required",
+            "model override is incomplete; api_protocol is required",
             "provider_configuration_invalid",
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
     let max_context_tokens = model_file
         .max_context_tokens
-        .or_else(|| builtin.map(|entry| entry.context_window))
-        .or_else(|| directory_limits.map(|limits| limits.context));
+        .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS);
+    let max_output_tokens = model_file
+        .max_output_tokens
+        .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS);
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = model_file
@@ -357,7 +350,7 @@ fn configured_model_from_user_file(
         ));
     }
     validate_catalog_limit(
-        max_context_tokens,
+        Some(max_context_tokens),
         "max_context_tokens",
         MAX_CONFIGURED_CONTEXT_TOKENS,
     )?;
@@ -366,7 +359,7 @@ fn configured_model_from_user_file(
         "max_output_tokens",
         MAX_CONFIGURED_OUTPUT_TOKENS,
     )?;
-    if max_context_tokens.is_some_and(|context| max_output_tokens >= context) {
+    if max_output_tokens >= max_context_tokens {
         return Err(configuration_error(
             "invalid model configuration: max_output_tokens must be smaller than max_context_tokens",
             "provider_configuration_invalid",
@@ -374,7 +367,7 @@ fn configured_model_from_user_file(
     }
     Ok(ConfiguredModel {
         protocol,
-        max_context_tokens,
+        max_context_tokens: Some(max_context_tokens),
         max_output_tokens,
         reasoning_variants,
         default_variant: model_file.default_variant.clone(),
@@ -403,9 +396,6 @@ where
             "provider_selector_invalid",
         )
     })?;
-    // 读路径只读本地元数据缓存，永不联网；缓存缺失或过期时目录为空，
-    // 能力解析保持与无第三级来源时相同的 fail closed 行为。
-    let metadata_directory = load_user_metadata_directory(&user_config.directory);
     let parsed_default = parse_model_selector(&default_model)?;
     let default_provider_name = user_config
         .config
@@ -450,7 +440,6 @@ where
             return Err(error);
         }
         let mut models = BTreeMap::new();
-        let endpoint_host = http_endpoint_host(&provider_file.base_url);
         for (model_name, model_file) in &provider_file.models {
             if let Err(error) = validate_model_id(model_name, "model id") {
                 if provider_name.as_str() == default_provider_name
@@ -460,14 +449,7 @@ where
                 }
                 continue;
             }
-            let directory_limits =
-                metadata_directory.limits_for(provider_name, model_name, endpoint_host.as_deref());
-            match configured_model_from_user_file(
-                provider_name,
-                model_name,
-                model_file,
-                directory_limits,
-            ) {
+            match configured_model_from_user_file(model_file) {
                 Ok(model) => {
                     models.insert(model_name.clone(), model);
                 }

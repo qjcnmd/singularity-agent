@@ -47,29 +47,15 @@ sg config import-env --file C:\path\to\.env
 sg config models
 ```
 
-运行时不会自动读取项目 `.env`。只要当前进程中出现任一 provider 变量，Singularity 就只使用该进程环境层；否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
+运行时不会自动读取项目 `.env`。只要当前进程中出现任一 provider 变量，Singularity 就只使用该进程环境层；否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。doctor 只显示脱敏的 present/missing 状态。
 
-需要为当前进程临时提供一份完整的多-provider 配置时，可以设置 `SINGULARITY_MODELS_CONFIG` 指向 JSON 文件；该进程环境层会整体覆盖用户级默认配置。该文件只保存环境变量名，不保存密钥；`default_model` 和 thread 的 `--model`/`thread.start.model` 都使用完整的 `provider_id/model_id`：
+新 provider 一次录入并自动发现模型：
 
-```json
-{
-  "default_model": "opencode-go/deepseek-v4-flash",
-  "providers": {
-    "opencode-go": {
-      "adapter": "openai_compatible",
-      "base_url": "https://opencode.ai/zen/go/v1",
-      "api_key_env": "OPENCODE_API_KEY",
-      "models": {
-        "deepseek-v4-flash": {
-          "api_protocol": "chat",
-          "max_context_tokens": 1000000,
-          "max_output_tokens": 384000
-        }
-      }
-    }
-  }
-}
+```powershell
+sg config add opencode-go https://opencode.ai/zen/go/v1 --api-key <your-key>
 ```
+
+该命令校验端点 → 请求 `GET {base_url}/models` 发现模型 id → 用 models.dev 目录元数据（缺失时内置模型表）补齐 context/output 限额，仍未命中回落保守默认 → 把 provider 与限额写入 `%USERPROFILE%\.singularity\config.json` 的 `providers` 段、密钥写入 `auth.v1.json`，并把默认选择指向新 provider 的首个模型。模型限额也可直接手写进 config.json（`.singularity` 内的普通 JSON，同目录两个文件由 CLI 写入时各自原子改名落盘）；带 `#variant` 的默认选择、`reasoning_variants` 与协议要求见下。
 
 配置在 app-server 进程启动时只捕获一次；provider、model、协议和 limits 在一个 turn 内保持不变。每个模型必须明确写 `chat` 或 `responses`，不会根据 URL 推断或跨协议 fallback；model id 不在 allowlist、provider 不存在或 selector 不是 `provider_id/model_id` 时 fail closed。
 

@@ -89,6 +89,15 @@ enum ConfigCommand {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Add a provider once: validate, discover /models, persist config.json
+    /// providers and auth.v1.json. `--api-key` or SINGULARITY_API_KEY
+    /// supplies the credentials.
+    Add {
+        name: String,
+        base_url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

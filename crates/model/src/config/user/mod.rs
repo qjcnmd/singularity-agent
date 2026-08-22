@@ -3,11 +3,15 @@
 //! User config and auth remain one lifecycle: read, validate, and atomically
 //! publish through the parent module's single source of truth.
 
+pub(crate) mod add;
 pub(crate) mod auth;
 pub(crate) mod catalog;
 pub(crate) mod import;
 pub(crate) mod metadata;
 
+pub use add::{
+    AddProviderResult, add_configured_provider, discover_provider_model_ids, refresh_model_metadata,
+};
 pub(crate) use auth::*;
 #[cfg(test)]
 pub(crate) use catalog::load_models_cache;
@@ -18,7 +22,6 @@ pub use catalog::{
 #[cfg(test)]
 pub(crate) use import::parse_import_model_selector;
 pub use import::{UserConfigImportResult, import_env_to_user_config};
-pub(crate) use metadata::{ModelTokenLimits, http_endpoint_host, load_user_metadata_directory};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

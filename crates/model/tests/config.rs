@@ -1118,13 +1118,14 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
     )
     .expect("unknown-context payload JSON");
     assert_eq!(payload["model"], "model");
+    // 未持久化窗口的模型由保守默认兜底，不发明具体窗口值。
     assert_eq!(
         snapshot
             .provider()
             .expect("default provider")
             .protocol_contract()
             .max_context_tokens,
-        None
+        Some(DEFAULT_MAX_CONTEXT_TOKENS)
     );
 }
 
@@ -1532,4 +1533,123 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
         singularity_model::ModelDiscoveryStatus::Fresh
     );
     drop(_process_env);
+}
+
+#[test]
+fn add_configured_provider_persists_config_auth_and_becomes_default() {
+    let home = tempdir().expect("home directory");
+    let _process_env = install_process_env("SINGULARITY_HOME", home.path());
+    let result = singularity_model::add_configured_provider(
+        "opencode-go",
+        "https://provider.example/v1",
+        "test-key-placeholder",
+        vec!["deepseek-v4-flash".to_string(), "new-model".to_string()],
+    )
+    .expect("add provider persists");
+    assert_eq!(result.provider_name, "opencode-go");
+    assert_eq!(
+        result.default_selector.as_deref(),
+        Some("opencode-go/deepseek-v4-flash")
+    );
+    assert_eq!(result.models_written, 2);
+
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("config.json")).expect("config file"),
+    )
+    .expect("config json");
+    assert_eq!(config["default_provider"], "opencode-go");
+    assert_eq!(config["default_model"], "opencode-go/deepseek-v4-flash");
+    // 内置表 enrichment：deepseek-v4-flash 走 responses 协议与内置限额。
+    let deepseek = &config["providers"]["opencode-go"]["models"]["deepseek-v4-flash"];
+    assert_eq!(deepseek["api_protocol"], "responses");
+    assert_eq!(deepseek["max_context_tokens"], 1_000_000);
+    assert_eq!(deepseek["max_output_tokens"], 384_000);
+    // 未知模型回落保守默认。
+    let new_model = &config["providers"]["opencode-go"]["models"]["new-model"];
+    assert_eq!(new_model["api_protocol"], "chat");
+    assert_eq!(new_model["max_context_tokens"], DEFAULT_MAX_CONTEXT_TOKENS);
+    assert_eq!(new_model["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("auth.v1.json")).expect("auth file"),
+    )
+    .expect("auth json");
+    assert_eq!(
+        auth["providers"]["opencode-go"]["api_key"],
+        "test-key-placeholder"
+    );
+}
+
+#[test]
+fn add_configured_provider_merges_with_existing_config_keeping_default() {
+    let home = tempdir().expect("home directory");
+    let _process_env = install_process_env("SINGULARITY_HOME", home.path());
+    let env_path = home.path().join(".env");
+    std::fs::write(
+        &env_path,
+        "SINGULARITY_BASE_URL=https://first.example/v1\nSINGULARITY_API_KEY=first-key\nSINGULARITY_MODEL=first-model\n",
+    )
+    .expect("dotenv");
+    singularity_model::import_env_to_user_config(Some(&env_path)).expect("import first provider");
+    singularity_model::add_configured_provider(
+        "second",
+        "https://second.example/v1",
+        "second-key",
+        vec!["second-model".to_string()],
+    )
+    .expect("add second provider");
+
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join("config.json")).expect("config"),
+    )
+    .expect("json");
+    assert_eq!(
+        config["default_model"], "openai_compatible/first-model",
+        "an existing default must be preserved"
+    );
+    assert!(config["providers"]["second"]["models"]["second-model"].is_object());
+}
+
+#[test]
+fn add_configured_provider_rejects_invalid_input() {
+    let home = tempdir().expect("home directory");
+    let _process_env = install_process_env("SINGULARITY_HOME", home.path());
+    singularity_model::add_configured_provider(
+        "bad name!",
+        "https://provider.example/v1",
+        "key",
+        vec!["model".to_string()],
+    )
+    .expect_err("invalid provider name rejected");
+    let error = singularity_model::add_configured_provider(
+        "valid",
+        "not a url",
+        "key",
+        vec!["model".to_string()],
+    )
+    .expect_err("invalid base url rejected");
+    assert!(
+        error.message.contains("SINGULARITY_BASE_URL") || error.message.contains("endpoint"),
+        "unexpected message: {}",
+        error.message
+    );
+    let error = singularity_model::add_configured_provider(
+        "valid",
+        "https://provider.example/v1",
+        "key",
+        vec![],
+    )
+    .expect_err("empty model list rejected");
+    assert!(error.message.contains("no model ids"));
+}
+
+#[test]
+fn discover_provider_model_ids_queries_the_models_endpoint() {
+    let (base_url, _) = models_server(
+        r#"{"object":"list","data":[{"id":"alpha"},{"id":"beta"},{"id":"alpha"},{"id":123}]}"#
+            .to_string(),
+    );
+    let ids = singularity_model::discover_provider_model_ids(&base_url, "test-key-placeholder")
+        .expect("discover ids");
+    assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
 }

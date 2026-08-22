@@ -2,6 +2,9 @@
 
 use super::*;
 use crate::client::app_server_bin;
+use singularity_model::{
+    add_configured_provider, discover_provider_model_ids, refresh_model_metadata,
+};
 use singularity_protocol::ProviderConfigurationStatus;
 
 fn print_readiness() -> Result<(), String> {
@@ -199,6 +202,36 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
                     result.default_selector.as_deref().unwrap_or("none")
                 );
                 println!("selectable={}", result.selectable);
+                Ok(())
+            }
+            ConfigCommand::Add {
+                name,
+                base_url,
+                api_key,
+            } => {
+                let api_key = api_key
+                    .or_else(|| std::env::var("SINGULARITY_API_KEY").ok())
+                    .ok_or_else(|| {
+                        "an api key is required: pass --api-key or set SINGULARITY_API_KEY"
+                            .to_string()
+                    })?;
+                refresh_model_metadata();
+                let model_ids = discover_provider_model_ids(&base_url, &api_key)
+                    .map_err(|error| format!("failed to discover provider models: {error}"))?;
+                println!("discovered_models={}", model_ids.len());
+                for model_id in &model_ids {
+                    println!("discovered_model={model_id}");
+                }
+                let result = add_configured_provider(&name, &base_url, &api_key, model_ids)
+                    .map_err(|error| format!("failed to persist provider config: {error}"))?;
+                println!("config_path={}", result.config_path);
+                println!("auth_path={}", result.auth_path);
+                println!("provider={}", result.provider_name);
+                println!(
+                    "default_selector={}",
+                    result.default_selector.as_deref().unwrap_or("none")
+                );
+                println!("models_written={}", result.models_written);
                 Ok(())
             }
         },
