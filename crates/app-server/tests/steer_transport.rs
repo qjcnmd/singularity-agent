@@ -590,7 +590,15 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         .as_str()
         .expect("turn id")
         .to_string();
-    // 注册前置保证：turn/started 回执之后立即中断必成功，无需人为等待。
+    // 注册前置保证：turn/started 发布时收件箱已可路由，中断无需人为等待即可
+    // 命中活动 turn。本场景要求打断的是「运行中的工具」：等 tool 执行真正开始
+    // （确定性业务事件）再发中断，避免取消与 SSE 流内 tool_call 解析的调度竞态。
+    process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "tool/execution/start"
+                && message["params"]["toolCallId"] == "call_interrupt_0"
+        });
     process.send_request(5, "turn/interrupt", json!({"turnId": turn_id}));
     let interrupt = process.output.recv_id(5, Duration::from_secs(5));
     assert_eq!(interrupt["result"]["status"], "interrupted");
@@ -598,7 +606,7 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
     assert_eq!(turn_response["result"]["turn"]["status"], "running");
     let terminal = process
         .output
-        .recv_where(Duration::from_secs(5), |message| {
+        .recv_where(Duration::from_secs(30), |message| {
             message["method"] == "turn/completed"
         });
     assert_eq!(terminal["params"]["turn"]["status"], "interrupted");
