@@ -87,78 +87,6 @@ pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Valu
     json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
 }
 
-/// 不透明游标的版本化编码前缀；未知前缀按无效参数拒绝。
-const TURN_CURSOR_PREFIX: &str = "sg1t";
-
-/// 游标内部只编码 turn 边界的物理位置，客户端必须原样回传。
-fn encode_turn_cursor(index: usize) -> String {
-    format!("{TURN_CURSOR_PREFIX}{index}")
-}
-
-fn decode_turn_cursor(raw: &str) -> Option<usize> {
-    raw.strip_prefix(TURN_CURSOR_PREFIX)?.parse::<usize>().ok()
-}
-
-/// 在物理轮次序列上选取一页。
-///
-/// `is_survivor` 标记 kinds 过滤后的候选位置；`anchor` 为包含语义的物理
-/// 下标（来自游标），缺省时 asc 从最旧端、desc 从最新端开始。扫描沿物理
-/// 顺序推进并收集幸存者直到填满 limit 或耗尽，因此被过滤掉的轮次不占用
-/// 每页配额。返回升序的页内物理下标、同方向续页锚点（已越过本页远端，
-/// 耗尽为 None）与反向锚点（本页远端轮次，供相反方向包含式重读；空页为
-/// None）。
-pub(crate) fn select_turn_page(
-    physical_len: usize,
-    is_survivor: impl Fn(usize) -> bool,
-    direction: HistorySortDirection,
-    limit: usize,
-    anchor: Option<usize>,
-) -> (Vec<usize>, Option<usize>, Option<usize>) {
-    let mut selected = Vec::new();
-    if physical_len == 0 || limit == 0 {
-        return (selected, None, None);
-    }
-    match direction {
-        HistorySortDirection::Asc => {
-            let mut index = anchor.unwrap_or(0);
-            while index < physical_len && selected.len() < limit {
-                if is_survivor(index) {
-                    selected.push(index);
-                }
-                index += 1;
-            }
-            // 扫描耗尽时（含恰好填满的情况）不再发放续页锚点。
-            let next = ((index < physical_len && selected.len() == limit)
-                && (index..physical_len).any(&is_survivor))
-            .then_some(index);
-            let backwards = selected.last().copied();
-            (selected, next, backwards)
-        }
-        HistorySortDirection::Desc => {
-            let mut index = anchor.unwrap_or(physical_len - 1);
-            loop {
-                if selected.len() == limit {
-                    break;
-                }
-                if is_survivor(index) {
-                    selected.push(index);
-                }
-                if index == 0 {
-                    selected.reverse();
-                    let backwards = selected.first().copied();
-                    return (selected, None, backwards);
-                }
-                index -= 1;
-            }
-            let next = (0..=index).any(&is_survivor).then_some(index);
-            selected.reverse();
-            // 反转后升序；desc 页的远端是本页最旧一轮，即升序首元素。
-            let backwards = selected.first().copied();
-            (selected, next, backwards)
-        }
-    }
-}
-
 impl AppServer {
     /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
@@ -252,7 +180,6 @@ impl AppServer {
                 json_response(message.required_id(), singularity_protocol::EmptyResult {})
             }
             Method::ThreadList => self.thread_list(message),
-            Method::ThreadResume => self.thread_resume(message),
             Method::ThreadStart => self.thread_start(message),
             Method::SessionRead => self.session_read(message),
             Method::SessionDelete => self.session_delete(message),
@@ -260,7 +187,7 @@ impl AppServer {
             Method::TurnStart => self.turn_start(message),
             Method::TurnSteer => self.turn_steer(message),
             Method::TurnFollowUp => self.turn_follow_up(message),
-            Method::AgentCapability => self.agent_capability(message),
+            Method::ProviderStatus => self.provider_status(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
@@ -309,29 +236,6 @@ impl AppServer {
         ])
     }
 
-    pub(super) fn thread_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = parse_params(&message)?;
-        let record = match self.store.get_session(&params.thread_id) {
-            Ok(record) => record,
-            Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let session = self.open_and_repair_session_for_thread(&thread_from_record(&record))?;
-        if session.path() != Path::new(&record.rollout_path) {
-            return invalid_state_response(message.required_id(), SAFE_WORKSPACE_FAILURE);
-        }
-        let record = self.store.get_session(&params.thread_id)?;
-        // resume 在目标会话打开时完成一次幂等 repair；继续操作仍追加新 turn。
-        json_response(
-            message.required_id(),
-            ThreadResult {
-                thread: self.project_thread(&record),
-            },
-        )
-    }
-
     pub(super) fn thread_settings(
         &mut self,
         message: JsonRpcMessage,
@@ -339,7 +243,7 @@ impl AppServer {
         let params: ThreadSettingsParams = parse_params(&message)?;
         let record = match self.store.get_session(&params.thread_id) {
             Ok(record) => record,
-            Err(StoreError::NotFound(_)) => {
+            Err(SessionIndexError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
@@ -454,24 +358,9 @@ impl AppServer {
         if !(1..=200).contains(&params.limit) {
             return invalid_params_response(message.required_id());
         }
-        if params.kinds.iter().any(|kind| {
-            !matches!(
-                kind.as_str(),
-                "message"
-                    | "thinking"
-                    | "tool_call"
-                    | "tool_result"
-                    | "turn"
-                    | "settings"
-                    | "usage"
-                    | "compaction"
-            )
-        }) {
-            return invalid_params_response(message.required_id());
-        }
         let record = match self.store.get_session(&params.session_id) {
             Ok(record) => record,
-            Err(StoreError::NotFound(_)) => {
+            Err(SessionIndexError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
@@ -480,8 +369,8 @@ impl AppServer {
         let read = repository
             .read(&record.session_id)
             .map_err(AppServerError::Session)?;
-        // 与 thread/list、thread/resume 复用同一 last-turn 投影，
-        // 三个读取接口不得显示互相矛盾的状态。
+        // 与 thread/list 复用同一 last-turn 投影，
+        // 两个读取接口不得显示互相矛盾的状态。
         let overall_status = self.project_thread(&record).last_turn_status;
         let mut turns = project_turn_history(&read.entries);
         // 整体状态一致性：末组 running 只有在整体 active（存在存活 turn）
@@ -493,50 +382,23 @@ impl AppServer {
         {
             turns.last_mut().expect("checked above").status = Some(TurnStatus::Interrupted);
         }
-        // 先过滤后分页：kinds 命中轮内条目，`turn` 命中轮次本身；
-        // 未命中过滤的轮次不进入候选序列，也不占用每页配额。
-        let mut survivor = vec![false; turns.len()];
-        for (index, turn) in turns.iter_mut().enumerate() {
-            turn.items.retain(|item| {
-                params.kinds.is_empty() || params.kinds.iter().any(|kind| kind == item.kind())
-            });
-            survivor[index] = params.kinds.is_empty()
-                || (turn.turn_id.is_some() && params.kinds.iter().any(|kind| kind == "turn"))
-                || !turn.items.is_empty();
-        }
-        let direction = params.sort_direction.unwrap_or(HistorySortDirection::Desc);
-        // 无效或越界游标一律按 invalid params 拒绝，不静默钳位。
-        let anchor = match params.cursor.as_deref() {
+        // 单向往回读分页：默认取最新 limit 轮；给 beforeItem（上一页最旧轮内
+        // 任意 item 的公开 id）则定位其所属轮，返回该轮之前的 limit 轮。
+        let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
+        let before_index = match params.before_item.as_deref() {
             None => None,
-            Some(raw) => match decode_turn_cursor(raw) {
-                Some(index) if index < turns.len() => Some(index),
-                _ => return invalid_params_response(message.required_id()),
+            Some(anchor) => match turns
+                .iter()
+                .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
+            {
+                Some(index) => Some(index),
+                None => return invalid_params_response(message.required_id()),
             },
         };
-        let (page_indices, next_anchor, backwards_anchor) = select_turn_page(
-            turns.len(),
-            |index| survivor[index],
-            direction,
-            params.limit as usize,
-            anchor,
-        );
-        let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
-        let detail = params.detail.unwrap_or(TurnDetail::Full);
-        let page: Vec<usize> = page_indices.into_iter().collect();
-        let page_turns = turns
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| page.binary_search(index).is_ok())
-            .map(|(_, turn)| {
-                if detail == TurnDetail::Summary {
-                    return SessionTurn {
-                        items: Vec::new(),
-                        ..turn
-                    };
-                }
-                turn
-            })
-            .collect();
+        let page_start = before_index
+            .unwrap_or(turns.len())
+            .saturating_sub(params.limit as usize);
+        let page_end = before_index.unwrap_or(turns.len());
         json_response(
             message.required_id(),
             SessionReadResult {
@@ -549,10 +411,8 @@ impl AppServer {
                 updated_at: record.updated_at,
                 token_usage: record.token_usage,
                 summary: read.summary,
-                turns: page_turns,
+                turns: turns[page_start..page_end].to_vec(),
                 total_turns,
-                next_cursor: next_anchor.map(encode_turn_cursor),
-                backwards_cursor: backwards_anchor.map(encode_turn_cursor),
             },
         )
     }
@@ -564,7 +424,7 @@ impl AppServer {
         let params: SessionIdParams = parse_params(&message)?;
         let record = match self.store.get_session(&params.session_id) {
             Ok(record) => record,
-            Err(StoreError::NotFound(_)) => {
+            Err(SessionIndexError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
@@ -583,13 +443,9 @@ impl AppServer {
         if turn_active {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
-        // 打开并校验 rollout header 后再进入可恢复删除；不能先永久删 JSONL。
+        // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。
         let _session = self.open_session_for_thread(&thread_from_record(&record))?;
-        let _left_tombstone = crate::delete::delete_session_with_faults(
-            &record,
-            &self.store,
-            crate::delete::DeleteFaults::default(),
-        )?;
+        crate::delete::delete_session(&record, &self.store)?;
         json_response(
             message.required_id(),
             SessionDeleteResult {

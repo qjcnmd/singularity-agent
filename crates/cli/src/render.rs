@@ -18,7 +18,7 @@ pub(super) fn protocol_events(messages: Vec<JsonRpcNotification>) -> Vec<Value> 
 // 将单条协议通知投影为约定事件字段，不透传未知 envelope 字段。
 pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
     let method = message.method;
-    let mut output = match method.as_str() {
+    let output = match method.as_str() {
         "thread/started" => {
             let params =
                 serde_json::from_value::<ThreadEventParams>(message.params.clone()).ok()?;
@@ -172,14 +172,6 @@ pub(super) fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value>
         }
         _ => Some(json!({"method": method})),
     }?;
-    if let Some(event) = message
-        .params
-        .get("event")
-        .and_then(|value| serde_json::from_value::<EventMetadata>(value.clone()).ok())
-        .and_then(|metadata| serde_json::to_value(metadata).ok())
-    {
-        output["event"] = event;
-    }
     Some(output)
 }
 

@@ -8,7 +8,9 @@ mod delete;
 mod dispatch;
 mod events;
 mod lifecycle;
+mod owner_only;
 pub mod paths;
+mod session_index;
 mod state;
 
 use std::collections::HashMap;
@@ -29,20 +31,20 @@ use singularity_core::{
 };
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::{
-    AgentCapabilityResult, AppEvent, EventClass, EventDelivery, EventMetadata, HistoryItem,
-    HistorySortDirection, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
+    AppEvent, HistoryItem, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
     MethodKind, ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult,
-    SessionIdParams, SessionReadParams, SessionReadResult, SessionTurn, Thread, ThreadIdParams,
-    ThreadListResult, ThreadResult, ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams,
-    ThreadStartResult, ThreadStatus, Turn, TurnDetail, TurnIdParams, TurnInjectionParams,
-    TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStartResult, TurnStatus,
-};
-use singularity_store::{
-    SessionMetadataUpdate, SessionRecord, SessionStatus, SessionStore, StoreError,
-    ensure_owner_only_file, now_iso,
+    SessionIdParams, SessionReadParams, SessionReadResult, SessionTurn, Thread, ThreadListResult,
+    ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus,
+    Turn, TurnIdParams, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
+    TurnStartParams, TurnStartResult, TurnStatus,
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+pub(crate) use owner_only::ensure_owner_only_file;
+pub use session_index::{
+    SessionIndex, SessionIndexError, SessionMetadataUpdate, SessionRecord, SessionStatus, now_iso,
+};
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
 const TURN_NOT_FOUND: &str = "Turn not found";
@@ -60,7 +62,7 @@ pub enum AppServerError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
     #[error("store error: {0}")]
-    Store(#[from] StoreError),
+    Store(#[from] SessionIndexError),
     #[error("session error: {0}")]
     Session(#[from] SessionError),
     #[error("project instructions error: {0}")]
@@ -247,9 +249,8 @@ pub type AppServerOutput = Value;
 
 use events::AssistantItemEventState;
 use events::project_turn_history;
-pub use paths::rebuild_session_index_from_jsonl;
 pub use paths::thread_from_record;
-use paths::{canonical_thread_cwd, refresh_session_index_from_open_session, workspace_path};
+use paths::{canonical_thread_cwd, workspace_path};
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 
 #[cfg(test)]

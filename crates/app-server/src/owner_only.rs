@@ -2,21 +2,22 @@
 //!
 //! 在 Unix 系统上通过文件模式（0700 目录 / 0600 文件）限制仅当前属主用户具备读写权限。
 
-use super::*;
 use std::path::Path;
 
-pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
+use super::session_index::SessionIndexResult;
+
+pub fn ensure_owner_only_dir(path: &Path) -> SessionIndexResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            StoreError::InvalidState(format!(
+            SessionIndexError::InvalidState(format!(
                 "cannot inspect owner-only dir {}: {error}",
                 path.display()
             ))
         })?;
         if !metadata.is_dir() {
-            return Err(StoreError::InvalidState(format!(
+            return Err(SessionIndexError::InvalidState(format!(
                 "owner-only path is not a directory: {}",
                 path.display()
             )));
@@ -24,7 +25,7 @@ pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
         if metadata.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
                 |error| {
-                    StoreError::InvalidState(format!(
+                    SessionIndexError::InvalidState(format!(
                         "cannot restrict owner-only dir {}: {error}",
                         path.display()
                     ))
@@ -45,18 +46,18 @@ pub fn ensure_owner_only_dir(path: &Path) -> StoreResult<()> {
     }
 }
 
-pub fn ensure_owner_only_file(path: &Path) -> StoreResult<()> {
+pub fn ensure_owner_only_file(path: &Path) -> SessionIndexResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            StoreError::InvalidState(format!(
+            SessionIndexError::InvalidState(format!(
                 "cannot inspect owner-only file {}: {error}",
                 path.display()
             ))
         })?;
         if !metadata.is_file() {
-            return Err(StoreError::InvalidState(format!(
+            return Err(SessionIndexError::InvalidState(format!(
                 "owner-only path is not a regular file: {}",
                 path.display()
             )));
@@ -64,7 +65,7 @@ pub fn ensure_owner_only_file(path: &Path) -> StoreResult<()> {
         if metadata.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
                 |error| {
-                    StoreError::InvalidState(format!(
+                    SessionIndexError::InvalidState(format!(
                         "cannot restrict owner-only file {}: {error}",
                         path.display()
                     ))

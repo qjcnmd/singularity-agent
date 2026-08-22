@@ -1,4 +1,4 @@
-//! Event delivery metadata and lifecycle event projection.
+//! Lifecycle event projection.
 //!
 //! stdio 单连接传输下事件随请求响应全量发送；协议中不存在 `event/subscribe`
 //! 或订阅状态，客户端把 matching response 之前的 notification 关联到本次请求。
@@ -55,15 +55,6 @@ impl AssistantItemEventState {
             .iter()
             .filter_map(|(id, terminal)| (!*terminal).then_some(id.clone()))
             .collect()
-    }
-}
-
-fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery) {
-    match event.method.as_str() {
-        "item/agentMessage/delta" | "agent/diagnostic" | "provider/attempt" => {
-            (EventClass::Progress, EventDelivery::BestEffort)
-        }
-        _ => (EventClass::State, EventDelivery::Reliable),
     }
 }
 
@@ -249,7 +240,7 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<SessionTurn>
 }
 
 impl AppServer {
-    /// 将应用事件包装为带类型化元数据的 JSON-RPC notification。
+    /// 将应用事件包装为 JSON-RPC notification。
     pub(super) fn event_notification(&self, event: AppEvent) -> AppServerResult<Value> {
         if self.consume_terminal_event_failure(&event.method) {
             return Err(AppServerError::TurnExecution {
@@ -258,10 +249,7 @@ impl AppServer {
                 original: Some(format!("injected terminal event failure: {}", event.method)),
             });
         }
-        let (class, delivery) = event_contract(&event);
-        Ok(event
-            .to_notification_with_metadata(EventMetadata { class, delivery })
-            .to_wire_value())
+        Ok(event.to_notification().to_wire_value())
     }
 
     /// 仅在 realtime item 已经出现过时构造脱敏失败事件。

@@ -7,9 +7,7 @@ use serde_json::{Value, json};
 use singularity_model::{import_env_to_user_config, read_user_model_catalog};
 #[cfg(test)]
 use singularity_protocol::SessionTurn;
-use singularity_protocol::{
-    EventMetadata, HistoryItem, ItemEventParams, JsonRpcNotification, SessionReadResult,
-};
+use singularity_protocol::{HistoryItem, ItemEventParams, JsonRpcNotification, SessionReadResult};
 
 mod client;
 mod commands;
@@ -147,8 +145,6 @@ mod tests {
                     .collect(),
             }],
             total_turns: 0,
-            next_cursor: None,
-            backwards_cursor: None,
         }
     }
 

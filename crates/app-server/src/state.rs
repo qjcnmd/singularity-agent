@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicUsize;
 
 /// 协调 session 索引、信任和活动 turn 的有状态 JSON-RPC 服务。
 pub struct AppServer {
-    pub(super) store: SessionStore,
+    pub(super) store: Arc<SessionIndex>,
     pub(super) sessions_dir: PathBuf,
     pub(super) initialized: bool,
     pub(super) initialized_acknowledged: bool,
@@ -97,12 +97,12 @@ impl Drop for ActiveTurnGuard {
 }
 
 impl AppServer {
-    pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
+    pub fn new(store: SessionIndex, provider_snapshot: ProviderConfigSnapshot) -> Self {
         let sessions_dir = user_singularity_home()
             .map(|home| home.join(paths::SESSIONS_DIR_NAME))
             .unwrap_or_else(|| PathBuf::from(".singularity/sessions"));
         Self {
-            store,
+            store: Arc::new(store),
             sessions_dir,
             initialized: false,
             initialized_acknowledged: false,
@@ -188,7 +188,7 @@ impl AppServer {
         &self.sessions_dir
     }
 
-    pub fn store(&self) -> &SessionStore {
+    pub fn store(&self) -> &SessionIndex {
         &self.store
     }
 
@@ -213,10 +213,10 @@ impl AppServer {
         }
     }
 
-    /// 为单一 turn 工作线程打开独立索引连接，同时共享停止与注入状态。
+    /// 为单一 turn 工作线程共享同一会话索引，同时共享停止与注入状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
-            store: self.store.trusted_reopen()?,
+            store: Arc::clone(&self.store),
             sessions_dir: self.sessions_dir.clone(),
             initialized: true,
             initialized_acknowledged: true,
@@ -348,11 +348,13 @@ impl AppServer {
         self.session_opens.fetch_add(1, Ordering::SeqCst);
         let session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
         if session.session_id() != record.session_id {
-            return Err(AppServerError::Store(StoreError::InvalidState(format!(
-                "rollout header id {} does not match index session id {}",
-                session.session_id(),
-                record.session_id
-            ))));
+            return Err(AppServerError::Store(SessionIndexError::InvalidState(
+                format!(
+                    "rollout header id {} does not match index session id {}",
+                    session.session_id(),
+                    record.session_id
+                ),
+            )));
         }
         Ok(session)
     }
@@ -368,7 +370,7 @@ impl AppServer {
         session
             .repair_orphaned_tool_calls()
             .map_err(AppServerError::Session)?;
-        refresh_session_index_from_open_session(&self.store, &session)?;
+        self.store.refresh_from_open_session(&session)?;
         Ok(session)
     }
 
@@ -387,7 +389,7 @@ impl AppServer {
             SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Interrupted
         ) && self.consume_terminal_metadata_failure()
         {
-            return Err(AppServerError::Store(StoreError::InvalidState(
+            return Err(AppServerError::Store(SessionIndexError::InvalidState(
                 "injected terminal metadata failure".to_string(),
             )));
         }

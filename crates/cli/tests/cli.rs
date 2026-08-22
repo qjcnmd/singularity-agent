@@ -10,13 +10,12 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use support::{
-    FakeAppServer as RawFakeAppServer, Scenario as RawScenario, agent_loop_capability,
-    capture_params, capture_request, exit, print_stderr, sleep_ms, thread as raw_fake_thread,
-    turn as fake_turn, write_pid, write_text,
+    FakeAppServer as RawFakeAppServer, Scenario as RawScenario, capture_params, capture_request,
+    exit, print_stderr, provider_status, sleep_ms, thread as raw_fake_thread, turn as fake_turn,
+    write_pid, write_text,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
-const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 /// CLI 测试用 fake app-server 只讲 stdio JSON-RPC；CLI 默认走 TCP，故测试显式回退到 stdio。
 const APP_SERVER_TRANSPORT_ENV: &str = "SINGULARITY_APP_SERVER_TRANSPORT";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
@@ -77,10 +76,7 @@ impl Scenario {
     }
 
     fn agent_loop_ready(self) -> Self {
-        self.respond(
-            "agent/capability",
-            agent_loop_capability(true, "completed", "enabled", &[]),
-        )
+        self.respond("provider/status", provider_status(true, false))
     }
 
     fn shutdown(self) -> Self {
@@ -229,7 +225,6 @@ fn cli_run_continue_threads_and_doctor_use_app_server_protocol() {
                     respond(json!({"thread": thread.clone()})),
                 ],
             )
-            .respond("thread/resume", json!({"thread": thread.clone()}))
             .respond("thread/list", json!({"threads": [thread]}))
             .interaction(
                 "turn/start",
@@ -584,23 +579,15 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
         Scenario::new()
             .initialized()
             .respond(
-                "agent/capability",
+                "provider/status",
                 json!({
-                    "agentLoop": {
-                        "available": true,
-                        "status": "completed",
-                        "reason": "enabled",
-                        "blockers": [],
-                    },
-                    "providerConfiguration": {
-                        "source": "process_env",
-                        "snapshotId": "provider_snapshot_cli_test",
-                        "configured": false,
-                        "configurationBlocker": "required_env_missing",
-                        "apiKeyPresent": false,
-                        "baseUrlPresent": true,
-                        "modelPresent": false,
-                    },
+                    "source": "process_env",
+                    "snapshotId": "provider_snapshot_cli_test",
+                    "configured": false,
+                    "configurationBlocker": "required_env_missing",
+                    "apiKeyPresent": false,
+                    "baseUrlPresent": true,
+                    "modelPresent": false,
                 }),
             )
             .shutdown(),
@@ -633,7 +620,6 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
 #[test]
 fn cli_prefers_sibling_app_server_over_path_lookup() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
     let fake_path_dir = temp.path().join("fake-path");
     std::fs::create_dir(&fake_path_dir).expect("fake path dir");
     let stale_server = FakeAppServer::new(
@@ -656,10 +642,9 @@ fn cli_prefers_sibling_app_server_over_path_lookup() {
     let output = command
         .args(["config", "doctor"])
         .env_remove(APP_SERVER_BIN_ENV)
-        .env(APP_SERVER_DB_ENV, &db_path)
         .env("PATH", path)
-        // 真实 app-server 即使使用显式 DB，启动时仍会 resolve/prepare
-        // SINGULARITY_HOME；测试必须隔离，绝不能触碰真实用户凭据/索引。
+        // 真实 app-server 即使使用显式配置，启动时仍会 resolve/prepare
+        // SINGULARITY_HOME；测试必须隔离，绝不能触碰真实用户凭据。
         .env("SINGULARITY_HOME", temp.path().join("home"))
         .output()
         .expect("doctor cli");
@@ -1278,10 +1263,6 @@ fn cli_continue_shows_actionable_nonterminal_turn_hint() {
         Scenario::new()
             .initialized()
             .agent_loop_ready()
-            .respond(
-                "thread/resume",
-                json!({"thread": fake_thread("thread_fake")}),
-            )
             .error(
                 "turn/start",
                 JSON_RPC_SERVER_ERROR_CODE,
@@ -1346,20 +1327,18 @@ fn cli_requests_server_shutdown_before_process_teardown() {
     );
 }
 
-// 验证 continue 只恢复 thread 并发送新输入，不上传历史。
+// 验证 continue 不再调用 thread/resume：只发送新输入，不上传历史。
 #[test]
-fn cli_continue_resumes_thread_and_does_not_upload_history() {
+fn cli_continue_skips_thread_resume_and_does_not_upload_history() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let method_trace = temp.path().join("methods.log");
     let turn_params = temp.path().join("turn-params.json");
-    let thread = fake_thread("thread_resume");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
             .agent_loop_ready()
-            .respond("thread/resume", json!({"thread": thread}))
             .interaction(
                 "turn/start",
                 vec![
@@ -1384,7 +1363,10 @@ fn cli_continue_resumes_thread_and_does_not_upload_history() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     let methods = std::fs::read_to_string(method_trace).expect("method trace");
-    assert!(methods.contains("thread/resume"));
+    assert!(
+        !methods.contains("thread/resume"),
+        "continue must not issue thread/resume; methods={methods}"
+    );
     assert!(!methods.contains("thread/read"));
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(turn_params).expect("turn params"))
@@ -1400,14 +1382,12 @@ fn cli_continue_forwards_model_and_projects_json_result() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let params_path = temp.path().join("thread-settings-params.json");
-    let thread = fake_thread("thread_continue_json");
     let turn = fake_turn("turn_continue_json", "thread_continue_json", "completed");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
             .agent_loop_ready()
-            .respond("thread/resume", json!({"thread": thread}))
             .interaction(
                 "thread/settings",
                 vec![
@@ -1459,11 +1439,7 @@ fn cli_continue_rejects_invalid_thread_id_through_app_server() {
         Scenario::new()
             .initialized()
             .agent_loop_ready()
-            .error(
-                "thread/resume",
-                JSON_RPC_SERVER_ERROR_CODE,
-                "Thread not found",
-            )
+            .error("turn/start", JSON_RPC_SERVER_ERROR_CODE, "Thread not found")
             .shutdown(),
     );
 
@@ -1687,20 +1663,17 @@ fn cli_manifest_does_not_depend_on_core_runtime_crates() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = std::fs::read_to_string(manifest_path).expect("read cli manifest");
 
-    for forbidden in ["singularity_agent", "singularity_store"] {
-        assert!(
-            !manifest.contains(forbidden),
-            "cli must not depend directly on {forbidden}"
-        );
-    }
+    assert!(
+        !manifest.contains("singularity_agent"),
+        "cli must not depend directly on singularity_agent"
+    );
     assert!(manifest.contains("singularity_protocol"));
 }
 
 // 构造指向指定 app-server 和数据库的 CLI 命令。
-fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Command {
+fn cli_with_app_server(app_server_bin: &str, _db_path: &std::path::Path) -> Command {
     let mut command = Command::cargo_bin("sg").expect("binary");
     command.env(APP_SERVER_BIN_ENV, app_server_bin);
-    command.env(APP_SERVER_DB_ENV, db_path);
     // 测试使用 stdio fake app-server；显式选择 stdio 承载，避免默认 TCP 连接失败。
     command.env(APP_SERVER_TRANSPORT_ENV, "stdio");
     command
@@ -1715,14 +1688,13 @@ fn cli_with_fake_app_server(fake_server: &FakeAppServer, db_path: &Path) -> Comm
 
 fn spawn_cli_with_fake_app_server(
     fake_server: &FakeAppServer,
-    db_path: &Path,
+    _db_path: &Path,
     args: &[&str],
 ) -> std::process::Child {
     let mut command = ProcessCommand::new(assert_cmd::cargo::cargo_bin("sg"));
     command
         .args(args)
         .env(APP_SERVER_BIN_ENV, path_str(fake_server.binary()))
-        .env(APP_SERVER_DB_ENV, db_path)
         .env(APP_SERVER_TRANSPORT_ENV, "stdio")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

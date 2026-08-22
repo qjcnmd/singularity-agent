@@ -80,25 +80,17 @@ fn injection_and_session_read_params_are_bounded_by_registry() {
     let read = json!({"sessionId":"session-id"});
     let params: SessionReadParams = serde_json::from_value(read).expect("session read params");
     assert_eq!(params.limit, 20);
-    assert_eq!(params.cursor, None);
-    assert_eq!(params.sort_direction, None);
-    assert_eq!(params.detail, None);
-    assert!(params.kinds.is_empty());
+    assert_eq!(params.before_item, None);
     let explicit: SessionReadParams = serde_json::from_value(json!({
         "sessionId":"session-id",
-        "cursor":"sg1t3",
         "limit":5,
-        "sortDirection":"asc",
-        "detail":"summary",
-        "kinds":["message","turn"]
+        "beforeItem":"entry:item"
     }))
     .expect("explicit session read params");
     let wire = serde_json::to_value(&explicit).expect("serialize session read params");
     assert_eq!(wire["sessionId"], "session-id");
-    assert_eq!(wire["cursor"], "sg1t3");
-    assert_eq!(wire["sortDirection"], "asc");
-    assert_eq!(wire["detail"], "summary");
-    assert_eq!(wire["kinds"][0], "message");
+    assert_eq!(wire["limit"], 5);
+    assert_eq!(wire["beforeItem"], "entry:item");
     assert!(
         Method::SessionRead
             .spec()
@@ -124,7 +116,6 @@ fn method_registry_keeps_only_converged_methods() {
         "initialized",
         "thread/list",
         "thread/start",
-        "thread/resume",
         "thread/settings",
         "session/read",
         "session/delete",
@@ -132,7 +123,7 @@ fn method_registry_keeps_only_converged_methods() {
         "turn/steer",
         "turn/followUp",
         "turn/interrupt",
-        "agent/capability",
+        "provider/status",
         "server/shutdown",
     ] {
         assert!(
@@ -349,15 +340,4 @@ fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
     assert_eq!(summary.method(), "provider/attempt/summary");
     assert_eq!(summary_params.attempt_count, 2);
     assert_eq!(summary_params.latency_ms, 20);
-}
-
-#[test]
-fn event_metadata_has_no_gap_variant() {
-    let state = serde_json::to_value(singularity_protocol::EventClass::State).unwrap();
-    assert_eq!(state, "state");
-    let progress = serde_json::to_value(singularity_protocol::EventClass::Progress).unwrap();
-    assert_eq!(progress, "progress");
-
-    assert!(serde_json::from_str::<singularity_protocol::EventClass>("\"gap\"").is_err());
-    assert!(serde_json::from_str::<singularity_protocol::EventDelivery>("\"gap\"").is_err());
 }

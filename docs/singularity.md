@@ -6,7 +6,7 @@
 
 ## 1. 总览与进程架构（图 a）
 
-采用清晰的进程分层模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，单客户端连接可长驻，连接内支持多 session 并发 turn worker 与单 output writer）+ 全部客户端走同一协议。会话正文由 JSONL 持久化，SQLite 只保存轻量索引投影；运行时只保留当前连接所需的活动句柄和有界终态引用。关闭连接时广播执行停止，满队列输出会在停止信号下有界退出，所有 turn worker 在进程退出前由 transport 持有并 join。
+采用清晰的进程分层模式：单一 **headless core 库**（无进程/UI 假设）+ 瘦身 **app-server**（stdio JSON-RPC transport，单客户端连接可长驻，连接内支持多 session 并发 turn worker 与单 output writer）+ 全部客户端走同一协议。会话正文由 JSONL 持久化（唯一权威），进程内会话索引只缓存定位与展示元数据、启动时从 JSONL 重建；运行时只保留当前连接所需的活动句柄和有界终态引用。关闭连接时广播执行停止，满队列输出会在停止信号下有界退出，所有 turn worker 在进程退出前由 transport 持有并 join。
 
 - **headless core**：
   - `AgentLoop`（核心执行循环）：双层循环状态机，持有单一原子 `TurnInbox`、输入/终态事实聚合与诊断事件派发；
@@ -20,11 +20,11 @@
   - stdio JSON-RPC transport（16 MiB 帧上限、单一有界输出 writer、按序分发）；
   - 分离的执行管道：stdio frame reader 持续读取，普通状态请求由唯一 `AppServer` owner 串行处理，实时控制请求（`turn/interrupt`、`turn/steer`、`turn/followUp`）通过窄 control lane 即时派发到活动 turn 句柄；
   - `lifecycle`：`runner` 负责 turn worker 启动与事件桥接，`terminal` 负责 durable terminalization 与 fail-stop 终态收敛；
-  - `state_paths`：SQLite 索引路径与 state 目录的解析、准备与安全校验（拒绝仓库内 home 与非安全路径）；
+  - `state_paths`：state 目录的解析、准备与安全校验（拒绝仓库内 home 与非安全路径）；
   - 命令/事件协议包含 thread/turn/item 生命周期、公开 history projection、settings、usage、`agent/diagnostic` 与 `provider/attempt` 遥测。
 - **传输**：CLI 每次命令启动独立 **stdio app-server 子进程**；Desktop 可保持一个长驻 stdio 连接并在同一进程中执行多轮、并发运行不同 session 的 turn、切换设置、取消和重连。没有 TCP daemon、cursor/gap replay 或独立 Desktop UI。
 - **客户端**：`sg` CLI（一次性 stdio 子进程客户端，支持信号拦截优雅中断与 JSON 事件类型化投影）；Desktop 接入复用同一协议、配置和会话。
-- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1.json`（私有认证单文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`，SQLite 仅保存 `~/.singularity/index.sqlite3` 中的轻量索引。
+- **共享事实**：`%USERPROFILE%\.singularity\config.json`（全局配置单一事实源）；`~/.singularity/auth.v1.json`（私有认证单文件，Unix 0600，Windows 继承目录 ACL）；会话 JSONL 为 `~/.singularity/sessions/<uuid>.jsonl`（唯一持久事实源），会话索引为进程内缓存、不落盘。
 - **依赖方向**：客户端只依赖协议层与 core；产品 crate 绝不依赖 evaluation。
 
 ```mermaid
@@ -45,8 +45,6 @@ flowchart LR
     end
     CFG[("~/.singularity/config.json<br/>全局配置单一事实源")]
     SES[("~/.singularity/sessions/<uuid>.jsonl<br/>JSONL 会话（唯一权威正文）")]
-
-    IDX[("~/.singularity/index.sqlite3<br/>会话元数据索引")]
     CLI -->|"spawn stdio 子进程"| Svr
     Dsk -->|"同一协议"| Svr
     Svr --> Core
@@ -58,7 +56,6 @@ flowchart LR
     Loop --> PV
     CP --> SM
     SM --> SES
-    Svr --> IDX
     RL --> CFG
     PV --> CFG
 ```
@@ -67,7 +64,7 @@ flowchart LR
 
 ## 2. 主调用链（图 b）
 
-`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → 严格握手（initialize 仅 `clientInfo` 并拒绝未知字段 / initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入索引）→ `turn/start`（持久化 `turn_started` metadata 与 active 索引，立即返回 `Running` 状态响应）→ 后台 AgentLoop 运行 → core 逐层加载项目指令（root→cwd）与历史（buildContextEntries）→ provider 调用和工具事件（携带显式 `threadId` 与 `turnId`）实时流式回传客户端 → 终态消息、terminal metadata、usage 追加到 JSONL → SQLite 更新索引 → 发布 item/turn 终态通知（`turn/completed` 或 `turn/error`）。CLI 与客户端根据匹配的 `(threadId, turnId)` 等待终端通知以决定渲染与退出码。`sg continue` 和 Desktop 重连都通过索引定位并重开既有会话文件，继续操作追加新 turn。
+`sg run <goal>` 完整链路：spawn 独立 app-server stdio 子进程 → 严格握手（initialize 仅 `clientInfo` 并拒绝未知字段 / initialized）→ `thread/start`（创建 `~/.singularity/sessions/<uuid>.jsonl` 并写入会话索引）→ `turn/start`（持久化 `turn_started` metadata 与 active 索引，立即返回 `Running` 状态响应）→ 后台 AgentLoop 运行 → core 逐层加载项目指令（root→cwd）与历史（buildContextEntries）→ provider 调用和工具事件（携带显式 `threadId` 与 `turnId`）实时流式回传客户端 → 终态消息、terminal metadata、usage 追加到 JSONL → 更新进程内会话索引 → 发布 item/turn 终态通知（`turn/completed` 或 `turn/error`）。CLI 与客户端根据匹配的 `(threadId, turnId)` 等待终端通知以决定渲染与退出码。`sg continue` 和 Desktop 重连都通过索引定位并重开既有会话文件，继续操作追加新 turn。
 
 ```mermaid
 sequenceDiagram
@@ -81,7 +78,7 @@ sequenceDiagram
     CLI->>S: thread/start {cwd, model}
     CLI->>S: turn/start {goal}
     S->>F: turn_started metadata
-    S->>S: 更新 SQLite running 投影
+    S->>S: 更新进程内索引 running 投影
     S-->>CLI: turn/started 通知 + turn/start running 响应
     Note over S,C: AgentLoop 在后台异步执行
     S->>C: run(goal)
@@ -94,7 +91,7 @@ sequenceDiagram
         S-->>CLI: 事件流（实时渲染）
     end
     C->>F: turn terminal + usage metadata (JSONL 优先)
-    S->>S: 更新 SQLite terminal 投影
+    S->>S: 更新进程内索引 terminal 投影
     S-->>CLI: item terminal + turn terminal 通知 (turn/completed 或 turn/error)
 ```
 
@@ -177,10 +174,10 @@ flowchart TD
 
 ## 5. Session 持久化与恢复（图 e）
 
-会话格式采用干净的 **version: 1** 格式：JSONL 严格线性序列，每个 entry 有 `id` 与 `timestamp`，条目的物理顺序即事实源顺序；不提供 branch/tree 语义，**不写 `parentId`**（旧格式文件作废硬切），重复 id、未知字段（含 `parentId`）与中间 header 一律严格拒绝。消息 role 仅包含 user / assistant / toolResult，另有 compaction 和不进入模型上下文的 metadata entry（`turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`、`thread_settings`、`usage`）。**会话 JSONL 是唯一持久事实源**。SQLite `session_index` 只保存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage 等轻量投影，不保存对话正文。
+会话格式采用干净的 **version: 1** 格式：JSONL 严格线性序列，每个 entry 有 `id` 与 `timestamp`，条目的物理顺序即事实源顺序；不提供 branch/tree 语义，**不写 `parentId`**（旧格式文件作废硬切），重复 id、未知字段（含 `parentId`）与中间 header 一律严格拒绝。消息 role 仅包含 user / assistant / toolResult，另有 compaction 和不进入模型上下文的 metadata entry（`turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`、`thread_settings`、`usage`）。**会话 JSONL 是唯一持久事实源**。进程内会话索引只缓存 session_id/rollout_path/cwd/title/model/status/created_at/updated_at/token_usage 等轻量投影，不保存对话正文，也不落盘（启动时从 sessions 目录重建）。
 
 - **单写者追加**：一轮 turn 只打开一次 `SessionManager` 并独占贯穿全程（开始标记 → 对话 → 工具 → 压缩 → 终态 → 用量）；`activate_turn` 保证同一会话至多一个存活写者（D-005）。append 基于内存态直接校验（行长/文件字节/条目数）并落盘，不做跨写者增量尾部合并；会话重开与崩溃恢复仍走有界解析与 repair。
-- **持久化发布次序与 Fail-Stop 合同**：终态发布顺序固定为 **durable JSONL metadata → SQLite 索引更新 → 公开终态通知**。当 turn terminal metadata 经有界重试后仍无法持久化时，**绝不发布任何虚假的 turn terminal event**；立即发出连接级致命存储诊断并终止 app-server 连接/进程，由重连后的 JSONL 恢复路径收敛状态。
+- **持久化发布次序与 Fail-Stop 合同**：终态发布顺序固定为 **durable JSONL metadata → 进程内索引更新 → 公开终态通知**。当 turn terminal metadata 经有界重试后仍无法持久化时，**绝不发布任何虚假的 turn terminal event**；立即发出连接级致命存储诊断并终止 app-server 连接/进程，由重连后的 JSONL 恢复路径收敛状态。
 - **崩溃恢复与 Orphan ToolResult**：重开文件时，未终态的 `turn_started` 追加 synthetic `turn_interrupted`；孤立的 assistant tool call 在文件尾部追加 synthetic failed ToolResult（`[previous execution outcome unknown; do not retry]`），绝不重新执行工具，保证 Provider 观察到的序列严格为 `assistant tool call → failed ToolResult → new user message`。
 
 ```mermaid
@@ -188,7 +185,7 @@ flowchart TD
     A(["turn 达到终态"]) --> B["append 锁内增量校验并写入 JSONL<br/>(turn terminal + usage)"]
     B --> C{"JSONL 写入成功?"}
     C -- 否 --> FAILSTOP["Fail-Stop: 发送 fatal 存储诊断<br/>不发 turn 终态通知<br/>断开连接待恢复"]
-    C -- 是 --> D["更新 SQLite 投影"]
+    C -- 是 --> D["更新进程内索引投影"]
     D --> E["发布 turn terminal 通知<br/>(turn/completed 或 turn/error)"]
     E --> F["进程退出 / 重启恢复"]
     F --> G["重开会话文件<br/>(增量校验或完整 repair)"]
@@ -284,7 +281,7 @@ sequenceDiagram
 
 ## 10. 配置与项目指令
 
-**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件为单一 `~/.singularity/auth.v1.json`，导入流程为写临时文件后同卷原子改名；Unix 上设为 0600，Windows 上继承目录 ACL。config 与 models 的模型条目不接受 `capabilities` 块，出现即按未知字段拒绝；能力以顶层字段为唯一权威。会话目录 `~/.singularity/sessions/`、索引 `~/.singularity/index.sqlite3` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
+**配置单一事实源**：`%USERPROFILE%\.singularity\config.json`（全局）+ 进程环境层（`SINGULARITY_MODELS_CONFIG` 等）；providers / models / 默认设置全部在此，CLI 与桌面端读同一文件。进程启动时捕获一次配置快照。私有认证文件为单一 `~/.singularity/auth.v1.json`，导入流程为写临时文件后同卷原子改名；Unix 上设为 0600，Windows 上继承目录 ACL。config 与 models 的模型条目不接受 `capabilities` 块，出现即按未知字段拒绝；能力以顶层字段为唯一权威。会话目录 `~/.singularity/sessions/` 与备份目录 `~/.singularity/backups/` 同理（Unix 0700/0600，Windows 继承目录 ACL）。
 
 **资源加载**：`AGENTS.md` 逐层加载（root→cwd），无 trust 门控。按 root→cwd 顺序逐层收集项目指令文件 `AGENTS.md`，合并后经 developer→system→user role adaptation seam 注入，不修改 user goal；单文件 ≤ 32 KiB、合并总计 ≤ 64 KiB 预算，超预算按预算截断纳入前缀并向模型追加截断尾注，同时向客户端发 `agent/diagnostic`（warning, `project_instructions_truncated`）；真 I/O 错误仍使 turn/start 失败。无 override 或 sha2 额外结构。
 
@@ -301,13 +298,13 @@ sequenceDiagram
 - **双管道调度**：stdio reader 将消息分类为 ordinary request 与 realtime turn control。普通状态请求排入单 owner 队列按序处理；`turn/interrupt`、`turn/steer`、`turn/followUp` 通过共享活动 turn 句柄即时处理，不被耗时的普通请求阻塞。所有响应与事件统一通过单一有界 output writer 发送。
 - **turn lane 就绪点**：`ready_for_turn` 在 initialize 请求处理完成（回执已写出）后置位，置位动作发生在 ordinary 处理任务内部、响应写出之后（同一任务内的先后序构成 happens-before）；客户端收到 initialize 回执即可立即发送 `turn/start` 进入流式 turn lane。`initialized` 通知继续把守 ordinary 门禁：initialize 与 initialized 均未完成前，落入普通管线的请求返回 not_initialized。
 - **注册前置发布**：`turn/start` 仅在打开会话、构建 Provider/Agent、注册 steer/followUp 收件箱全部成功后，才落盘 `turn_started` 并发布 `turn/started` 与 running 响应；收到 `turn/started` 后立即 steer/followUp 必成功。准备阶段失败则 turn/start 直接回错误响应，不产生任何 turn 痕迹。
-- **session/read 分页**：历史读取以 turn 为单位组织返回（`turns[]` + `totalTurns`），参数为 `cursor`/`limit`（1..=200）/`sortDirection`（asc|desc）/`detail`（summary|full）/`kinds`；不透明游标 `nextCursor`/`backwardsCursor` 支持双向翻页，无效或越界游标按 invalid params 拒绝；kinds 过滤先于分页（被过滤轮不占页配额），`turn` kind 命中轮次本身；页内轮次恒按会话顺序排列，首个 turn 标记前落盘的前导条目归入无身份前导组（turnId/status 为 null）。
+- **session/read 分页**：历史读取以 turn 为单位组织返回（`turns[]` + `totalTurns`），参数为 `sessionId`/`limit`（1..=200）/`beforeItem?`——默认返回最新 `limit` 轮；给 `beforeItem`（上一页最旧轮内任意公开 item id）则返回其所属轮之前的 `limit` 轮（覆盖"上滚加载更早"），未知锚点按 invalid params 拒绝。页内轮次恒按会话顺序排列，首个 turn 标记前落盘的前导条目归入无身份前导组（turnId/status 为 null）。
 - **终态与回执形态**：协议 `Turn` 只携带单一 `status`；`turn/interrupt` 回执直接给出目标终态 `interrupted`；`turn/steer`/`turn/followUp` 响应为 `TurnInjectionResult{turn}`；item 引用以 camelCase `itemId` 暴露；`tool/execution/end` 仅在 result 内保留一处 `isError`。
 - **CLI 信号处理与优雅退出**：第一次收到 Ctrl+C 信号时，CLI 发送 `turn/interrupt` 请求，停止接收新输入，继续读取并排空 terminal events，等待 app-server 子进程有界退出并返回常规 interrupted 退出码；第二次 Ctrl+C 强制退出。
 - **CLI Session Reference**：`sg run --session-reference <id>` 将历史会话投影为 untrusted reference 文本；每个生成段落（header、summary、transcript、role line、current-request heading）各占一行，未信任内容中的换行折叠为字面量 `⏎`，统一受控于 16 KiB 与 4096-token 硬上限。
 
 **命令与事件集**：
-- 命令：`initialize`、`initialized`、`agent/capability`、`thread/start`、`thread/list`、`thread/resume`、`thread/settings`、`session/read`、`session/delete`、`turn/start`、`turn/steer`、`turn/followUp`、`turn/interrupt`、`server/shutdown`；
+- 命令：`initialize`、`initialized`、`provider/status`、`thread/start`、`thread/list`、`thread/settings`、`session/read`、`session/delete`、`turn/start`、`turn/steer`、`turn/followUp`、`turn/interrupt`、`server/shutdown`；
 - 生命周期与执行事件：`thread/started`、`turn/started`、`item/started`、`item/agentMessage/delta`、`item/completed`、`item/failed`、`turn/completed`、`turn/error`、`tool/execution/start`、`tool/execution/update`、`tool/execution/end`；
 - 遥测与诊断事件：`agent/diagnostic`（结构化非致命告警）、`provider/attempt`（类型化 attempt 进度）、`provider/attempt/summary`（终态聚合）。
 
@@ -332,7 +329,7 @@ sequenceDiagram
 
 - 流式期间的消息 delta 不落盘；终态 user/assistant/toolResult/compaction 消息各追加一行，turn lifecycle/settings/usage 作为 metadata 追加到同一 JSONL。
 - turn 启动时当前 user 消息立即写盘（先于第一次模型请求），进程崩溃后重开会话可看到该 user 消息。
-- `turn_started` 在 SQLite active 投影和 `turn/started` 通知之前写盘；terminal metadata 与 usage 在 SQLite 终态投影和终态通知之前写盘。assistant tool-call 消息与其 toolResult 配对写盘；崩溃造成孤立 tool call 时，可写恢复路径先补 synthetic failed ToolResult（unknown / do not retry），不重写原条目、不重新执行工具。metadata 永远不进入模型 context。
+- `turn_started` 在进程内索引 active 投影和 `turn/started` 通知之前写盘；terminal metadata 与 usage 在进程内索引终态投影和终态通知之前写盘。assistant tool-call 消息与其 toolResult 配对写盘；崩溃造成孤立 tool call 时，可写恢复路径先补 synthetic failed ToolResult（unknown / do not retry），不重写原条目、不重新执行工具。metadata 永远不进入模型 context。
 
 ### 12.4 错误码与错误合同
 

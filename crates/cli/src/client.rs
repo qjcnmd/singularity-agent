@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AgentCapabilityResult, EmptyParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId,
-    JsonRpcMessage, JsonRpcNotification, Method, RpcMethod, SessionDeleteResult, SessionIdParams,
-    SessionReadParams, SessionReadResult, Thread, ThreadIdParams, ThreadSettingsParams,
+    EmptyParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId, JsonRpcMessage,
+    JsonRpcNotification, Method, ProviderConfigurationStatus, RpcMethod, SessionDeleteResult,
+    SessionIdParams, SessionReadParams, SessionReadResult, Thread, ThreadSettingsParams,
     ThreadStartParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams, TurnStatus,
     rpc_methods,
 };
@@ -26,7 +26,6 @@ use singularity_protocol::{
 use crate::render::should_render_assistant_summary;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
-const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity CLI";
@@ -228,15 +227,6 @@ pub(super) fn app_server_bin() -> Result<String, String> {
         })
 }
 
-pub(super) fn app_server_db_display() -> String {
-    if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
-        return db;
-    }
-    singularity_core::user_singularity_home()
-        .map(|home| home.join("index.sqlite3").to_string_lossy().to_string())
-        .unwrap_or_else(|| "~/.singularity/index.sqlite3".to_string())
-}
-
 fn sibling_app_server_bin() -> Option<std::path::PathBuf> {
     let mut path = std::env::current_exe().ok()?;
     path.pop();
@@ -406,9 +396,6 @@ impl AppServerClient {
     pub(super) fn spawn() -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
-        if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
-            command.env(APP_SERVER_DB_ENV, db);
-        }
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start app-server: {error}"))?;
@@ -456,14 +443,6 @@ impl AppServerClient {
         Ok((reply.result.thread, reply.notifications))
     }
 
-    // 恢复现有 thread，不向 app-server 上传历史。
-    pub(super) fn thread_resume(&mut self, thread_id: &str) -> Result<Thread, String> {
-        let reply = self.request::<rpc_methods::ThreadResume>(&ThreadIdParams {
-            thread_id: thread_id.to_string(),
-        })?;
-        Ok(reply.result.thread)
-    }
-
     pub(super) fn thread_settings(
         &mut self,
         thread_id: &str,
@@ -481,9 +460,9 @@ impl AppServerClient {
         Ok(())
     }
 
-    // 读取 AgentLoop capability 快照。
-    pub(super) fn agent_capability(&mut self) -> Result<AgentCapabilityResult, String> {
-        let reply = self.request::<rpc_methods::AgentCapability>(&EmptyParams::default())?;
+    // 读取脱敏的 provider 配置状态。
+    pub(super) fn provider_status(&mut self) -> Result<ProviderConfigurationStatus, String> {
+        let reply = self.request::<rpc_methods::ProviderStatus>(&EmptyParams::default())?;
         Ok(reply.result)
     }
 
@@ -520,11 +499,8 @@ impl AppServerClient {
     ) -> Result<SessionReadResult, String> {
         let reply = self.request::<rpc_methods::SessionRead>(&SessionReadParams {
             session_id: session_id.to_string(),
-            cursor: None,
             limit: limit.unwrap_or(20),
-            sort_direction: None,
-            detail: None,
-            kinds: Vec::new(),
+            before_item: None,
         })?;
         Ok(reply.result)
     }
@@ -554,14 +530,6 @@ impl AppServerClient {
         match result.summary {
             Some(summary) => println!("summary {summary}"),
             None => println!("summary none"),
-        }
-        match result.next_cursor {
-            Some(cursor) => println!("next_cursor {cursor}"),
-            None => println!("next_cursor none"),
-        }
-        match result.backwards_cursor {
-            Some(cursor) => println!("backwards_cursor {cursor}"),
-            None => println!("backwards_cursor none"),
         }
         for turn in &result.turns {
             let turn_id = turn.turn_id.as_deref().unwrap_or("none");

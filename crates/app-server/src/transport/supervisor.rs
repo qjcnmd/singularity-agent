@@ -9,8 +9,6 @@ use singularity_app_server::{
 };
 use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{JsonRpcInbound, JsonRpcMessage, Method, parse_json_rpc_payload};
-use singularity_store::SessionStore;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -19,14 +17,9 @@ use tokio::sync::mpsc;
 
 /// 在单一 Tokio runtime 内运行 stdio app-server 控制面。
 pub(crate) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
-    // 未设置 SINGULARITY_APP_SERVER_DB 时由 initialize_app_server 使用
-    // AppPaths::resolve() 的用户目录 index.sqlite3；这里不再保留旧的
-    // 项目目录 `.singularity/rust-app-server.sqlite3` 默认路径。
-    let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB").unwrap_or_default();
     run_with_io(
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
-        configured_db_path,
         runtime_handle,
     )
     .await
@@ -36,18 +29,15 @@ pub(crate) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
 async fn run_with_io<R, W>(
     reader: R,
     writer: W,
-    configured_db_path: String,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), String>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let server = tokio::task::spawn_blocking(move || {
-        initialize_app_server(&configured_db_path, runtime_handle)
-    })
-    .await
-    .map_err(|error| format!("app-server startup task failed: {error}"))??;
+    let server = tokio::task::spawn_blocking(move || initialize_app_server(runtime_handle))
+        .await
+        .map_err(|error| format!("app-server startup task failed: {error}"))??;
     run_server_with_io(server, reader, writer).await
 }
 
@@ -379,10 +369,7 @@ where
     }
 }
 
-fn initialize_app_server(
-    configured_db_path: &str,
-    runtime_handle: tokio::runtime::Handle,
-) -> Result<AppServer, String> {
+fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppServer, String> {
     // 显式 SINGULARITY_HOME 时，先于任何目录创建校验其不在当前仓库内
     // （model 层配置校验的启动期第一道防线；违规 fail closed）。
     if std::env::var_os("SINGULARITY_HOME").is_some() {
@@ -392,35 +379,14 @@ fn initialize_app_server(
     }
     let paths = singularity_app_server::paths::AppPaths::resolve()?;
     paths.prepare()?;
-    let db_path = if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
-        prepare_app_server_state_paths(configured_db_path)?
-    } else {
-        paths
-            .index_path
-            .to_str()
-            .map(str::to_string)
-            .ok_or_else(|| SAFE_FILE_BACKED_STATE_REQUIRED.to_string())?
-    };
-    let store = SessionStore::open_with_initialization(&db_path, |store| {
-        singularity_app_server::rebuild_session_index_from_jsonl(store, &paths.sessions_dir)
-            .map_err(|error| {
-                singularity_store::StoreError::InvalidState(format!(
-                    "failed to rebuild app-server session index: {error}"
-                ))
-            })
-    })
-    .map_err(|error| format!("failed to open app-server index {db_path}: {error}"))?;
-    // 收紧本次实际打开并创建的索引文件权限（在 Unix 系统上应用 0600/0700 权限）。
-    if std::env::var_os("SINGULARITY_APP_SERVER_DB").is_some() {
-        singularity_store::ensure_owner_only_file(Path::new(&db_path)).map_err(|error| {
-            format!("failed to enforce owner-only app-server index {db_path}: {error}")
-        })?;
-    } else {
-        paths.ensure_index_owner_only()?;
-    }
+    // 进程内会话索引：启动时从 sessions 目录的 JSONL rollout 重建（JSONL 是
+    // 唯一持久事实源，索引不落盘）。
+    let session_index =
+        singularity_app_server::SessionIndex::from_sessions_dir(&paths.sessions_dir)
+            .map_err(|error| format!("failed to scan app-server session index: {error}"))?;
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), runtime_handle);
-    Ok(AppServer::new(store, provider_snapshot).with_sessions_dir(paths.sessions_dir))
+    Ok(AppServer::new(session_index, provider_snapshot).with_sessions_dir(paths.sessions_dir))
 }
 
 /// 判断单请求是否需要后台 turn worker。
@@ -433,7 +399,7 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
 }
 
 /// 三个活动 turn 控制请求走独立 lane；它们只触碰 active-turn maps，
-/// 不读取 SessionStore，也不等待 ordinary owner。
+/// 不读取会话索引，也不等待 ordinary owner。
 fn is_turn_control(message: &JsonRpcMessage) -> bool {
     matches!(
         message.method_name(),
@@ -446,7 +412,7 @@ fn is_turn_control(message: &JsonRpcMessage) -> bool {
 }
 
 /// 唯一 ordinary AppServer owner。输入 reader 只把普通请求排入有界队列；
-/// 此任务按到达顺序处理队列并持有该 owner 的 SQLite 连接。
+/// 此任务按到达顺序处理队列并持有该 owner 的会话索引。
 async fn run_ordinary_dispatch(
     mut server: AppServer,
     mut requests: mpsc::Receiver<JsonRpcMessage>,

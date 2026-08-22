@@ -106,12 +106,9 @@ impl Scenario {
         self.respond("initialize", initialize_result())
     }
 
-    /// 添加已完成且无 blocker 的 AgentLoop capability 响应。
+    /// 添加标准的脱敏 provider 状态响应。
     pub fn agent_loop_ready(self) -> Self {
-        self.respond(
-            "agent/capability",
-            agent_loop_capability(true, "completed", "enabled", &[]),
-        )
+        self.respond("provider/status", provider_status(true, false))
     }
 
     /// 添加 server/shutdown 响应并使 fake 进程退出。
@@ -204,29 +201,16 @@ pub fn initialize_result() -> Value {
     json!({"userAgent": "fake", "platformFamily": "local", "platformOs": "test"})
 }
 
-/// 构造带 AgentLoop 与 provider capability 的响应对象。
-pub fn agent_loop_capability(
-    available: bool,
-    status: &str,
-    reason: &str,
-    blockers: &[&str],
-) -> Value {
+/// 构造脱敏的 provider 配置状态响应对象。
+pub fn provider_status(configured: bool, model_present: bool) -> Value {
     json!({
-        "agentLoop": {
-            "available": available,
-            "status": status,
-            "reason": reason,
-            "blockers": blockers,
-        },
-        "providerConfiguration": {
-            "source": "process_env",
-            "snapshotId": "provider_snapshot_fake_server",
-            "configured": true,
-            "configurationBlocker": null,
-            "apiKeyPresent": true,
-            "baseUrlPresent": true,
-            "modelPresent": true,
-        }
+        "source": "process_env",
+        "snapshotId": "provider_snapshot_fake_server",
+        "configured": configured,
+        "configurationBlocker": null,
+        "apiKeyPresent": true,
+        "baseUrlPresent": true,
+        "modelPresent": model_present,
     })
 }
 

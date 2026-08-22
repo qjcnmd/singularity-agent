@@ -1,14 +1,13 @@
 use super::framing::read_bounded_line_with_limit;
 use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
-use crate::state_paths::{
-    FILE_BACKED_STORE_REQUIRED, ensure_home_outside_repo, resolve_app_server_state_paths,
-};
+use crate::state_paths::ensure_home_outside_repo;
 use serde_json::{Value, json};
 use singularity_agent::agent::AgentError;
 use singularity_agent::session::{SessionManager, SessionMetadataKind};
 use singularity_app_server::{
-    AppServer, AppServerCancellationHandle, AppServerError, TurnFailureCause, TurnFailureStage,
+    AppServer, AppServerCancellationHandle, AppServerError, SessionIndex, SessionIndexError,
+    SessionRecord, TurnFailureCause, TurnFailureStage,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -16,7 +15,6 @@ use singularity_model::{
     ProviderProtocolContract,
 };
 use singularity_protocol::{JsonRpcId, JsonRpcMessage};
-use singularity_store::{SessionStore, StoreError};
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -82,8 +80,7 @@ fn test_output_channel(capacity: usize) -> (mpsc::Sender<Value>, mpsc::Receiver<
 }
 
 fn test_cancellation_handle() -> AppServerCancellationHandle {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let store = SessionIndex::new();
     let snapshot = ProviderConfigSnapshot::capture(|_| None, shared_provider_runtime_handle());
     AppServer::new(store, snapshot).cancellation_handle()
 }
@@ -109,10 +106,6 @@ fn progress_event() -> Value {
         serde_json::json!({
             "item": {"itemId": "item_progress"},
             "delta": "progress",
-            "event": singularity_protocol::EventMetadata {
-                class: singularity_protocol::EventClass::Progress,
-                delivery: singularity_protocol::EventDelivery::BestEffort,
-            },
         }),
     )
     .expect("progress event")
@@ -143,50 +136,6 @@ fn home_inside_current_repository_is_rejected_before_state_preparation() {
         assert!(error.contains("must not be inside"), "{error}");
         ensure_home_outside_repo(&outside, &plain).expect("outside cwd accepted");
     }
-}
-
-#[test]
-fn state_path_rejects_sqlite_uri_before_state_preparation() {
-    for path in [
-        ":memory:",
-        " :MEMORY: ",
-        "file::memory:?cache=shared",
-        "file:memory-db?mode=memory&cache=shared",
-        "file:memory-db?cache=shared&mode=MEMORY",
-        "file:memory-db?mode=ro",
-        "file:///state/rust-app-server.sqlite3",
-        "FILE://localhost/state/rust-app-server.sqlite3",
-    ] {
-        let error = resolve_app_server_state_paths(path).expect_err("memory store rejected");
-        assert_eq!(error, FILE_BACKED_STORE_REQUIRED);
-    }
-    assert!(resolve_app_server_state_paths("state/rust-app-server.sqlite3").is_ok());
-}
-
-#[test]
-fn prepared_state_paths_use_the_canonical_directory() {
-    let directory = tempfile::tempdir().expect("state directory");
-    let configured = directory.path().join("nested").join("sessions.sqlite3");
-    let db_path = prepare_app_server_state_paths(configured.to_str().expect("configured path"))
-        .expect("prepared state path");
-    let canonical_parent = std::fs::canonicalize(configured.parent().expect("parent"))
-        .expect("canonical state directory");
-    assert_eq!(
-        Path::new(&db_path).parent(),
-        Some(canonical_parent.as_path())
-    );
-    assert!(!Path::new(&db_path).exists());
-}
-
-#[test]
-fn sqlite_uri_rejection_has_no_directory_side_effect() {
-    let directory = tempfile::tempdir().expect("state directory");
-    let missing_parent = directory.path().join("must-not-be-created");
-    let configured = format!("file:{}?mode=memory", missing_parent.display());
-    let error = prepare_app_server_state_paths(&configured)
-        .expect_err("SQLite URI rejected before preparation");
-    assert_eq!(error, FILE_BACKED_STORE_REQUIRED);
-    assert!(!missing_parent.exists());
 }
 
 #[test]
@@ -429,7 +378,7 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
     let cases: Vec<(&str, AppServerError)> = vec![
         (
             "locked by another process",
-            AppServerError::Store(StoreError::InvalidState(
+            AppServerError::Store(SessionIndexError::InvalidState(
                 "locked by another process".to_string(),
             )),
         ),
@@ -495,7 +444,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("AGENTS.md as a directory");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionStore::open(temp.path().join("index.sqlite3")).expect("store");
+    let store = SessionIndex::new();
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
@@ -560,9 +509,10 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
             .is_some_and(|message| message.contains("project_instruction_unsupported_file_type")),
         "error must carry the project instruction cause: {values:?}"
     );
-    // 会话行与 JSONL 均无 turn 痕迹：直接错误响应是唯一事实。
-    let reopen = SessionStore::open(temp.path().join("index.sqlite3")).expect("store reopen");
-    let record = reopen.get_session(&session_id).expect("session record");
+    // 会话行与 JSONL 均无 turn 痕迹：直接错误响应是唯一事实（重启后由
+    // JSONL 重建索引观察同一事实）。
+    let index = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
+    let record = index.get_session(&session_id).expect("session record");
     assert_eq!(
         record.status, None,
         "prepare failure must not activate session"
@@ -618,6 +568,30 @@ struct TestProvider {
     release: Mutex<std_mpsc::Receiver<()>>,
 }
 
+/// 重连后新 turn 用的非阻塞 provider：直接返回固定响应，仅计数调用。
+struct ReopenProvider {
+    response: ModelTurnResponse,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+}
+
+impl Provider for ReopenProvider {
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("lock");
+        seen_requests.push(request.clone());
+        let mut response = self.response.clone();
+        response.request_id = request.request_id.clone();
+        Ok(response)
+    }
+
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+}
+
 impl Provider for TestProvider {
     fn complete(
         &self,
@@ -653,8 +627,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let index_path = temp.path().join("index.sqlite3");
-    let store = SessionStore::open(&index_path).expect("store");
+    let store = SessionIndex::new();
 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let (provider_started_tx, provider_started_rx) = std_mpsc::sync_channel(1);
@@ -674,7 +647,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         .expect("session metadata before storage fault")
         .permissions();
     store
-        .insert_session(&singularity_store::SessionRecord {
+        .insert_session(&SessionRecord {
             session_id: session_id.to_string(),
             rollout_path: session.path().to_string_lossy().to_string(),
             cwd: workspace.to_string_lossy().to_string(),
@@ -742,16 +715,16 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         // A request/response barrier proves that initialized was processed before turn/start.
         client_stdin
             .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"method\":\"agent/capability\",\"id\":99,\"params\":{}}\n",
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"provider/status\",\"id\":99,\"params\":{}}\n",
             )
             .await
-            .expect("write capability barrier");
-        let mut capability_response_line = String::new();
+            .expect("write status barrier");
+        let mut status_response_line = String::new();
         client_reader
-            .read_line(&mut capability_response_line)
+            .read_line(&mut status_response_line)
             .await
-            .expect("read capability barrier");
-        assert!(capability_response_line.contains("\"result\""));
+            .expect("read status barrier");
+        assert!(status_response_line.contains("\"result\""));
 
         // 4. Send turn/start
         let turn_start_line = format!(
@@ -853,8 +826,8 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         "provider was called exactly once during turn"
     );
 
-    // 7. 用同一 session 文件创建新 app-server 实例
-    let new_store = SessionStore::open(&index_path).expect("open store again");
+    // 7. 用同一 session 文件创建新 app-server 实例（重启语义：索引由 JSONL 重建）
+    let new_store = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
     let new_snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
@@ -867,7 +840,10 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     );
     let mut new_server = AppServer::new(new_store, new_snapshot)
         .with_sessions_dir(&sessions_dir)
-        .with_test_provider(Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>);
+        .with_test_provider(Arc::new(ReopenProvider {
+            response: ModelTurnResponse::completed("reopen_1", "reopen_response", "done"),
+            seen_requests: Arc::clone(&seen_requests),
+        }));
 
     new_server
         .handle_json(
@@ -878,28 +854,30 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized new server");
 
-    // 8. reopen/resume 收敛为 interrupted
-    let resume_response = new_server
+    // 8. reopen via turn/start：收敛残留 turn 并运行新 turn
+    let reopen_response = new_server
         .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":11,"params":{{"threadId":"{session_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":11,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen"}}]}}}}"#
         ))
-        .expect("thread/resume succeeds");
-    assert_eq!(
-        resume_response[0]["result"]["thread"]["lastTurnStatus"], "interrupted",
-        "resume converges uncompleted turn to interrupted"
+        .expect("turn/start after fail-stop");
+    assert!(
+        reopen_response
+            .iter()
+            .any(|value| value["method"] == "turn/completed"),
+        "reopened turn must complete: {reopen_response:?}"
     );
 
-    // 9. 不重执行工具或 Provider 调用
+    // 9. 重开不重放旧 turn 的 provider 调用；新 turn 恰好调用一次
     assert_eq!(
         seen_requests.lock().unwrap().len(),
-        initial_requests,
-        "reopen/resume must not re-execute provider calls or tools"
+        initial_requests + 1,
+        "reopen must not re-execute the old turn's provider calls"
     );
 }
 
-fn insert_session_record(store: &SessionStore, session_id: &str, rollout_path: &Path, cwd: &Path) {
+fn insert_session_record(store: &SessionIndex, session_id: &str, rollout_path: &Path, cwd: &Path) {
     store
-        .insert_session(&singularity_store::SessionRecord {
+        .insert_session(&SessionRecord {
             session_id: session_id.to_string(),
             rollout_path: rollout_path.to_string_lossy().to_string(),
             cwd: cwd.to_string_lossy().to_string(),
@@ -922,8 +900,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let index_path = temp.path().join("index.sqlite3");
-    let store = SessionStore::open(&index_path).expect("store");
+    let store = SessionIndex::new();
     let session_id = "aa1b2c3d-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
         .expect("create session");
@@ -1047,10 +1024,11 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
         server_result.is_ok(),
         "supervisor must exit cleanly after stdin EOF: {server_result:?}"
     );
-    let reopened = SessionStore::open(&index_path).expect("store reopen");
+    // 重启语义：索引由 JSONL 重建后应看到 completed 终态。
+    let reopened = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
     assert_eq!(
         reopened.get_session(session_id).expect("record").status,
-        Some(singularity_store::SessionStatus::Completed)
+        Some(singularity_app_server::SessionStatus::Completed)
     );
     let session_on_disk =
         SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))

@@ -16,18 +16,10 @@ singularity_agent = { path = "../agent" }
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
-singularity_store = { path = "../store" }
 thiserror.workspace = true
 tokio.workspace = true
+time.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-rusqlite.workspace = true
 tempfile.workspace = true
-
-[target.'cfg(windows)'.dependencies.windows-sys]
-version = "0.52"
-features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-]

@@ -1,7 +1,7 @@
 //! CLI command orchestration.
 
 use super::*;
-use crate::client::{app_server_bin, app_server_db_display};
+use crate::client::app_server_bin;
 use singularity_protocol::ProviderConfigurationStatus;
 
 fn print_readiness() -> Result<(), String> {
@@ -9,8 +9,8 @@ fn print_readiness() -> Result<(), String> {
     client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
     client.initialize()?;
     println!("agent_loop=available (headless core)");
-    let capability = client.agent_capability()?;
-    print_provider_configuration(&capability.provider_configuration)
+    let status = client.provider_status()?;
+    print_provider_configuration(&status)
 }
 
 fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Result<(), String> {
@@ -18,12 +18,12 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
         Some("process_env") => "process_env",
         Some("user_config") => "user_config",
         None => "unconfigured",
-        _ => return Err("invalid agent capability: providerConfiguration.source".to_string()),
+        _ => return Err("invalid provider status: providerConfiguration.source".to_string()),
     };
     println!("provider_config_source={source}");
     let snapshot_id = (!provider.snapshot_id.trim().is_empty())
         .then_some(provider.snapshot_id.as_str())
-        .ok_or_else(|| "invalid agent capability: providerConfiguration.snapshotId".to_string())?;
+        .ok_or_else(|| "invalid provider status: providerConfiguration.snapshotId".to_string())?;
     println!("provider_snapshot_id={snapshot_id}");
     println!("provider_configured={}", provider.configured);
     let blocker = match provider.configuration_blocker.as_deref() {
@@ -31,7 +31,7 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
         Some(blocker) if !blocker.trim().is_empty() => blocker,
         _ => {
             return Err(
-                "invalid agent capability: providerConfiguration.configurationBlocker".to_string(),
+                "invalid provider status: providerConfiguration.configurationBlocker".to_string(),
             );
         }
     };
@@ -99,7 +99,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
-            let _thread = client.thread_resume(&thread_id)?;
             client.thread_settings(&thread_id, model)?;
             if !json {
                 println!("thread {thread_id}");
@@ -137,7 +136,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Config { command } => match command {
             ConfigCommand::Doctor => {
                 println!("app_server_bin={}", app_server_bin()?);
-                println!("app_server_db={}", app_server_db_display());
                 println!("client=protocol-only");
                 print_readiness()?;
                 Ok(())

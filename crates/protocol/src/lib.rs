@@ -119,14 +119,13 @@ method_registry! {
     Initialized => ("initialized", Notification, EmptyParams, EmptyResult),
     ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
     ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
-    ThreadResume => ("thread/resume", Request, ThreadIdParams, ThreadResult),
     ThreadSettings => ("thread/settings", Request, ThreadSettingsParams, ThreadSettingsResult),
     SessionRead => ("session/read", Request, SessionReadParams, SessionReadResult),
     SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
     TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnInjectionResult),
     TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams, TurnInjectionResult),
-    AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
+    ProviderStatus => ("provider/status", Request, EmptyParams, ProviderConfigurationStatus),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
@@ -504,14 +503,6 @@ pub struct ThreadStartParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 只包含 thread id 的请求参数。
-pub struct ThreadIdParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 更新一个 thread 的非敏感 provider/model/reasoning 选择。
 pub struct ThreadSettingsParams {
     pub thread_id: String,
@@ -545,48 +536,19 @@ fn default_session_turn_limit() -> u32 {
     20
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-/// session/read 的翻页方向：asc 从最旧轮向新翻，desc 从最新轮向旧翻。
-/// 页内轮次始终按会话顺序（旧→新）排列，方向只决定窗口选取。
-pub enum HistorySortDirection {
-    Asc,
-    Desc,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-/// 每个返回轮次的条目细节级别。
-pub enum TurnDetail {
-    /// 只返回轮次身份（turnId/status），不携带条目内容。
-    Summary,
-    /// 返回该轮全部通过 kinds 过滤的公开条目。
-    Full,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 查看会话历史：按 turn 为单位分页返回，游标锚定 turn 边界位置。
+/// 查看会话历史：按 turn 为单位返回一页，默认最新 `limit` 轮；
+/// 给 `beforeItem` 则返回该锚点 item 所属轮之前的 `limit` 轮（不含锚点轮），
+/// 供"上滚加载更早"翻页。
 pub struct SessionReadParams {
     pub session_id: String,
-    /// 不透明翻页游标：来自上一次响应的 nextCursor 或 backwardsCursor；
-    /// 缺省时按 sortDirection 从最新/最旧一端开始。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
     /// 每页最多返回的轮数（1..=200）。
     #[serde(default = "default_session_turn_limit")]
     pub limit: u32,
-    /// 翻页方向；缺省 desc（从最新一轮往历史方向）。
+    /// 上一页最旧轮中的任意公开 item id；定位其所属轮并返回该轮之前的轮次。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sort_direction: Option<HistorySortDirection>,
-    /// 每轮条目细节级别；缺省 full。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<TurnDetail>,
-    /// 稳定公开 history kind 过滤；空数组 = 全部。`turn` 选择的是轮次本身：
-    /// 命中时该轮无论其条目是否命中都会出现在结果中，其余 kind 只匹配
-    /// 轮内条目。过滤先于分页，未命中过滤的轮次不占用每页配额。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kinds: Vec<String>,
+    pub before_item: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -635,17 +597,18 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// kinds 过滤使用的稳定公开 kind 名；与 session/read 参数校验共用同一词表。
-    pub fn kind(&self) -> &'static str {
+    /// 公开 history item 的稳定公开 id；`session/read` 的 beforeItem 翻页锚点
+    /// 取自上一页最旧轮内任意 item 的该 id。
+    pub fn id(&self) -> &str {
         match self {
-            Self::Message { .. } => "message",
-            Self::Thinking { .. } => "thinking",
-            Self::ToolCall { .. } => "tool_call",
-            Self::ToolResult { .. } => "tool_result",
-            Self::Turn { .. } => "turn",
-            Self::Settings { .. } => "settings",
-            Self::Usage { .. } => "usage",
-            Self::Compaction { .. } => "compaction",
+            Self::Message { id, .. }
+            | Self::Thinking { id, .. }
+            | Self::ToolCall { id, .. }
+            | Self::ToolResult { id, .. }
+            | Self::Turn { id, .. }
+            | Self::Settings { id, .. }
+            | Self::Usage { id, .. }
+            | Self::Compaction { id, .. } => id,
         }
     }
 }
@@ -660,7 +623,7 @@ pub struct SessionTurn {
     /// 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
     /// 投影修正为 interrupted），前导组为 null。
     pub status: Option<TurnStatus>,
-    /// 该轮通过 kinds 过滤的公开条目，按会话顺序排列。
+    /// 该轮公开条目，按会话顺序排列。
     pub items: Vec<HistoryItem>,
 }
 
@@ -672,8 +635,8 @@ pub struct SessionReadResult {
     pub cwd: String,
     pub title: Option<String>,
     pub model: Option<String>,
-    /// 最近一次 turn 状态的投影，与 thread/list、thread/resume 的
-    /// `lastTurnStatus` 来自同一投影：尚无 turn 为 None，运行中 active，
+    /// 最近一次 turn 状态的投影，与 thread/list 的 `lastTurnStatus` 来自
+    /// 同一投影：尚无 turn 为 None，运行中 active，
     /// 终态 completed/failed/interrupted。
     pub status: Option<ThreadStatus>,
     pub created_at: String,
@@ -685,11 +648,6 @@ pub struct SessionReadResult {
     pub turns: Vec<SessionTurn>,
     /// 会话中真实 turn 的总数（不含无归属 turn 的前导组）。
     pub total_turns: usize,
-    /// 同方向继续翻页的不透明游标；None 表示当前方向已无更多轮次。
-    pub next_cursor: Option<String>,
-    /// 反向翻页锚点游标：以相反 sortDirection 传入时从本页远端重新读取
-    /// 并包含该锚点轮；仅在本页非空时返回。
-    pub backwards_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -897,15 +855,6 @@ pub struct ProviderConfigurationStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// agent capability 查询的响应（仅保留 provider 就绪报告；AgentLoop 恒可用，
-/// 由 headless core 直接承担，不再作为 capability 门控）。
-pub struct AgentCapabilityResult {
-    #[serde(rename = "providerConfiguration")]
-    pub provider_configuration: ProviderConfigurationStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 /// turn/steer 或 turn/followUp 的响应。
 pub struct TurnInjectionResult {
     pub turn: Turn,
@@ -934,30 +883,6 @@ pub struct ServerShutdownResult {
 pub struct AppEvent {
     pub method: String,
     pub params: Value,
-}
-
-/// 事件的稳定语义分类；客户端据此选择可靠处理或可观察丢弃。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventClass {
-    State,
-    Progress,
-}
-
-/// 事件在 stdio 传输上的交付合同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventDelivery {
-    Reliable,
-    BestEffort,
-}
-
-/// JSON-RPC notification 中附带的严格事件元数据。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EventMetadata {
-    pub class: EventClass,
-    pub delivery: EventDelivery,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1384,20 +1309,6 @@ impl AppEvent {
     /// 将应用事件包装为 JSON-RPC 通知。
     pub fn to_notification(&self) -> JsonRpcMessage {
         JsonRpcMessage::notification(self.method.clone(), &self.params)
-            .expect("application event params serialize")
-    }
-
-    /// 将带有严格传输元数据的应用事件包装为 JSON-RPC 通知。
-    pub fn to_notification_with_metadata(&self, metadata: EventMetadata) -> JsonRpcMessage {
-        let mut params = match self.params.clone() {
-            Value::Object(params) => params,
-            _ => serde_json::Map::new(),
-        };
-        params.insert(
-            "event".to_string(),
-            serde_json::to_value(metadata).expect("event metadata serializes"),
-        );
-        JsonRpcMessage::notification(self.method.clone(), Value::Object(params))
             .expect("application event params serialize")
     }
 }

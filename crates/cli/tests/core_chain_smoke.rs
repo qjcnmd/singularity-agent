@@ -32,7 +32,6 @@ impl SmokeFixture {
         command
             .current_dir(&self.workspace)
             .env("SINGULARITY_HOME", &self.home)
-            .env("SINGULARITY_APP_SERVER_DB", self.home.join("index.sqlite3"))
             .env("SINGULARITY_APP_SERVER_BIN", &self.app_server)
             .env_remove("SINGULARITY_MODELS_CONFIG")
             .env_remove("SINGULARITY_MODEL_PROVIDER")

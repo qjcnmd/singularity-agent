@@ -160,7 +160,7 @@ impl AppServer {
         let params: TurnStartParams = parse_params(&message)?;
         let record = match self.store.get_session(&params.thread_id) {
             Ok(record) => record,
-            Err(StoreError::NotFound(_)) => {
+            Err(SessionIndexError::NotFound(_)) => {
                 emit_messages(
                     &mut emit,
                     not_found_response(message.required_id(), THREAD_NOT_FOUND)?,
@@ -647,15 +647,13 @@ impl AppServer {
         self.control_handle().turn_follow_up(message)
     }
 
-    pub(crate) fn agent_capability(
+    pub(crate) fn provider_status(
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         json_response(
             message.required_id(),
-            AgentCapabilityResult {
-                provider_configuration: provider_configuration(&self.provider_snapshot),
-            },
+            provider_configuration(&self.provider_snapshot),
         )
     }
 
