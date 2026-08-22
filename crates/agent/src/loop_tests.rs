@@ -378,7 +378,6 @@ fn fake_contract() -> ProviderProtocolContract {
         tool_reasoning_mode: singularity_model::ProviderToolReasoningMode::Unspecified,
         max_tools_per_request: 8,
         supports_system_message: false,
-        supports_developer_message: true,
         max_context_tokens: Some(128_000),
         max_output_tokens: 4_096,
     }
@@ -2213,35 +2212,9 @@ fn compaction_summarization_respects_model_output_limit() {
 }
 
 #[test]
-fn instruction_message_adapts_to_provider_roles() {
-    let developer = ProviderProtocolContract {
-        supports_developer_message: true,
-        supports_system_message: true,
-        ..ProviderProtocolContract::default()
-    };
-    let system = ProviderProtocolContract {
-        supports_developer_message: false,
-        supports_system_message: true,
-        ..ProviderProtocolContract::default()
-    };
-    let neither = ProviderProtocolContract {
-        supports_developer_message: false,
-        supports_system_message: false,
-        ..ProviderProtocolContract::default()
-    };
-    assert_eq!(
-        instruction_message(&developer, "x").unwrap().role,
-        ModelRole::Developer
-    );
-    assert_eq!(
-        instruction_message(&system, "x").unwrap().role,
-        ModelRole::System
-    );
-    assert_eq!(
-        instruction_message(&neither, "x").unwrap().role,
-        ModelRole::User
-    );
-    assert!(instruction_message(&developer, "").is_none());
+fn instruction_message_always_uses_developer_role() {
+    assert_eq!(instruction_message("x").unwrap().role, ModelRole::Developer);
+    assert!(instruction_message("").is_none());
 }
 
 struct OverflowProvider {

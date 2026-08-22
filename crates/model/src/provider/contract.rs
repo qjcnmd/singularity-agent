@@ -48,7 +48,6 @@ pub struct ProviderProtocolContract {
     pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub max_tools_per_request: u32,
     pub supports_system_message: bool,
-    pub supports_developer_message: bool,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -61,7 +60,6 @@ impl Default for ProviderProtocolContract {
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_system_message: true,
-            supports_developer_message: true,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
@@ -241,14 +239,6 @@ pub fn validate_model_request_with_capabilities(
             && !capabilities.supports_system_message
         {
             errors.push("provider_does_not_support_system_messages".to_string());
-        }
-        if request
-            .messages
-            .iter()
-            .any(|message| message.role == ModelRole::Developer)
-            && !capabilities.supports_developer_message
-        {
-            errors.push("provider_does_not_support_developer_messages".to_string());
         }
         if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
             && requested_output_tokens > capabilities.max_output_tokens

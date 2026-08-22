@@ -402,24 +402,14 @@ fn execute_tool_batch(
     Ok(results)
 }
 
-/// 按 provider 声明把系统/开发者指令投影为请求首条消息。
-///
-/// compaction 与普通请求共用同一 seam：supports developer → Developer；
-/// 否则 supports system → System；两者都不支持时投影为 user 前缀。
-pub(crate) fn instruction_message(
-    capabilities: &ProviderProtocolContract,
-    instruction: &str,
-) -> Option<ModelMessage> {
+/// 把系统/开发者指令投影为请求首条消息：恒以 Developer 角色构造，
+/// 对不支持 developer 角色的端点由 wire 层按 `supports_developer_role`
+/// 降级为 system（用户配置，默认 true）。
+pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
     if instruction.is_empty() {
         return None;
     }
-    if capabilities.supports_developer_message {
-        Some(ModelMessage::text(ModelRole::Developer, instruction))
-    } else if capabilities.supports_system_message {
-        Some(ModelMessage::text(ModelRole::System, instruction))
-    } else {
-        Some(ModelMessage::text(ModelRole::User, instruction))
-    }
+    Some(ModelMessage::text(ModelRole::Developer, instruction))
 }
 
 /// 有效输出上限 = min(配置值, provider 静态能力声明)；正常请求与
@@ -555,7 +545,6 @@ impl Agent {
                 }
                 let (request, assembled_estimate, assembled_entries) = match self.build_request(
                     &preferences,
-                    &capabilities,
                     &tools,
                     &tool_choice,
                     max_output_tokens,
@@ -788,7 +777,7 @@ impl Agent {
         let tools = self.tool_schemas(&capabilities);
         let entries = self.session.build_context_entries()?;
         let mut messages = Vec::with_capacity(entries.len() + 1);
-        if let Some(instruction) = instruction_message(&capabilities, &self.config.system_prompt) {
+        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
         }
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
@@ -854,15 +843,14 @@ impl Agent {
             .saturating_add(32)
     }
 
-    /// 组装单轮 provider 请求：system prompt（按能力选择 developer/system 角色，
-    /// 均不支持时以 user 前缀注入）+ 会话历史（compaction 感知）。
+    /// 组装单轮 provider 请求：首条指令消息恒以 Developer 角色构造（wire 层
+    /// 按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     ///
     /// 上下文条目只装配一次：messages、reasoning replay 与预算估算全部在
     /// 同一份装配成品上完成；返回 (请求, 装配成品估算, 装配时的条目数)。
     fn build_request(
         &self,
         preferences: &ModelPreferences,
-        capabilities: &ProviderProtocolContract,
         tools: &[ModelToolSchema],
         tool_choice: &ToolChoicePolicy,
         max_output_tokens: u32,
@@ -875,7 +863,7 @@ impl Agent {
             .collect::<Vec<_>>();
         let replays = self.reasoning_replays_from_entries(&entries);
         let mut messages = Vec::with_capacity(context_messages.len() + 1);
-        if let Some(instruction) = instruction_message(capabilities, &self.config.system_prompt) {
+        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
         }
         messages.extend(context_messages);

@@ -60,7 +60,7 @@ impl OpenAiProviderConfig {
             value
         };
         let values = resolve_provider_values(&mut get_env_once);
-        if values.models_config_path.is_some() || values.user_config.is_some() {
+        if values.user_config.is_some() {
             return Err(configuration_error(
                 "OpenAiProviderConfig cannot represent a composite models selection; use OpenAiProvider::from_env",
                 "provider_configuration_composite_selection_required",
@@ -185,7 +185,6 @@ impl OpenAiProviderConfig {
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_system_message: true,
-            supports_developer_message: true,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
         }

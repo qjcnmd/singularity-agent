@@ -2,8 +2,8 @@
 
 pub(crate) use serde_json::{Value, json};
 pub(crate) use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ENV_MODELS_CONFIG, ModelBlockerKind,
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelError,
+    ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
@@ -33,6 +33,100 @@ pub(crate) fn tool_call(id: &str, name: &str) -> ModelToolCall {
         raw_arguments: r#"{"path":"README.md"}"#.to_string(),
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
+    }
+}
+
+/// 进程环境写锁：所有测试对 SINGULARITY_HOME 等环境变量的修改必须经同一
+/// 把锁串行化（Rust 测试默认并行运行，直接 set_var 会互相覆盖）。
+pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 安装环境变量的 RAII guard：作用域结束时移除该变量并释放环境写锁。
+pub(crate) struct ProcessEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    key: String,
+}
+
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var(&self.key) };
+    }
+}
+
+/// 在环境写锁内设置 `key` 为 `value`；返回的 guard 在作用域结束时移除。
+/// 测试失败会留下 poisoned 锁，这里按中毒状态继续持有（环境串行化是
+/// 尽力而为，测试失败本身已是要报告的结果）。
+pub(crate) fn install_process_env(key: &str, value: &std::path::Path) -> ProcessEnvGuard {
+    let _lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe { std::env::set_var(key, value) };
+    ProcessEnvGuard {
+        _lock,
+        key: key.to_string(),
+    }
+}
+
+/// config.json 用户配置 fixture：以 `SINGULARITY_HOME` 指向隔离目录，
+/// 一次性写入 config.json 与 auth.v1.json（ProviderConfigSnapshot::capture
+/// 的 user-config 层读取两文件；该层直接读进程环境，因此必须经
+/// `install_env` 把 SINGULARITY_HOME 安装到进程环境）。
+pub(crate) struct UserConfigFixture {
+    pub(crate) directory: tempfile::TempDir,
+}
+
+/// 安装 SINGULARITY_HOME 的 RAII guard：作用域结束时移除，避免污染并行测试。
+pub(crate) struct UserConfigEnvGuard {
+    _process_env: ProcessEnvGuard,
+}
+
+impl UserConfigFixture {
+    pub(crate) fn new() -> Self {
+        Self {
+            directory: tempfile::tempdir().expect("user config directory"),
+        }
+    }
+
+    /// 把 SINGULARITY_HOME 安装到进程环境；返回的 guard 在作用域结束时移除。
+    pub(crate) fn install_env(&self) -> UserConfigEnvGuard {
+        let _process_env = install_process_env("SINGULARITY_HOME", self.directory.path());
+        UserConfigEnvGuard { _process_env }
+    }
+
+    /// 写入 config.json：`default_model` 为 `provider/model[#variant]` 选择器，
+    /// `providers` 为 config.json providers 段（`name -> {base_url, models}`）。
+    pub(crate) fn write_config(&self, default_model: &str, providers: Value) {
+        let default_provider = default_model.split('/').next().expect("provider id");
+        let config = json!({
+            "version": 1,
+            "default_provider": default_provider,
+            "default_model": default_model,
+            "providers": providers,
+        });
+        std::fs::write(
+            self.directory.path().join("config.json"),
+            config.to_string(),
+        )
+        .expect("write user config");
+    }
+
+    /// 写入 auth.v1.json：给指定 provider 设置测试 api key；多次调用按
+    /// provider 合并（保留既有条目）。
+    pub(crate) fn set_api_key(&self, provider: &str, api_key: &str) {
+        let path = self.directory.path().join("auth.v1.json");
+        let mut auth: Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| json!({ "schema_version": 1, "providers": {} }));
+        auth["providers"][provider] = json!({ "api_key": api_key });
+        std::fs::write(path, auth.to_string()).expect("write user auth");
+    }
+
+    /// ProviderConfigSnapshot 的 env getter：只回答 SINGULARITY_HOME。
+    pub(crate) fn env(&self, name: &str) -> Option<String> {
+        if name == "SINGULARITY_HOME" {
+            return Some(self.directory.path().to_string_lossy().into_owned());
+        }
+        None
     }
 }
 

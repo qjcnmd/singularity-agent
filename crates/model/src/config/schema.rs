@@ -113,51 +113,6 @@ pub(crate) struct ConfiguredModel {
     pub(crate) requires_assistant_content_for_tool_calls: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModelsFile {
-    pub(crate) default_model: String,
-    #[serde(deserialize_with = "deserialize_unique_map")]
-    pub(crate) providers: BTreeMap<String, ModelsFileProvider>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModelsFileProvider {
-    pub(crate) adapter: String,
-    pub(crate) base_url: String,
-    pub(crate) api_key_env: String,
-    #[serde(skip)]
-    pub(crate) api_key_override: Option<String>,
-    #[serde(deserialize_with = "deserialize_unique_map")]
-    pub(crate) models: BTreeMap<String, ModelsFileModel>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ModelsFileModel {
-    pub(crate) api_protocol: String,
-    pub(crate) max_context_tokens: Option<u32>,
-    #[serde(default)]
-    pub(crate) max_output_tokens: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_unique_map")]
-    pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
-    #[serde(default)]
-    pub(crate) default_variant: Option<String>,
-    #[serde(default)]
-    pub(crate) tool_reasoning_history: Option<String>,
-    #[serde(default)]
-    pub(crate) supports_developer_role: Option<bool>,
-    #[serde(default)]
-    pub(crate) supports_tool_choice: Option<bool>,
-    #[serde(default)]
-    pub(crate) requires_reasoning_content_for_tool_calls: bool,
-    #[serde(default)]
-    pub(crate) requires_assistant_content_for_tool_calls: bool,
-    #[serde(default)]
-    pub(crate) thinking_wire_format: Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsFileReasoningVariant {

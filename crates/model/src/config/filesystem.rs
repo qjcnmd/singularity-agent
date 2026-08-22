@@ -58,16 +58,16 @@ pub(crate) fn write_json_file(
     let parent = path
         .parent()
         .ok_or_else(|| super::user::user_config_error("user provider config path has no parent"))?;
-    super::user::ensure_no_reparse_components(parent, true)?;
+    super::user::ensure_no_reparse_point(parent, true)?;
     std::fs::create_dir_all(parent).map_err(|_| {
         super::user::user_config_error("user provider config directory could not be created")
     })?;
-    super::user::ensure_no_reparse_components(parent, false)?;
+    super::user::ensure_no_reparse_point(parent, false)?;
     if super::user::path_exists_or_missing(
         path,
         "user provider config path could not be inspected",
     )? {
-        super::user::ensure_no_reparse_components(path, false)?;
+        super::user::ensure_no_reparse_point(path, false)?;
     }
     let file_name = path
         .file_name()

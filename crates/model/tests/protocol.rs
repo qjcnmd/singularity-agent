@@ -695,48 +695,34 @@ const CHAT_REASONING_ONLY_RESPONSE: &str = r#"{
 fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_replay() {
     let (base_url, request_body) =
         captured_request_server("HTTP/1.1 200 OK", CHAT_REASONING_ONLY_RESPONSE);
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_reasoning_content_for_tool_calls": true,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -793,48 +779,34 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_reasoning_content_for_tool_calls": true,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -899,48 +871,34 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_reasoning_content_for_tool_calls": true,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -995,47 +953,33 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -1071,47 +1015,33 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -1155,48 +1085,34 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/chat#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/chat#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_reasoning_content_for_tool_calls": true,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/chat#high"))
         .expect("selected Chat provider");
@@ -1248,44 +1164,30 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
             }
         ]
     }));
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -1343,44 +1245,30 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -1438,44 +1326,30 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
             }
         ]
     }));
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -1537,44 +1411,30 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
             }
         ]
     }));
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -1629,44 +1489,30 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");
@@ -1736,44 +1582,30 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
         .map(|chunk| chunk.to_vec())
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "reasoning_test/responses#high",
-            "providers": {
-                "reasoning_test": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "REASONING_TEST_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("reasoning_test", "test-key-placeholder");
+    fixture.write_config(
+        "reasoning_test/responses#high",
+        json!({
+            "reasoning_test": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("reasoning_test/responses#high"))
         .expect("selected Responses provider");

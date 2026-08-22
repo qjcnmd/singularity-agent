@@ -43,7 +43,6 @@ pub enum ModelCacheStatus {
     Valid,
     Invalid,
     ReadFailed,
-    WriteFailed,
 }
 
 /// A discovered model id and whether an explicit capability override makes it
@@ -448,16 +447,25 @@ pub fn read_user_model_catalog(refresh: bool) -> Result<UserModelCatalog, Provid
             error: (!diagnostics.is_empty()).then(|| diagnostics.join("; ")),
         });
     }
-    if cache_changed && let Ok(cache_text) = serde_json::to_string_pretty(&cache) {
-        let _ = write_json_file(&cache_path, &cache_text, false);
+    if cache_changed
+        && let Ok(cache_text) = serde_json::to_string_pretty(&cache)
+        && let Err(error) = write_json_file(&cache_path, &cache_text, false)
+    {
+        eprintln!(
+            "provider models cache write failed ({}): {error}",
+            cache_path.display()
+        );
     }
     // 发现刷新链路成功后顺带更新 models.dev 目录元数据缓存；网络或解析
     // 失败 fail-soft，不影响目录读取主流程。
     if discovery_refreshed {
-        let _ = refresh_metadata_cache(
-            &user_config.directory.join(crate::METADATA_CACHE_FILE_NAME),
-            &runtime_handle,
-        );
+        let metadata_cache_path = user_config.directory.join(crate::METADATA_CACHE_FILE_NAME);
+        if let Err(error) = refresh_metadata_cache(&metadata_cache_path, &runtime_handle) {
+            eprintln!(
+                "model metadata cache refresh failed ({}): {error}",
+                metadata_cache_path.display()
+            );
+        }
     }
     let default_selector = user_config.config.default_model.clone();
     Ok(UserModelCatalog {

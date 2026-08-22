@@ -204,66 +204,6 @@ fn user_model_top_level_limits_project_with_builtin_fallback() {
 }
 
 #[test]
-fn models_file_projects_only_from_top_level_fields() {
-    let file: ModelsFile = serde_json::from_value(serde_json::json!({
-        "default_model": "primary/gpt-test",
-        "providers": {
-            "primary": {
-                "adapter": "openai_compatible",
-                "base_url": "https://example.invalid/v1",
-                "api_key_env": "PRIMARY_KEY",
-                "models": {
-                    "gpt-test": {
-                        "api_protocol": "chat",
-                        "max_context_tokens": 32000,
-                        "max_output_tokens": 2048
-                    }
-                }
-            }
-        }
-    }))
-    .expect("models file with top-level limits");
-    let (snapshot, _) = capture_models_file(
-        file,
-        &mut |name| (name == "PRIMARY_KEY").then(|| "test-primary-key".to_string()),
-        Some(ProviderConfigSource::UserConfigFile),
-        &test_provider_factory(),
-    )
-    .expect("models file capture");
-    let provider = provider_for_selection(&snapshot, None).expect("selected provider");
-    let contract = provider.protocol_contract();
-    assert_eq!(contract.max_context_tokens, Some(32000));
-    assert_eq!(contract.max_output_tokens, 2048);
-    assert!(contract.supports_tools);
-    assert!(contract.supports_developer_message);
-}
-
-#[test]
-fn models_file_rejects_capabilities_block() {
-    let error = serde_json::from_value::<ModelsFile>(serde_json::json!({
-        "default_model": "primary/gpt-test",
-        "providers": {
-            "primary": {
-                "adapter": "openai_compatible",
-                "base_url": "https://example.invalid/v1",
-                "api_key_env": "PRIMARY_KEY",
-                "models": {
-                    "gpt-test": {
-                        "api_protocol": "chat",
-                        "max_output_tokens": 2048,
-                        "capabilities": {
-                            "supports_tools": true
-                        }
-                    }
-                }
-            }
-        }
-    }))
-    .expect_err("capabilities block must be rejected as an unknown field");
-    assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
 fn persisted_capability_block_is_rejected() {
     let directory = tempfile::tempdir().expect("user config directory");
     let config = serde_json::json!({

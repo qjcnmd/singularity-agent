@@ -676,16 +676,13 @@ impl CompactionEngine {
         preferences.max_output_tokens = Some(cap);
         let mut request = ModelTurnRequest::new(
             format!("compaction-{}", Uuid::now_v7()),
-            crate::agent::instruction_message(
-                &self.provider.protocol_contract(),
-                SUMMARIZATION_SYSTEM_PROMPT,
-            )
-            .into_iter()
-            .chain(std::iter::once(ModelMessage::text(
-                ModelRole::User,
-                prompt_text,
-            )))
-            .collect(),
+            crate::agent::instruction_message(SUMMARIZATION_SYSTEM_PROMPT)
+                .into_iter()
+                .chain(std::iter::once(ModelMessage::text(
+                    ModelRole::User,
+                    prompt_text,
+                )))
+                .collect(),
         );
         request.model_preferences = preferences;
         let response = self.provider.complete(&request, cancellation)?;

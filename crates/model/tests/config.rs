@@ -158,7 +158,12 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
         snapshot.redacted_config().model_name.as_deref(),
         Some("snapshot-model")
     );
-    assert!(snapshot.configuration().configured);
+    assert!(
+        snapshot.configuration().configured,
+        "configuration={:?} provider_err={:?}",
+        snapshot.configuration(),
+        snapshot.provider()
+    );
     assert!(snapshot.provider().is_ok());
     assert!(snapshot.snapshot_id().starts_with("provider_snapshot_"));
     let debug = format!("{snapshot:?}");
@@ -436,11 +441,6 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
         default_config.protocol_contract().max_output_tokens,
         DEFAULT_MAX_OUTPUT_TOKENS
     );
-    assert!(
-        default_config
-            .protocol_contract()
-            .supports_developer_message
-    );
     assert!(default_config.protocol_contract().supports_system_message);
     assert!(
         !default_config
@@ -639,7 +639,6 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
     request.tool_choice.strict_tool_schema = true;
     let capabilities = ProviderProtocolContract {
         supports_tools: false,
-        supports_developer_message: false,
         ..ProviderProtocolContract::default()
     };
 
@@ -648,7 +647,6 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
     assert_eq!(
         result.errors,
         vec![
-            "provider_does_not_support_developer_messages",
             "provider_does_not_support_strict_tool_schema",
             "provider_does_not_support_tools",
         ]
@@ -671,60 +669,53 @@ fn openai_provider_debug_redacts_secret_configuration() {
 
 #[test]
 fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
-    let directory = tempdir().expect("model catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "first/chat-model",
-            "providers": {
-                "first": {
-                    "adapter": "openai_compatible",
-                    "base_url": "https://first.example/v1",
-                    "api_key_env": "FIRST_KEY",
-                    "models": {
-                        "chat-model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("first", "first-secret");
+    fixture.set_api_key("second", "second-secret");
+    fixture.write_config(
+        "first/chat-model",
+        json!({
+            "first": {
+                "base_url": "https://first.example/v1",
+                "models": {
+                    "chat-model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000
                     }
-                },
-                "second": {
-                    "adapter": "openai_compatible",
-                    "base_url": "https://second.example/v1",
-                    "api_key_env": "SECOND_KEY",
-                    "models": {
-                        "responses_model": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 200000,
-                            "max_output_tokens": 100000
-                        }
+                }
+            },
+            "second": {
+                "base_url": "https://second.example/v1",
+                "models": {
+                    "responses_model": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 200000,
+                        "max_output_tokens": 100000
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write model catalog");
-    let config_path = config_path.to_string_lossy().into_owned();
+        }),
+    );
     let mut reads = std::collections::HashMap::<String, usize>::new();
+    let fixture_inside = &fixture;
     let snapshot = ProviderConfigSnapshot::capture(
         |name| {
             let count = reads.entry(name.to_string()).or_default();
             *count += 1;
             assert_eq!(*count, 1, "configuration value {name} was captured twice");
-            match name {
-                "SINGULARITY_MODELS_CONFIG" => Some(config_path.clone()),
-                "FIRST_KEY" => Some("first-secret".to_string()),
-                "SECOND_KEY" => Some("second-secret".to_string()),
-                _ => None,
-            }
+            fixture_inside.env(name)
         },
         test_runtime_handle(),
     );
 
-    assert!(snapshot.configuration().configured);
+    assert!(
+        snapshot.configuration().configured,
+        "configuration={:?} provider_err={:?}",
+        snapshot.configuration(),
+        snapshot.provider()
+    );
     assert_eq!(
         snapshot.redacted_config().model_name.as_deref(),
         Some("first/chat-model")
@@ -780,48 +771,34 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
         "HTTP/1.1 200 OK",
         r#"{"id":"chat_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "deep/chat#high",
-            "providers": {
-                "deep": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "DEEP_KEY",
-                    "models": {
-                        "chat": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "reasoning_content",
-                            "supports_developer_role": false,
-                            "supports_tool_choice": false,
-                            "requires_reasoning_content_for_tool_calls": true,
-                            "requires_assistant_content_for_tool_calls": true
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("deep", "test-key-placeholder");
+    fixture.write_config(
+        "deep/chat#high",
+        json!({
+            "deep": {
+                "base_url": base_url,
+                "models": {
+                    "chat": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "reasoning_content",
+                        "supports_developer_role": false,
+                        "supports_tool_choice": false,
+                        "requires_reasoning_content_for_tool_calls": true,
+                        "requires_assistant_content_for_tool_calls": true
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "DEEP_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("deep/chat#high"))
         .expect("selected Chat provider");
@@ -876,40 +853,26 @@ fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_pro
         "HTTP/1.1 200 OK",
         r#"{"id":"catalog_no_tool_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "catalog/model",
-            "providers": {
-                "catalog": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "CATALOG_KEY",
-                    "models": {
-                        "model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "supports_developer_role": false
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("catalog", "test-key-placeholder");
+    fixture.write_config(
+        "catalog/model",
+        json!({
+            "catalog": {
+                "base_url": base_url,
+                "models": {
+                    "model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "supports_developer_role": false
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "CATALOG_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("catalog/model"))
         .expect("selected catalog provider");
@@ -985,44 +948,30 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
         "HTTP/1.1 200 OK",
         r#"{"id":"dashscope_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "dashscope/deepseek-v4-flash-0731#max",
-            "providers": {
-                "dashscope": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "DASHSCOPE_KEY",
-                    "models": {
-                        "deepseek-v4-flash-0731": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 393216,
-                            "thinking_wire_format": "enable_thinking",
-                            "reasoning_variants": {
-                                "max": {"enabled": true, "wire_effort": "max"}
-                            },
-                            "default_variant": "max"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("dashscope", "test-key-placeholder");
+    fixture.write_config(
+        "dashscope/deepseek-v4-flash-0731#max",
+        json!({
+            "dashscope": {
+                "base_url": base_url,
+                "models": {
+                    "deepseek-v4-flash-0731": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 393216,
+                        "thinking_wire_format": "enable_thinking",
+                        "reasoning_variants": {
+                            "max": {"enabled": true, "wire_effort": "max"}
+                        },
+                        "default_variant": "max"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "DASHSCOPE_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("dashscope/deepseek-v4-flash-0731#max"))
         .expect("selected DashScope provider");
@@ -1054,39 +1003,25 @@ fn missing_provider_usage_remains_unknown() {
         "HTTP/1.1 200 OK",
         r#"{"id":"no_usage_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "opencode-go/deepseek-v4-flash",
-            "providers": {
-                "opencode-go": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "OPENCODE_KEY",
-                    "models": {
-                        "deepseek-v4-flash": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("opencode-go", "test-key-placeholder");
+    fixture.write_config(
+        "opencode-go/deepseek-v4-flash",
+        json!({
+            "opencode-go": {
+                "base_url": base_url,
+                "models": {
+                    "deepseek-v4-flash": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "OPENCODE_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
         .expect("selected builtin provider");
@@ -1142,42 +1077,28 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
         "HTTP/1.1 200 OK",
         r#"{"id":"unknown_context_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
     );
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "unknown/model#max",
-            "providers": {
-                "unknown": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "UNKNOWN_KEY",
-                    "models": {
-                        "model": {
-                            "api_protocol": "chat",
-                            "max_output_tokens": 4096,
-                            "reasoning_variants": {
-                                "max": {"enabled": true, "wire_effort": "max"}
-                            },
-                            "default_variant": "max"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("unknown", "test-key-placeholder");
+    fixture.write_config(
+        "unknown/model#max",
+        json!({
+            "unknown": {
+                "base_url": base_url,
+                "models": {
+                    "model": {
+                        "api_protocol": "chat",
+                        "max_output_tokens": 4096,
+                        "reasoning_variants": {
+                            "max": {"enabled": true, "wire_effort": "max"}
+                        },
+                        "default_variant": "max"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "UNKNOWN_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("unknown/model#max"))
         .expect("selected unknown-context provider");
@@ -1209,39 +1130,25 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
 
 #[test]
 fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "invalid/model",
-            "providers": {
-                "invalid": {
-                    "adapter": "openai_compatible",
-                    "base_url": "https://provider.example/v1",
-                    "api_key_env": "INVALID_KEY",
-                    "models": {
-                        "model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 4096,
-                            "max_output_tokens": 4096
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("invalid", "test-key-placeholder");
+    fixture.write_config(
+        "invalid/model",
+        json!({
+            "invalid": {
+                "base_url": "https://provider.example/v1",
+                "models": {
+                    "model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 4096,
+                        "max_output_tokens": 4096
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write invalid catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "INVALID_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let error = snapshot
         .provider()
         .expect_err("invalid explicit limits must fail closed");
@@ -1261,44 +1168,30 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
             "content": [{"type": "output_text", "text": "done"}]
         }]
     }));
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "longcat/responses#high",
-            "providers": {
-                "longcat": {
-                    "adapter": "openai_compatible",
-                    "base_url": base_url,
-                    "api_key_env": "LONGCAT_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true, "wire_effort": "high"}
-                            },
-                            "default_variant": "high",
-                            "tool_reasoning_history": "responses_items"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("longcat", "test-key-placeholder");
+    fixture.write_config(
+        "longcat/responses#high",
+        json!({
+            "longcat": {
+                "base_url": base_url,
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true, "wire_effort": "high"}
+                        },
+                        "default_variant": "high",
+                        "tool_reasoning_history": "responses_items"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().to_string();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "LONGCAT_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("longcat/responses#high"))
         .expect("selected Responses provider");
@@ -1358,43 +1251,29 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
 
 #[test]
 fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
-    let directory = tempdir().expect("catalog directory");
-    let config_path = directory.path().join("models.json");
-    std::fs::write(
-        &config_path,
-        serde_json::json!({
-            "default_model": "provider/responses#high",
-            "providers": {
-                "provider": {
-                    "adapter": "openai_compatible",
-                    "base_url": "https://provider.example/v1",
-                    "api_key_env": "PROVIDER_KEY",
-                    "models": {
-                        "responses": {
-                            "api_protocol": "responses",
-                            "max_context_tokens": 1000000,
-                            "max_output_tokens": 384000,
-                            "reasoning_variants": {
-                                "high": {"enabled": true}
-                            },
-                            "default_variant": "high"
-                        }
+    let fixture = UserConfigFixture::new();
+    let _env = fixture.install_env();
+    fixture.set_api_key("provider", "test-key-placeholder");
+    fixture.write_config(
+        "provider/responses#high",
+        json!({
+            "provider": {
+                "base_url": "https://provider.example/v1",
+                "models": {
+                    "responses": {
+                        "api_protocol": "responses",
+                        "max_context_tokens": 1000000,
+                        "max_output_tokens": 384000,
+                        "reasoning_variants": {
+                            "high": {"enabled": true}
+                        },
+                        "default_variant": "high"
                     }
                 }
             }
-        })
-        .to_string(),
-    )
-    .expect("write catalog");
-    let path = config_path.to_string_lossy().into_owned();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            ENV_MODELS_CONFIG => Some(path.clone()),
-            "PROVIDER_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
+        }),
     );
+    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
     let error = snapshot
         .provider()
         .expect_err("Responses reasoning without a wire map must fail closed");
@@ -1515,14 +1394,11 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
 /// 已精确覆盖 Chat 无当前 tool call 时返回 reasoning content 的失败关闭（请求无 tools）；
 /// 本测试补充“请求含 tools 但响应仅 reasoning-only 无 tool call”的变体，覆盖新谓词
 /// `disabled_mode_not_honored` 不依赖响应是否有 tool call 的路径。
-// SINGULARITY_HOME 环境隔离：这两个端到端测试互相串行，其他测试不读该变量。
-static USER_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() {
-    let _guard = USER_CONFIG_ENV_LOCK.lock().expect("env lock");
     let home = tempdir().expect("home directory");
-    unsafe { std::env::set_var("SINGULARITY_HOME", home.path()) };
+    let _process_env = install_process_env("SINGULARITY_HOME", home.path());
     let env_path = home.path().join(".env");
     std::fs::write(
         &env_path,
@@ -1574,14 +1450,13 @@ fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() 
         "unexpected rejection message: {}",
         error.message
     );
-    unsafe { std::env::remove_var("SINGULARITY_HOME") };
+    drop(_process_env);
 }
 
 #[test]
 fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_network() {
-    let _guard = USER_CONFIG_ENV_LOCK.lock().expect("env lock");
     let home = tempdir().expect("home directory");
-    unsafe { std::env::set_var("SINGULARITY_HOME", home.path()) };
+    let _process_env = install_process_env("SINGULARITY_HOME", home.path());
     let env_path = home.path().join(".env");
     std::fs::write(
         &env_path,
@@ -1656,5 +1531,5 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
         again_provider.discovery,
         singularity_model::ModelDiscoveryStatus::Fresh
     );
-    unsafe { std::env::remove_var("SINGULARITY_HOME") };
+    drop(_process_env);
 }

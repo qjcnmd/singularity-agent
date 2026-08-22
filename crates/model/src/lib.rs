@@ -16,8 +16,6 @@ pub(crate) const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
 pub(crate) const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 1_000_000;
 pub(crate) const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 pub(crate) const ENV_MODEL: &str = "SINGULARITY_MODEL";
-/// Explicit path to the immutable multi-provider model configuration JSON.
-pub const ENV_MODELS_CONFIG: &str = "SINGULARITY_MODELS_CONFIG";
 pub(crate) const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
 pub(crate) const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
 pub(crate) const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";

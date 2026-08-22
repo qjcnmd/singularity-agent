@@ -35,8 +35,6 @@ use super::{
 use crate::error::ModelErrorCategory;
 #[cfg(test)]
 use filesystem::write_json_file;
-#[cfg(test)]
-pub(crate) use runtime::capture_models_file;
 pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
@@ -221,7 +219,6 @@ pub(crate) struct ProviderConfigLayer {
     max_output_tokens: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
-    models_config_path: Option<String>,
     user_config: Option<UserConfigData>,
     user_config_error: Option<ProviderError>,
 }
@@ -238,7 +235,6 @@ impl ProviderConfigLayer {
             max_output_tokens: get_env(ENV_MAX_OUTPUT_TOKENS),
             base_url: get_env(ENV_BASE_URL),
             api_key: get_env(ENV_API_KEY),
-            models_config_path: get_env(super::ENV_MODELS_CONFIG),
             user_config: None,
             user_config_error: None,
         }
@@ -251,7 +247,6 @@ impl ProviderConfigLayer {
             || self.max_output_tokens.is_some()
             || self.base_url.is_some()
             || self.api_key.is_some()
-            || self.models_config_path.is_some()
             || self.user_config.is_some()
             || self.user_config_error.is_some()
     }
@@ -265,7 +260,6 @@ impl ProviderConfigLayer {
             max_output_tokens: normalized_provider_value(self.max_output_tokens),
             base_url: normalized_provider_value(self.base_url),
             api_key: normalized_provider_value(self.api_key),
-            models_config_path: normalized_provider_value(self.models_config_path),
             user_config: self.user_config,
             user_config_error: self.user_config_error,
         }
@@ -281,7 +275,6 @@ pub(crate) struct ResolvedProviderValues {
     pub(crate) max_output_tokens: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    pub(crate) models_config_path: Option<String>,
     pub(crate) user_config: Option<UserConfigData>,
     pub(crate) user_config_error: Option<ProviderError>,
 }
@@ -588,26 +581,6 @@ fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfig
             },
         };
     }
-    if let Some(path) = values.models_config_path.as_deref() {
-        let config = read_bounded_text(Path::new(path), super::MAX_DISCOVERY_RESPONSE_BYTES)
-            .ok()
-            .and_then(|text| serde_json::from_str::<ModelsFile>(&text).ok())
-            .and_then(|file| {
-                let parsed = parse_model_selector(&file.default_model).ok()?;
-                file.providers.get(parsed.provider_name)?;
-                Some(ModelProviderConfig {
-                    provider_name: Some(parsed.provider_name.to_string()),
-                    model_name: Some(file.default_model.clone()),
-                    base_url_present: true,
-                    api_key_present: true,
-                })
-            })
-            .unwrap_or_else(redacted_models_config);
-        return ProviderConfigResolution {
-            source: values.source,
-            config,
-        };
-    }
     let provider_name = values.source.map(|_| {
         values
             .provider_name
@@ -646,6 +619,7 @@ where
     // depend on two mutable sources and hide an incomplete process setup.
     let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
     if process_layer.any_present() {
+        eprintln!("process environment provider variables override user config layer");
         return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);
     }
     user_config()
@@ -683,7 +657,6 @@ pub(crate) fn read_import_env_layer(path: &Path) -> ProviderConfigLayer {
             ENV_MAX_OUTPUT_TOKENS => &mut layer.max_output_tokens,
             ENV_BASE_URL => &mut layer.base_url,
             ENV_API_KEY => &mut layer.api_key,
-            super::ENV_MODELS_CONFIG => &mut layer.models_config_path,
             _ => continue,
         };
         if target.is_none() {

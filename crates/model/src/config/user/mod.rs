@@ -120,11 +120,11 @@ pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, Provider
     let home = normalize_absolute_path(&home)?;
     if explicit_home.is_some() {
         ensure_home_not_repo_controlled(&home)?;
-        ensure_no_reparse_components(&home, true)?;
+        ensure_no_reparse_point(&home, true)?;
         Ok(Some(home))
     } else {
         let directory = home.join(USER_CONFIG_DIR_NAME);
-        ensure_no_reparse_components(&directory, true)?;
+        ensure_no_reparse_point(&directory, true)?;
         Ok(Some(directory))
     }
 }
@@ -250,42 +250,34 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     }
 }
 
-pub(crate) fn ensure_no_reparse_components(
+/// 检查路径本体不是 reparse point（Windows junction/symlink）。检查范围收缩
+/// 到 `.singularity` 目录及其内文件：用户目录（如 Junction 化的 `%USERPROFILE%`
+/// 或自定义 SINGULARITY_HOME）的祖先不再逐级校验，恢复 Junction 用户目录可用。
+pub(crate) fn ensure_no_reparse_point(
     path: &Path,
     allow_missing_tail: bool,
 ) -> Result<(), ProviderError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        #[cfg(windows)]
-        if matches!(
-            component,
-            std::path::Component::Prefix(_) | std::path::Component::RootDir
-        ) {
-            continue;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing_tail && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
         }
-        let _metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if allow_missing_tail && error.kind() == std::io::ErrorKind::NotFound => {
-                break;
-            }
-            Err(_) => {
-                return Err(user_config_error(
-                    "user provider config path component could not be checked",
-                ));
-            }
-        };
-        #[cfg(windows)]
+        Err(_) => {
+            return Err(user_config_error(
+                "user provider config path could not be checked",
+            ));
+        }
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
         {
-            use std::os::windows::fs::MetadataExt;
-            if _metadata.file_attributes()
-                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-                != 0
-            {
-                return Err(user_config_error(
-                    "user provider config path contains a reparse point",
-                ));
-            }
+            return Err(user_config_error(
+                "user provider config path is a reparse point",
+            ));
         }
     }
     Ok(())
@@ -316,11 +308,11 @@ pub(crate) fn read_user_config_data_from_directory(
             ));
         }
     }
-    ensure_no_reparse_components(&directory, false)?;
+    ensure_no_reparse_point(&directory, false)?;
     if !path_exists_or_missing(&config_path, "user provider config could not be inspected")? {
         return Ok(None);
     }
-    ensure_no_reparse_components(&config_path, false)?;
+    ensure_no_reparse_point(&config_path, false)?;
     let mut config_file = open_user_config_file(&config_path, false)
         .map_err(|_| user_config_error("user provider config could not be opened"))?;
     let config_text =
@@ -343,7 +335,7 @@ pub(crate) fn read_user_config_data_from_directory(
     let auth_path = user_auth_file_path(&directory)?;
     let auth =
         if path_exists_or_missing(&auth_path, "user provider auth path could not be inspected")? {
-            ensure_no_reparse_components(&auth_path, false)?;
+            ensure_no_reparse_point(&auth_path, false)?;
             read_private_auth_file(&auth_path)?
         } else {
             UserAuthFile::default()

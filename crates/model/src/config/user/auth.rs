@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::{ensure_no_reparse_components, user_config_error};
+use super::{ensure_no_reparse_point, user_config_error};
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
@@ -103,7 +103,7 @@ pub(crate) fn open_user_config_file(
     path: &Path,
     private: bool,
 ) -> Result<std::fs::File, ProviderError> {
-    ensure_no_reparse_components(path, false)?;
+    ensure_no_reparse_point(path, false)?;
     let parent = path
         .parent()
         .ok_or_else(|| user_config_error("user provider config path has no parent"))?;
@@ -181,7 +181,7 @@ pub(crate) fn create_private_secret_file(path: &Path) -> Result<std::fs::File, P
     let parent = path
         .parent()
         .ok_or_else(|| user_config_error("user provider config path has no parent"))?;
-    ensure_no_reparse_components(parent, false)?;
+    ensure_no_reparse_point(parent, false)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -196,7 +196,7 @@ pub(crate) fn create_private_secret_file(path: &Path) -> Result<std::fs::File, P
 
 /// 返回凭据目录下唯一的 `auth.v1.json` 路径；目录边界先经 reparse 校验。
 pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
-    ensure_no_reparse_components(directory, false)?;
+    ensure_no_reparse_point(directory, false)?;
     Ok(directory.join(USER_AUTH_FILE_NAME))
 }
 
@@ -207,12 +207,12 @@ pub(crate) struct ConfigWriterLock {
 pub(crate) fn acquire_config_writer_lock(
     directory: &Path,
 ) -> Result<ConfigWriterLock, ProviderError> {
-    ensure_no_reparse_components(directory, false)?;
+    ensure_no_reparse_point(directory, false)?;
     let path = directory.join(".config.lock");
     let file = match config_writer_lock_options(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure_no_reparse_components(&path, false)?;
+            ensure_no_reparse_point(&path, false)?;
             config_writer_lock_options(false).open(&path).map_err(|_| {
                 user_config_error("provider config writer lock could not be acquired")
             })?

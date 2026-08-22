@@ -12,7 +12,7 @@ use super::catalog::user_model_override_is_selectable;
 use super::metadata::{http_endpoint_host, load_user_metadata_directory};
 use super::{
     USER_CONFIG_FILE_NAME, UserConfigData, UserConfigFile, UserConfigProvider,
-    ensure_no_reparse_components, read_user_config_data, user_config_directory_result,
+    ensure_no_reparse_point, read_user_config_data, user_config_directory_result,
     user_config_error,
 };
 use crate::config::filesystem::write_json_file;
@@ -81,10 +81,10 @@ pub fn import_env_to_user_config(
     let (default_selector, model_name) = parse_import_model_selector(&model_value, &provider_name)?;
     let directory = user_config_directory_result()?
         .ok_or_else(|| user_config_error("user config directory is unavailable"))?;
-    ensure_no_reparse_components(&directory, true)?;
+    ensure_no_reparse_point(&directory, true)?;
     std::fs::create_dir_all(&directory)
         .map_err(|_| user_config_error("user provider config directory could not be created"))?;
-    ensure_no_reparse_components(&directory, false)?;
+    ensure_no_reparse_point(&directory, false)?;
     let empty_existing = || UserConfigData {
         directory: directory.clone(),
         config: UserConfigFile {
