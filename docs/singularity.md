@@ -12,7 +12,7 @@
   - `AgentLoop`（核心执行循环）：双层循环状态机，持有单一原子 `TurnInbox`、输入/终态事实聚合与诊断事件派发；
   - `session` 子系统：按职责划分为 `format`（严格 JSONL v1 格式与 schema 校验）、`file`（有界文件 I/O 与 JSONL 尾部解析）、`manager`（单写者生命周期与追加）、`context`（上下文条目与 LLM 投影）、`repair`（中断与孤立 tool call 修复）、`repository`（会话定位）；公开 API 由 `session/mod.rs` 保持稳定；
   - `Compaction`：上下文自动压缩引擎，以 `thresholdRatio` 与 `retainRatio` 控制切点；判定在每轮响应后基于 Provider 实测 usage（首轮/无 usage 时用装配成品估算兜底），聚合每次摘要調用的 Provider usage；
-  - 工具系统：`ToolRegistry` 固定注册 `read`/`bash`/`edit`/`write` 四工具单一事实源，多工具调用批按模型给定顺序串行执行；
+  - 工具系统：`ToolRegistry` 固定注册 `read`/`glob`/`grep`/`bash`/`edit`/`write` 六工具单一事实源，多工具调用批按模型给定顺序串行执行；
   - 消息与事件流：`AgentEvents` 提供类型化、非裁决性的 Provider attempt 与诊断观察回调；
   - 资源加载：`AGENTS.md` root→cwd 逐层加载与角色适配；
   - `singularity_model`：按职责划分为 `types`（消息/工具/请求/响应/usage/reasoning）、`error`、`provider`（contract/runtime/telemetry）、`openai`（wire/chat/responses 适配）、`transport`（HTTP/retry/stream 解码）、`discovery` 以及整层原子选择的 `config`。
@@ -38,7 +38,7 @@ flowchart LR
         Loop["AgentLoop<br/>(TurnInbox + 执行循环)"]
         SM["session 子系统<br/>(format/file/manager/context/repair/repository)"]
         CP["Compaction<br/>(比例门限 + usage 聚合)"]
-        TR["工具注册表<br/>(read / bash / edit / write)"]
+        TR["工具注册表<br/>(read / glob / grep / bash / edit / write)"]
         EV["AgentEvents<br/>(attempt / diagnostic 回调)"]
         RL["资源加载<br/>(AGENTS.md 逐层加载)"]
         PV["singularity_model<br/>(Chat SSE / Responses / 全抖动重试)"]
@@ -142,11 +142,13 @@ flowchart TD
 
 模型 toolCall → 注册表查找（单一事实源 ToolSpec）→ source-order JSON Schema 参数校验 → 按模型给定顺序串行执行全部调用（无并行 worker）→ 进程内工具继承宿主权限执行 → 工具自身完成输出截断/超时/进程树终止 → `ToolExecution {content, is_error}` 按 assistant source order 回传。**无 before/after hook**：校验失败返回 is_error 结果，注册层错误（如未知工具）由 loop 包装为失败的 toolResult，不终止整轮。
 
-**工具面**：`ToolRegistry::new()` 只注册 `read`、`bash`、`edit`、`write` 4 个固定内建工具；无未注册工具，无动态工具开关、MCP 或扩展。工具 schema 见第 12.2 节。
+**工具面**：`ToolRegistry::new()` 只注册 `read`、`glob`、`grep`、`bash`、`edit`、`write` 6 个固定内建工具；无未注册工具，无动态工具开关、MCP 或扩展。工具 schema 见第 12.2 节。
 
 **执行可靠性与资源边界**：
 
 - **read**：收集满 `limit`（缺省 2000 行）即停止，不再扫描至 EOF 统计全文行数；保留单行 ≤ 4 MiB 与返回输出 ≤ 2000 行 / 50 KiB 限制；截断提示给出 `File continues; use offset=Z to continue.`；支持基于 1-indexed 行号的 `offset` 续读，不产生磁盘临时文件。
+- **glob**：进程内递归按 glob 模式匹配文件路径（`*`/`?` 不跨 `/`，`**` 跨任意目录层），`path` 缺省为工作目录；跳过 `.git`/`target`/`node_modules` 子树与符号链接目录（防环）；结果上限 200 条，超出截断并提示收窄模式；输出相对工作目录的路径，不产生磁盘临时文件。
+- **grep**：进程内递归按正则逐文件逐行匹配，输出 `path:line:text`（1-indexed，CRLF 容忍）；跳过 `.git`/`target`/`node_modules`、二进制文件（文件头 NUL 嗅探）与符号链接目录；`include` 按 basename glob 过滤待搜文件；单行输出截断为 1 KiB 前缀，匹配上限 500 条，超出截断并提示收窄模式或 include。
 - **edit**：输入文件与 projected replacement 均实施 20 MiB 硬上限预检；无 `\r` 文件走零映射恒等快路径，含 `\r` 时仅对命中区做局部边界换算，不再构建全量映射表；仅在 normalized view 下查找唯一匹配并映射回原始 byte offsets，未修改的前缀与后缀字节 100% 原样保留；替换行尾风格优先沿用被替换区域、邻近上下文或文件多数派，平票回退 LF；patch 展示为仅围绕命中区的局部上下文 diff；保持直接 in-place 写入。
 - **write**：直接 in-place 写入。
 - **bash**：
@@ -165,7 +167,7 @@ flowchart TD
     C -- 是 --> D["JSON Schema 参数校验"]
     D -- "不合法" --> R2["is_error ToolResult<br/>(不执行)"]
     D -- "合法" --> F1["按模型给定顺序串行执行"]
-    F1 --> F["进程内执行<br/>bash: Job Object 树杀 / 增量 UTF-8 / 内存尾部窗口 / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>cwd 绑定工作区"]
+    F1 --> F["进程内执行<br/>bash: Job Object 树杀 / 增量 UTF-8 / 内存尾部窗口 / 有界 pump<br/>read: 满 limit 即停 / 4 MiB 单行<br/>glob/grep: 只读遍历 / 上限截断<br/>cwd 绑定工作区"]
     F --> G["write/edit: in-place 写入<br/>edit 实施 20 MiB 门限与未触及字节保留"]
     G --> H["输出截断与回传<br/>ToolExecution {content, is_error}<br/>assistant source order 写入"]
 ```
@@ -262,7 +264,7 @@ sequenceDiagram
 
 ## 9. Provider 与模型
 
-**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表 > models.dev 目录元数据」三级解析，任一级命中即停，三级均未提供限额时配置捕获 fail closed（api_protocol 必须由用户显式声明）；目录元数据来自 models.dev api.json 的投影缓存 `~/.singularity/metadata-cache.json`（TTL 24h），捕获读路径只读该文件、缺失或过期时不填充且行为不变，仅在模型目录发现刷新成功后顺带重新拉取落盘，网络失败 fail-soft。模型发现作为运行时组件维护 `models-cache.json` + TTL 刷新的已发现模型目录（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
+**静态能力声明与运行时元数据**：模型能力（context window、max output、reasoning 档位、工具支持）的**运行时解析只取用户配置持久化值**（config.json `providers[].models[]` 顶层字段），缺省回落保守默认（128000 / 4096），api_protocol 必须由用户显式声明；内置模型表与 models.dev 目录元数据（`~/.singularity/metadata-cache.json`，TTL 24h）只作为 `sg config add` 录入时的限额 enrichment 兜底（目录 > 内置表 > 保守默认），不参与运行时解析。模型发现作为运行时组件维护 `models-cache.json` + TTL 刷新的已发现模型目录（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。执行时本地 compaction 预算以默认 128000 兜底。
 
 - **Provider 协议适配**：
   - OpenAI Responses 协议：官方 OpenAI reasoning 模型通过 Responses wire 发送；
@@ -287,7 +289,7 @@ sequenceDiagram
 
 ## 11. 客户端与协议
 
-**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程；Desktop 可保持同一连接长驻。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env）。
+**客户端**：`sg` CLI 是 app-server 协议客户端，每次命令 spawn 独立 stdio 子进程；Desktop 可保持同一连接长驻。CLI 命令：`sg run <goal>`（发起新回合）、`sg continue <session-id>`（重开既有会话继续）、`sg threads`（全部会话 + cwd）、`sg session read|delete`、`sg config`（doctor / models / import-env / add）。
 
 **JSON-RPC 传输合同**（stdio JSON-Lines framing）：
 
@@ -321,6 +323,8 @@ sequenceDiagram
 | 工具 | schema | 语义要点 |
 | --- | --- | --- |
 | read | `{path, offset?, limit?}` | 文本文件有界读取；单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB；收集满 limit（缺省 2000 行）即停，超限提示 `File continues; use offset=Z to continue.`，不写临时文件；offset 1-indexed，limit 上限 2000 |
+| glob | `{pattern, path?}` | 进程内递归匹配文件路径（`*`/`?` 不跨 `/`，`**` 跨任意目录层），path 缺省工作目录；跳过 .git/target/node_modules 与符号链接目录；结果上限 200 条，超限提示收窄模式；输出相对工作目录路径 |
+| grep | `{pattern, path?, include?}` | 进程内递归正则逐行匹配，输出 `path:line:text`（CRLF 容忍）；跳过 .git/target/node_modules、二进制文件与符号链接目录；include 按 basename glob 过滤；单行输出 ≤ 1 KiB 前缀，匹配上限 500 条，超限提示收窄模式或 include |
 | bash | `{command, timeout_ms?}` | `timeout_ms` 显式提供时生效（正整数毫秒），未提供时不主动超时；预览保留最后 2000 行 / 50 KiB，完整输出保留内存尾部窗口（100 KiB），截断发生时完整输出写 `<TEMP>/singularity-tool-output/<uuid>/<slug>.log` 并附 `Full output:` 路径行；输出 pump 有界（主进程退出后 2s 排空宽限，后台进程持管道时标示截断）；Windows Job Object（KILL_ON_JOB_CLOSE + 子进程创建后立即绑定）/ Unix 进程组终止整树 |
 | edit | `{path, oldString, newString}` | 单次精确文本替换（唯一匹配，否则 is_error）；20 MiB 大小上限；无 `\r` 零映射恒等、含 `\r` 仅命中区局部换算；未触及字节原样保留；保持行尾风格；返回局部 diff / firstChangedLine；in-place 写入 |
 | write | `{path, content}` | 写文件（新建或覆盖）；in-place 写入 |

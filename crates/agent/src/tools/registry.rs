@@ -9,6 +9,8 @@ use singularity_core::CancellationToken;
 
 use super::bash;
 use super::edit;
+use super::glob;
+use super::grep;
 use super::read;
 use super::write;
 
@@ -71,10 +73,12 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// 创建注册表并注册默认工具（read/bash/edit/write）。
+    /// 创建注册表并注册默认工具（read/glob/grep/bash/edit/write）。
     pub fn new() -> Self {
         let mut registry = Self::default();
         registry.insert_fixed(read::spec());
+        registry.insert_fixed(glob::spec());
+        registry.insert_fixed(grep::spec());
         registry.insert_fixed(bash::spec());
         registry.insert_fixed(edit::spec());
         registry.insert_fixed(write::spec());

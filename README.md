@@ -9,7 +9,7 @@ Singularity 是一个由 Rust 实现的本地 coding-agent harness。当前 CLI 
 ```text
 sg
   -> singularity_app_server（每命令独立 stdio 子进程）
-     -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/bash/edit/write）
+     -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/glob/grep/bash/edit/write）
      -> OpenAiProvider
      -> 会话 JSONL（~/.singularity/sessions/<uuid>.jsonl，唯一权威正文）
      -> SQLite 轻量索引（~/.singularity/index.sqlite3）
@@ -82,7 +82,7 @@ sg config add opencode-go https://opencode.ai/zen/go/v1 --api-key <your-key>
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
-工具能力按 provider 静态能力声明（内置模型表 + 用户配置覆盖）决定，不做运行时协商；协议选择、工具 schema 与 fail-closed 边界以 [架构事实文档](docs/singularity.md#9-provider-与模型) 为准。
+工具能力按 provider 静态能力声明（config.json 持久化值为运行时唯一来源，内置模型表与 models.dev 目录仅作 `config add` 录入时的限额 enrichment）决定，不做运行时协商；协议选择、工具 schema 与 fail-closed 边界以 [架构事实文档](docs/singularity.md#9-provider-与模型) 为准。
 
 检查配置：
 

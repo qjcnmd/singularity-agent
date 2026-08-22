@@ -2006,7 +2006,7 @@ fn agent_prompt_tool_list_matches_registry_names_only() {
         crate::lifecycle::agent_config_for_thread(&thread, &PromptOnlyProvider, &snapshot)
             .expect("agent config resolves");
     let names = ToolRegistry::new().names();
-    assert_eq!(names, ["bash", "edit", "read", "write"]);
+    assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
     for name in &names {
         assert!(
             config.system_prompt.contains(&format!("- {name}")),

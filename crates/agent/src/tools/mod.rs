@@ -6,11 +6,14 @@
 
 pub mod bash;
 pub mod edit;
+pub mod glob;
+pub mod grep;
 pub mod read;
 pub mod registry;
 pub mod write;
 
 mod truncate;
+mod walk;
 
 pub use registry::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry, ToolSpec,
