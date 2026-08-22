@@ -569,7 +569,7 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let session_id = started["result"]["thread"]["thread_id"]
+    let session_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -586,7 +586,7 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         .output
         .recv_where(Duration::from_secs(5), |message| {
             message["method"] == "turn/started"
-        })["params"]["turn"]["turn_id"]
+        })["params"]["turn"]["turnId"]
         .as_str()
         .expect("turn id")
         .to_string();
@@ -633,7 +633,7 @@ fn shutdown_requests_all_active_turns_and_reaps_workers_before_exit() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let session_id = started["result"]["thread"]["thread_id"]
+    let session_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -673,7 +673,7 @@ fn steer_immediately_after_started_is_accepted() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let session_id = started["result"]["thread"]["thread_id"]
+    let session_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -694,7 +694,7 @@ fn steer_immediately_after_started_is_accepted() {
         .output
         .recv_where(Duration::from_secs(5), |message| {
             message["method"] == "turn/started"
-        })["params"]["turn"]["turn_id"]
+        })["params"]["turn"]["turnId"]
         .as_str()
         .expect("turn id")
         .to_string();
@@ -760,7 +760,7 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let session_id = started["result"]["thread"]["thread_id"]
+    let session_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -792,7 +792,7 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
         .output
         .recv_where(Duration::from_secs(5), |message| {
             message["method"] == "turn/started"
-        })["params"]["turn"]["turn_id"]
+        })["params"]["turn"]["turnId"]
         .as_str()
         .expect("turn id")
         .to_string();
@@ -948,14 +948,14 @@ fn same_stdio_connection_runs_concurrent_turns_across_different_threads() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace_a}));
     let started_a = process.output.recv_id(3, Duration::from_secs(5));
-    let thread_id_a = started_a["result"]["thread"]["thread_id"]
+    let thread_id_a = started_a["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id a")
         .to_string();
 
     process.send_request(4, "thread/start", json!({"cwd": workspace_b}));
     let started_b = process.output.recv_id(4, Duration::from_secs(5));
-    let thread_id_b = started_b["result"]["thread"]["thread_id"]
+    let thread_id_b = started_b["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id b")
         .to_string();
@@ -990,29 +990,29 @@ fn same_stdio_connection_runs_concurrent_turns_across_different_threads() {
     // 验证 turn 5 和 turn 6 的即时 running 响应
     let resp_5 = process.output.recv_id(5, Duration::from_secs(5));
     assert_eq!(resp_5["result"]["turn"]["status"], "running");
-    let turn_id_a = resp_5["result"]["turn"]["turn_id"]
+    let turn_id_a = resp_5["result"]["turn"]["turnId"]
         .as_str()
         .expect("turn_id_a")
         .to_string();
 
     let resp_6 = process.output.recv_id(6, Duration::from_secs(5));
     assert_eq!(resp_6["result"]["turn"]["status"], "running");
-    let turn_id_b = resp_6["result"]["turn"]["turn_id"]
+    let turn_id_b = resp_6["result"]["turn"]["turnId"]
         .as_str()
         .expect("turn_id_b")
         .to_string();
 
     // 验证各自的 turn/completed 事件携带精确的 threadId 与 turnId
     let term_a = process.output.recv_where(Duration::from_secs(10), |m| {
-        m["method"] == "turn/completed" && m["params"]["turn"]["thread_id"] == thread_id_a
+        m["method"] == "turn/completed" && m["params"]["turn"]["threadId"] == thread_id_a
     });
-    assert_eq!(term_a["params"]["turn"]["turn_id"], turn_id_a);
+    assert_eq!(term_a["params"]["turn"]["turnId"], turn_id_a);
     assert_eq!(term_a["params"]["turn"]["status"], "completed");
 
     let term_b = process.output.recv_where(Duration::from_secs(10), |m| {
-        m["method"] == "turn/completed" && m["params"]["turn"]["thread_id"] == thread_id_b
+        m["method"] == "turn/completed" && m["params"]["turn"]["threadId"] == thread_id_b
     });
-    assert_eq!(term_b["params"]["turn"]["turn_id"], turn_id_b);
+    assert_eq!(term_b["params"]["turn"]["turnId"], turn_id_b);
     assert_eq!(term_b["params"]["turn"]["status"], "completed");
 
     assert!(
@@ -1038,13 +1038,13 @@ fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace_a}));
     let thread_a = process.output.recv_id(3, Duration::from_secs(5));
-    let thread_id_a = thread_a["result"]["thread"]["thread_id"]
+    let thread_id_a = thread_a["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id a")
         .to_string();
     process.send_request(4, "thread/start", json!({"cwd": workspace_b}));
     let thread_b = process.output.recv_id(4, Duration::from_secs(5));
-    let thread_id_b = thread_b["result"]["thread"]["thread_id"]
+    let thread_id_b = thread_b["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id b")
         .to_string();
@@ -1071,11 +1071,11 @@ fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
     let response_b = process.output.recv_id(6, Duration::from_secs(5));
     assert_eq!(response_a["result"]["turn"]["status"], "running");
     assert_eq!(response_b["result"]["turn"]["status"], "running");
-    let turn_id_a = response_a["result"]["turn"]["turn_id"]
+    let turn_id_a = response_a["result"]["turn"]["turnId"]
         .as_str()
         .expect("turn id a")
         .to_string();
-    let turn_id_b = response_b["result"]["turn"]["turn_id"]
+    let turn_id_b = response_b["result"]["turn"]["turnId"]
         .as_str()
         .expect("turn id b")
         .to_string();
@@ -1103,10 +1103,10 @@ fn concurrent_turns_use_barrier_and_keep_same_tool_call_id_scoped() {
                 message["method"] == "turn/completed"
                     && message["params"]["turn"]["status"] == "completed"
             });
-        let thread = terminal["params"]["turn"]["thread_id"]
+        let thread = terminal["params"]["turn"]["threadId"]
             .as_str()
             .expect("terminal thread id");
-        let turn = terminal["params"]["turn"]["turn_id"]
+        let turn = terminal["params"]["turn"]["turnId"]
             .as_str()
             .expect("terminal turn id");
         assert!(expected.contains(&(thread.to_string(), turn.to_string())));

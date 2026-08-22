@@ -947,8 +947,8 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "turn/completed",
             "params": {"turn": {
-                "thread_id": "thread_1",
-                "turn_id": "turn_1",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
                 "status": "interrupted"
             }}
         });

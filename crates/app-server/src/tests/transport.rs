@@ -526,7 +526,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
             .to_string(),
         )
         .expect("thread/start");
-    let session_id = started[1]["result"]["thread"]["thread_id"]
+    let session_id = started[1]["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();

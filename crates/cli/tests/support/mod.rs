@@ -232,14 +232,14 @@ pub fn agent_loop_capability(
 
 /// 构造测试用 thread 对象。
 pub fn thread(thread_id: &str) -> Value {
-    json!({"thread_id": thread_id, "model": null, "cwd": null, "lastTurnStatus": "active"})
+    json!({"threadId": thread_id, "model": null, "cwd": null, "lastTurnStatus": "active"})
 }
 
 /// 构造测试用 turn 对象。
 pub fn turn(turn_id: &str, thread_id: &str, status: &str) -> Value {
     json!({
-        "turn_id": turn_id,
-        "thread_id": thread_id,
+        "turnId": turn_id,
+        "threadId": thread_id,
         "status": status,
     })
 }

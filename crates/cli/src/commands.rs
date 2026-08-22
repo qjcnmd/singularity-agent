@@ -108,7 +108,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             if json {
                 println!(
                     "{}",
-                    json!({"thread": {"thread_id": thread_id}, "turn": turn, "events": protocol_events(events)})
+                    json!({"thread": {"threadId": thread_id}, "turn": turn, "events": protocol_events(events)})
                 );
             }
             fail_for_failed_turn(&turn)?;

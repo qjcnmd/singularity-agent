@@ -454,17 +454,17 @@ pub struct JsonRpcError {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 无参数 method 的严格空对象。
 pub struct EmptyParams {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 无结果 notification 或永不成功 method 的占位合同。
 pub struct EmptyResult {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 初始化请求参数。
 pub struct InitializeParams {
     #[serde(rename = "clientInfo")]
@@ -472,6 +472,7 @@ pub struct InitializeParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// 初始化响应及平台摘要。
 pub struct InitializeResult {
     #[serde(rename = "userAgent")]
@@ -502,7 +503,7 @@ pub struct ThreadStartParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 只包含 thread id 的请求参数。
 pub struct ThreadIdParams {
     #[serde(rename = "threadId")]
@@ -701,6 +702,7 @@ pub struct SessionDeleteResult {
 
 /// 持久化 thread（session）的公开摘要。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
@@ -744,25 +746,28 @@ impl ThreadStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// thread/start 的响应。
 pub struct ThreadStartResult {
     pub thread: Thread,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// thread/list 的响应。
 pub struct ThreadListResult {
     pub threads: Vec<Thread>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// 返回单个 thread 的响应。
 pub struct ThreadResult {
     pub thread: Thread,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 启动 turn 的参数。
 pub struct TurnStartParams {
     #[serde(rename = "threadId")]
@@ -787,6 +792,7 @@ pub struct TurnInjectionParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// 持久化 turn 的公开摘要。
 pub struct Turn {
     pub turn_id: String,
@@ -804,7 +810,7 @@ pub struct Turn {
 /// 模型 usage 的协议线格式（与 `singularity_model::ModelUsage` 同构，
 /// 避免 protocol 依赖 model crate）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct TurnModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -862,6 +868,7 @@ impl TurnStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// 只包含 turn id 的请求参数。
 pub struct TurnIdParams {
     #[serde(rename = "turnId")]
@@ -869,6 +876,7 @@ pub struct TurnIdParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// turn/start 的响应。
 pub struct TurnStartResult {
     pub turn: Turn,
@@ -888,6 +896,7 @@ pub struct ProviderConfigurationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// agent capability 查询的响应（仅保留 provider 就绪报告；AgentLoop 恒可用，
 /// 由 headless core 直接承担，不再作为 capability 门控）。
 pub struct AgentCapabilityResult {
@@ -896,12 +905,14 @@ pub struct AgentCapabilityResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// turn/steer 或 turn/followUp 的响应。
 pub struct TurnInjectionResult {
     pub turn: Turn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// turn/interrupt 的响应。回执确认中断请求已受理并给出目标终态，不制造
 /// 独立的中间请求状态。
 pub struct TurnInterruptResult {
@@ -912,12 +923,14 @@ pub struct TurnInterruptResult {
 
 /// server/shutdown 的类型化响应。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerShutdownResult {
     pub shutdown: bool,
 }
 
 /// 对外广播的应用事件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppEvent {
     pub method: String,
     pub params: Value,
@@ -948,12 +961,14 @@ pub struct EventMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// thread 生命周期 notification 的类型化参数。
 pub struct ThreadEventParams {
     pub thread: Thread,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// turn 生命周期 notification 的类型化参数。
 pub struct TurnEventParams {
     pub turn: Turn,

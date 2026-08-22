@@ -779,8 +779,8 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["thread_id"], "thread_json");
-    assert_eq!(value["turn"]["turn_id"], "turn_json");
+    assert_eq!(value["thread"]["threadId"], "thread_json");
+    assert_eq!(value["turn"]["turnId"], "turn_json");
     assert_eq!(value["turn"]["status"], "completed");
     let events = value["events"].as_array().expect("events");
     assert!(events.iter().all(|event| event["method"].is_string()));
@@ -893,8 +893,8 @@ fn cli_run_json_waits_for_matching_error_after_running_response() {
 
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["thread_id"], "thread_live");
-    assert_eq!(value["turn"]["turn_id"], "turn_live");
+    assert_eq!(value["thread"]["threadId"], "thread_live");
+    assert_eq!(value["turn"]["turnId"], "turn_live");
     assert_eq!(value["turn"]["status"], "failed");
     let events = value["events"].as_array().expect("events");
     assert!(
@@ -955,8 +955,8 @@ fn cli_run_json_projects_matching_rpc_error_after_running_response() {
 
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
-    assert_eq!(value["thread"]["thread_id"], "thread_rpc_error");
-    assert_eq!(value["turn"]["turn_id"], "turn_rpc_error");
+    assert_eq!(value["thread"]["threadId"], "thread_rpc_error");
+    assert_eq!(value["turn"]["turnId"], "turn_rpc_error");
     assert_eq!(value["turn"]["status"], "failed");
     let error_event = value["events"]
         .as_array()
@@ -1444,8 +1444,8 @@ fn cli_continue_forwards_model_and_projects_json_result() {
     assert_eq!(settings["threadId"], "thread_continue_json");
     assert_eq!(settings["model"], "gpt-test");
     let result: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json output");
-    assert_eq!(result["thread"]["thread_id"], "thread_continue_json");
-    assert_eq!(result["turn"]["turn_id"], "turn_continue_json");
+    assert_eq!(result["thread"]["threadId"], "thread_continue_json");
+    assert_eq!(result["turn"]["turnId"], "turn_continue_json");
     assert_eq!(result["turn"]["status"], "completed");
 }
 

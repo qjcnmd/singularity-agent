@@ -364,7 +364,7 @@ fn parse_success_json(output: Output) -> Result<Value, String> {
 
 fn thread_id(result: &Value) -> Result<&str, String> {
     result
-        .pointer("/thread/thread_id")
+        .pointer("/thread/threadId")
         .and_then(Value::as_str)
         .ok_or_else(|| "smoke response did not include a thread id".to_string())
 }

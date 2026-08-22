@@ -26,7 +26,7 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let thread_id = started["result"]["thread"]["thread_id"]
+    let thread_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -56,7 +56,7 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
     let listed = process.output.recv_id(4, Duration::from_secs(5));
     let threads = listed["result"]["threads"].as_array().expect("threads");
     assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0]["thread_id"], thread_id);
+    assert_eq!(threads[0]["threadId"], thread_id);
     assert_eq!(
         threads[0]["cwd"].as_str(),
         Some(
@@ -92,7 +92,7 @@ fn stdio_startup_recovers_corrupt_index_and_rebuilds_jsonl_projection() {
     let listed = process.output.recv_id(3, Duration::from_secs(5));
     let threads = listed["result"]["threads"].as_array().expect("threads");
     assert_eq!(threads.len(), 1, "JSONL must rebuild the index row");
-    assert_eq!(threads[0]["thread_id"], session_id);
+    assert_eq!(threads[0]["threadId"], session_id);
     assert!(
         std::fs::read_dir(&home)
             .expect("home entries")
@@ -133,7 +133,7 @@ fn explicit_db_startup_uses_the_same_recovery_and_rebuild_contract() {
     let listed = process.output.recv_id(3, Duration::from_secs(5));
     let threads = listed["result"]["threads"].as_array().expect("threads");
     assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0]["thread_id"], session_id);
+    assert_eq!(threads[0]["threadId"], session_id);
     assert!(
         std::fs::read_dir(dir.path())
             .expect("explicit db directory")
@@ -183,7 +183,7 @@ fn session_read_returns_turn_page_then_delete_removes_both() {
 
     process.send_request(3, "thread/start", json!({"cwd": workspace}));
     let started = process.output.recv_id(3, Duration::from_secs(5));
-    let session_id = started["result"]["thread"]["thread_id"]
+    let session_id = started["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();

@@ -466,7 +466,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
             .to_string(),
         )
         .expect("thread start");
-    let thread_id = started[1]["result"]["thread"]["thread_id"]
+    let thread_id = started[1]["result"]["thread"]["threadId"]
         .as_str()
         .expect("thread id")
         .to_string();
@@ -833,7 +833,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .to_string(),
         )
         .expect("thread start");
-    let session_id = started[1]["result"]["thread"]["thread_id"]
+    let session_id = started[1]["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -989,7 +989,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
             .to_string(),
         )
         .expect("thread start");
-    let session_id = started[1]["result"]["thread"]["thread_id"]
+    let session_id = started[1]["result"]["thread"]["threadId"]
         .as_str()
         .expect("session id")
         .to_string();
@@ -1003,7 +1003,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
             .as_array()
             .expect("threads")
             .iter()
-            .find(|thread| thread["thread_id"] == session_id)
+            .find(|thread| thread["threadId"] == session_id)
             .expect("session row")["lastTurnStatus"]
             .clone()
     }
@@ -1373,7 +1373,7 @@ fn steer_and_follow_up_after_turn_completion_are_rejected() {
         .iter()
         .find(|message| message["id"] == 2)
         .expect("turn one response");
-    let turn_id = turn_one["result"]["turn"]["turn_id"]
+    let turn_id = turn_one["result"]["turn"]["turnId"]
         .as_str()
         .expect("turn id")
         .to_string();
@@ -1622,14 +1622,14 @@ fn terminal_turn_usage_matches_provider_usage() {
         .iter()
         .find(|message| message["method"] == "turn/completed")
         .expect("turn completed event");
-    let usage = &completed_event["params"]["turn"]["model_usage"];
-    assert_eq!(usage["input_tokens"], 111);
-    assert_eq!(usage["output_tokens"], 22);
-    assert_eq!(usage["total_tokens"], 133);
-    assert_eq!(usage["cached_input_tokens"], 5);
-    assert_eq!(usage["reasoning_tokens"], 3);
-    assert_eq!(usage["usage_present"], true);
-    assert_eq!(usage["usage_complete"], true);
+    let usage = &completed_event["params"]["turn"]["modelUsage"];
+    assert_eq!(usage["inputTokens"], 111);
+    assert_eq!(usage["outputTokens"], 22);
+    assert_eq!(usage["totalTokens"], 133);
+    assert_eq!(usage["cachedInputTokens"], 5);
+    assert_eq!(usage["reasoningTokens"], 3);
+    assert_eq!(usage["usagePresent"], true);
+    assert_eq!(usage["usageComplete"], true);
 }
 
 #[test]
