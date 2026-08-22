@@ -265,7 +265,7 @@ sequenceDiagram
 
 ## 9. Provider 与模型
 
-**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表 > 运行时默认值」解析。模型发现作为运行时组件为缺省项自动填充 context/max output 元数据：发现结果带 `models-cache.json` + TTL 刷新（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 最终未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
+**静态能力声明与运行时元数据**：每个模型的能力（context window、max output、reasoning 档位、工具支持）按「用户配置顶层字段 > 内置模型表」解析，两者均未提供时配置捕获 fail closed（api_protocol 与 max_output_tokens 必须有显式来源）。模型发现作为运行时组件维护 `models-cache.json` + TTL 刷新的已发现模型目录（过期回落 Stale/Unavailable），发现负载中的坏条目按 fail-soft 跳过（响应级缺陷仍 fail closed）。context window 未声明时保留 `unknown` 元数据，执行时本地 compaction 预算以默认 128000 兜底。
 
 - **Provider 协议适配**：
   - OpenAI Responses 协议：官方 OpenAI reasoning 模型通过 Responses wire 发送；

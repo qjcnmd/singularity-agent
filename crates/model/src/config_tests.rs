@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, Provider, USER_AUTH_SCHEMA_VERSION,
-    USER_CONFIG_FILE_NAME,
-};
+use crate::{Provider, USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
 fn test_runtime_handle() -> tokio::runtime::Handle {
@@ -246,18 +243,20 @@ fn persisted_capability_block_is_rejected() {
 }
 
 #[test]
-fn unknown_model_without_limits_falls_back_to_runtime_defaults() {
+fn unknown_model_without_limits_still_fails_closed() {
     let model = UserConfigModel {
         api_protocol: Some("chat".to_string()),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file("unknown-provider", "unknown-model", &model)
-        .expect("missing limits are filled from the runtime defaults");
+    let error = match configured_model_from_user_file("unknown-provider", "unknown-model", &model) {
+        Ok(_) => panic!("no builtin fallback for an unknown model"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("incomplete"));
     assert_eq!(
-        resolved.max_context_tokens,
-        Some(DEFAULT_MAX_CONTEXT_TOKENS)
+        error.error.code.as_deref(),
+        Some("provider_configuration_invalid")
     );
-    assert_eq!(resolved.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
 }
 
 #[test]
@@ -279,7 +278,7 @@ fn user_model_override_without_api_protocol_still_fails_closed() {
 }
 
 #[test]
-fn capture_fills_runtime_metadata_for_model_without_declared_limits() {
+fn capture_fails_closed_for_override_without_any_limit_source() {
     let data = UserConfigData {
         directory: PathBuf::from("C:/singularity-test"),
         config: UserConfigFile {
@@ -310,19 +309,15 @@ fn capture_fills_runtime_metadata_for_model_without_declared_limits() {
             )]),
         },
     };
-    let (snapshot, _) = capture_user_model_selection(
+    let error = match capture_user_model_selection(
         &data,
         Some(ProviderConfigSource::UserConfigFile),
         &test_provider_factory(),
-    )
-    .expect("a protocol-only override is executable after metadata fill");
-    let provider = provider_for_selection(&snapshot, None).expect("default provider is configured");
-    let contract = provider.protocol_contract();
-    assert_eq!(
-        contract.max_context_tokens,
-        Some(DEFAULT_MAX_CONTEXT_TOKENS)
-    );
-    assert_eq!(contract.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    ) {
+        Ok(_) => panic!("a protocol-only override without any limit source must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("incomplete"));
 }
 
 #[test]
