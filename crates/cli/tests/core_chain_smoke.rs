@@ -327,11 +327,14 @@ fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
         .and_then(|models| models.get_mut(&model_name))
         .ok_or_else(|| "smoke config does not contain the selected model".to_string())?;
     // The isolated project instructions plus the normal request envelope expand
-    // across iterations. With 48,000 max context tokens, a 0.90 threshold ratio (43,200),
-    // and an 8,192 reserve ceiling, two bounded tool reads exceed the compaction trigger
-    // threshold, while the compacted follow-up request fits within budget.
-    model["max_context_tokens"] = Value::from(48_000_u64);
-    model["max_output_tokens"] = Value::from(8_192_u64);
+    // The bounded tool read contributes ≈31,200 chars ≈ 7,800 estimated tokens
+    // (chars/4). With a 16,000-token window and the 0.90 threshold ratio, the
+    // trigger sits at 14,400 tokens, so the first post-read compaction judgment
+    // (previous-request usage + the newly persisted read result) crosses it,
+    // while the compacted follow-up request and the 2,048 output budget still
+    // fit within the window.
+    model["max_context_tokens"] = Value::from(16_000_u64);
+    model["max_output_tokens"] = Value::from(2_048_u64);
     fs::write(
         &fixture.config_path,
         serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,
