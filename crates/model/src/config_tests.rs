@@ -60,7 +60,7 @@ fn unselected_provider_without_auth_does_not_block_capture() {
         providers: BTreeMap::from([(
             "primary".to_string(),
             UserAuthProvider {
-                api_key: "sk-primary".to_string(),
+                api_key: "test-primary-key".to_string(),
             },
         )]),
     };
@@ -225,7 +225,7 @@ fn models_file_projects_only_from_top_level_fields() {
     .expect("models file with top-level limits");
     let (snapshot, _) = capture_models_file(
         file,
-        &mut |name| (name == "PRIMARY_KEY").then(|| "sk-primary".to_string()),
+        &mut |name| (name == "PRIMARY_KEY").then(|| "test-primary-key".to_string()),
         Some(ProviderConfigSource::UserConfigFile),
         &test_provider_factory(),
     )
@@ -372,7 +372,7 @@ fn capture_fails_closed_for_override_without_any_limit_source() {
             providers: BTreeMap::from([(
                 "primary".to_string(),
                 UserAuthProvider {
-                    api_key: "sk-primary".to_string(),
+                    api_key: "test-primary-key".to_string(),
                 },
             )]),
         },
@@ -413,7 +413,7 @@ fn capture_fills_directory_limits_from_cache_and_keeps_fail_closed_without_it() 
             providers: BTreeMap::from([(
                 "primary".to_string(),
                 UserAuthProvider {
-                    api_key: "sk-primary".to_string(),
+                    api_key: "test-primary-key".to_string(),
                 },
             )]),
         },
@@ -890,11 +890,11 @@ fn auth_file_replaces_atomically_as_the_single_credential_file() {
         })
         .to_string()
     };
-    write_json_file(&auth_path, &credentials("sk-primary"), true).expect("write private auth file");
+    write_json_file(&auth_path, &credentials("test-primary-key"), true).expect("write private auth file");
     let data = read_user_config_data_from_directory(directory.path().to_path_buf())
         .expect("read user config")
         .expect("user config present");
-    assert_eq!(data.auth.providers["primary"].api_key, "sk-primary");
+    assert_eq!(data.auth.providers["primary"].api_key, "test-primary-key");
 
     // 同一路径重复写入即原子替换：内容整体翻新，读侧永远看到完整 JSON。
     write_json_file(&auth_path, &credentials("sk-rotated"), true)

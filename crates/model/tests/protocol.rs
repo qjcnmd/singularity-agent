@@ -225,7 +225,7 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
 fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     let base_url = single_response_server(
         "HTTP/1.1 401 Unauthorized",
-        r#"{"error":{"message":"bad key sk-secret-value"}}"#,
+        r#"{"error":{"message":"bad key test-key-placeholder"}}"#,
     );
     let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
@@ -249,7 +249,7 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     assert_eq!(metadata.retry_count, 0);
     assert_eq!(metadata.occurrences.len(), 1);
     assert!(!serialized.contains("bad key"));
-    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("test-key-placeholder"));
     let serialized_metadata = serde_json::to_string(metadata).expect("serialize attempt aggregate");
     assert!(!serialized_metadata.contains("occurrences"));
     assert!(!serialized_metadata.contains("openai_compatible"));
@@ -758,7 +758,7 @@ fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_rep
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -856,7 +856,7 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -962,7 +962,7 @@ fn reasoning_replay_obligation_chat_tool_call_without_replay_fails_closed() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1057,7 +1057,7 @@ fn reasoning_replay_obligation_chat_tool_call_without_reasoning_succeeds() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1133,7 +1133,7 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1218,7 +1218,7 @@ fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fa
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1307,7 +1307,7 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1402,7 +1402,7 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1497,7 +1497,7 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1596,7 +1596,7 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1688,7 +1688,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1795,7 +1795,7 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "REASONING_TEST_KEY" => Some("sk-secret-value".to_string()),
+            "REASONING_TEST_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),

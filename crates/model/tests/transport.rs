@@ -726,7 +726,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         response.tool_calls[0].arguments,
         serde_json::json!({"path": "README.md"})
     );
-    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("test-key-placeholder"));
     assert!(!serialized.contains("choices"));
 }
 
@@ -1178,7 +1178,7 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
     let serialized = serde_json::to_string(&metadata).expect("serialize aggregate metadata");
     assert!(!serialized.contains("occurrences"));
     assert!(!serialized.contains("sensitive prompt marker"));
-    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("test-key-placeholder"));
 }
 
 #[test]

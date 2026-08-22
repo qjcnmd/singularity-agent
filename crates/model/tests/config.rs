@@ -185,7 +185,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
     for (name, malformed) in [
         ("SINGULARITY_MODEL", "gpt-test\r"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1\r"),
-        ("SINGULARITY_API_KEY", "sk-secret-value\r"),
+        ("SINGULARITY_API_KEY", "test-key-placeholder\r"),
         ("SINGULARITY_MODEL", "gpt\n-test"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1\0"),
     ] {
@@ -204,7 +204,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
                 "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
                     malformed.to_string()
                 } else {
-                    "sk-secret-value".to_string()
+                    "test-key-placeholder".to_string()
                 }),
                 _ => None,
             },
@@ -241,7 +241,7 @@ fn process_env_provider_values_reject_boundary_whitespace() {
     for (name, malformed) in [
         ("SINGULARITY_MODEL", " gpt-test"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1 "),
-        ("SINGULARITY_API_KEY", "sk-secret-value\t"),
+        ("SINGULARITY_API_KEY", "test-key-placeholder\t"),
     ] {
         let error = OpenAiProviderConfig::from_env(|candidate| match candidate {
             "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
@@ -257,7 +257,7 @@ fn process_env_provider_values_reject_boundary_whitespace() {
             "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
                 malformed.to_string()
             } else {
-                "sk-secret-value".to_string()
+                "test-key-placeholder".to_string()
             }),
             _ => None,
         })
@@ -382,7 +382,7 @@ fn openai_provider_config_uses_endpoint_rules() {
     let config = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
     })
     .expect("provider config");
@@ -397,7 +397,7 @@ fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_tran
         "SINGULARITY_MODEL_PROVIDER" => Some("unregistered_provider".to_string()),
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
     })
     .expect_err("unknown provider must fail closed");
@@ -415,7 +415,7 @@ fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_tran
         error.error.provider_name.as_deref(),
         Some("unregistered_provider")
     );
-    assert!(!error.message.contains("sk-secret-value"));
+    assert!(!error.message.contains("test-key-placeholder"));
     assert!(!error.message.contains("provider.example"));
 }
 
@@ -424,7 +424,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let default_config = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
     })
     .expect("provider config");
@@ -456,7 +456,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let configured = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("131072".to_string()),
         "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("8192".to_string()),
         _ => None,
@@ -483,7 +483,7 @@ fn provider_limit_validation_has_bounded_secret_free_errors() {
         let result = OpenAiProviderConfig::from_env(|candidate| match candidate {
             "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
             "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             candidate if candidate == name => Some(value.to_string()),
             _ => None,
         });
@@ -505,7 +505,7 @@ fn removed_tool_capability_envs_are_not_read_or_parsed() {
         match name {
             "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
             "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         }
     })
@@ -520,7 +520,7 @@ fn provider_rejects_output_limit_that_cannot_fit_the_context_window() {
     let error = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("4096".to_string()),
         "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("4096".to_string()),
         _ => None,
@@ -534,7 +534,7 @@ fn provider_rejects_output_limit_that_cannot_fit_the_context_window() {
             .contains("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS")
     );
     assert!(error.message.contains("SINGULARITY_MODEL_CONTEXT_TOKENS"));
-    assert!(!error.message.contains("sk-secret-value"));
+    assert!(!error.message.contains("test-key-placeholder"));
 }
 
 #[test]
@@ -672,7 +672,7 @@ fn openai_provider_debug_redacts_secret_configuration() {
     let provider_debug = format!("{provider:?}");
 
     for debug_text in [config_debug, provider_debug] {
-        assert!(!debug_text.contains("sk-secret-value"));
+        assert!(!debug_text.contains("test-key-placeholder"));
         assert!(!debug_text.contains("provider.example"));
         assert!(debug_text.contains("[redacted]"));
     }
@@ -826,7 +826,7 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "DEEP_KEY" => Some("sk-secret-value".to_string()),
+            "DEEP_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -914,7 +914,7 @@ fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_pro
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "CATALOG_KEY" => Some("sk-secret-value".to_string()),
+            "CATALOG_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -958,7 +958,7 @@ fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model(
         |name| match name {
             "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
             "SINGULARITY_BASE_URL" => Some(base_url.clone()),
-            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1027,7 +1027,7 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "DASHSCOPE_KEY" => Some("sk-secret-value".to_string()),
+            "DASHSCOPE_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1091,7 +1091,7 @@ fn missing_provider_usage_remains_unknown() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "OPENCODE_KEY" => Some("sk-secret-value".to_string()),
+            "OPENCODE_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1182,7 +1182,7 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "UNKNOWN_KEY" => Some("sk-secret-value".to_string()),
+            "UNKNOWN_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1246,7 +1246,7 @@ fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "INVALID_KEY" => Some("sk-secret-value".to_string()),
+            "INVALID_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1303,7 +1303,7 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "LONGCAT_KEY" => Some("sk-secret-value".to_string()),
+            "LONGCAT_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1399,7 +1399,7 @@ fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             ENV_MODELS_CONFIG => Some(path.clone()),
-            "PROVIDER_KEY" => Some("sk-secret-value".to_string()),
+            "PROVIDER_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
         },
         test_runtime_handle(),
@@ -1535,7 +1535,7 @@ fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() 
     let env_path = home.path().join(".env");
     std::fs::write(
         &env_path,
-        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=test-key-placeholder\nSINGULARITY_MODEL=gpt-test\n",
     )
     .expect("dotenv file");
 
@@ -1573,7 +1573,7 @@ fn import_env_to_user_config_persists_config_auth_and_rejects_endpoint_change() 
         .expect("re-import with the same endpoint must succeed");
     std::fs::write(
         &env_path,
-        "SINGULARITY_BASE_URL=https://changed.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+        "SINGULARITY_BASE_URL=https://changed.invalid/v1\nSINGULARITY_API_KEY=test-key-placeholder\nSINGULARITY_MODEL=gpt-test\n",
     )
     .expect("changed dotenv file");
     let error = singularity_model::import_env_to_user_config(Some(&env_path))
@@ -1594,7 +1594,7 @@ fn read_user_model_catalog_serves_fresh_cache_and_explicit_models_without_networ
     let env_path = home.path().join(".env");
     std::fs::write(
         &env_path,
-        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=sk-secret-value\nSINGULARITY_MODEL=gpt-test\n",
+        "SINGULARITY_BASE_URL=https://example.invalid/v1\nSINGULARITY_API_KEY=test-key-placeholder\nSINGULARITY_MODEL=gpt-test\n",
     )
     .expect("dotenv file");
     singularity_model::import_env_to_user_config(Some(&env_path))

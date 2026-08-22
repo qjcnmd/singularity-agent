@@ -68,7 +68,7 @@ pub(crate) fn provider_config_with_base_url(base_url: String) -> OpenAiProviderC
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
         base_url,
-        api_key: "sk-secret-value".to_string(),
+        api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -110,7 +110,7 @@ pub(crate) fn single_response_server(status_line: &'static str, body: &'static s
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let (first_line, headers, _) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         write_provider_response(&mut stream, status_line, body, false);
     });
     format!("http://{addr}")
@@ -125,7 +125,7 @@ pub(crate) fn models_server(body: String) -> (String, Receiver<String>) {
         let mut reader = BufReader::new(stream.try_clone().expect("clone models provider stream"));
         let (first_line, headers, _) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/models"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
         tx.send(first_line).expect("send models request line");
     });
@@ -144,7 +144,7 @@ pub(crate) fn captured_request_server(
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let (first_line, headers, request_body) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         tx.send(request_body).expect("send request body");
         write_provider_response(&mut stream, status_line, body, true);
     });
@@ -162,7 +162,7 @@ pub(crate) fn responses_provider_server(
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let (first_line, headers, request_body) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/responses"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         let body = actual_body.to_string();
         write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
         tx.send(vec![(first_line, request_body)])
@@ -184,7 +184,7 @@ pub(crate) fn chat_stream_server(
         let mut reader = BufReader::new(stream.try_clone().expect("clone Chat stream request"));
         let (first_line, headers, request_body) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         tx.send(request_body).expect("send Chat stream request");
         let length = declared_length
             .map(|length| format!("content-length: {length}\r\n"))
@@ -218,7 +218,7 @@ pub(crate) fn responses_stream_server(
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let (first_line, headers, request_body) = read_provider_request(&mut reader);
         assert!(first_line.contains("/v1/responses"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
         tx.send(request_body)
             .expect("send Responses stream request");
         let length = declared_length

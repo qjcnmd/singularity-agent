@@ -62,7 +62,7 @@ fn selected_provider() -> OpenAiProvider {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
         base_url: "http://127.0.0.1:1/v1".to_string(),
-        api_key: "sk-secret-value".to_string(),
+        api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -221,7 +221,7 @@ fn test_provider_config(base_url: String) -> OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
         base_url,
-        api_key: "sk-secret-value".to_string(),
+        api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -325,7 +325,7 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
             provider_name: "openai_compatible".to_string(),
             model_name: "gpt-test".to_string(),
             base_url: format!("http://{address}"),
-            api_key: "sk-secret-value".to_string(),
+            api_key: "test-key-placeholder".to_string(),
             source: ProviderConfigSource::ProcessEnvironment,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -377,7 +377,7 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
         assert!(!occurrence.retry_scheduled);
     }
     let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
-    for secret in ["sk-secret-value", &address.to_string(), "authorization"] {
+    for secret in ["test-key-placeholder", &address.to_string(), "authorization"] {
         assert!(
             !serialized
                 .to_ascii_lowercase()
@@ -413,7 +413,7 @@ fn oversized_success_body_is_rejected_before_buffering() {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
         base_url: format!("http://{address}"),
-        api_key: "sk-secret-value".to_string(),
+        api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
