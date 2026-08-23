@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +17,8 @@ use crate::error::{
 };
 use crate::provider::telemetry::ProviderAttemptStatus;
 use crate::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelRole, ModelToolCall,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, HTTP_STATUS_RATE_LIMITED,
+    HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_ATTEMPTS, ModelMessage, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelTurnRequest, OpenAiProvider, OpenAiProviderConfig,
     PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS, Provider, ProviderApiProtocol,
     ProviderConfigSource, ProviderReasoningReplay, ProviderToolReasoningMode, SelectedModel,
@@ -688,4 +689,323 @@ fn protocol_contract_exposes_selected_tool_reasoning_mode() {
         provider.protocol_contract().tool_reasoning_mode,
         ProviderToolReasoningMode::ReplayReasoningContent
     );
+}
+
+/// 读取 provider 请求的完整头部与 body；未读数据残留会令服务端关闭变成 RST，
+/// 可能吞掉已写入的响应。
+fn read_full_test_provider_request(stream: &TcpStream) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+    let mut line = String::new();
+    let mut content_length = 0usize;
+    loop {
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .expect("read provider request header");
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0_u8; content_length];
+        reader
+            .read_exact(&mut body)
+            .expect("read provider request body");
+    }
+}
+
+fn write_provider_error_response(
+    stream: &mut TcpStream,
+    status_line: &str,
+    extra_headers: &str,
+    body: &str,
+) {
+    write!(
+        stream,
+        "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}\r\n{body}",
+        body.len()
+    )
+    .expect("write provider error response");
+}
+
+fn error_response_listener() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider listener");
+    let address = listener.local_addr().expect("provider address");
+    (listener, format!("http://{address}"))
+}
+
+/// 非 2xx + 结构化 context_length_exceeded：分类为 ContextLengthExceeded 且不可重试。
+/// 状态码故意选可重试的 429 并附 retry-after-ms: 0，若重试门失效会立刻发出第二次请求。
+#[test]
+fn structured_context_length_error_is_classified_and_never_retried() {
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept context-length request");
+        read_full_test_provider_request(&stream);
+        write_provider_error_response(
+            &mut stream,
+            "429 Too Many Requests",
+            "retry-after-ms: 0\r\n",
+            r#"{"error":{"code":"context_length_exceeded","message":"reduce the prompt"}}"#,
+        );
+    });
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_context_length",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("structured context-length error must fail the request");
+
+    assert_eq!(error.error.kind, ModelErrorKind::ContextLengthExceeded);
+    assert_eq!(
+        error.error.category(),
+        ModelErrorCategory::ContextLengthExceeded
+    );
+    assert_eq!(error.error.http_status, Some(HTTP_STATUS_RATE_LIMITED));
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_context_length_exceeded")
+    );
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("attempt metadata");
+    assert_eq!(
+        metadata.attempt_count, 1,
+        "context-length errors must not be retried"
+    );
+    assert_eq!(metadata.retry_count, 0);
+    assert_eq!(metadata.occurrences.len(), 1);
+    assert!(!metadata.occurrences[0].retry_scheduled);
+    server.join().expect("join context-length provider");
+}
+
+/// 非 2xx + 超过 8MiB 上限的错误体：读取失败降级为无 body，保持状态码分类且不挂起。
+#[test]
+fn oversized_non_2xx_body_falls_back_to_status_classification() {
+    const OVERSIZED_RESPONSE_BYTES: usize = 8 * 1024 * 1024 + 1;
+
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept oversized error request");
+        read_full_test_provider_request(&stream);
+        write!(
+            stream,
+            "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\ncontent-length: {OVERSIZED_RESPONSE_BYTES}\r\nconnection: close\r\n\r\n"
+        )
+        .expect("write oversized error headers");
+    });
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_oversized_error",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("oversized non-2xx body must fall back to the status error");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
+    assert_eq!(error.error.http_status, Some(413));
+    assert_eq!(error.error.code.as_deref(), Some("provider_http_status"));
+    assert!(
+        error
+            .error
+            .message
+            .starts_with("Provider returned HTTP 413.")
+    );
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    server.join().expect("join oversized error provider");
+}
+
+/// 非 2xx + 未知结构化 code：保持状态码映射（429→RateLimited），不得升级为
+/// ContextLengthExceeded。
+#[test]
+fn unknown_structured_code_keeps_http_status_classification() {
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        for _ in 0..MAX_PROVIDER_ATTEMPTS {
+            let (mut stream, _) = listener.accept().expect("accept rate-limited request");
+            read_full_test_provider_request(&stream);
+            write_provider_error_response(
+                &mut stream,
+                "429 Too Many Requests",
+                "retry-after-ms: 0\r\n",
+                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+            );
+        }
+    });
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_rate_limit",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("rate-limited request must fail after bounded retries");
+
+    assert_eq!(error.error.kind, ModelErrorKind::RateLimited);
+    assert_ne!(error.error.kind, ModelErrorKind::ContextLengthExceeded);
+    assert_eq!(
+        error.error.category(),
+        ModelErrorCategory::ProviderUnavailable
+    );
+    assert_eq!(error.error.http_status, Some(HTTP_STATUS_RATE_LIMITED));
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("attempt metadata");
+    assert_eq!(metadata.attempt_count, MAX_PROVIDER_ATTEMPTS);
+    assert_eq!(metadata.retry_count, MAX_PROVIDER_ATTEMPTS - 1);
+    server.join().expect("join rate-limited provider");
+}
+
+/// 错误体含密钥形状文本（与配置的 API key 同值）时，诊断整体替换为固定文案；
+/// 凭据绝不能进入错误文本。
+#[test]
+fn secret_shaped_error_body_is_replaced_with_fixed_diagnostic() {
+    const CREDENTIAL_VALUE: &str = "sk-test-credential-value-123";
+
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept secret error request");
+        read_full_test_provider_request(&stream);
+        write_provider_error_response(
+            &mut stream,
+            "401 Unauthorized",
+            "",
+            r#"{"error":{"code":"invalid_api_key","type":"invalid_request_error","message":"invalid credential sk-test-credential-value-123 supplied"}}"#,
+        );
+    });
+    let mut config = test_provider_config(base_url);
+    config.api_key = CREDENTIAL_VALUE.to_string();
+    let provider = test_provider(config).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_secret_error",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("secret-bearing error must still fail with the status classification");
+
+    // 状态码映射不受脱敏影响。
+    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
+    assert_eq!(error.error.http_status, Some(HTTP_STATUS_UNAUTHORIZED));
+    // 替换而非省略：诊断槽位仍在，只是内容为固定文案；序列化的 ModelError
+    // 与对外展示文本都不含凭据或错误体原文。
+    assert!(error.message.contains("Provider diagnostic:"));
+    assert!(!error.message.contains("invalid credential"));
+    let serialized = serde_json::to_string(&error.error).expect("serialize model error");
+    assert!(!serialized.contains(CREDENTIAL_VALUE));
+    assert!(!serialized.contains("invalid credential"));
+    assert!(!error.message.contains(CREDENTIAL_VALUE));
+    server.join().expect("join secret error provider");
+}
+
+/// 401 + 结构化 message：保持 AuthError 分类，诊断保留有界短文本。
+#[test]
+fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept auth error request");
+        read_full_test_provider_request(&stream);
+        write_provider_error_response(
+            &mut stream,
+            "401 Unauthorized",
+            "",
+            r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided."}}"#,
+        );
+    });
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_auth_error",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("unauthorized request must fail");
+
+    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
+    assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
+    assert_eq!(error.error.http_status, Some(HTTP_STATUS_UNAUTHORIZED));
+    assert_eq!(
+        error.error.message, "Provider returned HTTP 401.",
+        "serialized model error keeps the stable status message"
+    );
+    assert!(error.message.starts_with("Provider returned HTTP 401."));
+    assert!(
+        error
+            .message
+            .contains("Provider diagnostic: Incorrect API key provided.")
+    );
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    server.join().expect("join auth error provider");
+}
+
+/// 非 JSON 错误体：诊断回退到有界单行摘要（控制字符合并、截断到 256 字符内）。
+#[test]
+fn unparseable_error_body_attaches_bounded_single_line_summary() {
+    let raw_body = format!(
+        "upstream gateway exploded\nsecond line\ttabbed {}",
+        "x".repeat(300)
+    );
+    let (listener, base_url) = error_response_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept plain error request");
+        read_full_test_provider_request(&stream);
+        write_provider_error_response(&mut stream, "404 Not Found", "", &raw_body);
+    });
+    let provider = test_provider(test_provider_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_plain_error",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &CancellationToken::new())
+        .expect_err("non-JSON non-2xx body must keep the status classification");
+
+    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+    assert_eq!(error.error.http_status, Some(404));
+    assert_eq!(
+        error.error.message, "Provider returned HTTP 404.",
+        "serialized model error keeps the stable status message"
+    );
+    assert!(
+        error
+            .message
+            .contains("Provider diagnostic: upstream gateway exploded second line tabbed")
+    );
+    const DIAGNOSTIC_MARKER: &str = "Provider diagnostic: ";
+    let marker_position = error
+        .message
+        .find(DIAGNOSTIC_MARKER)
+        .expect("diagnostic marker present");
+    let diagnostic = &error.message[marker_position + DIAGNOSTIC_MARKER.len()..];
+    assert!(diagnostic.chars().count() <= 256);
+    assert!(!error.message.chars().any(char::is_control));
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    server.join().expect("join plain error provider");
 }

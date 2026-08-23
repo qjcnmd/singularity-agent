@@ -1,0 +1,102 @@
+//! 无交互入口的会话准备：默认持久化、`--session` 恢复、`--no-session` 临时运行。
+//!
+//! 三种形态共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
+
+use std::sync::Arc;
+
+use singularity_core::user_singularity_home;
+use singularity_model::ProviderConfigSnapshot;
+use singularity_runtime::store::{
+    ResumeError, canonical_thread_cwd, create_thread, prepare_session_dirs, resume_thread,
+};
+use singularity_runtime::{Conversation, TurnRunner};
+
+/// 一次无交互/交互执行的全部运行时句柄。
+///
+/// `_temporary_home` 与 `_tokio_runtime` 贯穿整个进程生命周期：前者承载
+/// `--no-session` 的临时会话目录，后者是 provider HTTP 泵依赖的 Handle 背景。
+pub struct SessionSetup {
+    pub conversation: Arc<Conversation>,
+    pub thread_id: String,
+    _runner: Arc<TurnRunner>,
+    _temporary_home: Option<tempfile::TempDir>,
+    _tokio_runtime: Arc<tokio::runtime::Runtime>,
+}
+
+/// 会话准备错误；文本可直接写入 stderr。
+pub struct SetupError {
+    pub message: String,
+}
+
+impl From<SetupError> for String {
+    fn from(error: SetupError) -> Self {
+        error.message
+    }
+}
+
+pub fn prepare(
+    model: Option<&str>,
+    session: Option<&str>,
+    no_session: bool,
+) -> Result<SessionSetup, SetupError> {
+    prepare_inner(model, session, no_session).map_err(|message| SetupError { message })
+}
+
+fn prepare_inner(
+    model: Option<&str>,
+    session: Option<&str>,
+    no_session: bool,
+) -> Result<SessionSetup, String> {
+    let tokio_runtime =
+        Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
+    let (home, temporary_home) = if no_session {
+        let temp =
+            tempfile::TempDir::new().map_err(|error| format!("temporary session home: {error}"))?;
+        (temp.path().to_path_buf(), Some(temp))
+    } else {
+        (
+            user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?,
+            None,
+        )
+    };
+    prepare_session_dirs(&home)?;
+    let sessions_dir = home.join(singularity_runtime::store::SESSIONS_DIR_NAME);
+    let snapshot = ProviderConfigSnapshot::capture(
+        |name| std::env::var(name).ok(),
+        tokio_runtime.handle().clone(),
+    );
+    let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
+    let default_selector = runner.default_model_selector();
+
+    let thread = if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+        let mut thread =
+            resume_thread(runner.sessions_dir(), session_id).map_err(|error| match error {
+                ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
+                ResumeError::Store(message) => {
+                    format!("failed to resume thread {session_id}: {message}")
+                }
+            })?;
+        // `--model` 只覆盖本次执行：不写回 Thread 元数据。
+        if model.is_some() {
+            thread.model = model.map(str::to_string);
+        }
+        thread
+    } else {
+        let cwd = canonical_thread_cwd(None)?;
+        create_thread(
+            runner.sessions_dir(),
+            &cwd,
+            model.map(str::to_string).or(default_selector),
+        )?
+    };
+
+    let thread_id = thread.thread_id.clone();
+    let conversation = Arc::new(Conversation::new(Arc::clone(&runner), thread));
+    Ok(SessionSetup {
+        conversation,
+        thread_id,
+        _runner: runner,
+        _temporary_home: temporary_home,
+        _tokio_runtime: tokio_runtime,
+    })
+}

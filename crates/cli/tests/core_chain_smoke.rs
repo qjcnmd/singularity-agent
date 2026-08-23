@@ -274,18 +274,18 @@ fn isolated_tempdir() -> Result<TempDir, String> {
 fn run_json(fixture: &SmokeFixture, goal: &str) -> Result<Value, String> {
     let output = fixture
         .command()
-        .args(["run", "--json", goal])
+        .args(["--json", goal])
         .output()
-        .map_err(|_| "could not start sg run".to_string())?;
+        .map_err(|_| "could not start sg --json".to_string())?;
     parse_success_json(output)
 }
 
 fn run_continue(fixture: &SmokeFixture, thread_id: &str, instruction: &str) -> Result<(), String> {
     let output = fixture
         .command()
-        .args(["continue", "--json", thread_id, instruction])
+        .args(["--json", "--session", thread_id, instruction])
         .output()
-        .map_err(|_| "could not start sg continue".to_string())?;
+        .map_err(|_| "could not start sg --session".to_string())?;
     if output.status.success() {
         Ok(())
     } else {

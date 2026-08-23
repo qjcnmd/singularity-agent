@@ -2,7 +2,8 @@ use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Response;
-use singularity_core::CancellationToken;
+use serde_json::Value;
+use singularity_core::{CancellationToken, contains_sensitive_text};
 
 use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
@@ -46,6 +47,84 @@ pub(crate) fn model_error_from_http_status(
         .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus);
     error.http_status = Some(status);
     error
+}
+
+/// Provider 错误响应体中精确表示上下文超限的 wire 错误码；匹配必须是全等，不做模糊推断。
+const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
+/// 附加到非 2xx 错误的 provider 诊断文本上界（字符数）。
+const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
+/// 诊断文本命中敏感内容或无法安全展示时的固定替代文案。
+const REDACTED_PROVIDER_ERROR_DIAGNOSTIC: &str =
+    "provider error diagnostic withheld: it may contain credentials";
+
+/// 非 2xx 响应体解析出的结构化错误字段。
+pub(crate) struct ProviderErrorBodyFields {
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl ProviderErrorBodyFields {
+    fn absent() -> Self {
+        Self {
+            code: None,
+            message: None,
+        }
+    }
+}
+
+/// 解析非 2xx 响应体的 `{"error": {"code": "...", "message": "..."}}` 形状。
+/// 顶层缺失、error 非对象或字段类型不符时一律视为未提供。
+pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return ProviderErrorBodyFields::absent();
+    };
+    let Some(error) = payload.get("error").filter(|error| error.is_object()) else {
+        return ProviderErrorBodyFields::absent();
+    };
+    ProviderErrorBodyFields {
+        code: error
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// 仅当结构化错误码字符串精确等于 context-length wire 码时成立；不匹配 message 文本。
+pub(crate) fn is_context_length_exceeded_code(code: Option<&str>) -> bool {
+    code == Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE)
+}
+
+/// 有界单行 provider 诊断：控制字符与空白合并为单个空格后截断到上限。
+/// 先在全文上做敏感判定再截断，避免把密钥切成两半绕过检测；
+/// 命中 `contains_sensitive_text` 或包含调用方凭据值时整体替换为固定文案，
+/// 凭据绝不进入错误文本。
+pub(crate) fn bounded_provider_error_diagnostic(text: &str, credential: &str) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let collapsed = flattened
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let credential_present = !credential.is_empty() && collapsed.contains(credential);
+    if credential_present || contains_sensitive_text(&collapsed) {
+        return REDACTED_PROVIDER_ERROR_DIAGNOSTIC.to_string();
+    }
+    collapsed
+        .chars()
+        .take(MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS)
+        .collect()
 }
 
 pub(super) fn provider_transport_error(

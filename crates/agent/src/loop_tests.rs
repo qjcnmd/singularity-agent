@@ -836,7 +836,7 @@ fn compaction_provider_failure_emits_safe_diagnostic_without_session_entry() {
             context_window: 30_000,
             max_output_tokens: 1,
             compaction: CompactionConfig {
-                threshold_ratio: 0.5,
+                reserve_tokens: 15_000,
                 summary_max_tokens: 4_096,
                 ..CompactionConfig::default()
             },
@@ -2102,7 +2102,7 @@ fn tiny_context_window_triggers_compaction() {
             context_window: 30_000,
             max_output_tokens: 1,
             compaction: CompactionConfig {
-                threshold_ratio: 0.5,
+                reserve_tokens: 15_000,
                 summary_max_tokens: 4_096,
                 ..CompactionConfig::default()
             },
@@ -2184,7 +2184,7 @@ fn compaction_summarization_respects_model_output_limit() {
             context_window: 30_000,
             max_output_tokens: 1_000_000,
             compaction: CompactionConfig {
-                threshold_ratio: 0.5,
+                reserve_tokens: 15_000,
                 summary_max_tokens: 4_096,
                 ..CompactionConfig::default()
             },
@@ -2483,9 +2483,9 @@ fn failed_force_compaction_returns_original_overflow_error() {
 }
 
 #[test]
-fn compaction_judgment_happens_after_first_response() {
-    // 3c：压缩判定移到响应后——即使首轮请求已显著超窗，第一个 provider 请求
-    // 仍以正常 turn 请求发出；压缩在响应返回后按装配成品估算触发。
+fn compaction_judgment_happens_before_first_request() {
+    // 压缩判定在请求前：首轮装配成品估算超过「窗口 − reserve_tokens」时，
+    // 第一个请求就是压缩摘要调用；压缩完成后才以正常 turn 请求发出。
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let big_text = "x".repeat(100_000);
@@ -2493,14 +2493,14 @@ fn compaction_judgment_happens_after_first_response() {
         fake_contract(),
         vec![
             FakeStep {
-                text: "first answer".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(0, 0),
-            },
-            FakeStep {
                 text: "## Goal\ncompacted summary".to_string(),
                 tool_calls: Vec::new(),
                 usage: usage(100, 20),
+            },
+            FakeStep {
+                text: "first answer".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(0, 0),
             },
         ],
     ));
@@ -2511,7 +2511,7 @@ fn compaction_judgment_happens_after_first_response() {
             context_window: 30_000,
             max_output_tokens: 1,
             compaction: CompactionConfig {
-                threshold_ratio: 0.5,
+                reserve_tokens: 15_000,
                 summary_max_tokens: 4_096,
                 ..CompactionConfig::default()
             },
@@ -2535,13 +2535,13 @@ fn compaction_judgment_happens_after_first_response() {
     assert_eq!(outcome.final_text, "first answer");
     let requests = provider.requests.lock().unwrap();
     assert!(
-        requests[0].request_id.starts_with("turn_"),
-        "first request must be a normal turn request (judgment is post-response): {:?}",
+        requests[0].request_id.starts_with("compaction-"),
+        "first request must be the pre-request compaction summary call: {:?}",
         requests[0].request_id
     );
     assert!(
-        requests[1].request_id.starts_with("compaction-"),
-        "second request must be the compaction summary call: {:?}",
+        requests[1].request_id.starts_with("turn_"),
+        "second request must be the normal turn request after compaction: {:?}",
         requests[1].request_id
     );
 }

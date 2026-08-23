@@ -1,0 +1,36 @@
+#![forbid(unsafe_code)]
+
+//! Thread/Turn 生命周期协调与进程内 turn 执行管线。
+//!
+//! runtime 是无交互入口（`--print`/`--json`）与交互式 TUI 共享的唯一执行层：
+//! [`TurnRunner`] 负责单个 turn 的完整生命周期（会话打开/修复、项目指令装配、
+//! Agent 执行、事件投影、终态落盘），[`Conversation`] 在其上维护一个 Thread 的
+//! 长驻状态：单活动 turn 不变量、steer/followUp 注入、取消、设置生效时序。
+//!
+//! 职责边界：
+//! - Context/Compaction 保留在 `singularity_agent::compaction`；
+//! - 工具保留在 `singularity_agent::tools`（[`singularity_agent::tools::ToolRegistry`]）;
+//! - Provider 选择与请求保留在 `singularity_model`（`dyn Provider` 即模型接缝）；
+//! - 会话 JSONL 持久化保留在 `singularity_agent::session`；
+//! - 协议 wire 与 JSON-RPC 属于 app-server 适配器；runtime 不依赖 protocol。
+//!
+//! 事件事实源：[`TurnEvent`]。文本渲染、JSONL 输出、TUI 与协议投影各自消费
+//! 同一枚举，任何一方的失败只影响自身投影。
+
+pub mod conversation;
+pub mod error;
+pub mod events;
+pub mod objects;
+pub mod runner;
+pub mod store;
+
+pub use conversation::{Conversation, ConversationError, SettingsPatch, TurnControls};
+pub use error::{
+    ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
+};
+pub use events::{TurnEvent, TurnEventSink};
+pub use objects::{Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
+pub use runner::{TurnOutcome, TurnParams, TurnRunner};
+pub use store::{
+    ResumeError, canonical_thread_cwd, create_thread, resume_thread, thread_session_path,
+};

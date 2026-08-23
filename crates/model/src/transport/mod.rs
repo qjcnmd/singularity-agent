@@ -972,20 +972,83 @@ impl OpenAiProvider {
                     }
                 };
             let status = response.status();
+            let status_code = status.as_u16();
             if !status.is_success() {
-                let error = ProviderError::from_model_error(model_error_from_http_status(
-                    status.as_u16(),
-                    &self.config.provider_name,
-                    model_name,
-                ));
+                // Retry-After 必须在响应体读取消费 response 之前提取。
+                let retry_after = retry_after_delay(response.headers());
+                // 有界读取非 2xx 响应体，供结构化解析与诊断增强；读取失败
+                // 不掩盖原始状态码错误，降级为无 body 继续。
+                let error_body = read_bounded_provider_response_body(
+                    runtime,
+                    cancellation,
+                    self.request_timeout_seconds,
+                    response,
+                )
+                .ok();
+                let error_fields = error_body.as_deref().map(parse_provider_error_body);
+                let context_length_exceeded = is_context_length_exceeded_code(
+                    error_fields
+                        .as_ref()
+                        .and_then(|fields| fields.code.as_deref()),
+                );
+                let model_error = if context_length_exceeded {
+                    let mut context_error = ModelError::new(
+                        ModelErrorKind::ContextLengthExceeded,
+                        "provider rejected the request: context length exceeded",
+                    )
+                    .with_provider(self.config.provider_name.clone())
+                    .with_model(model_name.to_string())
+                    .with_provider_diagnostic(
+                        "provider_context_length_exceeded",
+                        ProviderErrorStage::ResponseStatus,
+                    );
+                    context_error.http_status = Some(status_code);
+                    context_error
+                } else {
+                    model_error_from_http_status(
+                        status_code,
+                        &self.config.provider_name,
+                        model_name,
+                    )
+                };
+                // 有界诊断只进入对外展示文本（ProviderError.message），不写入
+                // 序列化的 ModelError：错误体内容经过有界、单行化与脱敏后仍不
+                // 进入结构化边界字段。结构化上下文超限使用固定文案。
+                let provider_diagnostic = if context_length_exceeded {
+                    None
+                } else {
+                    error_fields
+                        .as_ref()
+                        .and_then(|fields| fields.message.as_deref())
+                        .map(|message| {
+                            bounded_provider_error_diagnostic(message, &self.config.api_key)
+                        })
+                        .or_else(|| {
+                            error_body.as_deref().map(|body| {
+                                bounded_provider_error_diagnostic(
+                                    &String::from_utf8_lossy(body),
+                                    &self.config.api_key,
+                                )
+                            })
+                        })
+                        .filter(|diagnostic| !diagnostic.is_empty())
+                };
+                let mut display_message = model_error.message.clone();
+                if let Some(diagnostic) = provider_diagnostic {
+                    display_message.push_str(" Provider diagnostic: ");
+                    display_message.push_str(&diagnostic);
+                }
+                // 结构化上下文超限不可重试：重发同一请求必然再次超限，即使
+                // provider 将其映射到通常可重试的状态码（429/5xx）上。
                 if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                    && http_status_is_retryable(status.as_u16())
+                    && !context_length_exceeded
+                    && http_status_is_retryable(status_code)
                 {
                     let retry_backoff = record_provider_retry(
                         &mut metadata,
                         occurrence,
-                        &error.error,
-                        retry_after_delay(response.headers()),
+                        &model_error,
+                        retry_after,
                         on_attempt,
                     )?;
                     wait_retry_backoff(
@@ -1000,15 +1063,16 @@ impl OpenAiProvider {
                 record_provider_attempt(
                     &mut metadata,
                     occurrence,
-                    Some(&error.error),
+                    Some(&model_error),
                     None,
                     on_attempt,
                 )?;
-                return Err(
-                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                let mut error = ProviderError::from_model_error(model_error)
+                    .with_provider_attempt_metadata(provider_attempt_metadata(
                         &metadata, started_at,
-                    )),
-                );
+                    ));
+                error.message = display_message;
+                return Err(error);
             }
             let response_retry_after = retry_after_delay(response.headers());
             let failure = match read_response(response, occurrence.started_at) {

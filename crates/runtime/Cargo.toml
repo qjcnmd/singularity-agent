@@ -1,5 +1,5 @@
 [package]
-name = "singularity_cli"
+name = "singularity_runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,23 +9,19 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "sg"
-path = "src/main.rs"
+[features]
+# 仅测试/诊断：启用终态化故障注入，验证 fail-stop 与有界重试语义。
+test-hooks = []
 
 [dependencies]
-clap.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+singularity_agent = { path = "../agent" }
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
-singularity_runtime = { path = "../runtime" }
-tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+uuid.workspace = true
 
 [dev-dependencies]
-assert_cmd.workspace = true
+tempfile.workspace = true

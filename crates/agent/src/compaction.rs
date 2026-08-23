@@ -4,7 +4,8 @@
 //! 压缩引擎会自动提取历史对话的结构化摘要，修剪早期详细历史并保留最新对话上下文。
 //!
 //! 核心流程：
-//! 1. **触发判定**（`should_compact`）：依据当前 Token 数、模型上下文窗口与保留缓冲区预算判定是否触发。
+//! 1. **触发判定**（`should_compact`）：请求发出前基于本轮装配成品估算判定，
+//!    估算超过「上下文窗口 − `reserve_tokens` 预留」即触发；预留空间供模型回答使用。
 //! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `retain_ratio` 预算内的最新消息；
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
@@ -29,8 +30,8 @@ use crate::session::{
     CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionManager,
 };
 
-/// 默认在上下文窗口 90% 处触发压缩。
-pub const DEFAULT_THRESHOLD_RATIO: f64 = 0.90;
+/// 默认为模型回答预留的 Token 空间：装配成品估算超过 `context_window - reserve_tokens` 时触发压缩。
+pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
 /// 默认保留上下文窗口 20% 的最近内容。
 pub const DEFAULT_RETAIN_RATIO: f64 = 0.20;
 /// 摘要请求的默认最大输出 token 数。
@@ -139,7 +140,9 @@ const NO_PRIOR_HISTORY: &str = "No prior history.";
 /// 上下文压缩的用户可配置策略。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
-    pub threshold_ratio: f64,
+    /// 为模型回答预留的 Token 空间；装配成品估算超过
+    /// `context_window - reserve_tokens` 时在请求前触发压缩。
+    pub reserve_tokens: u64,
     pub retain_ratio: f64,
     pub summary_max_tokens: u32,
 }
@@ -147,7 +150,7 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            threshold_ratio: DEFAULT_THRESHOLD_RATIO,
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
             retain_ratio: DEFAULT_RETAIN_RATIO,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
         }
@@ -155,16 +158,18 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
-    pub fn validate(&self, provider_max_output_tokens: u32) -> Result<()> {
-        if !(self.threshold_ratio.is_finite()
-            && self.retain_ratio.is_finite()
-            && 0.0 < self.retain_ratio
-            && self.retain_ratio < self.threshold_ratio
-            && self.threshold_ratio < 1.0)
-        {
+    /// 校验压缩策略：`reserve_tokens` 必须小于 `context_window`（为上下文内容
+    /// 留出空间），`retain_ratio` 与摘要输出上限沿用既有约束；非法配置 fail closed。
+    pub fn validate(&self, context_window: u64, provider_max_output_tokens: u32) -> Result<()> {
+        if !(self.retain_ratio.is_finite() && 0.0 < self.retain_ratio && self.retain_ratio < 1.0) {
             return Err(CompactionError::InvalidResponse(
-                "compaction ratios must satisfy 0 < retain_ratio < threshold_ratio < 1".to_string(),
+                "retain_ratio must satisfy 0 < retain_ratio < 1".to_string(),
             ));
+        }
+        if self.reserve_tokens >= context_window {
+            return Err(CompactionError::InvalidResponse(format!(
+                "reserve_tokens must be smaller than the model context window ({context_window})"
+            )));
         }
         if self.summary_max_tokens == 0 || self.summary_max_tokens > provider_max_output_tokens {
             return Err(CompactionError::InvalidResponse(format!(
@@ -175,11 +180,11 @@ impl CompactionConfig {
     }
 }
 
-/// 一次压缩的运行预算（由模型窗口和 ratio 配置计算）。
+/// 一次压缩的运行预算（由模型窗口和压缩策略计算）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionBudget {
     pub context_window: u64,
-    pub threshold_ratio: f64,
+    pub reserve_tokens: u64,
     pub retain_ratio: f64,
     pub summary_max_tokens: u32,
 }
@@ -188,14 +193,14 @@ impl CompactionBudget {
     pub fn from_config(context_window: u64, config: &CompactionConfig) -> Self {
         Self {
             context_window,
-            threshold_ratio: config.threshold_ratio,
+            reserve_tokens: config.reserve_tokens,
             retain_ratio: config.retain_ratio,
             summary_max_tokens: config.summary_max_tokens,
         }
     }
 
     fn threshold_tokens(&self) -> u64 {
-        ((self.context_window as f64) * self.threshold_ratio).floor() as u64
+        self.context_window.saturating_sub(self.reserve_tokens)
     }
 
     fn retain_tokens(&self) -> u64 {
@@ -288,7 +293,8 @@ impl CompactionEngine {
         self
     }
 
-    /// 判定是否应当触发压缩：当前上下文超过窗口的 threshold ratio 时触发。
+    /// 判定是否应当触发压缩：上下文估算超过「窗口 − reserve_tokens 预留」时触发。
+    /// 恰好等于阈值不触发。
     pub fn should_compact(&self, context_tokens: u64, budget: &CompactionBudget) -> bool {
         context_tokens > budget.threshold_tokens()
     }
@@ -591,7 +597,9 @@ impl CompactionEngine {
             };
         }
         // 从最新条目向后回溯累加 Token 估算值，达到保留预算时选择 >= 当前条目的最近合法切点。
-        // 切点绝不切在 ToolResult 上（ToolResult 必须紧随其 ToolCall 保持在同一侧）。
+        // 切点绝不切在 ToolResult 上（ToolResult 必须紧随其 ToolCall 保持在同一侧）；
+        // 尾部 ToolResult 自身跨过保留预算且其后无合法切点时，回退到所属轮次起点，
+        // 完整保留当前轮并摘要更早全部历史。
         let mut accumulated_tokens = 0u64;
         let mut cut_index = cut_points[0];
         for index in (start_index..end_index).rev() {
@@ -601,9 +609,12 @@ impl CompactionEngine {
             }
             accumulated_tokens += message_tokens;
             if accumulated_tokens >= keep_recent_tokens {
-                if let Some(&next) = cut_points.iter().find(|&&cut| cut >= index) {
-                    cut_index = next;
-                }
+                cut_index = match cut_points.iter().find(|&&cut| cut >= index) {
+                    Some(&next) => next,
+                    None => {
+                        find_turn_start_index(entries, index, start_index).unwrap_or(start_index)
+                    }
+                };
                 break;
             }
         }

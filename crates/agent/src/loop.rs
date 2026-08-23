@@ -160,7 +160,9 @@ impl AgentConfig {
         {
             config.compaction.summary_max_tokens = provider_max_output_tokens;
         }
-        config.compaction.validate(provider_max_output_tokens)?;
+        config
+            .compaction
+            .validate(config.context_window, provider_max_output_tokens)?;
         Ok(config)
     }
 }
@@ -542,7 +544,7 @@ impl Agent {
                         return self.fail_after_progress(AgentError::Session(error), outcome);
                     }
                 }
-                let (request, assembled_estimate, assembled_entries) = match self.build_request(
+                let (mut request, assembled_estimate) = match self.build_request(
                     &preferences,
                     &tools,
                     &tool_choice,
@@ -552,6 +554,53 @@ impl Agent {
                     Ok(request) => request,
                     Err(error) => return self.fail_after_progress(error, outcome),
                 };
+                // 请求前主动判定：装配成品估算（含 max_output_tokens 预算）超过
+                // 「窗口 − reserve_tokens」时先压缩再重装请求。压缩失败降级为
+                // 警告继续发送，交由 provider 溢出强制压缩路径兜底。
+                let budget = CompactionBudget::from_config(
+                    self.config.context_window,
+                    &self.config.compaction,
+                );
+                if self.compaction.should_compact(assembled_estimate, &budget) {
+                    match self.compaction.compact(
+                        &mut self.session,
+                        &budget,
+                        assembled_estimate,
+                        cancellation,
+                    ) {
+                        Ok(result) => {
+                            record_compaction(&mut outcome, &result);
+                            if matches!(result, CompactionOutcome::Compacted { .. }) {
+                                let (rebuilt, _) = match self.build_request(
+                                    &preferences,
+                                    &tools,
+                                    &tool_choice,
+                                    max_output_tokens,
+                                    outcome.turns,
+                                ) {
+                                    Ok(rebuilt) => rebuilt,
+                                    Err(error) => {
+                                        return self.fail_after_progress(error, outcome);
+                                    }
+                                };
+                                request = rebuilt;
+                            }
+                        }
+                        Err(crate::compaction::CompactionError::Session(error)) => {
+                            return self.fail_after_progress(AgentError::Session(error), outcome);
+                        }
+                        Err(_error) => {
+                            outcome.usage_complete = false;
+                            emit_diagnostic(
+                                events,
+                                AgentDiagnostic::warning(
+                                    "compaction_skipped",
+                                    "automatic context compaction skipped".to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 let response = match self.stream_completion(
                     &request,
@@ -637,16 +686,6 @@ impl Agent {
                         }
                     }
                     outcome.final_text = assistant_text;
-                    if let Err(error) = self.maybe_compact(
-                        &mut outcome,
-                        Some(&response.usage),
-                        assembled_estimate,
-                        assembled_entries,
-                        cancellation,
-                        events,
-                    ) {
-                        return self.fail_after_progress(error, outcome);
-                    }
                     continue;
                 }
                 if !tool_calls.is_empty() {
@@ -711,16 +750,6 @@ impl Agent {
                         lock_inbox(&self.inbox).close();
                         return Ok(outcome);
                     }
-                    if let Err(error) = self.maybe_compact(
-                        &mut outcome,
-                        Some(&response.usage),
-                        assembled_estimate,
-                        assembled_entries,
-                        cancellation,
-                        events,
-                    ) {
-                        return self.fail_after_progress(error, outcome);
-                    }
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
@@ -731,16 +760,6 @@ impl Agent {
                     return self.fail_after_progress(AgentError::Session(error), outcome);
                 }
                 outcome.final_text = assistant_text;
-                if let Err(error) = self.maybe_compact(
-                    &mut outcome,
-                    Some(&response.usage),
-                    assembled_estimate,
-                    assembled_entries,
-                    cancellation,
-                    events,
-                ) {
-                    return self.fail_after_progress(error, outcome);
-                }
                 break;
             }
             // 代理将要停止：消费 follow-up 队列后回到内层循环。
@@ -807,7 +826,7 @@ impl Agent {
         }
     }
 
-    /// 在本轮已装配的请求成品上做 Token 估算（压缩判定兜底基线）。
+    /// 在本轮已装配的请求成品上做 Token 估算（请求前压缩判定的估算基础）。
     ///
     /// 覆盖最终 wire 请求：除 content 外，provider 还会重放每条 tool 消息的
     /// tool_call_id 与 assistant tool_calls 的 id/name/raw_arguments。
@@ -846,7 +865,7 @@ impl Agent {
     /// 按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     ///
     /// 上下文条目只装配一次：messages、reasoning replay 与预算估算全部在
-    /// 同一份装配成品上完成；返回 (请求, 装配成品估算, 装配时的条目数)。
+    /// 同一份装配成品上完成；返回 (请求, 装配成品估算)。
     fn build_request(
         &self,
         preferences: &ModelPreferences,
@@ -854,7 +873,7 @@ impl Agent {
         tool_choice: &ToolChoicePolicy,
         max_output_tokens: u32,
         turn: u32,
-    ) -> Result<(ModelTurnRequest, u64, usize)> {
+    ) -> Result<(ModelTurnRequest, u64)> {
         let entries = self.session.build_context_entries()?;
         let context_messages = entries
             .iter()
@@ -878,7 +897,7 @@ impl Agent {
             model_name: preferences.model_name.clone(),
             max_output_tokens: Some(max_output_tokens),
         };
-        Ok((request, assembled_estimate, entries.len()))
+        Ok((request, assembled_estimate))
     }
 
     /// 从 durable assistant entries 恢复 provider-private continuation。
@@ -1038,83 +1057,6 @@ impl Agent {
                 // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
                 Err(AgentError::Provider(error))
             }
-        }
-    }
-
-    /// 每轮模型调用后评估是否需要触发上下文压缩。
-    ///
-    /// 触发条件满足时调用 CompactionEngine 生成历史结构化摘要并追加 CompactionEntry 节点；
-    /// 后续请求将自动以该压缩节点作为上下文构建基线。
-    /// 若摘要模型调用遭遇瞬时错误，降级记录警告并继续会话，避免中断已完成的执行。
-    fn maybe_compact(
-        &mut self,
-        outcome: &mut AgentOutcome,
-        last_usage: Option<&ModelUsage>,
-        assembled_estimate: u64,
-        assembled_entries: usize,
-        cancellation: &CancellationToken,
-        events: &mut AgentEvents,
-    ) -> Result<()> {
-        let budget =
-            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        let context_tokens =
-            self.estimate_context_tokens(last_usage, assembled_estimate, assembled_entries)?;
-        if !self.compaction.should_compact(context_tokens, &budget) {
-            return Ok(());
-        }
-        match self
-            .compaction
-            .compact(&mut self.session, &budget, context_tokens, cancellation)
-        {
-            Ok(result) => record_compaction(outcome, &result),
-            Err(crate::compaction::CompactionError::Session(error)) => {
-                return Err(AgentError::Session(error));
-            }
-            Err(_error) => {
-                outcome.usage_complete = false;
-                emit_diagnostic(
-                    events,
-                    AgentDiagnostic::warning(
-                        "compaction_skipped",
-                        "automatic context compaction skipped".to_string(),
-                    ),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// 估算压缩判定用的上下文 Token 总量。
-    ///
-    /// 以 Provider 对上一请求的实测 usage 为基线，叠加装配后新增的尾部条目
-    /// 估算；usage 缺失时以本轮装配成品的估算兜底（首轮/无用量场景）。尾部
-    /// 从线性条目末尾反向累计至最近一条 assistant 消息为止（其内容已计入
-    /// provider 输出侧 usage）。估算直接在装配成品与条目上完成，不做第二次
-    /// 上下文装配。
-    fn estimate_context_tokens(
-        &self,
-        last_usage: Option<&ModelUsage>,
-        assembled_estimate: u64,
-        assembled_entries: usize,
-    ) -> Result<u64> {
-        let entries = self.session.entries();
-        let trailing = entries
-            .iter()
-            .rev()
-            .take(entries.len().saturating_sub(assembled_entries))
-            .take_while(|entry| {
-                !matches!(
-                    &entry.entry_type,
-                    SessionEntryType::Message(message)
-                        if message.role == AgentMessageRole::Assistant
-                )
-            })
-            .flat_map(entry_to_llm_messages)
-            .map(|message| self.compaction.estimate_tokens(&message.content))
-            .sum::<u64>();
-        match last_usage.filter(|usage| usage.total_tokens > 0) {
-            Some(usage) => Ok(usage.total_tokens.saturating_add(trailing)),
-            None => Ok(assembled_estimate.saturating_add(trailing)),
         }
     }
 

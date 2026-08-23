@@ -78,7 +78,7 @@ fn entries_of(messages: Vec<AgentMessage>) -> Vec<SessionEntry> {
 fn budget(window: u64, keep_recent: u64) -> CompactionBudget {
     CompactionBudget {
         context_window: window,
-        threshold_ratio: 0.90,
+        reserve_tokens: window / 10,
         retain_ratio: keep_recent as f64 / window as f64,
         summary_max_tokens: 4_096,
     }
@@ -135,36 +135,55 @@ fn mock_engine(texts: Vec<String>) -> (CompactionEngine, MockProvider) {
 fn should_compact_threshold_boundaries() {
     let (engine, _) = mock_engine(vec![]);
     let budget = budget(100_000, 20_000);
-    // 阈值 = 100_000 * 0.90 = 90_000。
+    // 阈值 = 窗口 100_000 − 预留 10_000 = 90_000。
     assert!(!engine.should_compact(0, &budget));
     assert!(!engine.should_compact(89_999, &budget));
     assert!(!engine.should_compact(90_000, &budget), "等于阈值不触发");
     assert!(engine.should_compact(90_001, &budget), "超过阈值触发");
     assert!(engine.should_compact(100_000, &budget));
-    // ratio 仍按模型窗口计算，不使用绝对 reserve sentinel。
+    // 极小窗口同样按绝对 token 预留计算。
     let tiny = CompactionBudget {
         context_window: 100,
-        threshold_ratio: 0.90,
+        reserve_tokens: 10,
         retain_ratio: 0.20,
         summary_max_tokens: 4_096,
     };
     assert!(!engine.should_compact(1, &tiny));
 }
 
+/// 1b. reserve_tokens 判定边界与默认值：threshold = window − reserve_tokens，
+///     默认配置预留 16_384。
 #[test]
-fn compaction_config_rejects_invalid_ratio_and_output_cap() {
-    let invalid_ratio = CompactionConfig {
-        threshold_ratio: 0.2,
+fn should_compact_reserve_tokens_boundary_and_default() {
+    let (engine, _) = mock_engine(vec![]);
+    let budget = CompactionBudget::from_config(128_000, &CompactionConfig::default());
+    assert_eq!(budget.reserve_tokens, 16_384);
+    // 阈值 = 128_000 − 16_384 = 111_616。
+    assert!(engine.should_compact(111_617, &budget));
+    assert!(!engine.should_compact(111_616, &budget));
+}
+
+#[test]
+fn compaction_config_rejects_invalid_policy_and_output_cap() {
+    let invalid_retain = CompactionConfig {
+        reserve_tokens: 10_000,
+        retain_ratio: 1.0,
+        summary_max_tokens: 8192,
+    };
+    assert!(invalid_retain.validate(100_000, 16_384).is_err());
+    // reserve_tokens 必须小于 context_window，非法时 fail closed。
+    let invalid_reserve = CompactionConfig {
+        reserve_tokens: 100_000,
         retain_ratio: 0.2,
         summary_max_tokens: 8192,
     };
-    assert!(invalid_ratio.validate(16_384).is_err());
+    assert!(invalid_reserve.validate(100_000, 16_384).is_err());
     let invalid_cap = CompactionConfig {
-        threshold_ratio: 0.9,
+        reserve_tokens: 10_000,
         retain_ratio: 0.2,
         summary_max_tokens: 16_385,
     };
-    assert!(invalid_cap.validate(16_384).is_err());
+    assert!(invalid_cap.validate(100_000, 16_384).is_err());
 }
 
 /// 2. find_cut_point：全量切点、toolResult 跟随、split turn、keep 边界、元数据回扫。
@@ -611,6 +630,130 @@ fn compact_nothing_to_summarize() {
     let content = std::fs::read_to_string(session.path()).unwrap();
     let lines: Vec<&str> = content.lines().skip(1).collect();
     assert_eq!(lines.len(), 1, "只有一条消息，无 compaction 条目");
+}
+
+/// 5d. 估算恰好等于「窗口 − reserve」时不压缩（compact 入口的相等边界）。
+#[test]
+fn compact_not_needed_when_estimate_equals_reserve_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), dir.path()).unwrap();
+    session.append_message(user("hello")).unwrap();
+    session.append_message(assistant("world")).unwrap();
+
+    // budget(100_000, 20_000) → reserve = 10_000，阈值 = 90_000。
+    let (mut engine, mock) = mock_engine(vec![]);
+    assert_eq!(
+        engine
+            .compact_with_reason(
+                &mut session,
+                &budget(100_000, 20_000),
+                90_000,
+                CompactionReason::Threshold,
+                &CancellationToken::new(),
+            )
+            .unwrap(),
+        CompactionOutcome::NotNeeded
+    );
+    assert!(mock.requests().is_empty(), "不应发起摘要调用");
+}
+
+/// 5e. 当前轮（无更早历史）尾部 ToolResult 自身跨过保留预算：切点回退到轮
+///     起点后无可摘要内容 → NotNeeded，不发起摘要请求、不落盘 compaction。
+#[test]
+fn compact_not_needed_when_unsplittable_current_turn_is_all_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), dir.path()).unwrap();
+    session.append_message(user(&"u".repeat(400))).unwrap(); // 100 token
+    session
+        .append_message(file_call("read", "src/main.rs"))
+        .unwrap();
+    session
+        .append_message(tool_result("c1", &"t".repeat(2000)))
+        .unwrap(); // 500 token
+
+    let (mut engine, mock) = mock_engine(vec![]);
+    // keep=250：回走累积在尾部 ToolResult（500）跨过预算，且其后无合法切点。
+    let outcome = engine
+        .compact_with_reason(
+            &mut session,
+            &budget(100_000, 250),
+            90_001,
+            CompactionReason::Threshold,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(outcome, CompactionOutcome::NotNeeded);
+    assert!(mock.requests().is_empty(), "不应发起摘要调用");
+    let content = std::fs::read_to_string(session.path()).unwrap();
+    let lines: Vec<&str> = content.lines().skip(1).collect();
+    assert_eq!(lines.len(), 3, "无 compaction 条目落盘");
+}
+
+/// 5f. 有更早历史且当前轮尾部 ToolResult 跨过保留预算：切点回退到当前轮起点，
+///     摘要仅含更早历史；当前轮完整保留且 ToolCall/ToolResult 成对。
+#[test]
+fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let id_u0 = session.append_message(user(&"u".repeat(400))).unwrap(); // 更早历史 turn
+    session
+        .append_message(file_call("read", "old.txt"))
+        .unwrap();
+    session
+        .append_message(tool_result("c1", &"t".repeat(400)))
+        .unwrap();
+    let id_u1 = session.append_message(user(&"d".repeat(400))).unwrap(); // 当前轮起点
+    let id_a1 = session
+        .append_message(file_call("read", "new.txt"))
+        .unwrap();
+    let id_t1 = session
+        .append_message(tool_result("c2", &"f".repeat(4000)))
+        .unwrap(); // 尾部跨预算
+
+    let (mut engine, mock) = mock_engine(vec!["## Goal\nearlier history".to_string()]);
+    // keep=250：回走累积在当前轮尾部 ToolResult（1000 token）跨过预算，
+    // 其后无合法切点 → 回退到当前轮起点 u1。
+    let outcome = engine
+        .compact_with_reason(
+            &mut session,
+            &budget(100_000, 250),
+            90_001,
+            CompactionReason::Threshold,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let CompactionOutcome::Compacted {
+        first_kept_entry_id,
+        ..
+    } = &outcome
+    else {
+        panic!("expected Compacted, got {outcome:?}");
+    };
+    assert_eq!(first_kept_entry_id, &id_u1, "切点应为当前轮起点");
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = &requests[0].messages[1].content;
+    assert!(prompt.contains("[User]: uuuu"), "摘要应包含更早历史");
+    assert!(!prompt.contains("dddd"), "摘要不得包含当前轮内容");
+    assert!(!prompt.contains("ffff"), "摘要不得包含当前轮工具结果");
+
+    // 重开：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult 成对保留。
+    let reopened = SessionManager::open(session.path()).unwrap();
+    let ctx = reopened.build_context_entries().unwrap();
+    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
+    assert_eq!(ctx_ids.len(), 4);
+    assert!(matches!(ctx[0].entry_type, SessionEntryType::Compaction(_)));
+    assert_eq!(
+        ctx_ids,
+        vec![
+            ctx[0].id.as_str(),
+            id_u1.as_str(),
+            id_a1.as_str(),
+            id_t1.as_str()
+        ]
+    );
+    assert!(!ctx_ids.contains(&id_u0.as_str()));
 }
 
 /// 6. 摘要 Prompt 常量结构完整性校验（段落与顺序检查）。

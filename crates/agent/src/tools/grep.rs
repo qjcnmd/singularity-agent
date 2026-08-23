@@ -14,7 +14,7 @@ use super::walk::{to_cwd_relative, walk_files};
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
 
 const MAX_MATCHES: usize = 500;
-/// 单行输出文本的最大长度；超长行只保留前缀。
+/// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
 /// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
 const BINARY_SNIFF_BYTES: usize = 8192;
@@ -46,6 +46,19 @@ fn looks_binary(file: &mut File) -> bool {
     let read = std::io::Read::read(file, &mut buf).unwrap_or(0);
     let _ = file.seek(SeekFrom::Start(0));
     buf[..read].contains(&0)
+}
+
+/// 命中行的展示文本：超过 [`MAX_LINE_OUTPUT_BYTES`] 的行截断为字节上限内、
+/// char 边界安全的前缀并追加 "..."；截断只影响展示，不影响匹配结果集。
+fn truncate_for_display(line: &str) -> String {
+    if line.len() <= MAX_LINE_OUTPUT_BYTES {
+        return line.to_string();
+    }
+    let mut end = MAX_LINE_OUTPUT_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
@@ -112,32 +125,23 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
                 Err(_) => break,
             };
             line_number += 1;
-            if bytes > MAX_LINE_OUTPUT_BYTES {
-                line_bytes.truncate(MAX_LINE_OUTPUT_BYTES);
-                let mut text = String::from_utf8_lossy(&line_bytes).into_owned();
-                text.push_str("...");
-                if regex.is_match(&text) {
-                    matches += 1;
-                    output.push_str(&format!(
-                        "{}:{line_number}:{text}\n",
-                        to_cwd_relative(ctx.cwd, &root, &relative)
-                    ));
-                }
-            } else {
-                let mut text = String::from_utf8_lossy(&line_bytes).into_owned();
-                if text.ends_with('\n') {
-                    text.pop();
-                }
-                if text.ends_with('\r') {
-                    text.pop();
-                }
-                if regex.is_match(&text) {
-                    matches += 1;
-                    output.push_str(&format!(
-                        "{}:{line_number}:{text}\n",
-                        to_cwd_relative(ctx.cwd, &root, &relative)
-                    ));
-                }
+            // 正则始终对完整原始行匹配；行尾 \n 与 CRLF 的 \r 先剥除，
+            // 展示截断只作用于命中行的输出文本。
+            let mut line_end = bytes;
+            if line_end > 0 && line_bytes[line_end - 1] == b'\n' {
+                line_end -= 1;
+            }
+            if line_end > 0 && line_bytes[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            let line = String::from_utf8_lossy(&line_bytes[..line_end]);
+            if regex.is_match(&line) {
+                matches += 1;
+                output.push_str(&format!(
+                    "{}:{line_number}:{}\n",
+                    to_cwd_relative(ctx.cwd, &root, &relative),
+                    truncate_for_display(&line),
+                ));
             }
             line_bytes.clear();
         }
@@ -255,5 +259,80 @@ mod tests {
         let result = execute(context(json!({ "pattern": "(" }), dir.path())).expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("invalid regular expression"));
+    }
+
+    #[test]
+    fn grep_matches_long_lines_beyond_display_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut line = "a".repeat(2040);
+        line.push_str("needle");
+        line.push_str(&"b".repeat(2040));
+        fs::write(dir.path().join("long.txt"), format!("{line}\n")).expect("long line");
+        let result = execute(context(json!({ "pattern": "needle" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        // 命中位于展示窗口之外：该行必须进入结果，展示前缀不含 needle。
+        let entry = result
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("long.txt:1:"))
+            .expect("hit beyond the display window must be reported");
+        assert!(!entry.contains("needle"), "{}", entry);
+    }
+
+    #[test]
+    fn grep_truncates_matched_line_display_to_limit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut line = String::from("marker ");
+        line.push_str(&"x".repeat(4096));
+        fs::write(dir.path().join("wide.txt"), format!("{line}\n")).expect("wide line");
+        let result = execute(context(json!({ "pattern": "marker" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        let text = result
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("wide.txt:1:"))
+            .expect("match line");
+        assert!(text.ends_with("..."), "{text}");
+        assert!(
+            text.len() <= MAX_LINE_OUTPUT_BYTES + "...".len(),
+            "{}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn grep_truncates_multibyte_lines_at_char_boundary() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // 3600 字节的多字节前缀使 1024 字节截断点落在 char 中间。
+        let line = format!("{}tail-marker", "汉字".repeat(600));
+        fs::write(dir.path().join("utf8.txt"), format!("{line}\n")).expect("utf8 line");
+        let result =
+            execute(context(json!({ "pattern": "tail-marker" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        let text = result
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("utf8.txt:1:"))
+            .expect("tail hit must be reported");
+        assert!(text.ends_with("..."), "{text}");
+        assert!(!text.contains('\u{FFFD}'), "{text}");
+        let prefix = text.strip_suffix("...").expect("suffix");
+        assert!(line.starts_with(prefix), "prefix split a char boundary");
+    }
+
+    #[test]
+    fn grep_skips_long_lines_without_match() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let line = "z".repeat(4096);
+        fs::write(
+            dir.path().join("quiet.txt"),
+            format!("{line}\nstill nothing here\n"),
+        )
+        .expect("quiet file");
+        let result =
+            execute(context(json!({ "pattern": "needle-gone" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        assert!(!result.content.contains("quiet.txt"), "{}", result.content);
+        assert!(result.content.contains("no matches"), "{}", result.content);
     }
 }
