@@ -872,7 +872,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         "completed"
     );
 
-    // SQLite-only 的陈旧 interrupted 不得覆盖 JSONL 中已有的 completed 事实；
+    // 索引中陈旧的 interrupted 不得覆盖 JSONL 中已有的 completed 事实；
     // 重开（turn/start）先按 JSONL 重投影，再正常完成新 turn。
     server
         .store()

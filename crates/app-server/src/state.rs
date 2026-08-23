@@ -56,7 +56,7 @@ pub struct AppServerCancellationHandle {
 ///
 /// It deliberately contains only the in-memory active-turn registry; ordinary
 /// state requests continue to run through the single `AppServer` owner and
-/// its SQLite connection.
+/// its in-memory session index.
 #[derive(Clone)]
 pub struct AppServerControlHandle {
     pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,

@@ -52,7 +52,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let cancellation = server.cancellation_handle();
-    // Ordinary requests retain the single AppServer/SQLite owner. The control
+    // Ordinary requests retain the single AppServer owner. The control
     // lane receives only cloneable active-turn/inbox handles and therefore
     // cannot create a second mutable state owner.
     let control_handle = server.control_handle();

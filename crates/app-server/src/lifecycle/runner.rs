@@ -206,7 +206,7 @@ impl AppServer {
         // turn 状态之前完成，任一失败都直接回错误响应，不遗留 turn_started 或 Active。
         let (provider, config, instructions_truncated) = self.resolve_agent_runtime(&thread)?;
         // JSONL is the authoritative lifecycle source: commit turn_started before
-        // projecting Active into SQLite or publishing turn/started.
+        // projecting Active into in-memory index or publishing turn/started.
         self.append_turn_started_metadata(&mut session, &turn_id)?;
         let mut metadata = SessionMetadataUpdate {
             status: Some(SessionStatus::Active),

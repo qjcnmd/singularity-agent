@@ -2,7 +2,7 @@
 
 //! 在进程边界负责 session/turn 准入、AgentLoop 执行和取消的 stdio JSON-RPC 应用服务。
 //!
-//! JSONL rollout 是会话正文的唯一权威；SQLite `session_index` 只保存定位与展示元数据。
+//! JSONL rollout 是会话正文的唯一持久事实源；进程内 `SessionIndex` 只缓存定位与展示元数据并在启动时从 JSONL 重建。
 
 mod delete;
 mod dispatch;

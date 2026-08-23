@@ -479,7 +479,6 @@ fn real_provider_restart_and_resume_smoke() {
     );
     run_continue(&fixture, &id, "Reply with one more short acknowledgement.")
         .expect("cross-process resume");
-    assert!(fixture.home.join("index.sqlite3").is_file());
     assert!(session_file(&fixture).is_ok());
 }
 

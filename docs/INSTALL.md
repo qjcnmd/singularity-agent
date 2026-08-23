@@ -87,13 +87,13 @@ sg config models
 
 思考档位必须逐模型声明，`reasoning_variants` 是唯一事实源；每个 variant 都写 `enabled`，启用档位可写一个 `wire_effort`，而 `off` 必须显式写成 `enabled:false`。`default_variant` 必须精确命中；无 map 表示不支持。Chat 纯开关只允许一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位必须写 wire。selector 可用 `provider_id/model_id#variant` 精确选择，未知档位、未声明的 `#off` 和不支持的模型 fail closed，不承诺自动 catalog 识别。
 
-Provider 私有 reasoning/output items 的语义按协议处理：Chat 的 reasoning 文本以 thinking 块写入会话 JSONL，下一轮按模型声明投影为 provider replay；Responses 的 opaque output items 作为 provider continuation state 写入会话 JSONL，在兼容的 provider/model/reasoning 绑定下可跨进程重开后重放，无法从公共文本块重建。Singularity 不使用 checkpoint，SQLite 仅保存 session index 元数据；Responses `encrypted_content` 仍是 provider opaque blob。
+Provider 私有 reasoning/output items 的语义按协议处理：Chat 的 reasoning 文本以 thinking 块写入会话 JSONL，下一轮按模型声明投影为 provider replay；Responses 的 opaque output items 作为 provider continuation state 写入会话 JSONL，在兼容的 provider/model/reasoning 绑定下可跨进程重开后重放，无法从公共文本块重建。Singularity 不使用 checkpoint，会话索引为进程内缓存并在启动时从 JSONL 重建；Responses `encrypted_content` 仍是 provider opaque blob。
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
 Provider 配置值不会被静默 trim 或纠正。进程环境和显式导入文件中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；导入文件的标准 `CRLF` 行尾仍会正常解析。
 
-工具面是 headless core 的静态 `ToolRegistry`（当前注册 read/bash/edit/write），不随模型名或 provider 动态协商；工具并行数、消息角色等能力由 provider 静态能力声明决定。模型专属的 reasoning history 则必须通过下面的模型字段显式声明。协议选择、能力声明、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#9-provider-与模型) 为准。
+工具面是 headless core 的静态 `ToolRegistry`（当前注册 read/glob/grep/bash/edit/write），不随模型名或 provider 动态协商；工具并行数、消息角色等能力由 provider 静态能力声明决定。模型专属的 reasoning history 则必须通过下面的模型字段显式声明。协议选择、能力声明、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#9-provider-与模型) 为准。
 
 需要跨仓库、跨 worktree 共用同一 provider 时，运行一次：
 
@@ -182,13 +182,7 @@ cargo build --release --locked --package singularity_cli --package singularity_a
 sg run "检查当前项目并修复一个明确问题"
 ```
 
-默认 app-server 会话索引位于用户目录：
-
-```text
-%USERPROFILE%\.singularity\index.sqlite3
-```
-
-会话正文位于同目录 `sessions\<uuid>.jsonl`。开发和自动化场景可以通过 `SINGULARITY_APP_SERVER_DB` 指向另一个 file-backed SQLite 文件；普通安装不需要设置。
+会话正文位于用户目录 `~/.singularity/sessions/<uuid>.jsonl`（唯一持久事实源），进程内会话索引只缓存定位与展示元数据并在启动时从 JSONL 重建，不落盘；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
 ## 更新与卸载
 

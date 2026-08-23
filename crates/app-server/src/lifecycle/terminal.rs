@@ -178,7 +178,7 @@ impl AppServer {
         {
             return (Some(first_error), true);
         }
-        // Do not write a terminal SQLite projection without its JSONL fact. The
+        // Do not write a terminal index projection without its JSONL fact. The
         // next reopen will repair an active turn from turn_started, while an
         // index-only fallback would violate the JSONL-first ordering contract.
         let _ = usage;

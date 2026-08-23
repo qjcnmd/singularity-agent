@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read or delete a session (JSONL rollout + SQLite index).
+    /// Read or delete a session.
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -108,7 +108,7 @@ enum SessionCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Delete the JSONL rollout and its SQLite index row.
+    /// Delete the session JSONL file.
     Delete { session_id: String },
 }
 

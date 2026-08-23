@@ -558,7 +558,7 @@ impl AppServerClient {
         Ok(())
     }
 
-    // 删除 JSONL rollout 与 SQLite 索引行。
+    // 删除会话 JSONL 文件及备份。
     pub(super) fn session_delete(&mut self, session_id: &str) -> Result<(), String> {
         let reply = self.request::<rpc_methods::SessionDelete>(&SessionIdParams {
             session_id: session_id.to_string(),

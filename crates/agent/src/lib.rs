@@ -6,11 +6,11 @@
 //!
 //! 提供无头（Headless）且独立于客户端界面的 Agent 运行能力：
 //!
-//! - `agent`（`loop.rs`）：核心执行循环，驱动模型调用、工具批次并发执行、转向引导（Steer）与跟进（FollowUp）；
+//! - `agent`（`loop.rs`）：核心执行循环，驱动模型调用、工具批次按模型给定顺序串行执行、转向引导（Steer）与跟进（FollowUp）；
 //! - `session`：严苛的线性 JSONL 会话持久化与崩溃状态自愈机制；
 //! - `compaction`：长程上下文自动压缩引擎（摘要提取与动态上下文窗口管理）；
 //! - `message`：会话消息与内容块数据模型；
-//! - `tools`：内建代码操作工具集（`read` / `bash` / `edit` / `write`）及并发文件修改队列保护。
+//! - `tools`：内建代码操作工具集（`read` / `glob` / `grep` / `bash` / `edit` / `write`）。
 
 #[path = "loop.rs"]
 pub mod agent;

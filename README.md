@@ -78,7 +78,7 @@ sg config add opencode-go https://opencode.ai/zen/go/v1 --api-key <your-key>
 }
 ```
 
-选择 `provider_id/model_id#off` 时必须显式使用该 disabled variant。Chat 发送 `thinking.type=enabled` 与单一解析后的 wire effort；Responses 发送 `reasoning.effort` 与 `include=["reasoning.encrypted_content"]`。工具循环所需的 `reasoning_content`（Chat）以 thinking 内容块随会话 JSONL 持久化，续接时从最后一条 assistant 消息投影为 provider reasoning replay（N2）；Responses 原始 output items 作为 provider opaque continuation state 随会话持久化，在兼容的 provider/model/reasoning 绑定下重放，不进入用户消息或错误正文；SQLite 不是内容加密层。
+选择 `provider_id/model_id#off` 时必须显式使用该 disabled variant。Chat 发送 `thinking.type=enabled` 与单一解析后的 wire effort；Responses 发送 `reasoning.effort` 与 `include=["reasoning.encrypted_content"]`。工具循环所需的 `reasoning_content`（Chat）以 thinking 内容块随会话 JSONL 持久化，续接时从最后一条 assistant 消息投影为 provider reasoning replay（N2）；Responses 原始 output items 作为 provider opaque continuation state 随会话持久化，在兼容的 provider/model/reasoning 绑定下重放，不进入用户消息或错误正文。
 
 可选的 legacy `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=1000000`，且最大输出必须严格小于 context window。
 
