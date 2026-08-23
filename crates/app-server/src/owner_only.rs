@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use super::session_index::SessionIndexError;
 use super::session_index::SessionIndexResult;
 
 pub fn ensure_owner_only_dir(path: &Path) -> SessionIndexResult<()> {

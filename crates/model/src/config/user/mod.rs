@@ -283,6 +283,10 @@ pub(crate) fn ensure_no_reparse_point(
             ));
         }
     }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+    }
     Ok(())
 }
 

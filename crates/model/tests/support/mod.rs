@@ -117,7 +117,14 @@ impl UserConfigFixture {
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_else(|| json!({ "schema_version": 1, "providers": {} }));
         auth["providers"][provider] = json!({ "api_key": api_key });
-        std::fs::write(path, auth.to_string()).expect("write user auth");
+        std::fs::write(&path, auth.to_string()).expect("write user auth");
+        // 读取层按文件 mode 做 owner-only fail-closed 校验，fixture 须以 0600 落盘。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict user auth to owner");
+        }
     }
 
     /// ProviderConfigSnapshot 的 env getter：只回答 SINGULARITY_HOME。
