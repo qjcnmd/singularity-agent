@@ -1513,7 +1513,7 @@ fn terminal_turn_usage_matches_provider_usage() {
 #[test]
 fn turn_failure_emits_typed_error_event_with_provider_cause() {
     // H4/M1：provider 边界失败（429）→ turn/error 终态事件携带 typed cause，
-    // willRetry=false（N3 后循环层不再重试）。
+    // 循环层不重试，终态即最终结果。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
