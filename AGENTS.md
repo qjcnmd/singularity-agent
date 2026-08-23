@@ -1,6 +1,6 @@
 # Singularity 仓库指令
 
-Singularity 是以 Rust 实现的、面向可靠 coding task 的最小 headless harness；一次性 CLI 是当前唯一客户端，交互式终端与 Desktop 是路线图内共用同一核心能力的客户端。
+Singularity 是以 Rust 实现的、面向可靠 coding task 的交互式 coding-agent harness，定位类似 Pi、Codex 和 OpenCode。当前 CLI 是现有客户端，交互式终端与桌面 GUI 是目标客户端形态；Agent 核心必须简洁、完整并与具体 UI 解耦，由两类客户端共同复用。headless operation 是可选运行能力，不定义项目整体定位。
 
 ## 每个任务都适用
 
@@ -13,7 +13,7 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的最小 headless 
 
 ### 项目不变量
 
-- 核心保持 headless，CLI、TUI 和 Desktop 复用同一 Agent 能力；不要复制 Agent 状态或业务逻辑。
+- Agent 核心保持 UI 解耦并支持 headless operation；交互式终端与 Desktop 复用同一 Agent 能力，不复制 Agent 状态或业务逻辑。
 - 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。比 Pi 基线更复杂的机制必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。
 - 不为未来的路由、多 Agent、任务图、插件平台、Sandbox、Approval 或分布式基础设施预建核心复杂度。安全、协议、持久化、执行、并发和恢复不变量不得因简化而削弱。
 - 同一事实只保留一个权威来源；文档描述当前有效设计，不把计划、审查过程或失效迁移叙述写入长期事实源。
