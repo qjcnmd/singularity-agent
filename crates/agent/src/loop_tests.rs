@@ -515,6 +515,10 @@ impl Provider for FailingProvider {
 }
 
 /// 从 `complete_stream` 直接返回 `Err(ProviderError)` 的假 provider：
+/// 每次 provider 调用开始时触发的钩子（按调用序号），用于在运行中的
+/// 精确时刻注入输入（如停止窗口内的 steer）。
+type OnCallHook = Box<dyn Fn(usize) + Send>;
+
 /// 脚本按序在若干次失败后返回一次成功，用于覆盖 provider 传输层
 /// 重试耗尽后仍失败的 typed 传播路径。
 struct ErrReturningProvider {
@@ -522,6 +526,7 @@ struct ErrReturningProvider {
     steps: Mutex<VecDeque<std::result::Result<String, ModelError>>>,
     calls: std::sync::atomic::AtomicUsize,
     contract: ProviderProtocolContract,
+    on_call: Mutex<Option<OnCallHook>>,
 }
 
 impl ErrReturningProvider {
@@ -533,14 +538,23 @@ impl ErrReturningProvider {
             steps: Mutex::new(steps.into()),
             calls: std::sync::atomic::AtomicUsize::new(0),
             contract,
+            on_call: Mutex::new(None),
         }
+    }
+
+    fn with_on_call(self, hook: Box<dyn Fn(usize) + Send>) -> Self {
+        *self.on_call.lock().unwrap() = Some(hook);
+        self
     }
 
     fn try_respond(
         &self,
         request: &ModelTurnRequest,
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = self.on_call.lock().unwrap().as_ref() {
+            hook(call_index);
+        }
         match self.steps.lock().unwrap().pop_front() {
             Some(Err(error)) => Err(ProviderError::from_model_error(error)),
             Some(Ok(text)) => {
@@ -720,16 +734,27 @@ fn non_retryable_err_provider_error_fails_immediately() {
 fn second_provider_error_returns_accumulated_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let provider = Arc::new(ErrReturningProvider::new(
-        fake_contract(),
-        vec![
-            Ok("first".to_string()),
-            Err(ModelError::new(
-                ModelErrorKind::Timeout,
-                "second request failed",
-            )),
-        ],
-    ));
+    let inbox_slot: Arc<Mutex<Option<TurnInboxHandle>>> = Arc::new(Mutex::new(None));
+    let hook_slot = Arc::clone(&inbox_slot);
+    let provider = Arc::new(
+        ErrReturningProvider::new(
+            fake_contract(),
+            vec![
+                Ok("first".to_string()),
+                Err(ModelError::new(
+                    ModelErrorKind::Timeout,
+                    "second request failed",
+                )),
+            ],
+        )
+        .with_on_call(Box::new(move |_| {
+            // 停止窗口注入：第一次调用进行中把输入放进箱内，代理在自然
+            // 停止点取出后继续一轮。
+            if let Some(inbox) = hook_slot.lock().unwrap().as_ref() {
+                inbox.lock().unwrap().enqueue("continue");
+            }
+        })),
+    );
     let mut agent = Agent::new(
         provider,
         ToolRegistry::new(),
@@ -737,7 +762,7 @@ fn second_provider_error_returns_accumulated_outcome() {
         session,
     )
     .unwrap();
-    agent.follow_up("continue");
+    *inbox_slot.lock().unwrap() = Some(agent.inbox_handle());
     let error = agent
         .run("task", &mut AgentEvents::new(), &CancellationToken::new())
         .expect_err("second provider error must remain a failure");
@@ -754,13 +779,22 @@ fn second_provider_error_returns_accumulated_outcome() {
 fn second_provider_cancellation_returns_aborted_accumulated_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let provider = Arc::new(ErrReturningProvider::new(
-        fake_contract(),
-        vec![
-            Ok("first".to_string()),
-            Err(ModelError::new(ModelErrorKind::Cancelled, "cancelled")),
-        ],
-    ));
+    let inbox_slot: Arc<Mutex<Option<TurnInboxHandle>>> = Arc::new(Mutex::new(None));
+    let hook_slot = Arc::clone(&inbox_slot);
+    let provider = Arc::new(
+        ErrReturningProvider::new(
+            fake_contract(),
+            vec![
+                Ok("first".to_string()),
+                Err(ModelError::new(ModelErrorKind::Cancelled, "cancelled")),
+            ],
+        )
+        .with_on_call(Box::new(move |_| {
+            if let Some(inbox) = hook_slot.lock().unwrap().as_ref() {
+                inbox.lock().unwrap().enqueue("continue");
+            }
+        })),
+    );
     let mut agent = Agent::new(
         provider,
         ToolRegistry::new(),
@@ -768,7 +802,7 @@ fn second_provider_cancellation_returns_aborted_accumulated_outcome() {
         session,
     )
     .unwrap();
-    agent.follow_up("continue");
+    *inbox_slot.lock().unwrap() = Some(agent.inbox_handle());
     let outcome = agent
         .run("task", &mut AgentEvents::new(), &CancellationToken::new())
         .expect("typed provider cancellation is a normal aborted outcome");
@@ -872,17 +906,17 @@ fn compaction_provider_failure_emits_safe_diagnostic_without_session_entry() {
 #[test]
 fn turn_inbox_stop_barrier_has_no_accepted_but_lost_state() {
     let mut inbox = TurnInbox::default();
-    assert!(inbox.enqueue_follow_up("continue"));
+    assert!(inbox.enqueue("steer at stop"));
     let pending = inbox
         .take_at_stop()
         .expect("pending input keeps inbox open");
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].kind, TurnInputKind::FollowUp);
-    assert!(inbox.enqueue_steer("steer after handoff"));
+    assert_eq!(pending[0], "steer at stop");
+    assert!(inbox.enqueue("steer after handoff"));
     let pending = inbox.take_at_stop().expect("new input is still accepted");
-    assert_eq!(pending[0].text, "steer after handoff");
+    assert_eq!(pending[0], "steer after handoff");
     assert!(inbox.take_at_stop().is_none());
-    assert!(!inbox.enqueue_follow_up("too late"));
+    assert!(!inbox.enqueue("too late"));
 }
 
 #[test]
@@ -898,10 +932,7 @@ fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
         let barrier_writer = Arc::clone(&barrier);
         let writer_thread = thread::spawn(move || {
             barrier_writer.wait();
-            inbox_writer
-                .lock()
-                .unwrap()
-                .enqueue_follow_up("concurrent input")
+            inbox_writer.lock().unwrap().enqueue("concurrent input")
         });
 
         let inbox_reader = Arc::clone(&inbox);
@@ -915,19 +946,19 @@ fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
         let initial_taken = reader_thread.join().expect("reader thread finished");
 
         let mut final_inbox = inbox.lock().unwrap();
-        let follow_up_taken = final_inbox.take_at_stop();
+        let retained_taken = final_inbox.take_at_stop();
 
         if accepted {
             // If the input was accepted, it MUST either have been collected in the initial take_at_stop,
-            // or retained in the queue and collected in follow_up_taken. It must never be lost.
+            // or retained in the queue and collected in retained_taken. It must never be lost.
             let found_in_initial = initial_taken
                 .as_ref()
-                .is_some_and(|inputs| inputs.iter().any(|i| i.text == "concurrent input"));
-            let found_in_follow_up = follow_up_taken
+                .is_some_and(|inputs| inputs.iter().any(|i| i == "concurrent input"));
+            let found_in_retained = retained_taken
                 .as_ref()
-                .is_some_and(|inputs| inputs.iter().any(|i| i.text == "concurrent input"));
+                .is_some_and(|inputs| inputs.iter().any(|i| i == "concurrent input"));
             assert!(
-                found_in_initial || found_in_follow_up,
+                found_in_initial || found_in_retained,
                 "accepted input was lost during concurrent take_at_stop!"
             );
         } else {
@@ -938,7 +969,7 @@ fn turn_inbox_stop_barrier_concurrent_race_has_no_accepted_but_lost_state() {
                 "rejected enqueue implies the stop barrier already closed the inbox"
             );
             assert!(
-                !final_inbox.enqueue_steer("rejected after close"),
+                !final_inbox.enqueue("rejected after close"),
                 "closed inbox accepted new inputs!"
             );
         }
@@ -1894,22 +1925,39 @@ fn steer_message_appears_in_following_turn_context() {
     );
 }
 
-/// 4. follow_up：文本响应后 follow_up 队列非空 → 继续一轮再停止。
+/// 4. 停止窗口内到达的转向输入：文本响应后箱内非空 → 继续一轮再停止。
 #[test]
-fn follow_up_continues_one_more_turn() {
-    let (mut agent, _dir, provider) = setup(vec![
-        FakeStep {
-            text: "first answer".to_string(),
-            tool_calls: Vec::new(),
-            usage: usage(10, 5),
-        },
-        FakeStep {
-            text: "second answer".to_string(),
-            tool_calls: Vec::new(),
-            usage: usage(20, 5),
-        },
-    ]);
-    agent.follow_up("please continue");
+fn steer_at_stop_continues_one_more_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let inbox_slot: Arc<Mutex<Option<TurnInboxHandle>>> = Arc::new(Mutex::new(None));
+    let hook_slot = Arc::clone(&inbox_slot);
+    let provider = Arc::new(
+        ErrReturningProvider::new(
+            fake_contract(),
+            vec![
+                Ok("first answer".to_string()),
+                Ok("second answer".to_string()),
+            ],
+        )
+        .with_on_call(Box::new(move |call_index| {
+            // 仅第一次调用进行中注入：输入落在自然停止窗口内，代理取出后
+            // 继续一轮再停止。
+            if call_index == 0
+                && let Some(inbox) = hook_slot.lock().unwrap().as_ref()
+            {
+                inbox.lock().unwrap().enqueue("please continue");
+            }
+        })),
+    );
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    *inbox_slot.lock().unwrap() = Some(agent.inbox_handle());
     let outcome = agent
         .run(
             "question",
@@ -1919,13 +1967,14 @@ fn follow_up_continues_one_more_turn() {
         .unwrap();
     assert_eq!(outcome.turns, 2);
     assert_eq!(outcome.final_text, "second answer");
-    let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
     assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| message.content == "please continue")
+        agent.session.entries().iter().any(|entry| matches!(
+            &entry.entry_type,
+            SessionEntryType::Message(message)
+                if message.role == AgentMessageRole::User
+                    && message.content_text() == "please continue"
+        )),
+        "stop-window input must join the session context before the extra round"
     );
 }
 
@@ -1949,7 +1998,7 @@ fn inbox_handle_injects_steer_during_run() {
     // 工具执行开始时（run 期间）从外部句柄注入转向消息。
     let on_event = &mut |event: AgentEvent| {
         if matches!(event, AgentEvent::ToolExecutionStarted { .. }) {
-            handle.lock().unwrap().enqueue_steer("steer during run");
+            handle.lock().unwrap().enqueue("steer during run");
         }
     };
     events.on_event = Some(on_event);

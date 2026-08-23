@@ -91,7 +91,7 @@ fn prepare_inner(
     };
 
     let thread_id = thread.thread_id.clone();
-    let conversation = Arc::new(Conversation::new(Arc::clone(&runner), thread));
+    let conversation = Conversation::new(Arc::clone(&runner), thread);
     Ok(SessionSetup {
         conversation,
         thread_id,

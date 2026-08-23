@@ -13,20 +13,20 @@
 
 分层：
 
-- **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线。
+- **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
-  - [`Conversation`]：一个 Thread 的长驻协调器——同一 Thread 至多一个活动 turn、steer/followUp 注入窗口、取消令牌、「活动 turn 期间的设置排队到 turn 完成后生效」。
-- **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。渲染只消费 typed `TurnEvent`；投影失败只丢弃投影，不影响执行事实。
+  - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
+- **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式直接调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
-  - `AgentLoop`（双层循环）：单一原子 `TurnInbox` 承载 steer/followUp；每轮**请求前**以装配成品估算对比 `context_window − reserve_tokens` 决定主动压缩；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次；
+  - `AgentLoop`（双层循环）：单一原子 `TurnInbox` 承载 steer；每轮**请求前**以装配成品估算对比 `context_window − reserve_tokens` 决定主动压缩；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次；
   - `session` 子系统：严格 JSONL v1（format/file/manager/context/repair/repository）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config/discovery。
-- **crates/app-server**：stdio JSON-RPC 服务，作为后续 GUI 的协议适配面保留；当前产品入口不 spawn 它，其内部能力不进入本阶段演进范围。
+- **crates/app-server**：stdio JSON-RPC 适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.v1.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。
-- **依赖方向**：cli → runtime → {core, model, agent}；runtime 与 agent 不依赖 protocol/UI；protocol 仅服务 app-server。
+- **依赖方向**：cli → runtime → {core, model, agent}；app-server → {runtime, protocol}；runtime 与 agent 不依赖 protocol/UI；protocol 类型仅服务 app-server 适配器。
 
 ## 2. 无交互主调用链
 
@@ -36,13 +36,15 @@ sg --print|--json <goal>
   ├─ 解析 SINGULARITY_HOME（或临时 home）并准备 sessions/backups 目录
   ├─ ProviderConfigSnapshot::capture(env)（进程层任一变量出现即整体短路用户配置）
   ├─ Thread 来源：--session 恢复并修复 | 新建 uuid v7 会话文件
-  ├─ Conversation::run_turn(goal)
-  │    └─ TurnRunner::run
-  │         ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
-  │         ├─ turn_started metadata 落盘 → 发布 turn/started
-  │         ├─ AgentLoop 执行（压缩、工具批、steer/followUp 注入）
-  │         ├─ 终态 metadata + usage 落盘（有界重试一次，失败即 fail-stop）
-  │         └─ 发布 item/turn 终态事件
+  ├─ Conversation::run_turn(goal)   # 内部 = reserve_start() 原子预订 → 执行链
+  │    ├─ TurnRunner::run（每轮独立控制面；当前轮可取消/可转向）
+  │    │    ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
+  │    │    ├─ turn_started metadata 落盘 → 发布 turn/started
+  │    │    ├─ AgentLoop 执行（压缩、工具批、steer 注入）
+  │    │    ├─ 终态 metadata + usage 落盘（有界重试一次，失败即 fail-stop）
+  │    │    └─ 发布 item/turn 终态事件
+  │    ├─ 终态后自动持久化待生效设置（若有）→ 下一轮用新 selector
+  │    └─ 按 FIFO 启动已接受的 followUp 为独立新 turn，直到队列清空
   └─ 渲染：--print 只写最终文本；--json 逐行事件 + summary 行
 ```
 
@@ -78,7 +80,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 - **单写者**：一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束关闭写者。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
-- 设置：`thread_settings` metadata 记录 provider/model/reasoning；活动 turn 期间由协调器排队，turn 完成后单写者追加，下一轮读取生效；不改写全局配置。
+- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化，活动 turn 期间合并为单份待生效意图并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector）；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。
 
 ## 6. Provider 与模型
 
@@ -90,8 +92,22 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。
 
-## 8. 当前维护边界
+## 8. 交互式 TUI 契约
 
-- 本文只描述当前有效的进程边界、事件流、会话格式、AgentLoop、Compaction、工具语义、Provider 能力声明、配置和评估入口。
-- app-server 的协议细节（命令/事件集、握手、控制 lane）作为 GUI 后续适配面的内部合同，由 crates/app-server 与 crates/protocol 自身的测试维护，本文不再展开。
+`sg` 无参数进入长驻 TUI，只依赖 `Conversation` 与 typed `TurnEvent`；业务状态不复制在客户端：
+
+- **布局**：主会话流（滚动区）＋底部多行编辑器（高度=内容折行行数，上限半屏）＋状态行＋提示行。
+- **滚动**：严格双态（跟随底部 / 浏览历史）。上滚（PgUp/Alt+↑/滚轮）脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、Ctrl+End、发送输入后恢复跟随。resize 不改变语义，只钳制位置。
+- **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行，Enter 提交；Enter 路由按上下文：idle=新 turn、running=当前模式注入（steer/followUp 由 Ctrl+T 切换）；提示行声明当前 Enter 行为。
+- **Esc 阶梯（无死端）**：浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；设置模态 Esc 关闭。
+- **工具块**：完成态稳定记录（运行中只就地刷新预览）；完成块 Alt+O 展开/收起全量结果（上限 100 行，预览超限显示出口提示）。
+- **状态行**：相位 + 具名等待对象（model / tool name / terminal convergence）+ 等待秒数 + thread id + 模型 + 输入模式 + followUp 队列计数；浏览态显示 `viewing history`。
+- **取消/退出**：运行中一次 Ctrl+C 中断当前轮（已接受 followUp 继续执行），消息行提示再次 Ctrl+C 强制退出（130）；空闲两次 Ctrl+C 退出（0）。
+- **设置模态**：Ctrl+S 打开，Tab 切换字段，Enter 应用（空闲立即生效 / 运行中 show queued），Esc 关闭；开关前后滚动位置与编辑器内容不变。
+- **终端生命周期**：alternate screen + raw mode + 鼠标捕获；正常路径与 panic 钩子共用同一恢复实现；退出后无残留 raw/alt-screen。
+
+## 9. 当前维护边界
+
+- 本文只描述当前有效的进程边界、事件流、会话格式、AgentLoop、Compaction、工具语义、Provider 能力声明、配置、TUI 契约和评估入口。
+- app-server 的协议细节（命令/事件集、握手、控制 lane、并发 turn 裁定）作为 GUI 适配面的内部合同，由 crates/app-server 与 crates/protocol 自身的适配器测试维护（协议事件名/字段/终态/取消/会话恢复不漂移）；协议类型不进入 runtime。
 - 已移除机制、迁移过程和历史提交由 Git 保存；修改上述任一事实时必须同步更新对应章节并跑受影响验证。

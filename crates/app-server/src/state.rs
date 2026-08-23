@@ -1,14 +1,22 @@
-//! 唯一 AppServer 运行时状态容器与活动 turn 生命周期句柄。
+//! 唯一 AppServer 运行时状态容器与 Thread 协调器注册表。
 //!
-//! Dispatch/lifecycle/events 通过这里的单一状态容器协作；本模块不引入
-//! Manager/Service，也不复制活动 turn、取消或 usage 状态。
+//! Turn 执行全部委托给 [`singularity_runtime::Conversation`]；这里只维护
+//! 会话索引、线程→协调器映射、存活 turn 注册表（供控制通道与投影判定），
+//! 不复制 Agent 状态、取消或 usage。
 
-use super::lifecycle::{agent_config_for_thread, terminal_metadata_for_status};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use singularity_model::ProviderConfigSnapshot;
+use singularity_protocol::Thread;
+use singularity_runtime::{Conversation, TurnRunner};
+
 use super::*;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 
-/// 协调 session 索引、信任和活动 turn 的有状态 JSON-RPC 服务。
+/// 协调 session 索引、信任和 Thread 协调器的有状态 JSON-RPC 服务。
+#[derive(Clone)]
 pub struct AppServer {
     pub(super) store: Arc<SessionIndex>,
     pub(super) sessions_dir: PathBuf,
@@ -16,63 +24,162 @@ pub struct AppServer {
     pub(super) initialized_acknowledged: bool,
     pub(super) shutdown_requested: bool,
     pub(super) provider_snapshot: ProviderConfigSnapshot,
-    /// 活动 turn 的单一注册表：取消令牌、线程归属与实时输入箱合一；
-    /// 终态化完成后由 guard drop 移除。
-    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    /// 共享 turn 执行核心：无状态、可共享。
+    pub(super) turn_runner: Arc<TurnRunner>,
+    /// thread_id → 长驻协调器；首次接触时按 JSONL 重开并修复。
+    pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
+    /// turn_id → thread_id：仅登记执行窗口（TurnStarted 后、终态事件前）。
+    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
-    /// 测试/诊断：统计本轮会话文件打开次数（每次 open_existing）。
-    #[cfg(test)]
-    pub(super) session_opens: Arc<AtomicUsize>,
-    #[cfg(test)]
-    pub(super) terminalization_faults: Arc<Mutex<TerminalizationFaults>>,
-    #[doc(hidden)]
-    pub test_provider_override:
-        Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct ActiveTurn {
-    pub(super) thread_id: String,
-    pub(super) cancellation: CancellationToken,
-    /// steer/follow-up 注入句柄；准备阶段注册，关闭一次后永不复用。
-    pub(super) inbox: Option<TurnInboxHandle>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(super) struct TerminalizationFaults {
-    pub(super) metadata_failures_remaining: usize,
-    pub(super) event_failures_remaining: usize,
-}
-
-/// 由请求工作线程与 stdio 传输层共享的可克隆停止句柄。
+/// 由 stdio 传输层共享的可克隆停止句柄。
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
-    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
 }
 
 /// Narrow cloneable control seam for active-turn cancellation and input.
 ///
-/// It deliberately contains only the in-memory active-turn registry; ordinary
-/// state requests continue to run through the single `AppServer` owner and
-/// its in-memory session index.
+/// 只携带存活 turn 注册表与 Thread 协调器映射：steer/followUp/interrupt
+/// 全部路由到协调器，不复制执行状态。
 #[derive(Clone)]
 pub struct AppServerControlHandle {
-    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
+    pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
+}
+
+impl AppServerControlHandle {
+    /// Dispatch one control-lane JSON-RPC message against active-turn handles.
+    ///
+    /// Notifications are intentionally side-effect free at the protocol layer:
+    /// they are accepted without producing a response, while request messages
+    /// receive the typed control result or an error response from the caller.
+    pub fn handle(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        // Request-only control methods arriving as notifications are true
+        // no-ops: no cancellation, enqueue, or response is allowed.
+        if message.is_notification() {
+            return Ok(Vec::new());
+        }
+        match message.method_name() {
+            Some("turn/interrupt") => self.turn_interrupt(message),
+            Some("turn/steer") => self.turn_steer(message),
+            Some("turn/followUp") => self.turn_follow_up(message),
+            _ => crate::dispatch::invalid_params_response(message.required_id()),
+        }
+    }
+
+    pub(crate) fn turn_interrupt(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = crate::dispatch::parse_params(&message)?;
+        if !self.interrupt_turn(&params.turn_id) {
+            return crate::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
+        }
+        Ok(vec![
+            JsonRpcMessage::response(
+                message.required_id(),
+                serde_json::to_value(TurnInterruptResult {
+                    turn_id: params.turn_id,
+                    status: TurnStatus::Interrupted,
+                })?,
+            )
+            .to_wire_value(),
+        ])
+    }
+
+    pub(crate) fn turn_steer(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, false)
+    }
+
+    pub(crate) fn turn_follow_up(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, true)
+    }
+
+    fn inject_turn_input(
+        &self,
+        message: JsonRpcMessage,
+        follow_up: bool,
+    ) -> AppServerResult<Vec<Value>> {
+        let params: TurnInjectionParams = crate::dispatch::parse_params(&message)?;
+        let payload = serde_json::to_value(&params.input)?;
+        let text = crate::dispatch::input_items_to_text(&payload)?;
+        let owner = self
+            .live_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(&params.turn_id)
+            .cloned();
+        let Some(thread_id) = owner else {
+            return super::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
+        };
+        let Some(conversation) = self
+            .conversations
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(&thread_id)
+            .cloned()
+        else {
+            return super::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
+        };
+        let accepted = if follow_up {
+            conversation.submit_follow_up(text)
+        } else {
+            conversation.steer(text)
+        };
+        if !accepted {
+            return super::dispatch::invalid_state_response(
+                message.required_id(),
+                "turn is no longer accepting input",
+            );
+        }
+        crate::dispatch::json_response(
+            message.required_id(),
+            TurnInjectionResult {
+                turn: Turn {
+                    turn_id: params.turn_id,
+                    thread_id,
+                    status: TurnStatus::Running,
+                    model_usage: None,
+                },
+            },
+        )
+    }
+
+    fn interrupt_turn(&self, turn_id: &str) -> bool {
+        let owner = self
+            .live_turns
+            .lock()
+            .ok()
+            .and_then(|turns| turns.get(turn_id).cloned());
+        let Some(thread_id) = owner else {
+            return false;
+        };
+        let Some(conversation) = self
+            .conversations
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&thread_id).cloned())
+        else {
+            return false;
+        };
+        conversation.interrupt();
+        true
+    }
 }
 
 impl AppServerCancellationHandle {
-    /// 停止后续执行，并将取消传播到每个活动 turn。
+    /// 停止后续执行，并把取消传播到每个已登记的 Thread 协调器。
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.execution_stopped.store(true, Ordering::SeqCst);
-        for active_turn in self
-            .active_turns
+        let conversations: Vec<Arc<Conversation>> = self
+            .conversations
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
             .values()
-        {
-            active_turn.cancellation.cancel();
+            .cloned()
+            .collect();
+        for conversation in conversations {
+            conversation.interrupt();
         }
         Ok(())
     }
@@ -83,15 +190,35 @@ impl AppServerCancellationHandle {
     }
 }
 
-pub(super) struct ActiveTurnGuard {
+/// 存活 turn 的执行窗口守卫：drop 时从注册表移除。
+pub(super) struct LiveTurnGuard {
     pub(super) turn_id: String,
-    pub(super) active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
 }
 
-impl Drop for ActiveTurnGuard {
+impl LiveTurnGuard {
+    /// 登记 turn 执行窗口；同 id 重复登记保持首见归属。
+    pub(super) fn register(
+        live_turns: Arc<Mutex<HashMap<String, String>>>,
+        turn_id: &str,
+        thread_id: &str,
+    ) -> Self {
+        if let Ok(mut turns) = live_turns.lock() {
+            turns
+                .entry(turn_id.to_string())
+                .or_insert(thread_id.to_string());
+        }
+        Self {
+            turn_id: turn_id.to_string(),
+            live_turns,
+        }
+    }
+}
+
+impl Drop for LiveTurnGuard {
     fn drop(&mut self) {
-        if let Ok(mut active_turns) = self.active_turns.lock() {
-            active_turns.remove(&self.turn_id);
+        if let Ok(mut turns) = self.live_turns.lock() {
+            turns.remove(&self.turn_id);
         }
     }
 }
@@ -101,6 +228,10 @@ impl AppServer {
         let sessions_dir = user_singularity_home()
             .map(|home| home.join(paths::SESSIONS_DIR_NAME))
             .unwrap_or_else(|| PathBuf::from(".singularity/sessions"));
+        let turn_runner = Arc::new(TurnRunner::new(
+            sessions_dir.clone(),
+            provider_snapshot.clone(),
+        ));
         Self {
             store: Arc::new(store),
             sessions_dir,
@@ -108,13 +239,10 @@ impl AppServer {
             initialized_acknowledged: false,
             shutdown_requested: false,
             provider_snapshot,
-            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_runner,
+            conversations: Arc::new(Mutex::new(HashMap::new())),
+            live_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            session_opens: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            terminalization_faults: Arc::new(Mutex::new(TerminalizationFaults::default())),
-            test_provider_override: None,
         }
     }
 
@@ -122,16 +250,30 @@ impl AppServer {
     #[doc(hidden)]
     pub fn with_sessions_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.sessions_dir = dir.as_ref().to_path_buf();
+        self.turn_runner = Arc::new(TurnRunner::new(
+            self.sessions_dir.clone(),
+            self.provider_snapshot.clone(),
+        ));
         self
     }
 
-    /// 仅测试：注入动态 provider 覆盖。
+    /// 仅测试：替换共享 turn 执行核心（可注入 provider 覆盖与故障钩子）。
+    #[doc(hidden)]
+    pub fn with_turn_runner(mut self, runner: Arc<TurnRunner>) -> Self {
+        self.turn_runner = runner;
+        self
+    }
+
+    /// 仅测试：以固定 provider 取代快照解析结果。
     #[doc(hidden)]
     pub fn with_test_provider(
         mut self,
-        provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
+        provider: Arc<dyn singularity_model::Provider + Send + Sync>,
     ) -> Self {
-        self.test_provider_override = Some(provider);
+        self.turn_runner = Arc::new(
+            TurnRunner::new(self.sessions_dir.clone(), self.provider_snapshot.clone())
+                .with_provider_override(provider),
+        );
         self
     }
 
@@ -141,47 +283,10 @@ impl AppServer {
         metadata_failures: usize,
         event_failures: usize,
     ) {
-        if let Ok(mut faults) = self.terminalization_faults.lock() {
-            faults.metadata_failures_remaining = metadata_failures;
-            faults.event_failures_remaining = event_failures;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn consume_terminal_metadata_failure(&self) -> bool {
-        let Ok(mut faults) = self.terminalization_faults.lock() else {
-            return false;
-        };
-        if faults.metadata_failures_remaining == 0 {
-            return false;
-        }
-        faults.metadata_failures_remaining -= 1;
-        true
-    }
-
-    #[cfg(not(test))]
-    pub(super) fn consume_terminal_metadata_failure(&self) -> bool {
-        false
-    }
-
-    #[cfg(test)]
-    pub(crate) fn consume_terminal_event_failure(&self, method: &str) -> bool {
-        if !matches!(method, "turn/completed" | "turn/error" | "item/failed") {
-            return false;
-        }
-        let Ok(mut faults) = self.terminalization_faults.lock() else {
-            return false;
-        };
-        if faults.event_failures_remaining == 0 {
-            return false;
-        }
-        faults.event_failures_remaining -= 1;
-        true
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn consume_terminal_event_failure(&self, _method: &str) -> bool {
-        false
+        #[allow(unused_variables)]
+        let _ = event_failures;
+        self.turn_runner
+            .inject_terminalization_faults(metadata_failures, 0);
     }
 
     pub fn sessions_dir(&self) -> &Path {
@@ -208,12 +313,19 @@ impl AppServer {
 
     pub fn cancellation_handle(&self) -> AppServerCancellationHandle {
         AppServerCancellationHandle {
-            active_turns: Arc::clone(&self.active_turns),
+            conversations: Arc::clone(&self.conversations),
             execution_stopped: Arc::clone(&self.execution_stopped),
         }
     }
 
-    /// 为单一 turn 工作线程共享同一会话索引，同时共享停止与注入状态。
+    pub fn control_handle(&self) -> AppServerControlHandle {
+        AppServerControlHandle {
+            live_turns: Arc::clone(&self.live_turns),
+            conversations: Arc::clone(&self.conversations),
+        }
+    }
+
+    /// 为单一 turn 工作线程共享同一会话索引与协调器注册表。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
             store: Arc::clone(&self.store),
@@ -222,245 +334,88 @@ impl AppServer {
             initialized_acknowledged: true,
             shutdown_requested: false,
             provider_snapshot: self.provider_snapshot.clone(),
-            active_turns: Arc::clone(&self.active_turns),
+            turn_runner: Arc::clone(&self.turn_runner),
+            conversations: Arc::clone(&self.conversations),
+            live_turns: Arc::clone(&self.live_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            #[cfg(test)]
-            session_opens: Arc::clone(&self.session_opens),
-            #[cfg(test)]
-            terminalization_faults: Arc::clone(&self.terminalization_faults),
-            test_provider_override: self.test_provider_override.clone(),
         })
     }
 
-    pub(crate) fn activate_turn(
-        &self,
-        turn_id: &str,
-        thread_id: &str,
-    ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
-        let mut active_turns = self
-            .active_turns
+    /// 取得（或按 JSONL 重开并修复）Thread 的长驻协调器。
+    ///
+    /// 进程内首次接触的线程从会话文件重投影（`resume_thread` 同时执行崩溃
+    /// 修复），并把持久化的 settings/状态带回索引行。
+    pub(crate) fn conversation_for(&self, session_id: &str) -> AppServerResult<Arc<Conversation>> {
+        if let Some(conversation) = self
+            .conversations
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
-        if active_turns
-            .values()
-            .any(|turn| turn.thread_id == thread_id)
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(session_id)
+            .cloned()
         {
-            return Err(AppServerError::Workspace(
-                "another turn is already running for this session".to_string(),
-            ));
+            return Ok(conversation);
         }
-        if active_turns.contains_key(turn_id) {
-            return Err(AppServerError::Workspace(format!(
-                "turn {turn_id} is already active"
-            )));
-        }
-        let cancellation = CancellationToken::new();
-        if self.execution_stopped.load(Ordering::SeqCst) {
-            cancellation.cancel();
-        }
-        active_turns.insert(
-            turn_id.to_string(),
-            ActiveTurn {
-                thread_id: thread_id.to_string(),
-                cancellation: cancellation.clone(),
-                inbox: None,
-            },
-        );
-        drop(active_turns);
-        let guard = ActiveTurnGuard {
-            turn_id: turn_id.to_string(),
-            active_turns: Arc::clone(&self.active_turns),
-        };
-        Ok((cancellation, guard))
-    }
-
-    /// 把 steer/follow-up 注入句柄注册进活动 turn；必须在发布 turn/started
-    /// 之前完成，保证 started 后立即注入必成功。
-    pub(crate) fn register_turn_inbox(
-        &self,
-        turn_id: &str,
-        inbox: TurnInboxHandle,
-    ) -> AppServerResult<()> {
-        let mut active_turns = self
-            .active_turns
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
-        let Some(active_turn) = active_turns.get_mut(turn_id) else {
-            return Err(AppServerError::Workspace(format!(
-                "turn {turn_id} is not active"
-            )));
-        };
-        active_turn.inbox = Some(inbox);
-        Ok(())
-    }
-}
-
-impl AppServer {
-    pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
-        if let Some(selector) = selector
-            && (self.provider_snapshot.has_explicit_model_selection()
-                || selector.contains('/')
-                || selector.contains('#'))
-        {
-            self.provider_snapshot
-                .provider_for_selector(Some(selector))
-                .map(|_| ())
-                .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))?;
-        }
-        Ok(())
-    }
-
-    fn provider_for_thread(
-        &self,
-        thread: &Thread,
-    ) -> Result<singularity_model::OpenAiProvider, singularity_model::ProviderError> {
-        self.provider_snapshot
-            .provider_for_selector(thread.model.as_deref())
-    }
-
-    pub(super) fn provider_and_config_for_thread(
-        &self,
-        thread: &Thread,
-    ) -> AppServerResult<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool)> {
-        let provider: Arc<dyn Provider + Send + Sync> =
-            if let Some(test_provider) = &self.test_provider_override {
-                Arc::clone(test_provider)
-            } else {
-                Arc::new(self.provider_for_thread(thread).map_err(|error| {
-                    AppServerError::TurnExecution {
-                        stage: TurnFailureStage::AgentLoop,
-                        cause: TurnFailureCause::Internal,
-                        original: Some(error.to_string()),
+        let thread =
+            singularity_runtime::store::resume_thread(self.turn_runner.sessions_dir(), session_id)
+                .map_err(|error| match error {
+                    singularity_runtime::store::ResumeError::NotFound(_) => {
+                        AppServerError::Store(SessionIndexError::NotFound(session_id.to_string()))
                     }
-                })?)
-            };
-        let (config, instructions_truncated) =
-            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
-        Ok((provider, config, instructions_truncated))
+                    singularity_runtime::store::ResumeError::Store(message) => {
+                        AppServerError::Workspace(format!("failed to resume thread: {message}"))
+                    }
+                })?;
+        // 索引投影与持久化事实对齐：JSONL 是权威，索引行模型/尺寸以重投影为准。
+        self.store
+            .update_session(
+                session_id,
+                SessionMetadataUpdate {
+                    model: Some(thread.model.as_deref()),
+                    ..SessionMetadataUpdate::default()
+                },
+            )
+            .ok();
+        let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
+        self.conversations
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .insert(session_id.to_string(), Arc::clone(&conversation));
+        Ok(conversation)
     }
 
-    pub(crate) fn open_session_for_thread(
-        &self,
-        thread: &Thread,
-    ) -> AppServerResult<SessionManager> {
-        let record = self.store.get_session(&thread.thread_id)?;
-        #[cfg(test)]
-        self.session_opens.fetch_add(1, Ordering::SeqCst);
-        let session = SessionManager::open_existing(Path::new(&record.rollout_path))?;
-        if session.session_id() != record.session_id {
-            return Err(AppServerError::Store(SessionIndexError::InvalidState(
-                format!(
-                    "rollout header id {} does not match index session id {}",
-                    session.session_id(),
-                    record.session_id
-                ),
-            )));
+    /// 该会话当前是否存在存活 turn（执行窗口内）。
+    pub(crate) fn thread_has_live_turn(&self, session_id: &str) -> bool {
+        let has_live = self
+            .live_turns
+            .lock()
+            .ok()
+            .is_some_and(|turns| turns.values().any(|owner| owner == session_id));
+        if has_live {
+            return true;
         }
-        Ok(session)
+        // 单写者执行期不经过 live_turns（inline 执行路径）：协调器自身的
+        // 活动标记是权威。
+        self.conversations
+            .lock()
+            .ok()
+            .and_then(|map| map.get(session_id).cloned())
+            .is_some_and(|conversation| conversation.has_active_turn())
     }
 
-    pub(crate) fn open_and_repair_session_for_thread(
-        &self,
-        thread: &Thread,
-    ) -> AppServerResult<SessionManager> {
-        let mut session = self.open_session_for_thread(thread)?;
-        session
-            .repair_interrupted_turns()
-            .map_err(AppServerError::Session)?;
-        session
-            .repair_orphaned_tool_calls()
-            .map_err(AppServerError::Session)?;
-        self.store.refresh_from_open_session(&session)?;
-        Ok(session)
+    /// 该会话当前是否正被删除拒绝（存在存活 turn 或活动协调器）。
+    pub(crate) fn thread_turn_active(&self, session_id: &str) -> bool {
+        self.thread_has_live_turn(session_id)
     }
 
-    /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘 terminal metadata 与
-    /// usage（JSONL 是事实源），再更新索引投影（D-011 先持久再索引）。
-    pub(crate) fn update_session_status_and_usage(
-        &self,
-        session: &mut SessionManager,
-        turn_id: Option<&str>,
-        status: SessionStatus,
-        usage: &ModelUsage,
-        usage_complete: bool,
-    ) -> AppServerResult<SessionRecord> {
-        if matches!(
-            status,
-            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Interrupted
-        ) && self.consume_terminal_metadata_failure()
-        {
-            return Err(AppServerError::Store(SessionIndexError::InvalidState(
-                "injected terminal metadata failure".to_string(),
-            )));
-        }
-        if let Some(turn_id) = turn_id
-            && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
-        {
-            self.append_terminal_metadata_if_missing(session, turn_id, metadata)?;
-            let usage_value =
-                serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
-            self.append_usage_metadata_if_missing(session, turn_id, usage_value)?;
-        }
-        let token_usage =
-            serde_json::to_value(usage_to_wire_with_completeness(usage, usage_complete))?;
-        Ok(self.store.update_session(
-            session.session_id(),
-            SessionMetadataUpdate {
-                status: Some(status),
-                token_usage: Some(&token_usage),
-                ..SessionMetadataUpdate::default()
-            },
-        )?)
+    pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
+        self.turn_runner
+            .validate_model_selector(selector)
+            .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))
     }
 
-    fn append_terminal_metadata_if_missing(
-        &self,
-        session: &mut SessionManager,
-        turn_id: &str,
-        metadata: singularity_agent::session::SessionMetadata,
-    ) -> AppServerResult<()> {
-        let already_terminal = session
-            .metadata_entries()
-            .iter()
-            .any(|entry| entry.turn_id() == Some(turn_id) && entry.kind().matches_turn_terminal());
-        if !already_terminal {
-            session.append_metadata(metadata)?;
-        }
-        Ok(())
-    }
-
-    fn append_usage_metadata_if_missing(
-        &self,
-        session: &mut SessionManager,
-        turn_id: &str,
-        usage: Value,
-    ) -> AppServerResult<()> {
-        let already_persisted = session.metadata_entries().iter().any(|entry| {
-            entry.kind() == SessionMetadataKind::Usage && entry.turn_id() == Some(turn_id)
-        });
-        if !already_persisted {
-            session.append_metadata(singularity_agent::session::SessionMetadata::usage(
-                turn_id, usage,
-            )?)?;
-        }
-        Ok(())
-    }
-
-    /// turn_started 通过本轮已打开的同一 `SessionManager` 落盘（开始标记）。
-    pub(crate) fn append_turn_started_metadata(
-        &self,
-        session: &mut SessionManager,
-        turn_id: &str,
-    ) -> AppServerResult<()> {
-        let already_started = session.metadata_entries().iter().any(|entry| {
-            entry.turn_id() == Some(turn_id) && entry.kind() == SessionMetadataKind::TurnStarted
-        });
-        if !already_started {
-            session.append_metadata(singularity_agent::session::SessionMetadata::turn_started(
-                turn_id,
-            ))?;
-        }
-        Ok(())
+    /// 注册活动窗口；返回的守卫在终态事件后 drop 时移除注册。
+    pub(super) fn register_live_turn(&self, turn_id: &str, thread_id: &str) -> LiveTurnGuard {
+        LiveTurnGuard::register(Arc::clone(&self.live_turns), turn_id, thread_id)
     }
 
     /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
@@ -474,86 +429,5 @@ impl AppServer {
             thread.last_turn_status = Some(singularity_protocol::ThreadStatus::Interrupted);
         }
         thread
-    }
-
-    fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        // 单一注册表：存在归属该会话的活动 turn 即视为存活。
-        self.active_turns
-            .lock()
-            // 锁中毒视为没有存活 turn：宁可投影为终态也不伪装运行中。
-            .ok()
-            .is_some_and(|turns| turns.values().any(|turn| turn.thread_id == session_id))
-    }
-
-    /// 终态 turn 的 usage 投影：优先使用本轮已在手的 model_usage；真正缺失
-    /// （provider 未上报 usage）时回退到同一会话 JSONL 已持久化的 usage metadata。
-    pub(crate) fn terminal_turn_with_usage(
-        &self,
-        session: &SessionManager,
-        turn: Turn,
-        usage: &ModelUsage,
-        usage_complete: bool,
-    ) -> Turn {
-        let model_usage = if usage.usage_present {
-            Some(usage_to_wire_with_completeness(usage, usage_complete))
-        } else {
-            self.persisted_usage_for_turn(session, &turn)
-                .map(|(persisted, complete)| usage_to_wire_with_completeness(&persisted, complete))
-        };
-        Turn {
-            model_usage,
-            ..turn
-        }
-    }
-
-    /// Return the narrow active-turn handle used by the stdio control lane.
-    ///
-    /// The handle contains no session-store owner and therefore cannot process
-    /// ordinary state requests. It is cloneable so interrupt/steer/follow-up
-    /// requests can bypass the ordinary request queue without duplicating the
-    /// application state owner.
-    pub fn control_handle(&self) -> AppServerControlHandle {
-        AppServerControlHandle {
-            active_turns: Arc::clone(&self.active_turns),
-        }
-    }
-
-    fn persisted_usage_for_turn(
-        &self,
-        session: &SessionManager,
-        turn: &Turn,
-    ) -> Option<(ModelUsage, bool)> {
-        let value = session
-            .metadata_entries()
-            .into_iter()
-            .rev()
-            .find(|entry| {
-                entry.kind() == SessionMetadataKind::Usage
-                    && entry.turn_id() == Some(turn.turn_id.as_str())
-            })?
-            .field("usage")
-            .cloned()?;
-        let wire: singularity_protocol::TurnModelUsage = serde_json::from_value(value).ok()?;
-        Some((
-            ModelUsage {
-                input_tokens: wire.input_tokens,
-                output_tokens: wire.output_tokens,
-                total_tokens: wire.total_tokens,
-                cached_input_tokens: wire.cached_input_tokens,
-                reasoning_tokens: wire.reasoning_tokens,
-                usage_present: wire.usage_present,
-            },
-            wire.usage_complete,
-        ))
-    }
-
-    /// 关闭已结束 turn 的实时注入窗口；活动映射保留到 guard drop，
-    /// 让并发 session/delete 仍能观察到终态化 worker。终态后的输入必须通过新的 turn/start。
-    pub(crate) fn close_turn_inputs(&self, turn_id: &str) {
-        if let Ok(mut active_turns) = self.active_turns.lock()
-            && let Some(active_turn) = active_turns.get_mut(turn_id)
-        {
-            active_turn.inbox = None;
-        }
     }
 }

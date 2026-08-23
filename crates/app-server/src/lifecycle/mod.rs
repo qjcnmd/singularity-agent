@@ -1,8 +1,9 @@
-//! AppServer turn lifecycle split by runner and terminal ownership.
+//! AppServer 生命周期适配层：协议投影与索引同步。
+//!
+//! 唯一执行实现位于 `singularity_runtime`（TurnRunner/Conversation/TurnEvent）；
+//! 本目录只保留投影适配器与终态分类。
 
 use super::*;
-mod runner;
-mod terminal;
+mod projection;
 
-pub(crate) use runner::agent_config_for_thread;
-pub(crate) use terminal::{terminal_metadata_for_status, turn_failure_from_error};
+pub(crate) use projection::{TurnProjection, classify_run_result};

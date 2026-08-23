@@ -1,6 +1,6 @@
 # Singularity 仓库指令
 
-Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness，产品由无交互模式、交互式 TUI 和 GUI 组成；当前阶段实现前两种，GUI 作为后续客户端形态。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期、Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式与 TUI 直接复用同一核心能力；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
+Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness，产品由无交互模式、交互式 TUI 和 GUI 组成；当前阶段实现前两种，GUI 以 stdio JSON-RPC 适配层（app-server）保留接入面。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期是 Turn 执行唯一所有者（crates/runtime 的 TurnRunner/Conversation），Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式、TUI 与 app-server 全部委托 runtime 执行；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
 
 ## 每个任务都适用
 

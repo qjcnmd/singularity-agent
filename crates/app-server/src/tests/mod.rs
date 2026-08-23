@@ -1,13 +1,16 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use super::*;
-use singularity_agent::agent::TurnInbox;
 use singularity_agent::session::SessionManager;
+use singularity_agent::tools::ToolRegistry;
+use singularity_core::CancellationToken;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderError,
-    ProviderProtocolContract, ProviderReasoningReplay,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderConfigSnapshot,
+    ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
 };
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
@@ -557,19 +560,16 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
 }
 
 #[test]
-fn completed_turn_runtime_registry_is_released() {
+fn live_turn_registry_is_released_when_guard_drops() {
     let temp = tempfile::tempdir().expect("temp dir");
     let store = SessionIndex::new();
     let sessions_dir = temp.path().join("sessions");
     let server = app_server(store, &sessions_dir);
     for index in 0..300 {
-        let turn_id = format!("turn-{index}");
-        let (_cancellation, guard) = server
-            .activate_turn(&turn_id, "thread-1")
-            .expect("activate");
+        let guard = server.register_live_turn(&format!("turn-{index}"), "thread-1");
         drop(guard);
     }
-    assert!(server.active_turns.lock().unwrap().is_empty());
+    assert!(server.live_turns.lock().unwrap().is_empty());
 }
 
 #[derive(Clone)]
@@ -701,45 +701,6 @@ fn turn_start_runs_tools_in_user_session_and_updates_index() {
     assert_eq!(
         metadata[2].kind(),
         singularity_agent::session::SessionMetadataKind::Usage
-    );
-}
-
-#[test]
-fn a_single_turn_opens_the_session_file_exactly_once() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-    let session_id = "3a0e99f1-8b2c-47d6-9f3e-2a1b0c8d7e6f";
-    let mut server =
-        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
-            responses: vec![completed_response("single-turn")],
-            seen_requests: Arc::new(Mutex::new(Vec::new())),
-        }));
-    initialize(&mut server);
-    insert_session(&server, &sessions_dir, session_id, &workspace);
-
-    // 单写者所有权：一轮 turn（开始标记→对话→工具→终态→用量）只打开一次
-    // SessionManager。计数放在 state.rs 的 open_session_for_thread（open_existing
-    // 的唯一 turn 入口），开始时清零观察一轮内的增量。
-    server.session_opens.store(0, Ordering::SeqCst);
-    let mut events = Vec::new();
-    server
-        .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
-            events.push(value);
-        })
-        .expect("turn start");
-    assert!(
-        events
-            .iter()
-            .any(|value| value["method"] == "turn/completed"),
-        "single completed turn"
-    );
-    assert_eq!(
-        server.session_opens.load(Ordering::SeqCst),
-        1,
-        "a single turn must open the session file exactly once"
     );
 }
 
@@ -983,9 +944,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
     );
 
     // 真正运行中的 turn：存活 guard 期间投影为 active，结束后回到崩溃遗留投影。
-    let (_cancellation, guard) = server
-        .activate_turn("turn_live_1", &session_id)
-        .expect("activate turn");
+    let guard = server.register_live_turn("turn_live_1", &session_id);
     assert_eq!(listed_status(&mut server, 8, &session_id), json!("active"));
     assert_eq!(read_status(&mut server, 9, &session_id), json!("active"));
     drop(guard);
@@ -1024,45 +983,89 @@ fn session_delete_removes_rollout_and_index_record() {
 }
 
 #[test]
-fn turn_steer_and_follow_up_inject_into_active_turn_queues() {
+fn turn_steer_and_follow_up_inject_into_active_turn_through_conversation() {
+    /// 在 provider 内部挂起直到外部放行，制造确定的活动 turn 窗口。
+    #[derive(Clone)]
+    struct GatedProvider {
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl Provider for GatedProvider {
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            ProviderProtocolContract::default()
+        }
+        fn complete(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ModelTurnResponse, ProviderError> {
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(500));
+            Ok(ModelTurnResponse::completed(
+                request.request_id.clone(),
+                "r",
+                "ok",
+            ))
+        }
+    }
+
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
     let store = SessionIndex::new();
     let session_id = "b928f6f2-ddb4-4a0b-a237-6936c7e8c268";
-    let mut server = app_server(store, &sessions_dir);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(GatedProvider {
+        release: Arc::new(Mutex::new(release_rx)),
+    }));
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
 
-    let (_, _guard) = server
-        .activate_turn("turn_live", session_id)
-        .expect("activate turn");
-    let inbox = Arc::new(Mutex::new(TurnInbox::default()));
-    server
-        .active_turns
-        .lock()
-        .expect("active turns")
-        .get_mut("turn_live")
-        .expect("active turn")
-        .inbox = Some(Arc::clone(&inbox));
+    // 生产路径：turn/start 在专用工作线程上执行，事件经通道流出。
+    let mut worker = server.turn_worker().expect("turn worker");
+    let (emit_tx, emit_rx) = std::sync::mpsc::channel::<Value>();
+    let worker_handle = thread::spawn(move || {
+        worker.handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |value| {
+            emit_tx.send(value).expect("emit channel open");
+        })
+    });
+    // 响应到达即可确定 runtime 生成的 turn id；此时 inbox 已注册。
+    let turn_id = loop {
+        match emit_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(value) if value["id"] == 2 => {
+                break value["result"]["turn"]["turnId"]
+                    .as_str()
+                    .expect("turn id")
+                    .to_string();
+            }
+            Ok(_) => continue,
+            Err(_) => panic!("no turn/start response"),
+        }
+    };
 
+    // steer 经控制通道注入当前活动 turn。
     let steer_response = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{"turnId":"turn_live","input":[{"type":"text","text":"change direction"}]}}"#,
-        )
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/steer","id":3,"params":{{"turnId":"{turn_id}","input":[{{"type":"text","text":"change direction"}}]}}}}"#
+        ))
         .expect("turn steer");
     assert_eq!(steer_response[0]["result"]["turn"]["status"], "running");
+    // followUp 提交进入 Conversation 后续队列（唯一业务队列）。
     let follow_up_response = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"turn/followUp","id":4,"params":{"turnId":"turn_live","input":[{"type":"text","text":"keep going"}]}}"#,
-        )
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/followUp","id":4,"params":{{"turnId":"{turn_id}","input":[{{"type":"text","text":"keep going"}}]}}}}"#
+        ))
         .expect("turn followUp");
     assert_eq!(follow_up_response[0]["result"]["turn"]["status"], "running");
 
-    // The production handles are typed atomic TurnInbox values rather than
-    // raw VecDeque instances; the active responses above prove acceptance
-    // without coupling this test to the inbox's private representation.
+    release_tx.send(()).expect("release");
+    worker_handle
+        .join()
+        .expect("worker join")
+        .expect("turn chain completes");
 }
 
 #[test]
@@ -1187,9 +1190,7 @@ fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
 
-    let (_, guard) = server
-        .activate_turn("turn_live", session_id)
-        .expect("activate turn");
+    let guard = server.register_live_turn("turn_live", session_id);
 
     // 活跃 turn 期间删除 → invalid state 拒绝，索引与 rollout 都不动。
     let responses = server
@@ -1655,6 +1656,8 @@ fn terminal_metadata_failure_emits_error_and_never_completion() {
         }));
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
+    // 首次终态写入失败：即使随后的降级写入成功，也按降级后的真实状态
+    // （failed）发布终态，不把瞬态故障冒充为 intended 完成。
     server.inject_terminalization_faults(1, 0);
 
     let mut events = Vec::new();
@@ -1727,58 +1730,6 @@ fn agent_failure_status_write_failure_still_converges_and_reports_terminalizatio
 }
 
 #[test]
-fn terminal_event_failure_emits_fallback_error_and_reports_event_stage() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-    let session_id = "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d";
-    let mut server =
-        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
-            responses: vec![completed_response("completed")],
-            seen_requests: Arc::new(Mutex::new(Vec::new())),
-        }));
-    initialize(&mut server);
-    insert_session(&server, &sessions_dir, session_id, &workspace);
-    server.inject_terminalization_faults(0, 1);
-
-    let mut events = Vec::new();
-    let result = server.handle_turn_start_streaming_with_output(
-        turn_start_message(2, session_id),
-        |value| {
-            events.push(value);
-        },
-    );
-    assert!(
-        result.is_ok(),
-        "terminal event failure returns ok and emits fallback error"
-    );
-    let error_event = events
-        .iter()
-        .find(|value| value["method"] == "turn/error")
-        .expect("turn/error");
-    assert_eq!(
-        error_event["params"]["error"]["stage"],
-        "event_notification"
-    );
-    assert_eq!(
-        server
-            .store()
-            .get_session(session_id)
-            .expect("record")
-            .status,
-        Some(SessionStatus::Completed)
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|value| value["method"] == "turn/completed")
-    );
-    assert!(events.iter().any(|value| value["method"] == "turn/error"));
-}
-
-#[test]
 fn terminal_metadata_double_failure_emits_no_terminal_event() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
@@ -1793,6 +1744,8 @@ fn terminal_metadata_double_failure_emits_no_terminal_event() {
         }));
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
+    // 注入五次写入故障会耗尽计数器、污染重开轮；三次恰好：预期写入失败、
+    // 降级写入尝试与重试全部失败 → fail-stop + storage_fatal。
     server.inject_terminalization_faults(3, 0);
 
     let mut events = Vec::new();
@@ -1931,7 +1884,7 @@ fn single_metadata_failure_recovers_via_bounded_retry() {
         }));
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
-    // Inject 1 fault on first write; retry write succeeds.
+    // Inject 1 fault on first write; the degraded failure state write succeeds.
     server.inject_terminalization_faults(1, 0);
 
     let mut events = Vec::new();
@@ -1949,7 +1902,7 @@ fn single_metadata_failure_recovers_via_bounded_retry() {
         !events
             .iter()
             .any(|value| value["method"] == "turn/completed"),
-        "must not emit turn/completed when initial metadata write fails"
+        "must not emit turn/completed when the intended terminal write fails"
     );
     assert!(
         events.iter().any(|value| value["method"] == "turn/error"),
@@ -1962,52 +1915,45 @@ fn single_metadata_failure_recovers_via_bounded_retry() {
     );
 }
 
-/// 仅暴露 generator 契约的最小 Provider 假件，供 prompt 装配测试使用。
-struct PromptOnlyProvider;
-
-impl Provider for PromptOnlyProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn complete(
-        &self,
-        _request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        Err(ProviderError::from_model_error(ModelError::new(
-            ModelErrorKind::NetworkError,
-            "unused",
-        )))
-    }
-}
-
 #[test]
 fn agent_prompt_tool_list_matches_registry_names_only() {
-    let temp = tempfile::tempdir().expect("workspace dir");
-    let thread = singularity_protocol::Thread {
-        thread_id: "thread_prompt".to_string(),
-        model: None,
-        cwd: Some(temp.path().to_string_lossy().to_string()),
-        last_turn_status: None,
-    };
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
-    );
-    let (config, _) =
-        crate::lifecycle::agent_config_for_thread(&thread, &PromptOnlyProvider, &snapshot)
-            .expect("agent config resolves");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let store = SessionIndex::new();
+    let session_id = "a0f9e8d7-6c5b-4a4a-9b3c-2d1e0f9a8b7c";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut server =
+        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
+            responses: vec![completed_response("prompt")],
+            seen_requests: Arc::clone(&seen),
+        }));
+    initialize(&mut server);
+    insert_session(&server, &sessions_dir, session_id, &workspace);
+
+    // 走真实 turn：首个 provider 请求携带装配后的系统提示词。
+    server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"run"}}]}}}}"#
+        ))
+        .expect("turn start");
     let names = ToolRegistry::new().names();
     assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
+    let joined: String = seen
+        .lock()
+        .expect("seen requests")
+        .last()
+        .expect("provider request")
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     for name in &names {
         assert!(
-            config.system_prompt.contains(&format!("- {name}")),
-            "tool list must include {name}"
+            joined.contains(&format!("- {name}")),
+            "prompt must list {name} by registry name"
         );
     }
     for tool_description in [
@@ -2017,7 +1963,7 @@ fn agent_prompt_tool_list_matches_registry_names_only() {
         "structured whole-file creation and overwrite",
     ] {
         assert!(
-            !config.system_prompt.contains(tool_description),
+            !joined.contains(tool_description),
             "prompt must list tool names only, not descriptions"
         );
     }

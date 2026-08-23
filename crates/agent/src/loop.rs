@@ -2,7 +2,7 @@
 //!
 //! 采用双层状态机循环结构：
 //! - **内层循环**：处理单轮任务执行中的模型流式请求、工具批次按模型给定顺序串行执行、中间引导（Steer）注入与上下文压缩；
-//! - **外层循环**：当模型完成当前阶段工作（返回纯文本且无工具调用）准备收尾时，消费跟进（FollowUp）队列继续执行下一阶段目标。
+//! - **外层循环**：在代理将要停止时，消费停止窗口内到达的引导输入继续执行。
 //!
 //! 会话状态持久化、上下文压缩、工具注册分发与模型调用分别由
 //! `session/` facade、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
@@ -220,80 +220,47 @@ pub struct AgentOutcome {
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
 }
 
-/// turn 输入的类别；两个类别共享同一个原子 inbox。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnInputKind {
-    Steer,
-    FollowUp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnInput {
-    kind: TurnInputKind,
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum TurnInboxState {
     #[default]
     Open,
     Closed,
 }
 
-/// 活动 turn 的单一输入箱。
+/// 活动 turn 的单一转向输入箱。
 ///
-/// `enqueue_*`、`drain_steer` 与 `take_at_stop` 都在调用方持有的同一把
-/// Mutex 内运行。自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出
-/// 并继续执行；只有箱为空时才原子地转为 Closed，之后的输入明确拒绝。
-/// 这保证不存在“已接受但丢失”的中间状态，也不引入持久队列或 grace period。
+/// `enqueue`、`drain` 与 `take_at_stop` 都在调用方持有的同一把 Mutex 内运行。
+/// 自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出并继续执行；只有
+/// 箱为空时才原子地转为 Closed，之后的输入明确拒绝。这保证不存在“已接受但
+/// 丢失”的中间状态，也不引入持久队列或 grace period。turn 之间的后续输入
+/// 队列由调用方的 Thread 协调器持有，不进入本箱。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     state: TurnInboxState,
-    entries: VecDeque<TurnInput>,
+    entries: VecDeque<String>,
 }
 
 impl TurnInbox {
-    pub fn enqueue(&mut self, kind: TurnInputKind, text: impl Into<String>) -> bool {
+    pub fn enqueue(&mut self, text: impl Into<String>) -> bool {
         if self.state == TurnInboxState::Closed {
             return false;
         }
-        self.entries.push_back(TurnInput {
-            kind,
-            text: text.into(),
-        });
+        self.entries.push_back(text.into());
         true
     }
 
-    pub fn enqueue_steer(&mut self, text: impl Into<String>) -> bool {
-        self.enqueue(TurnInputKind::Steer, text)
-    }
-
-    pub fn enqueue_follow_up(&mut self, text: impl Into<String>) -> bool {
-        self.enqueue(TurnInputKind::FollowUp, text)
-    }
-
-    fn drain_steer(&mut self) -> Vec<String> {
-        let mut steer = Vec::new();
-        let mut retained = VecDeque::new();
-        while let Some(input) = self.entries.pop_front() {
-            if input.kind == TurnInputKind::Steer {
-                steer.push(input.text);
-            } else {
-                retained.push_back(input);
-            }
-        }
-        self.entries = retained;
-        steer
+    fn drain(&mut self) -> Vec<String> {
+        self.entries.drain(..).collect()
     }
 
     /// Atomic natural-stop barrier.  A non-empty box remains open and hands
     /// all accepted inputs to the next loop; an empty box closes permanently.
-    fn take_at_stop(&mut self) -> Option<Vec<TurnInput>> {
+    fn take_at_stop(&mut self) -> Option<Vec<String>> {
         if self.entries.is_empty() {
             self.state = TurnInboxState::Closed;
             None
         } else {
-            Some(self.entries.drain(..).collect())
+            Some(self.drain())
         }
     }
 
@@ -302,7 +269,7 @@ impl TurnInbox {
     }
 }
 
-/// steer/follow-up 共用的线程安全句柄。
+/// 活动 turn 转向输入箱的线程安全句柄。
 pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
 struct PreparedToolCall {
@@ -428,7 +395,7 @@ pub struct Agent {
     registry: ToolRegistry,
     provider: Arc<dyn Provider + Send + Sync>,
     config: AgentConfig,
-    /// steer/follow-up 共用的活动 turn 输入箱；内存态不持久化。
+    /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
 }
 
@@ -464,7 +431,7 @@ impl Agent {
         })
     }
 
-    /// 返回 turn 实时输入队列（steer / follow-up）的线程安全句柄。
+    /// 返回 turn 实时转向输入队列的线程安全句柄。
     pub fn inbox_handle(&self) -> TurnInboxHandle {
         Arc::clone(&self.inbox)
     }
@@ -477,16 +444,11 @@ impl Agent {
 
     /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
     pub fn steer(&mut self, text: &str) -> bool {
-        lock_inbox(&self.inbox).enqueue_steer(text.to_string())
+        lock_inbox(&self.inbox).enqueue(text.to_string())
     }
 
-    /// 注入跟进：代理将要停止（无工具调用且文本非空）时继续一轮再停止。
-    pub fn follow_up(&mut self, text: &str) -> bool {
-        lock_inbox(&self.inbox).enqueue_follow_up(text.to_string())
-    }
-
-    /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用与
-    /// steer，外层循环消费 follow-up；停止后返回聚合结果。
+    /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
+    /// 运行中注入的转向输入在后续轮次生效；停止后返回聚合结果。
     ///
     /// `cancellation` 取消时终止并返回已完成文本（`terminal_reason=Aborted`，不视为错误）。
     pub fn run(
@@ -527,7 +489,7 @@ impl Agent {
                     .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema)),
         };
 
-        // 外层循环：代理将要停止时消费 follow-up 队列。
+        // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
             // 内层循环：工具调用与 steer 注入。
             loop {
@@ -537,8 +499,8 @@ impl Agent {
                     lock_inbox(&self.inbox).close();
                     return Ok(outcome);
                 }
-                // 注入 steer 队列全部消息（作为 user 消息追加到本轮上下文）。
-                let steer_messages = lock_inbox(&self.inbox).drain_steer();
+                // 注入转向队列全部消息（作为 user 消息追加到本轮上下文）。
+                let steer_messages = lock_inbox(&self.inbox).drain();
                 for text in steer_messages {
                     if let Err(error) = self.session.append_message(user_message(&text)) {
                         return self.fail_after_progress(AgentError::Session(error), outcome);
@@ -762,12 +724,12 @@ impl Agent {
                 outcome.final_text = assistant_text;
                 break;
             }
-            // 代理将要停止：消费 follow-up 队列后回到内层循环。
+            // 代理将要停止：消费停止窗口内到达的转向输入后回到内层循环。
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
             for input in pending_inputs {
-                if let Err(error) = self.session.append_message(user_message(&input.text)) {
+                if let Err(error) = self.session.append_message(user_message(&input)) {
                     return self.fail_after_progress(AgentError::Session(error), outcome);
                 }
             }

@@ -5,34 +5,6 @@ use singularity_core::user_singularity_home;
 use super::session_index::SessionRecord;
 use crate::owner_only::ensure_owner_only_dir;
 
-pub(super) fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
-    let path = match cwd {
-        Some(cwd) if !cwd.trim().is_empty() => Path::new(cwd).to_path_buf(),
-        Some(_) => return Err("thread cwd must not be empty".to_string()),
-        None => std::env::current_dir()
-            .map_err(|error| format!("failed to read current directory: {error}"))?,
-    };
-    let canonical =
-        std::fs::canonicalize(&path).map_err(|_| "failed to bind thread cwd".to_string())?;
-    canonical
-        .to_str()
-        .map(str::to_string)
-        .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
-}
-
-pub(super) fn workspace_path(thread: &singularity_protocol::Thread) -> Result<PathBuf, String> {
-    let cwd = thread
-        .cwd
-        .as_deref()
-        .filter(|cwd| !cwd.trim().is_empty())
-        .ok_or_else(|| "thread does not have an absolute workspace".to_string())?;
-    let path = Path::new(cwd);
-    if !path.is_absolute() {
-        return Err("thread does not have an absolute workspace".to_string());
-    }
-    Ok(path.to_path_buf())
-}
-
 /// 持久化状态的原始投影：仅供内部（打开会话、provider 配置）使用；
 /// wire 可见的 thread 摘要必须经过 `AppServer::project_thread`。
 pub fn thread_from_record(record: &SessionRecord) -> singularity_protocol::Thread {

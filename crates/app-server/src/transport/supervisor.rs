@@ -183,36 +183,74 @@ where
                 };
                 let request_id = message.id().cloned();
                 if is_turn_request(&message) && ready_for_turn.load(Ordering::SeqCst) {
-                    let task = tokio::task::spawn_blocking(move || {
-                        let worker = turn_factory.turn_worker();
-                        (turn_factory, worker)
-                    });
-                    let (next_factory, worker_result) = match task.await {
-                        Ok(result) => result,
+                    // 路由裁定在负载线程启动前同步完成：同线程的第二个
+                    // turn/start 在这里立即拿到 invalid-state 响应。
+                    let claim_result = tokio::task::spawn_blocking({
+                        let factory = turn_factory.clone();
+                        let message = message.clone();
+                        move || factory.claim_turn(message)
+                    })
+                    .await
+                    .map_err(|error| format!("turn claim task failed: {error}"))?;
+                    match claim_result {
                         Err(error) => {
-                            terminal_error = Some(format!("turn worker setup failed: {error}"));
-                            break;
-                        }
-                    };
-                    turn_factory = next_factory;
-                    match worker_result {
-                        Ok(worker) => {
-                            let worker_outputs = output_tx.clone();
-                            let worker_cancellation = cancellation.clone();
-                            turn_tasks.spawn_blocking(move || {
-                                run_turn_request(worker, message, worker_outputs, worker_cancellation)
-                            });
-                        }
-                        Err(error) => {
-                            if let Err(error) = send_output_async(
+                            if let Err(send_error) = send_output_async(
                                 output_tx.clone(),
                                 cancellation.clone(),
                                 transport_error_value(request_id, &error),
                             )
                             .await
                             {
-                                terminal_error = Some(error);
+                                terminal_error = Some(send_error);
                                 break;
+                            }
+                        }
+                        Ok(singularity_app_server::TurnClaim::Responded(response)) => {
+                            if let Err(send_error) = send_output_async(
+                                output_tx.clone(),
+                                cancellation.clone(),
+                                response,
+                            )
+                            .await
+                            {
+                                terminal_error = Some(send_error);
+                                break;
+                            }
+                        }
+                        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => {
+                            let task = tokio::task::spawn_blocking(move || {
+                                let worker = turn_factory.turn_worker();
+                                (turn_factory, worker)
+                            });
+                            let (next_factory, worker_result) = match task.await {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    terminal_error =
+                                        Some(format!("turn worker setup failed: {error}"));
+                                    break;
+                                }
+                            };
+                            turn_factory = next_factory;
+                            match worker_result {
+                                Ok(worker) => {
+                                    let worker_outputs = output_tx.clone();
+                                    let worker_cancellation = cancellation.clone();
+                                    turn_tasks.spawn_blocking(move || {
+                                        run_turn_request(worker, worker_outputs, worker_cancellation, claim)
+                                    });
+                                }
+                                Err(error) => {
+                                    if let Err(send_error) = send_output_async(
+                                        output_tx.clone(),
+                                        cancellation.clone(),
+                                        transport_error_value(request_id, &error),
+                                    )
+                                    .await
+                                    {
+                                        terminal_error = Some(send_error);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -498,14 +536,14 @@ async fn run_control_dispatch(
     Ok(())
 }
 
-/// 在单一 turn 工作线程内执行 turn/start，事件与最终响应顺序入队。
+/// 在单一 turn 工作线程内执行已预订的 turn/start，事件与最终响应顺序入队。
 pub(crate) fn run_turn_request(
     mut worker: AppServer,
-    message: JsonRpcMessage,
     outputs: mpsc::Sender<Value>,
     cancellation: AppServerCancellationHandle,
+    claim: singularity_app_server::TurnStartClaim,
 ) -> Result<(), String> {
-    let request_id = message.id().cloned();
+    let request_id = claim.request_id.clone();
     let mut output_error = None;
     let mut emit = |output: AppServerOutput| {
         if output_error.is_none()
@@ -514,14 +552,7 @@ pub(crate) fn run_turn_request(
             output_error = Some(error);
         }
     };
-    let result = match message.method_name() {
-        Some(method) if method == Method::TurnStart.as_str() => {
-            worker.handle_turn_start_streaming_with_output(message, &mut emit)
-        }
-        _ => Err(AppServerError::Workspace(
-            "streaming dispatch requires turn/start".to_string(),
-        )),
-    };
+    let result = worker.run_turn_started(claim, &mut emit);
     if let Some(error) = output_error {
         return Err(error);
     }
@@ -534,7 +565,7 @@ pub(crate) fn run_turn_request(
                 send_output(
                     &outputs,
                     &cancellation,
-                    request_error_value(request_id, &error),
+                    request_error_value(Some(request_id), &error),
                 )?;
             }
         }

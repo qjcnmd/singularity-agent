@@ -16,6 +16,7 @@ singularity_agent = { path = "../agent" }
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
+singularity_runtime = { path = "../runtime" }
 thiserror.workspace = true
 tokio.workspace = true
 time.workspace = true
@@ -23,3 +24,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# 测试通过 runtime 的故障注入钩子驱动终态化合同。
+singularity_runtime = { path = "../runtime", features = ["test-hooks"] }

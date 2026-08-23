@@ -7,11 +7,15 @@ Singularity 是一个由 Rust 实现的本地 coding-agent harness。`sg` 无参
 ## 运行结构
 
 ```text
-sg（单进程）
-  -> crates/runtime：TurnRunner（单轮管线）+ Conversation（Thread 生命周期协调）
-     -> AgentLoop（headless core：Agent 循环 + ToolRegistry read/glob/grep/bash/edit/write）
-     -> OpenAiProvider（Chat / Responses）
-     -> 会话 JSONL（~/.singularity/sessions/<uuid>.jsonl，唯一权威正文）
+sg（单进程，双入口）
+  ├─ 交互式 TUI（无参数）：主会话流 + 多行编辑器 + 状态行
+  └─ --print / --json：单次无交互执行
+        └─ crates/runtime：Turn 执行唯一所有者
+             ├─ TurnRunner（单轮管线）+ Conversation（Thread 生命周期协调：
+             │  单活动 turn、steer 注入当前轮、followUp FIFO 自执行、设置终态后自动生效）
+             └─ AgentLoop（headless core：Agent 循环 + ToolRegistry read/glob/grep/bash/edit/write）
+                  └─ OpenAiProvider（Chat / Responses）+ 会话 JSONL（唯一权威正文）
+crates/app-server（stdio JSON-RPC 适配器）：GUI 接入面，执行全部委托 runtime
 ```
 
 详细边界、对象、事件流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。

@@ -111,8 +111,12 @@ pub struct TurnFailure {
 /// 终态化失败（terminal metadata 无法落盘的 fatal 存储错误）。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
-    #[error("{0}")]
-    Preparation(String),
+    #[error("{message}")]
+    Preparation {
+        /// 失败来源分类；turn 未留下任何痕迹。
+        cause: TurnFailureCause,
+        message: String,
+    },
     #[error("turn failed: {0:?}")]
     Execution(TurnFailure),
     #[error("terminalization failed: {0:?}")]

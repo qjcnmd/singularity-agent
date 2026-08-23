@@ -1,5 +1,8 @@
 //! JSON-RPC registry validation and request dispatch handlers.
 
+use singularity_agent::session::{SessionManager, SessionRepository};
+use singularity_model::ProviderConfigSnapshot;
+
 use super::*;
 
 pub(super) fn json_response<T: serde::Serialize>(
@@ -37,19 +40,6 @@ pub(super) fn title_from_input(input: &str) -> String {
         .chars()
         .take(MAX_SESSION_TITLE_CHARS)
         .collect()
-}
-
-pub(super) fn compose_model_selector(
-    provider: &str,
-    model: &str,
-    reasoning: Option<&str>,
-) -> String {
-    let mut selector = format!("{provider}/{model}");
-    if let Some(reasoning) = reasoning {
-        selector.push('#');
-        selector.push_str(reasoning);
-    }
-    selector
 }
 
 pub(super) fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
@@ -275,20 +265,32 @@ impl AppServer {
         let selector = compose_model_selector(&provider, &model, reasoning.as_deref());
         self.validate_model_selector(Some(&selector))?;
         if changed {
-            let settings = singularity_agent::session::SessionMetadata::thread_settings(
-                provider.clone(),
-                model.clone(),
-                reasoning.clone(),
-            )?;
-            let mut session = self.open_session_for_thread(&thread_from_record(&record))?;
-            session.append_metadata(settings)?;
-            self.store.update_session(
-                &record.session_id,
-                SessionMetadataUpdate {
-                    model: Some(Some(&selector)),
-                    ..SessionMetadataUpdate::default()
-                },
-            )?;
+            // JSONL 先落盘（协调器负责校验与持久化），随后同步索引投影。
+            let conversation = self.conversation_for(&record.session_id)?;
+            let patch = singularity_runtime::SettingsPatch {
+                provider: Some(provider.clone()),
+                model: Some(model.clone()),
+                reasoning: reasoning.clone(),
+            };
+            if let Err(error) = conversation.queue_settings(patch) {
+                let message = match error {
+                    singularity_runtime::ConversationError::Settings(message) => {
+                        format!("invalid model selector: {message}")
+                    }
+                    other => other.to_string(),
+                };
+                return Err(AppServerError::InvalidParams(message));
+            }
+            let updated_model = conversation.thread().ok().and_then(|t| t.model);
+            if let Some(updated_model) = updated_model {
+                self.store.update_session(
+                    &record.session_id,
+                    SessionMetadataUpdate {
+                        model: Some(Some(&updated_model)),
+                        ..SessionMetadataUpdate::default()
+                    },
+                )?;
+            }
         }
         json_response(
             message.required_id(),
@@ -304,7 +306,7 @@ impl AppServer {
 
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadStartParams = parse_params(&message)?;
-        let cwd = match canonical_thread_cwd(params.cwd.as_deref()) {
+        let cwd = match singularity_runtime::store::canonical_thread_cwd(params.cwd.as_deref()) {
             Ok(cwd) => cwd,
             Err(_) => return invalid_params_response(message.required_id()),
         };
@@ -316,22 +318,31 @@ impl AppServer {
         }
         let model = match params.model.as_deref() {
             Some(model) => Some(model.to_string()),
-            None => self.provider_snapshot.resolved_default_selector(),
+            None => self.turn_runner.default_model_selector(),
         };
-        let session_id = Uuid::now_v7().to_string();
-        let session =
-            SessionManager::create_with_id(Path::new(&cwd), &self.sessions_dir, &session_id)
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-        ensure_owner_only_file(session.path())
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-        let rollout_path = session.path().to_string_lossy().to_string();
+        let thread = match singularity_runtime::store::create_thread(
+            &self.sessions_dir,
+            &cwd,
+            model.clone(),
+        ) {
+            Ok(thread) => thread,
+            Err(_) => {
+                return Err(AppServerError::Workspace(
+                    SAFE_WORKSPACE_FAILURE.to_string(),
+                ));
+            }
+        };
+        let rollout_path =
+            singularity_runtime::store::thread_session_path(&self.sessions_dir, &thread.thread_id)
+                .to_string_lossy()
+                .to_string();
         let created_at = now_iso();
         let record = SessionRecord {
-            session_id,
+            session_id: thread.thread_id.clone(),
             rollout_path,
             cwd: cwd.clone(),
             title: None,
-            model: model.clone(),
+            model,
             // 尚无 turn：status 为 null，首个 turn 真正开始时才写入。
             status: None,
             created_at: created_at.clone(),
@@ -339,13 +350,14 @@ impl AppServer {
             token_usage: json!({}),
         };
         self.store.insert_session(&record)?;
-        let thread = self.project_thread(&record);
-        let mut messages = vec![self.event_notification(AppEvent::thread_started(&thread))?];
+        let protocol_thread = self.project_thread(&record);
+        let mut messages =
+            vec![self.event_notification(AppEvent::thread_started(&protocol_thread))?];
         messages.push(
             JsonRpcMessage::response(
                 message.required_id(),
                 serde_json::to_value(ThreadStartResult {
-                    thread: thread.clone(),
+                    thread: protocol_thread.clone(),
                 })?,
             )
             .to_wire_value(),
@@ -431,20 +443,22 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
-        let turn_active = {
-            let active_turns = self
-                .active_turns
-                .lock()
-                .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.to_string()))?;
-            active_turns
-                .values()
-                .any(|turn| turn.thread_id == params.session_id)
-        };
-        if turn_active {
+        if self.thread_turn_active(&record.session_id) {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
         // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。
-        let _session = self.open_session_for_thread(&thread_from_record(&record))?;
+        let session = SessionManager::open_existing(Path::new(&record.rollout_path))
+            .map_err(AppServerError::Session)?;
+        if session.session_id() != record.session_id {
+            return Err(AppServerError::Store(SessionIndexError::InvalidState(
+                format!(
+                    "rollout header id {} does not match index session id {}",
+                    session.session_id(),
+                    record.session_id
+                ),
+            )));
+        }
+        drop(session);
         crate::delete::delete_session(&record, &self.store)?;
         json_response(
             message.required_id(),
@@ -454,4 +468,235 @@ impl AppServer {
             },
         )
     }
+}
+
+/// turn/start 请求路由裁定（stdio 二进制与测试共用）。
+pub enum TurnClaim {
+    /// 已获得活动窗口预订；worker 线程负责消费执行。
+    Accepted(TurnStartClaim),
+    /// 需要直接回给客户端的响应（thread 未找到 / 并发占用 / 参数无效）。
+    Responded(Value),
+}
+
+impl std::fmt::Debug for TurnClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accepted(_) => formatter.write_str("Accepted(_)"),
+            Self::Responded(value) => formatter.debug_tuple("Responded").field(value).finish(),
+        }
+    }
+}
+
+/// 已预订的 turn/start：把输入、投影头与预订一起交给执行线程。
+pub struct TurnStartClaim {
+    pub reservation: singularity_runtime::TurnReservation,
+    pub request_id: JsonRpcId,
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub input: String,
+}
+
+impl AppServer {
+    /// 路由裁定；二进制与库测试共用（`#[doc(hidden)]` 暴露给 stdio transport）。
+    #[doc(hidden)]
+    pub fn claim_turn(&self, message: JsonRpcMessage) -> AppServerResult<TurnClaim> {
+        if message.method_name() != Some(Method::TurnStart.as_str()) {
+            return Err(AppServerError::InvalidParams(
+                "claim requires turn/start".to_string(),
+            ));
+        }
+        let params: TurnStartParams = parse_params(&message)?;
+        let record = match self.store.get_session(&params.thread_id) {
+            Ok(record) => record,
+            Err(SessionIndexError::NotFound(_)) => {
+                return Ok(TurnClaim::Responded(
+                    not_found_response(message.required_id(), THREAD_NOT_FOUND)?.remove(0),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let payload = serde_json::to_value(&params.input)?;
+        let input_text = match input_items_to_text(&payload) {
+            Ok(text) => text,
+            Err(_) => {
+                return Ok(TurnClaim::Responded(
+                    invalid_params_response(message.required_id())?.remove(0),
+                ));
+            }
+        };
+        // 协调器按 JSONL 重开（含崩溃修复）并持有全程单写者语义。
+        let conversation = self.conversation_for(&record.session_id)?;
+        let title = title_from_input(&input_text);
+        match conversation.reserve_start() {
+            Ok(reservation) => Ok(TurnClaim::Accepted(TurnStartClaim {
+                reservation,
+                request_id: message.required_id(),
+                thread_id: record.session_id,
+                title: Some(title),
+                input: input_text,
+            })),
+            Err(singularity_runtime::ConversationError::TurnAlreadyActive) => {
+                Ok(TurnClaim::Responded(
+                    invalid_state_response(
+                        message.required_id(),
+                        "another turn is already running for this session",
+                    )?
+                    .remove(0),
+                ))
+            }
+            Err(singularity_runtime::ConversationError::Settings(message)) => Err(
+                AppServerError::InvalidParams(format!("invalid model selector: {message}")),
+            ),
+            Err(singularity_runtime::ConversationError::Turn(error)) => {
+                // 预订入口不可能产生执行/终态化错误；防御性内部映射。
+                Err(AppServerError::TurnExecution {
+                    stage: TurnFailureStage::AgentLoop,
+                    cause: TurnFailureCause::Internal,
+                    original: Some(error.to_string()),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let mut messages = Vec::new();
+        self.run_turn_start(message, &mut |output| messages.push(output))?;
+        Ok(messages)
+    }
+
+    /// 执行 `turn/start`：委托共享核心运行 turn，事件经投影适配器流出。
+    pub fn handle_turn_start_streaming_with_output(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        self.run_turn_start(message, &mut emit)
+    }
+
+    fn run_turn_start(
+        &mut self,
+        message: JsonRpcMessage,
+        emit: &mut impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        match self.claim_turn(message)? {
+            TurnClaim::Accepted(claim) => self.run_turn_started(claim, emit),
+            TurnClaim::Responded(response) => {
+                emit(response);
+                Ok(())
+            }
+        }
+    }
+
+    /// 以已预订的协调器执行整条 turn 链条（worker 线程入口）；终态与 usage
+    /// 索引同步在投影内完成。`#[doc(hidden)]` 暴露给 stdio transport。
+    #[doc(hidden)]
+    pub fn run_turn_started(
+        &mut self,
+        claim: TurnStartClaim,
+        emit: &mut impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        let TurnStartClaim {
+            reservation,
+            request_id,
+            thread_id,
+            title,
+            input,
+        } = claim;
+        let mut projection = crate::lifecycle::TurnProjection::new(
+            self,
+            Arc::clone(reservation.conversation()),
+            request_id,
+            &thread_id,
+            title,
+            emit,
+        );
+        let run_result = reservation.run(&input, &mut projection);
+        if let Some(poisoned) = projection.take_poisoned() {
+            return Err(poisoned);
+        }
+        match run_result {
+            Ok(_) => Ok(()),
+            Err(singularity_runtime::ConversationError::Settings(message)) => {
+                Err(AppServerError::InvalidParams(message))
+            }
+            Err(singularity_runtime::ConversationError::Turn(error)) => {
+                crate::lifecycle::classify_run_result(Err(error))
+            }
+            Err(singularity_runtime::ConversationError::TurnAlreadyActive) => {
+                // 预订后不可能再发生；防御性保留。
+                Err(AppServerError::Workspace(
+                    "another turn is already running for this session".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn provider_status(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        json_response(
+            message.required_id(),
+            provider_configuration(self.turn_runner.provider_snapshot()),
+        )
+    }
+
+    pub(crate) fn server_shutdown(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.shutdown_requested = true;
+        self.request_execution_stop()?;
+        json_response(
+            message.required_id(),
+            ServerShutdownResult { shutdown: true },
+        )
+    }
+
+    pub(crate) fn turn_interrupt(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_interrupt(message)
+    }
+
+    pub(crate) fn turn_steer(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_steer(message)
+    }
+
+    pub(crate) fn turn_follow_up(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<Value>> {
+        self.control_handle().turn_follow_up(message)
+    }
+}
+
+pub(super) fn provider_configuration(
+    snapshot: &ProviderConfigSnapshot,
+) -> ProviderConfigurationStatus {
+    let config = snapshot.redacted_config();
+    let configuration = snapshot.configuration();
+    ProviderConfigurationStatus {
+        source: snapshot.source().map(|source| source.as_str().to_string()),
+        snapshot_id: snapshot.snapshot_id().to_string(),
+        configured: configuration.configured,
+        configuration_blocker: configuration
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code().to_string()),
+        api_key_present: config.api_key_present,
+        base_url_present: config.base_url_present,
+        model_present: config.model_name.is_some(),
+    }
+}
+
+/// 组合 `provider/model[#reasoning]` selector（展示用；持久化校验由协调器完成）。
+fn compose_model_selector(provider: &str, model: &str, reasoning: Option<&str>) -> String {
+    let mut selector = format!("{provider}/{model}");
+    if let Some(reasoning) = reasoning {
+        selector.push('#');
+        selector.push_str(reasoning);
+    }
+    selector
 }

@@ -1,8 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! 在进程边界负责 session/turn 准入、AgentLoop 执行和取消的 stdio JSON-RPC 应用服务。
+//! 在进程边界负责 session/turn 准入、协议对象转换与事件投影的 stdio JSON-RPC
+//! 应用服务。
 //!
-//! JSONL rollout 是会话正文的唯一持久事实源；进程内 `SessionIndex` 只缓存定位与展示元数据并在启动时从 JSONL 重建。
+//! 职责边界：Thread/Turn 执行语义（Agent 构造、Provider 准备、会话单写者、
+//! 事件顺序、usage 聚合、终态落盘、取消、steer/followUp、设置时序）由
+//! [`singularity_runtime`] 唯一拥有；本 crate 只做 JSON-RPC 解析、索引投影、
+//! 协议对象转换，并把 [`singularity_runtime::TurnEvent`] 一一映射为协议通知。
+//! JSONL rollout 是会话正文的唯一持久事实源；进程内 `SessionIndex` 只缓存
+//! 定位与展示元数据并在启动时从 JSONL 重建。
 
 mod delete;
 mod dispatch;
@@ -13,35 +19,23 @@ pub mod paths;
 mod session_index;
 mod state;
 
-use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
-use singularity_agent::{
-    agent::{Agent, AgentConfig, AgentError, AgentEvents, AgentOutcome, TurnInboxHandle},
-    session::{SessionError, SessionManager, SessionMetadataKind, SessionRepository},
-    tools::ToolRegistry,
-};
-use singularity_core::{
-    CancellationToken, ErrorCode, ProjectInstructionError, load_project_instructions_from_cwd,
-    user_singularity_home,
-};
-use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
+use singularity_core::{ErrorCode, user_singularity_home};
+use singularity_model::ModelUsage;
 use singularity_protocol::{
     AppEvent, HistoryItem, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
     MethodKind, ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult,
     SessionIdParams, SessionReadParams, SessionReadResult, SessionTurn, Thread, ThreadListResult,
     ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus,
     Turn, TurnIdParams, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
-    TurnStartParams, TurnStartResult, TurnStatus,
+    TurnStartParams, TurnStatus,
 };
 use thiserror::Error;
-use uuid::Uuid;
 
-pub(crate) use owner_only::ensure_owner_only_file;
 pub use session_index::{
     SessionIndex, SessionIndexError, SessionMetadataUpdate, SessionRecord, SessionStatus, now_iso,
 };
@@ -64,18 +58,15 @@ pub enum AppServerError {
     #[error("store error: {0}")]
     Store(#[from] SessionIndexError),
     #[error("session error: {0}")]
-    Session(#[from] SessionError),
-    #[error("project instructions error: {0}")]
-    ProjectInstructions(#[from] ProjectInstructionError),
-    #[error("agent error: {0}")]
-    Agent(#[from] AgentError),
+    Session(#[from] singularity_agent::session::SessionError),
     #[error("workspace error: {0}")]
     Workspace(String),
+    /// 共享核心的 turn 执行失败：分类来自 runtime 的失败 taxonomy，
+    /// original 仅在 RPC 边界用于透出真实原因，不参与持久化分类。
     #[error("turn execution failed during {stage} ({cause})")]
     TurnExecution {
         stage: TurnFailureStage,
         cause: TurnFailureCause,
-        /// 原始失败文本；仅在 RPC 边界用于透出真实原因，不参与持久化分类。
         original: Option<String>,
     },
     #[error("turn execution failed during {stage} ({cause}); terminalization failed ({failure})")]
@@ -96,7 +87,6 @@ pub type AppServerResult<T> = Result<T, AppServerError>;
 pub enum TurnFailureStage {
     AgentLoop,
     TerminalOutcome,
-    EventNotification,
 }
 
 impl TurnFailureStage {
@@ -104,7 +94,6 @@ impl TurnFailureStage {
         match self {
             Self::AgentLoop => "agent_loop",
             Self::TerminalOutcome => "terminal_outcome",
-            Self::EventNotification => "event_notification",
         }
     }
 }
@@ -174,12 +163,54 @@ impl fmt::Display for TurnFailureCause {
     }
 }
 
+impl From<singularity_runtime::ProviderFailureKind> for ProviderFailureKind {
+    fn from(kind: singularity_runtime::ProviderFailureKind) -> Self {
+        use singularity_runtime::ProviderFailureKind as R;
+        match kind {
+            R::RateLimited => Self::RateLimited,
+            R::QuotaExceeded => Self::QuotaExceeded,
+            R::Network => Self::Network,
+            R::Timeout => Self::Timeout,
+            R::Auth => Self::Auth,
+            R::Validation => Self::Validation,
+            R::Overloaded => Self::Overloaded,
+            R::Cancelled => Self::Cancelled,
+            R::ContextOverflow => Self::ContextOverflow,
+            R::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<singularity_runtime::TurnFailureCause> for TurnFailureCause {
+    fn from(cause: singularity_runtime::TurnFailureCause) -> Self {
+        use singularity_runtime::TurnFailureCause as R;
+        match cause {
+            R::Store => Self::Store,
+            R::Workspace => Self::Workspace,
+            R::ProjectInstructions => Self::ProjectInstructions,
+            R::Serialization => Self::Serialization,
+            R::Provider(kind) => Self::Provider(kind.into()),
+            R::Internal => Self::Internal,
+        }
+    }
+}
+
+impl From<singularity_runtime::TurnFailureStage> for TurnFailureStage {
+    fn from(stage: singularity_runtime::TurnFailureStage) -> Self {
+        match stage {
+            singularity_runtime::TurnFailureStage::AgentLoop => Self::AgentLoop,
+            singularity_runtime::TurnFailureStage::TerminalOutcome => Self::TerminalOutcome,
+            // runtime 不再产生该阶段；投影侧事件通知失败已统一为 poisoned 错误。
+            singularity_runtime::TurnFailureStage::EventNotification => Self::AgentLoop,
+        }
+    }
+}
+
 /// 终态补偿失败的稳定分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnTerminalizationFailure {
     Store,
     StateChanged,
-    EventNotification,
 }
 
 impl fmt::Display for TurnTerminalizationFailure {
@@ -187,30 +218,8 @@ impl fmt::Display for TurnTerminalizationFailure {
         formatter.write_str(match self {
             Self::Store => "store",
             Self::StateChanged => "state_changed",
-            Self::EventNotification => "event_notification",
         })
     }
-}
-
-/// 一次 agent 运行的稳定终态投影：直接从 `AgentOutcome` 产出协议 turn 状态
-/// 与会话索引状态，不再经过独立生命周期中间枚举。
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunStatus {
-    pub turn_status: TurnStatus,
-    pub session_status: SessionStatus,
-    pub final_answer: Option<String>,
-    pub model_turns: u32,
-    pub model_usage: ModelUsage,
-    pub usage_complete: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnFailure {
-    stage: TurnFailureStage,
-    cause: TurnFailureCause,
-    /// 携带到 RPC 边界的原始失败文本；无原文时为 `None`。
-    original: Option<String>,
 }
 
 /// 将 provider 层聚合 usage 投影为协议线格式。
@@ -234,23 +243,12 @@ pub fn usage_to_wire_with_completeness(
     }
 }
 
-impl From<TurnFailureStage> for TurnFailure {
-    fn from(stage: TurnFailureStage) -> Self {
-        Self {
-            stage,
-            cause: TurnFailureCause::Internal,
-            original: None,
-        }
-    }
-}
-
 /// AppServer 交给 stdout transport 的消息。
 pub type AppServerOutput = Value;
 
-use events::AssistantItemEventState;
+pub use dispatch::{TurnClaim, TurnStartClaim};
 use events::project_turn_history;
 pub use paths::thread_from_record;
-use paths::{canonical_thread_cwd, workspace_path};
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 
 #[cfg(test)]

@@ -179,18 +179,34 @@ impl TurnRunner {
         let thread = params.thread;
         // fail-fast 准备：workspace、provider/config、会话打开修复、Agent 构造
         // 全部就绪后才写任何 turn 状态；此前的失败不留 turn 痕迹。
-        workspace_path(&thread).map_err(TurnRunError::Preparation)?;
+        workspace_path(&thread).map_err(|message| TurnRunError::Preparation {
+            cause: TurnFailureCause::Workspace,
+            message,
+        })?;
         let (provider, config, instructions_truncated) = self
             .resolve_agent_runtime(&thread)
-            .map_err(TurnRunError::Preparation)?;
-        let mut session = self
-            .open_and_repair_session(&thread)
-            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
-        append_turn_started_metadata(&mut session, &turn_id)
-            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+            .map_err(|error| TurnRunError::Preparation {
+                cause: error.cause,
+                message: error.to_string(),
+            })?;
+        let mut session =
+            self.open_and_repair_session(&thread)
+                .map_err(|error| TurnRunError::Preparation {
+                    cause: TurnFailureCause::Store,
+                    message: error.to_string(),
+                })?;
+        append_turn_started_metadata(&mut session, &turn_id).map_err(|error| {
+            TurnRunError::Preparation {
+                cause: TurnFailureCause::Store,
+                message: error,
+            }
+        })?;
         let mut agent = self
             .prepare_agent(&turn_id, session, provider, config, controls)
-            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+            .map_err(|error| TurnRunError::Preparation {
+                cause: TurnFailureCause::Internal,
+                message: error,
+            })?;
 
         let turn = Turn {
             turn_id: turn_id.clone(),
@@ -328,20 +344,20 @@ impl TurnRunner {
     fn resolve_agent_runtime(
         &self,
         thread: &Thread,
-    ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool), String> {
+    ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool), PreparationFailure> {
         let provider: Arc<dyn Provider + Send + Sync> = match &self.provider_override {
             Some(provider) => Arc::clone(provider),
             None => Arc::new(
                 self.provider_snapshot
                     .provider_for_selector(thread.model.as_deref())
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| PreparationFailure::internal(error.to_string()))?,
             ),
         };
         let (config, instructions_truncated) =
             agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
         let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
         let config = AgentConfig::prepare_for_provider_limits(config, provider_max_output_tokens)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PreparationFailure::internal(error.to_string()))?;
         Ok((provider, config, instructions_truncated))
     }
 
@@ -973,12 +989,36 @@ fn provider_attempt_event(
     }
 }
 
+/// 准备阶段失败：分类 + 真实原因文本（对外前仍需敏感边界）。
+struct PreparationFailure {
+    cause: TurnFailureCause,
+    message: String,
+}
+
+impl PreparationFailure {
+    fn internal(message: String) -> Self {
+        Self {
+            cause: TurnFailureCause::Internal,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 fn agent_config_for_thread(
     thread: &Thread,
     provider: &dyn Provider,
     snapshot: &ProviderConfigSnapshot,
-) -> Result<(AgentConfig, bool), String> {
-    let cwd = workspace_path(thread)?;
+) -> Result<(AgentConfig, bool), PreparationFailure> {
+    let cwd = workspace_path(thread).map_err(|message| PreparationFailure {
+        cause: TurnFailureCause::Workspace,
+        message,
+    })?;
     let cwd_path = std::path::Path::new(&cwd).to_path_buf();
     // 工具名单从 ToolRegistry 动态生成：提示词只列出工具名，完整定义由模型
     // 通过服务端 schema 获取。
@@ -1014,7 +1054,12 @@ fn agent_config_for_thread(
                 (system_prompt, instructions.truncated())
             }
             Ok(None) => (base_prompt, false),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(PreparationFailure {
+                    cause: TurnFailureCause::ProjectInstructions,
+                    message: error.to_string(),
+                });
+            }
         };
     let context_window = provider
         .protocol_contract()

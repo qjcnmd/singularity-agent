@@ -3,11 +3,10 @@ use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
 use crate::state_paths::ensure_home_outside_repo;
 use serde_json::{Value, json};
-use singularity_agent::agent::AgentError;
 use singularity_agent::session::{SessionManager, SessionMetadataKind};
 use singularity_app_server::{
-    AppServer, AppServerCancellationHandle, AppServerError, SessionIndex, SessionIndexError,
-    SessionRecord, TurnFailureCause, TurnFailureStage,
+    AppServer, AppServerCancellationHandle, AppServerError, ProviderFailureKind, SessionIndex,
+    SessionIndexError, SessionRecord, TurnFailureCause, TurnFailureStage,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -15,7 +14,6 @@ use singularity_model::{
     ProviderProtocolContract,
 };
 use singularity_protocol::{JsonRpcId, JsonRpcMessage};
-use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
@@ -383,7 +381,11 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
             )),
         ),
         ("provider unavailable", {
-            AppServerError::Agent(AgentError::Loop("provider unavailable".to_string()))
+            AppServerError::TurnExecution {
+                stage: TurnFailureStage::AgentLoop,
+                cause: TurnFailureCause::Provider(ProviderFailureKind::Unknown),
+                original: Some("provider unavailable".to_string()),
+            }
         }),
         ("workspace error: write denied", {
             AppServerError::Workspace("write denied".to_string())
@@ -491,7 +493,12 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     .expect("turn/start");
     let cancellation = server.cancellation_handle();
     let (outputs, mut receiver) = mpsc::channel(16);
-    run_turn_request(server, message, outputs, cancellation).expect("turn worker");
+    let claim = match server.claim_turn(message) {
+        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => claim,
+        Ok(other) => panic!("claim must accept the turn: {other:?}"),
+        Err(error) => panic!("claim failed: {error}"),
+    };
+    run_turn_request(server, outputs, cancellation, claim).expect("turn worker");
     let mut values = Vec::new();
     while let Some(value) = receiver.blocking_recv() {
         values.push(value);
