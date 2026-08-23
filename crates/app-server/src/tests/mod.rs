@@ -506,7 +506,6 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .expect("assistant");
     session
@@ -519,7 +518,6 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
             tool_call_id: Some("call-1".to_string()),
             tool_name: Some("write".to_string()),
             is_error: Some(true),
-            timestamp: None,
         })
         .expect("tool result");
     store
@@ -1559,7 +1557,6 @@ fn turn_failure_emits_typed_error_event_with_provider_cause() {
         "typed provider cause: {error_event:?}"
     );
     assert_eq!(error_event["params"]["error"]["stage"], "agent_loop");
-    assert_eq!(error_event["params"]["error"]["willRetry"], false);
     assert!(
         error_event["params"]["error"]["message"]
             .as_str()
@@ -2072,7 +2069,6 @@ fn seed_turned_session(
                     tool_call_id: Some(format!("call-{index}")),
                     tool_name: Some("bash".to_string()),
                     is_error: None,
-                    timestamp: None,
                 })
                 .expect("tool result");
         }

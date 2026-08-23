@@ -61,9 +61,6 @@ pub struct AgentMessage {
     /// 工具执行是否失败标志。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-    /// Unix 毫秒时间戳。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<u64>,
 }
 
 impl AgentMessage {
@@ -78,7 +75,6 @@ impl AgentMessage {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         }
     }
 
@@ -135,7 +131,6 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -173,7 +168,6 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -205,6 +199,5 @@ pub(crate) fn tool_result_message(
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
-        timestamp: None,
     }
 }

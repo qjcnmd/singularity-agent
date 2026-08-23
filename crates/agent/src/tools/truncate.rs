@@ -24,8 +24,6 @@ pub struct Truncation {
     pub output_lines: usize,
     /// 尾部截断场景：末尾单行本身超限时是否只保留了该行的尾部。
     pub last_line_partial: bool,
-    /// 头部截断场景：首行单独超过字节上限标志。
-    pub first_line_exceeds_limit: bool,
 }
 
 /// 将字节数格式化为人类可读的容量大小字符串（如 `45.2KB`、`1.5MB`）。
@@ -67,7 +65,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
             total_lines,
             output_lines: total_lines,
             last_line_partial: false,
-            first_line_exceeds_limit: false,
         };
     }
     let mut output: Vec<&str> = Vec::new();
@@ -88,7 +85,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
                     total_lines,
                     output_lines: 1,
                     last_line_partial: true,
-                    first_line_exceeds_limit: false,
                 };
             }
             break;
@@ -110,7 +106,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
         total_lines,
         output_lines: output.len(),
         last_line_partial: false,
-        first_line_exceeds_limit: false,
     }
 }
 

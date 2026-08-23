@@ -56,6 +56,20 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
     Ok(())
 }
 
+fn print_json_notification(notification: &singularity_protocol::JsonRpcNotification) {
+    println!(
+        "{}",
+        serde_json::to_string(notification).expect("notification serializes to JSON")
+    );
+}
+
+fn print_json_summary(thread: serde_json::Value, turn: serde_json::Value) {
+    println!(
+        "{}",
+        json!({ "summary": { "thread": thread, "turn": turn } })
+    );
+}
+
 // 按命令编排 app-server 请求和面向用户的输出。
 pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
     match cli.command {
@@ -76,24 +90,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             // JSON 模式：事件逐行 JSONL 输出（notification 原样），终态汇总行收尾。
             let mut on_notification = |notification: &singularity_protocol::JsonRpcNotification| {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(notification)
-                            .expect("notification serializes to JSON")
-                    );
+                    print_json_notification(notification);
                 }
             };
-            let (thread, _thread_events) = match client.thread_start(
-                model,
-                !json,
-                &mut on_notification,
-            ) {
-                Ok(result) => result,
+            let thread = match client.thread_start(model, !json, &mut on_notification) {
+                Ok(thread) => thread,
                 Err(error) => {
                     if json {
-                        println!(
-                            "{}",
-                            json!({"summary": {"thread": null, "turn": {"threadId": null, "turnId": null, "status": "failed"}}})
+                        print_json_summary(
+                            json!(null),
+                            json!({"threadId": null, "turnId": null, "status": "failed"}),
                         );
                     }
                     return Err(error);
@@ -102,25 +108,25 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             if !json {
                 println!("thread {}", thread.thread_id);
             }
-            let (turn, _turn_events) = match client.turn_start(
+            let turn = match client.turn_start(
                 &thread.thread_id,
                 &goal,
                 !json,
                 &mut on_notification,
             ) {
-                Ok(result) => result,
+                Ok(turn) => turn,
                 Err(error) => {
                     if json {
-                        println!(
-                            "{}",
-                            json!({"summary": {"thread": thread, "turn": {"threadId": thread.thread_id, "turnId": null, "status": "failed"}}})
+                        print_json_summary(
+                            json!(thread),
+                            json!({"threadId": thread.thread_id, "turnId": null, "status": "failed"}),
                         );
                     }
                     return Err(error);
                 }
             };
             if json {
-                println!("{}", json!({"summary": {"thread": thread, "turn": turn}}));
+                print_json_summary(json!(thread), json!(turn));
             }
             fail_for_failed_turn(&turn)?;
             Ok(())
@@ -140,35 +146,24 @@ pub(super) fn run_cli(cli: Cli) -> Result<(), String> {
             }
             let mut on_notification = |notification: &singularity_protocol::JsonRpcNotification| {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(notification)
-                            .expect("notification serializes to JSON")
-                    );
+                    print_json_notification(notification);
                 }
             };
-            let (turn, _events) = match client.turn_start(
-                &thread_id,
-                &instruction,
-                !json,
-                &mut on_notification,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    if json {
-                        println!(
-                            "{}",
-                            json!({"summary": {"thread": {"threadId": thread_id}, "turn": {"threadId": thread_id, "turnId": null, "status": "failed"}}})
-                        );
+            let turn =
+                match client.turn_start(&thread_id, &instruction, !json, &mut on_notification) {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        if json {
+                            print_json_summary(
+                                json!({"threadId": thread_id}),
+                                json!({"threadId": thread_id, "turnId": null, "status": "failed"}),
+                            );
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
             if json {
-                println!(
-                    "{}",
-                    json!({"summary": {"thread": {"threadId": thread_id}, "turn": turn}})
-                );
+                print_json_summary(json!({"threadId": thread_id}), json!(turn));
             }
             fail_for_failed_turn(&turn)?;
             Ok(())

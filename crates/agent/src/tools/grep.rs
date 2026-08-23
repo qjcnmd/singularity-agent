@@ -99,8 +99,6 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         if looks_binary(&mut file) {
             return;
         }
-        drop(file);
-        let file = File::open(root.join(&relative)).expect("reopened file");
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut line_bytes = Vec::new();
         let mut line_number = 0u64;

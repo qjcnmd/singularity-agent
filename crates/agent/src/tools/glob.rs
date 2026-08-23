@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 use super::walk::{display_path, to_cwd_relative, walk_files};
 
-pub(crate) const DESCRIPTION: &str = "Find files and directories? No: find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
+pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
 
 const MAX_MATCHES: usize = 200;
 
@@ -94,22 +94,24 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         Err(message) => return error_result(message),
     };
     let mut matches = Vec::new();
-    let mut scanned = 0usize;
+    let mut total_matches = 0usize;
     let _ = walk_files(&root, &mut |relative| {
-        scanned += 1;
-        if matches.len() < MAX_MATCHES && regex.is_match(&display_path(&relative)) {
-            matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
+        if regex.is_match(&display_path(&relative)) {
+            total_matches += 1;
+            if matches.len() < MAX_MATCHES {
+                matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
+            }
         }
     });
     matches.sort();
     let mut content = matches.join("\n");
-    let truncated = scanned > MAX_MATCHES;
+    let truncated = total_matches > MAX_MATCHES;
     if truncated {
         content.push_str("\n[glob] results truncated: showing first ");
         content.push_str(&MAX_MATCHES.to_string());
         content.push_str(" of ");
-        content.push_str(&scanned.to_string());
-        content.push_str(" scanned files; narrow the pattern to see the rest.");
+        content.push_str(&total_matches.to_string());
+        content.push_str(" matching files; narrow the pattern to see the rest.");
     }
     if content.is_empty() {
         content = format!("no files matched {pattern:?} under {path}");
@@ -194,6 +196,37 @@ mod tests {
             result
                 .content
                 .contains("missing required parameter \"pattern\"")
+        );
+    }
+
+    #[test]
+    fn glob_does_not_truncate_when_scanned_files_exceed_limit_but_matches_do_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..250 {
+            fs::write(dir.path().join(format!("file_{i}.txt")), "txt").expect("write txt");
+        }
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("file_{i}.rs")), "rs").expect("write rs");
+        }
+        let result = execute(context(json!({ "pattern": "*.rs" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        assert!(!result.content.contains("truncated"));
+        let lines: Vec<&str> = result.content.lines().collect();
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn glob_truncates_when_matches_exceed_limit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..205 {
+            fs::write(dir.path().join(format!("item_{i:03}.rs")), "rs").expect("write rs");
+        }
+        let result = execute(context(json!({ "pattern": "*.rs" }), dir.path())).expect("execute");
+        assert!(!result.is_error);
+        assert!(
+            result
+                .content
+                .contains("[glob] results truncated: showing first 200 of 205 matching files")
         );
     }
 }

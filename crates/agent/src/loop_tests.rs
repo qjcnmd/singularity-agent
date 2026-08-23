@@ -2319,7 +2319,6 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     session
@@ -2332,7 +2331,6 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let provider = Arc::new(OverflowProvider {
@@ -2390,7 +2388,6 @@ fn second_context_overflow_fails_without_retrying_again() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     session
@@ -2403,7 +2400,6 @@ fn second_context_overflow_fails_without_retrying_again() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let provider = Arc::new(OverflowProvider {
@@ -2452,7 +2448,6 @@ fn failed_force_compaction_returns_original_overflow_error() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let provider = Arc::new(OverflowProvider {
@@ -2576,7 +2571,6 @@ fn assembled_estimate_budgets_historical_tool_call_raw_arguments() {
             tool_name: Some("write".to_string()),
             provider_reasoning_replay: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     session
@@ -2589,7 +2583,6 @@ fn assembled_estimate_budgets_historical_tool_call_raw_arguments() {
             tool_call_id: Some("call_big_1".to_string()),
             tool_name: Some("write".to_string()),
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let provider = Arc::new(FakeProvider::new(fake_contract(), vec![]));
@@ -2653,7 +2646,6 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let agent = Agent::new(
@@ -2689,7 +2681,6 @@ fn responses_replay_is_recovered_from_durable_assistant_entry() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let incompatible = Agent::new(
@@ -2765,7 +2756,6 @@ fn chat_replay_without_variant_selector_reaches_next_request() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let mut agent = Agent::new(
@@ -2808,7 +2798,6 @@ fn chat_replay_without_variant_selector_reaches_next_request() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let mismatch = Agent::new(
@@ -2853,7 +2842,6 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
             tool_name: Some("write".to_string()),
             provider_reasoning_replay: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     drop(session);

@@ -78,7 +78,7 @@ fn model_turn_schema_excludes_runtime_and_trace_metadata() {
     let value = serde_json::to_value(&request).expect("serialize model request");
 
     assert_eq!(value["tools"], serde_json::json!([]));
-    assert_eq!(value["tool_choice"]["mode"], "auto");
+    assert_eq!(value["tool_choice"]["max_tool_calls"], 1);
     for excluded_field in [
         "run_id",
         "session_id",
@@ -1559,9 +1559,9 @@ fn add_configured_provider_persists_config_auth_and_becomes_default() {
     .expect("config json");
     assert_eq!(config["default_provider"], "opencode-go");
     assert_eq!(config["default_model"], "opencode-go/deepseek-v4-flash");
-    // 内置表 enrichment：deepseek-v4-flash 走 responses 协议与内置限额。
+    // 内置表 enrichment：deepseek-v4-flash 命中内置限额。
     let deepseek = &config["providers"]["opencode-go"]["models"]["deepseek-v4-flash"];
-    assert_eq!(deepseek["api_protocol"], "responses");
+    assert_eq!(deepseek["api_protocol"], "chat");
     assert_eq!(deepseek["max_context_tokens"], 1_000_000);
     assert_eq!(deepseek["max_output_tokens"], 384_000);
     // 未知模型回落保守默认。

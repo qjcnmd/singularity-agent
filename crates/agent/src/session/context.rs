@@ -13,31 +13,23 @@ use super::manager::SessionManager;
 impl SessionManager {
     /// 构建活跃的、compaction 感知的条目列表。
     pub fn build_context_entries(&self) -> Result<Vec<SessionEntry>> {
-        let path = self.session_path();
         let mut compaction_index = None;
-        for (index, &entry_index) in path.iter().enumerate() {
-            if matches!(
-                self.entries[entry_index].entry_type,
-                SessionEntryType::Compaction(_)
-            ) {
+        for (index, entry) in self.entries.iter().enumerate() {
+            if matches!(entry.entry_type, SessionEntryType::Compaction(_)) {
                 compaction_index = Some(index);
             }
         }
         let Some(compaction_index) = compaction_index else {
-            return Ok(path
-                .iter()
-                .map(|&index| self.entries[index].clone())
-                .collect());
+            return Ok(self.entries.clone());
         };
-        let compaction = &self.entries[path[compaction_index]];
+        let compaction = &self.entries[compaction_index];
         let first_kept = match &compaction.entry_type {
             SessionEntryType::Compaction(entry) => entry.first_kept_entry_id.clone(),
             _ => None,
         };
         let mut context = vec![compaction.clone()];
         let mut found_first_kept = false;
-        for &entry_index in &path[..compaction_index] {
-            let entry = &self.entries[entry_index];
+        for entry in &self.entries[..compaction_index] {
             if Some(entry.id.as_str()) == first_kept.as_deref() {
                 found_first_kept = true;
             }
@@ -45,11 +37,7 @@ impl SessionManager {
                 context.push(entry.clone());
             }
         }
-        context.extend(
-            path[compaction_index + 1..]
-                .iter()
-                .map(|&entry_index| self.entries[entry_index].clone()),
-        );
+        context.extend_from_slice(&self.entries[compaction_index + 1..]);
         Ok(context)
     }
 
@@ -60,12 +48,6 @@ impl SessionManager {
             .iter()
             .flat_map(entry_to_llm_messages)
             .collect())
-    }
-
-    pub(super) fn session_path(&self) -> Vec<usize> {
-        // 会话是严格的线性序列：事实源 `entries` 的物理顺序就是路径顺序，
-        // 不存在回溯/分叉，直接从 0 到末尾。
-        (0..self.entries.len()).collect()
     }
 }
 

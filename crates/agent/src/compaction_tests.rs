@@ -14,7 +14,6 @@ fn user(text: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -28,7 +27,6 @@ fn assistant(text: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -42,7 +40,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -58,7 +55,6 @@ fn file_call(tool_name: &str, path: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: None,
     }
 }
 
@@ -316,7 +312,6 @@ fn serialize_conversation_roles_and_truncation() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         },
         AgentMessage {
             role: AgentMessageRole::User,
@@ -327,7 +322,6 @@ fn serialize_conversation_roles_and_truncation() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         },
         user(""),
     ];

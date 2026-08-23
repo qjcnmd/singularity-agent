@@ -12,6 +12,7 @@ pub mod format;
 pub mod repair;
 pub mod repository;
 
+pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionEntryType, SessionError,
     SessionMetadata, SessionMetadataKind,

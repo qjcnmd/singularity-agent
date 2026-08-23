@@ -11,12 +11,11 @@ pub use super::manager::SessionManager;
 impl SessionManager {
     /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。
     pub fn repair_interrupted_turns(&mut self) -> Result<usize> {
-        let path = self.session_path();
         // BTreeSet 保证 turn_interrupted 追加顺序确定（同输入同输出）。
         let mut started = BTreeSet::new();
         let mut terminal = HashSet::new();
-        for &entry_index in &path {
-            let SessionEntryType::Metadata(metadata) = &self.entries[entry_index].entry_type else {
+        for entry in &self.entries {
+            let SessionEntryType::Metadata(metadata) = &entry.entry_type else {
                 continue;
             };
             let Some(turn_id) = metadata.turn_id() else {
@@ -51,9 +50,9 @@ impl SessionManager {
 
     /// 返回当前 leaf 路径上的 metadata。
     pub fn metadata_entries(&self) -> Vec<SessionMetadata> {
-        self.session_path()
-            .into_iter()
-            .filter_map(|index| match &self.entries[index].entry_type {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.entry_type {
                 SessionEntryType::Metadata(metadata) => Some(metadata.clone()),
                 _ => None,
             })
@@ -66,11 +65,10 @@ impl SessionManager {
     /// 全部已配对的 tool_result id，再按 assistant source order 补 synthetic
     /// failed 结果（tool_call_id 在会话内全局唯一，全局配对与后缀配对等价）。
     pub fn repair_orphaned_tool_calls(&mut self) -> Result<usize> {
-        let path = self.session_path();
         let mut paired_tool_results: HashSet<String> = HashSet::new();
-        let mut assistant_tool_calls: Vec<(usize, Vec<String>)> = Vec::new();
-        for (position, &entry_index) in path.iter().enumerate() {
-            match &self.entries[entry_index].entry_type {
+        let mut assistant_tool_calls: Vec<Vec<String>> = Vec::new();
+        for entry in &self.entries {
+            match &entry.entry_type {
                 SessionEntryType::Message(message)
                     if message.role == AgentMessageRole::Assistant =>
                 {
@@ -83,7 +81,7 @@ impl SessionManager {
                         })
                         .collect();
                     if !tool_call_ids.is_empty() {
-                        assistant_tool_calls.push((position, tool_call_ids));
+                        assistant_tool_calls.push(tool_call_ids);
                     }
                 }
                 SessionEntryType::Message(message)
@@ -97,7 +95,7 @@ impl SessionManager {
             }
         }
         let mut repaired = 0usize;
-        for (_position, tool_call_ids) in assistant_tool_calls {
+        for tool_call_ids in assistant_tool_calls {
             for tool_call_id in tool_call_ids {
                 if paired_tool_results.contains(&tool_call_id) {
                     continue;
@@ -111,7 +109,6 @@ impl SessionManager {
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     is_error: Some(true),
-                    timestamp: None,
                 }))?;
                 repaired += 1;
             }

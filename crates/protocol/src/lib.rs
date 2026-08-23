@@ -987,8 +987,6 @@ pub struct TurnErrorDetail {
     pub stage: String,
     pub cause: String,
     pub message: String,
-    #[serde(default)]
-    pub will_retry: bool,
 }
 
 /// 非致命 Agent 诊断事件；不进入 Session JSONL。
@@ -1066,7 +1064,6 @@ impl AppEvent {
         stage: &str,
         cause: &str,
         message: &str,
-        will_retry: bool,
     ) -> Self {
         Self {
             method: "turn/error".to_string(),
@@ -1077,7 +1074,6 @@ impl AppEvent {
                     "stage": stage,
                     "cause": cause,
                     "message": message,
-                    "willRetry": will_retry,
                 },
             }),
         }

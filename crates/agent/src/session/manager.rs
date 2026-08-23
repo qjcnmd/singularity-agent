@@ -286,12 +286,13 @@ impl SessionManager {
             .create(true)
             .append(true)
             .open(&self.file)?;
-        handle.write_all(serialized.as_bytes())?;
+        let bytes_to_write = serialized.as_bytes();
+        let total_written = (bytes_to_write.len() + 1) as u64;
+        handle.write_all(bytes_to_write)?;
         handle.write_all(b"\n")?;
         handle.flush()?;
-        let file_state = SessionFileState::capture(&self.file)?;
+        self.file_state.len += total_written;
         self.entries.push(entry);
-        self.file_state = file_state;
         Ok(id)
     }
 

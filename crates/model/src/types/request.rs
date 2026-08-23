@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelPreferences {
     pub model_name: Option<String>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
 }
 

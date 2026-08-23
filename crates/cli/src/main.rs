@@ -362,8 +362,7 @@ mod tests {
                 "error": {
                     "stage": "agent_loop",
                     "cause": "provider",
-                    "message": "provider failed",
-                    "willRetry": false
+                    "message": "provider failed"
                 }
             }
         }))
@@ -374,7 +373,6 @@ mod tests {
         assert_eq!(projected["params"]["turn_id"], "turn-1");
         assert_eq!(projected["params"]["error"]["stage"], "agent_loop");
         assert_eq!(projected["params"]["error"]["message"], "provider failed");
-        assert_eq!(projected["params"]["error"]["willRetry"], false);
     }
 
     #[test]

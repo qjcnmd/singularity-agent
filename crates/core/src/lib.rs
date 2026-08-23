@@ -173,14 +173,6 @@ impl ErrorCode {
         Self::new(JSON_RPC_INVALID_PARAMS, message)
     }
 
-    /// 构造方法不存在错误。
-    pub fn method_not_found(method: impl AsRef<str>) -> Self {
-        Self::new(
-            JSON_RPC_METHOD_NOT_FOUND,
-            format!("Method not found: {}", method.as_ref()),
-        )
-    }
-
     /// 构造资源不存在错误。
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(APP_ERROR_NOT_FOUND, message)

@@ -1,12 +1,5 @@
-//! Bounded file I/O, identity checks, and JSONL tail parsing.
-
-use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -37,12 +30,8 @@ pub(super) const DEFAULT_APPEND_LIMITS: AppendLimits = AppendLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionFileState {
-    /// Byte offset after the last validated complete line. Full opens repair
-    /// torn tails before recording this position.
+    /// Byte offset after the last validated complete line.
     pub(super) len: u64,
-    pub(super) identity: (u64, u64),
-    pub(super) modified: Option<SystemTime>,
-    pub(super) header: Vec<u8>,
 }
 
 impl SessionFileState {
@@ -50,9 +39,6 @@ impl SessionFileState {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self {
             len: metadata.len(),
-            identity: file_identity(&metadata),
-            modified: metadata.modified().ok(),
-            header: read_header_identity(path)?,
         })
     }
 }
@@ -269,47 +255,6 @@ fn read_bounded_session_line<R: BufRead>(
     }
 }
 
-fn read_header_identity(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let line = read_bounded_session_line(&mut reader, MAX_SESSION_LINE_BYTES)?
-        .ok_or_else(|| SessionError::InvalidSession("session header is missing".to_string()))?;
-    if line.too_long {
-        return Err(SessionError::InvalidSession(format!(
-            "session header exceeds {MAX_SESSION_LINE_BYTES} bytes"
-        )));
-    }
-    let mut identity = line.bytes;
-    identity.push(u8::from(line.has_newline));
-    Ok(identity)
-}
-
-fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        (metadata.dev(), metadata.ino())
-    }
-    #[cfg(windows)]
-    {
-        // Stable std metadata APIs do not expose Windows file indexes on the
-        // pinned toolchain; creation time plus length still detects normal
-        // replacement while `modified` and header bytes cover same-size edits.
-        (
-            metadata
-                .created()
-                .ok()
-                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or_default(),
-            metadata.len(),
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        (0, 0)
-    }
-}
-
 pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
     let serialized: Vec<String> = entries
         .iter()
@@ -394,7 +339,7 @@ pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {
     Uuid::new_v4().to_string()
 }
 
-pub(super) fn now_iso() -> String {
+pub fn now_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"

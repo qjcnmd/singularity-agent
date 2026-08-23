@@ -141,11 +141,7 @@ pub fn add_configured_provider(
         models.insert(
             model_id.clone(),
             UserConfigModel {
-                api_protocol: Some(
-                    builtin
-                        .map(|entry| entry.api_protocol.to_string())
-                        .unwrap_or_else(|| "chat".to_string()),
-                ),
+                api_protocol: Some("chat".to_string()),
                 max_context_tokens: Some(max_context_tokens),
                 max_output_tokens: Some(max_output_tokens),
                 ..UserConfigModel::default()

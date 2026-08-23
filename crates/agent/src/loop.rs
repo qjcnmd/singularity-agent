@@ -18,7 +18,7 @@ use singularity_model::{
     ModelRole, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
     PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
     ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
+    ProviderToolReasoningMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
     split_model_selector,
 };
 use thiserror::Error;
@@ -516,7 +516,6 @@ impl Agent {
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
         let tools = self.tool_schemas(&capabilities);
         let tool_choice = ToolChoicePolicy {
-            mode: ToolChoiceMode::Auto,
             // 单条 assistant 消息允许的工具调用数上限；本地按模型给定顺序
             // 串行执行全部调用，wire 侧 parallel_tool_calls 恒为 false。
             max_tool_calls: DEFAULT_MAX_TOOLS_PER_REQUEST,
@@ -878,7 +877,6 @@ impl Agent {
         request.model_preferences = ModelPreferences {
             model_name: preferences.model_name.clone(),
             max_output_tokens: Some(max_output_tokens),
-            ..ModelPreferences::default()
         };
         Ok((request, assembled_estimate, entries.len()))
     }

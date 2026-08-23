@@ -247,7 +247,7 @@ pub(super) fn render_and_wait_terminal(
     render: bool,
     ctrl_c: Option<CtrlCMonitor>,
     on_notification: &mut dyn FnMut(&JsonRpcNotification),
-) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
+) -> Result<Turn, String> {
     let thread_id = initial_turn.thread_id.clone();
     let turn_id = initial_turn.turn_id.clone();
 
@@ -266,7 +266,7 @@ pub(super) fn render_and_wait_terminal(
             );
             render_turn(&initial_turn);
         }
-        return Ok((initial_turn, notifications));
+        return Ok(initial_turn);
     }
 
     let mut interrupt_sent = false;
@@ -322,7 +322,7 @@ pub(super) fn render_and_wait_terminal(
                                 }
                                 render_turn(&params.turn);
                             }
-                            return Ok((params.turn, notifications));
+                            return Ok(params.turn);
                         }
                         notifications.push(notification);
                     }
@@ -342,7 +342,7 @@ pub(super) fn render_and_wait_terminal(
                             if render {
                                 render_turn(&terminal_turn);
                             }
-                            return Ok((terminal_turn, notifications));
+                            return Ok(terminal_turn);
                         }
                         notifications.push(notification);
                     }
@@ -370,7 +370,6 @@ pub(super) fn render_and_wait_terminal(
                             "stage": "terminal_outcome",
                             "cause": "internal",
                             "message": diagnostic,
-                            "willRetry": false,
                         },
                     }),
                 )
@@ -388,7 +387,7 @@ pub(super) fn render_and_wait_terminal(
                 if render {
                     render_turn(&terminal_turn);
                 }
-                return Ok((terminal_turn, notifications));
+                return Ok(terminal_turn);
             }
             JsonRpcMessage::Error(_) => {}
             JsonRpcMessage::Success(_) | JsonRpcMessage::Request(_) => {}
@@ -439,7 +438,7 @@ impl AppServerClient {
         model: Option<String>,
         render: bool,
         on_notification: &mut dyn FnMut(&JsonRpcNotification),
-    ) -> Result<(Thread, Vec<JsonRpcNotification>), String> {
+    ) -> Result<Thread, String> {
         let reply = self.request::<rpc_methods::ThreadStart>(&ThreadStartParams {
             model,
             cwd: Some(canonical_current_dir()?),
@@ -450,7 +449,7 @@ impl AppServerClient {
         if render {
             render_messages(&reply.notifications, false);
         }
-        Ok((reply.result.thread, reply.notifications))
+        Ok(reply.result.thread)
     }
 
     pub(super) fn thread_settings(
@@ -483,7 +482,7 @@ impl AppServerClient {
         text: &str,
         render: bool,
         on_notification: &mut dyn FnMut(&JsonRpcNotification),
-    ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
+    ) -> Result<Turn, String> {
         let params = TurnStartParams {
             thread_id: thread_id.to_string(),
             input: vec![InputItem::Text {
@@ -939,14 +938,17 @@ mod tests {
             .send(Ok(completed_notification.to_string()))
             .expect("terminal event");
 
-        let (terminal_turn, notifications) = render_and_wait_terminal(
+        let mut notifications = Vec::new();
+        let terminal_turn = render_and_wait_terminal(
             &mut client,
             running_turn(),
             Vec::new(),
             &JsonRpcId::Number(1),
             false,
             Some(CtrlCMonitor::scripted([0, 1])),
-            &mut |_notification| {},
+            &mut |notification| {
+                notifications.push(notification.clone());
+            },
         )
         .expect("terminal turn");
 

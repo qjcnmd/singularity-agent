@@ -10,10 +10,9 @@ pub(crate) use singularity_model::{
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
     ProviderConfigSource, ProviderConfigurationStatus, ProviderError, ProviderErrorStage,
     ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderStreamingCapability, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, responses_endpoint, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
-    validate_model_turn_response, validate_provider_config,
+    ProviderStreamingCapability, ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    validate_model_response, validate_model_turn_response, validate_provider_config,
 };
 pub(crate) use std::io::{BufRead, BufReader, Read, Write};
 pub(crate) use std::net::{TcpListener, TcpStream};

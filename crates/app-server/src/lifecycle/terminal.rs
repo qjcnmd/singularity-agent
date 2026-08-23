@@ -236,7 +236,6 @@ impl AppServer {
             failure.stage.as_str(),
             failure.cause.as_str(),
             &message,
-            false,
         )) {
             Ok(event) => emit(event),
             Err(error) if first_failure.is_none() => {

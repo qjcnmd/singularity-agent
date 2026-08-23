@@ -47,10 +47,10 @@ impl SessionRepository {
 
 impl SessionManager {
     pub fn summary(&self) -> Option<String> {
-        let path = self.session_path();
-        path.iter()
+        self.entries
+            .iter()
             .rev()
-            .find_map(|&index| match &self.entries[index].entry_type {
+            .find_map(|entry| match &entry.entry_type {
                 SessionEntryType::Compaction(entry) => Some(entry.summary.clone()),
                 _ => None,
             })

@@ -87,18 +87,6 @@ pub struct ModelError {
     pub validation_errors: Vec<String>,
 }
 
-/// 模型错误中可以安全跨越模型提供方边界的诊断子集。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderDiagnostic {
-    pub code: Option<String>,
-    pub stage: Option<ProviderErrorStage>,
-    pub transport_category: Option<ProviderTransportCategory>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-    pub http_status: Option<u16>,
-    pub validation_errors: Vec<String>,
-}
-
 impl ModelError {
     /// 创建带稳定 kind 的模型错误。
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
@@ -142,18 +130,6 @@ impl ModelError {
     /// 归类为公共模型错误类别。
     pub fn category(&self) -> ModelErrorCategory {
         classify_model_error(self)
-    }
-
-    /// 返回 provider 诊断的脱敏副本。
-    pub fn provider_diagnostic(&self) -> ProviderDiagnostic {
-        ProviderDiagnostic {
-            code: self.code.clone(),
-            stage: self.stage.clone(),
-            transport_category: self.transport_category.clone(),
-            timeout_seconds: self.timeout_seconds,
-            http_status: self.http_status,
-            validation_errors: self.validation_errors.clone(),
-        }
     }
 }
 

@@ -56,11 +56,7 @@ pub enum SessionIndexError {
 
 pub type SessionIndexResult<T> = Result<T, SessionIndexError>;
 
-pub fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
-}
+pub use singularity_agent::session::now_iso;
 
 /// 进程内会话索引：由唯一 AppServer owner 串行维护，turn worker 的终态更新
 /// 通过内部锁与读取互斥。

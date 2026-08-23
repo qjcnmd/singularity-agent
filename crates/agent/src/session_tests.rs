@@ -11,7 +11,6 @@ fn user(text: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: Some(1_700_000_000_000),
     }
 }
 
@@ -25,7 +24,6 @@ fn assistant(text: &str) -> AgentMessage {
         tool_call_id: None,
         tool_name: None,
         is_error: None,
-        timestamp: Some(1_700_000_000_001),
     }
 }
 
@@ -39,7 +37,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
-        timestamp: Some(1_700_000_000_002),
     }
 }
 
@@ -240,7 +237,6 @@ fn build_session_context_replays_assistant_tool_calls() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     manager
@@ -361,7 +357,6 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let file = manager.path().to_path_buf();
@@ -467,7 +462,6 @@ fn responses_private_replay_round_trips_exactly_through_jsonl() {
             tool_call_id: None,
             tool_name: None,
             is_error: None,
-            timestamp: None,
         })
         .unwrap();
     let path = manager.path().to_path_buf();

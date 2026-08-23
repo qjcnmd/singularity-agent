@@ -50,12 +50,6 @@ pub fn openai_request_payload(
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
     }
-    if let Some(temperature) = request.model_preferences.temperature {
-        payload["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = request.model_preferences.top_p {
-        payload["top_p"] = json!(top_p);
-    }
     if reasoning_enabled {
         match thinking_wire_format {
             ThinkingWireFormat::ThinkingType => {
