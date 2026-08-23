@@ -515,7 +515,7 @@ impl OpenAiProvider {
             ));
         }
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
-        // selected_model 或 endpoint 后缀决定（删 probe 后不再探测协议）。
+        // selected_model 或 endpoint 后缀决定。
         let capabilities = self.protocol_contract();
         let api_protocol = self
             .selected_model

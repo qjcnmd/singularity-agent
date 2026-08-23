@@ -502,7 +502,7 @@ impl Agent {
             terminal_reason: AgentTerminalReason::Completed,
             provider_attempt_metadata: None,
         };
-        // 显式上下文溢出每轮只允许一次强制压缩重试（N3：循环层不再做整轮瞬时重试）。
+        // 显式上下文溢出每轮只允许一次强制压缩重试。
         let mut context_overflow_retried = false;
         self.session.append_message(user_message(input))?;
 

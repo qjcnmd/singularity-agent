@@ -796,7 +796,7 @@ fn default_usage_complete_protocol() -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// turn 的生命周期状态；暂停/挂起状态机已删除。
+/// turn 的生命周期状态：运行中（running）、已完成（completed）、已失败（failed）或已中断（interrupted）。
 pub enum TurnStatus {
     Running,
     Completed,
