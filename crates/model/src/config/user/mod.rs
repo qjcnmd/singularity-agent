@@ -1,31 +1,14 @@
-//! User-level configuration, authentication and catalog seam.
+//! User-level configuration and authentication seam.
 //!
-//! User config and auth remain one lifecycle: read, validate, and atomically
-//! publish through the parent module's single source of truth.
+//! User config and auth remain one lifecycle: read, validate, and expose to
+//! the parent module's single source of truth.
 
-pub(crate) mod add;
 pub(crate) mod auth;
-pub(crate) mod catalog;
-pub(crate) mod import;
-pub(crate) mod metadata;
 
-pub use add::{
-    AddProviderResult, add_configured_provider, discover_provider_model_ids, refresh_model_metadata,
-};
 pub(crate) use auth::*;
-#[cfg(test)]
-pub(crate) use catalog::load_models_cache;
-pub use catalog::{
-    ModelCacheStatus, ModelDiscoveryStatus, UserModelCatalog, UserModelCatalogEntry,
-    UserProviderModelCatalog, read_user_model_catalog,
-};
-#[cfg(test)]
-pub(crate) use import::parse_import_model_selector;
-pub use import::{UserConfigImportResult, import_env_to_user_config};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,12 +17,6 @@ use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::config::{ProviderConfigLayer, parse_model_selector};
 use crate::error::ProviderError;
 use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
-
-pub(crate) fn unix_timestamp_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -99,7 +76,6 @@ pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
 
 #[derive(Clone)]
 pub(crate) struct UserConfigData {
-    pub(crate) directory: PathBuf,
     pub(crate) config: UserConfigFile,
     pub(crate) auth: UserAuthFile,
 }
@@ -328,7 +304,7 @@ pub(crate) fn read_user_config_data_from_directory(
                 BoundedTextError::TooLarge => {
                     user_config_error("user provider config exceeds the size limit")
                 }
-                BoundedTextError::Read(_) => {
+                BoundedTextError::Read => {
                     user_config_error("user provider config could not be read")
                 }
             })?;
@@ -347,11 +323,7 @@ pub(crate) fn read_user_config_data_from_directory(
         } else {
             UserAuthFile::default()
         };
-    Ok(Some(UserConfigData {
-        directory,
-        config,
-        auth,
-    }))
+    Ok(Some(UserConfigData { config, auth }))
 }
 
 pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool, ProviderError> {

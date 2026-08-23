@@ -202,3 +202,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 ## 记录规则
 
 后续每次用户裁决追加新的 \`D-xxx\` 条目，并注明：问题、参考实现、当前代码事实、选择、影响和验收方式。若新证据推翻旧裁决，不删除旧条目，而是追加修正条目并标注取代关系。
+
+### D-047：双入口硬切与进程内共享运行时（取代旧一次性 CLI 路线）
+
+问题：产品此前按旧式一次性管理型 CLI 扩展（run/continue/session/threads/config 子命令 + 每命令独立 app-server stdio 子进程），执行、会话管理、配置导入与模型发现混在同一命令面，形成第二套客户端状态与协议开销。参考实现：Pi 的单次执行入口与 AgentSession 复用、Codex 的 thread/turn/item 分层与「设置下一轮生效」。当前代码事实：crates/runtime 提供 TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化）与 Conversation 长驻协调器（单活动 turn、steer/followUp 注入窗口、取消、设置排队）；CLI 无参数进入 TUI，--print/--json 以必需位置参数单次执行，--model 只覆盖本次，--session/--no-session 控制持久化；app-server 保留为后续 GUI 的协议适配面，当前无产品入口 spawn 它。选择：硬切，不为旧 CLI 保留兼容层或别名；TUI 与两种无交互渲染消费同一 runtime 与同一事件枚举；压缩采用请求前 reserve_tokens（默认 16k）+ Provider 结构化 context_length_exceeded 拒绝后强制压缩重试一次。影响：旧管理面（config doctor/add/models/import-env、session reference 投影等）零消费者即删除；Evaluator 迁移为 `sg --json <goal> --model <model>` 且 summary 合同不变；GUI 后续接入以 app-server 适配 runtime 管线为准。验收方式：entry_contract 黑盒合同测试（本地假 SSE 服务器驱动真实 Provider 栈）、runtime 行为测试（单活动 turn/失败收敛/中断/设置时序）、workspace 全量门禁；真实 Provider smoke 与 Evaluator 对照另行留档。

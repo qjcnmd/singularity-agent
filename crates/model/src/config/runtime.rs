@@ -1,8 +1,8 @@
 //! Runtime provider selection, transport capability assembly, and immutable snapshots.
 //!
-//! User-facing catalog discovery, cache refresh, dotenv import, auth persistence, and
-//! doctor projection remain in the sibling `user` module. This module only assembles
-//! the provider instance and protocol capabilities required by AgentLoop execution.
+//! User config and auth reading lives in the sibling `user` module. This module
+//! only assembles the provider instance and protocol capabilities required by
+//! AgentLoop execution.
 
 use std::collections::BTreeMap;
 use std::fmt;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
+use std::path::{Path, PathBuf};
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
 fn test_runtime_handle() -> tokio::runtime::Handle {
@@ -39,7 +40,6 @@ fn user_provider() -> UserConfigProvider {
 
 fn user_config_with_two_providers(auth: UserAuthFile) -> UserConfigData {
     UserConfigData {
-        directory: PathBuf::from("C:/singularity-test"),
         config: UserConfigFile {
             version: 1,
             default_provider: Some("primary".to_string()),
@@ -158,10 +158,9 @@ fn persisted_capability_block_is_rejected() {
             }
         }
     });
-    write_json_file(
-        &directory.path().join(USER_CONFIG_FILE_NAME),
-        &config.to_string(),
-        false,
+    std::fs::write(
+        directory.path().join(USER_CONFIG_FILE_NAME),
+        config.to_string(),
     )
     .expect("write persisted user config");
 
@@ -296,30 +295,6 @@ fn selected_provider_without_auth_fails_closed_as_auth_error() {
 }
 
 #[test]
-fn cache_read_failures_are_typed_and_non_blocking() {
-    let directory = tempfile::tempdir().expect("cache directory");
-    let invalid = directory.path().join("invalid.json");
-    std::fs::write(&invalid, b"not-json").expect("write invalid cache");
-    assert_eq!(
-        load_models_cache(&invalid).status,
-        ModelCacheStatus::Invalid
-    );
-
-    let missing = directory.path().join("missing.json");
-    assert_eq!(
-        load_models_cache(&missing).status,
-        ModelCacheStatus::NotPresent
-    );
-
-    let read_failed = directory.path().join("cache-directory");
-    std::fs::create_dir(&read_failed).expect("create cache directory");
-    assert_eq!(
-        load_models_cache(&read_failed).status,
-        ModelCacheStatus::ReadFailed
-    );
-}
-
-#[test]
 fn relative_home_is_rejected_before_path_use() {
     let error = normalize_absolute_path(Path::new("relative-home"))
         .expect_err("relative user home must fail closed");
@@ -373,42 +348,6 @@ fn metadata_errors_are_not_treated_as_missing_paths() {
     let error = path_exists_or_missing(invalid, "metadata failed")
         .expect_err("metadata errors must fail closed");
     assert_eq!(error.message, "metadata failed");
-}
-
-#[test]
-fn import_selector_rejects_invalid_model_and_variant_identifiers() {
-    assert!(parse_import_model_selector("default/model name#high", "default").is_err());
-    assert!(parse_import_model_selector("default/model#high variant", "default").is_err());
-    assert!(parse_import_model_selector("default/model#high/fast", "default").is_err());
-}
-
-#[test]
-fn import_selector_accepts_configured_provider_prefix_and_bare_slash_model_ids() {
-    assert_eq!(
-        parse_import_model_selector("default/models/gpt#high", "default")
-            .expect("configured provider selector"),
-        (
-            "default/models/gpt#high".to_string(),
-            "models/gpt".to_string()
-        )
-    );
-    assert_eq!(
-        parse_import_model_selector("models/gpt", "default")
-            .expect("bare slash-containing model id"),
-        ("default/models/gpt".to_string(), "models/gpt".to_string())
-    );
-}
-
-#[test]
-fn import_selector_treats_mismatched_provider_prefix_as_a_bare_model_id() {
-    assert_eq!(
-        parse_import_model_selector("other/models/gpt", "default")
-            .expect("slash-containing model id is not a selector for another provider"),
-        (
-            "default/other/models/gpt".to_string(),
-            "other/models/gpt".to_string()
-        )
-    );
 }
 
 #[test]
@@ -481,33 +420,11 @@ fn selected_invalid_endpoint_precedes_missing_auth() {
 }
 
 #[test]
-fn oversized_cache_is_invalid_while_io_failures_remain_read_failed() {
-    let directory = tempfile::tempdir().expect("cache directory");
-    let oversized = directory.path().join("oversized.json");
-    std::fs::write(
-        &oversized,
-        vec![b'x'; crate::MAX_DISCOVERY_RESPONSE_BYTES + 1],
-    )
-    .expect("write oversized cache");
-    assert_eq!(
-        load_models_cache(&oversized).status,
-        ModelCacheStatus::Invalid
-    );
-
-    let read_failed = directory.path().join("cache-directory");
-    std::fs::create_dir(&read_failed).expect("create cache directory");
-    assert_eq!(
-        load_models_cache(&read_failed).status,
-        ModelCacheStatus::ReadFailed
-    );
-}
-
-#[test]
 fn oversized_user_config_and_private_auth_reads_are_rejected() {
     let directory = tempfile::tempdir().expect("user config directory");
     let oversized_contents = "x".repeat(crate::MAX_DISCOVERY_RESPONSE_BYTES + 1);
     let config_path = directory.path().join(USER_CONFIG_FILE_NAME);
-    write_json_file(&config_path, &oversized_contents, true).expect("write oversized user config");
+    std::fs::write(&config_path, &oversized_contents).expect("write oversized user config");
     let config_error = match read_user_config_data_from_directory(directory.path().to_path_buf()) {
         Ok(_) => panic!("oversized user config must fail"),
         Err(error) => error,
@@ -531,7 +448,13 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     );
 
     let auth_path = directory.path().join(crate::USER_AUTH_FILE_NAME);
-    write_json_file(&auth_path, &oversized_contents, true).expect("write oversized private auth");
+    std::fs::write(&auth_path, &oversized_contents).expect("write oversized private auth");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict private auth to owner");
+    }
     let auth_error =
         read_private_auth_file(&auth_path).expect_err("oversized private auth must fail");
     assert_eq!(
@@ -554,46 +477,10 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     assert!(!auth_error.message.contains(&oversized_contents));
 }
 
+/// 凭据目录只认唯一 `auth.v1.json`：读侧合并 config.json + auth.v1.json，
+/// 同一路径内容翻新后读取结果随之收敛。
 #[test]
-fn config_writer_lock_is_exclusive_and_releases_cleanly() {
-    let directory = tempfile::tempdir().expect("writer lock directory");
-    let first = acquire_config_writer_lock(directory.path()).expect("first writer lock");
-    let second = match acquire_config_writer_lock(directory.path()) {
-        Ok(_) => panic!("second writer must observe the exclusive lock"),
-        Err(error) => error,
-    };
-    assert!(second.message.contains("in progress"));
-    drop(first);
-    assert!(directory.path().join(".config.lock").exists());
-    let third = acquire_config_writer_lock(directory.path()).expect("lock is released");
-    drop(third);
-    assert!(directory.path().join(".config.lock").exists());
-}
-
-#[test]
-fn config_json_write_is_atomic() {
-    let directory = tempfile::tempdir().expect("temporary user config directory");
-    let path = directory.path().join(USER_CONFIG_FILE_NAME);
-    write_json_file(&path, r#"{"providers":{}}"#, false).expect("write config file");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read config file"),
-        r#"{"providers":{}}"#
-    );
-    assert!(
-        !directory
-            .path()
-            .read_dir()
-            .expect("read temporary directory")
-            .any(|entry| entry
-                .expect("read directory entry")
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".config.json.tmp-"))
-    );
-}
-
-#[test]
-fn auth_file_replaces_atomically_as_the_single_credential_file() {
+fn auth_file_reads_reflect_the_single_credential_file() {
     let directory = tempfile::tempdir().expect("user config directory");
     let config = serde_json::json!({
         "version": 1,
@@ -608,10 +495,9 @@ fn auth_file_replaces_atomically_as_the_single_credential_file() {
             }
         }
     });
-    write_json_file(
-        &directory.path().join(USER_CONFIG_FILE_NAME),
-        &config.to_string(),
-        false,
+    std::fs::write(
+        directory.path().join(USER_CONFIG_FILE_NAME),
+        config.to_string(),
     )
     .expect("write user config");
     let auth_path = directory.path().join(crate::USER_AUTH_FILE_NAME);
@@ -622,43 +508,27 @@ fn auth_file_replaces_atomically_as_the_single_credential_file() {
         })
         .to_string()
     };
-    write_json_file(&auth_path, &credentials("test-primary-key"), true)
-        .expect("write private auth file");
+    let write_auth = |contents: String| {
+        std::fs::write(&auth_path, contents).expect("write private auth file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict private auth to owner");
+        }
+    };
+    write_auth(credentials("test-primary-key"));
     let data = read_user_config_data_from_directory(directory.path().to_path_buf())
         .expect("read user config")
         .expect("user config present");
     assert_eq!(data.auth.providers["primary"].api_key, "test-primary-key");
 
-    // 同一路径重复写入即原子替换：内容整体翻新，读侧永远看到完整 JSON。
-    write_json_file(&auth_path, &credentials("sk-rotated"), true)
-        .expect("replace private auth file");
+    // 同一路径整体翻新凭据后，读侧看到替换后的完整 JSON。
+    write_auth(credentials("sk-rotated"));
     let data = read_user_config_data_from_directory(directory.path().to_path_buf())
         .expect("read replaced user config")
         .expect("user config present");
     assert_eq!(data.auth.providers["primary"].api_key, "sk-rotated");
-
-    // 凭据目录只保留唯一 auth 文件，且原子替换不残留临时文件。
-    let names = directory
-        .path()
-        .read_dir()
-        .expect("read credential directory")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("directory entries")
-        .into_iter()
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names
-            .iter()
-            .filter(|name| name.starts_with("auth."))
-            .count(),
-        1,
-        "exactly one auth file must exist: {names:?}"
-    );
-    assert!(
-        !names.iter().any(|name| name.contains(".tmp-")),
-        "atomic replacement must not leave temporary files: {names:?}"
-    );
 }
 
 #[cfg(unix)]
@@ -668,7 +538,7 @@ fn auth_permissions_fail_closed_when_group_readable() {
 
     let directory = tempfile::tempdir().expect("temporary user config directory");
     let path = directory.path().join("auth.json");
-    write_json_file(&path, r#"{"providers":{}}"#, true).expect("write auth file");
+    std::fs::write(&path, r#"{"providers":{}}"#).expect("write auth file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
         .expect("make auth file group-readable");
     assert!(super::user::ensure_private_secret_file(&path).is_err());

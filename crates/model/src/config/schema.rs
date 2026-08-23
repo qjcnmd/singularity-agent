@@ -166,18 +166,6 @@ where
     deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
-pub(crate) fn deserialize_unique_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let values = Vec::<String>::deserialize(deserializer)?;
-    let mut seen = std::collections::BTreeSet::new();
-    if values.iter().any(|value| !seen.insert(value)) {
-        return Err(de::Error::custom("duplicate model id"));
-    }
-    Ok(values)
-}
-
 pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), ProviderError> {
     if value.is_empty()
         || value.chars().any(|character| {

@@ -1,6 +1,5 @@
 //! provider 配置分层解析、脱敏状态和服务级配置快照。
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 pub(crate) mod filesystem;
 pub(crate) mod runtime;
@@ -8,7 +7,6 @@ pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;
 
-pub(crate) use filesystem::read_bounded_text;
 pub use runtime::ProviderConfigSnapshot;
 pub(crate) use runtime::*;
 pub(crate) use schema::*;
@@ -17,12 +15,6 @@ pub use schema::{
     ProviderConfigurationStatus,
 };
 pub(crate) use user::*;
-pub use user::{
-    AddProviderResult, ModelCacheStatus, ModelDiscoveryStatus, UserConfigImportResult,
-    UserModelCatalog, UserModelCatalogEntry, UserProviderModelCatalog, add_configured_provider,
-    discover_provider_model_ids, import_env_to_user_config, read_user_model_catalog,
-    refresh_model_metadata,
-};
 
 use super::{
     DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
@@ -34,8 +26,6 @@ use super::{
 
 #[cfg(test)]
 use crate::error::ModelErrorCategory;
-#[cfg(test)]
-use filesystem::write_json_file;
 pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
@@ -194,22 +184,6 @@ pub(crate) fn validate_base_url(
         ));
     }
     Ok(())
-}
-
-pub(crate) fn normalized_endpoint_identity(base_url: &str) -> Result<String, ProviderError> {
-    validate_base_url(Some(base_url), Some(ProviderConfigSource::UserConfigFile))?;
-    let url = reqwest::Url::parse(base_url)
-        .map_err(|_| user_config_error("user provider endpoint could not be normalized"))?;
-    let mut identity = url.as_str().to_string();
-    while identity.ends_with('/') {
-        identity.pop();
-    }
-    if identity.is_empty() {
-        return Err(user_config_error(
-            "user provider endpoint could not be normalized",
-        ));
-    }
-    Ok(identity)
 }
 
 #[derive(Default)]
@@ -611,71 +585,6 @@ where
 
 pub(crate) fn normalized_provider_value(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
-}
-
-pub(crate) fn find_import_env_file(project_dir: &Path) -> Option<PathBuf> {
-    let mut dir = project_dir.to_path_buf();
-    loop {
-        let path = dir.join(".env");
-        if path.is_file() {
-            return Some(path);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-pub(crate) fn read_import_env_layer(path: &Path) -> ProviderConfigLayer {
-    let Ok(text) = read_bounded_text(path, super::MAX_DISCOVERY_RESPONSE_BYTES) else {
-        return ProviderConfigLayer::default();
-    };
-    let mut layer = ProviderConfigLayer::default();
-    for (name, value) in text.lines().filter_map(parse_env_line) {
-        let target = match name.as_str() {
-            ENV_PROVIDER => &mut layer.provider_name,
-            ENV_MODEL => &mut layer.model_name,
-            ENV_CONTEXT_TOKENS => &mut layer.context_tokens,
-            ENV_MAX_OUTPUT_TOKENS => &mut layer.max_output_tokens,
-            ENV_BASE_URL => &mut layer.base_url,
-            ENV_API_KEY => &mut layer.api_key,
-            _ => continue,
-        };
-        if target.is_none() {
-            *target = Some(value);
-        }
-    }
-    layer
-}
-
-pub(crate) fn parse_env_line(line: &str) -> Option<(String, String)> {
-    let mut text = line.trim_start();
-    if text.is_empty() || text.starts_with('#') {
-        return None;
-    }
-    if let Some(rest) = text.strip_prefix("export ") {
-        text = rest.trim_start();
-    }
-    let (name, value) = text.split_once('=')?;
-    let name = name.trim();
-    if name.is_empty()
-        || name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return None;
-    }
-    let mut value = value;
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
-            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
-        {
-            value = &value[1..value.len() - 1];
-        }
-    }
-    Some((name.to_string(), value.to_string()))
 }
 
 pub(crate) fn redacted_presence(present: bool) -> String {

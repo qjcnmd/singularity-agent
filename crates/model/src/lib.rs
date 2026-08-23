@@ -30,14 +30,6 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一文件：写入走临时文件 + 同卷原子改名，读侧只认这一个文件名。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.v1.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
-pub(crate) const USER_MODELS_CACHE_FILE_NAME: &str = "models-cache.json";
-pub(crate) const USER_MODELS_CACHE_SCHEMA_VERSION: u32 = 1;
-pub(crate) const USER_MODELS_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
-/// models.dev 目录元数据的独立缓存文件名（投影子集，与发现缓存分离）。
-pub(crate) const METADATA_CACHE_FILE_NAME: &str = "metadata-cache.json";
-pub(crate) const METADATA_CACHE_SCHEMA_VERSION: u32 = 1;
-/// models.dev 公开模型目录的 api.json 端点。
-pub(crate) const METADATA_DIRECTORY_URL: &str = "https://models.dev/api.json";
 pub(crate) const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 pub(crate) const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -58,7 +50,6 @@ pub(crate) const HTTP_STATUS_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
-mod builtin_models;
 mod config;
 mod discovery;
 mod error;
@@ -68,12 +59,9 @@ mod transport;
 mod types;
 
 pub use config::{
-    AddProviderResult, ModelBlockerKind, ModelCacheStatus, ModelDiscoveryStatus,
-    ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, UserConfigImportResult, UserModelCatalog,
-    UserModelCatalogEntry, UserProviderModelCatalog, add_configured_provider,
-    discover_provider_model_ids, import_env_to_user_config, read_user_model_catalog,
-    refresh_model_metadata, resolve_provider_config, split_model_selector,
+    ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution,
+    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
+    resolve_provider_config, split_model_selector,
 };
 pub use error::*;
 pub use openai::{
