@@ -48,13 +48,13 @@ Desktop 的“继续”追加新 turn，不复用旧 turn、不新建 Session。
 
 重开 Session 发现没有终态的 \`turn_started\` 时，追加一次幂等的 synthetic \`turn_interrupted\`，而不是每次读取都重新推断。
 
-### D-011：持久事实与发布顺序
+### D-011：持久事实与发布顺序（已被 D-046 取代）
 
-终态必须先写入 JSONL，再更新 SQLite 索引并发布 \`turn/completed\`、\`turn/failed\` 或 \`turn/interrupted\` 事件。客户端看到终态时，持久事实必须已经存在。
+终态必须先写入 JSONL，再更新 SQLite 索引并发布 `turn/completed`、`turn/failed` 或 `turn/interrupted` 事件。客户端看到终态时，持久事实必须已经存在。
 
 ### D-012：重连
 
-Desktop 重连采用 \`thread/resume\` 和 Session 状态重建，不实现事件 cursor/gap 重放。实时 delta 只保证在线连接期间传输。
+Desktop 重连采用 `thread/resume` 和 Session 状态重建，不实现事件 cursor/gap 重放。实时 delta 只保证在线连接期间传输。
 
 ### D-013：事件背压
 
@@ -68,13 +68,13 @@ Desktop 运行期间切换模型/Provider 不重启 app-server；当前 turn 保
 
 切换模型/Provider 后，不兼容的 provider-private reasoning replay 丢弃；可见消息、tool call、tool result 保留，从新 Provider 的公开历史重新开始。不得尝试跨协议转换 opaque replay。
 
-### D-016：thread 设置存储
+### D-016：thread 设置存储（已被 D-046 取代）
 
-模型、Provider、reasoning effort 等非敏感选择追加为 JSONL \`thread_settings\` 记录，SQLite 只做索引；不重写 Session header，不只存内存。
+模型、Provider、reasoning effort 等非敏感选择追加为 JSONL `thread_settings` 记录，SQLite 只做索引；不重写 Session header，不只存内存。
 
 ### D-017：凭据边界
 
-\`thread_settings\` 不保存 API key、Authorization header 或其他认证材料；凭据继续由全局配置/环境管理。
+`thread_settings` 不保存 API key、Authorization header 或其他认证材料；凭据继续由全局配置/环境管理。
 
 ### D-018：配置不可用
 
@@ -98,7 +98,7 @@ Desktop 是独立客户端，本仓库只提供有界工具预览、工具状态
 
 ### D-023：Item 生命周期
 
-Desktop 接入前补齐 Codex 式 \`item/completed\` 生命周期：每个 \`item/started\` 必须对应 terminal 的 \`item/completed\` 或 \`item/failed\`，再发布 turn 终态。工具详细参数和结果继续通过已有 \`tool/execution/*\` 事件传递。
+Desktop 接入前补齐 Codex 式 `item/completed` 生命周期：每个 `item/started` 必须对应 terminal 的 `item/completed` 或 `item/failed`，再发布 turn 终态。工具详细参数和结果继续通过已有 `tool/execution/*` 事件传递。
 
 ### D-024：Item 持久化
 
@@ -128,7 +128,7 @@ Desktop 接入前补齐 Codex 式 \`item/completed\` 生命周期：每个 \`ite
 
 活动 turn 期间允许更新 thread 设置并立即持久化；当前 turn 及其 steer 继续使用启动时的旧 Provider/模型，设置只对下一 turn 生效。
 
-### D-031：Usage 持久化
+### D-031：Usage 持久化（已被 D-046 取代）
 
 标准化 turn usage 持久化到 JSONL，SQLite 继续做聚合索引；\`thread/resume\` 恢复 usage 给 Desktop。Provider 未提供 usage 时显示 unknown，不伪造为 0。
 
@@ -144,7 +144,7 @@ Desktop 接入前补齐 Codex 式 \`item/completed\` 生命周期：每个 \`ite
 
 Desktop 公开显示文本 thinking block。DeepSeek 等 Provider 明确返回的完整 \`reasoning_content\` 可以完整保留并折叠展示；过滤 replay 元数据、Responses opaque output items 和 \`encrypted_content\`。最终历史读取采用公开结构化投影，不返回原始 SessionEntry。
 
-### D-035：Thread 模型投影
+### D-035：Thread 模型投影（已被 D-046 取代）
 
 thread_settings 追加后同步更新 SQLite 当前模型索引；JSONL 是历史事实，SQLite 是最新值投影，\`thread/list\`、\`thread/resume\` 和 \`session/read\` 保持一致。
 
@@ -152,7 +152,7 @@ thread_settings 追加后同步更新 SQLite 当前模型索引；JSONL 是历�
 
 turn 生命周期、thread_settings、usage、item 状态等 metadata 只用于恢复和客户端展示，不进入模型请求上下文；模型仍只接收 user/assistant/toolResult 及必要 compaction 投影。
 
-### D-037：SQLite 索引修复
+### D-037：SQLite 索引修复（已被 D-046 取代）
 
 JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL 修复 SQLite 索引，不回滚历史、不允许永久不一致。
 

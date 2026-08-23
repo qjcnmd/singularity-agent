@@ -315,7 +315,7 @@ sequenceDiagram
 ### 12.1 脱敏与工具输出合同
 
 - 工具执行结果是 `ToolExecution {content: String, is_error: bool}`，追加为会话 `toolResult` message 后按原样进入 LLM 上下文（role `tool` + tool_call_id），并在公开 history 中投影为带 `isError` 的 `tool_result` item；没有把流式 delta 永久化为独立事件。
-- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB；完整输出仅保留内存尾部窗口（100 KiB 上限，超出即弃并标记截断），不写磁盘临时文件。read 收集满 `limit`（缺省 2000 行）即停、不扫描至 EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限提示 `File continues; use offset=Z to continue.`，不写临时文件。edit 实施 20 MiB 输入与输出上限，无 `\r` 时零映射恒等、含 `\r` 时仅对命中区局部换算并产出局部上下文 diff，未触及字节 100% 保持原样。
+- bash 对流式输出做控制字符过滤（保留 `\t`/`\n`/`\r`），预览保留最后 2000 行 / 50 KiB，内部窗口上限为 100 KiB；发生截断时完整输出写入 `<TEMP>/singularity-tool-output/<uuid>/<slug>.log` 并附 `Full output: <绝对路径>`。read 收集满 `limit`（缺省 2000 行）即停、不扫描至 EOF，单行 ≤ 4 MiB，输出 ≤ 2000 行 / 50 KiB，超限提示 `File continues; use offset=Z to continue.`，不写临时文件。edit 实施 20 MiB 输入与输出上限，无 `\r` 时零映射恒等、含 `\r` 时仅对命中区局部换算并产出局部上下文 diff，未触及字节 100% 保持原样。
 - 工具结果文本不包含 provider 原始响应；raw tool arguments 仅存在于 assistant 的 `tool_call` 内容块及工具生命周期事件中。密钥边界由 provider 错误脱敏承担。
 
 ### 12.2 工具 schema
