@@ -273,15 +273,15 @@ fn record_from_session(session: &SessionManager, rollout_path: &Path) -> Session
         .and_then(|entry| {
             let model = entry.field_string("model")?;
             let provider = entry.field_string("provider").unwrap_or_default();
-            let selector = if provider.is_empty() {
-                model.to_string()
-            } else {
-                format!("{provider}/{model}")
-            };
-            Some(match entry.field_string("reasoning") {
-                Some(reasoning) if !reasoning.is_empty() => format!("{selector}#{reasoning}"),
-                _ => selector,
-            })
+            if provider.is_empty() {
+                // 旧版裸 model 记录：保持原样，不套 provider/。
+                return Some(model.to_string());
+            }
+            Some(singularity_model::compose_model_selector(
+                &provider,
+                &model,
+                entry.field_string("reasoning").as_deref(),
+            ))
         });
     let status = metadata.iter().rev().find_map(|entry| match entry.kind() {
         singularity_agent::session::SessionMetadataKind::TurnStarted => Some(SessionStatus::Active),

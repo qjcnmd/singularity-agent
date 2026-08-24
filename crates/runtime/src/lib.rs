@@ -26,7 +26,7 @@ pub mod store;
 
 pub use conversation::{
     Conversation, ConversationError, SettingsApplyTiming, SettingsPatch, TurnControls,
-    TurnReservation,
+    TurnReservation, compose_merged_selector,
 };
 pub use error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,

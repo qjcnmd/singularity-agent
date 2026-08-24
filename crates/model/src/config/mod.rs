@@ -27,7 +27,7 @@ use super::{
 #[cfg(test)]
 use crate::error::ModelErrorCategory;
 pub(super) use selection::model_selector_error;
-pub use selection::{ModelSelectorParts, split_model_selector};
+pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution

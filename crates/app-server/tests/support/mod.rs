@@ -121,6 +121,8 @@ fn format_exit_status(status: Option<ExitStatus>) -> String {
 
 impl JsonOutput {
     /// 服务器失败上下文（stderr 与退出状态），供测试断言拼接。
+    /// 仅 steer_transport 测试目标使用，app_server 目标不引用。
+    #[allow(dead_code)]
     pub fn failure_context(&self) -> String {
         self.diagnostics.failure_context()
     }
@@ -176,6 +178,8 @@ impl AppServerProcess {
     /// 变体：通过用户配置目录（`{home}/config.json` + `{home}/auth.v1.json`）
     /// 提供 provider 选择，不注入 SINGULARITY_MODEL/BASE_URL/API_KEY——
     /// 环境层会覆盖用户配置层，注入这些变量会把快照打回单模型 legacy 形态。
+    /// 仅 steer_transport 测试目标使用，app_server 目标不引用。
+    #[allow(dead_code)]
     pub fn spawn_with_user_config(cwd: &Path, home: &Path) -> Self {
         Self::spawn_with_provider_env(cwd, home, &[])
     }

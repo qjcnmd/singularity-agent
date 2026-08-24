@@ -238,41 +238,29 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let parts = singularity_model::split_model_selector(record.model.as_deref().unwrap_or(""));
-        let current_provider = parts.provider.map(str::to_string);
-        let current_model = parts.model.map(str::to_string);
-        let current_reasoning = parts.effort.map(str::to_string);
         let changed =
             params.provider.is_some() || params.model.is_some() || params.reasoning.is_some();
-        let provider = params
-            .provider
-            .or(current_provider)
-            .unwrap_or_else(|| "openai_compatible".to_string());
-        let model = params.model.or(current_model);
-        let reasoning = params.reasoning.or(current_reasoning);
-        let Some(model) = model.filter(|model| !model.trim().is_empty()) else {
-            return invalid_params_response(message.required_id());
+        let patch = singularity_runtime::SettingsPatch {
+            provider: params.provider,
+            model: params.model,
+            reasoning: params.reasoning,
         };
-        if provider.trim().is_empty()
-            || provider.chars().any(char::is_whitespace)
-            || model.chars().any(char::is_whitespace)
-            || reasoning.as_deref().is_some_and(|value| {
-                value.trim().is_empty() || value.chars().any(char::is_whitespace)
-            })
-        {
-            return invalid_params_response(message.required_id());
-        }
-        let selector = compose_model_selector(&provider, &model, reasoning.as_deref());
+        // 组合与校验与协调器共用同一实现：以索引行 selector 为基线合并
+        // patch；空白/缺失段由协调器的提交点校验统一拒绝。
+        let selector =
+            singularity_runtime::compose_merged_selector(record.model.as_deref(), &patch);
         self.validate_model_selector(Some(&selector))?;
+        let parts = singularity_model::split_model_selector(&selector);
+        let provider = parts
+            .provider
+            .map(str::to_string)
+            .unwrap_or_else(|| "openai_compatible".to_string());
+        let model = parts.model.map(str::to_string);
+        let reasoning = parts.effort.map(str::to_string);
         let mut queued = false;
         if changed {
             // JSONL 先落盘（协调器负责校验与持久化），随后同步索引投影。
             let conversation = self.conversation_for(&record.session_id)?;
-            let patch = singularity_runtime::SettingsPatch {
-                provider: Some(provider.clone()),
-                model: Some(model.clone()),
-                reasoning: reasoning.clone(),
-            };
             let timing = match conversation.queue_settings(patch) {
                 Ok(timing) => timing,
                 Err(error) => {
@@ -313,7 +301,7 @@ impl AppServer {
             ThreadSettingsResult {
                 thread_id: record.session_id,
                 provider: Some(provider),
-                model: Some(model),
+                model,
                 reasoning,
                 updated: changed,
                 queued,
@@ -706,14 +694,4 @@ pub(super) fn provider_configuration(
         base_url_present: config.base_url_present,
         model_present: config.model_name.is_some(),
     }
-}
-
-/// 组合 `provider/model[#reasoning]` selector（展示用；持久化校验由协调器完成）。
-fn compose_model_selector(provider: &str, model: &str, reasoning: Option<&str>) -> String {
-    let mut selector = format!("{provider}/{model}");
-    if let Some(reasoning) = reasoning {
-        selector.push('#');
-        selector.push_str(reasoning);
-    }
-    selector
 }

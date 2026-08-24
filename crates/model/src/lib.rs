@@ -61,7 +61,7 @@ mod types;
 pub use config::{
     ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
-    resolve_provider_config, split_model_selector,
+    compose_model_selector, resolve_provider_config, split_model_selector,
 };
 pub use error::*;
 pub use openai::{

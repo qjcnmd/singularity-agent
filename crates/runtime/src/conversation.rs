@@ -512,14 +512,29 @@ impl Conversation {
     }
 }
 
-/// 组合 `provider/model[#reasoning]` selector（与配置层拆分规则互逆）。
-fn compose_model_selector(provider: &str, model: &str, reasoning: Option<&str>) -> String {
-    let mut selector = format!("{provider}/{model}");
-    if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
-        selector.push('#');
-        selector.push_str(reasoning);
-    }
-    selector
+/// 把 patch 合并到当前 selector 上（`provider/model[#effort]`），返回完整
+/// 选择器；不做合法性校验。提交点校验、终态自动生效与 app-server 回显
+/// 共用同一组合语义。
+pub fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
+    let parts = split_model_selector(current.unwrap_or(""));
+    let provider = patch
+        .provider
+        .clone()
+        .or_else(|| parts.provider.map(str::to_string))
+        .unwrap_or_else(|| "openai_compatible".to_string());
+    let model = patch
+        .model
+        .clone()
+        .or_else(|| parts.model.map(str::to_string));
+    let reasoning = patch
+        .reasoning
+        .clone()
+        .or_else(|| parts.effort.map(str::to_string));
+    singularity_model::compose_model_selector(
+        &provider,
+        model.as_deref().unwrap_or(""),
+        reasoning.as_deref(),
+    )
 }
 
 /// 无锁的 selector 组合与校验：以当前 Thread 投影为基线合并 patch，
@@ -529,30 +544,22 @@ fn compose_validated_selector(
     patch: &SettingsPatch,
     runner: &TurnRunner,
 ) -> Result<String, String> {
-    let parts = split_model_selector(current.as_deref().unwrap_or(""));
-    let current_provider = parts.provider.map(str::to_string);
-    let current_model = parts.model.map(str::to_string);
-    let current_reasoning = parts.effort.map(str::to_string);
-    let provider = patch
-        .provider
-        .clone()
-        .or(current_provider)
-        .unwrap_or_else(|| "openai_compatible".to_string());
-    let model = patch.model.clone().or(current_model);
-    let reasoning = patch.reasoning.clone().or(current_reasoning);
-    let Some(model) = model.filter(|model| !model.trim().is_empty()) else {
+    let selector = compose_merged_selector(current.as_deref(), patch);
+    let parts = split_model_selector(&selector);
+    let model = parts.model.unwrap_or_default();
+    if model.trim().is_empty() {
         return Err("thread settings require a model".to_string());
-    };
+    }
+    let provider = parts.provider.unwrap_or("openai_compatible");
+    let reasoning = parts.effort;
     if provider.trim().is_empty()
         || provider.chars().any(char::is_whitespace)
         || model.chars().any(char::is_whitespace)
         || reasoning
-            .as_deref()
             .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
     {
         return Err("invalid provider/model/reasoning value".to_string());
     }
-    let selector = compose_model_selector(&provider, &model, reasoning.as_deref());
     runner.validate_model_selector(Some(&selector))?;
     Ok(selector)
 }

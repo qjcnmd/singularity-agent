@@ -46,6 +46,17 @@ pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
     }
 }
 
+/// 组合 `provider/model[#effort]` 选择器；effort 为空时省略。与
+/// [`split_model_selector`] 互逆（段内容不校验，合法性由配置层负责）。
+pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
+    let mut selector = format!("{provider}/{model}");
+    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+        selector.push('#');
+        selector.push_str(effort);
+    }
+    selector
+}
+
 pub(super) fn parse_model_selector(
     selector: &str,
 ) -> Result<ParsedModelSelector<'_>, ProviderError> {

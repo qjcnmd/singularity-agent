@@ -397,6 +397,25 @@ fn split_model_selector_allows_partial_selectors() {
 }
 
 #[test]
+fn compose_model_selector_is_split_inverse_for_qualified_selectors() {
+    let selector = compose_model_selector("provider", "model", Some("high"));
+    assert_eq!(selector, "provider/model#high");
+    let parts = split_model_selector(&selector);
+    assert_eq!(parts.provider, Some("provider"));
+    assert_eq!(parts.model, Some("model"));
+    assert_eq!(parts.effort, Some("high"));
+    // 空 effort 不附加 #，round-trip 后 effort 为 None。
+    let plain = compose_model_selector("provider", "model", None);
+    assert_eq!(plain, "provider/model");
+    assert_eq!(split_model_selector(&plain).effort, None);
+    assert_eq!(
+        compose_model_selector("provider", "model", Some("")),
+        "provider/model",
+        "空 effort 视为未提供"
+    );
+}
+
+#[test]
 fn selected_invalid_endpoint_precedes_missing_auth() {
     let mut data = user_config_with_two_providers(UserAuthFile::default());
     data.config
