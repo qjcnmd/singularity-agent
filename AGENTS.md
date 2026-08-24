@@ -1,6 +1,6 @@
 # Singularity 仓库指令
 
-Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness。产品恰好两个用户入口：① 无交互（`sg --print/--json <goal>`），② 交互式 TUI；两者在进程内共享同一核心。app-server（stdio JSON-RPC）是富客户端接入接口，不是用户模式也不是 GUI 入口，只把 runtime 事实投影为协议，不复制执行语义。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期是 Turn 执行唯一所有者（crates/runtime 的 TurnRunner/Conversation），Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式、TUI 与 app-server 全部委托 runtime 执行；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
+Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness。产品有三种形态：① 参照 pi 的无交互单次入口（`sg --print/--json <goal>`）；② 交互式 TUI，界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照；③ 参照 Codex Desktop 的桌面端。app-server（stdio JSON-RPC）是形态③的后端接线口，不是独立用户入口；它只把 runtime 事实投影为协议，不复制执行语义。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期是 Turn 执行唯一所有者（crates/runtime 的 TurnRunner/Conversation），Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式、TUI 与 app-server 全部委托 runtime 执行；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
 
 ## 每个任务都适用
 
@@ -13,7 +13,7 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 
 ### 项目不变量
 
-- 核心协调器保持 UI 解耦并支持无交互执行；交互式 TUI、无交互文本/JSONL 和后续 Desktop 通过稳定的共享接口复用同一能力，不复制 Agent 状态或业务逻辑。
+- 核心协调器保持 UI 解耦并支持无交互执行；交互式 TUI、无交互文本/JSONL 与桌面端通过稳定的共享接口复用同一能力，不复制 Agent 状态或业务逻辑。TUI 和无交互入口进程内调用 runtime，桌面端通过 app-server 调用同一 runtime。
 - Context/Compaction、Tool、Model/Provider、Session persistence、项目指令/提示词、Event sink 和客户端 adapter 都是独立模块；模块内部可以更换实现，协调器只依赖其稳定接口和生命周期合同。
 - 可替换性通过静态、窄、类型化的 seam 实现；模块替换不应要求修改其他模块的实现或客户端渲染。只为明确的定制热点建立 seam，不引入通用插件平台、动态脚本加载或依赖注入容器。
 - 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。任何超出当前最小合同的机制都必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。

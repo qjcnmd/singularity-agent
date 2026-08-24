@@ -1,10 +1,10 @@
-# Desktop 近期接入可靠性裁决记录
+# Singularity 三种产品形态与可靠性裁决记录
 
 > 本文件是本轮架构讨论的单一裁决记录。它记录用户已确认的产品边界和取舍，不代表这些决策已经实施。实施计划、代码提交和验证结果必须另行记录，并引用本文件中的决策编号。
 
 ## 目标
 
-Singularity 最终面向类似 Codex CLI/Desktop 的交互式 coding-agent 使用方式。CLI 和 Desktop 是两种客户端形态，通常由用户选择其中一种；两者复用同一 headless Agent core、Session 和协议语义。Desktop 是近期接入目标，不再按遥远未来消费者处理。
+Singularity 提供三种产品形态：参照 pi 的无交互单次入口、界面交互以 Grok Build 为主且功能参照 pi/Codex CLI/Grok Build 的交互式 TUI，以及参照 Codex Desktop 的桌面端。三者复用同一 headless Agent core、Session 和执行语义；app-server 是桌面端的后端接线口。
 
 ## 已确认裁决
 
@@ -24,9 +24,9 @@ Desktop 接入前增加最小运行时清理和长驻测试：结束 turn 后释
 
 Desktop 初版必须支持 Bash 按进程组/作业整体取消，并为 Windows/Unix 提供回归测试；取消不能只停止 Agent loop 而留下后台子进程。
 
-### D-005：客户端进程形态
+### D-005：客户端进程形态（已被 D-049 取代）
 
-CLI 保持一次性 app-server 使用方式；Desktop 在应用存活期间使用长驻连接。两者不是要求同时使用，也不为同时写同一 Session 的边缘场景增加协调系统。
+历史方案曾让 CLI 使用一次性 app-server、桌面端使用长驻连接。现行进程形态由 D-049 统一规定。
 
 ### D-006：崩溃中的 turn
 
@@ -52,9 +52,9 @@ Desktop 的“继续”追加新 turn，不复用旧 turn、不新建 Session。
 
 终态必须先写入 JSONL，再更新 SQLite 索引并发布 `turn/completed`、`turn/failed` 或 `turn/interrupted` 事件。客户端看到终态时，持久事实必须已经存在。
 
-### D-012：重连
+### D-012：重连（已被 D-049 取代）
 
-Desktop 重连采用 `thread/resume` 和 Session 状态重建，不实现事件 cursor/gap 重放。实时 delta 只保证在线连接期间传输。
+历史方案指定桌面端通过尚未实现的 `thread/resume` 重连。桌面端协议属于形态③，具体恢复合同在出现桌面端消费者时确定。
 
 ### D-013：事件背压
 
@@ -124,9 +124,9 @@ Desktop 接入前补齐 Codex 式 `item/completed` 生命周期：每个 `item/s
 
 增加独立 \`thread/settings\` 请求。设置更新与 thread 恢复分离；设置成功后从下一 turn 生效，并追加 JSONL \`thread_settings\` 记录。
 
-### D-030：活动 Turn 中的设置变更
+### D-030：活动 Turn 中的设置变更（已被 D-048 取代）
 
-活动 turn 期间允许更新 thread 设置并立即持久化；当前 turn 及其 steer 继续使用启动时的旧 Provider/模型，设置只对下一 turn 生效。
+活动 turn 的设置时序以 D-048 为准。
 
 ### D-031：Usage 持久化（已被 D-046 取代）
 
@@ -180,9 +180,9 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 问题：项目指令超限（FileTooLarge/TotalTooLarge）现直接报错，使整个 turn 无法开始；超长 AGENTS.md 是常见现实。参考实现：Codex 同 32KB 默认文件预算，剩余预算用尽即停止纳入。当前代码事实：`project_instructions.rs` 超限返回错误 → runner 使 turn/start 直接失败。选择：超限不再报错：按预算截断并纳入前缀 + 发诊断告警"项目指令被截断"；真正 I/O 错误仍报错 fail closed。影响：超大 AGENTS.md 不再阻断任务，截断对模型可见且客户端收到告警。验收方式：project_instructions 测试从断言报错改为断言截断 + 告警；I/O 错误路径仍断言报错。
 
-### D-044：心跳保活不加（P5-5）
+### D-044：心跳保活不加（P5-5，连接恢复部分已被 D-049 取代）
 
-问题：是否增加协议级 heartbeat 保活。参考实现：Codex 无自定义心跳层，靠进程级存活检测与重连。当前代码事实：协议固定 14 个方法，无心跳；app-server 为 stdio 子进程；D-012 已确立 thread/resume 重连。选择：不加心跳，14 个方法保持不变。Desktop 端僵死检测用"请求超时 → 强杀 app-server 子进程 → D-012 thread/resume 重连"闭环。影响：协议表面保持最小；僵死恢复靠超时 + 重连，不留半开放协议面。验收方式：本决策记录本身；如 Desktop 相关代码已有超时兜底则确认即可，无代码改动。
+问题：是否增加协议级 heartbeat 保活。参考实现：Codex 无自定义心跳层，靠进程级存活检测与重连。当前代码事实：协议注册表有 9 个业务方法，无心跳；app-server 为 stdio 子进程；`thread/resume` 从未实现。选择：不增加心跳，保持协议表面最小。桌面端连接恢复合同在出现形态③消费者时确定。验收方式：协议注册表测试与本记录一致。
 
 ### D-045：模型限额的目录来源与 fail-closed 边界（演进 D-041）
 
@@ -207,6 +207,14 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 后续每次用户裁决追加新的 \`D-xxx\` 条目，并注明：问题、参考实现、当前代码事实、选择、影响和验收方式。若新证据推翻旧裁决，不删除旧条目，而是追加修正条目并标注取代关系。
 
-### D-047：共享运行时硬切 + app-server 委托
+### D-047：共享运行时硬切 + app-server 委托（产品形态由 D-049 修正）
 
-问题：产品用户面由无交互（`--print`/`--json`）与 TUI 两种入口组成，app-server 是富客户端接入接口而不是第三种用户入口；若各形态各自实现 turn 执行会造成多套状态机与事件投影漂移；此前 app-server 内维护并行 turn 管线，与 runtime 的 Conversation/TurnRunner 形成第二执行体。参考实现：Pi 的单次执行入口与 AgentSession 复用、Codex 的 thread/turn/item 分层与「设置下一轮生效」。当前代码事实：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立、设置终态后自动应用）；CLI 无参数进入 TUI，--print/--json 单次执行；app-server 是 stdio JSON-RPC 适配器，turn/start 经 Conversation 预订同步裁定并发（先到先得、后到立即 invalid-state），worker 线程以预订执行整条链，事件由适配器 1:1 映射 typed TurnEvent 为协议通知，控制 lane（steer/followUp/interrupt）、设置与删除全部路由到共享 Conversation。选择：客户端形态（TUI / headless / app-server）一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol 与适配器，runtime 不依赖 protocol/UI；app-server 的并行管线与重复 helper 全部删除，以适配器测试证明协议事件名/字段/终态/取消/会话恢复无漂移。影响：执行、并发裁定与恢复语义只有 runtime 一个事实源；TUI/headless/app-server 三者共享同一 Conversation 链（含 followUp 队列与设置时序）；协议契约由 app-server 适配器测试维护。验收方式：runtime 行为测试（预订互斥、单活动 turn、失败收敛、中断、设置时序、followUp 恰一次）、app-server 适配器+协议合同测试（事件名/字段/终态/取消/恢复不漂移）、CLI 双入口合同、TUI 状态/布局/输入测试、进程级 stdio 并发 turn 冲突测试与真实 TTY e2e。
+问题：若各形态各自实现 turn 执行会造成多套状态机与事件投影漂移；此前 app-server 内维护并行 turn 管线，与 runtime 的 Conversation/TurnRunner 形成第二执行体。参考实现：Pi 的单次执行入口与 AgentSession 复用、Codex 的 thread/turn/item 分层与「设置下一轮生效」。当前代码事实：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立、设置终态后自动应用）；CLI 无参数进入 TUI，--print/--json 单次执行；app-server 是 stdio JSON-RPC 适配器。选择：客户端形态（TUI / headless / app-server）一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol 与适配器，runtime 不依赖 protocol/UI。产品形态定位由 D-049 修正。影响与验收方式保持不变。
+
+### D-049：三种产品形态与桌面端后端
+
+问题：双入口框架无法表达已确认的桌面端产品形态，并把 app-server 的角色描述为泛化接入面。参考实现：pi 的单次执行与交互终端、Grok Build 的终端交互、Codex Desktop 及其 app-server。当前代码事实：无交互与 TUI 进程内调用 runtime；app-server 把同一 runtime 投影为 stdio JSON-RPC。选择：产品固定为无交互单次入口、交互式 TUI、桌面端三种形态；app-server 只作为桌面端后端接线口，不构成独立用户入口。影响：产品文档、客户端合同和后续桌面端工作均以三种形态为准。
+
+### D-050：协议与认证文件硬切命名
+
+问题：桌面端协议的 `session/read` 与 Thread 领域命名不一致，认证文件名携带未提供兼容价值的版本后缀。参考实现：Codex app-server 的 `thread/read` 与 `$CODEX_HOME/auth.json`。当前代码事实：协议面尚无外部消费者，认证文件只有单文件读路径。选择：按 D-039 硬切为 `thread/read` 与 `auth.json`，不保留旧名读取或 wire 兼容层；app-server crate 与其余协议方法保留。影响：protocol、app-server、runtime 配置读取、测试和文档同步使用新名称。

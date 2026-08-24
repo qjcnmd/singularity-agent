@@ -6,17 +6,18 @@
 
 ## 1. 总览与进程架构
 
-产品由两种当前入口组成，共享同一进程内运行时：
+产品有三种形态，共享同一运行时语义：
 
-- **`sg` 无参数**：长驻交互式 TUI（alternate screen、主会话流、底部多行编辑器、状态 footer、临时设置菜单）；
-- **`sg --print <goal>` / `sg --json <goal>`**：单次无交互执行。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
+- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
+- **交互式 TUI**：`sg` 无参数进入长驻终端界面；界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照。
+- **桌面端**：参照 Codex Desktop；app-server 是桌面端连接共享 runtime 的 stdio JSON-RPC 后端，不构成独立用户入口。
 
 分层：
 
 - **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
-- **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式直接调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
+- **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`（双层循环）：单一原子 `TurnInbox` 承载 steer；每轮**请求前**以装配成品估算对比 `context_window − reserve_tokens` 决定主动压缩；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次；
   - `session` 子系统：严格 JSONL v1（format/file/manager/context/repair/repository）；会话 JSONL 是唯一持久事实源；
@@ -24,8 +25,8 @@
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config/discovery。
-- **crates/app-server**：stdio JSON-RPC 适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
-- **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.v1.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。
+- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
+- **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。
 - **依赖方向**：cli → runtime → {core, model, agent}；app-server → {runtime, protocol}；runtime 与 agent 不依赖 protocol/UI；protocol 类型仅服务 app-server 适配器。
 
 ## 2. 无交互主调用链
@@ -99,13 +100,16 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 `sg` 无参数进入长驻 TUI，只依赖 `Conversation` 与 typed `TurnEvent`；业务状态不复制在客户端：
 
 - **布局**：主会话流（滚动区）＋底部多行编辑器（高度=内容折行行数，上限半屏）＋状态行＋提示行。
-- **滚动**：严格双态（跟随底部 / 浏览历史）。上滚（PgUp/Alt+↑/滚轮）脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、Ctrl+End、发送输入后恢复跟随。resize 不改变语义，只钳制位置。
-- **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行，Enter 提交；Enter 路由按上下文：idle=新 turn、running=当前模式注入（steer/followUp 由 Ctrl+T 切换）；提示行声明当前 Enter 行为。
-- **Esc 阶梯（无死端）**：浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；设置模态 Esc 关闭。
-- **工具块**：完成态稳定记录（运行中只就地刷新预览）；完成块 Alt+O 展开/收起全量结果（上限 100 行，预览超限显示出口提示）。
-- **状态行**：相位 + 具名等待对象（model / tool name / terminal convergence）+ 等待秒数 + thread id + 模型 + 输入模式 + followUp 队列计数；浏览态显示 `viewing history`。
-- **取消/退出**：运行中一次 Ctrl+C 中断当前轮（已接受 followUp 继续执行），消息行提示再次 Ctrl+C 强制退出（130）；空闲两次 Ctrl+C 退出（0）。
-- **设置模态**：Ctrl+S 打开，Tab 切换字段，Enter 应用（空闲立即生效 / 运行中 show queued），Esc 关闭；开关前后滚动位置与编辑器内容不变。
+- **滚动**：严格双态（钉底跟随 / 上翻脱离）。PgUp、Alt+↑ 或滚轮上滚会脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、End 或发送输入恢复跟随。resize 不改变语义，只钳制位置。
+- **鼠标**：滚轮浏览会话流；点击输入框按显示位置定位编辑光标。
+- **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
+- **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`。
+- **Esc 阶梯**：运行中 Esc 停止生成；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
+- **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
+- **思考块**：Ctrl+T 折叠或展开思考内容，不改变运行中输入路由。
+- **状态行**：显示当前活动（思考中、等待模型、执行工具或终态收敛）、本轮经过时间、thread id、模型、token usage 与 followUp 队列计数；浏览态显示 `viewing history`。
+- **取消/退出**：Esc 中断当前轮；Ctrl+C 第一次清空输入，输入已经为空时进入退出确认，第二次退出；输入为空时 Ctrl+D 退出。
+- **设置模态**：`/settings` 打开，Tab 切换字段，Enter 应用（空闲立即生效 / 运行中排队到下一轮），Esc 关闭；开关前后滚动位置与编辑器内容不变。
 - **终端生命周期**：alternate screen + raw mode + 鼠标捕获；正常路径与 panic 钩子共用同一恢复实现；退出后无残留 raw/alt-screen。
 
 ## 9. 当前维护边界

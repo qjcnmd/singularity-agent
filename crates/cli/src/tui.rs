@@ -1,19 +1,16 @@
-//! 交互式 TUI：主会话流 + 底部多行编辑器 + 状态/提示双行 footer + 临时设置
-//! 模态。TUI 只依赖 [`singularity_runtime`] 的 `Conversation` 与
-//! [`TurnEvent`]：turn 在工作线程上执行，事件经通道驱动渲染；steer 注入当前
-//! 活动 turn，followUp 提交给 Conversation 的后续队列并自动逐条执行。
+//! 交互式 TUI：主会话流 + 底部多行编辑器 + 状态/提示双行 footer + 临时选择
+//! 菜单。TUI 只依赖 [`singularity_runtime`] 的 `Conversation` 与 [`TurnEvent`]：
+//! turn 在工作线程上执行，事件经通道驱动渲染；运行中 Enter 注入当前 turn，
+//! Alt+Enter 提交到后续队列，Alt+Up 撤回最近一条排队消息。
 //!
 //! Ctrl+C 由 crossterm `KeyEvent` 驱动（raw mode 下不依赖操作系统信号）：
-//! 运行中第一次中断当前轮（已接受 followUp 在可信终态后继续），第二次强制
-//! 退出（130）；空闲第一次进入再确认提示，第二次正常退出（0）。确认状态由
-//! 任何其他按键、提交输入或 turn 链结束复位，settings 模态不改变该语义。
+//! 第一次清空非空输入；输入为空时进入退出确认，第二次退出。Esc 在运行中
+//! 中断当前轮，空闲时依次回底跟随、清空草稿或 no-op；输入为空时 Ctrl+D 退出。
 //!
-//! 其余按键语义（对照上游 Grok Build 的 cancel/clear/rewind 惯例）：
-//! Esc 为无死端阶梯——浏览态先回底跟随，其次清空非空草稿，空输入为 no-op；
-//! Ctrl+T 切换 steer/followUp 提交语义（运行中 Enter 注入当前轮或排队为
-//! 后续 turn）；Ctrl+S 打开临时设置模态；Ctrl+J 强制插入换行（窗口/终端
-//! 不转发 Shift+Enter 时的手工等价键）；Ctrl+Home/Ctrl+End 跳转记录两端，
-//! PageUp/PageDown 翻页；Alt+O 折叠/展开最近工具 result。
+//! Ctrl+T 折叠思考块；Ctrl+O（兼容 Alt+O）循环工具块的折叠、截断、完整
+//! 三档；Ctrl+J 强制换行；End 回到最新内容，PageUp/PageDown 翻页。鼠标滚轮
+//! 浏览记录，点击输入框定位光标。`/model`、`/settings`、`/resume`、`/new`、
+//! `/session`、`/compact` 与 `/name` 通过共用的临时菜单范式处理。
 //!
 //! 终端生命周期：进入 alternate screen + raw mode + 鼠标捕获 + 键盘增强
 //! （CSI-u 修饰键）；所有退出路径（正常、错误、panic）统一恢复终端状态。
