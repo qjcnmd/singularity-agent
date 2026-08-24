@@ -9,8 +9,12 @@
 //!
 //! Ctrl+T 折叠思考块；Ctrl+O（兼容 Alt+O）循环工具块的折叠、截断、完整
 //! 三档；Ctrl+J 强制换行；End 回到最新内容，PageUp/PageDown 翻页。鼠标滚轮
-//! 浏览记录，点击输入框定位光标。`/model`、`/settings`、`/resume`、`/new`、
-//! `/session`、`/compact` 与 `/name` 通过共用的临时菜单范式处理。
+//! 按事件间隔归一化加速（滚轮/触控板）并按指针位置路由：输入框内滚动
+//! 编辑器视口（光标一动即回跟随），其余滚动会话流；点击输入框定位光标；
+//! 运行中状态行右侧的 [stop] 可点击（与 Esc 同一中断路径）。提交新消息后
+//! 视口钉在新内容首行（page-flip），填满一屏后自动回底跟随。`/model`、
+//! `/settings`、`/resume`、`/new`、`/session`、`/compact` 与 `/name` 通过
+//! 共用的临时菜单范式处理。
 //!
 //! 终端生命周期：进入 alternate screen + raw mode + 鼠标捕获 + 键盘增强
 //! （CSI-u 修饰键）；所有退出路径（正常、错误、panic）统一恢复终端状态。
@@ -193,8 +197,12 @@ fn event_loop(
                     Action::Exit(code) => return Ok(code),
                 },
                 Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
-                    crossterm::event::MouseEventKind::ScrollUp => app.handle_wheel(true),
-                    crossterm::event::MouseEventKind::ScrollDown => app.handle_wheel(false),
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        app.handle_wheel(true, mouse.column, mouse.row)
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        app.handle_wheel(false, mouse.column, mouse.row)
+                    }
                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         app.handle_click(mouse.column, mouse.row)
                     }

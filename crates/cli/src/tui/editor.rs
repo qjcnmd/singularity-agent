@@ -1,7 +1,9 @@
 //! 底部多行输入编辑器：光标、编辑键、按内容折行的高度增长。
 //!
 //! 编辑器始终持有键盘焦点；`col` 以字符（char）为单位，可视列由渲染层
-//! 按 unicode 宽度换算。高度为内容折行数钳制在 `[1, max_rows]`。
+//! 按 unicode 宽度换算。高度为内容折行数钳制在 `[1, max_rows]`。鼠标滚轮
+//! 可把视口暂时移离光标（`scroll_override`），任何编辑/移动光标操作立即
+//! 清除覆盖、回到跟随光标（参照 Grok textarea 的 scroll_override 语义）。
 
 use unicode_width::UnicodeWidthStr;
 
@@ -10,6 +12,8 @@ pub(crate) struct Editor {
     lines: Vec<String>,
     row: usize,
     col: usize,
+    /// 鼠标滚轮造成的视口行偏移；`None` 表示跟随光标。
+    scroll_override: Option<usize>,
 }
 
 impl Editor {
@@ -18,6 +22,7 @@ impl Editor {
             lines: vec![String::new()],
             row: 0,
             col: 0,
+            scroll_override: None,
         }
     }
 
@@ -45,9 +50,33 @@ impl Editor {
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
+        self.scroll_override = None;
+    }
+
+    /// 鼠标滚轮滚动视口：`delta` 为行偏移（负=向上）。滚动后任何光标
+    /// 移动都会清除覆盖；顶到 0 用 `Some(0)` 钉住（与 `None`=跟随区分）。
+    pub fn scroll_by(&mut self, delta: i32) {
+        let base = self.scroll_override.unwrap_or(0) as i32;
+        let next = base + delta;
+        self.scroll_override = Some(next.max(0) as usize);
+    }
+
+    /// 当前滚轮视口覆盖（`None`=跟随光标）。
+    #[cfg(test)]
+    pub fn scroll_override(&self) -> Option<usize> {
+        self.scroll_override
+    }
+
+    /// 实际视口顶行：覆盖偏移优先，否则跟随光标所在可视行。
+    pub fn effective_scroll_top(&self, cursor_visual_row: usize, inner_height: usize) -> usize {
+        match self.scroll_override {
+            Some(offset) => offset,
+            None => cursor_visual_row.saturating_sub(inner_height.saturating_sub(1)),
+        }
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        self.scroll_override = None;
         let line = &mut self.lines[self.row];
         let byte = char_to_byte(line, self.col);
         line.insert(byte, ch);
@@ -55,6 +84,7 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
+        self.scroll_override = None;
         let line = &mut self.lines[self.row];
         let byte = char_to_byte(line, self.col);
         let tail = line.split_off(byte);
@@ -64,6 +94,7 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.scroll_override = None;
         if self.col > 0 {
             let line = &mut self.lines[self.row];
             let byte = char_to_byte(line, self.col - 1);
@@ -78,6 +109,7 @@ impl Editor {
     }
 
     pub fn delete(&mut self) {
+        self.scroll_override = None;
         let line_len = self.lines[self.row].chars().count();
         if self.col < line_len {
             let line = &mut self.lines[self.row];
@@ -90,6 +122,7 @@ impl Editor {
     }
 
     pub fn move_left(&mut self) {
+        self.scroll_override = None;
         if self.col > 0 {
             self.col -= 1;
         } else if self.row > 0 {
@@ -99,6 +132,7 @@ impl Editor {
     }
 
     pub fn move_right(&mut self) {
+        self.scroll_override = None;
         let line_len = self.lines[self.row].chars().count();
         if self.col < line_len {
             self.col += 1;
@@ -109,6 +143,7 @@ impl Editor {
     }
 
     pub fn move_up(&mut self) {
+        self.scroll_override = None;
         if self.row == 0 {
             return;
         }
@@ -117,6 +152,7 @@ impl Editor {
     }
 
     pub fn move_down(&mut self) {
+        self.scroll_override = None;
         if self.row + 1 >= self.lines.len() {
             return;
         }
@@ -125,10 +161,12 @@ impl Editor {
     }
 
     pub fn move_home(&mut self) {
+        self.scroll_override = None;
         self.col = 0;
     }
 
     pub fn move_end(&mut self) {
+        self.scroll_override = None;
         self.col = self.lines[self.row].chars().count();
     }
 
@@ -195,7 +233,9 @@ impl Editor {
     }
 
     /// 把折行后的可视坐标映射回字符光标；列落在宽字符中间时定位到该字符前。
+    /// 点击定位即光标移动：清除滚轮滚动覆盖。
     pub fn set_cursor_visual(&mut self, target_row: usize, target_col: usize, width: u16) {
+        self.scroll_override = None;
         let width = width.max(1) as usize;
         let mut visual_row = 0usize;
         for (logical_row, line) in self.lines.iter().enumerate() {
@@ -381,5 +421,39 @@ mod tests {
         assert_eq!(editor.cursor(), (0, 4));
         editor.set_cursor_visual(0, 1, 5);
         assert_eq!(editor.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn wheel_override_scrolls_viewport_until_any_cursor_move() {
+        let mut editor = Editor::new();
+        for ch in "line one\nline two\nline three".chars() {
+            if ch == '\n' {
+                editor.insert_newline();
+            } else {
+                editor.insert_char(ch);
+            }
+        }
+        // 光标在第 3 行（可视行 3），高度 2 → 跟随顶行 = 2。
+        assert_eq!(editor.effective_scroll_top(3, 2), 2);
+        // 滚轮向上偏移 2 行：视口顶 = 0 并钉住（与跟随区分）。
+        editor.scroll_by(-2);
+        assert_eq!(editor.effective_scroll_top(3, 2), 0);
+        // 继续向上滚：不越界为负。
+        editor.scroll_by(-5);
+        assert_eq!(editor.effective_scroll_top(3, 2), 0);
+        // 向下滚回：覆盖偏移生效。
+        editor.scroll_by(2);
+        assert_eq!(editor.effective_scroll_top(3, 2), 2);
+        // 任何光标移动清除覆盖：回到跟随光标。
+        editor.move_up();
+        assert_eq!(editor.effective_scroll_top(2, 2), 1);
+        // 点击定位也清除。
+        editor.scroll_by(-3);
+        editor.set_cursor_visual(0, 0, 80);
+        assert_eq!(editor.effective_scroll_top(0, 2), 0);
+        // 输入与清空同样清除。
+        editor.scroll_by(-3);
+        editor.insert_char('x');
+        assert_eq!(editor.effective_scroll_top(0, 2), 0);
     }
 }

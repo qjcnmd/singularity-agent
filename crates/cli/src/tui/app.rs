@@ -19,6 +19,7 @@ use singularity_runtime::{Conversation, SettingsPatch};
 use super::editor::Editor;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
+use unicode_width::UnicodeWidthStr;
 
 const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
@@ -41,6 +42,41 @@ const COMMANDS: [(&str, &str); 7] = [
     ("/compact", "compact context now"),
     ("/name", "name this session"),
 ];
+
+/// 设置菜单提示：菜单内与状态行提示共用同一文案（行为与提示同源，防漂移）。
+const SETTINGS_MENU_HINT: &str = "Enter apply · Tab next field · Esc close";
+
+/// 滚轮归一化：按事件间隔区分滚轮/触控板并区间加速（参照 Grok 的
+/// `mouse.rs` 简化版——<8ms ×2.5、<20ms ×1.6，其余 ×1.0），小数部分
+/// 累计到下一事件，单次事件有上下限防失控。
+#[derive(Default)]
+pub(crate) struct WheelNormalizer {
+    last: Option<std::time::Instant>,
+    pending: f64,
+}
+
+impl WheelNormalizer {
+    fn rows_for(&mut self, now: std::time::Instant) -> usize {
+        let multiplier = match self.last {
+            Some(last) => {
+                let gap_ms = now.duration_since(last).as_millis();
+                if gap_ms <= 8 {
+                    2.5
+                } else if gap_ms <= 20 {
+                    1.6
+                } else {
+                    1.0
+                }
+            }
+            None => 1.0,
+        };
+        self.last = Some(now);
+        self.pending += WHEEL_ROWS as f64 * multiplier;
+        let rows = self.pending.floor() as usize;
+        self.pending -= rows as f64;
+        rows.clamp(1, 8)
+    }
+}
 
 /// 当前正在等待的对象：驱动状态行的具名活动提示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -158,6 +194,11 @@ pub(crate) struct TuiApp {
     last_viewport_rows: usize,
     last_editor_area: Option<Rect>,
     last_editor_scroll_top: usize,
+    last_status_area: Option<Rect>,
+    /// 状态行 "[stop]" 的可点击列范围（终端坐标；空闲或未渲染时为 None）。
+    last_stop_cols: Option<(u16, u16)>,
+    /// 滚轮归一化状态（滚轮/触控板加速）。
+    wheel: WheelNormalizer,
 }
 
 impl TuiApp {
@@ -186,6 +227,9 @@ impl TuiApp {
             last_viewport_rows: 5,
             last_editor_area: None,
             last_editor_scroll_top: 0,
+            last_status_area: None,
+            last_stop_cols: None,
+            wheel: WheelNormalizer::default(),
         }
     }
 
@@ -506,17 +550,41 @@ impl TuiApp {
         Action::Continue
     }
 
-    /// 鼠标滚轮：向上脱离跟随，向下触底恢复。
-    pub fn handle_wheel(&mut self, up: bool) {
+    /// 鼠标滚轮：指针在输入框内时滚动编辑器视口（光标一动即回跟随），
+    /// 其余滚动会话流；事件间隔触发滚轮/触控板加速（参照 Grok 的滚轮路由）。
+    pub fn handle_wheel(&mut self, up: bool, column: u16, row: u16) {
+        let rows = self.wheel.rows_for(std::time::Instant::now());
+        if let Some(area) = self.last_editor_area {
+            let inside_x = column > area.x && column < area.x.saturating_add(area.width - 1);
+            let inside_y = row > area.y && row < area.y.saturating_add(area.height - 1);
+            if inside_x && inside_y {
+                self.editor
+                    .scroll_by(if up { -(rows as i32) } else { rows as i32 });
+                return;
+            }
+        }
         let (total, viewport) = self.flow_metrics();
         if up {
-            self.scroll.scroll_up(WHEEL_ROWS, total, viewport);
+            self.scroll.scroll_up(rows, total, viewport);
         } else {
-            self.scroll.scroll_down(WHEEL_ROWS, total, viewport);
+            self.scroll.scroll_down(rows, total, viewport);
         }
     }
 
     pub fn handle_click(&mut self, column: u16, row: u16) {
+        // 运行中点击状态行 "[stop]"：中断当前轮（与 Esc 同一路径）。
+        if self.phase != Phase::Idle
+            && let Some(area) = self.last_status_area
+            && let Some((start, end)) = self.last_stop_cols
+            && row == area.y
+            && column >= start
+            && column < end
+        {
+            self.conversation.interrupt();
+            self.phase = Phase::Interrupting;
+            self.set_waiting(WaitingTarget::TerminalConvergence);
+            return;
+        }
         let Some(area) = self.last_editor_area else {
             return;
         };
@@ -702,8 +770,12 @@ impl TuiApp {
             return Action::Continue;
         }
         self.reset_quit_confirm();
-        let action = match self.phase {
+        match self.phase {
             Phase::Idle => {
+                // 新回合 page-flip：视口钉在新内容首行，回复填满一屏后回底
+                // 跟随（参照 Grok 的 follow_new_turn）。
+                let (total, _) = self.flow_metrics();
+                self.scroll.pin_new_content_at(total);
                 self.phase = Phase::Running;
                 self.waiting = WaitingTarget::Model;
                 Action::Submit(text)
@@ -711,13 +783,12 @@ impl TuiApp {
             Phase::Running | Phase::Interrupting => {
                 let accepted = self.conversation.steer(text.clone());
                 self.note_injection("steer", accepted, &text);
+                // steer 注入后回到最新内容（page-flip 只属于新回合）。
+                let (total, viewport) = self.flow_metrics();
+                self.scroll.jump_to_bottom(total, viewport);
                 Action::Continue
             }
-        };
-        // 发送输入后回到最新内容。
-        let (total, viewport) = self.flow_metrics();
-        self.scroll.jump_to_bottom(total, viewport);
-        action
+        }
     }
 
     fn note_injection(&mut self, kind: &str, accepted: bool, text: &str) {
@@ -837,7 +908,8 @@ impl TuiApp {
         let editor_inner_w = editor_area.width.saturating_sub(2).max(1);
         let inner_h = editor_rows.saturating_sub(2) as usize;
         let (visual_row, visual_col) = self.editor.cursor_visual(editor_inner_w);
-        let scroll_top = visual_row.saturating_sub(inner_h.saturating_sub(1));
+        // 滚轮覆盖优先，否则跟随光标。
+        let scroll_top = self.editor.effective_scroll_top(visual_row, inner_h);
         self.last_editor_area = Some(editor_area);
         self.last_editor_scroll_top = scroll_top;
         let mut editor_lines: Vec<Line<'static>> = Vec::new();
@@ -855,6 +927,8 @@ impl TuiApp {
 
         // 状态行 + 提示行。
         let (status_spans, hint_spans) = self.footer_spans(total_rows, viewport);
+        self.last_status_area = Some(status_area);
+        self.last_stop_cols = stop_span_columns(&status_spans, status_area.x);
         frame.render_widget(Paragraph::new(vec![Line::from(status_spans)]), status_area);
         frame.render_widget(Paragraph::new(vec![Line::from(hint_spans)]), hint_area);
 
@@ -902,7 +976,7 @@ impl TuiApp {
             )));
         }
         lines.push(Line::from(Span::styled(
-            "Enter apply · Tab next field · Esc close",
+            SETTINGS_MENU_HINT,
             Style::new().fg(Color::DarkGray),
         )));
         frame.render_widget(
@@ -1042,11 +1116,18 @@ impl TuiApp {
             }
             status.push(Span::styled(" · viewing history", magenta));
         }
+        // 运行中显示可点击的 [stop]（点击 = 中断，参照 Grok 的 turn-status）。
+        if self.phase != Phase::Idle {
+            status.push(Span::styled(
+                "[stop]",
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
 
         let hint_text = if self.quit_armed {
             "press Ctrl+C again to quit"
         } else if self.settings.is_some() {
-            "Esc close · Tab field · Enter apply"
+            SETTINGS_MENU_HINT
         } else if self.resume.is_some() {
             "↑/↓ select · Enter resume · Esc close"
         } else {
@@ -1103,6 +1184,19 @@ fn describe_usage(turn: &singularity_runtime::objects::Turn) -> String {
         ),
         _ => "usage unavailable".to_string(),
     }
+}
+
+/// 状态行中 "[stop]" 可点击区域的列范围（终端坐标；未渲染时返回 None）。
+fn stop_span_columns(spans: &[Span<'_>], origin_x: u16) -> Option<(u16, u16)> {
+    let mut col = origin_x;
+    for span in spans {
+        let width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        if span.content.as_ref() == "[stop]" {
+            return Some((col, col + width));
+        }
+        col += width;
+    }
+    None
 }
 
 fn short_id(id: &str) -> String {
@@ -1436,7 +1530,7 @@ mod tests {
         let hint_text: String = hint.iter().map(|span| span.content.clone()).collect();
         assert!(hint_text.contains("Ctrl+T"), "{hint_text}");
 
-        app.handle_wheel(true);
+        app.handle_wheel(true, 1, 1); // 指针在流区域：滚动会话流
         let (status, _) = app.footer_spans(100, 20);
         let status_text: String = status.iter().map(|span| span.content.clone()).collect();
         assert!(
@@ -1738,5 +1832,119 @@ mod tests {
                 panic!("timed out waiting for interrupted chain finish");
             }
         }
+    }
+
+    // -- 鼠标与滚轮 ----------------------------------------------------------
+
+    #[test]
+    fn wheel_normalizer_accelerates_rapid_events() {
+        let mut normalizer = WheelNormalizer::default();
+        let t0 = std::time::Instant::now();
+        // 首事件：×1.0 → 3 行。
+        assert_eq!(normalizer.rows_for(t0), 3);
+        // 间隔 4ms：×2.5 → 7.5 → 7（余 0.5 累计）。
+        assert_eq!(
+            normalizer.rows_for(t0 + std::time::Duration::from_millis(4)),
+            7
+        );
+        // 间隔 12ms（距上一事件）：×1.6 → 4.8 + 0.5 → 5（余 0.3）。
+        assert_eq!(
+            normalizer.rows_for(t0 + std::time::Duration::from_millis(16)),
+            5
+        );
+        // 间隔 100ms：×1.0 → 3 + 0.3 → 3。
+        assert_eq!(
+            normalizer.rows_for(t0 + std::time::Duration::from_millis(116)),
+            3
+        );
+        // 单次事件有上限。
+        for _ in 0..10 {
+            normalizer.rows_for(t0 + std::time::Duration::from_millis(1));
+        }
+        let now = std::time::Instant::now();
+        assert!(normalizer.rows_for(now) <= 8, "single event capped");
+    }
+
+    #[test]
+    fn wheel_over_editor_scrolls_editor_not_flow() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        for ch in "line one\nline two\nline three".chars() {
+            if ch == '\n' {
+                app.editor.insert_newline();
+            } else {
+                app.editor.insert_char(ch);
+            }
+        }
+        let mut terminal = draw_at(&mut app, 100, 30);
+        let _ = &mut terminal;
+        let editor_area = app.last_editor_area.expect("editor area after draw");
+        let before = app.scroll_snapshot();
+        // 指针在编辑器内滚轮：编辑器视口偏移，会话流不动。
+        app.handle_wheel(true, editor_area.x + 5, editor_area.y + 1);
+        assert!(
+            app.editor.scroll_override().is_some(),
+            "editor scroll override must engage"
+        );
+        assert_eq!(app.scroll_snapshot(), before, "flow scroll untouched");
+        // 指针在编辑器外滚轮：会话流滚动。
+        app.handle_wheel(true, 1, 1);
+        assert_ne!(app.scroll_snapshot(), before, "flow scroll moves");
+    }
+
+    #[test]
+    fn clicking_stop_interrupts_the_running_turn() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.force_phase(Phase::Running);
+        let status_area = ratatui::layout::Rect::new(0, 28, 100, 1);
+        app.last_status_area = Some(status_area);
+        app.last_stop_cols = Some((90, 97));
+        // 命中 [stop]：中断当前轮。
+        app.handle_click(93, status_area.y);
+        assert_eq!(
+            app.phase(),
+            Phase::Interrupting,
+            "click on [stop] interrupts"
+        );
+    }
+
+    #[test]
+    fn clicking_elsewhere_does_not_interrupt() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.force_phase(Phase::Running);
+        app.last_status_area = Some(ratatui::layout::Rect::new(0, 28, 100, 1));
+        app.last_stop_cols = Some((90, 97));
+        // 列在 [stop] 之外：不中断。
+        app.handle_click(10, 28);
+        assert_eq!(app.phase(), Phase::Running);
+        // 空闲态点击 [stop]：不中断。
+        app.force_phase(Phase::Idle);
+        app.handle_click(93, 28);
+        assert_eq!(app.phase(), Phase::Idle);
+    }
+
+    // -- page-flip 提交 ------------------------------------------------------
+
+    #[test]
+    fn idle_submit_pins_new_content_top() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        for index in 1..=30 {
+            app.push_test_note(&format!("note-{index}"));
+        }
+        let (total, _) = app.flow_metrics();
+        for ch in "hello".chars() {
+            app.editor.insert_char(ch);
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(_) => {}
+            other => panic!("expected Submit action, got {other:?}"),
+        }
+        let (follow, top, _) = app.scroll_snapshot();
+        assert!(follow, "page-flip keeps follow semantics");
+        assert_eq!(top, total, "viewport pinned at the new content start");
+        assert_eq!(app.phase(), Phase::Running);
     }
 }

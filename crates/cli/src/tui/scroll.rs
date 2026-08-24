@@ -1,8 +1,9 @@
 //! 会话流滚动状态机：底部跟随与历史浏览两个状态，无中间态。
 //!
 //! 合同：新内容到达时，跟随态钉住最新输出；用户上滚即进入浏览态并统计
-//! 底部新增行数；滚动回底或显式跳转后重新跟随。resize 只做位置钳制，
-//! 不改变跟随语义。
+//! 底部新增行数；滚动回底（过冲手势）或显式跳转后重新跟随。提交新消息
+//! 后进入 page-flip：新内容首行钉在视口顶，填满一屏后自动回底跟随；
+//! 任何用户手势立即解除钉住。resize 只做位置钳制，不改变跟随语义。
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScrollState {
@@ -12,6 +13,10 @@ pub(crate) struct ScrollState {
     top_row: usize,
     /// 浏览态期间底部新增的可视行数（供「N 行新内容」提示）。
     new_below: usize,
+    /// page-flip：提交时刻的流总行数——新内容首行从该行开始显示，
+    /// 视口钉在该行直到新内容填满一屏（参照 Grok 的 reserve-pad）。
+    /// 任何用户滚动手势立即解除。
+    pin_at_total: Option<usize>,
 }
 
 impl Default for ScrollState {
@@ -20,6 +25,7 @@ impl Default for ScrollState {
             follow: true,
             top_row: 0,
             new_below: 0,
+            pin_at_total: None,
         }
     }
 }
@@ -37,10 +43,28 @@ impl ScrollState {
         self.top_row
     }
 
-    /// 内容增长后的收敛：跟随态保持钉底；浏览态累计底部新增并钳制位置。
+    /// 提交新消息后进入 page-flip：视口钉在 `total_rows`（新内容首行），
+    /// 保持跟随语义（状态行不显示浏览提示）。
+    pub fn pin_new_content_at(&mut self, total_rows: usize) {
+        self.follow = true;
+        self.new_below = 0;
+        self.pin_at_total = Some(total_rows);
+        self.top_row = total_rows;
+    }
+
+    /// 内容增长后的收敛：跟随态保持钉底；浏览态累计底部新增并钳制位置；
+    /// page-flip 保持钉顶直到新内容填满一屏。
     pub fn on_content_grow(&mut self, grown_rows: usize, total_rows: usize, viewport: usize) {
         if grown_rows == 0 {
             self.clamp(total_rows, viewport);
+            return;
+        }
+        if let Some(pin) = self.pin_at_total {
+            self.top_row = pin;
+            if total_rows.saturating_sub(pin) >= viewport {
+                self.pin_at_total = None;
+                self.top_row = bottom_top(total_rows, viewport);
+            }
             return;
         }
         if self.follow {
@@ -51,11 +75,12 @@ impl ScrollState {
         }
     }
 
-    /// 上滚 n 行：进入浏览态；已在顶部则停留。
+    /// 上滚 n 行：进入浏览态并解除 page-flip；已在顶部则停留。
     pub fn scroll_up(&mut self, rows: usize, total_rows: usize, viewport: usize) {
         if rows == 0 {
             return;
         }
+        self.pin_at_total = None;
         if self.follow {
             // 从底部脱离：以当前底为锚向上滚。
             self.follow = false;
@@ -67,15 +92,30 @@ impl ScrollState {
         self.clamp(total_rows, viewport);
     }
 
-    /// 下滚 n 行：触及底部时恢复跟随并清零新增计数。
+    /// 下滚 n 行：触及底部时到位但不立即回归——只有下一次滚动（过冲手势）
+    /// 才恢复跟随，防止快速下滚意外进入跟随（参照 Grok 的 overscroll 语义）。
+    /// page-flip 期间下滚：解除钉住，从钉点位置继续滚动。
     pub fn scroll_down(&mut self, rows: usize, total_rows: usize, viewport: usize) {
-        if rows == 0 || self.follow {
+        if rows == 0 {
+            return;
+        }
+        if let Some(pin) = self.pin_at_total.take() {
+            self.top_row = pin;
+            self.follow = false;
+        } else if self.follow {
             return;
         }
         let bottom = bottom_top(total_rows, viewport);
+        if self.top_row >= bottom {
+            // 已到底再滚：过冲 → 回归跟随。
+            self.reattach(total_rows, viewport);
+            return;
+        }
         let candidate = self.top_row.saturating_add(rows);
         if candidate >= bottom {
-            self.reattach(total_rows, viewport);
+            // 恰好落到底部：到位，不回归。
+            self.top_row = bottom;
+            self.new_below = 0;
         } else {
             self.top_row = candidate;
             self.new_below = self.new_below.saturating_sub(rows);
@@ -84,6 +124,7 @@ impl ScrollState {
 
     /// 显式跳转到底部（快捷键 / 发送输入）。
     pub fn jump_to_bottom(&mut self, total_rows: usize, viewport: usize) {
+        self.pin_at_total = None;
         self.follow = true;
         self.new_below = 0;
         self.top_row = bottom_top(total_rows, viewport);
@@ -91,13 +132,24 @@ impl ScrollState {
 
     /// 跳转到内容顶部并进入浏览态；底部新增计数保持（内容确实在下方）。
     pub fn jump_to_top(&mut self) {
+        self.pin_at_total = None;
         self.follow = false;
         self.top_row = 0;
     }
 
-    /// resize 后的位置钳制：不改变跟随语义。
+    /// resize 后的位置钳制：不改变跟随语义；page-flip 在钉点被视口吞没时
+    /// 解除并回底。
     pub fn clamp(&mut self, total_rows: usize, viewport: usize) {
         let max_top = bottom_top(total_rows, viewport);
+        if let Some(pin) = self.pin_at_total {
+            if pin <= max_top {
+                self.top_row = pin;
+            } else {
+                self.pin_at_total = None;
+                self.top_row = max_top;
+            }
+            return;
+        }
         if self.follow {
             self.top_row = max_top;
         } else {
@@ -106,6 +158,7 @@ impl ScrollState {
     }
 
     fn reattach(&mut self, total_rows: usize, viewport: usize) {
+        self.pin_at_total = None;
         self.follow = true;
         self.new_below = 0;
         self.top_row = bottom_top(total_rows, viewport);
@@ -156,10 +209,81 @@ mod tests {
         grow_to(&mut state, 0, 100);
         state.scroll_up(30, 100, VIEW);
         assert!(!state.is_following());
+        // 恰好落到底部：到位但不回归（防止快速下滚误入跟随）。
         state.scroll_down(usize::MAX / 2, 100, VIEW);
+        assert!(!state.is_following());
+        assert_eq!(state.top_row(), 90);
+        // 已到底再滚：过冲手势 → 回归跟随。
+        state.scroll_down(1, 100, VIEW);
         assert!(state.is_following());
         assert_eq!(state.pending_below(), 0);
         assert_eq!(state.top_row(), 90);
+    }
+
+    #[test]
+    fn overscroll_is_required_to_reattach() {
+        let mut state = ScrollState::default();
+        grow_to(&mut state, 0, 100);
+        state.scroll_up(5, 100, VIEW);
+        // 单次滚动恰好到达底部：不回归。
+        state.scroll_down(5, 100, VIEW);
+        assert!(!state.is_following());
+        assert_eq!(state.top_row(), 90);
+        // 底部再滚一格：回归。
+        state.scroll_down(1, 100, VIEW);
+        assert!(state.is_following());
+    }
+
+    #[test]
+    fn page_flip_pins_new_content_until_viewport_fills() {
+        let mut state = ScrollState::default();
+        grow_to(&mut state, 0, 100);
+        state.pin_new_content_at(100);
+        assert!(state.is_following());
+        assert_eq!(state.top_row(), 100);
+        // 新内容未满一屏：保持钉住。
+        grow_to(&mut state, 100, 102);
+        assert_eq!(state.top_row(), 100);
+        grow_to(&mut state, 102, 109);
+        assert_eq!(state.top_row(), 100);
+        // 恰好填满一屏：解除钉住并回底跟随。
+        grow_to(&mut state, 109, 110);
+        assert_eq!(state.top_row(), 100);
+        grow_to(&mut state, 110, 130);
+        assert_eq!(state.top_row(), 120);
+    }
+
+    #[test]
+    fn user_gestures_release_the_page_flip_pin() {
+        let mut state = ScrollState::default();
+        grow_to(&mut state, 0, 100);
+        state.pin_new_content_at(100);
+        state.scroll_up(3, 102, VIEW);
+        assert!(state.pin_at_total.is_none());
+        assert!(!state.is_following());
+
+        state.pin_new_content_at(102);
+        state.scroll_down(1, 102, VIEW);
+        assert!(state.pin_at_total.is_none());
+
+        state.pin_new_content_at(102);
+        state.jump_to_top();
+        assert!(state.pin_at_total.is_none());
+
+        state.pin_new_content_at(102);
+        state.jump_to_bottom(102, VIEW);
+        assert!(state.pin_at_total.is_none());
+    }
+
+    #[test]
+    fn resize_releases_pin_when_viewport_swallows_it() {
+        let mut state = ScrollState::default();
+        grow_to(&mut state, 0, 100);
+        state.pin_new_content_at(100);
+        // 视口巨大（80 行），钉点 100 在最大顶部 20 之下：解除并回底。
+        state.clamp(100, 80);
+        assert!(state.pin_at_total.is_none());
+        assert_eq!(state.top_row(), 20);
     }
 
     #[test]
