@@ -26,7 +26,7 @@
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config/discovery。
 - **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
-- **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。
+- **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
 - **依赖方向**：cli → runtime → {core, model, agent}；app-server → {runtime, protocol}；runtime 与 agent 不依赖 protocol/UI；protocol 类型仅服务 app-server 适配器。
 
 ## 2. 无交互主调用链

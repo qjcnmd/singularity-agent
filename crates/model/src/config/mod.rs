@@ -256,9 +256,10 @@ pub(crate) struct ResolvedProviderValues {
 
 fn configured_model_from_user_file(
     model_file: &UserConfigModel,
+    provider_name: &str,
+    model_name: &str,
+    cache: Option<&crate::catalog::CachedCatalog>,
 ) -> Result<ConfiguredModel, ProviderError> {
-    // 运行时限额只取「持久化值 > 保守默认」：内置表与 models.dev 目录元数据
-    // 不再参与运行时解析（它们只作为 `config add` 录入时的 enrichment 兜底）。
     // api_protocol 必须由用户显式声明。
     let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
@@ -267,12 +268,14 @@ fn configured_model_from_user_file(
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
-    let max_context_tokens = model_file
-        .max_context_tokens
-        .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS);
-    let max_output_tokens = model_file
-        .max_output_tokens
-        .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS);
+    let max_context_tokens = model_file.max_context_tokens.unwrap_or_else(|| {
+        let (ctx, _, _) = crate::catalog::resolve_model_limits(provider_name, model_name, cache);
+        ctx
+    });
+    let max_output_tokens = model_file.max_output_tokens.unwrap_or_else(|| {
+        let (_, out, _) = crate::catalog::resolve_model_limits(provider_name, model_name, cache);
+        out
+    });
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = model_file
@@ -383,6 +386,8 @@ where
         ));
     }
     let mut providers = BTreeMap::new();
+    // 目录投影缓存读取一次供全部模型解析复用（TTL 内、损坏 fail-soft）。
+    let catalog_cache = crate::catalog::CachedCatalog::load_default();
     for (provider_name, provider_file) in &user_config.config.providers {
         if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
             if provider_name.as_str() == default_provider_name {
@@ -423,7 +428,12 @@ where
                 }
                 continue;
             }
-            match configured_model_from_user_file(model_file) {
+            match configured_model_from_user_file(
+                model_file,
+                provider_name,
+                model_name,
+                catalog_cache.as_ref(),
+            ) {
                 Ok(model) => {
                     models.insert(model_name.clone(), model);
                 }
@@ -575,7 +585,6 @@ where
     // depend on two mutable sources and hide an incomplete process setup.
     let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
     if process_layer.any_present() {
-        eprintln!("process environment provider variables override user config layer");
         return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);
     }
     user_config()

@@ -50,6 +50,7 @@ pub(crate) const HTTP_STATUS_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
+pub(crate) mod catalog;
 mod config;
 mod discovery;
 mod error;

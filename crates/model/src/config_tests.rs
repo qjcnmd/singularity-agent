@@ -85,7 +85,7 @@ fn user_model_without_limits_falls_back_to_conservative_defaults() {
         api_protocol: Some("responses".to_string()),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file(&model)
+    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
         .expect("missing limits resolve to conservative defaults");
     assert_eq!(
         resolved.max_context_tokens,
@@ -102,7 +102,8 @@ fn user_declared_limits_win_over_conservative_defaults() {
         max_output_tokens: Some(8_192),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file(&model).expect("user declaration resolves");
+    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
+        .expect("user declaration resolves");
     assert_eq!(resolved.max_context_tokens, Some(64_000));
     assert_eq!(resolved.max_output_tokens, 8_192);
 }
@@ -128,7 +129,7 @@ fn user_model_top_level_limits_project_with_conservative_output_fallback() {
         max_context_tokens: Some(400_000),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file(&model)
+    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
         .expect("top-level and conservative fallback resolve");
     assert_eq!(resolved.max_context_tokens, Some(400_000));
     assert_eq!(resolved.max_output_tokens, crate::DEFAULT_MAX_OUTPUT_TOKENS);
@@ -184,8 +185,8 @@ fn unknown_model_without_limits_resolves_with_conservative_defaults() {
         api_protocol: Some("chat".to_string()),
         ..UserConfigModel::default()
     };
-    let resolved =
-        configured_model_from_user_file(&model).expect("unknown model resolves with defaults");
+    let resolved = configured_model_from_user_file(&model, "test-provider", "unknown-model", None)
+        .expect("unknown model resolves with defaults");
     assert_eq!(
         resolved.max_context_tokens,
         Some(crate::DEFAULT_MAX_CONTEXT_TOKENS)
@@ -200,7 +201,7 @@ fn user_model_override_without_api_protocol_still_fails_closed() {
         max_output_tokens: Some(4_096),
         ..UserConfigModel::default()
     };
-    let error = match configured_model_from_user_file(&model) {
+    let error = match configured_model_from_user_file(&model, "test-provider", "test-model", None) {
         Ok(_) => panic!("api_protocol cannot be guessed"),
         Err(error) => error,
     };

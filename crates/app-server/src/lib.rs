@@ -126,7 +126,6 @@ pub enum TurnFailureCause {
     Workspace,
     ProjectInstructions,
     Serialization,
-    StoredInputUnavailable,
     /// provider/模型边界失败（限流/配额/网络/校验等，见 `ProviderFailureKind`）。
     Provider(ProviderFailureKind),
     Internal,
@@ -139,7 +138,6 @@ impl TurnFailureCause {
             Self::Workspace => "workspace",
             Self::ProjectInstructions => "project_instructions",
             Self::Serialization => "serialization",
-            Self::StoredInputUnavailable => "stored_input_unavailable",
             Self::Provider(kind) => match kind {
                 ProviderFailureKind::RateLimited => "provider_rate_limited",
                 ProviderFailureKind::QuotaExceeded => "provider_quota_exceeded",
@@ -200,8 +198,6 @@ impl From<singularity_runtime::TurnFailureStage> for TurnFailureStage {
         match stage {
             singularity_runtime::TurnFailureStage::AgentLoop => Self::AgentLoop,
             singularity_runtime::TurnFailureStage::TerminalOutcome => Self::TerminalOutcome,
-            // runtime 不再产生该阶段；投影侧事件通知失败已统一为 poisoned 错误。
-            singularity_runtime::TurnFailureStage::EventNotification => Self::AgentLoop,
         }
     }
 }
@@ -210,14 +206,12 @@ impl From<singularity_runtime::TurnFailureStage> for TurnFailureStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnTerminalizationFailure {
     Store,
-    StateChanged,
 }
 
 impl fmt::Display for TurnTerminalizationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Store => "store",
-            Self::StateChanged => "state_changed",
         })
     }
 }

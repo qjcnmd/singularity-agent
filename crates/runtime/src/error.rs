@@ -12,7 +12,6 @@ use thiserror::Error;
 pub enum TurnFailureStage {
     AgentLoop,
     TerminalOutcome,
-    EventNotification,
 }
 
 impl TurnFailureStage {
@@ -20,7 +19,6 @@ impl TurnFailureStage {
         match self {
             Self::AgentLoop => "agent_loop",
             Self::TerminalOutcome => "terminal_outcome",
-            Self::EventNotification => "event_notification",
         }
     }
 }

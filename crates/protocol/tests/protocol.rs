@@ -3,10 +3,9 @@
 use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AgentDiagnosticParams, AppEvent, EmptyParams, InitializeParams, JsonRpcInbound, JsonRpcMessage,
-    Method, MethodKind, ProviderAttemptEventParams, ProviderAttemptSummaryParams, ThreadReadParams,
-    ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams, TurnStatus,
-    parse_json_rpc_payload, rpc_methods,
+    AppEvent, EmptyParams, InitializeParams, JsonRpcInbound, JsonRpcMessage, Method, MethodKind,
+    ThreadReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
+    TurnStatus, parse_json_rpc_payload, rpc_methods,
 };
 
 #[test]
@@ -296,7 +295,7 @@ fn initialize_params_keep_client_info_contract() {
 }
 
 #[test]
-fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
+fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     let diagnostic = AppEvent::agent_diagnostic(
         "thread-1",
         "turn-1",
@@ -304,10 +303,8 @@ fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
         "compaction_skipped",
         "automatic context compaction skipped",
     );
-    let diagnostic_params: AgentDiagnosticParams =
-        serde_json::from_value(diagnostic.params.clone()).expect("diagnostic params");
     assert_eq!(diagnostic.method(), "agent/diagnostic");
-    assert_eq!(diagnostic_params.code, "compaction_skipped");
+    assert_eq!(diagnostic.params["code"], "compaction_skipped");
     assert!(!diagnostic.params.to_string().contains("raw"));
 
     let attempt = AppEvent::provider_attempt(
@@ -326,17 +323,13 @@ fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
         Some("network".to_string()),
         Some("provider_timeout".to_string()),
     );
-    let attempt_params: ProviderAttemptEventParams =
-        serde_json::from_value(attempt.params.clone()).expect("attempt params");
     assert_eq!(attempt.method(), "provider/attempt");
-    assert_eq!(attempt_params.model_turn_ordinal, 2);
-    assert_eq!(attempt_params.retry_scheduled, Some(true));
+    assert_eq!(attempt.params["modelTurnOrdinal"], 2);
+    assert_eq!(attempt.params["retryScheduled"], true);
     assert!(attempt.params.get("raw").is_none());
 
     let summary = AppEvent::provider_attempt_summary("thread-1", "turn-1", 2, 2, 1, 20);
-    let summary_params: ProviderAttemptSummaryParams =
-        serde_json::from_value(summary.params.clone()).expect("summary params");
     assert_eq!(summary.method(), "provider/attempt/summary");
-    assert_eq!(summary_params.attempt_count, 2);
-    assert_eq!(summary_params.latency_ms, 20);
+    assert_eq!(summary.params["attemptCount"], 2);
+    assert_eq!(summary.params["latencyMs"], 20);
 }
