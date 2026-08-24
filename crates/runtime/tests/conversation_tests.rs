@@ -2,11 +2,11 @@
 //! 验证单活动 turn、事件顺序、失败收敛、取消、设置自动生效与
 //! followUp 后续队列合同。
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
-use singularity_agent::session::SessionManager;
-use singularity_agent::session::SessionMetadataKind;
+use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderProtocolContract, ProviderReasoningReplay,
@@ -611,6 +611,42 @@ fn idle_settings_persist_immediately_without_any_turn() {
     assert_eq!(
         conversation.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model")
+    );
+}
+
+#[test]
+fn persisted_selector_keeps_reasoning_effort_across_resume() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let thread_id = "11111111-2222-3333-4444-555555555555";
+
+    // 直接落盘带 reasoning 的 thread_settings metadata，绕过选择器校验，
+    // 聚焦恢复投影的三段保真。
+    let mut session = SessionManager::create_with_id(Path::new("."), &sessions, thread_id)
+        .expect("create session file");
+    session
+        .append_metadata(
+            SessionMetadata::thread_settings(
+                "openai_compatible".to_string(),
+                "base-model".to_string(),
+                Some("high".to_string()),
+            )
+            .expect("thread settings metadata"),
+        )
+        .expect("append settings");
+
+    let resumed = resume_thread(&sessions, thread_id).expect("resume thread");
+    assert_eq!(
+        resumed.model.as_deref(),
+        Some("openai_compatible/base-model#high"),
+        "resume must keep the reasoning effort segment"
+    );
+    let reopened = SessionManager::open_existing(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen session file");
+    assert_eq!(
+        persisted_model_selector(&reopened).as_deref(),
+        Some("openai_compatible/base-model#high"),
+        "persisted selector projection keeps all three segments"
     );
 }
 

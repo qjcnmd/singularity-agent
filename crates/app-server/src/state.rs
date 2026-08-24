@@ -344,8 +344,10 @@ impl AppServer {
     /// 取得（或按 JSONL 重开并修复）Thread 的长驻协调器。
     ///
     /// 进程内首次接触的线程从会话文件重投影（`resume_thread` 同时执行崩溃
-    /// 修复），并把持久化的 settings/状态带回索引行。
+    /// 修复），并把持久化的 settings/状态带回索引行。慢路径持缓存锁完成
+    /// resume+insert，避免并发首次接触产生同一 Thread 的两个协调器。
     pub(crate) fn conversation_for(&self, session_id: &str) -> AppServerResult<Arc<Conversation>> {
+        // 快路径：缓存命中直接返回。
         if let Some(conversation) = self
             .conversations
             .lock()
@@ -353,6 +355,14 @@ impl AppServer {
             .get(session_id)
             .cloned()
         {
+            return Ok(conversation);
+        }
+        // 慢路径：持锁完成重投影与回插；锁内二次检查挡住并发未命中。
+        let mut guard = self
+            .conversations
+            .lock()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        if let Some(conversation) = guard.get(session_id).cloned() {
             return Ok(conversation);
         }
         let thread =
@@ -376,10 +386,7 @@ impl AppServer {
             )
             .ok();
         let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
-        self.conversations
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .insert(session_id.to_string(), Arc::clone(&conversation));
+        guard.insert(session_id.to_string(), Arc::clone(&conversation));
         Ok(conversation)
     }
 

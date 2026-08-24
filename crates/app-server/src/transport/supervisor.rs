@@ -91,10 +91,28 @@ where
     let mut turn_tasks: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut reader = reader;
     let mut terminal_error = None;
+    // 就绪标志置位前到达的 turn/start：暂存通道等待就绪后转流式 lane，
+    // 不落入 ordinary 执行体（ordinary 内联整轮会冻结管理面）。
+    let (pending_tx, mut pending_rx) = mpsc::channel::<JsonRpcMessage>(64);
 
     loop {
         tokio::select! {
             biased;
+            // 就绪后按到达顺序消费挂起的 turn/start（流式 lane）。
+            Some(message) = pending_rx.recv(), if ready_for_turn.load(Ordering::SeqCst) => {
+                if let Err(error) = handle_streaming_turn_start(
+                    message,
+                    &mut turn_factory,
+                    &output_tx,
+                    &cancellation,
+                    &mut turn_tasks,
+                )
+                .await
+                {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
             result = &mut writer, if !writer_done => {
                 writer_done = true;
                 writer_result = Some(result);
@@ -181,78 +199,29 @@ where
                         continue;
                     }
                 };
-                let request_id = message.id().cloned();
-                if is_turn_request(&message) && ready_for_turn.load(Ordering::SeqCst) {
+                if is_turn_request(&message) {
+                    if !ready_for_turn.load(Ordering::SeqCst) {
+                        // 就绪前的 turn/start 暂存等待；就绪后由 select 分支
+                        // 按序转流式 lane，避免在 ordinary 线程内联执行整轮。
+                        pending_tx
+                            .send(message)
+                            .await
+                            .map_err(|_| "pending turn channel closed".to_string())?;
+                        continue;
+                    }
                     // 路由裁定在负载线程启动前同步完成：同线程的第二个
                     // turn/start 在这里立即拿到 invalid-state 响应。
-                    let claim_result = tokio::task::spawn_blocking({
-                        let factory = turn_factory.clone();
-                        let message = message.clone();
-                        move || factory.claim_turn(message)
-                    })
+                    if let Err(error) = handle_streaming_turn_start(
+                        message,
+                        &mut turn_factory,
+                        &output_tx,
+                        &cancellation,
+                        &mut turn_tasks,
+                    )
                     .await
-                    .map_err(|error| format!("turn claim task failed: {error}"))?;
-                    match claim_result {
-                        Err(error) => {
-                            if let Err(send_error) = send_output_async(
-                                output_tx.clone(),
-                                cancellation.clone(),
-                                transport_error_value(request_id, &error),
-                            )
-                            .await
-                            {
-                                terminal_error = Some(send_error);
-                                break;
-                            }
-                        }
-                        Ok(singularity_app_server::TurnClaim::Responded(response)) => {
-                            if let Err(send_error) = send_output_async(
-                                output_tx.clone(),
-                                cancellation.clone(),
-                                response,
-                            )
-                            .await
-                            {
-                                terminal_error = Some(send_error);
-                                break;
-                            }
-                        }
-                        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => {
-                            let task = tokio::task::spawn_blocking(move || {
-                                let worker = turn_factory.turn_worker();
-                                (turn_factory, worker)
-                            });
-                            let (next_factory, worker_result) = match task.await {
-                                Ok(result) => result,
-                                Err(error) => {
-                                    terminal_error =
-                                        Some(format!("turn worker setup failed: {error}"));
-                                    break;
-                                }
-                            };
-                            turn_factory = next_factory;
-                            match worker_result {
-                                Ok(worker) => {
-                                    let worker_outputs = output_tx.clone();
-                                    let worker_cancellation = cancellation.clone();
-                                    turn_tasks.spawn_blocking(move || {
-                                        run_turn_request(worker, worker_outputs, worker_cancellation, claim)
-                                    });
-                                }
-                                Err(error) => {
-                                    if let Err(send_error) = send_output_async(
-                                        output_tx.clone(),
-                                        cancellation.clone(),
-                                        transport_error_value(request_id, &error),
-                                    )
-                                    .await
-                                    {
-                                        terminal_error = Some(send_error);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    {
+                        terminal_error = Some(error);
+                        break;
                     }
                 } else if is_turn_control(&message) && ready_for_turn.load(Ordering::SeqCst) {
                     if let Err(error) = control_tx.try_send(message) {
@@ -404,6 +373,66 @@ where
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+/// 在流式 lane 处理 turn/start：claim 同步裁定（先到先得、后到立即
+/// invalid-state），Accepted 后启动独立 turn worker 执行整条链。
+async fn handle_streaming_turn_start(
+    message: JsonRpcMessage,
+    turn_factory: &mut AppServer,
+    output_tx: &mpsc::Sender<Value>,
+    cancellation: &AppServerCancellationHandle,
+    turn_tasks: &mut tokio::task::JoinSet<Result<(), String>>,
+) -> Result<(), String> {
+    let request_id = message.id().cloned();
+    let claim_result = tokio::task::spawn_blocking({
+        let factory = turn_factory.clone();
+        move || factory.claim_turn(message)
+    })
+    .await
+    .map_err(|error| format!("turn claim task failed: {error}"))?;
+    match claim_result {
+        Err(error) => {
+            send_output_async(
+                output_tx.clone(),
+                cancellation.clone(),
+                transport_error_value(request_id, &error),
+            )
+            .await
+        }
+        Ok(singularity_app_server::TurnClaim::Responded(response)) => {
+            send_output_async(output_tx.clone(), cancellation.clone(), response).await
+        }
+        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => {
+            let factory = turn_factory.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let worker = factory.turn_worker();
+                (factory, worker)
+            });
+            let (next_factory, worker_result) = task
+                .await
+                .map_err(|error| format!("turn worker setup failed: {error}"))?;
+            *turn_factory = next_factory;
+            match worker_result {
+                Ok(worker) => {
+                    let worker_outputs = output_tx.clone();
+                    let worker_cancellation = cancellation.clone();
+                    turn_tasks.spawn_blocking(move || {
+                        run_turn_request(worker, worker_outputs, worker_cancellation, claim)
+                    });
+                    Ok(())
+                }
+                Err(error) => {
+                    send_output_async(
+                        output_tx.clone(),
+                        cancellation.clone(),
+                        transport_error_value(request_id, &error),
+                    )
+                    .await
+                }
+            }
+        }
     }
 }
 

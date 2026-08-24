@@ -17,7 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use singularity_agent::session::SessionManager;
 use support::AppServerProcess;
+use support::send_json;
 
 /// 按脚本顺序服务固定数量 HTTP 请求的 fake provider。
 ///
@@ -620,6 +622,86 @@ fn same_stdio_connection_interrupts_running_tool_turn() {
         tool_terminal["params"]["item"]["itemId"],
         "call_interrupt_0"
     );
+    assert!(
+        provider.errors().is_empty(),
+        "provider worker must be error-free: {:?}",
+        provider.errors()
+    );
+    process.shutdown();
+}
+
+#[test]
+fn pipelined_turn_start_during_ready_window_keeps_ordinary_available() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let home_dir = support::isolated_home();
+    let home = home_dir.path().to_path_buf();
+    // 预创建会话：流水线 turn/start 需要 thread 已存在于 JSONL。
+    let session_id = "aa1b2c3d-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let sessions_dir = home.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("create session");
+    let provider = ScriptedProvider::start(interrupt_responses());
+    let mut process = spawn(&workspace, &home, &provider.base_url);
+
+    // 同步初始化后再发 turn/start。
+    process.send_request(
+        1,
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "app-server-test",
+                "title": "App Server Test",
+                "version": "0.1.0"
+            }
+        }),
+    );
+    let init = process.output.recv_id(1, Duration::from_secs(5));
+    assert_eq!(init["result"]["platformFamily"], "local", "{init}");
+    send_json(
+        &mut process.input,
+        json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+    process.send_request(
+        4,
+        "turn/start",
+        json!({"threadId": session_id, "input": [{"type": "text", "text": "run long tool"}]}),
+    );
+    let turn_id = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "turn/started"
+        })["params"]["turn"]["turnId"]
+        .as_str()
+        .expect("turn id")
+        .to_string();
+    // 长工具（sleep 30）执行开始：turn 正在流式 lane 运行。
+    process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "tool/execution/start"
+                && message["params"]["toolCallId"] == "call_interrupt_0"
+        });
+
+    // 关键断言：长 turn 执行期间 ordinary 管理面仍即时可用。
+    process.send_request(5, "thread/list", json!({}));
+    let list = process.output.recv_id(5, Duration::from_secs(5));
+    assert!(
+        list["result"]["threads"].is_array(),
+        "thread/list must respond while the turn runs on the streaming lane: {list}"
+    );
+
+    // 中断长工具并收敛 turn。
+    process.send_request(6, "turn/interrupt", json!({"turnId": turn_id}));
+    let interrupt = process.output.recv_id(6, Duration::from_secs(5));
+    assert_eq!(interrupt["result"]["status"], "interrupted");
+    let terminal = process
+        .output
+        .recv_where(Duration::from_secs(30), |message| {
+            message["method"] == "turn/completed"
+        });
+    assert_eq!(terminal["params"]["turn"]["status"], "interrupted");
     assert!(
         provider.errors().is_empty(),
         "provider worker must be error-free: {:?}",

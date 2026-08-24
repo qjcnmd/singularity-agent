@@ -177,7 +177,7 @@ pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result
     Ok(())
 }
 
-/// 从最新 `thread_settings` metadata 投影模型 selector。
+/// 从最新 `thread_settings` metadata 投影模型 selector（含推理档位段）。
 pub fn persisted_model_selector(session: &SessionManager) -> Option<String> {
     session.metadata_entries().iter().rev().find_map(|entry| {
         if entry.kind() != SessionMetadataKind::ThreadSettings {
@@ -185,9 +185,15 @@ pub fn persisted_model_selector(session: &SessionManager) -> Option<String> {
         }
         let provider = entry.field_string("provider");
         let model = entry.field_string("model")?;
+        let reasoning = entry
+            .field_string("reasoning")
+            .filter(|value| !value.is_empty());
         Some(match provider {
-            Some(provider) => format!("{provider}/{model}"),
-            None => model.to_string(),
+            Some(provider) => singularity_model::compose_model_selector(provider, model, reasoning),
+            None => match reasoning {
+                Some(reasoning) => format!("{model}#{reasoning}"),
+                None => model.to_string(),
+            },
         })
     })
 }
