@@ -34,7 +34,7 @@ fn executable_user_model() -> UserConfigModel {
 fn user_provider() -> UserConfigProvider {
     UserConfigProvider {
         base_url: "https://example.invalid/v1".to_string(),
-        models: BTreeMap::from([("gpt-test".to_string(), executable_user_model())]),
+        models: BTreeMap::from([("test-model".to_string(), executable_user_model())]),
     }
 }
 
@@ -43,7 +43,7 @@ fn user_config_with_two_providers(auth: UserAuthFile) -> UserConfigData {
         config: UserConfigFile {
             version: 1,
             default_provider: Some("primary".to_string()),
-            default_model: Some("primary/gpt-test".to_string()),
+            default_model: Some("primary/test-model".to_string()),
             providers: BTreeMap::from([
                 ("primary".to_string(), user_provider()),
                 ("secondary".to_string(), user_provider()),
@@ -73,7 +73,7 @@ fn unselected_provider_without_auth_does_not_block_capture() {
     .expect("selected provider is configured");
     assert!(redacted.api_key_present);
     assert!(snapshot.providers["secondary"].provider.is_none());
-    let error = provider_for_selection(&snapshot, Some("secondary/gpt-test"))
+    let error = provider_for_selection(&snapshot, Some("secondary/test-model"))
         .expect_err("missing auth must fail when selected");
     assert_eq!(error.error.kind, ModelErrorKind::AuthError);
     assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
@@ -140,12 +140,12 @@ fn persisted_capability_block_is_rejected() {
     let config = serde_json::json!({
         "version": 1,
         "default_provider": "primary",
-        "default_model": "primary/gpt-test",
+        "default_model": "primary/test-model",
         "providers": {
             "primary": {
                 "base_url": "https://example.invalid/v1",
                 "models": {
-                    "gpt-test": {
+                    "test-model": {
                         "api_protocol": "chat",
                         "max_output_tokens": 2048,
                         "capabilities": {
@@ -485,12 +485,12 @@ fn auth_file_reads_reflect_the_single_credential_file() {
     let config = serde_json::json!({
         "version": 1,
         "default_provider": "primary",
-        "default_model": "primary/gpt-test",
+        "default_model": "primary/test-model",
         "providers": {
             "primary": {
                 "base_url": "https://example.invalid/v1",
                 "models": {
-                    "gpt-test": { "api_protocol": "chat", "max_output_tokens": 2048 }
+                    "test-model": { "api_protocol": "chat", "max_output_tokens": 2048 }
                 }
             }
         }

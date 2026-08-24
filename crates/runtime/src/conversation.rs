@@ -20,7 +20,7 @@ use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
 
 use crate::error::TurnRunError;
-use crate::events::TurnEventSink;
+use crate::events::{TurnEvent, TurnEventSink};
 use crate::objects::{Thread, ThreadStatus, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 
@@ -30,6 +30,18 @@ pub struct SettingsPatch {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
+}
+
+/// [`Conversation::queue_settings`] 的结果：本次修改的生效时点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsApplyTiming {
+    /// 没有可应用的内容（空 patch）。
+    NothingToApply,
+    /// 已立即校验并持久化，内存投影同步更新。
+    AppliedNow,
+    /// 活动 turn 期间只记录了意图；turn 到达可信终态后自动持久化并在
+    /// 下一 turn 生效（持久化结果以 `thread/settingsApplied` 事件发布）。
+    QueuedForNextTurn,
 }
 
 impl SettingsPatch {
@@ -258,10 +270,14 @@ impl Conversation {
     /// 空闲时立即校验并持久化为 `thread_settings` metadata（不改写全局配置）；
     /// 活动 turn 期间只记录一份待生效意图（新 patch 按字段合并覆盖），当前
     /// turn 继续使用启动时的 selector，turn 到达可信终态后由 [`Self::run_turn`]
-    /// 自动持久化并在下一 turn 生效。校验失败立即报错，不进入队列。
-    pub fn queue_settings(&self, patch: SettingsPatch) -> Result<bool, ConversationError> {
+    /// 自动持久化并以 `thread/settingsApplied` 事件发布，下一 turn 生效。
+    /// 校验失败立即报错，不进入队列。返回本次修改的生效时点。
+    pub fn queue_settings(
+        &self,
+        patch: SettingsPatch,
+    ) -> Result<SettingsApplyTiming, ConversationError> {
         if patch.is_empty() {
-            return Ok(false);
+            return Ok(SettingsApplyTiming::NothingToApply);
         }
         // 先用当前投影做即时校验：无效值在提交点就被拒绝，而不是等到终态后。
         self.compose_selector(&patch)?;
@@ -271,13 +287,13 @@ impl Conversation {
                 Some(pending) => pending.merged_with(&patch),
                 None => patch,
             });
-            return Ok(true);
+            return Ok(SettingsApplyTiming::QueuedForNextTurn);
         }
         // 空闲路径与终态后路径共用同一份待生效意图：先入队再立即消费，
         // 持久化失败时意图保留在队列中等待重试。
         state.queued_settings = Some(patch);
         self.persist_pending_settings_locked(&mut state)?;
-        Ok(true)
+        Ok(SettingsApplyTiming::AppliedNow)
     }
 
     /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入与设置。
@@ -343,10 +359,18 @@ impl Conversation {
                     Ok(outcome) => Ok(outcome),
                 };
             }
-            if let Err(error) = self.apply_pending_settings() {
-                // 设置持久化失败：保留该意图与剩余输入，返回可行动错误。
-                self.requeue_follow_ups(queue);
-                return Err(error);
+            // 成功应用后发布投影更新：客户端（app-server 索引同步、TUI
+            // 状态行）据此拿到下一 turn 生效的线程模型。持久化失败时
+            // 保留该意图与剩余输入，返回可行动错误。
+            let applied = match self.apply_pending_settings() {
+                Ok(applied) => applied,
+                Err(error) => {
+                    self.requeue_follow_ups(queue);
+                    return Err(error);
+                }
+            };
+            if let Some(updated) = applied {
+                sink.emit(TurnEvent::ThreadSettingsApplied { thread: updated });
             }
             // 可信终态（completed/failed/interrupted）后继续消费队列；
             // 单轮执行失败不阻断其余已接受的 followUp。
@@ -392,13 +416,15 @@ impl Conversation {
         result.map_err(ConversationError::from)
     }
 
-    /// 终态后应用待生效设置；无待生效意图时为 no-op。
-    fn apply_pending_settings(&self) -> Result<(), ConversationError> {
+    /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回
+    /// `None`（不产生事件）。持久化失败时意图保留在队列中等待重试。
+    fn apply_pending_settings(&self) -> Result<Option<Thread>, ConversationError> {
         let mut state = self.lock_state()?;
         if state.queued_settings.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        self.persist_pending_settings_locked(&mut state)
+        self.persist_pending_settings_locked(&mut state)?;
+        Ok(Some(state.thread.clone()))
     }
 
     /// 校验并把当前待生效意图持久化为 `thread_settings` metadata，

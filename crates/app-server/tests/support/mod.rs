@@ -120,6 +120,11 @@ fn format_exit_status(status: Option<ExitStatus>) -> String {
 }
 
 impl JsonOutput {
+    /// 服务器失败上下文（stderr 与退出状态），供测试断言拼接。
+    pub fn failure_context(&self) -> String {
+        self.diagnostics.failure_context()
+    }
+
     pub fn recv_id(&mut self, id: i64, timeout: Duration) -> Value {
         self.recv_where(timeout, |message| message["id"] == id)
     }
@@ -159,18 +164,39 @@ pub struct AppServerProcess {
 
 impl AppServerProcess {
     pub fn spawn(cwd: &Path, home: &Path, base_url: &str) -> Self {
+        let provider_env: Vec<(&str, &str)> = vec![
+            ("SINGULARITY_MODEL_PROVIDER", "openai_compatible"),
+            ("SINGULARITY_MODEL", "test-model"),
+            ("SINGULARITY_BASE_URL", base_url),
+            ("SINGULARITY_API_KEY", "test-secret"),
+        ];
+        Self::spawn_with_provider_env(cwd, home, &provider_env)
+    }
+
+    /// 变体：通过用户配置目录（`{home}/config.json` + `{home}/auth.v1.json`）
+    /// 提供 provider 选择，不注入 SINGULARITY_MODEL/BASE_URL/API_KEY——
+    /// 环境层会覆盖用户配置层，注入这些变量会把快照打回单模型 legacy 形态。
+    pub fn spawn_with_user_config(cwd: &Path, home: &Path) -> Self {
+        Self::spawn_with_provider_env(cwd, home, &[])
+    }
+
+    fn spawn_with_provider_env(cwd: &Path, home: &Path, provider_env: &[(&str, &str)]) -> Self {
         let binary = app_server_bin();
         let mut command = Command::new(&binary);
         command
             .current_dir(cwd)
             .env("SINGULARITY_HOME", home)
-            .env("SINGULARITY_MODEL_PROVIDER", "openai_compatible")
-            .env("SINGULARITY_MODEL", "gpt-test")
-            .env("SINGULARITY_BASE_URL", base_url)
-            .env("SINGULARITY_API_KEY", "test-secret")
+            // 防止宿主环境泄漏覆盖用户配置层。
+            .env_remove("SINGULARITY_MODEL_PROVIDER")
+            .env_remove("SINGULARITY_MODEL")
+            .env_remove("SINGULARITY_BASE_URL")
+            .env_remove("SINGULARITY_API_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in provider_env {
+            command.env(name, value);
+        }
         let mut child = command.spawn().unwrap_or_else(|error| {
             panic!(
                 "spawn app-server failed: binary={} cwd={} SINGULARITY_HOME={} error={error}",

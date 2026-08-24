@@ -517,12 +517,17 @@ pub struct ThreadSettingsParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// thread/settings 的脱敏结果；不包含 key、header 或其他认证材料。
+///
+/// `queued` 表示修改发生在活动轮期间：已接受但尚未持久化，
+/// turn 到达可信终态后由 runtime 自动落盘并在下一 turn 生效。
 pub struct ThreadSettingsResult {
     pub thread_id: String,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub updated: bool,
+    #[serde(default)]
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

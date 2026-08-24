@@ -25,7 +25,8 @@ pub mod runner;
 pub mod store;
 
 pub use conversation::{
-    Conversation, ConversationError, SettingsPatch, TurnControls, TurnReservation,
+    Conversation, ConversationError, SettingsApplyTiming, SettingsPatch, TurnControls,
+    TurnReservation,
 };
 pub use error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,

@@ -19,19 +19,19 @@ fn model_turn_request_serializes_provider_boundary_fields() {
 #[test]
 fn model_discovery_skips_invalid_model_entries_without_failing_the_catalog() {
     let tolerated_payloads = [
-        ("missing id", r#"{"data":[{"id":"gpt-valid"},{}]}"#),
-        ("empty id", r#"{"data":[{"id":"gpt-valid"},{"id":""}]}"#),
+        ("missing id", r#"{"data":[{"id":"entry-valid"},{}]}"#),
+        ("empty id", r#"{"data":[{"id":"entry-valid"},{"id":""}]}"#),
         (
             "whitespace id",
-            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt invalid"}]}"#,
+            r#"{"data":[{"id":"entry-valid"},{"id":"entry invalid"}]}"#,
         ),
         (
             "control character id",
-            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt\ninvalid"}]}"#,
+            r#"{"data":[{"id":"entry-valid"},{"id":"entry\ninvalid"}]}"#,
         ),
         (
             "duplicate id",
-            r#"{"data":[{"id":"gpt-valid"},{"id":"gpt-valid"}]}"#,
+            r#"{"data":[{"id":"entry-valid"},{"id":"entry-valid"}]}"#,
         ),
     ];
     for (label, payload) in tolerated_payloads {
@@ -39,7 +39,7 @@ fn model_discovery_skips_invalid_model_entries_without_failing_the_catalog() {
         let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
         assert_eq!(
             provider.discover_model_ids().expect(label),
-            vec!["gpt-valid"],
+            vec!["entry-valid"],
             "the valid sibling entry must survive: {label}"
         );
         assert!(
@@ -55,11 +55,11 @@ fn model_discovery_skips_invalid_model_entries_without_failing_the_catalog() {
 #[test]
 fn model_discovery_accepts_complete_unique_model_entries() {
     let (base_url, request) =
-        models_server(r#"{"data":[{"id":"gpt-test"},{"id":"o4-mini"}]}"#.to_string());
+        models_server(r#"{"data":[{"id":"test-model"},{"id":"test-model-b"}]}"#.to_string());
     let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
     assert_eq!(
         provider.discover_model_ids().expect("complete catalog"),
-        vec!["gpt-test", "o4-mini"]
+        vec!["test-model", "test-model-b"]
     );
     assert!(
         request
@@ -115,7 +115,7 @@ fn model_turn_schema_excludes_runtime_and_trace_metadata() {
 fn provider_config_validation_reports_missing_boundary_fields() {
     let result = validate_provider_config(&ModelProviderConfig {
         provider_name: None,
-        model_name: Some("gpt-test".to_string()),
+        model_name: Some("test-model".to_string()),
         base_url_present: false,
         api_key_present: false,
     });
@@ -188,10 +188,10 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
 #[test]
 fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
     for (name, malformed) in [
-        ("SINGULARITY_MODEL", "gpt-test\r"),
+        ("SINGULARITY_MODEL", "test-model\r"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1\r"),
         ("SINGULARITY_API_KEY", "test-key-placeholder\r"),
-        ("SINGULARITY_MODEL", "gpt\n-test"),
+        ("SINGULARITY_MODEL", "test-model\n"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1\0"),
     ] {
         let snapshot = ProviderConfigSnapshot::capture(
@@ -199,7 +199,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
                 "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
                     malformed.to_string()
                 } else {
-                    "gpt-test".to_string()
+                    "test-model".to_string()
                 }),
                 "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
                     malformed.to_string()
@@ -244,7 +244,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
 #[test]
 fn process_env_provider_values_reject_boundary_whitespace() {
     for (name, malformed) in [
-        ("SINGULARITY_MODEL", " gpt-test"),
+        ("SINGULARITY_MODEL", " test-model"),
         ("SINGULARITY_BASE_URL", "https://provider.example/v1 "),
         ("SINGULARITY_API_KEY", "test-key-placeholder\t"),
     ] {
@@ -252,7 +252,7 @@ fn process_env_provider_values_reject_boundary_whitespace() {
             "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
                 malformed.to_string()
             } else {
-                "gpt-test".to_string()
+                "test-model".to_string()
             }),
             "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
                 malformed.to_string()
@@ -385,7 +385,7 @@ fn openai_provider_config_uses_endpoint_rules() {
     );
 
     let config = OpenAiProviderConfig::from_env(|name| match name {
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_MODEL" => Some("test-model".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
@@ -400,7 +400,7 @@ fn openai_provider_config_uses_endpoint_rules() {
 fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_transport() {
     let error = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL_PROVIDER" => Some("unregistered_provider".to_string()),
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_MODEL" => Some("test-model".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
@@ -427,7 +427,7 @@ fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_tran
 #[test]
 fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let default_config = OpenAiProviderConfig::from_env(|name| match name {
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_MODEL" => Some("test-model".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         _ => None,
@@ -449,7 +449,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     );
 
     let configured = OpenAiProviderConfig::from_env(|name| match name {
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_MODEL" => Some("test-model".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("131072".to_string()),
@@ -475,7 +475,7 @@ fn provider_limit_validation_has_bounded_secret_free_errors() {
         ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "not-a-token-limit"),
     ] {
         let result = OpenAiProviderConfig::from_env(|candidate| match candidate {
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_MODEL" => Some("test-model".to_string()),
             "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
             "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             candidate if candidate == name => Some(value.to_string()),
@@ -497,7 +497,7 @@ fn removed_tool_capability_envs_are_not_read_or_parsed() {
             "SINGULARITY_MODEL_MAX_TOOL_CALLS" | "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA"
         ));
         match name {
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_MODEL" => Some("test-model".to_string()),
             "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
             "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
@@ -511,7 +511,7 @@ fn removed_tool_capability_envs_are_not_read_or_parsed() {
 #[test]
 fn provider_rejects_output_limit_that_cannot_fit_the_context_window() {
     let error = OpenAiProviderConfig::from_env(|name| match name {
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_MODEL" => Some("test-model".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("4096".to_string()),
@@ -910,7 +910,7 @@ fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model(
     );
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_MODEL" => Some("test-model".to_string()),
             "SINGULARITY_BASE_URL" => Some(base_url.clone()),
             "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
             _ => None,
@@ -1326,13 +1326,13 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     };
     let provider_config = ModelProviderConfig {
         provider_name: Some("openai_compatible".to_string()),
-        model_name: Some("gpt-test".to_string()),
+        model_name: Some("test-model".to_string()),
         base_url_present: true,
         api_key_present: true,
     };
     let model_error = ModelError::new(ModelErrorKind::Timeout, "provider timed out")
         .with_provider("openai_compatible")
-        .with_model("gpt-test");
+        .with_model("test-model");
     let attempt_metadata = ProviderAttemptMetadata {
         attempt_count: 3,
         retry_count: 2,

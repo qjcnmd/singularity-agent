@@ -168,7 +168,8 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     let mut settings_writer = SessionManager::open(&file).unwrap();
     let s1 = settings_writer
         .append_metadata(
-            SessionMetadata::thread_settings("openai", "gpt-4o", Some("high".to_string())).unwrap(),
+            SessionMetadata::thread_settings("openai", "test-model", Some("high".to_string()))
+                .unwrap(),
         )
         .unwrap();
     drop(settings_writer);
@@ -404,7 +405,7 @@ fn build_session_context_projects_messages_around_thread_settings() {
     let lines = [
         r#"{"type":"session","version":1,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
         r#"{"type":"message","id":"aaaa1111","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
-        r#"{"type":"metadata","id":"bbbb2222","timestamp":"2026-08-20T00:00:02.000Z","metadataType":"thread_settings","provider":"openai","model":"gpt-4o"}"#,
+        r#"{"type":"metadata","id":"bbbb2222","timestamp":"2026-08-20T00:00:02.000Z","metadataType":"thread_settings","provider":"openai","model":"test-model"}"#,
         r#"{"type":"message","id":"dddd4444","timestamp":"2026-08-20T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}"#,
     ];
     std::fs::write(&file, lines.join("\n")).unwrap();

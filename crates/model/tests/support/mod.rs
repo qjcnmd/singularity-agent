@@ -166,7 +166,7 @@ pub(crate) fn provider_auto_test_config(base_url: String) -> OpenAiProviderConfi
 pub(crate) fn provider_config_with_base_url(base_url: String) -> OpenAiProviderConfig {
     OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
-        model_name: "gpt-test".to_string(),
+        model_name: "test-model".to_string(),
         base_url,
         api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,

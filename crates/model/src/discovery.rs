@@ -145,20 +145,20 @@ mod tests {
     #[test]
     fn malformed_entries_are_skipped_without_failing_discovery() {
         let parsed = parse_discovery_payload(&payload(serde_json::json!([
-            { "id": "gpt-valid" },
+            { "id": "entry-valid" },
             {},
             { "id": 42 },
             { "id": "" },
             { "id": "has space" },
-            { "id": "gpt-valid" },
+            { "id": "entry-valid" },
             { "other": true },
-            { "id": "gpt-also-valid" }
+            { "id": "entry-also-valid" }
         ])))
         .expect("valid entries survive malformed siblings");
 
         assert_eq!(
             parsed,
-            vec!["gpt-valid".to_string(), "gpt-also-valid".to_string()]
+            vec!["entry-valid".to_string(), "entry-also-valid".to_string()]
         );
     }
 

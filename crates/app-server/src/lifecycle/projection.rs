@@ -247,6 +247,21 @@ impl TurnEventSink for TurnProjection<'_> {
             TurnEvent::ThreadStarted { thread } => {
                 self.emit_notification(AppEvent::thread_started(&protocol_thread(&thread)));
             }
+            // 待生效设置已在可信终态后持久化：JSONL 先落盘，此处同步索引
+            // model 投影，随后客户端读到的 thread/list 与 session/read 一致。
+            TurnEvent::ThreadSettingsApplied { thread } => {
+                let metadata = SessionMetadataUpdate {
+                    model: Some(thread.model.as_deref()),
+                    ..SessionMetadataUpdate::default()
+                };
+                if let Err(error) = self
+                    .server
+                    .store()
+                    .update_session(&thread.thread_id, metadata)
+                {
+                    self.poison_or(AppServerError::Store(error));
+                }
+            }
             TurnEvent::ItemStarted {
                 thread_id,
                 turn_id,

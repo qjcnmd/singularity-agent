@@ -317,7 +317,7 @@ fn typed_diagnostic_and_provider_attempt_events_have_safe_params() {
         2,
         "completion",
         "openai",
-        "gpt-test",
+        "test-model",
         "open_ai_responses",
         1,
         "error",

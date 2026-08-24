@@ -29,8 +29,8 @@ use portable_pty::{CommandBuilder, PtySize};
 
 /// 累计输出上限：超过后只保留前缀，避免长会话撑爆内存。
 const OUTPUT_CAP: usize = 2 << 20;
-/// 失败上下文里展示的终端尾部字节数。
-const CONTEXT_TAIL: usize = 256 << 10;
+/// 失败上下文里展示的终端尾部字节数（去控制序列后有界）。
+const CONTEXT_TAIL: usize = 4 << 10;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn pty_system() -> Box<dyn portable_pty::PtySystem> {

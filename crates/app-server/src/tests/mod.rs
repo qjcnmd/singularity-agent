@@ -33,7 +33,7 @@ fn app_server(store: SessionIndex, sessions_dir: &Path) -> AppServer {
         ProviderConfigSnapshot::capture(
             |name| match name {
                 "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_MODEL" => Some("test-model".to_string()),
                 "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,
@@ -66,7 +66,7 @@ fn insert_session(server: &AppServer, sessions_dir: &Path, session_id: &str, cwd
             rollout_path: session.path().to_string_lossy().to_string(),
             cwd: cwd.to_string_lossy().to_string(),
             title: None,
-            model: Some("gpt-test".to_string()),
+            model: Some("test-model".to_string()),
             status: None,
             created_at,
             updated_at: now_iso(),
@@ -435,7 +435,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
                 "params": {
                     "threadId": thread_id,
                     "provider": "openai_compatible",
-                    "model": "gpt-test",
+                    "model": "test-model",
                 },
             })
             .to_string(),
@@ -443,7 +443,10 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
         .expect("settings");
     assert_eq!(settings[0]["result"]["updated"], true);
     let record = server.store().get_session(&thread_id).expect("record");
-    assert_eq!(record.model.as_deref(), Some("openai_compatible/gpt-test"));
+    assert_eq!(
+        record.model.as_deref(),
+        Some("openai_compatible/test-model")
+    );
     server
         .store()
         .rebuild_from_sessions_dir(&sessions_dir)
@@ -455,7 +458,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
             .unwrap()
             .model
             .as_deref(),
-        Some("openai_compatible/gpt-test")
+        Some("openai_compatible/test-model")
     );
     let rollout = std::fs::read_to_string(record.rollout_path).expect("rollout");
     assert!(rollout.contains("thread_settings"));
@@ -1986,7 +1989,7 @@ fn seed_turned_session(
         .append_metadata(
             singularity_agent::session::SessionMetadata::thread_settings(
                 "openai_compatible",
-                "gpt-test",
+                "test-model",
                 None,
             )
             .expect("settings"),
@@ -2242,7 +2245,7 @@ fn project_turn_history_groups_boundaries_and_marks_leftovers() {
         .append_metadata(
             singularity_agent::session::SessionMetadata::thread_settings(
                 "openai_compatible",
-                "gpt-test",
+                "test-model",
                 None,
             )
             .expect("settings"),

@@ -283,7 +283,7 @@ fn find_cut_point_metadata_scan() {
         id: "m0000001".to_string(),
         timestamp: None,
         entry_type: SessionEntryType::Metadata(
-            SessionMetadata::thread_settings("openai", "gpt-4o", None).unwrap(),
+            SessionMetadata::thread_settings("openai", "test-model", None).unwrap(),
         ),
     };
     let mut entries = vec![thread_settings];

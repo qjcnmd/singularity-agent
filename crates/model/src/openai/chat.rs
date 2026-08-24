@@ -675,7 +675,7 @@ mod replay_binding_tests {
     fn replay_test_config() -> OpenAiProviderConfig {
         OpenAiProviderConfig {
             provider_name: "openai_compatible".to_string(),
-            model_name: "chat".to_string(),
+            model_name: "test-model".to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
             api_key: "test-key-placeholder".to_string(),
             source: ProviderConfigSource::ProcessEnvironment,
@@ -727,7 +727,7 @@ mod replay_binding_tests {
             &replay_test_config(),
             reasoning_tool_call_payload(),
             &ProviderProtocolContract::default(),
-            "chat",
+            "test-model",
             None,
         )
         .expect("parse response with reasoning_content");
@@ -750,13 +750,13 @@ mod replay_binding_tests {
         assert!(replay.is_valid());
         assert!(replay.is_compatible_with(
             "openai_compatible",
-            "chat",
+            "test-model",
             None,
             ProviderToolReasoningMode::ReplayReasoningContent
         ));
         assert!(!replay.is_compatible_with(
             "openai_compatible",
-            "chat",
+            "test-model",
             Some("high"),
             ProviderToolReasoningMode::ReplayReasoningContent
         ));
@@ -771,7 +771,7 @@ mod replay_binding_tests {
             &replay_test_config(),
             reasoning_tool_call_payload(),
             &ProviderProtocolContract::default(),
-            "chat",
+            "test-model",
             Some("high"),
         )
         .expect("parse response with reasoning_content");
@@ -785,7 +785,7 @@ mod replay_binding_tests {
         }
         let disabled = ProviderReasoningReplay::Chat {
             provider_name: "openai_compatible".to_string(),
-            model_name: "chat".to_string(),
+            model_name: "test-model".to_string(),
             reasoning_effort: Some("off".to_string()),
             tool_call_ids: vec!["call_1".to_string()],
             reasoning_content: "opaque".to_string(),

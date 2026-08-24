@@ -264,6 +264,7 @@ impl AppServer {
         }
         let selector = compose_model_selector(&provider, &model, reasoning.as_deref());
         self.validate_model_selector(Some(&selector))?;
+        let mut queued = false;
         if changed {
             // JSONL 先落盘（协调器负责校验与持久化），随后同步索引投影。
             let conversation = self.conversation_for(&record.session_id)?;
@@ -272,24 +273,39 @@ impl AppServer {
                 model: Some(model.clone()),
                 reasoning: reasoning.clone(),
             };
-            if let Err(error) = conversation.queue_settings(patch) {
-                let message = match error {
-                    singularity_runtime::ConversationError::Settings(message) => {
-                        format!("invalid model selector: {message}")
+            let timing = match conversation.queue_settings(patch) {
+                Ok(timing) => timing,
+                Err(error) => {
+                    let message = match error {
+                        singularity_runtime::ConversationError::Settings(message) => {
+                            format!("invalid model selector: {message}")
+                        }
+                        other => other.to_string(),
+                    };
+                    return Err(AppServerError::InvalidParams(message));
+                }
+            };
+            match timing {
+                // 空闲路径：内存投影已更新，直接同步索引。
+                singularity_runtime::SettingsApplyTiming::AppliedNow => {
+                    let updated_model = conversation.thread().ok().and_then(|t| t.model);
+                    if let Some(updated_model) = updated_model {
+                        self.store.update_session(
+                            &record.session_id,
+                            SessionMetadataUpdate {
+                                model: Some(Some(&updated_model)),
+                                ..SessionMetadataUpdate::default()
+                            },
+                        )?;
                     }
-                    other => other.to_string(),
-                };
-                return Err(AppServerError::InvalidParams(message));
-            }
-            let updated_model = conversation.thread().ok().and_then(|t| t.model);
-            if let Some(updated_model) = updated_model {
-                self.store.update_session(
-                    &record.session_id,
-                    SessionMetadataUpdate {
-                        model: Some(Some(&updated_model)),
-                        ..SessionMetadataUpdate::default()
-                    },
-                )?;
+                }
+                // 活动轮路径：索引保持旧 model；终态后由 runtime 的
+                // settingsApplied 事件驱动索引同步，避免客户端读到
+                // 尚未持久化的投影。
+                singularity_runtime::SettingsApplyTiming::QueuedForNextTurn => {
+                    queued = true;
+                }
+                singularity_runtime::SettingsApplyTiming::NothingToApply => {}
             }
         }
         json_response(
@@ -300,6 +316,7 @@ impl AppServer {
                 model: Some(model),
                 reasoning,
                 updated: changed,
+                queued,
             },
         )
     }

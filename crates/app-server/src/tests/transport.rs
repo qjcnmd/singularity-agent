@@ -450,7 +450,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_MODEL" => Some("test-model".to_string()),
             "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
             "SINGULARITY_API_KEY" => Some("test-key".to_string()),
             _ => None,
@@ -659,7 +659,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             rollout_path: session.path().to_string_lossy().to_string(),
             cwd: workspace.to_string_lossy().to_string(),
             title: None,
-            model: Some("gpt-test".to_string()),
+            model: Some("test-model".to_string()),
             status: None,
             created_at: "2026-08-20T00:00:00Z".to_string(),
             updated_at: "2026-08-20T00:00:00Z".to_string(),
@@ -677,7 +677,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         let snapshot = ProviderConfigSnapshot::capture(
             |name| match name {
                 "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_MODEL" => Some("test-model".to_string()),
                 "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,
@@ -838,7 +838,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     let new_snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_MODEL" => Some("test-model".to_string()),
             "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
             "SINGULARITY_API_KEY" => Some("test-key".to_string()),
             _ => None,
@@ -889,7 +889,7 @@ fn insert_session_record(store: &SessionIndex, session_id: &str, rollout_path: &
             rollout_path: rollout_path.to_string_lossy().to_string(),
             cwd: cwd.to_string_lossy().to_string(),
             title: None,
-            model: Some("gpt-test".to_string()),
+            model: Some("test-model".to_string()),
             status: None,
             created_at: "2026-08-20T00:00:00Z".to_string(),
             updated_at: "2026-08-20T00:00:00Z".to_string(),
@@ -930,7 +930,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
         let snapshot = ProviderConfigSnapshot::capture(
             |name| match name {
                 "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-                "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+                "SINGULARITY_MODEL" => Some("test-model".to_string()),
                 "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
                 "SINGULARITY_API_KEY" => Some("test-key".to_string()),
                 _ => None,

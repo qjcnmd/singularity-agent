@@ -106,6 +106,10 @@ pub enum TurnEvent {
         turn: Turn,
         error: TurnErrorDetail,
     },
+    /// 待生效设置已在可信终态后持久化并更新线程投影（下一 turn 生效）。
+    ThreadSettingsApplied {
+        thread: Thread,
+    },
 }
 
 /// 终态失败的分类信息；message 已经过脱敏边界处理。
@@ -134,6 +138,7 @@ impl TurnEvent {
             Self::ProviderAttemptSummary { .. } => "provider/attempt/summary",
             Self::TurnCompleted { .. } => "turn/completed",
             Self::TurnFailed { .. } => "turn/error",
+            Self::ThreadSettingsApplied { .. } => "thread/settingsApplied",
         }
     }
 }

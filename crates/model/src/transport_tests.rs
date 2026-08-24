@@ -61,7 +61,7 @@ fn tool_result_message(call_id: &str, text: &str) -> ModelMessage {
 fn selected_provider() -> OpenAiProvider {
     let config = OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
-        model_name: "gpt-test".to_string(),
+        model_name: "test-model".to_string(),
         base_url: "http://127.0.0.1:1/v1".to_string(),
         api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
@@ -71,7 +71,7 @@ fn selected_provider() -> OpenAiProvider {
     test_provider(config)
         .expect("provider")
         .with_selected_model(SelectedModel {
-            model_name: "gpt-test".to_string(),
+            model_name: "test-model".to_string(),
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -122,7 +122,7 @@ fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
     request.model_preferences.model_name = Some("provider/model#on".to_string());
     request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
         provider_name: "openai_compatible".to_string(),
-        model_name: "gpt-test".to_string(),
+        model_name: "test-model".to_string(),
         reasoning_effort: Some("on".to_string()),
         tool_call_ids: vec!["fresh_call".to_string()],
         reasoning_content: "reasoning for fresh".to_string(),
@@ -137,7 +137,7 @@ fn validate_reasoning_history_allows_unbound_legacy_tool_message() {
         request.provider_reasoning_history[0].clone(),
         ProviderReasoningReplay::Chat {
             provider_name: "openai_compatible".to_string(),
-            model_name: "gpt-test".to_string(),
+            model_name: "test-model".to_string(),
             reasoning_effort: Some("on".to_string()),
             tool_call_ids: vec!["fresh_call".to_string()],
             reasoning_content: "another replay for fresh".to_string(),
@@ -220,7 +220,7 @@ fn provider_retry_backoff_uses_full_jitter_window() {
 fn test_provider_config(base_url: String) -> OpenAiProviderConfig {
     OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
-        model_name: "gpt-test".to_string(),
+        model_name: "test-model".to_string(),
         base_url,
         api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
@@ -324,7 +324,7 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
     let provider = test_provider_with_timeout(
         OpenAiProviderConfig {
             provider_name: "openai_compatible".to_string(),
-            model_name: "gpt-test".to_string(),
+            model_name: "test-model".to_string(),
             base_url: format!("http://{address}"),
             api_key: "test-key-placeholder".to_string(),
             source: ProviderConfigSource::ProcessEnvironment,
@@ -416,7 +416,7 @@ fn oversized_success_body_is_rejected_before_buffering() {
     });
     let provider = test_provider(OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
-        model_name: "gpt-test".to_string(),
+        model_name: "test-model".to_string(),
         base_url: format!("http://{address}"),
         api_key: "test-key-placeholder".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
@@ -626,7 +626,7 @@ fn streaming_response_timeout_is_idle_not_total() {
         test_provider_with_timeout(test_provider_config(format!("http://{address}/v1")), 1)
             .expect("provider")
             .with_selected_model(SelectedModel {
-                model_name: "gpt-test".to_string(),
+                model_name: "test-model".to_string(),
                 api_protocol: ProviderApiProtocol::OpenAiResponses,
                 max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -671,7 +671,7 @@ fn protocol_contract_exposes_selected_tool_reasoning_mode() {
     let provider = test_provider(config)
         .expect("provider")
         .with_selected_model(SelectedModel {
-            model_name: "gpt-test".to_string(),
+            model_name: "test-model".to_string(),
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,

@@ -281,6 +281,9 @@ impl TuiApp {
                 );
                 self.set_waiting(WaitingTarget::TerminalConvergence);
             }
+            // 待生效设置已在可信终态后应用：状态行与后续 turn 自会反映新
+            // selector，无需额外文案（提交点已提示过生效时点）。
+            TurnEvent::ThreadSettingsApplied { .. } => {}
         }
     }
 
@@ -364,8 +367,12 @@ impl TuiApp {
                 KeyCode::Enter => {
                     let patch = menu.patch();
                     match self.conversation.queue_settings(patch) {
-                        Ok(true) => {
-                            let queued_now = self.phase != Phase::Idle;
+                        Ok(singularity_runtime::SettingsApplyTiming::NothingToApply) => {
+                            menu.error = Some("nothing to change".into());
+                        }
+                        Ok(timing) => {
+                            let queued_now = timing
+                                == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn;
                             self.transcript.push_note(
                                 if queued_now {
                                     "settings queued; effective from the next turn"
@@ -376,7 +383,6 @@ impl TuiApp {
                             );
                             self.settings = None;
                         }
-                        Ok(false) => menu.error = Some("nothing to change".into()),
                         Err(error) => menu.error = Some(error.to_string()),
                     }
                 }

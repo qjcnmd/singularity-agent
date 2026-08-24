@@ -86,7 +86,7 @@ fn openai_responses_stream_aggregates_deltas_and_ignores_ping_after_completion()
         ProviderAttemptOperationPhase::Completion
     );
     assert_eq!(occurrence.provider_name, "openai_compatible");
-    assert_eq!(occurrence.model_name, "gpt-test");
+    assert_eq!(occurrence.model_name, "test-model");
     assert_eq!(
         occurrence.actual_api_protocol,
         ProviderApiProtocol::OpenAiResponses

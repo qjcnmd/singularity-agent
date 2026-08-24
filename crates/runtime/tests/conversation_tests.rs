@@ -15,7 +15,7 @@ use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::{ThreadStatus, TurnStatus};
 use singularity_runtime::runner::{TurnOutcome, TurnRunner};
 use singularity_runtime::store::{create_thread, persisted_model_selector, resume_thread};
-use singularity_runtime::{Conversation, ConversationError, SettingsPatch};
+use singularity_runtime::{Conversation, ConversationError, SettingsApplyTiming, SettingsPatch};
 
 fn temp_sessions() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("temp home");
@@ -114,9 +114,12 @@ impl Provider for RecordingProvider {
 }
 
 /// 在 provider 内部挂起直到外部放行，制造确定的活动 turn 窗口；同时记录请求。
+/// `requested` 在请求到达 provider 时置位——会话已在准备阶段打开，此后
+/// 对 JSONL 的改动不会影响本轮执行，只影响终态后的重新打开。
 struct GatedRecordingProvider {
     release: std::sync::Mutex<mpsc::Receiver<()>>,
     log: Arc<RequestLog>,
+    requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Provider for GatedRecordingProvider {
@@ -129,6 +132,8 @@ impl Provider for GatedRecordingProvider {
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self
             .release
             .lock()
@@ -141,6 +146,16 @@ impl Provider for GatedRecordingProvider {
             "ok",
         ))
     }
+}
+
+fn wait_for_requested(requested: &std::sync::atomic::AtomicBool) {
+    for _ in 0..400 {
+        if requested.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("provider should have received the request");
 }
 
 struct FailingProvider;
@@ -179,11 +194,12 @@ fn collected_turn_ids(sink_log: &[&'static str]) -> usize {
     sink_log.iter().filter(|m| **m == "turn/started").count()
 }
 
-/// 收集 turn/started 事件的完整 turn id 序列。
+/// 收集 turn/started 事件的完整 turn id 序列与 settingsApplied 投影。
 #[derive(Clone, Default)]
 struct EventCollector {
     methods: Arc<std::sync::Mutex<Vec<&'static str>>>,
     started_turn_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    applied_threads: Arc<std::sync::Mutex<Vec<singularity_runtime::Thread>>>,
 }
 
 impl EventCollector {
@@ -194,6 +210,13 @@ impl EventCollector {
                     .lock()
                     .expect("ids")
                     .push(turn.turn_id.clone());
+                self.methods.lock().expect("methods").push(event.method());
+            }
+            TurnEvent::ThreadSettingsApplied { thread } => {
+                self.applied_threads
+                    .lock()
+                    .expect("applied threads")
+                    .push(thread.clone());
                 self.methods.lock().expect("methods").push(event.method());
             }
             _ => self.methods.lock().expect("methods").push(event.method()),
@@ -303,6 +326,7 @@ fn only_one_turn_may_be_active_at_a_time() {
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::new(RequestLog::default()),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         None,
     ));
@@ -413,6 +437,7 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::clone(&log),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         Some("base-model"),
     ));
@@ -440,21 +465,21 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
     );
 
     // 活动 turn 期间：合法 patch 只记录意图，不落盘、不改内存投影。
-    // 两次部分修改按字段合并为一份待生效意图。
+    // 两次部分修改按字段合并为一份待生效意图；返回值说明生效时点。
     let queued = shared
         .queue_settings(SettingsPatch {
             model: Some("base-model".to_string()),
             ..SettingsPatch::default()
         })
         .expect("queue first patch");
-    assert!(queued);
+    assert_eq!(queued, SettingsApplyTiming::QueuedForNextTurn);
     let queued = shared
         .queue_settings(SettingsPatch {
             provider: Some("openai_compatible".to_string()),
             ..SettingsPatch::default()
         })
         .expect("queue second patch");
-    assert!(queued);
+    assert_eq!(queued, SettingsApplyTiming::QueuedForNextTurn);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("base-model"),
@@ -530,7 +555,7 @@ fn idle_settings_persist_immediately_without_any_turn() {
             ..SettingsPatch::default()
         })
         .expect("apply while idle");
-    assert!(updated);
+    assert_eq!(updated, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
         1,
@@ -538,6 +563,184 @@ fn idle_settings_persist_immediately_without_any_turn() {
     );
     assert_eq!(
         conversation.thread().unwrap().model.as_deref(),
+        Some("openai_compatible/base-model")
+    );
+}
+
+#[test]
+fn queued_settings_publish_settings_applied_event_after_terminal() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (release_tx, release_rx) = mpsc::channel();
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(GatedRecordingProvider {
+            release: std::sync::Mutex::new(release_rx),
+            log: Arc::new(RequestLog::default()),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+        Some("base-model"),
+    ));
+    let collector = EventCollector::default();
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        let collector = collector.clone();
+        std::thread::spawn(move || {
+            let mut sink = collector.sink();
+            shared.run_turn("first turn", &mut sink)
+        })
+    };
+    wait_for_active(&shared);
+    shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue during turn");
+
+    release_tx.send(()).expect("release");
+    turn_thread.join().expect("join").expect("turn ok");
+
+    // 事件发生在可信终态之后，且携带应用后的线程投影。
+    let methods = collector.methods.lock().unwrap().clone();
+    let applied_at = methods
+        .iter()
+        .position(|method| *method == "thread/settingsApplied")
+        .expect("settings applied event emitted");
+    let completed_at = methods
+        .iter()
+        .position(|method| *method == "turn/completed")
+        .expect("terminal event emitted");
+    assert!(
+        applied_at > completed_at,
+        "settingsApplied must follow the trusted terminal"
+    );
+    let applied_thread = collector
+        .applied_threads
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("applied thread captured");
+    assert_eq!(
+        applied_thread.model.as_deref(),
+        Some("openai_compatible/base-model"),
+        "event carries the applied projection"
+    );
+}
+
+#[test]
+fn empty_settings_patch_reports_nothing_to_apply() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(RecordingProvider {
+            text: "ok".into(),
+            log: Arc::new(RequestLog::default()),
+        }),
+        None,
+    );
+    assert_eq!(
+        conversation
+            .queue_settings(SettingsPatch::default())
+            .expect("empty patch is accepted without persistence"),
+        SettingsApplyTiming::NothingToApply
+    );
+    assert_eq!(
+        thread_settings_count(&sessions, &conversation.thread().unwrap().thread_id),
+        0,
+        "nothing to apply must not touch the JSONL"
+    );
+}
+
+#[test]
+fn settings_persistence_failure_keeps_intent_and_fails_run() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (release_tx, release_rx) = mpsc::channel();
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(GatedRecordingProvider {
+            release: std::sync::Mutex::new(release_rx),
+            log: Arc::new(RequestLog::default()),
+            requested: Arc::clone(&requested),
+        }),
+        Some("base-model"),
+    ));
+    let thread_id = shared.thread().unwrap().thread_id;
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+
+    // 在 sink 回调里让 JSONL 变为只读：会话复用每次写盘都重新打开文件，
+    // 但运行中的 turn 全部写入（终态 metadata 等）都在 turn/completed 事件
+    // 之前完成；本窗口只截断紧随其后的设置持久化重开，其余写入不受影响。
+    let readonly_at_terminal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let turn_readonly = Arc::clone(&readonly_at_terminal);
+    let sink_path = path.clone();
+    let sink = move |event: TurnEvent| {
+        if matches!(event, TurnEvent::TurnCompleted { .. }) {
+            let metadata = std::fs::metadata(&sink_path).expect("jsonl exists");
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&sink_path, permissions).expect("make jsonl readonly");
+            turn_readonly.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut sink = sink;
+            shared.run_turn("first turn", &mut sink)
+        })
+    };
+    wait_for_requested(&requested);
+    shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue during turn");
+
+    release_tx.send(()).expect("release");
+    let result = turn_thread.join().expect("join");
+    let error = result.expect_err("settings persistence failure must fail the run");
+    assert!(
+        matches!(error, ConversationError::Settings(_)),
+        "expected a settings persistence error, got {error:?}"
+    );
+    assert!(
+        readonly_at_terminal.load(std::sync::atomic::Ordering::SeqCst),
+        "the readonly window must have been armed by the terminal event"
+    );
+
+    // 意图保留：线程投影未更新，JSONL 没有 thread_settings 记录。
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
+        Some("base-model"),
+        "intent stays queued; projection keeps the old selector"
+    );
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        0,
+        "no thread_settings metadata was persisted"
+    );
+
+    // 恢复可写后同一意图可被继续消费（下一 turn 的终态路径或空闲重提）。
+    let mut permissions = std::fs::metadata(&path).expect("jsonl").permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).expect("restore writable");
+    let timing = shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("re-apply after restore");
+    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model")
     );
 }
@@ -557,6 +760,7 @@ fn follow_up_runs_exactly_once_as_a_distinct_new_turn() {
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::clone(&log),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         Some("openai_compatible/base-model"),
     ));
@@ -625,6 +829,7 @@ fn multiple_follow_ups_execute_in_fifo_order_once_each() {
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::clone(&log),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         Some("openai_compatible/base-model"),
     ));
@@ -668,6 +873,7 @@ fn steer_affects_only_the_current_turn() {
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::clone(&log),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         Some("openai_compatible/base-model"),
     ));

@@ -233,7 +233,7 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     let serialized_metadata = serde_json::to_string(metadata).expect("serialize attempt aggregate");
     assert!(!serialized_metadata.contains("occurrences"));
     assert!(!serialized_metadata.contains("openai_compatible"));
-    assert!(!serialized_metadata.contains("gpt-test"));
+    assert!(!serialized_metadata.contains("test-model"));
 }
 
 #[test]
@@ -478,7 +478,7 @@ fn provider_status_reports_required_env_missing_blocker() {
 fn model_errors_classify_provider_failures_by_typed_cause_without_transport_calls() {
     let auth = ModelError::new(ModelErrorKind::AuthError, "Provider returned HTTP 401.")
         .with_provider("openai_compatible")
-        .with_model("gpt-test");
+        .with_model("test-model");
 
     assert_eq!(
         classify_model_error(&auth),
@@ -493,7 +493,7 @@ fn model_errors_classify_provider_failures_by_typed_cause_without_transport_call
 
     let model_missing = ModelError::new(
         ModelErrorKind::InvalidRequest,
-        "model gpt-missing does not exist",
+        "model entry-missing does not exist",
     );
 
     assert_eq!(model_missing.category(), ModelErrorCategory::InvalidRequest);
@@ -518,7 +518,7 @@ fn model_errors_classify_provider_failures_by_typed_cause_without_transport_call
 #[test]
 fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes() {
     let mut request = ModelTurnRequest::new("request_1", vec![]);
-    request.model_preferences.model_name = Some("gpt-test".to_string());
+    request.model_preferences.model_name = Some("test-model".to_string());
 
     let request_result = validate_model_request(&request);
     assert!(!request_result.valid);
@@ -578,7 +578,7 @@ fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history(
 fn model_error_serializes_redacted_boundary_fields() {
     let mut failure = ModelError::new(ModelErrorKind::Timeout, "provider transport failed")
         .with_provider("openai_compatible")
-        .with_model("gpt-test");
+        .with_model("test-model");
     failure.timeout_seconds = Some(120);
 
     let value = serde_json::to_value(&failure).expect("serialize provider failure");
@@ -586,7 +586,7 @@ fn model_error_serializes_redacted_boundary_fields() {
     assert_eq!(value["kind"], "timeout");
     assert_eq!(value["timeout_seconds"], 120);
     assert_eq!(value["provider_name"], "openai_compatible");
-    assert_eq!(value["model_name"], "gpt-test");
+    assert_eq!(value["model_name"], "test-model");
     assert!(!value.to_string().contains("sk-"));
 }
 
