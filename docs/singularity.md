@@ -58,7 +58,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影；app-server 据此把索引行的 model 同步到已落盘值。空闲路径无此事件（提交点内已立即持久化）。
 
-`--json` 行形状为 `{"method": <名>, "params": <camelCase payload>}`；终态行为
+`--json` 行形状为 `{"method": <名>, "params": <TurnEvent 字段，snake_case>}`；终态行为
 `{"summary":{"thread":{"threadId"},"turn":{"threadId","status","usage"}}}`，
 其中 `status ∈ completed|failed|interrupted`，`usage` 含 input/output/total/cached/reasoning tokens 与 `usagePresent/usageComplete`。外部评估器仅依赖该 summary 合同。
 
