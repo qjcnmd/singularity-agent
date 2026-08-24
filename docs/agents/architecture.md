@@ -30,5 +30,5 @@ crates/app-server（stdio JSON-RPC 适配器）
 
 - 同一 Thread 至多一个活动 turn 链：`Conversation::reserve_start` 原子预订链窗口；app-server 在 worker 线程启动前同步裁定 turn/start（先到先得，后到立即 invalid-state 响应），TUI/headless 同走该入口。
 - 取消与转向按轮独立：interrupt 只取消当前轮；已接受的 followUp 在可信终态后继续执行；steer 只注入当前轮 inbox。
-- 设置时序：活动期间 `queue_settings` 合并为单份意图，轮终态收敛后自动校验并持久化，下一轮生效；无公开手工应用接口。
+- 设置时序：空闲 `queue_settings` 立即校验并持久化（`AppliedNow`）；活动期间合并为单份意图（`QueuedForNextTurn`），轮终态收敛后自动校验并持久化，随后以 `thread/settingsApplied` 事件发布投影，下一轮生效；无公开手工应用接口。app-server 在排队返回 `queued=true` 时不改写索引（索引任何时刻只含已落盘值），终态后随该事件同步模型。
 - 终态化：JSONL 落盘（有界重试一次）在前，事件与索引投影在后；无法落盘时 fail-stop（storage_fatal 诊断），不发布虚假终态。

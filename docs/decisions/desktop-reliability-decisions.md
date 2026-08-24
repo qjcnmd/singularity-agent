@@ -192,6 +192,10 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 问题：既有裁决（D-011 持久事实与发布顺序、D-016 thread 设置存储、D-031 usage 持久化、D-035 thread 模型投影、D-037 索引修复）以 SQLite 会话索引为前提；该 store 层独立于 JSONL 唯一权威之外形成第二落盘事实，增加崩溃恢复与修复路径。参考实现：无（项目内部收敛）。当前代码事实：会话正文 JSONL 是唯一权威，进程内 `SessionIndex` 启动时从 JSONL 重建；SQLite store 层已删除。选择：会话索引只存在于进程内（定位与展示元数据缓存，启动重建、退出不落盘），不再有第二持久化索引；D-011/D-016/D-031/D-035/D-037 中「先写 JSONL 再更新 SQLite 索引」的时序语义由「先写 JSONL 再更新进程内索引」承接，其余不变。影响：无索引修复路径、无 SQLite 依赖；`session/delete` 只删 JSONL 与备份。验收方式：删除 SQLite store 层与依赖；JSONL 唯一权威链路（终态事件通知前完成写盘 + 索引更新）测试全绿。
 
+### D-048：活动轮设置时序与索引一致性（D-030/D-035 的落地形态）
+
+问题：活动轮期间 `thread/settings` 若立即改写索引，线程列表会读到尚未落盘的投影；若只排队，终态后索引无人同步，模型展示永远滞后。参考实现：无（项目内部收敛）。当前代码事实：`queue_settings` 返回 `SettingsApplyTiming`（`AppliedNow`/`QueuedForNextTurn`/`NothingToApply`）；活动轮只合并单份意图，可信终态后自动持久化并以 `thread/settingsApplied` 事件发布更新投影；持久化失败保留意图并返回 Settings 错误。选择：生效时点由协调器唯一裁定（客户端不再用自身相位猜测），索引任何时刻只读已落盘值——排队时 `thread/settings` 返回 `queued=true` 且索引保持旧值，终态后随事件同步。影响：`thread/list` 与 `session/read` 的模型字段永不领先 JSONL；协议结果新增 `queued` 字段（additive）。验收方式：运行时时序与持久化失败契约测试、app-server 进程级集成测试（活动轮排队→索引不变→终态后收敛）。
+
 ## 参考实现
 
 - Pi：小核心、Agent Loop、Session JSONL、compaction、工具输出截断与临时 spill。
@@ -203,6 +207,6 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 后续每次用户裁决追加新的 \`D-xxx\` 条目，并注明：问题、参考实现、当前代码事实、选择、影响和验收方式。若新证据推翻旧裁决，不删除旧条目，而是追加修正条目并标注取代关系。
 
-### D-047：共享运行时硬切 + app-server 委托（演进 D-047：双入口硬切与进程内共享运行时）
+### D-047：共享运行时硬切 + app-server 委托
 
-问题：产品入口由 CLI、TUI 与后续 GUI 三种消费形态组成，若各自实现 turn 执行会造成多套状态机与事件投影漂移；此前 app-server 内维护并行 turn 管线，与 runtime 的 Conversation/TurnRunner 形成第二执行体。参考实现：Pi 的单次执行入口与 AgentSession 复用、Codex 的 thread/turn/item 分层与「设置下一轮生效」。当前代码事实：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立、设置终态后自动应用）；CLI 无参数进入 TUI，--print/--json 单次执行；app-server 是 stdio JSON-RPC 适配器，turn/start 经 Conversation 预订同步裁定并发（先到先得、后到立即 invalid-state），worker 线程以预订执行整条链，事件由适配器 1:1 映射 typed TurnEvent 为协议通知，控制 lane（steer/followUp/interrupt）、设置与删除全部路由到共享 Conversation。选择：客户端形态（TUI / headless / app-server）一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol 与适配器，runtime 不依赖 protocol/UI；app-server 的并行管线与重复 helper 全部删除，以适配器测试证明协议事件名/字段/终态/取消/会话恢复无漂移。影响：执行、并发裁定与恢复语义只有 runtime 一个事实源；TUI/headless/app-server 三者共享同一 Conversation 链（含 followUp 队列与设置时序）；协议契约由 app-server 适配器测试维护。验收方式：runtime 行为测试（预订互斥、单活动 turn、失败收敛、中断、设置时序、followUp 恰一次）、app-server 适配器+协议合同测试（事件名/字段/终态/取消/恢复不漂移）、CLI 双入口合同、TUI 状态/布局/输入测试、进程级 stdio 并发 turn 冲突测试与真实 TTY e2e。
+问题：产品用户面由无交互（`--print`/`--json`）与 TUI 两种入口组成，app-server 是富客户端接入接口而不是第三种用户入口；若各形态各自实现 turn 执行会造成多套状态机与事件投影漂移；此前 app-server 内维护并行 turn 管线，与 runtime 的 Conversation/TurnRunner 形成第二执行体。参考实现：Pi 的单次执行入口与 AgentSession 复用、Codex 的 thread/turn/item 分层与「设置下一轮生效」。当前代码事实：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立、设置终态后自动应用）；CLI 无参数进入 TUI，--print/--json 单次执行；app-server 是 stdio JSON-RPC 适配器，turn/start 经 Conversation 预订同步裁定并发（先到先得、后到立即 invalid-state），worker 线程以预订执行整条链，事件由适配器 1:1 映射 typed TurnEvent 为协议通知，控制 lane（steer/followUp/interrupt）、设置与删除全部路由到共享 Conversation。选择：客户端形态（TUI / headless / app-server）一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol 与适配器，runtime 不依赖 protocol/UI；app-server 的并行管线与重复 helper 全部删除，以适配器测试证明协议事件名/字段/终态/取消/会话恢复无漂移。影响：执行、并发裁定与恢复语义只有 runtime 一个事实源；TUI/headless/app-server 三者共享同一 Conversation 链（含 followUp 队列与设置时序）；协议契约由 app-server 适配器测试维护。验收方式：runtime 行为测试（预订互斥、单活动 turn、失败收敛、中断、设置时序、followUp 恰一次）、app-server 适配器+协议合同测试（事件名/字段/终态/取消/恢复不漂移）、CLI 双入口合同、TUI 状态/布局/输入测试、进程级 stdio 并发 turn 冲突测试与真实 TTY e2e。
