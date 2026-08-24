@@ -1,5 +1,5 @@
 //! 真实 PTY 上的流式端到端测试：在 ConPTY（Windows）/ forkpty（Unix）中启动
-//! `sg` 交互模式，验证启动渲染、键入回显、Esc 阶梯、滚轮、Ctrl+C 中断/强退、
+//! `sg` 交互模式，验证启动渲染、键入回显、Esc 阶梯与停止、滚轮、Ctrl+C 退出、
 //! 退出码与终端恢复。断言针对真实终端输出字节流。
 //!
 //! 装置契约：
@@ -483,7 +483,7 @@ fn pty_harness_streams_ordinary_child_output_in_real_time() {
 // TUI 启动与基本交互
 // ---------------------------------------------------------------------------
 
-/// 启动后能在子进程存活期间实时看到输入框、idle 状态与当前输入模式；
+/// 启动后能在子进程存活期间实时看到输入框与 idle 状态；
 /// 空闲两次 Ctrl+C 以退出码 0 干净终止，随后终端已恢复（行规程回显）。
 #[test]
 fn tui_boots_idle_and_renders_input_frame() {
@@ -493,11 +493,8 @@ fn tui_boots_idle_and_renders_input_frame() {
     };
     let since = session.must_see_since(&rendered("input"), 0, "editor frame");
     let since = session.must_see_since(&rendered("idle"), since, "idle status line");
-    session.must_see_since(
-        &rendered("[steer]"),
-        since,
-        "steer input mode is the default",
-    );
+    session.send_keys(b"/session\r");
+    session.must_see_since(&rendered("0 turns"), since, "slash session command runs");
 
     // 空闲 Ctrl+C 状态机：第一次出现再确认提示（armed），第二次以 0 退出。
     session.send_keys(b"\x03");
@@ -521,7 +518,7 @@ fn tui_boots_idle_and_renders_input_frame() {
 }
 
 // ---------------------------------------------------------------------------
-// 活动 turn 的 Ctrl+C 语义（真实流式 Provider）
+// 活动 turn 的 Esc 停止与 Ctrl+C 退出（真实流式 Provider）
 // ---------------------------------------------------------------------------
 
 /// 本地 Chat SSE 流式服务器：对每个请求持续发送内容 delta（`Hold`），
@@ -745,7 +742,7 @@ fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
     String::from_utf8(body).ok()
 }
 
-/// 运行中第一次 Ctrl+C 中断当前轮；已接受的 followUp 在可信终态后作为新
+/// 运行中 Esc 中断当前轮；已接受的 followUp 在可信终态后作为新
 /// turn 执行；链结束后空闲两次 Ctrl+C 正常退出（退出码 0）。
 ///
 /// 输入时间线按本机 ConPTY 的送达特性编排：独立写入的按键之间保持
@@ -754,7 +751,7 @@ fn read_request_body(stream: &mut std::net::TcpStream) -> Option<String> {
 /// 验证（与启动测试同一可靠窗口），运行中 Enter 路由以 steer 注入断言。
 /// followUp 队列与链式执行语义由 runtime 与 TUI 单元测试覆盖。
 #[test]
-fn tui_first_ctrl_c_interrupts_turn_then_clean_exit() {
+fn tui_escape_interrupts_turn_then_clean_exit() {
     let provider = StreamingProvider::start(vec![Mode::Hold]);
     let mut session = match PtySession::spawn_with_base_url(Some(&provider.base_url)) {
         Ok(session) => session,
@@ -784,13 +781,13 @@ fn tui_first_ctrl_c_interrupts_turn_then_clean_exit() {
         3,
     );
 
-    // 运行中第一次 Ctrl+C：中断当前轮，链条收敛后回到 idle；
+    // 运行中 Esc：中断当前轮，链条收敛后回到 idle；
     // 没有排队 followUp，Provider 只收到一个请求。
     let after_note = session.press_until_seen(
-        b"\x03",
+        b"\x1b",
         since,
         &rendered("turn interrupted"),
-        "first Ctrl+C interrupts the turn",
+        "Esc interrupts the turn",
         3,
     );
     // 收敛帧内 note 与 idle 状态行同一 chunk 到达：从 note 结束偏移起等待。
@@ -809,9 +806,9 @@ fn tui_first_ctrl_c_interrupts_turn_then_clean_exit() {
     session.press_quit_and_exit("clean exit after interrupt", 0);
 }
 
-/// 活动 turn 中连续两次 Ctrl+C：强制退出，退出码 130。
+/// 活动 turn 中连续两次 Ctrl+C：以退出码 0 正常退出。
 #[test]
-fn tui_double_ctrl_c_force_exits_active_turn_with_130() {
+fn tui_double_ctrl_c_exits_active_turn_with_zero() {
     let provider = StreamingProvider::start(vec![Mode::Hold]);
     let mut session = match PtySession::spawn_with_base_url(Some(&provider.base_url)) {
         Ok(session) => session,
@@ -839,14 +836,10 @@ fn tui_double_ctrl_c_force_exits_active_turn_with_130() {
         );
     }
 
-    // 同一排空周期内两次 Ctrl+C：第一次中断、第二次强制退出（130）。
+    // 同一排空周期内两次 Ctrl+C：第一次确认、第二次正常退出。
     session.send_keys(b"\x03\x03");
-    let status = session.must_exit("forced exit");
-    assert_eq!(
-        status.exit_code(),
-        130,
-        "double Ctrl+C while running exits 130"
-    );
+    let status = session.must_exit("normal exit");
+    assert_eq!(status.exit_code(), 0, "double Ctrl+C while running exits 0");
 }
 
 /// 键入回显与 Esc 阶梯在真实 PTY 上可观察：Esc 清空非空草稿（Provider
@@ -884,10 +877,10 @@ fn tui_typed_goals_and_esc_staircase_reach_the_provider() {
 
     // 中断第一轮：链收敛回 idle（最后一轮为 interrupted，出现收敛提示）。
     let after_first_note = session.press_until_seen(
-        b"\x03",
+        b"\x1b",
         stream_mark,
         &rendered("turn interrupted"),
-        "first Ctrl+C interrupts the first turn",
+        "Esc interrupts the first turn",
         3,
     );
     assert!(
@@ -934,10 +927,10 @@ fn tui_typed_goals_and_esc_staircase_reach_the_provider() {
 
     // 中断当前轮，链收敛后空闲两次 Ctrl+C 干净退出。
     let after_second_note = session.press_until_seen(
-        b"\x03",
+        b"\x1b",
         second_mark,
         &rendered("turn interrupted"),
-        "first Ctrl+C interrupts the second turn",
+        "Esc interrupts the second turn",
         3,
     );
     assert!(

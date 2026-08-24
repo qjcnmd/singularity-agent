@@ -61,7 +61,7 @@ SINGULARITY_MODEL=your-model-name
 }
 ```
 
-TUI 内可用 Ctrl+S 设置菜单为当前 Thread 选择 provider/model/reasoning（活动 turn 期间排队到该轮结束后生效）；不提供 provider 注册、认证或全局配置编辑面。可选环境变量 `SINGULARITY_MODEL_CONTEXT_TOKENS` / `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 覆盖限额，默认 128000/4096。
+TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的 provider/model/reasoning（活动 turn 期间排队到该轮结束后生效）。`/resume`、`/new`、`/session`、`/compact` 与 `/name` 管理会话。TUI 不编辑 provider 注册、认证或全局配置。可选环境变量 `SINGULARITY_MODEL_CONTEXT_TOKENS` / `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 覆盖限额，默认 128000/4096。
 
 ## 使用
 
@@ -69,6 +69,7 @@ TUI 内可用 Ctrl+S 设置菜单为当前 Thread 选择 provider/model/reasonin
 
 ```powershell
 sg
+sg --session <thread-id>
 ```
 
 无交互模式（goal 是必需位置参数）：

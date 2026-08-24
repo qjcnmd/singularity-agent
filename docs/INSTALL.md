@@ -82,7 +82,7 @@ SINGULARITY_MODEL=your-model-name
 
 可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 与最大输出 token 数；默认 `128000` / `4096`，最大输出必须严格小于 context window。配置值不会被静默 trim 或纠正：含控制字符或首尾空白的必填值以 `provider_configuration_invalid` fail closed。
 
-TUI 内可用 Ctrl+S 为当前 Thread 选择 provider/model/reasoning（写入该 Thread 元数据；活动 turn 期间排队到本轮结束后生效）。provider 注册、认证与全局限额编辑不进入 TUI。
+TUI 内用 `/model` 或 `/settings` 为当前 Thread 选择 provider/model/reasoning（写入该 Thread 元数据；活动 turn 期间排队到本轮结束后生效）。provider 注册、认证与全局限额编辑不进入 TUI。
 
 ## 运行
 
@@ -90,6 +90,7 @@ TUI 内可用 Ctrl+S 为当前 Thread 选择 provider/model/reasoning（写入�
 
 ```powershell
 sg
+sg --session <thread-id>
 ```
 
 无交互模式（goal 是必需位置参数）：
@@ -106,7 +107,7 @@ sg --json "检查当前项目并完成一项可验证的修改" --model dashscop
 
 会话正文位于 `%USERPROFILE%\.singularity\sessions\<uuid>.jsonl`（唯一持久事实源）；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
-第一次 Ctrl+C 中断当前 turn，第二次强制退出；无交互模式以退出码 0/130/1 表示 completed/interrupted/failed。
+无交互模式中，第一次 Ctrl+C 中断当前 turn，第二次强制退出；退出码 0/130/1 分别表示 completed/interrupted/failed。TUI 用 Esc 停止生成；Ctrl+C 先清空输入并确认退出，再按一次以退出码 0 退出。
 
 ## 更新与卸载
 

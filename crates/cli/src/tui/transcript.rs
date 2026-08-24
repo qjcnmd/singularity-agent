@@ -11,6 +11,24 @@ use unicode_width::UnicodeWidthStr;
 const TOOL_RESULT_PREVIEW_LINES: usize = 3;
 /// 展开态下的结果行上限：防超长输出撑爆视口。
 const TOOL_RESULT_EXPANDED_LINES: usize = 100;
+const TOOL_COMPLETION_FLASH: std::time::Duration = std::time::Duration::from_millis(400);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolDisplay {
+    Collapsed,
+    Truncated,
+    Full,
+}
+
+impl ToolDisplay {
+    fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Truncated,
+            Self::Truncated => Self::Full,
+            Self::Full => Self::Collapsed,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoteStyle {
@@ -50,7 +68,8 @@ enum ToolState {
     Done {
         output: String,
         is_error: bool,
-        expanded: bool,
+        display: ToolDisplay,
+        completed_at: std::time::Instant,
     },
 }
 
@@ -68,6 +87,7 @@ impl ToolItem {
 #[derive(Debug)]
 pub(crate) enum FlowItem {
     Text { style: NoteStyle, text: String },
+    Thinking(String),
     Tool(ToolItem),
 }
 
@@ -77,6 +97,7 @@ pub(crate) struct Transcript {
     items: Vec<FlowItem>,
     assistant_buffer: String,
     assistant_active: bool,
+    thinking_collapsed: bool,
 }
 
 impl Transcript {
@@ -100,6 +121,19 @@ impl Transcript {
             self.assistant_active = true;
         }
         self.assistant_buffer.push_str(delta);
+    }
+
+    pub fn push_thinking(&mut self, text: impl Into<String>) {
+        self.flush_assistant();
+        self.items.push(FlowItem::Thinking(text.into()));
+    }
+
+    pub fn toggle_thinking(&mut self) {
+        self.thinking_collapsed = !self.thinking_collapsed;
+    }
+
+    pub fn thinking_collapsed(&self) -> bool {
+        self.thinking_collapsed
     }
 
     /// 落定当前 assistant 段落（若有）。
@@ -147,7 +181,8 @@ impl Transcript {
                 item.state = ToolState::Done {
                     output: result.to_string(),
                     is_error,
-                    expanded: false,
+                    display: ToolDisplay::Truncated,
+                    completed_at: std::time::Instant::now(),
                 };
             }
         } else {
@@ -159,7 +194,8 @@ impl Transcript {
                 state: ToolState::Done {
                     output: result.to_string(),
                     is_error,
-                    expanded: false,
+                    display: ToolDisplay::Truncated,
+                    completed_at: std::time::Instant::now(),
                 },
             }));
         }
@@ -170,9 +206,9 @@ impl Transcript {
     pub fn toggle_latest_tool_expansion(&mut self) -> bool {
         for item in self.items.iter_mut().rev() {
             if let FlowItem::Tool(tool) = item
-                && let ToolState::Done { expanded, .. } = &mut tool.state
+                && let ToolState::Done { display, .. } = &mut tool.state
             {
-                *expanded = !*expanded;
+                *display = display.next();
                 return true;
             }
         }
@@ -225,7 +261,7 @@ impl Transcript {
         let width = width.max(1) as usize;
         self.items
             .iter()
-            .map(|item| item_row_count(item, width))
+            .map(|item| item_row_count(item, width, self.thinking_collapsed))
             .collect()
     }
 
@@ -245,6 +281,24 @@ impl Transcript {
                 .into_iter()
                 .nth(row_in_item)
                 .map(|line| Line::from(Span::styled(line, style.style()))),
+            FlowItem::Thinking(text) => {
+                if self.thinking_collapsed {
+                    return (row_in_item == 0)
+                        .then(|| Line::from(Span::styled("▸ thinking", NoteStyle::Dim.style())));
+                }
+                if row_in_item == 0 {
+                    return Some(Line::from(Span::styled(
+                        "▾ thinking",
+                        NoteStyle::Accent.style(),
+                    )));
+                }
+                wrapped_lines(text, width.saturating_sub(2))
+                    .into_iter()
+                    .nth(row_in_item - 1)
+                    .map(|line| {
+                        Line::from(Span::styled(format!("│ {line}"), NoteStyle::Dim.style()))
+                    })
+            }
             FlowItem::Tool(tool) => {
                 let header_rows = wrapped_lines(&tool.header(), width.saturating_sub(2));
                 let header_len = header_rows.len().max(1);
@@ -259,6 +313,13 @@ impl Transcript {
                     let style = match &tool.state {
                         ToolState::Running { .. } => NoteStyle::Accent.style(),
                         ToolState::Done { is_error: true, .. } => NoteStyle::Error.style(),
+                        ToolState::Done {
+                            completed_at,
+                            is_error: false,
+                            ..
+                        } if completed_at.elapsed() < TOOL_COMPLETION_FLASH => {
+                            NoteStyle::Accent.style().add_modifier(Modifier::BOLD)
+                        }
                         ToolState::Done {
                             is_error: false, ..
                         } => NoteStyle::Dim.style(),
@@ -282,11 +343,15 @@ impl Transcript {
                     ToolState::Done {
                         output,
                         is_error,
-                        expanded,
+                        display,
+                        ..
                     } => {
+                        if *display == ToolDisplay::Collapsed {
+                            return None;
+                        }
                         let total_nonempty =
                             output.lines().filter(|l| !l.trim().is_empty()).count();
-                        let visible: Vec<&str> = if *expanded {
+                        let visible: Vec<&str> = if *display == ToolDisplay::Full {
                             output
                                 .lines()
                                 .filter(|line| !line.trim().is_empty())
@@ -306,18 +371,20 @@ impl Transcript {
                                 style,
                             )))
                         } else if row == visible.len() {
-                            if *expanded && total_nonempty > visible.len() {
+                            if *display == ToolDisplay::Full && total_nonempty > visible.len() {
                                 Some(Line::from(Span::styled(
                                     format!(
-                                        "│ … {} more lines (Alt+O collapse)",
+                                        "│ … {} more lines (Ctrl+O collapse)",
                                         total_nonempty - visible.len()
                                     ),
                                     NoteStyle::Dim.style(),
                                 )))
-                            } else if !*expanded && total_nonempty > visible.len() {
+                            } else if *display == ToolDisplay::Truncated
+                                && total_nonempty > visible.len()
+                            {
                                 Some(Line::from(Span::styled(
                                     format!(
-                                        "│ … {} more lines (Alt+O expand)",
+                                        "│ … {} more lines (Ctrl+O expand)",
                                         total_nonempty - visible.len()
                                     ),
                                     NoteStyle::Dim.style(),
@@ -344,9 +411,16 @@ fn bounded_preview(output: &str) -> Vec<&str> {
         .collect()
 }
 
-fn item_row_count(item: &FlowItem, width: usize) -> usize {
+fn item_row_count(item: &FlowItem, width: usize, thinking_collapsed: bool) -> usize {
     match item {
         FlowItem::Text { text, .. } => wrapped_lines(text, width).len().max(1),
+        FlowItem::Thinking(text) => {
+            if thinking_collapsed {
+                1
+            } else {
+                1 + wrapped_lines(text, width.saturating_sub(2)).len().max(1)
+            }
+        }
         FlowItem::Tool(tool) => {
             let mut rows = wrapped_lines(&tool.header(), width.saturating_sub(2))
                 .len()
@@ -358,10 +432,13 @@ fn item_row_count(item: &FlowItem, width: usize) -> usize {
                     }
                 }
                 ToolState::Done {
-                    output, expanded, ..
+                    output, display, ..
                 } => {
+                    if *display == ToolDisplay::Collapsed {
+                        return rows;
+                    }
                     let total_nonempty = output.lines().filter(|l| !l.trim().is_empty()).count();
-                    if *expanded {
+                    if *display == ToolDisplay::Full {
                         let visible = total_nonempty.min(TOOL_RESULT_EXPANDED_LINES);
                         rows += visible;
                         if total_nonempty > visible {
@@ -451,6 +528,19 @@ mod tests {
     }
 
     #[test]
+    fn thinking_blocks_toggle_between_content_and_one_line_header() {
+        let mut transcript = Transcript::new();
+        transcript.push_thinking("first line\nsecond line");
+        assert_eq!(transcript.row_counts(80), vec![3]);
+        transcript.toggle_thinking();
+        assert!(transcript.thinking_collapsed());
+        assert_eq!(transcript.row_counts(80), vec![1]);
+        let row = transcript.render_item_row(0, 0, 80, ' ').unwrap();
+        let text: String = row.spans.iter().map(|span| span.content.clone()).collect();
+        assert_eq!(text, "▸ thinking");
+    }
+
+    #[test]
     fn tool_lifecycle_updates_in_place_and_converges_once() {
         let mut transcript = Transcript::new();
         transcript.tool_start("call-1", "bash", &serde_json::json!({"command":"echo hi"}));
@@ -511,7 +601,13 @@ mod tests {
             .collect();
         assert!(text.contains("line-9"), "deep rows reachable: {text}");
         assert!(transcript.toggle_latest_tool_expansion());
-        assert_eq!(transcript.row_counts(80)[0], 5, "toggle back to preview");
+        assert_eq!(transcript.row_counts(80)[0], 1, "second toggle collapses");
+        assert!(transcript.toggle_latest_tool_expansion());
+        assert_eq!(
+            transcript.row_counts(80)[0],
+            5,
+            "third toggle restores preview"
+        );
         // 无已完成工具时切换不承诺：返回 false。
         let mut empty = Transcript::new();
         assert!(!empty.toggle_latest_tool_expansion());

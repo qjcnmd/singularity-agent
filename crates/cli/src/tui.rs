@@ -4,7 +4,7 @@
 //! Alt+Enter 提交到后续队列，Alt+Up 撤回最近一条排队消息。
 //!
 //! Ctrl+C 由 crossterm `KeyEvent` 驱动（raw mode 下不依赖操作系统信号）：
-//! 第一次清空非空输入；输入为空时进入退出确认，第二次退出。Esc 在运行中
+//! 第一次在需要时清空输入并进入退出确认，第二次退出。Esc 在运行中
 //! 中断当前轮，空闲时依次回底跟随、清空草稿或 no-op；输入为空时 Ctrl+D 退出。
 //!
 //! Ctrl+T 折叠思考块；Ctrl+O（兼容 Alt+O）循环工具块的折叠、截断、完整
@@ -187,12 +187,17 @@ fn event_loop(
             match crossterm::event::read() {
                 Ok(crossterm::event::Event::Key(key)) => match app.handle_key(key) {
                     Action::Continue => {}
-                    Action::Submit(goal) => spawn_turn(&conversation, goal, tx.clone()),
+                    Action::Submit(goal) => {
+                        spawn_turn(&app.conversation_handle(), goal, tx.clone())
+                    }
                     Action::Exit(code) => return Ok(code),
                 },
                 Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
                     crossterm::event::MouseEventKind::ScrollUp => app.handle_wheel(true),
                     crossterm::event::MouseEventKind::ScrollDown => app.handle_wheel(false),
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        app.handle_click(mouse.column, mouse.row)
+                    }
                     _ => {}
                 },
                 Ok(crossterm::event::Event::Resize(_, _)) => {

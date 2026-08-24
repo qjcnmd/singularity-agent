@@ -219,6 +219,14 @@ impl Conversation {
         Arc::clone(&self.runner)
     }
 
+    /// 读取一个已完成 turn 持久化的思考块。
+    pub fn thinking_for_turn(&self, turn_id: &str) -> Result<Vec<String>, ConversationError> {
+        let thread = self.thread()?;
+        self.runner
+            .thinking_for_turn(&thread, turn_id)
+            .map_err(ConversationError::Settings)
+    }
+
     /// 当前 Thread 投影快照。
     pub fn thread(&self) -> Result<Thread, ConversationError> {
         self.lock_state().map(|state| state.thread.clone())

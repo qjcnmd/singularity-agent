@@ -32,27 +32,15 @@ pub(crate) enum Phase {
     Interrupting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputMode {
-    Steer,
-    FollowUp,
-}
-
-impl InputMode {
-    fn toggled(self) -> Self {
-        match self {
-            Self::Steer => Self::FollowUp,
-            Self::FollowUp => Self::Steer,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Steer => "steer",
-            Self::FollowUp => "followUp",
-        }
-    }
-}
+const COMMANDS: [(&str, &str); 7] = [
+    ("/model", "select the thread model"),
+    ("/settings", "edit provider, model, and reasoning"),
+    ("/resume", "resume a saved session"),
+    ("/new", "start a new session"),
+    ("/session", "show session facts"),
+    ("/compact", "compact context now"),
+    ("/name", "name this session"),
+];
 
 /// 当前正在等待的对象：驱动状态行的具名活动提示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,6 +49,8 @@ pub(crate) enum WaitingTarget {
     None,
     /// 等待模型响应或流式输出。
     Model,
+    /// Provider 已开始本次生成，尚未收到可见回答文本。
+    Thinking,
     /// 等待指定工具执行完成。
     Tool(String),
     /// Agent 已停止，等待终态落盘与事件收口。
@@ -72,6 +62,7 @@ impl WaitingTarget {
         match self {
             Self::None => None,
             Self::Model => Some("model".to_string()),
+            Self::Thinking => Some("thinking".to_string()),
             Self::Tool(name) => Some(format!("tool {name}")),
             Self::TerminalConvergence => Some("terminal convergence".to_string()),
         }
@@ -89,9 +80,13 @@ pub(crate) struct SettingsMenu {
 
 impl SettingsMenu {
     pub fn open(current_model: Option<&str>) -> Self {
+        Self::open_field(current_model, 0)
+    }
+
+    fn open_field(current_model: Option<&str>, field: usize) -> Self {
         let parts = singularity_model::split_model_selector(current_model.unwrap_or_default());
         Self {
-            field: 0,
+            field,
             provider: parts.provider.unwrap_or("openai_compatible").to_string(),
             model: parts.model.unwrap_or_default().to_string(),
             reasoning: parts.effort.unwrap_or_default().to_string(),
@@ -124,6 +119,11 @@ impl SettingsMenu {
     }
 }
 
+pub(crate) struct ResumeMenu {
+    threads: Vec<singularity_runtime::ThreadSummary>,
+    selected: usize,
+}
+
 /// 键盘处理结果：继续、提交一轮输入或以指定退出码结束进程。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -138,10 +138,10 @@ pub(crate) struct TuiApp {
     transcript: Transcript,
     scroll: ScrollState,
     editor: Editor,
-    input_mode: InputMode,
     phase: Phase,
     waiting: WaitingTarget,
     settings: Option<SettingsMenu>,
+    resume: Option<ResumeMenu>,
     thread_id: String,
     /// 二次确认退出已生效：下一次 Ctrl+C 直接退出（空闲 0 / 运行中 130）。
     /// 复位规则：任何非 Ctrl+C 按键、提交输入或 turn 链结束都会清除；
@@ -150,10 +150,14 @@ pub(crate) struct TuiApp {
     spinner_frame: usize,
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     waiting_since: Option<std::time::Instant>,
+    turn_started_at: Option<std::time::Instant>,
+    last_usage: Option<singularity_runtime::TurnUsage>,
     /// 最近一帧会话流宽度、总行数与视口高（键位滚动与增长检测依赖）。
     last_flow_width: Option<u16>,
     last_total_rows: usize,
     last_viewport_rows: usize,
+    last_editor_area: Option<Rect>,
+    last_editor_scroll_top: usize,
 }
 
 impl TuiApp {
@@ -167,18 +171,26 @@ impl TuiApp {
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
             editor: Editor::new(),
-            input_mode: InputMode::Steer,
             phase: Phase::Idle,
             waiting: WaitingTarget::None,
             settings: None,
+            resume: None,
             thread_id,
             quit_armed: false,
             spinner_frame: 0,
             waiting_since: None,
+            turn_started_at: None,
+            last_usage: None,
             last_flow_width: None,
             last_total_rows: 0,
             last_viewport_rows: 5,
+            last_editor_area: None,
+            last_editor_scroll_top: 0,
         }
+    }
+
+    pub fn conversation_handle(&self) -> Arc<Conversation> {
+        Arc::clone(&self.conversation)
     }
 
     // -- 状态推进 ------------------------------------------------------------
@@ -207,6 +219,7 @@ impl TuiApp {
                     NoteStyle::Dim,
                 );
                 self.set_waiting(WaitingTarget::Model);
+                self.turn_started_at = Some(std::time::Instant::now());
             }
             TurnEvent::AssistantDelta { delta, item_id, .. } => {
                 if Self::is_assistant(item_id) {
@@ -216,7 +229,7 @@ impl TuiApp {
             }
             TurnEvent::ProviderAttempt { status, .. } => {
                 if status == "started" {
-                    self.set_waiting(WaitingTarget::Model);
+                    self.set_waiting(WaitingTarget::Thinking);
                 }
             }
             // 聚合遥测不改变等待对象，也不进入会话流。
@@ -268,6 +281,12 @@ impl TuiApp {
                     .push_note(format!("⚠ [{severity}] {code}: {message}"), style);
             }
             TurnEvent::TurnCompleted { turn } => {
+                self.last_usage = turn.usage.clone();
+                if let Ok(blocks) = self.conversation.thinking_for_turn(&turn.turn_id) {
+                    for block in blocks {
+                        self.transcript.push_thinking(block);
+                    }
+                }
                 self.transcript.push_note(
                     format!("✔ completed ({})", describe_usage(turn)),
                     NoteStyle::Dim,
@@ -296,6 +315,7 @@ impl TuiApp {
         self.phase = Phase::Idle;
         self.set_waiting(WaitingTarget::None);
         self.quit_armed = false;
+        self.turn_started_at = None;
         match result {
             Ok(TurnStatus::Interrupted) => {
                 self.transcript
@@ -319,19 +339,17 @@ impl TuiApp {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
-    /// Ctrl+C 应用级语义（按键驱动，全部退出路径由事件循环统一恢复终端）：
-    /// 运行中第一次按下中断当前轮并进入二次确认，空闲第一次按下只进入二次
-    /// 确认；确认状态下第二次按下退出——空闲 0、运行/中断 130。
+    /// Ctrl+C：优先清空输入；输入为空时第一次确认、第二次正常退出。
     fn handle_ctrl_c(&mut self) -> Action {
+        if !self.editor.is_empty() {
+            self.editor.clear();
+            self.quit_armed = true;
+            return Action::Continue;
+        }
         if self.quit_armed {
-            let code = if self.phase == Phase::Idle { 0 } else { 130 };
-            return Action::Exit(code);
+            return Action::Exit(0);
         }
         self.quit_armed = true;
-        if self.phase != Phase::Idle {
-            self.conversation.interrupt();
-            self.phase = Phase::Interrupting;
-        }
         Action::Continue
     }
 
@@ -392,28 +410,48 @@ impl TuiApp {
             return Action::Continue;
         }
 
+        if let Some(menu) = self.resume.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.resume = None,
+                KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    menu.selected = (menu.selected + 1).min(menu.threads.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let selected = menu.threads.get(menu.selected).cloned();
+                    self.resume = None;
+                    if let Some(summary) = selected {
+                        self.resume_thread(&summary.thread_id);
+                    }
+                }
+                _ => {}
+            }
+            return Action::Continue;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('t') if ctrl => self.input_mode = self.input_mode.toggled(),
-            KeyCode::Char('s') if ctrl => {
-                let current = self.conversation.thread().ok().and_then(|t| t.model);
-                self.settings = Some(SettingsMenu::open(current.as_deref()));
-            }
+            KeyCode::Char('t') if ctrl => self.transcript.toggle_thinking(),
             KeyCode::Char('j') if ctrl => self.editor.insert_newline(),
-            KeyCode::Char('o') if alt => {
+            KeyCode::Char('o') if ctrl || alt => {
                 self.transcript.toggle_latest_tool_expansion();
             }
             KeyCode::Esc => {
-                // 阶梯式退出，不留死端：浏览态先回底跟随；随后清空非空草稿；
-                // 空输入时为 no-op（提示行不会承诺按键行为）。
-                let (total, viewport) = self.flow_metrics();
-                if !self.scroll.is_following() {
-                    self.scroll.jump_to_bottom(total, viewport);
-                } else if !self.editor.is_empty() {
-                    self.editor.clear();
+                if self.phase != Phase::Idle {
+                    self.conversation.interrupt();
+                    self.phase = Phase::Interrupting;
+                    self.set_waiting(WaitingTarget::TerminalConvergence);
+                } else {
+                    let (total, viewport) = self.flow_metrics();
+                    if !self.scroll.is_following() {
+                        self.scroll.jump_to_bottom(total, viewport);
+                    } else if !self.editor.is_empty() {
+                        self.editor.clear();
+                    }
                 }
             }
+            KeyCode::Char('d') if ctrl && self.editor.is_empty() => return Action::Exit(0),
             KeyCode::Home if ctrl => self.scroll.jump_to_top(),
             KeyCode::End if ctrl => {
                 let (total, viewport) = self.flow_metrics();
@@ -430,8 +468,12 @@ impl TuiApp {
                 self.scroll.scroll_down(page, total, viewport);
             }
             KeyCode::Up if alt => {
-                let (total, viewport) = self.flow_metrics();
-                self.scroll.scroll_up(1, total, viewport);
+                if let Some(text) = self.conversation.withdraw_follow_up() {
+                    self.transcript.push_note(
+                        format!("withdrawn: {}", truncate_label(&text, 40)),
+                        NoteStyle::Accent,
+                    );
+                }
             }
             KeyCode::Down if alt => {
                 let (total, viewport) = self.flow_metrics();
@@ -439,6 +481,11 @@ impl TuiApp {
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.editor.insert_newline();
+            }
+            KeyCode::Enter if alt => {
+                if self.phase != Phase::Idle {
+                    self.submit_follow_up();
+                }
             }
             KeyCode::Enter => return self.submit_input(),
             KeyCode::Backspace => self.editor.backspace(),
@@ -448,6 +495,10 @@ impl TuiApp {
             KeyCode::Up => self.editor.move_up(),
             KeyCode::Down => self.editor.move_down(),
             KeyCode::Home => self.editor.move_home(),
+            KeyCode::End if !self.scroll.is_following() => {
+                let (total, viewport) = self.flow_metrics();
+                self.scroll.jump_to_bottom(total, viewport);
+            }
             KeyCode::End => self.editor.move_end(),
             KeyCode::Char(ch) if !ctrl && !alt => self.editor.insert_char(ch),
             _ => {}
@@ -465,10 +516,189 @@ impl TuiApp {
         }
     }
 
+    pub fn handle_click(&mut self, column: u16, row: u16) {
+        let Some(area) = self.last_editor_area else {
+            return;
+        };
+        let inside_x = column > area.x && column < area.x.saturating_add(area.width - 1);
+        let inside_y = row > area.y && row < area.y.saturating_add(area.height - 1);
+        if !inside_x || !inside_y {
+            return;
+        }
+        let visual_row = self
+            .last_editor_scroll_top
+            .saturating_add((row - area.y - 1) as usize);
+        let visual_col = (column - area.x - 1) as usize;
+        self.editor
+            .set_cursor_visual(visual_row, visual_col, area.width.saturating_sub(2));
+    }
+
+    fn resume_thread(&mut self, thread_id: &str) {
+        let runner = self.conversation.runner_handle();
+        match singularity_runtime::resume_thread(runner.sessions_dir(), thread_id) {
+            Ok(thread) => {
+                self.conversation = Conversation::new(runner, thread.clone());
+                self.thread_id = thread.thread_id;
+                self.transcript = Transcript::new();
+                self.scroll = ScrollState::default();
+                self.last_usage =
+                    singularity_runtime::list_threads(self.conversation.runner().sessions_dir())
+                        .ok()
+                        .and_then(|threads| {
+                            threads
+                                .into_iter()
+                                .find(|summary| summary.thread_id == self.thread_id)
+                        })
+                        .map(|summary| singularity_runtime::TurnUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            total_tokens: summary.total_tokens,
+                            cached_input_tokens: 0,
+                            reasoning_tokens: 0,
+                            usage_present: summary.total_tokens > 0,
+                            usage_complete: false,
+                        });
+                self.transcript.push_note(
+                    format!("resumed thread {}", short_id(&self.thread_id)),
+                    NoteStyle::Accent,
+                );
+            }
+            Err(error) => self
+                .transcript
+                .push_note(format!("resume failed: {error}"), NoteStyle::Error),
+        }
+    }
+
+    fn execute_command(&mut self, text: &str) {
+        let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
+        match command {
+            "/model" => {
+                let current = self
+                    .conversation
+                    .thread()
+                    .ok()
+                    .and_then(|thread| thread.model);
+                self.settings = Some(SettingsMenu::open_field(current.as_deref(), 1));
+            }
+            "/settings" => {
+                let current = self
+                    .conversation
+                    .thread()
+                    .ok()
+                    .and_then(|thread| thread.model);
+                self.settings = Some(SettingsMenu::open(current.as_deref()));
+            }
+            "/resume" => {
+                match singularity_runtime::list_threads(self.conversation.runner().sessions_dir()) {
+                    Ok(threads) if !threads.is_empty() => {
+                        self.resume = Some(ResumeMenu {
+                            threads,
+                            selected: 0,
+                        });
+                    }
+                    Ok(_) => self
+                        .transcript
+                        .push_note("no saved sessions", NoteStyle::Dim),
+                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
+                }
+            }
+            "/new" => {
+                let runner = self.conversation.runner_handle();
+                let current = self.conversation.thread().ok();
+                let cwd = current
+                    .as_ref()
+                    .map(|thread| thread.cwd.clone())
+                    .unwrap_or_default();
+                let model = current.and_then(|thread| thread.model);
+                match singularity_runtime::create_thread(runner.sessions_dir(), &cwd, model) {
+                    Ok(thread) => {
+                        let thread_id = thread.thread_id.clone();
+                        self.conversation = Conversation::new(runner, thread);
+                        self.thread_id = thread_id;
+                        self.transcript = Transcript::new();
+                        self.scroll = ScrollState::default();
+                        self.last_usage = None;
+                        self.transcript.push_note(
+                            format!("new thread {}", short_id(&self.thread_id)),
+                            NoteStyle::Accent,
+                        );
+                    }
+                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
+                }
+            }
+            "/session" => {
+                let summary =
+                    singularity_runtime::list_threads(self.conversation.runner().sessions_dir())
+                        .ok()
+                        .and_then(|threads| {
+                            threads
+                                .into_iter()
+                                .find(|summary| summary.thread_id == self.thread_id)
+                        });
+                match summary {
+                    Some(summary) => self.transcript.push_note(
+                        format!(
+                            "session {} · {} turns · {} tokens",
+                            summary.thread_id, summary.turn_count, summary.total_tokens
+                        ),
+                        NoteStyle::Accent,
+                    ),
+                    None => self
+                        .transcript
+                        .push_note("session facts unavailable", NoteStyle::Warning),
+                }
+            }
+            "/compact" => match self.conversation.compact() {
+                Ok(singularity_runtime::CompactionOutcome::Compacted { tokens_before, .. }) => {
+                    self.transcript.push_note(
+                        format!("context compacted from {tokens_before} estimated tokens"),
+                        NoteStyle::Accent,
+                    )
+                }
+                Ok(singularity_runtime::CompactionOutcome::NotNeeded) => self
+                    .transcript
+                    .push_note("nothing to compact", NoteStyle::Dim),
+                Err(error) => self
+                    .transcript
+                    .push_note(format!("compaction failed: {error}"), NoteStyle::Error),
+            },
+            "/name" if !argument.trim().is_empty() => {
+                match self.conversation.rename(argument.trim()) {
+                    Ok(()) => self.transcript.push_note(
+                        format!("session named {}", argument.trim()),
+                        NoteStyle::Accent,
+                    ),
+                    Err(error) => self
+                        .transcript
+                        .push_note(error.to_string(), NoteStyle::Error),
+                }
+            }
+            "/name" => self
+                .transcript
+                .push_note("usage: /name <session name>", NoteStyle::Warning),
+            _ => self
+                .transcript
+                .push_note(format!("unknown command: {command}"), NoteStyle::Warning),
+        }
+    }
+
+    fn submit_follow_up(&mut self) {
+        let text = self.editor.take().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let accepted = self.conversation.submit_follow_up(text.clone());
+        self.note_injection("followUp", accepted, &text);
+    }
+
     fn submit_input(&mut self) -> Action {
         let raw = self.editor.take();
         let text = raw.trim().to_string();
         if text.is_empty() {
+            return Action::Continue;
+        }
+        if text.starts_with('/') {
+            self.execute_command(&text);
             return Action::Continue;
         }
         self.reset_quit_confirm();
@@ -479,16 +709,8 @@ impl TuiApp {
                 Action::Submit(text)
             }
             Phase::Running | Phase::Interrupting => {
-                match self.input_mode {
-                    InputMode::Steer => {
-                        let accepted = self.conversation.steer(text.clone());
-                        self.note_injection("steer", accepted, &text);
-                    }
-                    InputMode::FollowUp => {
-                        let accepted = self.conversation.submit_follow_up(text.clone());
-                        self.note_injection("followUp", accepted, &text);
-                    }
-                }
+                let accepted = self.conversation.steer(text.clone());
+                self.note_injection("steer", accepted, &text);
                 Action::Continue
             }
         };
@@ -616,6 +838,8 @@ impl TuiApp {
         let inner_h = editor_rows.saturating_sub(2) as usize;
         let (visual_row, visual_col) = self.editor.cursor_visual(editor_inner_w);
         let scroll_top = visual_row.saturating_sub(inner_h.saturating_sub(1));
+        self.last_editor_area = Some(editor_area);
+        self.last_editor_scroll_top = scroll_top;
         let mut editor_lines: Vec<Line<'static>> = Vec::new();
         for logical in self.editor.lines() {
             for piece in wrap_plain(logical, editor_inner_w as usize) {
@@ -636,6 +860,12 @@ impl TuiApp {
 
         if let Some(menu) = &self.settings {
             self.render_settings(frame, menu);
+        } else if let Some(menu) = &self.resume {
+            self.render_resume(frame, menu);
+        } else if self.editor.text().starts_with('/')
+            && !self.editor.text().contains(char::is_whitespace)
+        {
+            self.render_command_menu(frame);
         }
 
         // 光标定位到编辑器内。
@@ -685,15 +915,73 @@ impl TuiApp {
         );
     }
 
-    /// footer 合同：状态行＝相位+spinner·具名等待对象·thread·模型；右侧＝
-    /// 输入模式·队列数·浏览指示（含新增计数）。提示行按上下文给出关键操作。
+    fn render_resume(&self, frame: &mut Frame<'_>, menu: &ResumeMenu) {
+        let height = (menu.threads.len().min(8) as u16).saturating_add(2).max(3);
+        let popup = centered_rect(frame.area(), 72, height);
+        frame.render_widget(Clear, popup);
+        let lines = menu
+            .threads
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(index, thread)| {
+                let style = if index == menu.selected {
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                };
+                Line::from(Span::styled(
+                    format!(
+                        "{} · {} turns · {} tokens · {}",
+                        short_id(&thread.thread_id),
+                        thread.turn_count,
+                        thread.total_tokens,
+                        thread.title.as_deref().unwrap_or("untitled")
+                    ),
+                    style,
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("resume")),
+            popup,
+        );
+    }
+
+    fn render_command_menu(&self, frame: &mut Frame<'_>) {
+        let prefix = self.editor.text();
+        let matches = COMMANDS
+            .iter()
+            .filter(|(command, _)| command.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return;
+        }
+        let popup = centered_rect(frame.area(), 64, matches.len() as u16 + 2);
+        frame.render_widget(Clear, popup);
+        let lines = matches
+            .into_iter()
+            .map(|(command, description)| {
+                Line::from(vec![
+                    Span::styled(format!("{command:<12}"), Style::new().fg(Color::Cyan)),
+                    Span::styled(*description, Style::new().fg(Color::DarkGray)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("commands")),
+            popup,
+        );
+    }
+
+    /// footer 合同：状态行＝相位+spinner·具名等待对象·thread·模型·
+    /// token/队列数·浏览指示（含新增计数）。提示行按上下文给出关键操作。
     pub fn footer_spans(
         &self,
         total_rows: usize,
         viewport: usize,
     ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let dim = Style::new().fg(Color::DarkGray);
-        let accent = Style::new().fg(Color::Cyan);
         let warn = Style::new().fg(Color::Yellow);
         let magenta = Style::new().fg(Color::Magenta);
 
@@ -706,6 +994,11 @@ impl TuiApp {
                 Phase::Idle => unreachable!("guarded above"),
             };
             status.push(Span::styled(format!("{spinner} {phase_word}"), warn));
+            let turn_elapsed = self
+                .turn_started_at
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0);
+            status.push(Span::styled(format!(" · turn {turn_elapsed}s"), warn));
             if let Some(target) = self.waiting.label() {
                 let elapsed = self
                     .waiting_since
@@ -727,10 +1020,14 @@ impl TuiApp {
             Some(model) => status.push(Span::styled(format!("{model} · "), dim)),
             None => status.push(Span::styled("model unset · ", warn)),
         }
-        status.push(Span::styled(
-            format!("[{}]", self.input_mode.label()),
-            accent,
-        ));
+        if self.transcript.thinking_collapsed() {
+            status.push(Span::styled("[thinking folded]", dim));
+        }
+        if let Some(usage) = &self.last_usage
+            && usage.usage_present
+        {
+            status.push(Span::styled(format!(" {} tokens", usage.total_tokens), dim));
+        }
         let queue = self.conversation.pending_follow_ups().len();
         if queue > 0 {
             status.push(Span::styled(format!(" queue:{queue}"), warn));
@@ -747,19 +1044,18 @@ impl TuiApp {
         }
 
         let hint_text = if self.quit_armed {
-            match self.phase {
-                Phase::Idle => "press Ctrl+C again to quit",
-                Phase::Running | Phase::Interrupting => "press Ctrl+C again to force quit",
-            }
+            "press Ctrl+C again to quit"
         } else if self.settings.is_some() {
             "Esc close · Tab field · Enter apply"
+        } else if self.resume.is_some() {
+            "↑/↓ select · Enter resume · Esc close"
         } else {
             match self.phase {
                 Phase::Idle => {
-                    "Enter send · Shift+Enter newline · Ctrl+S settings · PgUp/PgDn scroll · Ctrl+End latest"
+                    "Enter send · Ctrl+J newline · / commands · PgUp/PgDn scroll · End latest"
                 }
                 Phase::Running | Phase::Interrupting => {
-                    "Enter steer/followUp · Ctrl+T switch · Alt+O expand tool · Ctrl+C interrupt (twice force)"
+                    "Enter steer · Alt+Enter queue · Alt+Up withdraw · Esc stop · Ctrl+T thinking · Ctrl+O tool view"
                 }
             }
         };
@@ -791,11 +1087,6 @@ impl TuiApp {
     #[cfg(test)]
     fn force_phase(&mut self, phase: Phase) {
         self.phase = phase;
-    }
-
-    #[cfg(test)]
-    fn set_mode(&mut self, mode: InputMode) {
-        self.input_mode = mode;
     }
 
     #[cfg(test)]
@@ -1070,7 +1361,10 @@ mod tests {
         app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE));
         let snapshot_before = app.scroll_snapshot();
 
-        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        for ch in "/settings".chars() {
+            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         draw_at(&mut app, 80, 24);
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
 
@@ -1134,7 +1428,7 @@ mod tests {
         let status_text: String = status.iter().map(|span| span.content.clone()).collect();
         assert!(status_text.contains("running"), "{status_text}");
         assert!(status_text.contains("waiting: model"), "{status_text}");
-        assert!(status_text.contains("[steer]"), "{status_text}");
+        assert!(!status_text.contains("[steer]"), "{status_text}");
         assert!(
             status_text.contains("openai_compatible/base-model"),
             "{status_text}"
@@ -1153,13 +1447,13 @@ mod tests {
         app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
         let (status, _) = app.footer_spans(100, 20);
         let status_text: String = status.iter().map(|span| span.content.clone()).collect();
-        assert!(status_text.contains("[followUp]"), "{status_text}");
+        assert!(status_text.contains("[thinking folded]"), "{status_text}");
 
-        // 运行中第一次 Ctrl+C：进入中断相位并显示强制退出提示。
+        // Ctrl+C 在各相位都只执行常规的两次退出确认。
         app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let (_, hint) = app.footer_spans(100, 20);
         let hint_text: String = hint.iter().map(|span| span.content.clone()).collect();
-        assert!(hint_text.contains("force quit"), "{hint_text}");
+        assert!(hint_text.contains("again to quit"), "{hint_text}");
     }
 
     // -- 输入路由：followUp 单队列 -------------------------------------------
@@ -1194,13 +1488,12 @@ mod tests {
         assert!(conversation.has_active_turn(), "gated turn must be active");
         assert_eq!(app.phase(), Phase::Running);
 
-        // 与生产路径一致：编辑器输入 + Enter，以 followUp 模式提交。
-        app.set_mode(InputMode::FollowUp);
+        // 与生产路径一致：编辑器输入 + Alt+Enter 提交 followUp。
         for ch in "second".chars() {
             app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         assert_eq!(app.editor_text(), "second");
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
         assert!(
             app.editor_text().is_empty(),
             "submitted input leaves the editor"
@@ -1274,24 +1567,24 @@ mod tests {
     }
 
     #[test]
-    fn running_first_ctrl_c_interrupts_and_second_exits_130() {
+    fn running_ctrl_c_uses_the_normal_two_press_exit() {
         let (_home, sessions) = test_home();
         let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
         app.force_phase(Phase::Running);
         assert_eq!(app.handle_key(ctrl_c()), Action::Continue);
         assert_eq!(
             app.phase(),
-            Phase::Interrupting,
-            "first Ctrl+C while running moves to the interrupting phase"
+            Phase::Running,
+            "Ctrl+C does not interrupt the active turn"
         );
         assert!(
-            hint_text(&app).contains("force quit"),
-            "running first Ctrl+C announces the force-quit exit"
+            hint_text(&app).contains("again to quit"),
+            "the first Ctrl+C announces the normal exit confirmation"
         );
         assert_eq!(
             app.handle_key(ctrl_c()),
-            Action::Exit(130),
-            "second Ctrl+C while interrupting force-exits with 130"
+            Action::Exit(0),
+            "the second Ctrl+C exits normally"
         );
     }
 
@@ -1306,8 +1599,9 @@ mod tests {
         assert_eq!(
             app.handle_key(ctrl_c()),
             Action::Continue,
-            "after reset the first Ctrl+C only re-arms"
+            "non-empty Ctrl+C clears the editor"
         );
+        assert!(app.editor_text().is_empty());
         assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
     }
 
@@ -1344,14 +1638,17 @@ mod tests {
             Action::Continue,
             "submission clears the armed confirm even though a turn is running"
         );
-        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(130));
+        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
     }
 
     #[test]
     fn ctrl_c_keeps_one_semantics_inside_settings_modal() {
         let (_home, sessions) = test_home();
         let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        for ch in "/settings".chars() {
+            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.settings.is_some(), "modal is open");
         assert_eq!(
             app.handle_key(ctrl_c()),
@@ -1370,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn running_ctrl_c_delivers_interrupt_to_the_active_turn() {
+    fn running_escape_delivers_interrupt_to_the_active_turn() {
         use singularity_core::CancellationToken;
         struct ProbeProvider {
             probe: Arc<std::sync::Mutex<Option<CancellationToken>>>,
@@ -1423,12 +1720,12 @@ mod tests {
         }
         assert!(probe.lock().unwrap().is_some(), "provider must be running");
 
-        // 生产路径：运行中按键 Ctrl+C → Conversation::interrupt 送达当前轮。
-        app.handle_key(ctrl_c());
+        // 生产路径：运行中 Esc → Conversation::interrupt 送达当前轮。
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.phase(), Phase::Interrupting);
         assert!(
             probe.lock().unwrap().as_ref().unwrap().is_cancelled(),
-            "first Ctrl+C must cancel the active turn token"
+            "Esc must cancel the active turn token"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {

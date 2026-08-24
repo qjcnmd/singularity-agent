@@ -9,7 +9,7 @@ use singularity_agent::session::SessionManager;
 use singularity_agent::session::SessionMetadataKind;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
-    ProviderProtocolContract,
+    ProviderProtocolContract, ProviderReasoningReplay,
 };
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::{ThreadStatus, TurnStatus};
@@ -94,6 +94,30 @@ impl RequestLog {
 struct RecordingProvider {
     text: String,
     log: Arc<RequestLog>,
+}
+
+struct ThinkingProvider;
+
+impl Provider for ThinkingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut response = ModelTurnResponse::completed(&request.request_id, "thinking", "answer");
+        response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "base-model".to_string(),
+            reasoning_effort: None,
+            tool_call_ids: Vec::new(),
+            reasoning_content: "considered the evidence".to_string(),
+        }];
+        Ok(response)
+    }
 }
 
 impl Provider for RecordingProvider {
@@ -299,6 +323,27 @@ fn successful_turn_emits_lifecycle_events_and_final_text() {
     // 终态 metadata 已落盘：resume 投影出 completed。
     let resumed = resume_thread(&sessions, &outcome.thread_id).expect("resume");
     assert_eq!(resumed.last_turn_status, Some(ThreadStatus::Completed));
+}
+
+#[test]
+fn completed_turn_exposes_its_persisted_thinking_blocks() {
+    let home = temp_sessions();
+    let conversation = new_conversation(
+        &home.path().join("sessions"),
+        Arc::new(ThinkingProvider),
+        None,
+    );
+    let mut events = Vec::new();
+    let outcome = conversation
+        .run_turn("reason", &mut |event| events.push(event))
+        .expect("turn completes");
+
+    assert_eq!(
+        conversation
+            .thinking_for_turn(&outcome.turn_id)
+            .expect("thinking loads"),
+        vec!["considered the evidence"]
+    );
 }
 
 #[test]

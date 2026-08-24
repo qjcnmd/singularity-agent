@@ -193,6 +193,34 @@ impl Editor {
         }
         (visual_row, 0)
     }
+
+    /// 把折行后的可视坐标映射回字符光标；列落在宽字符中间时定位到该字符前。
+    pub fn set_cursor_visual(&mut self, target_row: usize, target_col: usize, width: u16) {
+        let width = width.max(1) as usize;
+        let mut visual_row = 0usize;
+        for (logical_row, line) in self.lines.iter().enumerate() {
+            for (_, char_start) in wrap_with_positions(line, width) {
+                if visual_row == target_row {
+                    let mut used = 0usize;
+                    let mut chars = 0usize;
+                    for ch in line.chars().skip(char_start) {
+                        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+                        if used + ch_width > target_col || used + ch_width > width {
+                            break;
+                        }
+                        used += ch_width;
+                        chars += 1;
+                    }
+                    self.row = logical_row;
+                    self.col = char_start + chars;
+                    return;
+                }
+                visual_row += 1;
+            }
+        }
+        self.row = self.lines.len().saturating_sub(1);
+        self.col = self.lines[self.row].chars().count();
+    }
 }
 
 fn char_to_byte(line: &str, char_index: usize) -> usize {
@@ -341,5 +369,17 @@ mod tests {
         assert_eq!(editor.cursor_visual(20), (0, 5));
         editor.move_home();
         assert_eq!(editor.cursor_visual(20), (0, 0));
+    }
+
+    #[test]
+    fn visual_click_positions_cursor_across_wrapped_and_wide_text() {
+        let mut editor = Editor::new();
+        for ch in "ab中文cd".chars() {
+            editor.insert_char(ch);
+        }
+        editor.set_cursor_visual(1, 2, 5);
+        assert_eq!(editor.cursor(), (0, 4));
+        editor.set_cursor_visual(0, 1, 5);
+        assert_eq!(editor.cursor(), (0, 1));
     }
 }

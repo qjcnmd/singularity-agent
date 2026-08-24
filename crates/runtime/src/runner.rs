@@ -18,7 +18,10 @@ use singularity_agent::agent::{
     AgentTerminalReason,
 };
 use singularity_agent::compaction::CompactionConfig;
-use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
+use singularity_agent::message::{AgentMessageRole, ContentBlock};
+use singularity_agent::session::{
+    SessionEntryType, SessionManager, SessionMetadata, SessionMetadataKind,
+};
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{
@@ -90,6 +93,44 @@ impl TurnRunner {
 
     pub fn sessions_dir(&self) -> &std::path::Path {
         &self.sessions_dir
+    }
+
+    /// 读取一个已落盘 turn 的思考块，供交互客户端按需展示。
+    pub fn thinking_for_turn(&self, thread: &Thread, turn_id: &str) -> Result<Vec<String>, String> {
+        let session = self
+            .open_and_repair_session(thread)
+            .map_err(|error| error.to_string())?;
+        let mut inside_turn = false;
+        let mut thinking = Vec::new();
+        for entry in session.entries() {
+            match &entry.entry_type {
+                SessionEntryType::Metadata(metadata)
+                    if metadata.kind() == SessionMetadataKind::TurnStarted
+                        && metadata.turn_id() == Some(turn_id) =>
+                {
+                    inside_turn = true;
+                }
+                SessionEntryType::Metadata(metadata)
+                    if inside_turn
+                        && metadata.kind().matches_turn_terminal()
+                        && metadata.turn_id() == Some(turn_id) =>
+                {
+                    break;
+                }
+                SessionEntryType::Message(message)
+                    if inside_turn && message.role == AgentMessageRole::Assistant =>
+                {
+                    thinking.extend(message.content.iter().filter_map(|block| match block {
+                        ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                            Some(thinking.clone())
+                        }
+                        _ => None,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(thinking)
     }
 
     pub fn provider_snapshot(&self) -> &ProviderConfigSnapshot {

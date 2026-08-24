@@ -94,7 +94,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             eprintln!("sg: {message}");
             return Ok(2);
         }
-        let setup = session_options::prepare(None, None, false)?;
+        let setup =
+            session_options::prepare(cli.model.as_deref(), cli.session.as_deref(), cli.no_session)?;
         return Ok(tui::run(setup.conversation).exit_code);
     };
 
