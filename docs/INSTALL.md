@@ -19,7 +19,7 @@ $env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
 cargo build --release --locked --package singularity_cli
 ```
 
-将 `$env:CARGO_TARGET_DIR\release\sg.exe` 所在目录加入 `PATH`。若不设置 `CARGO_TARGET_DIR`，默认输出位于仓库的 `target\release`。
+将 `$env:CARGO_TARGET_DIR\release\sg.exe` 所在目录加入 `PATH`。未设置 `CARGO_TARGET_DIR` 时，构建输出位置由仓库 `.cargo/config.toml` 的 `target-dir` 决定。
 
 验证安装：
 
@@ -107,7 +107,7 @@ sg --json "检查当前项目并完成一项可验证的修改" --model dashscop
 
 会话正文位于 `%USERPROFILE%\.singularity\sessions\<uuid>.jsonl`（唯一持久事实源）；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
-无交互模式中，第一次 Ctrl+C 中断当前 turn，第二次强制退出；退出码 0/130/1 分别表示 completed/interrupted/failed。TUI 用 Esc 停止生成；Ctrl+C 先清空输入并确认退出，再按一次以退出码 0 退出。
+无交互模式中，第一次 Ctrl+C 中断当前 turn，第二次强制退出；退出码 0/130/1 分别表示 completed/interrupted/failed。TUI 用 Esc 停止生成；Ctrl+C 先清空输入并确认退出，再按一次退出（空闲时退出码 0，运行中强制退出码 130）。
 
 ## 更新与卸载
 

@@ -1332,7 +1332,7 @@ fn turn_injection_unknown_turn_is_not_found() {
 
 #[test]
 fn project_instructions_load_from_workspace_root_to_cwd() {
-    // H2 回归：root→cwd 逐层加载（此前 &cwd,&cwd 只加载 cwd 层）。
+    // 回归固定：root→cwd 逐层加载。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     let nested = workspace.join("src").join("nested");

@@ -40,8 +40,8 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 
 ## 按需读取的项目指令
 
-- docs/agents/domain.md：领域与架构事实；涉及核心对象、进程边界、会话、工具或架构决策时必读。
-- docs/agents/architecture.md：AgentLoop、Session、Tool、Context、Compaction、客户端边界或代码图。
+- docs/agents/domain.md：仓库读取顺序、单上下文约定与领域命名；探索仓库或引入新领域词汇时读取。
+- docs/agents/architecture.md：模块接缝与替换边界；涉及模块替换、Sandbox/Approval 或候选简化调查时读取。
 - docs/agents/provider-evaluation.md：模型、协议、真实调用、Evaluation、checker 或归因。
 - docs/agents/workflow.md：复杂任务、测试、Cargo、worktree、提交、远程操作或 Issue。
 - docs/agents/skills.md：命中 Skill、需要委派或跨阶段恢复。

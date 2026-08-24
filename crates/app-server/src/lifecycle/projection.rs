@@ -129,8 +129,8 @@ impl<'a> TurnProjection<'a> {
     }
 
     /// turn/started 到达：JSONL 已落盘，先投影索引（Active + 首轮标题），
-    /// 随后才允许发布通知与 RPC 响应。执行停止请求在入场时取消，保证
-    /// 与旧实现的「预取消令牌 → 快速 interrupted 收敛」一致。
+    /// 随后才允许发布通知与 RPC 响应。执行停止请求在入场时立即取消，
+    /// 使被取消的轮快速收敛为 interrupted。
     fn on_turn_started(&mut self, turn: &RuntimeTurn) {
         if self.server.execution_stopped.load(Ordering::SeqCst) {
             self.conversation.interrupt();

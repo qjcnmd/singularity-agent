@@ -47,17 +47,29 @@ SINGULARITY_MODEL=your-model-name
 思考档位是模型配置的一部分：`reasoning_variants` 是唯一事实源，每个 variant 必须写 `enabled`，启用档位可写 `wire_effort`；选择形如 `provider_id/model_id#variant`。示例：
 
 ```json
-"deepseek-v4-flash": {
-  "api_protocol": "chat",
-  "max_context_tokens": 1000000,
-  "max_output_tokens": 384000,
-  "reasoning_variants": {
-    "off": {"enabled": false},
-    "high": {"enabled": true, "wire_effort": "high"},
-    "max": {"enabled": true, "wire_effort": "max"}
-  },
-  "default_variant": "high",
-  "tool_reasoning_history": "reasoning_content"
+{
+  "version": 1,
+  "default_provider": "dashscope",
+  "default_model": "dashscope/deepseek-v4-flash-0731#high",
+  "providers": {
+    "dashscope": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "models": {
+        "deepseek-v4-flash-0731": {
+          "api_protocol": "chat",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 384000,
+          "reasoning_variants": {
+            "off": {"enabled": false},
+            "high": {"enabled": true, "wire_effort": "high"},
+            "max": {"enabled": true, "wire_effort": "max"}
+          },
+          "default_variant": "high",
+          "tool_reasoning_history": "reasoning_content"
+        }
+      }
+    }
+  }
 }
 ```
 

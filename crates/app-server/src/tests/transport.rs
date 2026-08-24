@@ -901,8 +901,8 @@ fn insert_session_record(store: &SessionIndex, session_id: &str, rollout_path: &
 #[test]
 fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     // 1a 回归：就绪点前移到 initialize 请求处理完成。客户端收到 initialize
-    // 回执后（不等待、也不发送 initialized）立即发 turn/start，必须走 turn
-    // lane 流式路径；旧实现会把它留在 ordinary 管线并被 not_initialized 拒绝。
+    // 回执后（不等待、也不发送 initialized）立即发 turn/start，请求直接走
+    // turn lane 流式路径并开始执行。
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");

@@ -19,7 +19,7 @@ pub fn thread_from_record(record: &SessionRecord) -> singularity_protocol::Threa
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 pub const BACKUPS_DIR_NAME: &str = "backups";
 
-/// `~/.singularity` 下由本次架构固定下来的路径集合。
+/// `~/.singularity` 下的固定路径集合。
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub home_dir: PathBuf,

@@ -238,7 +238,7 @@ impl TurnRunner {
         let turn_id = Uuid::new_v4().to_string();
         let thread = params.thread;
         // fail-fast 准备：workspace、provider/config、会话打开修复、Agent 构造
-        // 全部就绪后才写任何 turn 状态；此前的失败不留 turn 痕迹。
+        // 全部就绪后才写任何 turn 状态；准备阶段的失败发生在状态写入之前。
         workspace_path(&thread).map_err(|message| TurnRunError::Preparation {
             cause: TurnFailureCause::Workspace,
             message,
