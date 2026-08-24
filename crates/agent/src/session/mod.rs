@@ -18,7 +18,7 @@ pub use format::{
     SessionMetadata, SessionMetadataKind,
 };
 pub use manager::SessionManager;
-pub use repository::{SessionRead, SessionRepository};
+pub use repository::{SessionRepository, ThreadRead};
 
 #[cfg(test)]
 pub(crate) use file::{AppendLimits, normalize_cwd_string};

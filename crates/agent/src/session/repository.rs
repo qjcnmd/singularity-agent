@@ -10,7 +10,7 @@ use super::manager::SessionManager;
 /// 打开文件时的行数/单行大小上限仍然生效；条目序列是 turn 分页投影的
 /// 唯一输入，任何窗口裁剪都发生在其上的过滤与分页层，不做物理切片。
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionRead {
+pub struct ThreadRead {
     pub summary: Option<String>,
     pub entries: Vec<SessionEntry>,
 }
@@ -29,7 +29,7 @@ impl SessionRepository {
     }
 
     /// 读取会话：按 id 定位 rollout，校验 header id，返回摘要与完整 leaf 序列。
-    pub fn read(&self, session_id: &str) -> Result<SessionRead> {
+    pub fn read(&self, session_id: &str) -> Result<ThreadRead> {
         let path = self.sessions_dir.join(format!("{session_id}.jsonl"));
         let session = SessionManager::open_existing(&path)?;
         if session.session_id() != session_id {
@@ -38,7 +38,7 @@ impl SessionRepository {
                 session.session_id()
             )));
         }
-        Ok(SessionRead {
+        Ok(ThreadRead {
             summary: session.summary(),
             entries: session.entries().to_vec(),
         })

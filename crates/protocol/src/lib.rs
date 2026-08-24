@@ -120,7 +120,7 @@ method_registry! {
     ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
     ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
     ThreadSettings => ("thread/settings", Request, ThreadSettingsParams, ThreadSettingsResult),
-    SessionRead => ("session/read", Request, SessionReadParams, SessionReadResult),
+    ThreadRead => ("thread/read", Request, ThreadReadParams, ThreadReadResult),
     SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
     TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnInjectionResult),
@@ -546,7 +546,7 @@ fn default_session_turn_limit() -> u32 {
 /// 查看会话历史：按 turn 为单位返回一页，默认最新 `limit` 轮；
 /// 给 `beforeItem` 则返回该锚点 item 所属轮之前的 `limit` 轮（不含锚点轮），
 /// 供"上滚加载更早"翻页。
-pub struct SessionReadParams {
+pub struct ThreadReadParams {
     pub session_id: String,
     /// 每页最多返回的轮数（1..=200）。
     #[serde(default = "default_session_turn_limit")]
@@ -558,7 +558,7 @@ pub struct SessionReadParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-/// `session/read` 的公开历史 item；不暴露 SessionEntry 的 parent/tree、迁移或
+/// `thread/read` 的公开历史 item；不暴露 SessionEntry 的 parent/tree、迁移或
 /// provider-private replay 字段。
 pub enum HistoryItem {
     Message {
@@ -602,7 +602,7 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 公开 history item 的稳定公开 id；`session/read` 的 beforeItem 翻页锚点
+    /// 公开 history item 的稳定公开 id；`thread/read` 的 beforeItem 翻页锚点
     /// 取自上一页最旧轮内任意 item 的该 id。
     pub fn id(&self) -> &str {
         match self {
@@ -623,7 +623,7 @@ impl HistoryItem {
 /// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 turn 开始 metadata
 /// 划定；首个开始标记之前落盘的前导条目（settings 等）没有归属 turn，
 /// turnId/status 为 null。
-pub struct SessionTurn {
+pub struct ThreadTurn {
     pub turn_id: Option<String>,
     /// 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
     /// 投影修正为 interrupted），前导组为 null。
@@ -634,8 +634,8 @@ pub struct SessionTurn {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// session/read 的响应：摘要 + 一页按 turn 组织的历史。
-pub struct SessionReadResult {
+/// thread/read 的响应：摘要 + 一页按 turn 组织的历史。
+pub struct ThreadReadResult {
     pub session_id: String,
     pub cwd: String,
     pub title: Option<String>,
@@ -650,7 +650,7 @@ pub struct SessionReadResult {
     /// 最近一次 compaction 摘要；无 compaction 时为 None。
     pub summary: Option<String>,
     /// 本页轮次，按会话顺序（旧→新）排列。
-    pub turns: Vec<SessionTurn>,
+    pub turns: Vec<ThreadTurn>,
     /// 会话中真实 turn 的总数（不含无归属 turn 的前导组）。
     pub total_turns: usize,
 }

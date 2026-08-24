@@ -99,6 +99,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 model: metadata.field_string("model").map(str::to_string),
                 reasoning: metadata.field_string("reasoning").map(str::to_string),
             }],
+            SessionMetadataKind::ThreadName => Vec::new(),
             SessionMetadataKind::Usage => metadata
                 .field("usage")
                 .cloned()
@@ -120,7 +121,7 @@ fn terminal_turn_status(kind: SessionMetadataKind) -> TurnStatus {
     }
 }
 
-/// session/read 的按轮分组投影。
+/// thread/read 的按轮分组投影。
 ///
 /// turn 开始 metadata 划定轮次边界；同 id 的终态 metadata 写入轮次身份而
 /// 不是条目，message/compaction/settings/usage 全部投影为轮内条目。首个
@@ -130,11 +131,11 @@ fn terminal_turn_status(kind: SessionMetadataKind) -> TurnStatus {
 /// 崩溃遗留的未终止轮：非末组直接按 interrupted 投影（与 reopen repair 的
 /// 落盘结果一致）；末组保持 running，由调用方依据整体状态投影修正——只有
 /// 本进程存在该会话的存活 turn 时 running 才成立。
-pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<SessionTurn> {
+pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> {
     // 前导组按需创建：一旦出现过 turn 开始标记，后续条目都归属当前组。
-    fn leading_or_last(turns: &mut Vec<SessionTurn>) -> &mut SessionTurn {
+    fn leading_or_last(turns: &mut Vec<ThreadTurn>) -> &mut ThreadTurn {
         if turns.is_empty() {
-            turns.push(SessionTurn {
+            turns.push(ThreadTurn {
                 turn_id: None,
                 status: None,
                 items: Vec::new(),
@@ -143,11 +144,11 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<SessionTurn>
         turns.last_mut().expect("group just ensured")
     }
 
-    let mut turns: Vec<SessionTurn> = Vec::new();
+    let mut turns: Vec<ThreadTurn> = Vec::new();
     for entry in entries {
         match &entry.entry_type {
             SessionEntryType::Metadata(metadata) => match metadata.kind() {
-                SessionMetadataKind::TurnStarted => turns.push(SessionTurn {
+                SessionMetadataKind::TurnStarted => turns.push(ThreadTurn {
                     turn_id: metadata.turn_id().map(str::to_string),
                     status: None,
                     items: Vec::new(),

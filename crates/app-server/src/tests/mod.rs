@@ -545,13 +545,13 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
         .handle_json(
             &json!({
                 "jsonrpc":"2.0",
-                "method":"session/read",
+                "method":"thread/read",
                 "id":2,
                 "params":{"sessionId":session_id}
             })
             .to_string(),
         )
-        .expect("session/read");
+        .expect("thread/read");
     let wire = serde_json::to_string(&output).expect("wire");
     assert!(wire.contains("visible reasoning"));
     assert!(wire.contains("out.txt"));
@@ -909,7 +909,7 @@ fn last_turn_status_reports_running_only_with_live_turn() {
     fn read_status(server: &mut AppServer, id: i64, session_id: &str) -> serde_json::Value {
         server
             .handle_json(&format!(
-                r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{{"sessionId":"{session_id}"}}}}"#
+                r#"{{"jsonrpc":"2.0","method":"thread/read","id":{id},"params":{{"sessionId":"{session_id}"}}}}"#
             ))
             .expect("session read")[0]["result"]["status"]
             .clone()
@@ -1090,7 +1090,7 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
             r#"{"clientInfo":{"name":"t","title":"T","version":"0"}}"#,
         ),
         ("thread/start", r#"{"cwd":"/tmp"}"#),
-        ("session/read", r#"{"sessionId":"<session>"}"#),
+        ("thread/read", r#"{"sessionId":"<session>"}"#),
         ("session/delete", r#"{"sessionId":"<session>"}"#),
         (
             "turn/start",
@@ -1972,7 +1972,7 @@ fn agent_prompt_tool_list_matches_registry_names_only() {
     }
 }
 
-// ===== session/read turn 分页 =====
+// ===== thread/read turn 分页 =====
 
 /// 建一个带 settings 前导组的多轮会话：每轮一条 user 消息，偶数索引轮
 /// 额外带一条 toolResult 消息（供条目内容断言区分轮次）。
@@ -2041,10 +2041,10 @@ fn seed_turned_session(
     sid
 }
 
-fn session_read_response(server: &mut AppServer, id: i64, params: &str) -> serde_json::Value {
+fn thread_read_response(server: &mut AppServer, id: i64, params: &str) -> serde_json::Value {
     server
         .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"session/read","id":{id},"params":{params}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":{id},"params":{params}}}"#
         ))
         .expect("session read")[0]
         .clone()
@@ -2063,7 +2063,7 @@ fn turn_page(result: &serde_json::Value) -> Vec<String> {
 }
 
 #[test]
-fn session_read_pages_newest_first_and_before_item() {
+fn thread_read_pages_newest_first_and_before_item() {
     let temp = tempfile::tempdir().expect("temp dir");
     let sessions_dir = temp.path().join("sessions");
     let store = SessionIndex::new();
@@ -2077,7 +2077,7 @@ fn session_read_pages_newest_first_and_before_item() {
     );
 
     // 默认页：最新 limit 轮，按会话顺序排列；前导组不入默认最新窗口。
-    let page1 = session_read_response(
+    let page1 = thread_read_response(
         &mut server,
         10,
         &format!(r#"{{"sessionId":"{sid}","limit":2}}"#),
@@ -2098,7 +2098,7 @@ fn session_read_pages_newest_first_and_before_item() {
     let anchor = result1["turns"][0]["items"][0]["id"]
         .as_str()
         .expect("anchor id");
-    let page2 = session_read_response(
+    let page2 = thread_read_response(
         &mut server,
         11,
         &format!(r#"{{"sessionId":"{sid}","limit":2,"beforeItem":"{anchor}"}}"#),
@@ -2120,7 +2120,7 @@ fn session_read_pages_newest_first_and_before_item() {
     let earlier_anchor = page2["result"]["turns"][1]["items"][0]["id"]
         .as_str()
         .expect("earlier anchor id");
-    let page3 = session_read_response(
+    let page3 = thread_read_response(
         &mut server,
         12,
         &format!(r#"{{"sessionId":"{sid}","limit":2,"beforeItem":"{earlier_anchor}"}}"#),
@@ -2133,7 +2133,7 @@ fn session_read_pages_newest_first_and_before_item() {
 }
 
 #[test]
-fn session_read_rejects_unknown_before_item() {
+fn thread_read_rejects_unknown_before_item() {
     let temp = tempfile::tempdir().expect("temp dir");
     let sessions_dir = temp.path().join("sessions");
     let store = SessionIndex::new();
@@ -2147,7 +2147,7 @@ fn session_read_rejects_unknown_before_item() {
     );
 
     for bad_before in ["garbage", "no-such-item", "sg1t0"] {
-        let response = session_read_response(
+        let response = thread_read_response(
             &mut server,
             20,
             &format!(r#"{{"sessionId":"{sid}","beforeItem":"{bad_before}"}}"#),
@@ -2160,7 +2160,7 @@ fn session_read_rejects_unknown_before_item() {
 }
 
 #[test]
-fn session_read_empty_session_returns_empty_page() {
+fn thread_read_empty_session_returns_empty_page() {
     let temp = tempfile::tempdir().expect("temp dir");
     let sessions_dir = temp.path().join("sessions");
     let store = SessionIndex::new();
@@ -2173,7 +2173,7 @@ fn session_read_empty_session_returns_empty_page() {
         &sessions_dir,
     );
 
-    let response = session_read_response(&mut server, 50, &format!(r#"{{"sessionId":"{sid}"}}"#));
+    let response = thread_read_response(&mut server, 50, &format!(r#"{{"sessionId":"{sid}"}}"#));
     let result = &response["result"];
     assert_eq!(result["turns"].as_array().expect("turns").len(), 0);
     assert_eq!(result["totalTurns"], 0);
@@ -2181,7 +2181,7 @@ fn session_read_empty_session_returns_empty_page() {
 }
 
 #[test]
-fn session_read_projects_crash_leftover_turn_as_interrupted() {
+fn thread_read_projects_crash_leftover_turn_as_interrupted() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -2221,7 +2221,7 @@ fn session_read_projects_crash_leftover_turn_as_interrupted() {
         )
         .expect("force active row");
 
-    let response = session_read_response(&mut server, 60, &format!(r#"{{"sessionId":"{sid}"}}"#));
+    let response = thread_read_response(&mut server, 60, &format!(r#"{{"sessionId":"{sid}"}}"#));
     let result = &response["result"];
     assert_eq!(result["status"], "interrupted");
     assert_eq!(result["turns"][0]["turnId"], "t9");

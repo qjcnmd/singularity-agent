@@ -32,7 +32,7 @@ sg --help
 运行时按以下优先级解析 provider 配置：
 
 1. 进程环境中只要存在任一 provider 变量（`SINGULARITY_BASE_URL` / `SINGULARITY_API_KEY` / `SINGULARITY_MODEL` 等），就只使用进程环境层；
-2. 否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.v1.json`；
+2. 否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；
 3. 三个必需值必须来自同一层，缺失时 fail closed。
 
 最小进程环境示例：

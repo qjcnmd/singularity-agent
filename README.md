@@ -34,7 +34,7 @@ cargo build --release --locked --package singularity_cli
 
 ## Provider 配置
 
-Provider 配置持久化在 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.v1.json`；也可用进程环境层整体覆盖（任一 provider 变量出现即只使用该层）：
+Provider 配置持久化在 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；也可用进程环境层整体覆盖（任一 provider 变量出现即只使用该层）：
 
 ```dotenv
 SINGULARITY_BASE_URL=https://provider.example/v1

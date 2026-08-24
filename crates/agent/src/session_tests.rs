@@ -751,7 +751,7 @@ fn strict_open_rejects_unknown_entry_types_and_roles() {
 }
 
 #[test]
-fn bounded_session_read_checks_file_metadata_before_parsing_body() {
+fn bounded_thread_read_checks_file_metadata_before_parsing_body() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("oversized.jsonl");
     std::fs::write(&file, "not-json").unwrap();
@@ -763,7 +763,7 @@ fn bounded_session_read_checks_file_metadata_before_parsing_body() {
 }
 
 #[test]
-fn bounded_session_read_rejects_an_oversized_line_without_unbounded_growth() {
+fn bounded_thread_read_rejects_an_oversized_line_without_unbounded_growth() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("oversized-line.jsonl");
     let header = session_header("01914f6b-0000-7000-8000-000000000001");
@@ -777,7 +777,7 @@ fn bounded_session_read_rejects_an_oversized_line_without_unbounded_growth() {
 }
 
 #[test]
-fn bounded_session_read_counts_content_entries_without_counting_header() {
+fn bounded_thread_read_counts_content_entries_without_counting_header() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("entry-boundary.jsonl");
     let content = format!(

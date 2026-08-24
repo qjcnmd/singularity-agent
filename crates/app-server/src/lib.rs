@@ -29,9 +29,9 @@ use singularity_model::ModelUsage;
 use singularity_protocol::{
     AppEvent, HistoryItem, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
     MethodKind, ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult,
-    SessionIdParams, SessionReadParams, SessionReadResult, SessionTurn, Thread, ThreadListResult,
+    SessionIdParams, Thread, ThreadListResult, ThreadReadParams, ThreadReadResult,
     ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus,
-    Turn, TurnIdParams, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
+    ThreadTurn, Turn, TurnIdParams, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
     TurnStartParams, TurnStatus,
 };
 use thiserror::Error;

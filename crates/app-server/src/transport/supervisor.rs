@@ -500,7 +500,7 @@ async fn run_ordinary_dispatch(
 }
 
 /// 独立 control owner。它使用 AppServer 的共享活动-turn句柄，因而控制
-/// 请求不会排在 session/read、thread/list 等 ordinary state request 后面。
+/// 请求不会排在 thread/read、thread/list 等 ordinary state request 后面。
 async fn run_control_dispatch(
     control: AppServerControlHandle,
     mut requests: mpsc::Receiver<JsonRpcMessage>,

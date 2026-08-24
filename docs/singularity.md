@@ -83,7 +83,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 - **单写者**：一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束关闭写者。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
-- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。app-server 的 `thread/settings` 在排队时同步返回 `queued=true` 且索引行保持旧 model，终态后随 `thread/settingsApplied` 事件同步——任何时刻 thread/list 与 session/read 都只读已落盘值。
+- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。app-server 的 `thread/settings` 在排队时同步返回 `queued=true` 且索引行保持旧 model，终态后随 `thread/settingsApplied` 事件同步——任何时刻 thread/list 与 thread/read 都只读已落盘值。
 
 ## 6. Provider 与模型
 

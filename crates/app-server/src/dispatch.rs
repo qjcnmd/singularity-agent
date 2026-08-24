@@ -171,7 +171,7 @@ impl AppServer {
             }
             Method::ThreadList => self.thread_list(message),
             Method::ThreadStart => self.thread_start(message),
-            Method::SessionRead => self.session_read(message),
+            Method::ThreadRead => self.thread_read(message),
             Method::SessionDelete => self.session_delete(message),
             Method::ThreadSettings => self.thread_settings(message),
             Method::TurnStart => self.turn_start(message),
@@ -370,8 +370,8 @@ impl AppServer {
         Ok(messages)
     }
 
-    pub(super) fn session_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: SessionReadParams = parse_params(&message)?;
+    pub(super) fn thread_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadReadParams = parse_params(&message)?;
         if !(1..=200).contains(&params.limit) {
             return invalid_params_response(message.required_id());
         }
@@ -418,7 +418,7 @@ impl AppServer {
         let page_end = before_index.unwrap_or(turns.len());
         json_response(
             message.required_id(),
-            SessionReadResult {
+            ThreadReadResult {
                 session_id: record.session_id,
                 cwd: record.cwd,
                 title: record.title,

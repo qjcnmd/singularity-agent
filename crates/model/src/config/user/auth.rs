@@ -1,12 +1,9 @@
-//! 用户鉴权文件与安全保护（`auth.v1.json` 只读访问与权限校验）。
+//! 用户鉴权文件与安全保护（`auth.json` 只读访问与权限校验）。
 //!
-//! 凭据目录里只有一个 `auth.v1.json`，读侧只认这一个文件名并要求 owner-only
+//! 凭据目录里只有一个 `auth.json`，读侧只认这一个文件名并要求 owner-only
 //! 权限、常规文件与非 reparse 路径；任何越界状态都 fail closed。
 //!
-//! 历史世代文件处置指引：早期布局按每次导入写入 `auth.v1-<uuid>.json`
-//! 并由 config.json 的 `auth_generation` 字段指向最新一代。该机制已移除；
-//! 残留的世代文件与本文件 schema 相同，仅含 api_key 明文，可由主代理或
-//! 用户在确认新文件就绪后直接归档删除，运行时不再读取它们。
+//! 导入始终以临时文件加同卷原子改名更新唯一文件；运行时不扫描其他凭据文件。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -177,7 +174,7 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
     Ok(())
 }
 
-/// 返回凭据目录下唯一的 `auth.v1.json` 路径；目录边界先经 reparse 校验。
+/// 返回凭据目录下唯一的 `auth.json` 路径；目录边界先经 reparse 校验。
 pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
     ensure_no_reparse_point(directory, false)?;
     Ok(directory.join(USER_AUTH_FILE_NAME))

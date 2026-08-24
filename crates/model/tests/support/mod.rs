@@ -66,7 +66,7 @@ pub(crate) fn install_process_env(key: &str, value: &std::path::Path) -> Process
 }
 
 /// config.json 用户配置 fixture：以 `SINGULARITY_HOME` 指向隔离目录，
-/// 一次性写入 config.json 与 auth.v1.json（ProviderConfigSnapshot::capture
+/// 一次性写入 config.json 与 auth.json（ProviderConfigSnapshot::capture
 /// 的 user-config 层读取两文件；该层直接读进程环境，因此必须经
 /// `install_env` 把 SINGULARITY_HOME 安装到进程环境）。
 pub(crate) struct UserConfigFixture {
@@ -108,10 +108,10 @@ impl UserConfigFixture {
         .expect("write user config");
     }
 
-    /// 写入 auth.v1.json：给指定 provider 设置测试 api key；多次调用按
+    /// 写入 auth.json：给指定 provider 设置测试 api key；多次调用按
     /// provider 合并（保留既有条目）。
     pub(crate) fn set_api_key(&self, provider: &str, api_key: &str) {
-        let path = self.directory.path().join("auth.v1.json");
+        let path = self.directory.path().join("auth.json");
         let mut auth: Value = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())

@@ -496,7 +496,7 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     assert!(!auth_error.message.contains(&oversized_contents));
 }
 
-/// 凭据目录只认唯一 `auth.v1.json`：读侧合并 config.json + auth.v1.json，
+/// 凭据目录只认唯一 `auth.json`：读侧合并 config.json + auth.json，
 /// 同一路径内容翻新后读取结果随之收敛。
 #[test]
 fn auth_file_reads_reflect_the_single_credential_file() {

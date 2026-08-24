@@ -4,9 +4,9 @@ use serde_json::json;
 use singularity_core::ClientInfo;
 use singularity_protocol::{
     AgentDiagnosticParams, AppEvent, EmptyParams, InitializeParams, JsonRpcInbound, JsonRpcMessage,
-    Method, MethodKind, ProviderAttemptEventParams, ProviderAttemptSummaryParams,
-    SessionReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
-    TurnStatus, parse_json_rpc_payload, rpc_methods,
+    Method, MethodKind, ProviderAttemptEventParams, ProviderAttemptSummaryParams, ThreadReadParams,
+    ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload, rpc_methods,
 };
 
 #[test]
@@ -55,7 +55,7 @@ fn thread_and_turn_start_params_use_codex_style_wire_shape() {
 }
 
 #[test]
-fn injection_and_session_read_params_are_bounded_by_registry() {
+fn injection_and_thread_read_params_are_bounded_by_registry() {
     let steer = serde_json::to_value(TurnInjectionParams {
         turn_id: "turn-id".to_string(),
         input: vec![singularity_protocol::InputItem::Text {
@@ -78,10 +78,10 @@ fn injection_and_session_read_params_are_bounded_by_registry() {
     );
 
     let read = json!({"sessionId":"session-id"});
-    let params: SessionReadParams = serde_json::from_value(read).expect("session read params");
+    let params: ThreadReadParams = serde_json::from_value(read).expect("session read params");
     assert_eq!(params.limit, 20);
     assert_eq!(params.before_item, None);
-    let explicit: SessionReadParams = serde_json::from_value(json!({
+    let explicit: ThreadReadParams = serde_json::from_value(json!({
         "sessionId":"session-id",
         "limit":5,
         "beforeItem":"entry:item"
@@ -92,13 +92,13 @@ fn injection_and_session_read_params_are_bounded_by_registry() {
     assert_eq!(wire["limit"], 5);
     assert_eq!(wire["beforeItem"], "entry:item");
     assert!(
-        Method::SessionRead
+        Method::ThreadRead
             .spec()
             .validate_params(json!({"sessionId":"x"}))
             .is_ok()
     );
     assert!(
-        Method::SessionRead
+        Method::ThreadRead
             .spec()
             .validate_params(json!({"sessionId":"x","unknown":true}))
             .is_err()
@@ -117,7 +117,7 @@ fn method_registry_keeps_only_converged_methods() {
         "thread/list",
         "thread/start",
         "thread/settings",
-        "session/read",
+        "thread/read",
         "session/delete",
         "turn/start",
         "turn/steer",
@@ -133,7 +133,6 @@ fn method_registry_keeps_only_converged_methods() {
     }
     for removed in [
         "server/capabilities",
-        "thread/read",
         "thread/fork",
         "thread/archive",
         "thread/delete",

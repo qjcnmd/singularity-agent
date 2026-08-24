@@ -94,7 +94,7 @@ fn removed_thread_and_turn_methods_return_stable_errors() {
 }
 
 #[test]
-fn session_read_returns_turn_page_then_delete_removes_both() {
+fn thread_read_returns_turn_page_then_delete_removes_both() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -127,7 +127,7 @@ fn session_read_returns_turn_page_then_delete_removes_both() {
     .expect("append entry");
     drop(file);
 
-    process.send_request(4, "session/read", json!({"sessionId": session_id}));
+    process.send_request(4, "thread/read", json!({"sessionId": session_id}));
     let read = process.output.recv_id(4, Duration::from_secs(5));
     assert_eq!(read["result"]["sessionId"], session_id);
     assert_eq!(read["result"]["totalTurns"], 0);

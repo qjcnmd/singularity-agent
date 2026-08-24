@@ -175,7 +175,7 @@ impl AppServerProcess {
         Self::spawn_with_provider_env(cwd, home, &provider_env)
     }
 
-    /// 变体：通过用户配置目录（`{home}/config.json` + `{home}/auth.v1.json`）
+    /// 变体：通过用户配置目录（`{home}/config.json` + `{home}/auth.json`）
     /// 提供 provider 选择，不注入 SINGULARITY_MODEL/BASE_URL/API_KEY——
     /// 环境层会覆盖用户配置层，注入这些变量会把快照打回单模型 legacy 形态。
     /// 仅 steer_transport 测试目标使用，app_server 目标不引用。

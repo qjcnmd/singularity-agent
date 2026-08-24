@@ -136,9 +136,9 @@ Desktop 接入前补齐 Codex 式 `item/completed` 生命周期：每个 `item/s
 
 曾讨论让 Desktop/app-server 的历史读取返回原始 SessionEntry，包括 \`providerReasoningReplay\` 等 provider-private reasoning state；用户已撤回该选择，不得实施。最终边界由 D-034 确定：公开结构化 history projection，不返回原始 SessionEntry。
 
-### D-033：session/read entry_types（已撤回）
+### D-033：thread/read entry_types（已撤回）
 
-曾讨论是否扩展 \`session/read\` 的 entry_types；用户已撤回该选择，不得实施。当前 \`session/read\` 的公开历史种类和过滤范围以 D-034 及当前 protocol 类型为准。
+曾讨论是否扩展 \`thread/read\` 的 entry_types；用户已撤回该选择，不得实施。当前 \`thread/read\` 的公开历史种类和过滤范围以 D-034 及当前 protocol 类型为准。
 
 ### D-034：Thinking 公开投影
 
@@ -146,7 +146,7 @@ Desktop 公开显示文本 thinking block。DeepSeek 等 Provider 明确返回�
 
 ### D-035：Thread 模型投影（已被 D-046 取代）
 
-thread_settings 追加后同步更新 SQLite 当前模型索引；JSONL 是历史事实，SQLite 是最新值投影，\`thread/list\`、\`thread/resume\` 和 \`session/read\` 保持一致。
+thread_settings 追加后同步更新 SQLite 当前模型索引；JSONL 是历史事实，SQLite 是最新值投影，\`thread/list\`、\`thread/resume\` 和 \`thread/read\` 保持一致。
 
 ### D-036：Metadata 上下文隔离
 
@@ -174,7 +174,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 ### D-042：凭据单文件原子替换（P5-3）
 
-问题：`auth.v1-<uuid>.json` 世代机制使凭据目录出现多文件，导入也不清理旧世代。参考实现：Codex 单一 `$CODEX_HOME/auth.json`。当前代码事实：auth 写入生成 `auth.v1-<uuid>.json` 世代文件。选择：只保留一个 `auth.v1.json`；导入 = 写临时文件 + 同卷原子 rename；删除世代机制；现存历史世代文件提供一次性清理命令或在文档中指引用户手删。影响：凭据目录恒为单文件；导入失败不留下半写文件。验收方式：auth 读写测试 + 目录单文件断言。
+问题：早期世代机制使凭据目录出现多文件，导入也不清理旧世代。参考实现：Codex 单一 `$CODEX_HOME/auth.json`。选择：只保留一个 `auth.json`；导入 = 写临时文件 + 同卷原子 rename；删除世代机制。影响：凭据目录恒为单文件；导入失败不留下半写文件。验收方式：auth 读写测试 + 目录单文件断言。
 
 ### D-043：AGENTS.md 预算截断（P5-4）
 
@@ -194,7 +194,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 ### D-048：活动轮设置时序与索引一致性（D-030/D-035 的落地形态）
 
-问题：活动轮期间 `thread/settings` 若立即改写索引，线程列表会读到尚未落盘的投影；若只排队，终态后索引无人同步，模型展示永远滞后。参考实现：无（项目内部收敛）。当前代码事实：`queue_settings` 返回 `SettingsApplyTiming`（`AppliedNow`/`QueuedForNextTurn`/`NothingToApply`）；活动轮只合并单份意图，可信终态后自动持久化并以 `thread/settingsApplied` 事件发布更新投影；持久化失败保留意图并返回 Settings 错误。选择：生效时点由协调器唯一裁定（客户端不再用自身相位猜测），索引任何时刻只读已落盘值——排队时 `thread/settings` 返回 `queued=true` 且索引保持旧值，终态后随事件同步。影响：`thread/list` 与 `session/read` 的模型字段永不领先 JSONL；协议结果新增 `queued` 字段（additive）。验收方式：运行时时序与持久化失败契约测试、app-server 进程级集成测试（活动轮排队→索引不变→终态后收敛）。
+问题：活动轮期间 `thread/settings` 若立即改写索引，线程列表会读到尚未落盘的投影；若只排队，终态后索引无人同步，模型展示永远滞后。参考实现：无（项目内部收敛）。当前代码事实：`queue_settings` 返回 `SettingsApplyTiming`（`AppliedNow`/`QueuedForNextTurn`/`NothingToApply`）；活动轮只合并单份意图，可信终态后自动持久化并以 `thread/settingsApplied` 事件发布更新投影；持久化失败保留意图并返回 Settings 错误。选择：生效时点由协调器唯一裁定（客户端不再用自身相位猜测），索引任何时刻只读已落盘值——排队时 `thread/settings` 返回 `queued=true` 且索引保持旧值，终态后随事件同步。影响：`thread/list` 与 `thread/read` 的模型字段永不领先 JSONL；协议结果新增 `queued` 字段（additive）。验收方式：运行时时序与持久化失败契约测试、app-server 进程级集成测试（活动轮排队→索引不变→终态后收敛）。
 
 ## 参考实现
 
@@ -217,4 +217,4 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 ### D-050：协议与认证文件硬切命名
 
-问题：桌面端协议的 `session/read` 与 Thread 领域命名不一致，认证文件名携带未提供兼容价值的版本后缀。参考实现：Codex app-server 的 `thread/read` 与 `$CODEX_HOME/auth.json`。当前代码事实：协议面尚无外部消费者，认证文件只有单文件读路径。选择：按 D-039 硬切为 `thread/read` 与 `auth.json`，不保留旧名读取或 wire 兼容层；app-server crate 与其余协议方法保留。影响：protocol、app-server、runtime 配置读取、测试和文档同步使用新名称。
+问题：桌面端历史读取方法需要与 Thread 领域统一，认证文件名不需要版本后缀。参考实现：Codex app-server 的 `thread/read` 与 `$CODEX_HOME/auth.json`。当前代码事实：协议面尚无外部消费者，认证文件只有单文件读路径。选择：按 D-039 硬切为 `thread/read` 与 `auth.json`，不保留 wire 或文件读取兼容层；app-server crate 与其余协议方法保留。影响：protocol、app-server、runtime 配置读取、测试和文档同步使用新名称。

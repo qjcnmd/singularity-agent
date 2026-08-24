@@ -757,7 +757,7 @@ fn steer_immediately_after_started_is_accepted() {
 
 /// 活动轮设置只排队不落盘：索引与 JSONL 保持旧 model；终态后 runtime
 /// 持久化并发布 settingsApplied，app-server 据此同步索引——thread/list
-/// 与 session/read 不得在任何时刻读到未持久化的投影。
+/// 与 thread/read 不得在任何时刻读到未持久化的投影。
 #[test]
 fn active_turn_settings_queue_until_terminal_then_index_syncs() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -788,14 +788,14 @@ fn active_turn_settings_queue_until_terminal_then_index_syncs() {
     )
     .expect("write config.json");
     std::fs::write(
-        home.join("auth.v1.json"),
+        home.join("auth.json"),
         serde_json::to_string(&json!({
             "schema_version": 1,
             "providers": { "openai_compatible": { "api_key": "test-secret" } }
         }))
         .expect("auth json"),
     )
-    .expect("write auth.v1.json");
+    .expect("write auth.json");
     let mut process = support::AppServerProcess::spawn_with_user_config(&workspace, &home);
     process.initialize();
 

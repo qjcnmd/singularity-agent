@@ -300,18 +300,29 @@ fn record_from_session(session: &SessionManager, rollout_path: &Path) -> Session
         .find(|entry| entry.kind() == singularity_agent::session::SessionMetadataKind::Usage)
         .and_then(|entry| entry.field("usage").cloned())
         .unwrap_or_else(|| serde_json::json!({}));
-    let title = session.entries().iter().find_map(|entry| {
-        if let singularity_agent::session::SessionEntryType::Message(msg) = &entry.entry_type
-            && msg.role == singularity_agent::message::AgentMessageRole::User
-        {
-            let text = msg.content_text();
-            let title = crate::dispatch::title_from_input(&text);
-            if !title.is_empty() {
-                return Some(title);
-            }
-        }
-        None
-    });
+    let title = metadata
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.kind() == singularity_agent::session::SessionMetadataKind::ThreadName)
+                .then(|| entry.field_string("name").map(str::to_string))
+                .flatten()
+        })
+        .or_else(|| {
+            session.entries().iter().find_map(|entry| {
+                if let singularity_agent::session::SessionEntryType::Message(msg) =
+                    &entry.entry_type
+                    && msg.role == singularity_agent::message::AgentMessageRole::User
+                {
+                    let text = msg.content_text();
+                    let title = crate::dispatch::title_from_input(&text);
+                    if !title.is_empty() {
+                        return Some(title);
+                    }
+                }
+                None
+            })
+        });
     let created_at = session.created_at().to_string();
     let updated_at = session
         .entries()

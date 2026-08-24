@@ -51,7 +51,7 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
             .map_err(|_| "persistent smoke config could not be read".to_string())?,
     )
     .map_err(|_| "persistent smoke config is not valid JSON".to_string())?;
-    let source_auth = source_home.join("auth.v1.json");
+    let source_auth = source_home.join("auth.json");
     if !source_auth.is_file() {
         return Err("persistent smoke auth file is unavailable".to_string());
     }
@@ -71,7 +71,7 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
         serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,
     )
     .map_err(|_| "could not copy smoke config".to_string())?;
-    let isolated_auth = home.join("auth.v1.json");
+    let isolated_auth = home.join("auth.json");
     fs::copy(&source_auth, &isolated_auth)
         .map_err(|_| "could not copy smoke auth file".to_string())?;
     set_owner_only_permissions(&config_path)?;
