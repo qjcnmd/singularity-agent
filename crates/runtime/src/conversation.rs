@@ -215,6 +215,10 @@ impl Conversation {
         &self.runner
     }
 
+    pub fn runner_handle(&self) -> Arc<TurnRunner> {
+        Arc::clone(&self.runner)
+    }
+
     /// 当前 Thread 投影快照。
     pub fn thread(&self) -> Result<Thread, ConversationError> {
         self.lock_state().map(|state| state.thread.clone())
@@ -255,6 +259,40 @@ impl Conversation {
             .lock()
             .map(|state| state.pending_follow_ups.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// 撤回最近加入队列、尚未开始执行的一条 followUp。
+    pub fn withdraw_follow_up(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending_follow_ups.pop_back())
+    }
+
+    /// 空闲时执行一次用户请求的上下文压缩。
+    pub fn compact(
+        &self,
+    ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
+        let thread = {
+            let mut state = self.lock_state()?;
+            if state.reserved {
+                return Err(ConversationError::TurnAlreadyActive);
+            }
+            state.reserved = true;
+            state.thread.clone()
+        };
+        let result = self.runner.compact_thread(&thread);
+        self.release_reservation();
+        result.map_err(ConversationError::Settings)
+    }
+
+    pub fn rename(&self, name: &str) -> Result<(), ConversationError> {
+        let state = self.lock_state()?;
+        if state.reserved {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        crate::store::rename_thread(self.runner.sessions_dir(), &state.thread.thread_id, name)
+            .map_err(ConversationError::Settings)
     }
 
     /// 中断当前活动 turn；无活动 turn 时为 no-op。已接受的 followUp 不受

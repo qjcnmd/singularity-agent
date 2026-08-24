@@ -35,5 +35,6 @@ pub use events::{TurnEvent, TurnEventSink};
 pub use objects::{Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
 pub use runner::{TurnOutcome, TurnParams, TurnRunner};
 pub use store::{
-    ResumeError, canonical_thread_cwd, create_thread, resume_thread, thread_session_path,
+    ResumeError, ThreadSummary, canonical_thread_cwd, create_thread, list_threads, rename_thread,
+    resume_thread, thread_session_path,
 };

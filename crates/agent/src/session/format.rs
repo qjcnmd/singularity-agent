@@ -81,6 +81,7 @@ pub enum SessionMetadataKind {
     TurnFailed,
     TurnInterrupted,
     ThreadSettings,
+    ThreadName,
     Usage,
 }
 
@@ -179,6 +180,16 @@ impl SessionMetadata {
             fields.insert("reasoning".to_string(), Value::String(reasoning));
         }
         Self::new(SessionMetadataKind::ThreadSettings, fields)
+    }
+
+    pub fn thread_name(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SessionError::InvalidStructure(
+                "thread name must not be empty".to_string(),
+            ));
+        }
+        Ok(Self::simple(SessionMetadataKind::ThreadName, "name", name))
     }
 
     pub fn usage(turn_id: impl Into<String>, usage: Value) -> Result<Self> {
@@ -456,6 +467,7 @@ pub(super) fn strict_entry_from_value(value: &Value) -> std::result::Result<Sess
                 | "provider"
                 | "model"
                 | "reasoning"
+                | "name"
                 | "usage"
         ) {
             return Err(format!("unknown session entry field: {key}"));

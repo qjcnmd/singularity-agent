@@ -14,7 +14,9 @@ use singularity_model::{
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::{ThreadStatus, TurnStatus};
 use singularity_runtime::runner::{TurnOutcome, TurnRunner};
-use singularity_runtime::store::{create_thread, persisted_model_selector, resume_thread};
+use singularity_runtime::store::{
+    create_thread, list_threads, persisted_model_selector, resume_thread,
+};
 use singularity_runtime::{Conversation, ConversationError, SettingsApplyTiming, SettingsPatch};
 
 fn temp_sessions() -> tempfile::TempDir {
@@ -872,12 +874,13 @@ fn steer_affects_only_the_current_turn() {
     let sessions = home.path().join("sessions");
     let (release_tx, release_rx) = mpsc::channel();
     let log = Arc::new(RequestLog::default());
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shared = Arc::new(new_conversation(
         &sessions,
         Arc::new(GatedRecordingProvider {
             release: std::sync::Mutex::new(release_rx),
             log: Arc::clone(&log),
-            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            requested: Arc::clone(&requested),
         }),
         Some("openai_compatible/base-model"),
     ));
@@ -892,6 +895,7 @@ fn steer_affects_only_the_current_turn() {
         })
     };
     wait_for_active(&shared);
+    wait_for_requested(&requested);
     wait_steer_accepted(&shared, "course correction");
     release_tx.send(()).expect("release");
     turn_thread.join().expect("join").expect("turn completes");
@@ -908,6 +912,69 @@ fn steer_affects_only_the_current_turn() {
         vec!["original task".to_string(), "course correction".to_string()],
         "steer joins the current turn's context without spawning a turn"
     );
+}
+
+#[test]
+fn follow_up_withdrawal_removes_only_the_newest_queued_message() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(&sessions, Arc::new(FailingProvider), None);
+    let reservation = conversation.reserve_start().expect("reserve");
+    assert!(conversation.submit_follow_up("first"));
+    assert!(conversation.submit_follow_up("second"));
+    assert_eq!(conversation.withdraw_follow_up().as_deref(), Some("second"));
+    assert_eq!(conversation.pending_follow_ups(), vec!["first"]);
+    drop(reservation);
+}
+
+#[test]
+fn thread_name_is_persisted_and_listed_with_session_facts() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(RecordingProvider {
+            text: "done".into(),
+            log: Arc::new(RequestLog::default()),
+        }),
+        None,
+    );
+    let (_, mut sink) = collect_sink();
+    conversation.run_turn("hello", &mut sink).expect("turn");
+    conversation.rename("named thread").expect("rename");
+
+    let threads = list_threads(&sessions).expect("list");
+    let summary = threads
+        .iter()
+        .find(|summary| summary.thread_id == conversation.thread().unwrap().thread_id)
+        .expect("listed thread");
+    assert_eq!(summary.title.as_deref(), Some("named thread"));
+    assert_eq!(summary.turn_count, 1);
+}
+
+#[test]
+fn manual_compaction_uses_the_existing_thread_without_starting_a_turn() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(RecordingProvider {
+            text: "## Goal\ncompact summary".into(),
+            log: Arc::new(RequestLog::default()),
+        }),
+        None,
+    );
+    for input in ["one", "two", "three"] {
+        let (_, mut sink) = collect_sink();
+        conversation.run_turn(input, &mut sink).expect("turn");
+    }
+    let before = list_threads(&sessions).unwrap()[0].turn_count;
+    let result = conversation.compact().expect("compact");
+    assert!(matches!(
+        result,
+        singularity_agent::compaction::CompactionOutcome::Compacted { .. }
+    ));
+    assert_eq!(list_threads(&sessions).unwrap()[0].turn_count, before);
 }
 
 #[test]

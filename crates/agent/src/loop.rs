@@ -788,6 +788,34 @@ impl Agent {
         }
     }
 
+    /// 用户显式请求的压缩：沿正常保留预算选择安全切点，但不要求上下文先
+    /// 达到自动阈值。没有可摘要历史时返回 `NotNeeded`。
+    pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
+        let mut budget =
+            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
+        budget.retain_ratio = 0.0;
+        let capabilities = self.provider.protocol_contract();
+        let tools = self.tool_schemas(&capabilities);
+        let entries = self.session.build_context_entries()?;
+        let mut messages = Vec::with_capacity(entries.len() + 1);
+        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
+            messages.push(instruction);
+        }
+        messages.extend(entries.iter().flat_map(entry_to_llm_messages));
+        let max_output_tokens =
+            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
+        let tokens_before = self.estimate_assembled(&messages, &tools, max_output_tokens);
+        self.compaction
+            .compact_with_reason(
+                &mut self.session,
+                &budget,
+                tokens_before,
+                CompactionReason::Manual,
+                cancellation,
+            )
+            .map_err(AgentError::Compaction)
+    }
+
     /// 在本轮已装配的请求成品上做 Token 估算（请求前压缩判定的估算基础）。
     ///
     /// 覆盖最终 wire 请求：除 content 外，provider 还会重放每条 tool 消息的

@@ -12,6 +12,15 @@ use uuid::Uuid;
 use crate::error::TurnFailureCause;
 use crate::objects::{Thread, ThreadStatus};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub turn_count: usize,
+    pub total_tokens: u64,
+}
+
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 pub const BACKUPS_DIR_NAME: &str = "backups";
 
@@ -103,6 +112,69 @@ pub fn resume_thread(sessions_dir: &Path, thread_id: &str) -> Result<Thread, Res
         last_turn_status: persisted_thread_status(&session),
     };
     Ok(thread)
+}
+
+/// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
+pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
+    let entries = std::fs::read_dir(sessions_dir)
+        .map_err(|error| format!("failed to list sessions: {error}"))?;
+    let mut threads = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(session) = SessionManager::open_existing_read_only(&path) else {
+            continue;
+        };
+        let title = session.metadata_entries().iter().rev().find_map(|entry| {
+            (entry.kind() == SessionMetadataKind::ThreadName)
+                .then(|| entry.field_string("name").map(str::to_string))
+                .flatten()
+        });
+        let turn_count = session
+            .metadata_entries()
+            .iter()
+            .filter(|entry| entry.kind() == SessionMetadataKind::TurnStarted)
+            .count();
+        let total_tokens = session
+            .metadata_entries()
+            .iter()
+            .filter(|entry| entry.kind() == SessionMetadataKind::Usage)
+            .filter_map(|entry| entry.field("usage"))
+            .filter_map(|usage| usage.get("totalTokens").and_then(serde_json::Value::as_u64))
+            .sum();
+        threads.push(ThreadSummary {
+            thread_id: session.session_id().to_string(),
+            title,
+            created_at: session.created_at().to_string(),
+            turn_count,
+            total_tokens,
+        });
+    }
+    threads.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(threads)
+}
+
+/// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
+pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("thread name must not be empty".to_string());
+    }
+    let path = thread_session_path(sessions_dir, thread_id);
+    let mut session = SessionManager::open_existing(&path).map_err(|error| error.to_string())?;
+    if session.session_id() != thread_id {
+        return Err("thread id does not match session header".to_string());
+    }
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::thread_name(name)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// 从最新 `thread_settings` metadata 投影模型 selector。

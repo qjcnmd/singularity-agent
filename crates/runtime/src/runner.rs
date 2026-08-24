@@ -116,6 +116,25 @@ impl TurnRunner {
         Ok(())
     }
 
+    /// 在 turn 之外压缩既有 Thread，不写入 turn 生命周期 metadata。
+    pub fn compact_thread(
+        &self,
+        thread: &Thread,
+    ) -> Result<singularity_agent::compaction::CompactionOutcome, String> {
+        workspace_path(thread)?;
+        let (provider, config, _) = self
+            .resolve_agent_runtime(thread)
+            .map_err(|error| error.to_string())?;
+        let session = self
+            .open_and_repair_session(thread)
+            .map_err(|error| error.to_string())?;
+        let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)
+            .map_err(|error| error.to_string())?;
+        agent
+            .compact_now(&CancellationToken::new())
+            .map_err(|error| error.to_string())
+    }
+
     /// 注入终态化故障（仅测试）：前 N 次 terminal metadata 写入 / 终态事件
     /// 发射按注入次数失败，用于验证 fail-stop 与有界重试语义。
     #[cfg(feature = "test-hooks")]

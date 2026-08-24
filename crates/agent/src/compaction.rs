@@ -237,6 +237,7 @@ pub enum CompactionOutcome {
 pub enum CompactionReason {
     Threshold,
     ContextOverflow,
+    Manual,
 }
 
 /// Compaction 错误。
@@ -409,8 +410,8 @@ impl CompactionEngine {
         )
     }
 
-    /// 执行一次带显式原因的压缩。ContextOverflow 仅绕过阈值判定，调用方
-    /// 仍须传入强制前重建上下文的真实估算值。
+    /// 执行一次带显式原因的压缩。ContextOverflow 与 Manual 绕过阈值判定，
+    /// 调用方仍须传入压缩前重建上下文的真实估算值。
     pub fn compact_with_reason(
         &mut self,
         session: &mut SessionManager,
