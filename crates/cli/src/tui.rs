@@ -8,6 +8,13 @@
 //! 退出（130）；空闲第一次进入再确认提示，第二次正常退出（0）。确认状态由
 //! 任何其他按键、提交输入或 turn 链结束复位，settings 模态不改变该语义。
 //!
+//! 其余按键语义（对照上游 Grok Build 的 cancel/clear/rewind 惯例）：
+//! Esc 为无死端阶梯——浏览态先回底跟随，其次清空非空草稿，空输入为 no-op；
+//! Ctrl+T 切换 steer/followUp 提交语义（运行中 Enter 注入当前轮或排队为
+//! 后续 turn）；Ctrl+S 打开临时设置模态；Ctrl+J 强制插入换行（窗口/终端
+//! 不转发 Shift+Enter 时的手工等价键）；Ctrl+Home/Ctrl+End 跳转记录两端，
+//! PageUp/PageDown 翻页；Alt+O 折叠/展开最近工具 result。
+//!
 //! 终端生命周期：进入 alternate screen + raw mode + 鼠标捕获 + 键盘增强
 //! （CSI-u 修饰键）；所有退出路径（正常、错误、panic）统一恢复终端状态。
 
