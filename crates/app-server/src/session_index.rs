@@ -278,9 +278,9 @@ fn record_from_session(session: &SessionManager, rollout_path: &Path) -> Session
                 return Some(model.to_string());
             }
             Some(singularity_model::compose_model_selector(
-                &provider,
-                &model,
-                entry.field_string("reasoning").as_deref(),
+                provider,
+                model,
+                entry.field_string("reasoning"),
             ))
         });
     let status = metadata.iter().rev().find_map(|entry| match entry.kind() {

@@ -515,7 +515,7 @@ impl TuiApp {
     fn flow_metrics(&self) -> (usize, usize) {
         let width = self.last_flow_width.unwrap_or(80);
         let total: usize = self.transcript.row_counts(width).iter().sum::<usize>()
-            + self.transcript.live_row_count(width as u16);
+            + self.transcript.live_row_count(width);
         (total, self.last_viewport_rows.max(1))
     }
 

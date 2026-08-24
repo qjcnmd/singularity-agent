@@ -729,9 +729,13 @@ fn settings_persistence_failure_keeps_intent_and_fails_run() {
     );
 
     // 恢复可写后同一意图可被继续消费（下一 turn 的终态路径或空闲重提）。
-    let mut permissions = std::fs::metadata(&path).expect("jsonl").permissions();
-    permissions.set_readonly(false);
-    std::fs::set_permissions(&path, permissions).expect("restore writable");
+    // 临时目录内的测试文件恢复可写；Unix 权限放宽只影响该临时文件本身。
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut permissions = std::fs::metadata(&path).expect("jsonl").permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).expect("restore writable");
+    }
     let timing = shared
         .queue_settings(SettingsPatch {
             provider: Some("openai_compatible".to_string()),

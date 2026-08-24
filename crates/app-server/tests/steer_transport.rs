@@ -985,10 +985,12 @@ fn same_stdio_connection_steers_and_follows_up_during_one_turn() {
             .expect("second request"),
         1
     );
+    // 链式 followUp 在终态后准备新 turn；全工作区并行测试时本机负载
+    // 可能拖长准备窗口，等待界放宽但仍快速失败。
     assert_eq!(
         provider
             .served
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(20))
             .expect("third request"),
         2
     );
