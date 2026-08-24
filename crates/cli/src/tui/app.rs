@@ -124,11 +124,12 @@ impl SettingsMenu {
     }
 }
 
-/// 键盘处理结果：继续或提交一轮输入。
+/// 键盘处理结果：继续、提交一轮输入或以指定退出码结束进程。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Continue,
     Submit(String),
+    Exit(i32),
 }
 
 /// 交互式会话的应用状态。
@@ -142,7 +143,10 @@ pub(crate) struct TuiApp {
     waiting: WaitingTarget,
     settings: Option<SettingsMenu>,
     thread_id: String,
-    quit_hint: bool,
+    /// 二次确认退出已生效：下一次 Ctrl+C 直接退出（空闲 0 / 运行中 130）。
+    /// 复位规则：任何非 Ctrl+C 按键、提交输入或 turn 链结束都会清除；
+    /// 按下期间提示行持续显示再次确认文案。
+    quit_armed: bool,
     spinner_frame: usize,
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     waiting_since: Option<std::time::Instant>,
@@ -168,7 +172,7 @@ impl TuiApp {
             waiting: WaitingTarget::None,
             settings: None,
             thread_id,
-            quit_hint: false,
+            quit_armed: false,
             spinner_frame: 0,
             waiting_since: None,
             last_flow_width: None,
@@ -288,7 +292,7 @@ impl TuiApp {
     pub fn on_chain_finished(&mut self, result: &Result<TurnStatus, String>) {
         self.phase = Phase::Idle;
         self.set_waiting(WaitingTarget::None);
-        crate::signal::reset();
+        self.quit_armed = false;
         match result {
             Ok(TurnStatus::Interrupted) => {
                 self.transcript
@@ -302,22 +306,35 @@ impl TuiApp {
         }
     }
 
-    pub fn note_interrupt_requested(&mut self) {
-        self.phase = Phase::Interrupting;
-        self.quit_hint = false;
-    }
-
+    #[cfg(test)]
     pub fn phase(&self) -> Phase {
         self.phase
-    }
-
-    pub fn mark_quit_hint(&mut self) {
-        self.quit_hint = true;
     }
 
     /// 推进 spinner 节拍（由事件循环按固定间隔调用）。
     pub fn tick(&mut self) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    /// Ctrl+C 应用级语义（按键驱动，全部退出路径由事件循环统一恢复终端）：
+    /// 运行中第一次按下中断当前轮并进入二次确认，空闲第一次按下只进入二次
+    /// 确认；确认状态下第二次按下退出——空闲 0、运行/中断 130。
+    fn handle_ctrl_c(&mut self) -> Action {
+        if self.quit_armed {
+            let code = if self.phase == Phase::Idle { 0 } else { 130 };
+            return Action::Exit(code);
+        }
+        self.quit_armed = true;
+        if self.phase != Phase::Idle {
+            self.conversation.interrupt();
+            self.phase = Phase::Interrupting;
+        }
+        Action::Continue
+    }
+
+    /// 二次确认复位：任何非 Ctrl+C 按键、提交输入与 turn 链结束都会清除。
+    fn reset_quit_confirm(&mut self) {
+        self.quit_armed = false;
     }
 
     // -- 键盘路由 ------------------------------------------------------------
@@ -327,6 +344,13 @@ impl TuiApp {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return Action::Continue;
         }
+
+        // Ctrl+C 是应用级按键语义，先于 settings 模态消费：行为只由 turn
+        // 相位决定，模态不改变它；其余任何按键都取消已 armed 的二次确认。
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            return self.handle_ctrl_c();
+        }
+        self.reset_quit_confirm();
 
         if let Some(menu) = self.settings.as_mut() {
             match key.code {
@@ -441,12 +465,11 @@ impl TuiApp {
         if text.is_empty() {
             return Action::Continue;
         }
+        self.reset_quit_confirm();
         let action = match self.phase {
             Phase::Idle => {
                 self.phase = Phase::Running;
-                self.quit_hint = false;
                 self.waiting = WaitingTarget::Model;
-                crate::signal::reset();
                 Action::Submit(text)
             }
             Phase::Running | Phase::Interrupting => {
@@ -485,7 +508,8 @@ impl TuiApp {
 
     fn flow_metrics(&self) -> (usize, usize) {
         let width = self.last_flow_width.unwrap_or(80);
-        let total: usize = self.transcript.row_counts(width).iter().sum();
+        let total: usize = self.transcript.row_counts(width).iter().sum::<usize>()
+            + self.transcript.live_row_count(width as u16);
         (total, self.last_viewport_rows.max(1))
     }
 
@@ -512,7 +536,8 @@ impl TuiApp {
 
         // 滚动收敛：内容增长后按当前视口同步。
         self.last_flow_width = Some(flow.width);
-        let counts = self.transcript.row_counts(flow.width);
+        let mut counts = self.transcript.row_counts(flow.width);
+        counts.push(self.transcript.live_row_count(flow.width));
         let total_rows: usize = counts.iter().sum();
         let viewport = flow.height as usize;
         let grown = total_rows.saturating_sub(self.last_total_rows);
@@ -537,6 +562,7 @@ impl TuiApp {
             let mut offset = 0usize;
             let mut emitted = 0usize;
             let mut first_overlap_done = false;
+            let finished_items = self.transcript.item_count();
             for (item_index, rows) in counts.iter().enumerate() {
                 if emitted >= viewport {
                     break;
@@ -557,12 +583,17 @@ impl TuiApp {
                     if emitted >= viewport {
                         break;
                     }
-                    if let Some(line) = self.transcript.render_item_row(
-                        item_index,
-                        row_in_item,
-                        flow.width,
-                        spinner,
-                    ) {
+                    let line = if item_index < finished_items {
+                        self.transcript.render_item_row(
+                            item_index,
+                            row_in_item,
+                            flow.width,
+                            spinner,
+                        )
+                    } else {
+                        self.transcript.render_live_row(row_in_item, flow.width)
+                    };
+                    if let Some(line) = line {
                         lines.push(line);
                         emitted += 1;
                     }
@@ -709,10 +740,13 @@ impl TuiApp {
             status.push(Span::styled(" · viewing history", magenta));
         }
 
-        let hint_text = if self.settings.is_some() {
+        let hint_text = if self.quit_armed {
+            match self.phase {
+                Phase::Idle => "press Ctrl+C again to quit",
+                Phase::Running | Phase::Interrupting => "press Ctrl+C again to force quit",
+            }
+        } else if self.settings.is_some() {
             "Esc close · Tab field · Enter apply"
-        } else if self.quit_hint {
-            "press Ctrl+C again to quit"
         } else {
             match self.phase {
                 Phase::Idle => {
@@ -723,7 +757,7 @@ impl TuiApp {
                 }
             }
         };
-        let hint_style = if self.quit_hint {
+        let hint_style = if self.quit_armed {
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
             dim
@@ -1115,10 +1149,11 @@ mod tests {
         let status_text: String = status.iter().map(|span| span.content.clone()).collect();
         assert!(status_text.contains("[followUp]"), "{status_text}");
 
-        app.mark_quit_hint();
+        // 运行中第一次 Ctrl+C：进入中断相位并显示强制退出提示。
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let (_, hint) = app.footer_spans(100, 20);
         let hint_text: String = hint.iter().map(|span| span.content.clone()).collect();
-        assert!(hint_text.contains("Ctrl+C again"), "{hint_text}");
+        assert!(hint_text.contains("force quit"), "{hint_text}");
     }
 
     // -- 输入路由：followUp 单队列 -------------------------------------------
@@ -1198,5 +1233,207 @@ mod tests {
             other => panic!("expected Submit action, got {other:?}"),
         }
         assert_eq!(app.phase(), Phase::Running);
+    }
+
+    // -- Ctrl+C 状态机（按键驱动） -------------------------------------------
+
+    fn ctrl_c() -> KeyEvent {
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn hint_text(app: &TuiApp) -> String {
+        let (_, hint) = app.footer_spans(100, 20);
+        hint.iter().map(|span| span.content.clone()).collect()
+    }
+
+    #[test]
+    fn idle_first_ctrl_c_arms_confirm_and_second_exits_zero() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        assert_eq!(app.handle_key(ctrl_c()), Action::Continue);
+        assert_eq!(
+            app.phase(),
+            Phase::Idle,
+            "idle Ctrl+C must not change phase"
+        );
+        assert!(
+            hint_text(&app).contains("again to quit"),
+            "idle first Ctrl+C shows the re-confirm hint"
+        );
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Exit(0),
+            "idle second Ctrl+C exits with code 0"
+        );
+    }
+
+    #[test]
+    fn running_first_ctrl_c_interrupts_and_second_exits_130() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.force_phase(Phase::Running);
+        assert_eq!(app.handle_key(ctrl_c()), Action::Continue);
+        assert_eq!(
+            app.phase(),
+            Phase::Interrupting,
+            "first Ctrl+C while running moves to the interrupting phase"
+        );
+        assert!(
+            hint_text(&app).contains("force quit"),
+            "running first Ctrl+C announces the force-quit exit"
+        );
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Exit(130),
+            "second Ctrl+C while interrupting force-exits with 130"
+        );
+    }
+
+    #[test]
+    fn any_other_key_resets_the_quit_confirm() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.handle_key(ctrl_c());
+        assert!(hint_text(&app).contains("again to quit"));
+
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Continue,
+            "after reset the first Ctrl+C only re-arms"
+        );
+        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
+    }
+
+    #[test]
+    fn chain_finished_resets_the_quit_confirm() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.force_phase(Phase::Running);
+        app.handle_key(ctrl_c());
+        app.on_chain_finished(&Ok(TurnStatus::Interrupted));
+        assert_eq!(app.phase(), Phase::Idle);
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Continue,
+            "chain end clears the armed state; a fresh two-press sequence applies"
+        );
+        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
+    }
+
+    #[test]
+    fn submitting_input_clears_the_quit_confirm() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.handle_key(ctrl_c());
+        for ch in "go".chars() {
+            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(_) => {}
+            other => panic!("expected Submit action, got {other:?}"),
+        }
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Continue,
+            "submission clears the armed confirm even though a turn is running"
+        );
+        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(130));
+    }
+
+    #[test]
+    fn ctrl_c_keeps_one_semantics_inside_settings_modal() {
+        let (_home, sessions) = test_home();
+        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.settings.is_some(), "modal is open");
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Continue,
+            "first Ctrl+C inside the modal only arms the confirm"
+        );
+        assert!(
+            app.settings.is_some(),
+            "armed quit does not close the modal by itself"
+        );
+        assert_eq!(
+            app.handle_key(ctrl_c()),
+            Action::Exit(0),
+            "second Ctrl+C inside the modal exits with idle code 0"
+        );
+    }
+
+    #[test]
+    fn running_ctrl_c_delivers_interrupt_to_the_active_turn() {
+        use singularity_core::CancellationToken;
+        struct ProbeProvider {
+            probe: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+        }
+        impl singularity_model::Provider for ProbeProvider {
+            fn protocol_contract(&self) -> singularity_model::ProviderProtocolContract {
+                singularity_model::ProviderProtocolContract::default()
+            }
+            fn complete(
+                &self,
+                _request: &singularity_model::ModelTurnRequest,
+                cancellation: &CancellationToken,
+            ) -> Result<singularity_model::ModelTurnResponse, singularity_model::ProviderError>
+            {
+                self.probe.lock().unwrap().replace(cancellation.clone());
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(singularity_model::ProviderError::from_model_error(
+                    singularity_model::ModelError::new(
+                        singularity_model::ModelErrorKind::Cancelled,
+                        "cancelled",
+                    ),
+                ))
+            }
+        }
+
+        let (_home, sessions) = test_home();
+        let probe: Arc<std::sync::Mutex<Option<CancellationToken>>> = Arc::default();
+        let conversation = test_conversation(
+            &sessions,
+            Arc::new(ProbeProvider {
+                probe: Arc::clone(&probe),
+            }),
+        );
+        let mut app = TuiApp::new(Arc::clone(&conversation));
+        let (tx, rx) = mpsc::channel::<crate::tui::UiEvent>();
+        for ch in "block me".chars() {
+            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(goal) => crate::tui::spawn_turn(&conversation, goal, tx.clone()),
+            other => panic!("expected Submit action, got {other:?}"),
+        }
+        for _ in 0..400 {
+            if probe.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(probe.lock().unwrap().is_some(), "provider must be running");
+
+        // 生产路径：运行中按键 Ctrl+C → Conversation::interrupt 送达当前轮。
+        app.handle_key(ctrl_c());
+        assert_eq!(app.phase(), Phase::Interrupting);
+        assert!(
+            probe.lock().unwrap().as_ref().unwrap().is_cancelled(),
+            "first Ctrl+C must cancel the active turn token"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(16)) {
+                Ok(crate::tui::UiEvent::ChainFinished(Ok(TurnStatus::Interrupted))) => break,
+                Ok(_) => {}
+                Err(_) => panic!("chain should finish interrupted"),
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for interrupted chain finish");
+            }
+        }
     }
 }

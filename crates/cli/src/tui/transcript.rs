@@ -193,10 +193,31 @@ impl Transcript {
         })
     }
 
-    /// 条目总数（测试用；滚动锚定按可视行数计算）。
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
+    /// 条目总数。
+    pub fn item_count(&self) -> usize {
         self.items.len()
+    }
+
+    /// 进行中 assistant 段落的可视行数：未落定内容随帧实时可见，不再
+    /// 等到段落关闭才一次性出现。
+    pub fn live_row_count(&self, width: u16) -> usize {
+        if !self.assistant_active {
+            return 0;
+        }
+        wrapped_lines(&self.assistant_buffer, width.max(1) as usize)
+            .len()
+            .max(1)
+    }
+
+    /// 进行中 assistant 段落的第 `row_in_item` 可视行。
+    pub fn render_live_row(&self, row_in_item: usize, width: u16) -> Option<Line<'static>> {
+        if !self.assistant_active {
+            return None;
+        }
+        wrapped_lines(&self.assistant_buffer, width.max(1) as usize)
+            .into_iter()
+            .nth(row_in_item)
+            .map(|line| Line::from(Span::styled(line, NoteStyle::Info.style())))
     }
 
     /// 在给定宽度下每个条目占用的可视行数。
@@ -403,7 +424,7 @@ mod tests {
         transcript.assistant_delta("lo");
         // 其他事实到达时段落落定，且只有一个文本条目。
         transcript.push_note("marker", NoteStyle::Dim);
-        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript.item_count(), 2);
         let rows = transcript.row_counts(80);
         assert_eq!(rows, vec![1, 1]);
         let first = transcript.render_item_row(0, 0, 80, ' ').unwrap();
@@ -433,15 +454,19 @@ mod tests {
     fn tool_lifecycle_updates_in_place_and_converges_once() {
         let mut transcript = Transcript::new();
         transcript.tool_start("call-1", "bash", &serde_json::json!({"command":"echo hi"}));
-        assert_eq!(transcript.len(), 1, "start creates exactly one record");
+        assert_eq!(
+            transcript.item_count(),
+            1,
+            "start creates exactly one record"
+        );
         transcript.tool_update("call-1", "partial output");
         transcript.tool_update("call-1", "partial output two");
-        assert_eq!(transcript.len(), 1, "updates refresh in place");
+        assert_eq!(transcript.item_count(), 1, "updates refresh in place");
         transcript.tool_end("call-1", "line one\nline two\nline three\nline four", false);
-        assert_eq!(transcript.len(), 1, "end finalizes in place");
+        assert_eq!(transcript.item_count(), 1, "end finalizes in place");
         // 幂等终态：重复 end 不新增条目、不覆盖首见结果。
         transcript.tool_end("call-1", "different", true);
-        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript.item_count(), 1);
 
         // 渲染：头部 + 三行预览 + 溢出行。
         let counts = transcript.row_counts(80);

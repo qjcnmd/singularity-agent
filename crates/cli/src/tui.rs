@@ -3,8 +3,13 @@
 //! [`TurnEvent`]：turn 在工作线程上执行，事件经通道驱动渲染；steer 注入当前
 //! 活动 turn，followUp 提交给 Conversation 的后续队列并自动逐条执行。
 //!
-//! 终端生命周期：进入 alternate screen + raw mode + 鼠标捕获；所有退出路径
-//! （正常、错误、panic）统一恢复终端状态。
+//! Ctrl+C 由 crossterm `KeyEvent` 驱动（raw mode 下不依赖操作系统信号）：
+//! 运行中第一次中断当前轮（已接受 followUp 在可信终态后继续），第二次强制
+//! 退出（130）；空闲第一次进入再确认提示，第二次正常退出（0）。确认状态由
+//! 任何其他按键、提交输入或 turn 链结束复位，settings 模态不改变该语义。
+//!
+//! 终端生命周期：进入 alternate screen + raw mode + 鼠标捕获 + 键盘增强
+//! （CSI-u 修饰键）；所有退出路径（正常、错误、panic）统一恢复终端状态。
 
 mod app;
 mod editor;
@@ -63,22 +68,32 @@ pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> I
 
 fn enter_terminal() -> std::io::Result<()> {
     use crossterm::ExecutableCommand;
-    use crossterm::event::EnableMouseCapture;
+    use crossterm::event::{
+        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
+    // 键盘增强：让 Shift+Enter / Ctrl+J 等在真实终端以带修饰符的 CSI-u 序列
+    // 到达。尽力而为：Windows 控制台键记录天然携带修饰键，不受影响；不支持
+    // 的主机只退回无增强模式，不阻断终端启动。
+    let _ = stdout.execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+    ));
     Ok(())
 }
 
 fn restore_terminal() -> std::io::Result<()> {
     use crossterm::ExecutableCommand;
-    use crossterm::event::DisableMouseCapture;
+    use crossterm::event::{DisableMouseCapture, PopKeyboardEnhancementFlags};
     use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
     // 幂等：任一步失败继续其余步骤，保证退出路径尽量恢复。
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
+    let _ = stdout.execute(PopKeyboardEnhancementFlags);
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.flush();
@@ -169,6 +184,7 @@ fn event_loop(
                 Ok(crossterm::event::Event::Key(key)) => match app.handle_key(key) {
                     Action::Continue => {}
                     Action::Submit(goal) => spawn_turn(&conversation, goal, tx.clone()),
+                    Action::Exit(code) => return Ok(code),
                 },
                 Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
                     crossterm::event::MouseEventKind::ScrollUp => app.handle_wheel(true),
@@ -180,27 +196,6 @@ fn event_loop(
                 }
                 _ => {}
             }
-        }
-
-        // Ctrl+C 两级语义：运行中一次中断、两次强退；空闲两次退出。
-        match crate::signal::count() {
-            count if count >= 2 => {
-                let code = if app.phase() == app::Phase::Idle {
-                    0
-                } else {
-                    130
-                };
-                return Ok(code);
-            }
-            1 if matches!(app.phase(), app::Phase::Running | app::Phase::Interrupting) => {
-                conversation.interrupt();
-                app.note_interrupt_requested();
-            }
-            1 => {
-                app.mark_quit_hint();
-                // 计数保持到第二次按下或超时清理由 signal 模块处理。
-            }
-            _ => {}
         }
 
         if last_spinner_tick.elapsed() >= SPINNER_TICK {
