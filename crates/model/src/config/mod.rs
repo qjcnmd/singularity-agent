@@ -262,7 +262,7 @@ fn configured_model_from_user_file(
     // api_protocol 必须由用户显式声明。
     let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
-            "model override is incomplete; api_protocol is required",
+            "user config model must declare api_protocol (chat or responses)",
             "provider_configuration_invalid",
         ));
     };
