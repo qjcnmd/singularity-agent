@@ -15,10 +15,10 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 
 ## 执行 checkpoint
 
-- revision: `cac8e9c`
+- revision: `0bd125d`
 - branch: `main`
 - phase: Phase 5 — 文档同步与最终门禁
-- next task: TASK-502
+- next task: none
 
 ## 1. Requirements & Constraints
 
