@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
-    validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    resolve_path, validate_args,
 };
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
@@ -49,9 +49,9 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args::<ReadArgs>(&ctx.args) {
+    let args = match deserialize_args_or_error::<ReadArgs>(&ctx.args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");

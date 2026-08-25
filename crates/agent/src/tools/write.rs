@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
-    validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    resolve_path, validate_args,
 };
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
@@ -42,9 +42,9 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args::<WriteArgs>(&ctx.args) {
+    let args = match deserialize_args_or_error::<WriteArgs>(&ctx.args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     let path = &args.path;
     let content = &args.content;

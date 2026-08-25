@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use super::glob::glob_regex;
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
-    validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    resolve_path, validate_args,
 };
 use super::walk::{to_cwd_relative, walk_files};
 
@@ -75,9 +75,9 @@ fn truncate_for_display(line: &str) -> String {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args::<GrepArgs>(&ctx.args) {
+    let args = match deserialize_args_or_error::<GrepArgs>(&ctx.args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();

@@ -38,17 +38,9 @@ impl JsonlRenderer {
         let _ = lock.flush();
     }
 
-    /// 终态 summary 行。usage 仅在已知时输出；普通终态不输出截断字段。
-    pub fn emit_summary(&self, status: TurnStatus, usage: Option<Value>) {
-        self.emit_summary_with_truncation(status, usage, false);
-    }
-
-    pub fn emit_summary_with_truncation(
-        &self,
-        status: TurnStatus,
-        usage: Option<Value>,
-        truncated: bool,
-    ) {
+    /// 终态 summary 行。usage 仅在已知时输出；`truncated` 为 true 时额外
+    /// 输出 `turn.truncated: true`（仅截断终态出现，加法兼容）。
+    pub fn emit_summary(&self, status: TurnStatus, usage: Option<Value>, truncated: bool) {
         let mut turn = json!({
             "threadId": self.thread_id,
             "status": status.as_str(),

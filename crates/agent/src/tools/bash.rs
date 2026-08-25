@@ -102,7 +102,8 @@ mod job_object {
 use serde_json::{Value, json};
 
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    validate_args,
 };
 use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail,
@@ -178,9 +179,9 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
         signal,
         mut on_update,
     } = ctx;
-    let args = match deserialize_args::<BashArgs>(&raw_args) {
+    let args = match deserialize_args_or_error::<BashArgs>(&raw_args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     let command = args.command;
     let timeout = args.timeout_ms;

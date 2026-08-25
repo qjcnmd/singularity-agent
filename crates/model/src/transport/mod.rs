@@ -708,12 +708,13 @@ impl OpenAiProvider {
         model_name: &str,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let completion = self.complete_with_contract_details_until(
+        let completion = self.complete_protocol(
             request,
             cancellation,
             capabilities,
             api_protocol,
             model_name,
+            None,
             on_attempt,
         )?;
         validate_response_tool_reasoning_contract(
@@ -725,26 +726,6 @@ impl OpenAiProvider {
                 .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
         )?;
         Ok(completion.response)
-    }
-
-    pub(super) fn complete_with_contract_details_until(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        capabilities: &ProviderProtocolContract,
-        api_protocol: ProviderApiProtocol,
-        model_name: &str,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<OpenAiCompletion, ProviderError> {
-        self.complete_protocol(
-            request,
-            cancellation,
-            capabilities,
-            api_protocol,
-            model_name,
-            None,
-            on_attempt,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]

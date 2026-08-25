@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
-    validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    resolve_path, validate_args,
 };
 use super::walk::{display_path, to_cwd_relative, walk_files};
 
@@ -90,9 +90,9 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args::<GlobArgs>(&ctx.args) {
+    let args = match deserialize_args_or_error::<GlobArgs>(&ctx.args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     let path = args.path.as_deref().unwrap_or(".");
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {

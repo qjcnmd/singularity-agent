@@ -861,20 +861,7 @@ impl Agent {
         // normal recent-content ratio when the provider has already rejected
         // the request for exceeding its context window.
         budget.retain_ratio = 0.0;
-        // 与正常请求同一装配 seam 重建全上下文并取真实估算：强制压缩记录的
-        // tokens_before 必须反映被 provider 拒绝的完整请求规模，而非退化占位。
-        let capabilities = self.provider.protocol_contract();
-        let tools = self.tool_schemas(&capabilities);
-        let entries = self.session.build_context_entries()?;
-        let replays = self.reasoning_replays_from_entries(&entries);
-        let mut messages = Vec::with_capacity(entries.len() + 1);
-        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
-            messages.push(instruction);
-        }
-        messages.extend(entries.iter().flat_map(entry_to_llm_messages));
-        let max_output_tokens =
-            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        let tokens_before = self.estimate_assembled(&messages, &tools, &replays, max_output_tokens);
+        let tokens_before = self.assembled_context_estimate()?;
         match self.compaction.compact_with_reason(
             &mut self.session,
             &budget,
@@ -904,6 +891,22 @@ impl Agent {
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
+        let tokens_before = self.assembled_context_estimate()?;
+        self.compaction
+            .compact_with_reason(
+                &mut self.session,
+                &budget,
+                tokens_before,
+                CompactionReason::Manual,
+                cancellation,
+            )
+            .map_err(AgentError::Compaction)
+    }
+
+    /// 以正常请求同一装配 seam 重建当前上下文并估算规模：压缩前记录的
+    /// tokens_before 必须反映完整装配（消息、工具 schema、reasoning replay、
+    /// 输出预算与固定余量），而非退化占位。
+    fn assembled_context_estimate(&self) -> Result<u64> {
         let capabilities = self.provider.protocol_contract();
         let tools = self.tool_schemas(&capabilities);
         let entries = self.session.build_context_entries()?;
@@ -915,16 +918,7 @@ impl Agent {
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        let tokens_before = self.estimate_assembled(&messages, &tools, &replays, max_output_tokens);
-        self.compaction
-            .compact_with_reason(
-                &mut self.session,
-                &budget,
-                tokens_before,
-                CompactionReason::Manual,
-                cancellation,
-            )
-            .map_err(AgentError::Compaction)
+        Ok(self.estimate_assembled(&messages, &tools, &replays, max_output_tokens))
     }
 
     /// 对本轮装配结果做保守 Token 估算，供首轮或 provider usage 缺失时

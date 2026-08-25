@@ -91,8 +91,11 @@ fn run(cli: Cli) -> Result<i32, String> {
     let mode = cli.mode()?;
     if let Err(error) = singularity_runtime::ensure_bash_available() {
         if mode == Some(Mode::Json) {
-            JsonlRenderer::new(fallback_thread_id(cli.session.as_deref()))
-                .emit_summary(TurnStatus::Failed, None);
+            JsonlRenderer::new(fallback_thread_id(cli.session.as_deref())).emit_summary(
+                TurnStatus::Failed,
+                None,
+                false,
+            );
         }
         return Err(error);
     }
@@ -120,8 +123,11 @@ fn run(cli: Cli) -> Result<i32, String> {
             // 准备阶段失败也必须有终态形态：--json 输出 failed summary 行，
             // 保证机器解析方总能看到终态；--print 只向 stderr 报告。
             if mode == Mode::Json {
-                JsonlRenderer::new(fallback_thread_id(cli.session.as_deref()))
-                    .emit_summary(TurnStatus::Failed, None);
+                JsonlRenderer::new(fallback_thread_id(cli.session.as_deref())).emit_summary(
+                    TurnStatus::Failed,
+                    None,
+                    false,
+                );
             }
             return Err(error.message);
         }
@@ -237,16 +243,12 @@ fn drain_json(
     match outcome {
         Ok(outcome) => {
             let usage = serde_json::to_value(outcome.usage).unwrap_or(serde_json::Value::Null);
-            renderer.emit_summary_with_truncation(
-                outcome.turn_status,
-                Some(usage),
-                outcome.truncated,
-            );
+            renderer.emit_summary(outcome.turn_status, Some(usage), outcome.truncated);
             Ok(exit_code_for(outcome.turn_status))
         }
         Err(message) => {
             // 失败也必须以终态 summary 收尾，保证机器解析总能看到终态行。
-            renderer.emit_summary(TurnStatus::Failed, None);
+            renderer.emit_summary(TurnStatus::Failed, None, false);
             Err(message)
         }
     }

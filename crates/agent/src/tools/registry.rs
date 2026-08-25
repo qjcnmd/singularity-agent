@@ -174,6 +174,24 @@ pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, S
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))
 }
 
+/// 反序列化工具参数；失败时把错误文本包装为模型可见的 `is_error` 结果。
+/// 调用方把返回的失败结果直接作为工具执行结果透传，例如：
+///
+/// ```ignore
+/// let args = match deserialize_args_or_error::<MyArgs>(&raw_args) {
+///     Ok(args) => args,
+///     Err(execution) => return Ok(execution),
+/// };
+/// ```
+pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
+    args: &Value,
+) -> Result<T, ToolExecution> {
+    deserialize_args::<T>(args).map_err(|message| ToolExecution {
+        content: message,
+        is_error: true,
+    })
+}
+
 pub(crate) fn validate_args<T: DeserializeOwned>(args: &Value) -> Result<(), String> {
     deserialize_args::<T>(args).map(|_| ())
 }

@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
-    validate_args,
+    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
+    resolve_path, validate_args,
 };
 use super::truncate::{format_size, split_lines};
 
@@ -54,9 +54,9 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args::<EditArgs>(&ctx.args) {
+    let args = match deserialize_args_or_error::<EditArgs>(&ctx.args) {
         Ok(args) => args,
-        Err(message) => return error_result(message),
+        Err(execution) => return Ok(execution),
     };
     let path = &args.path;
     let old_string = &args.old_string;
