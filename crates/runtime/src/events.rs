@@ -74,7 +74,6 @@ pub enum TurnEvent {
         thread_id: String,
         turn_id: String,
         model_turn_ordinal: u32,
-        operation_phase: String,
         provider: String,
         model: String,
         protocol: String,
@@ -82,10 +81,6 @@ pub enum TurnEvent {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_duration_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_scheduled: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_backoff_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_category: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

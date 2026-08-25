@@ -598,7 +598,7 @@ impl TurnRunner {
             format!(
                 "turn failed during {} ({})",
                 failure.stage.as_str(),
-                failure.cause.as_str()
+                failure.cause.wire_str()
             )
         });
         sink.emit(TurnEvent::TurnFailed {
@@ -610,7 +610,7 @@ impl TurnRunner {
             },
             error: TurnErrorDetail {
                 stage: failure.stage.as_str().to_string(),
-                cause: failure.cause.as_str().to_string(),
+                cause: failure.cause.wire_str().to_string(),
                 message,
             },
         });
@@ -873,15 +873,12 @@ fn provider_attempt_event(
             thread_id: thread.thread_id.clone(),
             turn_id: turn_id.to_string(),
             model_turn_ordinal,
-            operation_phase: serialized_enum_text(&started.operation_phase),
             provider: started.provider_name.clone(),
             model: started.model_name.clone(),
             protocol: serialized_enum_text(&started.actual_api_protocol),
             attempt_index: started.attempt_index,
             status: "started".to_string(),
             attempt_duration_ms: None,
-            retry_scheduled: None,
-            retry_backoff_ms: None,
             error_category: None,
             diagnostic_code: None,
         },
@@ -889,15 +886,12 @@ fn provider_attempt_event(
             thread_id: thread.thread_id.clone(),
             turn_id: turn_id.to_string(),
             model_turn_ordinal,
-            operation_phase: serialized_enum_text(&occurrence.operation_phase),
             provider: occurrence.provider_name.clone(),
             model: occurrence.model_name.clone(),
             protocol: serialized_enum_text(&occurrence.actual_api_protocol),
             attempt_index: occurrence.attempt_index,
             status: serialized_enum_text(&occurrence.terminal_status),
             attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-            retry_scheduled: Some(occurrence.retry_scheduled),
-            retry_backoff_ms: occurrence.retry_backoff_ms,
             error_category: occurrence.error_category.as_ref().map(serialized_enum_text),
             diagnostic_code: occurrence.diagnostic_code.clone(),
         },

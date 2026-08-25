@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 
 use singularity_agent::session::{SessionManager, SessionProjectionStatus, project_session};
-use singularity_core::user_singularity_home;
 use uuid::Uuid;
 
 use crate::error::TurnFailureCause;
@@ -22,13 +21,6 @@ pub struct ThreadSummary {
 }
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
-
-/// 解析默认的会话目录（`SINGULARITY_HOME/sessions`）。
-pub fn default_sessions_dir() -> Result<PathBuf, String> {
-    let home =
-        user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
-    Ok(home.join(SESSIONS_DIR_NAME))
-}
 
 /// 创建 home 下的 sessions 目录（Unix 收紧为属主专用）。
 pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
@@ -163,11 +155,6 @@ pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result
         )
         .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-/// 从最新 `thread_settings` metadata 投影模型 selector（含推理档位段）。
-pub fn persisted_model_selector(session: &SessionManager) -> Option<String> {
-    project_session(session).model
 }
 
 /// 把 [`TurnFailureCause`] 中与存储相关的失败映射为统一文本。

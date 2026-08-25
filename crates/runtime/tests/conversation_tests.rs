@@ -9,13 +9,15 @@ use std::sync::mpsc;
 use crate::events::TurnEvent;
 use crate::objects::{ThreadStatus, TurnStatus};
 use crate::runner::{TurnOutcome, TurnRunner};
-use crate::store::{create_thread, persisted_model_selector, resume_thread};
+use crate::store::{create_thread, resume_thread};
 use crate::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
     compose_merged_selector,
 };
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
-use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
+use singularity_agent::session::{
+    SessionManager, SessionMetadata, SessionMetadataKind, project_session,
+};
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderProtocolContract, ProviderReasoningReplay,
@@ -573,7 +575,7 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
     let persisted = {
         let session = SessionManager::open_existing(&sessions.join(format!("{thread_id}.jsonl")))
             .expect("reopen");
-        persisted_model_selector(&session)
+        project_session(&session).model
     };
     assert_eq!(
         persisted.as_deref(),
@@ -662,7 +664,7 @@ fn persisted_selector_keeps_reasoning_effort_across_resume() {
     let reopened = SessionManager::open_existing(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen session file");
     assert_eq!(
-        persisted_model_selector(&reopened).as_deref(),
+        project_session(&reopened).model.as_deref(),
         Some("openai_compatible/base-model#high"),
         "persisted selector projection keeps all three segments"
     );

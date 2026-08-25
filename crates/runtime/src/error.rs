@@ -44,6 +44,30 @@ impl TurnFailureCause {
             Self::Internal => "internal",
         }
     }
+
+    /// 协议线格式的稳定 cause 词形；`Provider` 变体带 `provider_` 前缀。
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::ProjectInstructions => "project_instructions",
+            Self::Workspace => "workspace",
+            Self::Provider(kind) => kind.wire_str(),
+            Self::Serialization => "serialization",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnFailureCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_str())
+    }
+}
+
+impl std::fmt::Display for TurnFailureStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +95,22 @@ impl ProviderFailureKind {
             Self::Cancelled => "cancelled",
             Self::ContextOverflow => "context_overflow",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// 协议线格式的稳定 cause 词形（`provider_` 前缀）——app-server 与
+    /// JSON-RPC 边界共用这一个定义，杜绝跨 crate 词表漂移。
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "provider_rate_limited",
+            Self::Network => "provider_network",
+            Self::Timeout => "provider_timeout",
+            Self::Auth => "provider_auth",
+            Self::Validation => "provider_validation",
+            Self::Overloaded => "provider_overloaded",
+            Self::Cancelled => "provider_cancelled",
+            Self::ContextOverflow => "provider_context_overflow",
+            Self::Unknown => "provider_unknown",
         }
     }
 

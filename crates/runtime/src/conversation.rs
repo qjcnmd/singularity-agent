@@ -11,7 +11,6 @@
 //!   后由本对象自动校验并持久化，调用方无需手动提取或应用。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::TurnInboxHandle;
@@ -427,10 +426,7 @@ impl Conversation {
             );
             if untrusted {
                 self.requeue_follow_ups(queue);
-                return match step {
-                    Err(error) => Err(error),
-                    Ok(outcome) => Ok(outcome),
-                };
+                return step;
             }
             // 成功应用后发布投影更新：客户端（app-server 索引同步、TUI
             // 状态行）据此拿到下一 turn 生效的线程模型。持久化失败时
@@ -643,8 +639,4 @@ fn compose_validated_selector(
     }
     runner.validate_model_selector(Some(&selector))?;
     Ok(selector)
-}
-/// 便捷构造：home 路径下的会话目录。
-pub fn sessions_dir_of(home: &std::path::Path) -> PathBuf {
-    home.join(crate::store::SESSIONS_DIR_NAME)
 }
