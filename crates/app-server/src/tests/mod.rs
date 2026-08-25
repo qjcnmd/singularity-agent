@@ -304,6 +304,80 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
 }
 
 #[test]
+fn thread_settings_null_clears_reasoning_while_missing_keeps_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let session_id = "27474472-1f3d-4e7f-9018-cc74461a82b4";
+    let mut session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
+        .expect("create session");
+    session
+        .append_metadata(
+            singularity_agent::session::SessionMetadata::thread_settings(
+                "openai_compatible",
+                "test-model",
+                None,
+            )
+            .expect("settings metadata"),
+        )
+        .expect("append settings");
+    drop(session);
+
+    let store = SessionIndex::new();
+    store
+        .rebuild_from_sessions_dir(&sessions_dir)
+        .expect("rebuild index");
+    let mut server = app_server(store, &sessions_dir);
+    initialize(&mut server);
+
+    let kept = server
+        .handle_json(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "thread/settings",
+                "id": 20,
+                "params": {"threadId": session_id},
+            })
+            .to_string(),
+        )
+        .expect("missing reasoning keeps current value");
+    assert_eq!(kept[0]["result"]["updated"], false);
+    assert_eq!(
+        server
+            .store()
+            .get_session(session_id)
+            .expect("record")
+            .model
+            .as_deref(),
+        Some("openai_compatible/test-model")
+    );
+
+    let cleared = server
+        .handle_json(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "thread/settings",
+                "id": 21,
+                "params": {"threadId": session_id, "reasoning": null},
+            })
+            .to_string(),
+        )
+        .expect("null reasoning clears current value");
+    assert_eq!(cleared[0]["result"]["updated"], true);
+    assert_eq!(cleared[0]["result"]["reasoning"], serde_json::Value::Null);
+    assert_eq!(
+        server
+            .store()
+            .get_session(session_id)
+            .expect("record")
+            .model
+            .as_deref(),
+        Some("openai_compatible/test-model")
+    );
+}
+
+#[test]
 fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");

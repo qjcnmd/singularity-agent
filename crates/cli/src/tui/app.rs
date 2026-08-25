@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
-use singularity_runtime::{Conversation, SettingsPatch};
+use singularity_runtime::{Conversation, ReasoningPatch, SettingsPatch};
 
 use super::editor::Editor;
 use super::scroll::ScrollState;
@@ -150,7 +150,7 @@ impl SettingsMenu {
         SettingsPatch {
             provider: optional(&self.provider),
             model: optional(&self.model),
-            reasoning: optional(&self.reasoning),
+            reasoning: optional(&self.reasoning).map_or(ReasoningPatch::Clear, ReasoningPatch::Set),
         }
     }
 }
@@ -1385,7 +1385,7 @@ mod tests {
         let patch = menu.patch();
         assert_eq!(patch.provider.as_deref(), Some("prov"));
         assert_eq!(patch.model.as_deref(), Some("m"));
-        assert_eq!(patch.reasoning.as_deref(), Some("high"));
+        assert_eq!(patch.reasoning, ReasoningPatch::Set("high".to_string()));
 
         let (_home, sessions) = test_home();
         let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
@@ -1407,6 +1407,17 @@ mod tests {
         assert!(
             app.editor_text().is_empty(),
             "modal never steals the editor buffer"
+        );
+    }
+
+    #[test]
+    fn clearing_reasoning_in_settings_removes_the_selector_effort() {
+        let mut menu = SettingsMenu::open(Some("prov/m#high"));
+        menu.reasoning.clear();
+
+        assert_eq!(
+            singularity_runtime::compose_merged_selector(Some("prov/m#high"), &menu.patch()),
+            "prov/m"
         );
     }
 

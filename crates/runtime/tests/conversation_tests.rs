@@ -17,6 +17,7 @@ use singularity_runtime::objects::{ThreadStatus, TurnStatus};
 use singularity_runtime::runner::{TurnOutcome, TurnRunner};
 use singularity_runtime::store::{create_thread, persisted_model_selector, resume_thread};
 use singularity_runtime::{Conversation, ConversationError, SettingsApplyTiming, SettingsPatch};
+use singularity_runtime::{ReasoningPatch, compose_merged_selector};
 
 fn temp_sessions() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("temp home");
@@ -946,6 +947,30 @@ fn reservation_holds_window_and_releases_on_drop() {
         shared.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model")
     );
+}
+
+#[test]
+fn reasoning_patch_keeps_sets_and_clears_selector_effort() {
+    let current = Some("openai_compatible/base-model#medium");
+    for (reasoning, expected) in [
+        (ReasoningPatch::Keep, "openai_compatible/base-model#medium"),
+        (
+            ReasoningPatch::Set("high".to_string()),
+            "openai_compatible/base-model#high",
+        ),
+        (ReasoningPatch::Clear, "openai_compatible/base-model"),
+    ] {
+        assert_eq!(
+            compose_merged_selector(
+                current,
+                &SettingsPatch {
+                    reasoning,
+                    ..SettingsPatch::default()
+                }
+            ),
+            expected
+        );
+    }
 }
 
 #[test]

@@ -224,11 +224,21 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let changed =
-            params.provider.is_some() || params.model.is_some() || params.reasoning.is_some();
+            params.provider.is_some() || params.model.is_some() || !params.reasoning.is_keep();
         let patch = singularity_runtime::SettingsPatch {
             provider: params.provider,
             model: params.model,
-            reasoning: params.reasoning,
+            reasoning: match params.reasoning {
+                singularity_protocol::ReasoningPatch::Keep => {
+                    singularity_runtime::ReasoningPatch::Keep
+                }
+                singularity_protocol::ReasoningPatch::Set(value) => {
+                    singularity_runtime::ReasoningPatch::Set(value)
+                }
+                singularity_protocol::ReasoningPatch::Clear => {
+                    singularity_runtime::ReasoningPatch::Clear
+                }
+            },
         };
         // 组合与校验与协调器共用同一实现：以索引行 selector 为基线合并
         // patch；空白/缺失段由协调器的提交点校验统一拒绝。

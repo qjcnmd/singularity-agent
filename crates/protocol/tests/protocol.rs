@@ -151,6 +151,26 @@ fn method_registry_keeps_only_converged_methods() {
 }
 
 #[test]
+fn thread_settings_reasoning_wire_distinguishes_missing_string_and_null() {
+    for (wire, expected_reasoning) in [
+        (json!({"threadId": "thread"}), None),
+        (
+            json!({"threadId": "thread", "reasoning": "high"}),
+            Some(json!("high")),
+        ),
+        (
+            json!({"threadId": "thread", "reasoning": null}),
+            Some(serde_json::Value::Null),
+        ),
+    ] {
+        let params: singularity_protocol::ThreadSettingsParams =
+            serde_json::from_value(wire).expect("settings params");
+        let encoded = serde_json::to_value(params).expect("settings params serialize");
+        assert_eq!(encoded.get("reasoning").cloned(), expected_reasoning);
+    }
+}
+
+#[test]
 fn item_and_tool_execution_events_carry_thread_and_turn_identity() {
     let started = AppEvent::item_started("thread-1", "turn-1", "item-1");
     assert_eq!(started.method, "item/started");

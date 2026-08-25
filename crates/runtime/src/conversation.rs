@@ -29,7 +29,16 @@ use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 pub struct SettingsPatch {
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub reasoning: Option<String>,
+    pub reasoning: ReasoningPatch,
+}
+
+/// reasoning effort 的字段级修改意图。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReasoningPatch {
+    #[default]
+    Keep,
+    Set(String),
+    Clear,
 }
 
 /// [`Conversation::queue_settings`] 的结果：本次修改的生效时点。
@@ -46,7 +55,9 @@ pub enum SettingsApplyTiming {
 
 impl SettingsPatch {
     pub fn is_empty(&self) -> bool {
-        self.provider.is_none() && self.model.is_none() && self.reasoning.is_none()
+        self.provider.is_none()
+            && self.model.is_none()
+            && matches!(self.reasoning, ReasoningPatch::Keep)
     }
 
     /// 字段级合并：`patch` 中给出的字段覆盖 `self`，未给出的保持不变。
@@ -54,7 +65,10 @@ impl SettingsPatch {
         Self {
             provider: patch.provider.clone().or(self.provider),
             model: patch.model.clone().or(self.model),
-            reasoning: patch.reasoning.clone().or(self.reasoning),
+            reasoning: match patch.reasoning {
+                ReasoningPatch::Keep => self.reasoning,
+                _ => patch.reasoning.clone(),
+            },
         }
     }
 }
@@ -588,10 +602,11 @@ pub fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> 
         .model
         .clone()
         .or_else(|| parts.model.map(str::to_string));
-    let reasoning = patch
-        .reasoning
-        .clone()
-        .or_else(|| parts.effort.map(str::to_string));
+    let reasoning = match &patch.reasoning {
+        ReasoningPatch::Keep => parts.effort.map(str::to_string),
+        ReasoningPatch::Set(value) => Some(value.clone()),
+        ReasoningPatch::Clear => None,
+    };
     singularity_model::compose_model_selector(
         &provider,
         model.as_deref().unwrap_or(""),
