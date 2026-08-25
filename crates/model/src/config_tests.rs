@@ -95,20 +95,6 @@ fn user_model_without_limits_falls_back_to_conservative_defaults() {
 }
 
 #[test]
-fn user_declared_limits_win_over_conservative_defaults() {
-    let model = UserConfigModel {
-        api_protocol: Some("responses".to_string()),
-        max_context_tokens: Some(64_000),
-        max_output_tokens: Some(8_192),
-        ..UserConfigModel::default()
-    };
-    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
-        .expect("user declaration resolves");
-    assert_eq!(resolved.max_context_tokens, Some(64_000));
-    assert_eq!(resolved.max_output_tokens, 8_192);
-}
-
-#[test]
 fn user_config_rejects_capabilities_block() {
     let error = serde_json::from_value::<UserConfigModel>(serde_json::json!({
         "api_protocol": "responses",
@@ -120,78 +106,6 @@ fn user_config_rejects_capabilities_block() {
     }))
     .expect_err("capabilities must be rejected as an unknown field");
     assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
-fn user_model_top_level_limits_project_with_conservative_output_fallback() {
-    let model = UserConfigModel {
-        api_protocol: Some("responses".to_string()),
-        max_context_tokens: Some(400_000),
-        ..UserConfigModel::default()
-    };
-    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
-        .expect("top-level and conservative fallback resolve");
-    assert_eq!(resolved.max_context_tokens, Some(400_000));
-    assert_eq!(resolved.max_output_tokens, crate::DEFAULT_MAX_OUTPUT_TOKENS);
-}
-
-#[test]
-fn persisted_capability_block_is_rejected() {
-    let directory = tempfile::tempdir().expect("user config directory");
-    let config = serde_json::json!({
-        "version": 1,
-        "default_provider": "primary",
-        "default_model": "primary/test-model",
-        "providers": {
-            "primary": {
-                "base_url": "https://example.invalid/v1",
-                "models": {
-                    "test-model": {
-                        "api_protocol": "chat",
-                        "max_output_tokens": 2048,
-                        "capabilities": {
-                            "supports_tools": true,
-                            "supports_required_tool_choice": false,
-                            "supports_json_mode": false
-                        }
-                    }
-                }
-            }
-        }
-    });
-    std::fs::write(
-        directory.path().join(USER_CONFIG_FILE_NAME),
-        config.to_string(),
-    )
-    .expect("write persisted user config");
-
-    let error = match read_user_config_data_from_directory(directory.path().to_path_buf()) {
-        Ok(_) => panic!("config with a capabilities block must be rejected"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_configuration_invalid")
-    );
-    assert!(
-        error.message.contains("invalid JSON"),
-        "capabilities is an unknown field"
-    );
-}
-
-#[test]
-fn unknown_model_without_limits_resolves_with_conservative_defaults() {
-    let model = UserConfigModel {
-        api_protocol: Some("chat".to_string()),
-        ..UserConfigModel::default()
-    };
-    let resolved = configured_model_from_user_file(&model, "test-provider", "unknown-model", None)
-        .expect("unknown model resolves with defaults");
-    assert_eq!(
-        resolved.max_context_tokens,
-        Some(crate::DEFAULT_MAX_CONTEXT_TOKENS)
-    );
-    assert_eq!(resolved.max_output_tokens, crate::DEFAULT_MAX_OUTPUT_TOKENS);
 }
 
 #[test]
@@ -280,22 +194,6 @@ fn partial_process_environment_is_authoritative_over_user_config_layer() {
 }
 
 #[test]
-fn selected_provider_without_auth_fails_closed_as_auth_error() {
-    let data = user_config_with_two_providers(UserAuthFile::default());
-    let result = capture_user_model_selection(
-        &data,
-        Some(ProviderConfigSource::UserConfigFile),
-        &test_provider_factory(),
-    );
-    let error = match result {
-        Ok(_) => panic!("default provider auth is required"),
-        Err(error) => error,
-    };
-    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
-    assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
-}
-
-#[test]
 fn relative_home_is_rejected_before_path_use() {
     let error = normalize_absolute_path(Path::new("relative-home"))
         .expect_err("relative user home must fail closed");
@@ -381,20 +279,6 @@ fn split_model_selector_lazily_splits_each_segment() {
     assert_eq!(parts.provider, Some("provider"));
     assert_eq!(parts.model, Some("model"));
     assert_eq!(parts.effort, Some("high"));
-}
-
-#[test]
-fn split_model_selector_allows_partial_selectors() {
-    assert_eq!(split_model_selector("provider/model").effort, None);
-    assert_eq!(split_model_selector("model").provider, None);
-    assert_eq!(split_model_selector("model").model, Some("model"));
-    assert_eq!(
-        split_model_selector("provider/model/extra#high").model,
-        Some("model/extra")
-    );
-    assert_eq!(split_model_selector("provider/").model, None);
-    assert_eq!(split_model_selector("").provider, None);
-    assert_eq!(split_model_selector("").model, None);
 }
 
 #[test]

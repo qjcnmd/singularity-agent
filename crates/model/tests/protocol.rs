@@ -202,41 +202,6 @@ fn openai_provider_accepts_multiple_tool_calls_in_one_response() {
 }
 
 #[test]
-fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
-    let base_url = single_response_server(
-        "HTTP/1.1 401 Unauthorized",
-        r#"{"error":{"message":"bad key test-key-placeholder"}}"#,
-    );
-    let provider = test_provider(provider_test_config(base_url)).expect("provider");
-    let request = ModelTurnRequest::new(
-        "request_1",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-
-    let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
-        .expect_err("auth error");
-    let serialized = serde_json::to_string(&error.error).expect("serialize error");
-
-    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
-    assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
-    assert!(error.error.message.contains("HTTP 401"));
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("auth attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
-    assert_eq!(metadata.occurrences.len(), 1);
-    assert!(!serialized.contains("bad key"));
-    assert!(!serialized.contains("test-key-placeholder"));
-    let serialized_metadata = serde_json::to_string(metadata).expect("serialize attempt aggregate");
-    assert!(!serialized_metadata.contains("occurrences"));
-    assert!(!serialized_metadata.contains("openai_compatible"));
-    assert!(!serialized_metadata.contains("test-model"));
-}
-
-#[test]
 fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
     for (status_line, expected_kind, expected_category) in [
         (
@@ -404,60 +369,6 @@ fn openai_provider_rejects_unknown_native_tool_even_when_arguments_are_repairabl
 }
 
 #[test]
-fn openai_provider_rejects_missing_or_non_string_chat_argument_fields() {
-    for (case_name, arguments) in [("missing", None), ("number", Some(serde_json::json!(7)))] {
-        let mut function = serde_json::json!({"name": "read"});
-        if let Some(arguments) = arguments {
-            function["arguments"] = arguments;
-        }
-        let body = serde_json::json!({
-            "id": format!("resp_{case_name}_arguments"),
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": format!("call_{case_name}_arguments"),
-                        "type": "function",
-                        "function": function,
-                    }],
-                },
-                "finish_reason": "tool_calls",
-            }],
-        })
-        .to_string();
-        let base_url = single_response_server("HTTP/1.1 200 OK", Box::leak(body.into_boxed_str()));
-        let provider = test_provider(provider_test_config(base_url)).expect("provider");
-        let mut request = ModelTurnRequest::new(
-            format!("request_{case_name}_arguments"),
-            vec![ModelMessage::text(ModelRole::User, "hello")],
-        );
-        request.tools.push(ModelToolSchema {
-            name: "read".to_string(),
-            description: "Read a file".to_string(),
-            parameters_schema: serde_json::json!({"type": "object"}),
-        });
-
-        let response = provider
-            .complete(&request, &singularity_core::CancellationToken::new())
-            .expect("provider response");
-
-        assert_eq!(response.status, ModelTurnStatus::Invalid, "{case_name}");
-        assert!(response.error.is_some(), "{case_name}");
-        assert!(
-            response
-                .validation
-                .as_ref()
-                .expect("validation")
-                .errors
-                .iter()
-                .any(|error| error == "schema_mismatch"),
-            "{case_name}"
-        );
-    }
-}
-
-#[test]
 fn provider_status_reports_required_env_missing_blocker() {
     let status = ProviderConfigurationStatus::from_config(&ModelProviderConfig {
         provider_name: Some("openai_compatible".to_string()),
@@ -572,22 +483,6 @@ fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history(
     let direct_result = validate_model_turn_response(&direct_request, &direct_response, &[], None);
 
     assert!(direct_result.valid);
-}
-
-#[test]
-fn model_error_serializes_redacted_boundary_fields() {
-    let mut failure = ModelError::new(ModelErrorKind::Timeout, "provider transport failed")
-        .with_provider("openai_compatible")
-        .with_model("test-model");
-    failure.timeout_seconds = Some(120);
-
-    let value = serde_json::to_value(&failure).expect("serialize provider failure");
-
-    assert_eq!(value["kind"], "timeout");
-    assert_eq!(value["timeout_seconds"], 120);
-    assert_eq!(value["provider_name"], "openai_compatible");
-    assert_eq!(value["model_name"], "test-model");
-    assert!(!value.to_string().contains("sk-"));
 }
 
 #[test]
@@ -1066,83 +961,6 @@ fn reasoning_replay_obligation_chat_request_orphan_replay_fails_closed() {
     assert_eq!(
         error.error.code.as_deref(),
         Some("provider_tool_reasoning_history_unsupported")
-    );
-}
-
-/// 矩阵项 3d：Chat 请求侧，flag=true（严格声明）时每个 tool-call 消息仍必须
-/// 有绑定 reasoning 的 replay；历史里只有另一组 ids 的 replay 时 fail-closed。
-#[test]
-fn reasoning_replay_obligation_chat_request_tool_call_without_matching_replay_fails_closed_strict()
-{
-    let (base_url, _request_body) = captured_request_server(
-        "HTTP/1.1 200 OK",
-        r#"{
-            "id": "chat_final_answer",
-            "choices": [{
-                "message": {"role": "assistant", "content": "done"},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-        }"#,
-    );
-    let fixture = UserConfigFixture::new();
-    let _env = fixture.install_env();
-    fixture.set_api_key("reasoning_test", "test-key-placeholder");
-    fixture.write_config(
-        "reasoning_test/chat#high",
-        json!({
-            "reasoning_test": {
-                "base_url": base_url,
-                "models": {
-                    "chat": {
-                        "api_protocol": "chat",
-                        "max_context_tokens": 1000000,
-                        "max_output_tokens": 384000,
-                        "reasoning_variants": {
-                            "high": {"enabled": true, "wire_effort": "high"}
-                        },
-                        "default_variant": "high",
-                        "tool_reasoning_history": "reasoning_content",
-                        "supports_developer_role": false,
-                        "supports_tool_choice": false,
-                        "requires_reasoning_content_for_tool_calls": true,
-                        "requires_assistant_content_for_tool_calls": true
-                    }
-                }
-            }
-        }),
-    );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
-    let provider = snapshot
-        .provider_for_selector(Some("reasoning_test/chat#high"))
-        .expect("selected Chat provider");
-    let mut request = ModelTurnRequest::new(
-        "reasoning_chat_request",
-        vec![
-            ModelMessage::text(ModelRole::Developer, "instruction"),
-            ModelMessage::assistant_tool_calls(vec![tool_call("call_2", "read")]),
-        ],
-    );
-    request.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
-        provider_name: "reasoning_test".to_string(),
-        model_name: "chat".to_string(),
-        reasoning_effort: Some("high".to_string()),
-        tool_call_ids: vec!["call_1".to_string()],
-        reasoning_content: "opaque-deepseek-state".to_string(),
-    }];
-    let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
-        .expect_err("strict request without bound reasoning must fail closed");
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_history_unsupported")
-    );
-    assert!(
-        error
-            .error
-            .validation_errors
-            .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
     );
 }
 

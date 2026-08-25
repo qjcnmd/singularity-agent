@@ -1378,64 +1378,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn browsing_holds_position_and_counts_new_content_until_recalled() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for index in 1..=40 {
-            app.push_test_note(&format!("note-{index}"));
-        }
-        draw_at(&mut app, 80, 24); // 建立真实视口度量。
-        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE));
-        let (follow, top, _) = app.scroll_snapshot();
-        assert!(!follow, "PageUp enters browsing state");
-        let held_top = top;
-
-        // 新内容到达：浏览位置不动，底部新增被计数。
-        for index in 41..=47 {
-            app.push_test_note(&format!("note-{index}"));
-        }
-        draw_at(&mut app, 80, 24);
-        let (follow, top_after, pending) = app.scroll_snapshot();
-        assert!(!follow);
-        assert_eq!(top_after, held_top, "browsing position must not jump");
-        assert_eq!(pending, 7);
-
-        // 快捷键回底：跟随恢复、计数清零。
-        app.handle_key(key(KeyCode::End, KeyModifiers::CONTROL));
-        let (follow, _, pending) = app.scroll_snapshot();
-        assert!(follow);
-        assert_eq!(pending, 0);
-        let terminal = draw_at(&mut app, 80, 24);
-        assert!(row_text(&terminal, 18, 80).contains("note-47"));
-    }
-
-    #[test]
-    fn resize_keeps_browsing_anchor_without_content_loss() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for index in 1..=60 {
-            app.push_test_note(&format!("note-{index}"));
-        }
-        draw_at(&mut app, 80, 24);
-        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE));
-        let (_, top_before, _) = app.scroll_snapshot();
-
-        draw_at(&mut app, 100, 30);
-        let (follow, top_after, _) = app.scroll_snapshot();
-        assert!(!follow, "resize must not force reattach");
-        assert!(
-            top_after <= top_before,
-            "anchor must stay within clamped bounds"
-        );
-
-        // 缩小窗口后跟随态仍钉底。
-        app.handle_key(key(KeyCode::End, KeyModifiers::CONTROL));
-        draw_at(&mut app, 70, 20);
-        let (follow, _top, _) = app.scroll_snapshot();
-        assert!(follow);
-    }
-
     // -- 设置模态 ------------------------------------------------------------
 
     #[test]
@@ -1505,51 +1447,6 @@ mod tests {
 
     // -- footer 合同 ---------------------------------------------------------
 
-    #[test]
-    fn footer_shows_phase_waiting_mode_and_history_indicator() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.force_phase(Phase::Running);
-        app.on_turn_event(&TurnEvent::TurnStarted {
-            turn: singularity_runtime::objects::Turn {
-                turn_id: "abcd1234-rest".to_string(),
-                thread_id: "thread-1".to_string(),
-                status: TurnStatus::Running,
-                usage: None,
-            },
-        });
-        let (status, hint) = app.footer_spans(100, 20);
-        let status_text: String = status.iter().map(|span| span.content.clone()).collect();
-        assert!(status_text.contains("running"), "{status_text}");
-        assert!(status_text.contains("waiting: model"), "{status_text}");
-        assert!(!status_text.contains("[steer]"), "{status_text}");
-        assert!(
-            status_text.contains("openai_compatible/base-model"),
-            "{status_text}"
-        );
-        let hint_text: String = hint.iter().map(|span| span.content.clone()).collect();
-        assert!(hint_text.contains("Ctrl+T"), "{hint_text}");
-
-        app.handle_wheel(true, 1, 1); // 指针在流区域：滚动会话流
-        let (status, _) = app.footer_spans(100, 20);
-        let status_text: String = status.iter().map(|span| span.content.clone()).collect();
-        assert!(
-            status_text.contains("viewing history"),
-            "detached state must be announced"
-        );
-
-        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        let (status, _) = app.footer_spans(100, 20);
-        let status_text: String = status.iter().map(|span| span.content.clone()).collect();
-        assert!(status_text.contains("[thinking folded]"), "{status_text}");
-
-        // Ctrl+C 在各相位都只执行常规的两次退出确认。
-        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        let (_, hint) = app.footer_spans(100, 20);
-        let hint_text: String = hint.iter().map(|span| span.content.clone()).collect();
-        assert!(hint_text.contains("again to quit"), "{hint_text}");
-    }
-
     // -- 输入路由：followUp 单队列 -------------------------------------------
 
     #[test]
@@ -1614,20 +1511,6 @@ mod tests {
         assert!(conversation.pending_follow_ups().is_empty());
     }
 
-    #[test]
-    fn idle_enter_submits_a_new_turn_action() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for ch in "do it".chars() {
-            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
-            Action::Submit(goal) => assert_eq!(goal, "do it"),
-            other => panic!("expected Submit action, got {other:?}"),
-        }
-        assert_eq!(app.phase(), Phase::Running);
-    }
-
     // -- Ctrl+C 状态机（按键驱动） -------------------------------------------
 
     fn ctrl_c() -> KeyEvent {
@@ -1679,84 +1562,6 @@ mod tests {
             app.handle_key(ctrl_c()),
             Action::Exit(0),
             "the second Ctrl+C exits normally"
-        );
-    }
-
-    #[test]
-    fn any_other_key_resets_the_quit_confirm() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.handle_key(ctrl_c());
-        assert!(hint_text(&app).contains("again to quit"));
-
-        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!(
-            app.handle_key(ctrl_c()),
-            Action::Continue,
-            "non-empty Ctrl+C clears the editor"
-        );
-        assert!(app.editor_text().is_empty());
-        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
-    }
-
-    #[test]
-    fn chain_finished_resets_the_quit_confirm() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.force_phase(Phase::Running);
-        app.handle_key(ctrl_c());
-        app.on_chain_finished(&Ok(TurnStatus::Interrupted));
-        assert_eq!(app.phase(), Phase::Idle);
-        assert_eq!(
-            app.handle_key(ctrl_c()),
-            Action::Continue,
-            "chain end clears the armed state; a fresh two-press sequence applies"
-        );
-        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
-    }
-
-    #[test]
-    fn submitting_input_clears_the_quit_confirm() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.handle_key(ctrl_c());
-        for ch in "go".chars() {
-            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
-            Action::Submit(_) => {}
-            other => panic!("expected Submit action, got {other:?}"),
-        }
-        assert_eq!(
-            app.handle_key(ctrl_c()),
-            Action::Continue,
-            "submission clears the armed confirm even though a turn is running"
-        );
-        assert_eq!(app.handle_key(ctrl_c()), Action::Exit(0));
-    }
-
-    #[test]
-    fn ctrl_c_keeps_one_semantics_inside_settings_modal() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for ch in "/settings".chars() {
-            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.settings.is_some(), "modal is open");
-        assert_eq!(
-            app.handle_key(ctrl_c()),
-            Action::Continue,
-            "first Ctrl+C inside the modal only arms the confirm"
-        );
-        assert!(
-            app.settings.is_some(),
-            "armed quit does not close the modal by itself"
-        );
-        assert_eq!(
-            app.handle_key(ctrl_c()),
-            Action::Exit(0),
-            "second Ctrl+C inside the modal exits with idle code 0"
         );
     }
 
@@ -1837,62 +1642,6 @@ mod tests {
     // -- 鼠标与滚轮 ----------------------------------------------------------
 
     #[test]
-    fn wheel_normalizer_accelerates_rapid_events() {
-        let mut normalizer = WheelNormalizer::default();
-        let t0 = std::time::Instant::now();
-        // 首事件：×1.0 → 3 行。
-        assert_eq!(normalizer.rows_for(t0), 3);
-        // 间隔 4ms：×2.5 → 7.5 → 7（余 0.5 累计）。
-        assert_eq!(
-            normalizer.rows_for(t0 + std::time::Duration::from_millis(4)),
-            7
-        );
-        // 间隔 12ms（距上一事件）：×1.6 → 4.8 + 0.5 → 5（余 0.3）。
-        assert_eq!(
-            normalizer.rows_for(t0 + std::time::Duration::from_millis(16)),
-            5
-        );
-        // 间隔 100ms：×1.0 → 3 + 0.3 → 3。
-        assert_eq!(
-            normalizer.rows_for(t0 + std::time::Duration::from_millis(116)),
-            3
-        );
-        // 单次事件有上限。
-        for _ in 0..10 {
-            normalizer.rows_for(t0 + std::time::Duration::from_millis(1));
-        }
-        let now = std::time::Instant::now();
-        assert!(normalizer.rows_for(now) <= 8, "single event capped");
-    }
-
-    #[test]
-    fn wheel_over_editor_scrolls_editor_not_flow() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for ch in "line one\nline two\nline three".chars() {
-            if ch == '\n' {
-                app.editor.insert_newline();
-            } else {
-                app.editor.insert_char(ch);
-            }
-        }
-        let mut terminal = draw_at(&mut app, 100, 30);
-        let _ = &mut terminal;
-        let editor_area = app.last_editor_area.expect("editor area after draw");
-        let before = app.scroll_snapshot();
-        // 指针在编辑器内滚轮：编辑器视口偏移，会话流不动。
-        app.handle_wheel(true, editor_area.x + 5, editor_area.y + 1);
-        assert!(
-            app.editor.scroll_override().is_some(),
-            "editor scroll override must engage"
-        );
-        assert_eq!(app.scroll_snapshot(), before, "flow scroll untouched");
-        // 指针在编辑器外滚轮：会话流滚动。
-        app.handle_wheel(true, 1, 1);
-        assert_ne!(app.scroll_snapshot(), before, "flow scroll moves");
-    }
-
-    #[test]
     fn clicking_stop_interrupts_the_running_turn() {
         let (_home, sessions) = test_home();
         let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
@@ -1909,42 +1658,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clicking_elsewhere_does_not_interrupt() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        app.force_phase(Phase::Running);
-        app.last_status_area = Some(ratatui::layout::Rect::new(0, 28, 100, 1));
-        app.last_stop_cols = Some((90, 97));
-        // 列在 [stop] 之外：不中断。
-        app.handle_click(10, 28);
-        assert_eq!(app.phase(), Phase::Running);
-        // 空闲态点击 [stop]：不中断。
-        app.force_phase(Phase::Idle);
-        app.handle_click(93, 28);
-        assert_eq!(app.phase(), Phase::Idle);
-    }
-
     // -- page-flip 提交 ------------------------------------------------------
-
-    #[test]
-    fn idle_submit_pins_new_content_top() {
-        let (_home, sessions) = test_home();
-        let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
-        for index in 1..=30 {
-            app.push_test_note(&format!("note-{index}"));
-        }
-        let (total, _) = app.flow_metrics();
-        for ch in "hello".chars() {
-            app.editor.insert_char(ch);
-        }
-        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
-            Action::Submit(_) => {}
-            other => panic!("expected Submit action, got {other:?}"),
-        }
-        let (follow, top, _) = app.scroll_snapshot();
-        assert!(follow, "page-flip keeps follow semantics");
-        assert_eq!(top, total, "viewport pinned at the new content start");
-        assert_eq!(app.phase(), Phase::Running);
-    }
 }

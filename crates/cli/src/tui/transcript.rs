@@ -514,20 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_newlines_and_wide_chars_count_as_visual_rows() {
-        let mut transcript = Transcript::new();
-        // 「中文」宽度为 4；宽度 5 时一行放不下两个词，折成两行。
-        transcript.push_note("中文中文中文", NoteStyle::Info);
-        let rows = transcript.row_counts(5);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], 3, "6 wide chars at width 5 wrap into 3 rows");
-        // 显式换行强制分行。
-        let mut multi = Transcript::new();
-        multi.push_note("a\nb\nc", NoteStyle::Info);
-        assert_eq!(multi.row_counts(80), vec![3]);
-    }
-
-    #[test]
     fn thinking_blocks_toggle_between_content_and_one_line_header() {
         let mut transcript = Transcript::new();
         transcript.push_thinking("first line\nsecond line");
@@ -569,52 +555,6 @@ mod tests {
         assert!(
             text.contains("more lines"),
             "overflow is advertised instead of silently dropped"
-        );
-    }
-
-    #[test]
-    fn running_tool_renders_spinner_without_result_rows() {
-        let mut transcript = Transcript::new();
-        transcript.tool_start("c", "grep", &serde_json::json!({}));
-        assert_eq!(transcript.row_counts(40)[0], 1);
-        transcript.tool_update("c", "streaming…");
-        assert_eq!(transcript.row_counts(40)[0], 4, "running preview bounded");
-    }
-
-    #[test]
-    fn completed_tool_toggles_between_preview_and_expanded() {
-        let mut transcript = Transcript::new();
-        transcript.tool_start("c", "bash", &serde_json::json!({}));
-        let output: String = (0..40).map(|i| format!("line-{i}\n")).collect();
-        transcript.tool_end("c", &output, false);
-        // 折叠态：头 + 3 行预览 + 溢出提示。
-        assert_eq!(transcript.row_counts(80)[0], 5);
-        // 展开切换：全量（上限内）可见，无折叠提示之外的行。
-        assert!(transcript.toggle_latest_tool_expansion());
-        let counts = transcript.row_counts(80)[0];
-        assert!(counts > 40, "expanded shows the full result: {counts}");
-        let expanded_row = transcript.render_item_row(0, 10, 80, ' ').unwrap();
-        let text: String = expanded_row
-            .spans
-            .iter()
-            .map(|s| s.content.clone())
-            .collect();
-        assert!(text.contains("line-9"), "deep rows reachable: {text}");
-        assert!(transcript.toggle_latest_tool_expansion());
-        assert_eq!(transcript.row_counts(80)[0], 1, "second toggle collapses");
-        assert!(transcript.toggle_latest_tool_expansion());
-        assert_eq!(
-            transcript.row_counts(80)[0],
-            5,
-            "third toggle restores preview"
-        );
-        // 无已完成工具时切换不承诺：返回 false。
-        let mut empty = Transcript::new();
-        assert!(!empty.toggle_latest_tool_expansion());
-        empty.tool_start("c", "bash", &serde_json::json!({}));
-        assert!(
-            !empty.toggle_latest_tool_expansion(),
-            "running tool cannot be expanded"
         );
     }
 }

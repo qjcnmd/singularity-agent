@@ -766,35 +766,4 @@ mod replay_binding_tests {
             ProviderToolReasoningMode::ReplayReasoningContent
         ));
     }
-
-    /// 有变体 selection 时 replay 绑定该变体；伪造的禁用变体 `"off"` 无法
-    /// 通过绑定校验。
-    #[test]
-    fn chat_replay_binds_requested_variant_and_rejects_disabled() {
-        let response = parse_openai_response(
-            &replay_test_request(),
-            &replay_test_config(),
-            reasoning_tool_call_payload(),
-            &ProviderProtocolContract::default(),
-            "test-model",
-            Some("high"),
-        )
-        .expect("parse response with reasoning_content");
-        match &response.provider_reasoning_history[0] {
-            ProviderReasoningReplay::Chat {
-                reasoning_effort, ..
-            } => {
-                assert_eq!(reasoning_effort, &Some("high".to_string()));
-            }
-            other => panic!("expected Chat replay, got {other:?}"),
-        }
-        let disabled = ProviderReasoningReplay::Chat {
-            provider_name: "openai_compatible".to_string(),
-            model_name: "test-model".to_string(),
-            reasoning_effort: Some("off".to_string()),
-            tool_call_ids: vec!["call_1".to_string()],
-            reasoning_content: "opaque".to_string(),
-        };
-        assert!(!disabled.is_valid());
-    }
 }

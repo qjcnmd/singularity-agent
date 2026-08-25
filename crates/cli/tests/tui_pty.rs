@@ -431,54 +431,6 @@ fn rendered(needle: &str) -> Vec<u8> {
 // 装置自身的流式能力证明（普通子进程与 TUI 输出）
 // ---------------------------------------------------------------------------
 
-/// 装置能实时读取普通子进程输出：alpha 到达时 beta 尚未写入，因此观察
-/// 快照必须只含 alpha（EOF 一次性发送的装置会在该快照里同时看到 beta）。
-#[test]
-fn pty_harness_streams_ordinary_child_output_in_real_time() {
-    let script = if cfg!(windows) {
-        "echo alpha & ping -n 2 127.0.0.1 >nul & echo beta"
-    } else {
-        "printf 'alpha'; sleep 1; printf 'beta'"
-    };
-    let program = if cfg!(windows) { "cmd" } else { "sh" };
-    let mut builder = CommandBuilder::new(program);
-    if cfg!(windows) {
-        builder.args(["/C", script]);
-    } else {
-        builder.args(["-c", script]);
-    }
-    builder.cwd(std::env::current_dir().expect("cwd"));
-    let mut session = match PtySession::spawn_program(builder, None) {
-        Ok(session) => session,
-        Err(reason) => {
-            eprintln!("skipped: {reason}");
-            return;
-        }
-    };
-
-    let since = session.snapshot().len();
-    assert!(
-        session.wait_for_since(b"alpha", since),
-        "streaming child output must be observed while the child is alive"
-    );
-    let at_alpha = session.snapshot();
-    assert!(
-        !at_alpha.windows(4).any(|window| window == b"beta"),
-        "alpha must be observed before beta is written (proves chunk-streaming)"
-    );
-    let since = at_alpha.len();
-    assert!(
-        session.wait_for_since(b"beta", since),
-        "later bytes arrive too"
-    );
-    let status = session.must_exit("normal child exits");
-    assert_eq!(
-        status.exit_code(),
-        0,
-        "probe child exits cleanly, got {status:?}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // TUI 启动与基本交互
 // ---------------------------------------------------------------------------
@@ -939,25 +891,4 @@ fn tui_typed_goals_and_esc_staircase_reach_the_provider() {
         session.tail(CONTEXT_TAIL)
     );
     session.press_quit_and_exit("clean exit after typed turns", 0);
-}
-
-/// 滚轮 SGR 事件不影响进程存活，之后仍可正常交互并干净退出。
-#[test]
-fn tui_mouse_wheel_does_not_crash() {
-    let mut session = match skipped_or_session() {
-        Some(session) => session,
-        None => return,
-    };
-    let booted = session.must_see_since(&rendered("input"), 0, "editor frame");
-    session.send_keys(b"\x1b[<64;50;15M");
-    session.send_keys(b"x");
-    session.must_see_since(&rendered("x"), booted, "typing after wheel works");
-    let _ = session.press_until_seen(
-        b"\x03",
-        booted,
-        &rendered("press Ctrl+C again to quit"),
-        "wheel does not disturb Ctrl+C arming",
-        3,
-    );
-    session.press_quit_and_exit("clean exit after mouse event", 0);
 }

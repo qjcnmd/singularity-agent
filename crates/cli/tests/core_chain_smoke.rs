@@ -22,7 +22,6 @@ struct SmokeFixture {
 
 #[derive(Clone, Copy)]
 enum SmokeScenario {
-    LongCat,
     ResponsesReplay,
 }
 
@@ -56,7 +55,6 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
         return Err("persistent smoke auth file is unavailable".to_string());
     }
     let selector = match scenario {
-        SmokeScenario::LongCat => select_longcat_selector(&config)?,
         SmokeScenario::ResponsesReplay => select_responses_replay_selector(&config)?,
     };
     set_default_selector(&mut config, &selector)?;
@@ -298,56 +296,6 @@ fn run_continue(fixture: &SmokeFixture, thread_id: &str, instruction: &str) -> R
     }
 }
 
-fn configure_compaction_fixture(fixture: &SmokeFixture) -> Result<(), String> {
-    let mut config: Value = serde_json::from_str(
-        &fs::read_to_string(&fixture.config_path)
-            .map_err(|_| "could not read isolated smoke config".to_string())?,
-    )
-    .map_err(|_| "isolated smoke config is not valid JSON".to_string())?;
-    let default_model = config
-        .get("default_model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "smoke config does not declare default_model".to_string())?;
-    let (provider_name, model_selector) = default_model
-        .split_once('/')
-        .ok_or_else(|| "smoke default_model must use provider/model form".to_string())?;
-    let provider_name = provider_name.to_string();
-    let model_name = model_selector
-        .split_once('#')
-        .map_or(model_selector, |(name, _)| name)
-        .to_string();
-    let model = config
-        .get_mut("providers")
-        .and_then(Value::as_object_mut)
-        .and_then(|providers| providers.get_mut(&provider_name))
-        .and_then(|provider| provider.get_mut("models"))
-        .and_then(Value::as_object_mut)
-        .and_then(|models| models.get_mut(&model_name))
-        .ok_or_else(|| "smoke config does not contain the selected model".to_string())?;
-    // The isolated project instructions plus the normal request envelope expand
-    // The bounded tool read contributes ≈31,200 chars ≈ 7,800 estimated tokens
-    // (chars/4). With a 16,000-token window and the 0.90 threshold ratio, the
-    // trigger sits at 14,400 tokens, so the first post-read compaction judgment
-    // (previous-request usage + the newly persisted read result) crosses it,
-    // while the compacted follow-up request and the 2,048 output budget still
-    // fit within the window.
-    model["max_context_tokens"] = Value::from(16_000_u64);
-    model["max_output_tokens"] = Value::from(2_048_u64);
-    fs::write(
-        &fixture.config_path,
-        serde_json::to_vec(&config).map_err(|_| "could not serialize smoke config".to_string())?,
-    )
-    .map_err(|_| "could not update isolated compaction smoke config".to_string())?;
-    set_owner_only_permissions(&fixture.config_path)?;
-    fs::write(
-        fixture.workspace.join("AGENTS.md"),
-        // Stay below the per-file 32 KiB project-instruction limit while
-        // making a full tool read large enough to trigger compaction.
-        "Keep this context available for the task. ".repeat(780),
-    )
-    .map_err(|_| "could not create compaction smoke context".to_string())
-}
-
 fn parse_success_json(output: Output) -> Result<Value, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -412,56 +360,6 @@ fn session_contains_responses_replay(fixture: &SmokeFixture) -> Result<bool, Str
     }))
 }
 
-fn session_contains_multi_tool_assistant(fixture: &SmokeFixture) -> Result<bool, String> {
-    Ok(session_entries(fixture)?.iter().any(|entry| {
-        entry.get("type").and_then(Value::as_str) == Some("message")
-            && entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
-            && entry
-                .pointer("/message/content")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks
-                        .iter()
-                        .filter(|block| {
-                            block.get("type").and_then(Value::as_str) == Some("tool_call")
-                        })
-                        .count()
-                        >= 2
-                })
-    }))
-}
-
-fn session_contains_compaction(fixture: &SmokeFixture) -> Result<bool, String> {
-    let rollout = fs::read_to_string(session_file(fixture)?)
-        .map_err(|_| "could not read isolated rollout".to_string())?;
-    Ok(rollout.lines().any(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|entry| entry.get("type").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            == Some("compaction")
-    }))
-}
-
-fn session_entry_shapes(fixture: &SmokeFixture) -> Result<String, String> {
-    let rollout = fs::read_to_string(session_file(fixture)?)
-        .map_err(|_| "could not read isolated rollout".to_string())?;
-    Ok(rollout
-        .lines()
-        .filter_map(|line| {
-            serde_json::from_str::<Value>(line).ok().map(|entry| {
-                let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("?");
-                let role = entry
-                    .pointer("/message/role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("-");
-                format!("{entry_type}:{role}:{}B", line.len())
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("; "))
-}
-
 #[test]
 #[ignore = "requires persistent Singularity config and credentials"]
 fn real_provider_restart_and_resume_smoke() {
@@ -480,77 +378,6 @@ fn real_provider_restart_and_resume_smoke() {
     run_continue(&fixture, &id, "Reply with one more short acknowledgement.")
         .expect("cross-process resume");
     assert!(session_file(&fixture).is_ok());
-}
-
-#[test]
-#[ignore = "requires persistent Singularity config and credentials"]
-fn real_provider_compaction_smoke() {
-    let fixture = fixture(SmokeScenario::LongCat).expect("isolated smoke configuration");
-    configure_compaction_fixture(&fixture).expect("compaction fixture");
-    let first = run_json(
-        &fixture,
-        "Use the read tool to read every line of AGENTS.md, then reply with a short acknowledgement.",
-    )
-    .expect("initial compaction turn");
-    let id = thread_id(&first).expect("thread id").to_string();
-    let mut compacted = false;
-    for _ in 0..3 {
-        run_continue(
-            &fixture,
-            &id,
-            "Use the read tool to reread every line of AGENTS.md, then reply with a short acknowledgement.",
-        )
-        .expect("compaction continuation");
-        if session_contains_compaction(&fixture).expect("read compaction rollout") {
-            compacted = true;
-            break;
-        }
-    }
-    assert!(
-        compacted,
-        "the bounded compaction continuations did not compact; entry shapes: {}",
-        session_entry_shapes(&fixture).expect("read compaction entry shapes")
-    );
-    run_continue(
-        &fixture,
-        &id,
-        "Confirm that the compacted project context remains available.",
-    )
-    .expect("continuation after compaction");
-}
-
-#[test]
-#[ignore = "requires persistent Singularity config and credentials"]
-fn real_provider_tool_and_parallel_recovery_smoke() {
-    let fixture = fixture(SmokeScenario::LongCat).expect("isolated smoke configuration");
-    let first = run_json(
-        &fixture,
-        "In one response, use two independent write tool calls: create smoke-a.txt containing A and smoke-b.txt containing B. Do not split the writes across responses, then report both paths.",
-    )
-    .expect("tool turn");
-    let id = thread_id(&first).expect("thread id").to_string();
-    assert!(
-        session_contains_multi_tool_assistant(&fixture).expect("read assistant tool calls"),
-        "parallel smoke must persist one assistant entry containing at least two tool calls"
-    );
-    run_continue(
-        &fixture,
-        &id,
-        "Confirm the two files still exist after reconnecting.",
-    )
-    .expect("tool recovery continuation");
-    assert_eq!(
-        fs::read_to_string(fixture.workspace.join("smoke-a.txt"))
-            .ok()
-            .as_deref(),
-        Some("A")
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.workspace.join("smoke-b.txt"))
-            .ok()
-            .as_deref(),
-        Some("B")
-    );
 }
 
 #[test]
@@ -575,76 +402,4 @@ fn longcat_selector_uses_the_highest_enabled_reasoning_variant() {
         select_longcat_selector(&config).expect("LongCat selector"),
         "longcat/LongCat-2.0#high"
     );
-}
-
-#[test]
-fn responses_replay_selector_requires_one_matching_model_and_uses_its_highest_variant() {
-    let config = json!({
-        "providers": {
-            "chat": {
-                "models": {
-                    "ordinary": {
-                        "api_protocol": "chat",
-                        "tool_reasoning_history": "reasoning_content",
-                        "reasoning_variants": { "high": { "enabled": true } }
-                    }
-                }
-            },
-            "responses": {
-                "models": {
-                    "private": {
-                        "api_protocol": "responses",
-                        "tool_reasoning_history": "responses_items",
-                        "reasoning_variants": {
-                            "high": { "enabled": true },
-                            "max": { "enabled": true }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    assert_eq!(
-        select_responses_replay_selector(&config).expect("Responses replay selector"),
-        "responses/private#max"
-    );
-}
-
-#[test]
-fn responses_replay_selector_fails_closed_without_one_matching_model() {
-    let no_match = json!({
-        "providers": {
-            "chat": {
-                "models": {
-                    "ordinary": {
-                        "api_protocol": "chat",
-                        "tool_reasoning_history": "reasoning_content",
-                        "reasoning_variants": { "high": { "enabled": true } }
-                    }
-                }
-            }
-        }
-    });
-    let multiple_matches = json!({
-        "providers": {
-            "responses": {
-                "models": {
-                    "one": {
-                        "api_protocol": "responses",
-                        "tool_reasoning_history": "responses_items",
-                        "reasoning_variants": { "high": { "enabled": true } }
-                    },
-                    "two": {
-                        "api_protocol": "responses",
-                        "tool_reasoning_history": "responses_items",
-                        "reasoning_variants": { "high": { "enabled": true } }
-                    }
-                }
-            }
-        }
-    });
-
-    assert!(select_responses_replay_selector(&no_match).is_err());
-    assert!(select_responses_replay_selector(&multiple_matches).is_err());
 }

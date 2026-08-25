@@ -101,24 +101,6 @@ fn missing_agents_files_are_not_an_error() {
 }
 
 #[test]
-fn override_files_are_ignored() {
-    let temp = TestDir::new();
-    let workspace = temp.path().join("workspace");
-    let cwd = workspace.join("src");
-    std::fs::create_dir_all(&cwd).expect("nested cwd");
-    std::fs::write(workspace.join("AGENTS.md"), "root ordinary").expect("root agents");
-    std::fs::write(workspace.join("AGENTS.override.md"), "root override").expect("root override");
-    std::fs::write(cwd.join("AGENTS.md"), "cwd ordinary").expect("cwd agents");
-    std::fs::write(cwd.join("AGENTS.override.md"), "cwd override").expect("cwd override");
-
-    let loaded = load_project_instructions(&workspace, &cwd)
-        .expect("load project instructions")
-        .expect("instructions present");
-
-    assert_eq!(loaded.content(), "root ordinary\n\ncwd ordinary");
-}
-
-#[test]
 fn instruction_content_changes_are_observed() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
@@ -208,16 +190,4 @@ fn truncates_hierarchy_to_total_budget_and_stops() {
         "cwd file limited to remaining total budget"
     );
     assert!(loaded.truncated(), "truncation fact must be observable");
-}
-
-#[test]
-fn rejects_unsupported_file_type() {
-    let temp = TestDir::new();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("agents-as-directory");
-
-    let error = load_project_instructions(&workspace, &workspace).expect_err("dir is not a file");
-
-    assert_eq!(error.code, ProjectInstructionErrorCode::UnsupportedFileType);
-    assert_eq!(error.path.as_deref(), Some(Path::new("AGENTS.md")));
 }

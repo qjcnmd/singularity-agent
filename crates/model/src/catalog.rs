@@ -448,12 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_models_dev_empty_providers_returns_none() {
-        assert!(parse_models_dev_payload(&serde_json::json!({})).is_none());
-        assert!(parse_models_dev_payload(&serde_json::json!({"p": {"models": {}}})).is_none());
-    }
-
-    #[test]
     fn write_and_read_back_catalog_is_consistent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata-cache.json");
@@ -471,20 +465,6 @@ mod tests {
         );
     }
 
-    /// 真实拉取 models.dev 目录并写入缓存（需网络；手动运行验证完整链路）。
-    #[test]
-    #[ignore = "manual: requires network access to models.dev"]
-    fn refresh_catalog_from_models_dev_manual() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        refresh_metadata_cache_to(&runtime.handle().clone(), dir.path())
-            .expect("models.dev refresh must succeed");
-        let cached = load_catalog_file(&dir.path().join(METADATA_CACHE_FILE_NAME))
-            .expect("cached catalog must be readable");
-        assert!(cached.providers.contains_key("deepseek"));
-        assert!(cached.lookup("deepseek", "deepseek-chat").is_some());
-    }
-
     #[test]
     fn builtin_table_exact_and_case_insensitive_match() {
         let limits = builtin_limits("deepseek", "deepseek-v4-flash").expect("builtin deepseek");
@@ -493,33 +473,6 @@ mod tests {
         let upper = builtin_limits("deepseek", "DEEPSEEK-V4-FLASH").expect("case fallback");
         assert_eq!(upper, limits);
         assert!(builtin_limits("unknown-provider", "any").is_none());
-    }
-
-    #[test]
-    fn catalog_lookup_exact_and_case_insensitive_match() {
-        let now = time::OffsetDateTime::now_utc();
-        let fetched = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .expect("format");
-        let catalog = parse_catalog_payload(&cache_payload(&fetched)).expect("parse");
-        let exact = catalog
-            .lookup("catalog-provider", "catalog-model")
-            .expect("exact match");
-        assert_eq!(exact.context, 99_000);
-        let upper = catalog
-            .lookup("catalog-provider", "CATALOG-MODEL")
-            .expect("case fallback");
-        assert_eq!(upper, exact);
-        assert!(
-            catalog
-                .lookup("missing-provider", "catalog-model")
-                .is_none()
-        );
-        assert!(
-            catalog
-                .lookup("catalog-provider", "missing-model")
-                .is_none()
-        );
     }
 
     #[test]

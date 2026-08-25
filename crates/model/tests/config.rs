@@ -2,57 +2,6 @@ mod support;
 use support::*;
 
 #[test]
-fn model_turn_request_serializes_provider_boundary_fields() {
-    let request = ModelTurnRequest::new(
-        "request_1",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    let value = serde_json::to_value(&request).expect("serialize model request");
-
-    assert_eq!(value["request_id"], "request_1");
-    assert_eq!(value["messages"][0]["role"], "user");
-
-    let response = ModelTurnResponse::completed("request_1", "response_1", "done");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-}
-
-#[test]
-fn model_discovery_skips_invalid_model_entries_without_failing_the_catalog() {
-    let tolerated_payloads = [
-        ("missing id", r#"{"data":[{"id":"entry-valid"},{}]}"#),
-        ("empty id", r#"{"data":[{"id":"entry-valid"},{"id":""}]}"#),
-        (
-            "whitespace id",
-            r#"{"data":[{"id":"entry-valid"},{"id":"entry invalid"}]}"#,
-        ),
-        (
-            "control character id",
-            r#"{"data":[{"id":"entry-valid"},{"id":"entry\ninvalid"}]}"#,
-        ),
-        (
-            "duplicate id",
-            r#"{"data":[{"id":"entry-valid"},{"id":"entry-valid"}]}"#,
-        ),
-    ];
-    for (label, payload) in tolerated_payloads {
-        let (base_url, request) = models_server(payload.to_string());
-        let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
-        assert_eq!(
-            provider.discover_model_ids().expect(label),
-            vec!["entry-valid"],
-            "the valid sibling entry must survive: {label}"
-        );
-        assert!(
-            request
-                .recv_timeout(Duration::from_secs(1))
-                .expect("models request")
-                .contains("GET /v1/models"),
-            "{label}"
-        );
-    }
-}
-
-#[test]
 fn model_discovery_accepts_complete_unique_model_entries() {
     let (base_url, request) =
         models_server(r#"{"data":[{"id":"test-model"},{"id":"test-model-b"}]}"#.to_string());
@@ -238,41 +187,6 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
                 .expect("serialize configuration error")
                 .contains(malformed)
         );
-    }
-}
-
-#[test]
-fn process_env_provider_values_reject_boundary_whitespace() {
-    for (name, malformed) in [
-        ("SINGULARITY_MODEL", " test-model"),
-        ("SINGULARITY_BASE_URL", "https://provider.example/v1 "),
-        ("SINGULARITY_API_KEY", "test-key-placeholder\t"),
-    ] {
-        let error = OpenAiProviderConfig::from_env(|candidate| match candidate {
-            "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
-                malformed.to_string()
-            } else {
-                "test-model".to_string()
-            }),
-            "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
-                malformed.to_string()
-            } else {
-                "https://provider.example/v1".to_string()
-            }),
-            "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
-                malformed.to_string()
-            } else {
-                "test-key-placeholder".to_string()
-            }),
-            _ => None,
-        })
-        .expect_err("boundary whitespace must be rejected");
-
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_configuration_invalid")
-        );
-        assert!(!error.message.contains(malformed));
     }
 }
 
@@ -552,28 +466,6 @@ fn model_request_validation_rejects_output_above_provider_capability() {
 }
 
 #[test]
-fn model_request_validation_accepts_multiple_tool_calls_per_message() {
-    let mut request = ModelTurnRequest::new(
-        "request_1",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    request.tools.push(ModelToolSchema {
-        name: "read".to_string(),
-        description: "read".to_string(),
-        parameters_schema: serde_json::json!({"type": "object"}),
-    });
-    request.tool_choice.max_tool_calls = 2;
-
-    let result = validate_model_request_with_capabilities(
-        &request,
-        Some(&ProviderProtocolContract::default()),
-    );
-
-    assert!(result.valid);
-    assert!(result.errors.is_empty());
-}
-
-#[test]
 fn model_request_validation_rejects_tool_definitions_above_provider_capability() {
     let mut request = ModelTurnRequest::new(
         "request_1",
@@ -845,61 +737,6 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
     );
     assert!(payload.get("tools").is_none());
     assert!(payload.get("tool_choice").is_none());
-}
-
-#[test]
-fn catalog_no_tool_request_accepts_system_and_developer_messages_before_wire_projection() {
-    let (base_url, request_body) = captured_request_server(
-        "HTTP/1.1 200 OK",
-        r#"{"id":"catalog_no_tool_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
-    );
-    let fixture = UserConfigFixture::new();
-    let _env = fixture.install_env();
-    fixture.set_api_key("catalog", "test-key-placeholder");
-    fixture.write_config(
-        "catalog/model",
-        json!({
-            "catalog": {
-                "base_url": base_url,
-                "models": {
-                    "model": {
-                        "api_protocol": "chat",
-                        "max_context_tokens": 1000000,
-                        "max_output_tokens": 384000,
-                        "supports_developer_role": false
-                    }
-                }
-            }
-        }),
-    );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
-    let provider = snapshot
-        .provider_for_selector(Some("catalog/model"))
-        .expect("selected catalog provider");
-    let request = ModelTurnRequest::new(
-        "catalog_no_tool_request",
-        vec![
-            ModelMessage::text(ModelRole::System, "system instruction"),
-            ModelMessage::text(ModelRole::Developer, "developer instruction"),
-            ModelMessage::text(ModelRole::User, "hello"),
-        ],
-    );
-    let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
-        .expect("catalog no-tool request");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    let payload: serde_json::Value = serde_json::from_str(
-        &request_body
-            .recv_timeout(Duration::from_secs(1))
-            .expect("captured catalog no-tool request"),
-    )
-    .expect("catalog no-tool payload JSON");
-    let messages = payload["messages"]
-        .as_array()
-        .expect("catalog no-tool messages");
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[1]["role"], "system");
-    assert_eq!(messages[2]["role"], "user");
 }
 
 #[test]

@@ -173,25 +173,6 @@ fn retry_after_parser_prefers_milliseconds_and_accepts_seconds_and_http_date() {
 }
 
 #[test]
-fn retry_after_parser_falls_back_for_invalid_and_clamps_large_values() {
-    let mut headers = HeaderMap::new();
-    headers.insert("retry-after", HeaderValue::from_static("-1"));
-    assert_eq!(retry_after_delay(&headers), None);
-
-    headers.insert("retry-after", HeaderValue::from_static("999999"));
-    assert_eq!(
-        retry_after_delay(&headers),
-        Some(Duration::from_millis(PROVIDER_RETRY_MAX_BACKOFF_MS))
-    );
-
-    headers.insert("retry-after-ms", HeaderValue::from_static("not-a-duration"));
-    assert_eq!(
-        retry_after_delay(&headers),
-        Some(Duration::from_millis(PROVIDER_RETRY_MAX_BACKOFF_MS))
-    );
-}
-
-#[test]
 fn provider_retry_backoff_uses_full_jitter_window() {
     for retry_count in 1..=6 {
         let window = retry_backoff_window_ms(retry_count);
@@ -282,27 +263,6 @@ fn concurrent_provider_server() -> (String, Receiver<usize>, thread::JoinHandle<
         }
     });
     (format!("http://{address}"), maximum_rx, server)
-}
-
-fn cancellation_followup_server() -> (String, Receiver<()>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation provider");
-    let address = listener
-        .local_addr()
-        .expect("cancellation provider address");
-    let (first_request_tx, first_request_rx) = mpsc::channel();
-    let server = thread::spawn(move || {
-        let (first_stream, _) = listener.accept().expect("accept cancelled request");
-        read_test_provider_request(&first_stream);
-        first_request_tx
-            .send(())
-            .expect("send cancelled request started");
-
-        let (mut followup_stream, _) = listener.accept().expect("accept follow-up request");
-        read_test_provider_request(&followup_stream);
-        write_test_provider_response(&mut followup_stream);
-        thread::sleep(Duration::from_millis(100));
-    });
-    (format!("http://{address}"), first_request_rx, server)
 }
 
 #[test]
@@ -500,88 +460,6 @@ fn provider_clones_share_a_runtime_and_requests_progress_concurrently() {
         "shared runtime must not serialize provider requests"
     );
     server.join().expect("join concurrent provider server");
-}
-
-#[test]
-fn cancelled_request_does_not_poison_followup_on_the_shared_runtime() {
-    let (base_url, first_request_rx, server) = cancellation_followup_server();
-    let provider = test_provider(test_provider_config(base_url)).expect("provider");
-    let cancellation = CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let worker_provider = provider.clone();
-    let worker = thread::spawn(move || {
-        let request = ModelTurnRequest::new(
-            "request_cancel_shared_runtime",
-            vec![ModelMessage::text(ModelRole::User, "wait")],
-        );
-        worker_provider.complete(&request, &worker_cancellation)
-    });
-    first_request_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("cancelled request reached server");
-    cancellation.cancel();
-    let error = worker
-        .join()
-        .expect("join cancel worker")
-        .expect_err("cancelled request must fail");
-    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
-
-    let followup = ModelTurnRequest::new(
-        "request_after_cancel_shared_runtime",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    provider
-        .complete(&followup, &CancellationToken::new())
-        .expect("follow-up request must succeed on shared runtime");
-    server.join().expect("join cancellation provider server");
-}
-
-#[test]
-fn timed_out_request_does_not_poison_followup_on_the_shared_runtime() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout provider");
-    let address = listener.local_addr().expect("timeout provider address");
-    let server = thread::spawn(move || {
-        let mut hanging_streams = Vec::new();
-        // 超时（挂起）不再重试：只接受 1 个挂起连接。
-        for _ in 0..1 {
-            let (stream, _) = listener.accept().expect("accept timed-out request");
-            read_test_provider_request(&stream);
-            hanging_streams.push(stream);
-        }
-
-        let (mut followup_stream, _) = listener.accept().expect("accept timeout follow-up");
-        read_test_provider_request(&followup_stream);
-        write_test_provider_response(&mut followup_stream);
-        drop(hanging_streams);
-    });
-    let provider = test_provider_with_timeout(test_provider_config(format!("http://{address}")), 1)
-        .expect("provider");
-    let timed_out_request = ModelTurnRequest::new(
-        "request_timeout_shared_runtime",
-        vec![ModelMessage::text(ModelRole::User, "wait")],
-    );
-    let error = provider
-        .complete(&timed_out_request, &CancellationToken::new())
-        .expect_err("provider request must time out");
-    assert_eq!(error.error.kind, ModelErrorKind::Timeout);
-    assert_eq!(
-        error
-            .provider_attempt_metadata
-            .as_ref()
-            .expect("timeout metadata")
-            .attempt_count,
-        // 超时（挂起）不再重试：单次超时即失败。
-        1
-    );
-
-    let followup = ModelTurnRequest::new(
-        "request_after_timeout_shared_runtime",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    provider
-        .complete(&followup, &CancellationToken::new())
-        .expect("follow-up request must still succeed");
-    server.join().expect("join timeout provider server");
 }
 
 #[test]

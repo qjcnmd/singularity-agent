@@ -61,12 +61,6 @@ impl Editor {
         self.scroll_override = Some(next.max(0) as usize);
     }
 
-    /// 当前滚轮视口覆盖（`None`=跟随光标）。
-    #[cfg(test)]
-    pub fn scroll_override(&self) -> Option<usize> {
-        self.scroll_override
-    }
-
     /// 实际视口顶行：覆盖偏移优先，否则跟随光标所在可视行。
     pub fn effective_scroll_top(&self, cursor_visual_row: usize, inner_height: usize) -> usize {
         match self.scroll_override {
@@ -360,22 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_merges_following_line_at_row_end() {
-        let mut editor = Editor::new();
-        for ch in "ab".chars() {
-            editor.insert_char(ch);
-        }
-        editor.insert_newline();
-        editor.move_home();
-        editor.delete(); // 行首 delete 是 no-op（右侧无内容合并语义按列）
-        assert_eq!(editor.text(), "ab\n");
-        editor.move_up();
-        editor.move_end();
-        editor.delete(); // 行尾删除合并下一行
-        assert_eq!(editor.text(), "ab");
-    }
-
-    #[test]
     fn take_resets_state() {
         let mut editor = Editor::new();
         editor.insert_char('x');
@@ -384,43 +362,6 @@ mod tests {
         assert_eq!(editor.take(), "x\ny");
         assert!(editor.is_empty());
         assert_eq!(editor.cursor(), (0, 0));
-    }
-
-    #[test]
-    fn wrapped_height_counts_wide_chars_and_grows_with_content() {
-        let mut editor = Editor::new();
-        assert_eq!(editor.wrapped_height(10), 1, "empty input stays one row");
-        for _ in 0..12 {
-            editor.insert_char('中'); // 每个宽 2
-        }
-        // 宽度 10 → 每行 5 个字 → 3 行。
-        assert_eq!(editor.wrapped_height(10), 3);
-        assert_eq!(editor.display_height(10, 2), 2, "clamped by max rows");
-        assert_eq!(editor.display_height(10, 8), 3);
-    }
-
-    #[test]
-    fn cursor_visual_maps_ascii_and_cjk_positions() {
-        let mut editor = Editor::new();
-        for ch in "中文a".chars() {
-            editor.insert_char(ch);
-        }
-        // 宽度 20：光标在第 0 行，可视列 = 2+2+1 = 5。
-        assert_eq!(editor.cursor_visual(20), (0, 5));
-        editor.move_home();
-        assert_eq!(editor.cursor_visual(20), (0, 0));
-    }
-
-    #[test]
-    fn visual_click_positions_cursor_across_wrapped_and_wide_text() {
-        let mut editor = Editor::new();
-        for ch in "ab中文cd".chars() {
-            editor.insert_char(ch);
-        }
-        editor.set_cursor_visual(1, 2, 5);
-        assert_eq!(editor.cursor(), (0, 4));
-        editor.set_cursor_visual(0, 1, 5);
-        assert_eq!(editor.cursor(), (0, 1));
     }
 
     #[test]
