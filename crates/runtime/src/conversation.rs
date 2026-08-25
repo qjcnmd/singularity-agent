@@ -194,7 +194,9 @@ pub enum ConversationError {
     #[error("thread already has an active turn")]
     TurnAlreadyActive,
     #[error("{0}")]
-    Settings(String),
+    Configuration(String),
+    #[error("{0}")]
+    State(String),
     #[error(transparent)]
     Turn(#[from] TurnRunError),
 }
@@ -251,7 +253,7 @@ impl Conversation {
         let thread = self.thread()?;
         self.runner
             .thinking_for_turn(&thread, turn_id)
-            .map_err(ConversationError::Settings)
+            .map_err(ConversationError::Configuration)
     }
 
     /// 当前 Thread 投影快照。
@@ -316,7 +318,7 @@ impl Conversation {
         let thread = reservation.conversation.thread()?;
         let result = self.runner.compact_thread(&thread);
         drop(reservation);
-        result.map_err(ConversationError::Settings)
+        result.map_err(ConversationError::Configuration)
     }
 
     pub fn rename(&self, name: &str) -> Result<(), ConversationError> {
@@ -325,7 +327,7 @@ impl Conversation {
             return Err(ConversationError::TurnAlreadyActive);
         }
         crate::store::rename_thread(self.runner.sessions_dir(), &state.thread.thread_id, name)
-            .map_err(ConversationError::Settings)
+            .map_err(ConversationError::Configuration)
     }
 
     /// 中断当前活动 turn；无活动 turn 时为 no-op。已接受的 followUp 不受
@@ -487,7 +489,7 @@ impl Conversation {
             Err(TurnRunError::Terminalization(_)) => {}
             Err(_) => state.thread.last_turn_status = Some(ThreadStatus::Failed),
         }
-        result.map_err(ConversationError::from)
+        result.map_err(ConversationError::Turn)
     }
 
     /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回
@@ -516,7 +518,7 @@ impl Conversation {
         }
         // 调用方已持有 state 锁：selector 组合必须走无锁纯函数。
         let selector = compose_validated_selector(&state.thread.model, &pending, &self.runner)
-            .map_err(ConversationError::Settings)?;
+            .map_err(ConversationError::Configuration)?;
         let path =
             crate::store::thread_session_path(self.runner.sessions_dir(), &state.thread.thread_id);
         let write_result = (|| -> Result<(), String> {
@@ -543,7 +545,7 @@ impl Conversation {
                 Ok(())
             }
             // JSONL 未写入：意图原样保留，避免静默丢失。
-            Err(message) => Err(ConversationError::Settings(format!(
+            Err(message) => Err(ConversationError::Configuration(format!(
                 "failed to persist thread settings: {message}"
             ))),
         }
@@ -552,7 +554,7 @@ impl Conversation {
     fn compose_selector(&self, patch: &SettingsPatch) -> Result<String, ConversationError> {
         let current = self.lock_state()?.thread.model.clone();
         compose_validated_selector(&current, patch, &self.runner)
-            .map_err(ConversationError::Settings)
+            .map_err(ConversationError::Configuration)
     }
 
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
@@ -584,7 +586,7 @@ impl Conversation {
     ) -> Result<std::sync::MutexGuard<'_, ConversationState>, ConversationError> {
         self.state
             .lock()
-            .map_err(|_| ConversationError::Settings("conversation state poisoned".to_string()))
+            .map_err(|_| ConversationError::State("conversation state poisoned".to_string()))
     }
 }
 

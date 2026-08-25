@@ -38,7 +38,7 @@ pub fn format_size(bytes: usize) -> String {
 }
 
 /// 将文本按换行切分为行列表；空内容返回空数组，末尾换行不产生多余空行。
-fn split_lines(content: &str) -> Vec<&str> {
+pub(crate) fn split_lines(content: &str) -> Vec<&str> {
     if content.is_empty() {
         return Vec::new();
     }

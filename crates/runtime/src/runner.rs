@@ -309,9 +309,9 @@ impl TurnRunner {
         }
         // 取消可能打断已开始 item 的工具执行：终态事件前补齐所有未闭合 item。
         for tool_call_id in item_events.open_tool_items() {
-            self.emit_tool_terminal(&mut item_events, &tool_call_id, true, sink);
+            item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
-        self.emit_assistant_terminal_completed(&mut item_events, sink);
+        item_events.emit_assistant_terminal_completed(sink);
         let final_turn = self.terminal_turn_with_usage(
             &session,
             Turn {
@@ -592,7 +592,7 @@ impl TurnRunner {
     ) {
         item_events.emit_assistant_terminal_failed(sink);
         for tool_call_id in item_events.open_tool_items() {
-            self.emit_tool_terminal(item_events, &tool_call_id, true, sink);
+            item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
         let message = failure.original.clone().unwrap_or_else(|| {
             format!(
@@ -1104,26 +1104,6 @@ impl AssistantItemEvents {
             turn_id: self.turn_id.clone(),
             item_id: self.item_id.clone(),
         });
-    }
-}
-
-impl TurnRunner {
-    fn emit_tool_terminal(
-        &self,
-        item_events: &mut AssistantItemEvents,
-        tool_call_id: &str,
-        is_error: bool,
-        sink: &mut dyn TurnEventSink,
-    ) {
-        item_events.emit_tool_terminal(sink, tool_call_id, is_error);
-    }
-
-    fn emit_assistant_terminal_completed(
-        &self,
-        item_events: &mut AssistantItemEvents,
-        sink: &mut dyn TurnEventSink,
-    ) {
-        item_events.emit_assistant_terminal_completed(sink);
     }
 }
 

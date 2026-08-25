@@ -260,20 +260,17 @@ fn wrap_with_positions(line: &str, width: usize) -> Vec<(String, usize)> {
     let mut current = String::new();
     let mut current_width = 0usize;
     let mut start_char = 0usize;
-    let mut consumed = 0usize;
     for (index, ch) in line.chars().enumerate() {
         let w = UnicodeWidthStr::width(ch.to_string().as_str());
         if current_width + w > width && !current.is_empty() {
             rows.push((std::mem::take(&mut current), start_char));
             start_char = index;
             current_width = 0;
-            consumed = index;
         }
         current.push(ch);
         current_width += w;
     }
     rows.push((current, start_char));
-    let _ = consumed;
     rows
 }
 

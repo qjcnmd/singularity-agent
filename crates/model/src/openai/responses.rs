@@ -58,7 +58,7 @@ pub fn openai_responses_request_payload(
                 .collect::<Vec<_>>()
         );
         if supports_tool_choice {
-            payload["tool_choice"] = openai_responses_tool_choice_payload();
+            payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
         }
@@ -460,8 +460,4 @@ pub fn openai_responses_input(
         }
     }
     ((!instructions.is_empty()).then_some(instructions), items)
-}
-
-pub fn openai_responses_tool_choice_payload() -> Value {
-    json!("auto")
 }

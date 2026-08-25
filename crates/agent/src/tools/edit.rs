@@ -16,7 +16,7 @@ use super::registry::{
     ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
     validate_args,
 };
-use super::truncate::format_size;
+use super::truncate::{format_size, split_lines};
 
 const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
 
@@ -414,7 +414,7 @@ fn generate_patch(
     let added = &new[removed_line_start..new_added_end];
     let context_after = &old[removed_line_end..after_end];
 
-    let old_start = line_number_at(old, before_start);
+    let old_start = line_number_at(old, before_start).saturating_add(1);
     let old_count = split_lines(context_before).len()
         + split_lines(removed).len()
         + split_lines(context_after).len();
@@ -444,18 +444,6 @@ fn generate_patch(
         let _ = writeln!(patch, " {line}");
     }
     patch
-}
-
-/// 按 `\n` 切分为行；`\n` 结尾的尾随空串不计为额外行。空切片返回零行。
-fn split_lines(slice: &str) -> Vec<&str> {
-    if slice.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<&str> = slice.split('\n').collect();
-    if slice.ends_with('\n') {
-        lines.pop();
-    }
-    lines
 }
 
 /// `position` 所在行（从 0 起）的行首字节偏移。

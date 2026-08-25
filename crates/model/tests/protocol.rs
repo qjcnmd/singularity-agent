@@ -375,10 +375,7 @@ fn model_errors_classify_provider_failures_by_typed_cause_without_transport_call
         .with_provider("openai_compatible")
         .with_model("test-model");
 
-    assert_eq!(
-        classify_model_error(&auth),
-        ModelErrorCategory::Authentication
-    );
+    assert_eq!(auth.category(), ModelErrorCategory::Authentication);
     let permission_denied = ModelError::new(
         ModelErrorKind::NetworkError,
         "[WinError 10013] socket access denied",

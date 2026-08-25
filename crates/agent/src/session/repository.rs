@@ -31,7 +31,7 @@ impl SessionRepository {
     /// 读取会话：按 id 定位 rollout，校验 header id，返回摘要与完整 leaf 序列。
     pub fn read(&self, session_id: &str) -> Result<ThreadRead> {
         let path = self.sessions_dir.join(format!("{session_id}.jsonl"));
-        let session = SessionManager::open_existing(&path)?;
+        let session = SessionManager::open_existing_read_only(&path)?;
         if session.session_id() != session_id {
             return Err(SessionError::InvalidSession(format!(
                 "rollout header id {} does not match requested session id {session_id}",

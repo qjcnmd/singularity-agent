@@ -86,7 +86,7 @@ pub fn openai_request_payload(
                 .collect::<Vec<_>>()
         );
         if supports_tool_choice {
-            payload["tool_choice"] = openai_tool_choice_payload();
+            payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
         }
@@ -664,10 +664,6 @@ pub fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> 
         payload["function"]["strict"] = json!(true);
     }
     payload
-}
-
-pub fn openai_tool_choice_payload() -> Value {
-    json!("auto")
 }
 
 #[cfg(test)]

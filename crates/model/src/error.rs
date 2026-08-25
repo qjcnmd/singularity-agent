@@ -125,13 +125,8 @@ impl ModelError {
 
     /// 归类为公共模型错误类别。
     pub fn category(&self) -> ModelErrorCategory {
-        classify_model_error(self)
+        contract::model_error_category(self)
     }
-}
-
-/// 将模型错误映射为稳定公共类别。
-pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
-    contract::model_error_category(error)
 }
 
 #[derive(Debug, Clone, PartialEq, Error)]

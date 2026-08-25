@@ -9,7 +9,7 @@ pub(crate) use singularity_model::{
     ProviderApiProtocol, ProviderAttemptEvent, ProviderConfigSnapshot, ProviderConfigSource,
     ProviderConfigurationStatus, ProviderError, ProviderErrorStage, ProviderProtocolContract,
     ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability, ToolChoicePolicy,
-    chat_completions_endpoint, classify_model_error, responses_endpoint, validate_model_request,
+    chat_completions_endpoint, responses_endpoint, validate_model_request,
     validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };

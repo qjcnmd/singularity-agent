@@ -9,6 +9,10 @@ pub(crate) use responses::*;
 pub(crate) use wire::OpenAiCompletion;
 pub use wire::{chat_completions_endpoint, provider_error_response, responses_endpoint};
 
+pub(crate) fn tool_choice_payload() -> serde_json::Value {
+    serde_json::json!("auto")
+}
+
 #[cfg(test)]
 mod tests {
     use super::responses::openai_responses_input;

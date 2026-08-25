@@ -260,7 +260,8 @@ impl AppServer {
                 Ok(timing) => timing,
                 Err(error) => {
                     let message = match error {
-                        singularity_runtime::ConversationError::Settings(message) => {
+                        singularity_runtime::ConversationError::Configuration(message)
+                        | singularity_runtime::ConversationError::State(message) => {
                             format!("invalid model selector: {message}")
                         }
                         other => other.to_string(),
@@ -543,7 +544,8 @@ impl AppServer {
                     .remove(0),
                 ))
             }
-            Err(singularity_runtime::ConversationError::Settings(message)) => Err(
+            Err(singularity_runtime::ConversationError::Configuration(message))
+            | Err(singularity_runtime::ConversationError::State(message)) => Err(
                 AppServerError::InvalidParams(format!("invalid model selector: {message}")),
             ),
             Err(singularity_runtime::ConversationError::Turn(error)) => {
@@ -615,7 +617,8 @@ impl AppServer {
         }
         match run_result {
             Ok(_) => Ok(()),
-            Err(singularity_runtime::ConversationError::Settings(message)) => {
+            Err(singularity_runtime::ConversationError::Configuration(message))
+            | Err(singularity_runtime::ConversationError::State(message)) => {
                 Err(AppServerError::InvalidParams(message))
             }
             Err(singularity_runtime::ConversationError::Turn(error)) => {

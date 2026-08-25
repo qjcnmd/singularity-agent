@@ -721,7 +721,7 @@ fn settings_persistence_failure_keeps_intent_and_fails_run() {
     let result = turn_thread.join().expect("join");
     let error = result.expect_err("settings persistence failure must fail the run");
     assert!(
-        matches!(error, ConversationError::Settings(_)),
+        matches!(error, ConversationError::Configuration(_)),
         "expected a settings persistence error, got {error:?}"
     );
     assert!(
