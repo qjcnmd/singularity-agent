@@ -686,7 +686,7 @@ fn turn_start_before_initialize_is_rejected() {
 }
 
 #[test]
-fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
+fn session_delete_rejects_reserved_turn_and_succeeds_after_reservation_drops() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
@@ -697,9 +697,23 @@ fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
     initialize(&mut server);
     insert_session(&server, &sessions_dir, session_id, &workspace);
 
-    let guard = server.register_live_turn("turn_live", session_id);
+    let message: JsonRpcMessage = serde_json::from_value(json!({
+        "jsonrpc": "2.0",
+        "method": "turn/start",
+        "id": 10,
+        "params": {
+            "threadId": session_id,
+            "input": [{"type": "text", "text": "reserved"}],
+        }
+    }))
+    .expect("turn/start");
+    let claim = match server.claim_turn(message) {
+        Ok(TurnClaim::Accepted(claim)) => claim,
+        Ok(other) => panic!("claim must accept the turn: {other:?}"),
+        Err(error) => panic!("claim failed: {error}"),
+    };
 
-    // 活跃 turn 期间删除 → invalid state 拒绝，索引与 rollout 都不动。
+    // 请求已获执行权但工作线程尚未启动时，删除仍须被活动窗口拒绝。
     let responses = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"session/delete","id":2,"params":{{"sessionId":"{session_id}"}}}}"#
@@ -709,8 +723,7 @@ fn session_delete_rejects_active_turn_and_succeeds_after_turn_ends() {
     assert!(server.store().get_session(session_id).is_ok());
     assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());
 
-    // turn 结束后删除成功。
-    drop(guard);
+    drop(claim);
     let responses = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"session/delete","id":3,"params":{{"sessionId":"{session_id}"}}}}"#

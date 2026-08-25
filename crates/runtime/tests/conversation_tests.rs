@@ -865,17 +865,21 @@ fn steer_affects_only_the_current_turn() {
 fn reservation_holds_window_and_releases_on_drop() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
+    let log = Arc::new(RequestLog::default());
     let shared = new_conversation(
         &sessions,
         Arc::new(RecordingProvider {
             text: "ok".into(),
-            log: Arc::new(RequestLog::default()),
+            log: Arc::clone(&log),
         }),
         Some("base-model"),
     );
+    let thread_id = shared.thread().unwrap().thread_id;
 
-    // 预订原子开启活动窗口：第二个预订与普通 run 都被拒绝。
+    // 预订原子开启活动窗口：busy、设置、followUp 与控制路由全部从同一
+    // Reserved 生命周期状态派生。
     let reservation = shared.reserve_start().expect("first reservation wins");
+    assert!(shared.has_active_turn(), "reservation is a busy window");
     assert!(
         shared.reserve_start().is_err(),
         "second reservation must be rejected"
@@ -885,11 +889,44 @@ fn reservation_holds_window_and_releases_on_drop() {
         shared.run_turn("must not run", &mut sink).is_err(),
         "run_turn must be rejected while a reservation holds the window"
     );
+    assert!(!shared.steer("not running yet"));
+    shared.interrupt();
+    assert!(
+        shared.submit_follow_up("queued while reserved"),
+        "followUp is protected by the reserved chain window"
+    );
+    let timing = shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue settings during reservation");
+    assert_eq!(timing, SettingsApplyTiming::QueuedForNextTurn);
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
+        Some("base-model"),
+        "reserved settings must not change the current projection"
+    );
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        0,
+        "reserved settings must not persist before a trusted terminal"
+    );
 
-    // 未消费的预订 drop 后窗口释放：随后可正常执行一轮。
+    // 未消费的预订 drop 后窗口释放；已接受的 followUp 与设置意图保留，
+    // 随后由下一条执行链按合同消费。
     drop(reservation);
     assert!(!shared.has_active_turn());
     let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     assert!(shared.pending_follow_ups().is_empty());
+    assert_eq!(
+        log.input_sequence(),
+        vec!["queued while reserved", "now it runs"]
+    );
+    assert_eq!(thread_settings_count(&sessions, &thread_id), 1);
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
+        Some("openai_compatible/base-model")
+    );
 }

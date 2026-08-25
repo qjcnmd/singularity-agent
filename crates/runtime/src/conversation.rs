@@ -104,15 +104,30 @@ impl TurnControls {
 
 struct ConversationState {
     thread: Thread,
-    /// 当前轮的取消/注入控制面；链执行期间在轮间隙短暂为 None。
-    active: Option<Arc<TurnControls>>,
-    /// 链窗口预订：活动 turn 贯穿整条链（首轮+后续队列），窗口内其他
-    /// 预订与 `run_turn` 被拒绝，窗口由预订守卫持有。
-    reserved: bool,
+    turn: TurnLifecycle,
     /// 活动 turn 期间接受、待终态后生效的设置意图；至多一份。
     queued_settings: Option<SettingsPatch>,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行。
     pending_follow_ups: VecDeque<String>,
+}
+
+enum TurnLifecycle {
+    Idle,
+    Reserved,
+    Running(Arc<TurnControls>),
+}
+
+impl TurnLifecycle {
+    fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn controls(&self) -> Option<Arc<TurnControls>> {
+        match self {
+            Self::Running(controls) => Some(Arc::clone(controls)),
+            Self::Idle | Self::Reserved => None,
+        }
+    }
 }
 
 /// 一个 Thread 的长驻协调器。
@@ -177,8 +192,7 @@ impl Conversation {
             self_weak: weak.clone(),
             state: Mutex::new(ConversationState {
                 thread,
-                active: None,
-                reserved: false,
+                turn: TurnLifecycle::Idle,
                 queued_settings: None,
                 pending_follow_ups: VecDeque::new(),
             }),
@@ -190,10 +204,10 @@ impl Conversation {
     /// 释放。
     pub fn reserve_start(&self) -> Result<TurnReservation, ConversationError> {
         let mut state = self.lock_state()?;
-        if state.reserved {
+        if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
-        state.reserved = true;
+        state.turn = TurnLifecycle::Reserved;
         let conversation = self
             .self_weak
             .upgrade()
@@ -206,8 +220,7 @@ impl Conversation {
 
     fn release_reservation(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.reserved = false;
-            state.active = None;
+            state.turn = TurnLifecycle::Idle;
         }
     }
 
@@ -234,7 +247,11 @@ impl Conversation {
 
     /// 当前 Thread 是否有正在执行的 turn（含后续队列的连续执行期）。
     pub fn has_active_turn(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.reserved)
+        match self.state.lock() {
+            Ok(state) => state.turn.is_busy(),
+            // 状态未知时保持删除与并发启动护栏关闭，避免把潜在写者误判为空闲。
+            Err(_) => true,
+        }
     }
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时为 false。
@@ -254,7 +271,7 @@ impl Conversation {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if !state.reserved {
+        if !state.turn.is_busy() {
             return false;
         }
         state.pending_follow_ups.push_back(text);
@@ -283,10 +300,10 @@ impl Conversation {
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
         let thread = {
             let mut state = self.lock_state()?;
-            if state.reserved {
+            if state.turn.is_busy() {
                 return Err(ConversationError::TurnAlreadyActive);
             }
-            state.reserved = true;
+            state.turn = TurnLifecycle::Reserved;
             state.thread.clone()
         };
         let result = self.runner.compact_thread(&thread);
@@ -296,7 +313,7 @@ impl Conversation {
 
     pub fn rename(&self, name: &str) -> Result<(), ConversationError> {
         let state = self.lock_state()?;
-        if state.reserved {
+        if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
         crate::store::rename_thread(self.runner.sessions_dir(), &state.thread.thread_id, name)
@@ -328,7 +345,7 @@ impl Conversation {
         // 先用当前投影做即时校验：无效值在提交点就被拒绝，而不是等到终态后。
         self.compose_selector(&patch)?;
         let mut state = self.lock_state()?;
-        if state.active.is_some() {
+        if state.turn.is_busy() {
             state.queued_settings = Some(match state.queued_settings.take() {
                 Some(pending) => pending.merged_with(&patch),
                 None => patch,
@@ -434,8 +451,11 @@ impl Conversation {
     ) -> Result<TurnOutcome, ConversationError> {
         let controls = {
             let mut state = self.lock_state()?;
+            if !matches!(state.turn, TurnLifecycle::Reserved) {
+                return Err(ConversationError::TurnAlreadyActive);
+            }
             let controls = Arc::new(TurnControls::new());
-            state.active = Some(Arc::clone(&controls));
+            state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             controls
         };
         let thread_snapshot = self.lock_state()?.thread.clone();
@@ -445,7 +465,7 @@ impl Conversation {
         };
         let result = self.runner.run(params, &controls, sink);
         let mut state = self.lock_state()?;
-        state.active = None;
+        state.turn = TurnLifecycle::Reserved;
         match &result {
             Ok(outcome) => {
                 state.thread.last_turn_status = Some(match outcome.turn_status {
@@ -531,7 +551,7 @@ impl Conversation {
         self.state
             .lock()
             .ok()
-            .and_then(|state| state.active.clone())
+            .and_then(|state| state.turn.controls())
     }
 
     fn take_one_pending_follow_up(&self) -> Option<String> {
