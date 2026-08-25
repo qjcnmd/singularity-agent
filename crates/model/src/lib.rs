@@ -31,7 +31,6 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一文件：写入走临时文件 + 同卷原子改名，读侧只认这一个文件名。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
-pub(crate) const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 pub(crate) const MAX_CONFIG_AUTH_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
@@ -51,7 +50,6 @@ pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
 pub(crate) mod catalog;
 mod config;
-mod discovery;
 mod error;
 mod openai;
 mod provider;
@@ -64,9 +62,7 @@ pub use config::{
     compose_model_selector, split_model_selector,
 };
 pub use error::*;
-pub use openai::{
-    chat_completions_endpoint, models_endpoint, provider_error_response, responses_endpoint,
-};
+pub use openai::{chat_completions_endpoint, provider_error_response, responses_endpoint};
 pub use provider::Provider;
 pub use provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,

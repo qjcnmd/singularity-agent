@@ -49,7 +49,6 @@ impl TurnFailureCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailureKind {
     RateLimited,
-    QuotaExceeded,
     Network,
     Timeout,
     Auth,
@@ -64,7 +63,6 @@ impl ProviderFailureKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RateLimited => "rate_limited",
-            Self::QuotaExceeded => "quota_exceeded",
             Self::Network => "network",
             Self::Timeout => "timeout",
             Self::Auth => "auth",

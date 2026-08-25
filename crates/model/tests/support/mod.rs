@@ -216,22 +216,6 @@ pub(crate) fn single_response_server(status_line: &'static str, body: &'static s
     format!("http://{addr}")
 }
 
-pub(crate) fn models_server(body: String) -> (String, Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind models provider");
-    let addr = listener.local_addr().expect("models provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept models provider request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone models provider stream"));
-        let (first_line, headers, _) = read_provider_request(&mut reader);
-        assert!(first_line.contains("/v1/models"));
-        assert!(headers.contains("authorization: Bearer test-key-placeholder"));
-        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
-        tx.send(first_line).expect("send models request line");
-    });
-    (format!("http://{addr}"), rx)
-}
-
 pub(crate) fn captured_request_server(
     status_line: &'static str,
     body: &'static str,

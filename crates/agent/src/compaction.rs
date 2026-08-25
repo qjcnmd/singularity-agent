@@ -565,7 +565,6 @@ impl CompactionEngine {
             summary: summary_text,
             first_kept_entry_id: Some(first_kept_entry_id.clone()),
             tokens_before: Some(tokens_before),
-            previous_summary: previous.as_ref().map(|summary| summary.text.clone()),
             usage: summary_usage.usage_present.then_some(summary_usage.clone()),
             details: Some(json!({
                 "readFiles": read_files,

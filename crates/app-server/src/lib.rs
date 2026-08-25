@@ -14,7 +14,6 @@ mod delete;
 mod dispatch;
 mod events;
 mod lifecycle;
-mod owner_only;
 pub mod paths;
 mod session_index;
 mod state;
@@ -108,7 +107,6 @@ impl fmt::Display for TurnFailureStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailureKind {
     RateLimited,
-    QuotaExceeded,
     Network,
     Timeout,
     Auth,
@@ -140,7 +138,6 @@ impl TurnFailureCause {
             Self::Serialization => "serialization",
             Self::Provider(kind) => match kind {
                 ProviderFailureKind::RateLimited => "provider_rate_limited",
-                ProviderFailureKind::QuotaExceeded => "provider_quota_exceeded",
                 ProviderFailureKind::Network => "provider_network",
                 ProviderFailureKind::Timeout => "provider_timeout",
                 ProviderFailureKind::Auth => "provider_auth",
@@ -166,7 +163,6 @@ impl From<singularity_runtime::ProviderFailureKind> for ProviderFailureKind {
         use singularity_runtime::ProviderFailureKind as R;
         match kind {
             R::RateLimited => Self::RateLimited,
-            R::QuotaExceeded => Self::QuotaExceeded,
             R::Network => Self::Network,
             R::Timeout => Self::Timeout,
             R::Auth => Self::Auth,

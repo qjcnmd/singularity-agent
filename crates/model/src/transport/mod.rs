@@ -244,16 +244,6 @@ impl OpenAiProvider {
         })
     }
 
-    /// Discover public model ids from the provider's standard `/models` endpoint.
-    pub fn discover_model_ids(&self) -> Result<Vec<String>, ProviderError> {
-        crate::discovery::discover_provider_models(
-            &self.config,
-            &self.client,
-            &self.runtime,
-            self.request_timeout_seconds,
-        )
-    }
-
     /// Clone a provider for one allowlisted model while freezing its protocol
     /// and token limits. The clone shares the HTTP client, runtime and caches.
     pub(crate) fn with_selected_model(&self, selected_model: SelectedModel) -> Self {

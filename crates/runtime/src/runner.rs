@@ -10,9 +10,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "test-hooks")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use singularity_agent::agent::{
     Agent, AgentConfig, AgentDiagnosticSeverity, AgentError, AgentEvent, AgentEvents, AgentOutcome,
     AgentTerminalReason,
@@ -64,15 +61,6 @@ pub struct TurnRunner {
     sessions_dir: PathBuf,
     provider_snapshot: ProviderConfigSnapshot,
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
-    #[cfg(feature = "test-hooks")]
-    faults: TestFaults,
-}
-
-#[cfg(feature = "test-hooks")]
-#[derive(Default)]
-struct TestFaults {
-    metadata_failures_remaining: AtomicUsize,
-    event_failures_remaining: AtomicUsize,
 }
 
 impl TurnRunner {
@@ -81,8 +69,6 @@ impl TurnRunner {
             sessions_dir,
             provider_snapshot,
             provider_override: None,
-            #[cfg(feature = "test-hooks")]
-            faults: TestFaults::default(),
         }
     }
 
@@ -175,52 +161,6 @@ impl TurnRunner {
         agent
             .compact_now(&CancellationToken::new())
             .map_err(|error| error.to_string())
-    }
-
-    /// 注入终态化故障（仅测试）：前 N 次 terminal metadata 写入 / 终态事件
-    /// 发射按注入次数失败，用于验证 fail-stop 与有界重试语义。
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inject_terminalization_faults(&self, metadata_failures: usize, event_failures: usize) {
-        self.faults
-            .metadata_failures_remaining
-            .store(metadata_failures, Ordering::SeqCst);
-        self.faults
-            .event_failures_remaining
-            .store(event_failures, Ordering::SeqCst);
-    }
-
-    #[cfg(feature = "test-hooks")]
-    fn consume_terminal_event_failure(&self, method: &str) -> bool {
-        if !matches!(method, "turn/completed" | "turn/error" | "item/failed") {
-            return false;
-        }
-        self.faults
-            .event_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                (remaining > 0).then(|| remaining - 1)
-            })
-            .is_ok()
-    }
-
-    #[cfg(not(feature = "test-hooks"))]
-    fn consume_terminal_event_failure(&self, _method: &str) -> bool {
-        false
-    }
-
-    #[cfg(feature = "test-hooks")]
-    fn consume_terminal_metadata_failure(&self) -> bool {
-        self.faults
-            .metadata_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                (remaining > 0).then(|| remaining - 1)
-            })
-            .is_ok()
-    }
-
-    #[cfg(not(feature = "test-hooks"))]
-    fn consume_terminal_metadata_failure(&self) -> bool {
-        false
     }
 
     /// 执行一个 turn 直到终态收敛。
@@ -382,13 +322,9 @@ impl TurnRunner {
             &status.model_usage,
             status.usage_complete,
         );
-        if self.consume_terminal_event_failure("turn/completed") {
-            // 注入故障路径：终态事件发射失败按投影失败处理（事件已持久化）。
-        } else {
-            sink.emit(TurnEvent::TurnCompleted {
-                turn: final_turn.clone(),
-            });
-        }
+        sink.emit(TurnEvent::TurnCompleted {
+            turn: final_turn.clone(),
+        });
         Ok(TurnOutcome {
             thread_id: thread.thread_id,
             turn_id,
@@ -720,7 +656,7 @@ impl TurnRunner {
         failure: &TurnFailure,
         sink: &mut dyn TurnEventSink,
     ) {
-        if item_events.appeared() && !self.consume_terminal_event_failure("item/failed") {
+        if item_events.appeared() {
             item_events.emit_assistant_terminal_failed(sink);
         }
         for tool_call_id in item_events.open_tool_items() {
@@ -733,21 +669,19 @@ impl TurnRunner {
                 failure.cause.as_str()
             )
         });
-        if !self.consume_terminal_event_failure("turn/error") {
-            sink.emit(TurnEvent::TurnFailed {
-                turn: Turn {
-                    turn_id: turn_id.to_string(),
-                    thread_id: thread_id.to_string(),
-                    status: TurnStatus::Failed,
-                    usage: None,
-                },
-                error: TurnErrorDetail {
-                    stage: failure.stage.as_str().to_string(),
-                    cause: failure.cause.as_str().to_string(),
-                    message,
-                },
-            });
-        }
+        sink.emit(TurnEvent::TurnFailed {
+            turn: Turn {
+                turn_id: turn_id.to_string(),
+                thread_id: thread_id.to_string(),
+                status: TurnStatus::Failed,
+                usage: None,
+            },
+            error: TurnErrorDetail {
+                stage: failure.stage.as_str().to_string(),
+                cause: failure.cause.as_str().to_string(),
+                message,
+            },
+        });
     }
 
     fn converge_after_storage_failure(
@@ -802,21 +736,14 @@ impl TurnRunner {
         usage: &ModelUsage,
         usage_complete: bool,
     ) -> Result<(), String> {
-        if let Some(turn_id) = turn_id {
-            let terminal_status = matches!(
-                status,
-                ThreadStatus::Completed | ThreadStatus::Failed | ThreadStatus::Interrupted
-            );
-            if terminal_status && self.consume_terminal_metadata_failure() {
-                return Err("injected terminal metadata failure".to_string());
-            }
-            if let Some(metadata) = terminal_metadata_for_status(turn_id, status) {
-                append_terminal_metadata_if_missing(session, turn_id, metadata)?;
-                let usage_value =
-                    serde_json::to_value(TurnUsage::from_model_usage(usage, usage_complete))
-                        .map_err(|error| error.to_string())?;
-                append_usage_metadata_if_missing(session, turn_id, usage_value)?;
-            }
+        if let Some(turn_id) = turn_id
+            && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
+        {
+            append_terminal_metadata_if_missing(session, turn_id, metadata)?;
+            let usage_value =
+                serde_json::to_value(TurnUsage::from_model_usage(usage, usage_complete))
+                    .map_err(|error| error.to_string())?;
+            append_usage_metadata_if_missing(session, turn_id, usage_value)?;
         }
         Ok(())
     }

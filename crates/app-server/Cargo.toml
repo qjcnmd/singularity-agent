@@ -24,5 +24,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# 测试通过 runtime 的故障注入钩子驱动终态化合同。
-singularity_runtime = { path = "../runtime", features = ["test-hooks"] }

@@ -9,10 +9,6 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[features]
-# 仅测试/诊断：启用终态化故障注入，验证 fail-stop 与有界重试语义。
-test-hooks = []
-
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

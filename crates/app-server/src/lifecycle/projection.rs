@@ -42,9 +42,8 @@ fn session_status(status: &RuntimeTurnStatus) -> SessionStatus {
 }
 
 /// provider 分类的裸术语表：runtime 输出裸词，协议线格式带 `provider_` 前缀。
-const PROVIDER_CAUSE_WORDS: [&str; 10] = [
+const PROVIDER_CAUSE_WORDS: [&str; 9] = [
     "rate_limited",
-    "quota_exceeded",
     "network",
     "timeout",
     "auth",

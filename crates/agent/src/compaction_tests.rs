@@ -232,7 +232,6 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["type"], "compaction");
     assert_eq!(last["firstKeptEntryId"], id_u1);
     assert_eq!(last["tokensBefore"], 90_001);
-    assert!(last.get("previousSummary").is_none());
     let summary = last["summary"].as_str().unwrap();
     assert!(summary.starts_with("## Goal"));
     assert!(summary.ends_with("\n\n<read-files>\nsrc/main.rs\n</read-files>"));
@@ -257,7 +256,7 @@ fn compact_full_flow_and_reopen_slicing() {
     assert!(!ctx_ids.contains(&id_u0.as_str()));
     assert!(!ctx_ids.contains(&id_t0.as_str()));
 
-    // 二次压缩：起点 = 上次 first_kept_entry_id，previousSummary 传入 UPDATE 合并。
+    // 二次压缩：起点 = 上次 first_kept_entry_id，旧摘要传入 UPDATE 合并。
     let id_u2 = session.append_message(user(&"g".repeat(7000))).unwrap();
     let id_a2 = session
         .append_message(assistant(&"h".repeat(7000)))
@@ -281,7 +280,7 @@ fn compact_full_flow_and_reopen_slicing() {
     let requests = mock.requests();
     assert_eq!(requests.len(), 1);
     let prompt = &requests[0].messages[1].content;
-    // previousSummary 为上次压缩的完整 summary 文本（含文件操作块）。
+    // UPDATE prompt 使用上次压缩的完整 summary 文本（含文件操作块）。
     let previous_summary =
         "## Goal\nsummary of history\n\n<read-files>\nsrc/main.rs\n</read-files>";
     assert!(prompt.contains(&format!(
@@ -291,7 +290,6 @@ fn compact_full_flow_and_reopen_slicing() {
     let content = std::fs::read_to_string(session.path()).unwrap();
     let last: Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
     assert_eq!(last["firstKeptEntryId"], id_u2);
-    assert_eq!(last["previousSummary"], previous_summary);
     // 文件列表从历史 details 累积。
     assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
     let reopened = SessionManager::open(session.path()).unwrap();

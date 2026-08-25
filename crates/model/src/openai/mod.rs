@@ -7,9 +7,7 @@ pub(crate) mod wire;
 pub(crate) use chat::*;
 pub(crate) use responses::*;
 pub(crate) use wire::OpenAiCompletion;
-pub use wire::{
-    chat_completions_endpoint, models_endpoint, provider_error_response, responses_endpoint,
-};
+pub use wire::{chat_completions_endpoint, provider_error_response, responses_endpoint};
 
 #[cfg(test)]
 mod tests {

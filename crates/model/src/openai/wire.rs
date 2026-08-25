@@ -28,22 +28,6 @@ pub fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
-/// 将基础 URL 解析为标准 OpenAI `/models` catalog 端点。
-pub fn models_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/models") {
-        trimmed.to_string()
-    } else if let Some(prefix) = trimmed.strip_suffix(CHAT_COMPLETIONS_PATH) {
-        format!("{prefix}/models")
-    } else if let Some(prefix) = trimmed.strip_suffix(RESPONSES_PATH) {
-        format!("{prefix}/models")
-    } else if trimmed.ends_with("/v1") {
-        format!("{trimmed}/models")
-    } else {
-        format!("{trimmed}/v1/models")
-    }
-}
-
 /// 将模型提供方失败转换为 `AgentLoop` 使用的失败响应结构。
 pub fn provider_error_response(
     request: &ModelTurnRequest,

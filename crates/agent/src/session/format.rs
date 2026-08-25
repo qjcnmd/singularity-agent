@@ -61,12 +61,6 @@ pub struct CompactionEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub tokens_before: Option<u64>,
-    #[serde(
-        rename = "previousSummary",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub previous_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

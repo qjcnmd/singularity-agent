@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use singularity_core::user_singularity_home;
+use singularity_core::{create_owner_only_dir, user_singularity_home};
 
 use super::session_index::SessionRecord;
-use crate::owner_only::ensure_owner_only_dir;
 
 /// 持久化状态的原始投影：仅供内部（打开会话、provider 配置）使用；
 /// wire 可见的 thread 摘要必须经过 `AppServer::project_thread`。
@@ -41,10 +40,4 @@ impl AppPaths {
         create_owner_only_dir(&self.sessions_dir)?;
         Ok(())
     }
-}
-
-pub fn create_owner_only_dir(path: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    ensure_owner_only_dir(path).map_err(|error| error.to_string())
 }

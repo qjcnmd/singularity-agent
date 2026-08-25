@@ -2,23 +2,6 @@ mod support;
 use support::*;
 
 #[test]
-fn model_discovery_accepts_complete_unique_model_entries() {
-    let (base_url, request) =
-        models_server(r#"{"data":[{"id":"test-model"},{"id":"test-model-b"}]}"#.to_string());
-    let provider = test_provider(provider_auto_test_config(base_url)).expect("models provider");
-    assert_eq!(
-        provider.discover_model_ids().expect("complete catalog"),
-        vec!["test-model", "test-model-b"]
-    );
-    assert!(
-        request
-            .recv_timeout(Duration::from_secs(1))
-            .expect("models request")
-            .contains("GET /v1/models")
-    );
-}
-
-#[test]
 fn model_turn_schema_excludes_runtime_and_trace_metadata() {
     let request = ModelTurnRequest::new(
         "request_1",
