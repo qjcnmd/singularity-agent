@@ -15,10 +15,10 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 
 ## 执行 checkpoint
 
-- revision: `15ea2c3`
+- revision: `cac8e9c`
 - branch: `main`
-- phase: Phase 4 — P3 一致性
-- next task: TASK-401
+- phase: Phase 5 — 文档同步与最终门禁
+- next task: TASK-502
 
 ## 1. Requirements & Constraints
 
@@ -104,16 +104,16 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 | Task | Description | Done | Date |
 |------|-------------|------|------|
 | TASK-401 | REQ-020 会话投影共享 API。 | [x] | 2026-08-25 |
-| TASK-402 | REQ-021 TUI 四项。 | [ ] | |
-| TASK-403 | REQ-022 spill 惰性清理（7 天）。 | [ ] | |
-| TASK-404 | REQ-023 小重复簇十项。 | [ ] | |
+| TASK-402 | REQ-021 TUI 四项。 | [x] | 2026-08-25 |
+| TASK-403 | REQ-022 spill 惰性清理（7 天）。 | [x] | 2026-08-25 |
+| TASK-404 | REQ-023 小重复簇十项。 | [x] | 2026-08-25 |
 
 ### Phase 5 — 文档同步与最终门禁
 
 | Task | Description | Done | Date |
 |------|-------------|------|------|
-| TASK-501 | docs/singularity.md 全量同步（§2 事件流/§3 压缩触发/§5 metadata/§6 目录移除/§8 TUI）；README（限额显式声明、Git Bash 前置）；INSTALL。只写当前事实。 | [ ] | |
-| TASK-502 | 最终门禁：fmt --check / clippy -D warnings / test --workspace / build --bins / git diff --check 全绿；汇总执行日志（提交清单、评估对照、偏差、遗留风险）。 | [ ] | |
+| TASK-501 | docs/singularity.md 全量同步（§2 事件流/§3 压缩触发/§5 metadata/§6 目录移除/§8 TUI）；README（限额显式声明、Git Bash 前置）；INSTALL。只写当前事实。 | [x] | 2026-08-25 |
+| TASK-502 | 最终门禁：fmt --check / clippy -D warnings / test --workspace / build --bins / git diff --check 全绿；汇总执行日志（提交清单、评估对照、偏差、遗留风险）。 | [x] | 2026-08-25 |
 | TASK-503 | EVAL-002 终局完整评估，结果记入执行日志。 | [ ] | |
 
 ## 3. Alternatives（已否决方向，勿重开）
@@ -186,3 +186,8 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 - TASK-310 — commit `7a22517`; structure-only 等价验证：`cargo test -p singularity_model --locked --no-fail-fast` 38 unit + 24 config + 23 protocol + 22 transport passed，`cargo test -p singularity_runtime --locked --no-fail-fast` 15 unit passed，`cargo test -p singularity_cli --locked --no-fail-fast` 21 unit + 1 smoke passed/1 ignored + 12 entry contract + 4 TUI PTY passed，`cargo test -p singularity_app_server --locked --no-fail-fast` 35 lib + 4 integration + 3 transport passed，`cargo build --workspace --bins --locked` exit 0，`cargo check --workspace --all-targets --locked` exit 0，`cargo clippy -p singularity_model -p singularity_runtime -p singularity_cli -p singularity_app_server --all-targets --all-features --locked --no-deps -- -D warnings` exit 0，`cargo fmt --all -- --check` exit 0，`git diff --check` exit 0。删除 `OpenAiProviderConfig::from_env` 与 `ProviderConfigResolution` 公共导出；原 from_env 覆盖等量迁入 model 私有配置单测。runtime provider override 及字段仅在 cfg(test)/`test-support` feature 存在，CLI/app-server 仅由 dev-dependency 启用；runtime conversation 集成回归收编为 crate unit module。app-server stdio transport 归入 lib 私有模块，测试 provider 仅 cfg(test)，会话目录成为构造必填而非公开测试 builder，store accessor 收窄 crate 可见。首次把 `with_sessions_dir` 直接收窄时二进制 target 作为独立 crate 无法访问；改为构造时注入并把 transport 归入 lib 后完整复验。偏差：Phase 3 统一审查按用户最新“无需审查”指令取消；按 EVAL-001 未运行 TASK 评估。
 
 - TASK-401 — commit 15ea2c3; structure-only 等价验证：cargo test -p singularity_runtime --locked --no-fail-fast 15 passed，cargo test -p singularity_app_server --locked --no-fail-fast 35 lib + 4 integration + 3 transport passed，cargo clippy -p singularity_agent -p singularity_runtime -p singularity_app_server --all-targets --all-features --locked --no-deps -- -D warnings exit 0，cargo fmt --all -- --check exit 0，git diff --check exit 0。新增 agent session 层只读 project_session 共享投影，runtime 与 app-server 仅映射本地状态类型；JSONL header/metadata、标题、model、status、usage、时间戳、turn/token 统计语义保持，未改变修复/写入路径。agent 全量测试首轮出现既有 Windows descendant cancellation 偶发失败（descendant loop must start producing ticks），未由本次改动触发；runtime/app-server、clippy、fmt、diff 复验通过。偏差：无；按 EVAL-001 未运行 TASK 评估。
+- TASK-402 — commit `61d1cf5`; structure-only 等价验证：`cargo test -p singularity_cli --locked --no-fail-fast` 21 unit + 1 smoke passed/1 ignored + 12 entry contract + 4 TUI PTY passed，`cargo fmt --all -- --check` exit 0。TUI 共享 `wrapped_lines` 纯函数覆盖 transcript/app/editor 高度；工具 item 身份由事件携带的 tool call 集合判定，不再依赖 assistant 后缀猜测；Ctrl+C 文案与实现保持一致。偏差：无；按 EVAL-001 未运行 TASK 评估。
+- TASK-403 — commit `ce64507`; TDD/定向验证：`cargo test -p singularity_agent tools::bash::tests::small_output_never_spills --locked` 1 passed，`cargo fmt --all -- --check` exit 0。新 spill 创建时扫描专用根目录并惰性删除超过 7 天的旧项，无后台线程或退出钩子。偏差：无；按 EVAL-001 未运行 TASK 评估。
+- TASK-404 — commit `75a6d26`; structure-only 等价验证：`cargo test -p singularity_agent -p singularity_runtime -p singularity_model --locked --no-fail-fast` 全部通过（71/15/38+24+23+22），`cargo test -p singularity_app_server --locked --no-fail-fast` 35 lib + 4 integration + 3 transport passed，`cargo clippy -p singularity_agent -p singularity_runtime -p singularity_model -p singularity_app_server --all-targets --all-features --locked --no-deps -- -D warnings` exit 0，`cargo fmt --all -- --check` exit 0，`git diff --check` exit 0。删除 TurnRunner 尾部委托、合并 split_lines 与 tool_choice payload、移除 classify_model_error 别名、清理 editor consumed、SessionRepository 改只读、修正 edit hunk 起始行号，并将 ConversationError 杂项拆为 Configuration/State。偏差：无；按 EVAL-001 未运行 TASK 评估。
+- TASK-501 — commit `cac8e9c`; 文档终态检查：`rg` 确认 docs/singularity.md、README.md、docs/INSTALL.md 无 models.dev/discovery/provider summary/旧脱敏描述残留，`git diff --check` exit 0。同步压缩、事件、metadata、spill 清理、Git Bash 前置与未知模型限额当前事实。偏差：无。
+- TASK-502 — commit `PENDING`; 五项终局门禁全部 exit 0：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings`、`cargo test --workspace --all-targets --locked --no-fail-fast`（provider smoke 1 ignored）、`cargo build --workspace --bins --locked`、`git diff --check`。偏差：无。
