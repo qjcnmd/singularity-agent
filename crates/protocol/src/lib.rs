@@ -830,13 +830,6 @@ pub struct ThreadListResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-/// 返回单个 thread 的响应。
-pub struct ThreadResult {
-    pub thread: Thread,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 启动 turn 的参数。
 pub struct TurnStartParams {
@@ -1069,15 +1062,12 @@ impl AppEvent {
         thread_id: impl Into<String>,
         turn_id: impl Into<String>,
         model_turn_ordinal: u32,
-        operation_phase: impl Into<String>,
         provider: impl Into<String>,
         model: impl Into<String>,
         protocol: impl Into<String>,
         attempt_index: u32,
         status: impl Into<String>,
         attempt_duration_ms: Option<u64>,
-        retry_scheduled: Option<bool>,
-        retry_backoff_ms: Option<u64>,
         error_category: Option<String>,
         diagnostic_code: Option<String>,
     ) -> Self {
@@ -1087,15 +1077,12 @@ impl AppEvent {
                 "threadId": thread_id.into(),
                 "turnId": turn_id.into(),
                 "modelTurnOrdinal": model_turn_ordinal,
-                "operationPhase": operation_phase.into(),
                 "provider": provider.into(),
                 "model": model.into(),
                 "protocol": protocol.into(),
                 "attemptIndex": attempt_index,
                 "status": status.into(),
                 "attemptDurationMs": attempt_duration_ms,
-                "retryScheduled": retry_scheduled,
-                "retryBackoffMs": retry_backoff_ms,
                 "errorCategory": error_category,
                 "diagnosticCode": diagnostic_code,
             }),

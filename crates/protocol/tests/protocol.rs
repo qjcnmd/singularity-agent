@@ -331,20 +331,17 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
         "thread-1",
         "turn-1",
         2,
-        "completion",
         "openai",
         "test-model",
         "open_ai_responses",
         1,
         "error",
         Some(12),
-        Some(true),
-        Some(4),
         Some("network".to_string()),
         Some("provider_timeout".to_string()),
     );
     assert_eq!(attempt.method(), "provider/attempt");
     assert_eq!(attempt.params["modelTurnOrdinal"], 2);
-    assert_eq!(attempt.params["retryScheduled"], true);
+    assert!(attempt.params.get("retryScheduled").is_none());
     assert!(attempt.params.get("raw").is_none());
 }
