@@ -271,18 +271,6 @@ impl AppServer {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_terminalization_faults(
-        &self,
-        metadata_failures: usize,
-        event_failures: usize,
-    ) {
-        #[allow(unused_variables)]
-        let _ = event_failures;
-        self.turn_runner
-            .inject_terminalization_faults(metadata_failures, 0);
-    }
-
     pub fn sessions_dir(&self) -> &Path {
         &self.sessions_dir
     }
