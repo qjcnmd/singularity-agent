@@ -577,6 +577,86 @@ fn tool_call_executes_and_results_feed_next_turn() {
     assert!(second.messages[2].content.contains("Successfully wrote"));
 }
 
+#[test]
+fn tool_events_pair_around_each_serial_execution_and_preflight_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(FakeProvider::new(
+        fake_contract(),
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![
+                    tool_call(
+                        "call_write_1",
+                        "write",
+                        json!({ "path": "one.txt", "content": "one" }),
+                    ),
+                    tool_call("call_rejected", "unknown_tool", json!({})),
+                    tool_call(
+                        "call_write_2",
+                        "write",
+                        json!({ "path": "two.txt", "content": "two" }),
+                    ),
+                ],
+                usage: usage(50, 10),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(120, 20),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    let mut observed = Vec::new();
+    let mut events = AgentEvents::new();
+    let mut on_event = |event| match event {
+        AgentEvent::ToolExecutionStarted { tool_call_id, .. } => {
+            observed.push(format!("start:{tool_call_id}"));
+        }
+        AgentEvent::ToolExecutionEnded {
+            tool_call_id,
+            execution,
+            ..
+        } => {
+            observed.push(format!("end:{tool_call_id}:{}", execution.is_error));
+        }
+        _ => {}
+    };
+    events.on_event = Some(&mut on_event);
+
+    let outcome = agent
+        .run("run the batch", &mut events, &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "done");
+    assert_eq!(
+        observed,
+        [
+            "start:call_write_1",
+            "end:call_write_1:false",
+            "start:call_rejected",
+            "end:call_rejected:true",
+            "start:call_write_2",
+            "end:call_write_2:false",
+        ]
+    );
+    let requests = provider.requests.lock().unwrap();
+    let rejected_result = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call_rejected"))
+        .expect("preflight rejection must remain model-visible");
+    assert!(rejected_result.content.contains("tool execution failed"));
+}
+
 /// 4. 停止窗口内到达的转向输入：文本响应后箱内非空 → 继续一轮再停止。
 #[test]
 fn steer_at_stop_continues_one_more_turn() {

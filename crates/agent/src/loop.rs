@@ -120,7 +120,7 @@ impl AgentDiagnostic {
 
 /// Agent 运行生命周期事件，统一经 `AgentEvents::on_event` 出口流式投递。
 ///
-/// tool 事件按执行完成顺序投递；持久化的 toolResult 顺序不受影响。
+/// tool 事件按调用的串行执行顺序投递；持久化的 toolResult 顺序不受影响。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
@@ -406,6 +406,14 @@ fn execute_tool_batch(
 ) -> Result<Vec<ToolExecution>> {
     let mut results = Vec::with_capacity(calls.len());
     for item in calls {
+        emit(
+            events,
+            AgentEvent::ToolExecutionStarted {
+                tool_name: item.call.tool_name.clone(),
+                tool_call_id: item.call.tool_call_id.clone(),
+                arguments: item.call.arguments.clone(),
+            },
+        );
         if let Some(execution) = &item.preflight_execution {
             emit(
                 events,
@@ -802,16 +810,6 @@ impl Agent {
                             }
                         })
                         .collect::<Vec<_>>();
-                    for item in &prepared_calls {
-                        emit(
-                            events,
-                            AgentEvent::ToolExecutionStarted {
-                                tool_name: item.call.tool_name.clone(),
-                                tool_call_id: item.call.tool_call_id.clone(),
-                                arguments: item.call.arguments.clone(),
-                            },
-                        );
-                    }
                     let executions = execute_tool_batch(
                         &self.registry,
                         &prepared_calls,
