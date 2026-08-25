@@ -41,28 +41,6 @@ fn session_status(status: &RuntimeTurnStatus) -> SessionStatus {
     }
 }
 
-/// provider 分类的裸术语表：runtime 输出裸词，协议线格式带 `provider_` 前缀。
-const PROVIDER_CAUSE_WORDS: [&str; 9] = [
-    "rate_limited",
-    "network",
-    "timeout",
-    "auth",
-    "validation",
-    "overloaded",
-    "cancelled",
-    "context_overflow",
-    "unknown",
-];
-
-/// 终端化错误 cause 的 wire 词形归一。
-pub(crate) fn wire_error_cause(cause: &str) -> String {
-    if PROVIDER_CAUSE_WORDS.contains(&cause) {
-        format!("provider_{cause}")
-    } else {
-        cause.to_string()
-    }
-}
-
 /// 单次 run_turn 调用的协议投影。
 ///
 /// 所有投影失败都通过 [`Self::poisoned`] 暂存并在 run 返回后以错误返回，
@@ -239,11 +217,12 @@ impl TurnEventSink for TurnProjection<'_> {
             TurnEvent::TurnFailed { turn, error } => {
                 self.sync_terminal_index(&turn);
                 self.live_turn = None;
+                // cause/stage 已是 runtime 单点定义的 wire 词形，直接透传。
                 self.emit_notification(AppEvent::turn_error(
                     &turn.turn_id,
                     &turn.thread_id,
                     &error.stage,
-                    &wire_error_cause(&error.cause),
+                    &error.cause,
                     &error.message,
                 ));
             }
@@ -345,30 +324,24 @@ impl TurnEventSink for TurnProjection<'_> {
                 thread_id,
                 turn_id,
                 model_turn_ordinal,
-                operation_phase,
                 provider,
                 model,
                 protocol,
                 attempt_index,
                 status,
                 attempt_duration_ms,
-                retry_scheduled,
-                retry_backoff_ms,
                 error_category,
                 diagnostic_code,
             } => self.emit_notification(AppEvent::provider_attempt(
                 thread_id,
                 turn_id,
                 model_turn_ordinal,
-                operation_phase,
                 provider,
                 model,
                 protocol,
                 attempt_index,
                 status,
                 attempt_duration_ms,
-                retry_scheduled,
-                retry_backoff_ms,
                 error_category,
                 diagnostic_code,
             )),
@@ -402,13 +375,13 @@ pub(crate) fn classify_run_result(
         Ok(_) => Ok(()),
         Err(TurnRunError::Preparation { cause, message }) => Err(AppServerError::TurnExecution {
             stage: TurnFailureStage::AgentLoop,
-            cause: cause.into(),
+            cause,
             original: Some(message),
         }),
         Err(TurnRunError::Execution(_)) => Ok(()),
         Err(TurnRunError::Terminalization(failure)) => Err(AppServerError::TurnTerminalization {
-            stage: failure.stage.into(),
-            cause: failure.cause.into(),
+            stage: failure.stage,
+            cause: failure.cause,
             failure: TurnTerminalizationFailure::Store,
             original: failure.original,
         }),

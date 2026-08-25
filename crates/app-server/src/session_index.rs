@@ -151,35 +151,6 @@ impl SessionIndex {
         Ok(())
     }
 
-    /// 会话打开/更新后以打开的 SessionManager 增量刷新单条索引记录：文件内
-    /// 已有的 model/status/title/usage 优先，缺失时回退到索引旧值；created_at
-    /// 保留原值，updated_at 刷新为当前时间。
-    pub fn refresh_from_open_session(
-        &self,
-        session: &SessionManager,
-    ) -> SessionIndexResult<SessionRecord> {
-        let existing = self.get_session(session.session_id()).ok();
-        let mut record = record_from_session(session, session.path());
-        if let Some(existing) = existing {
-            if record.title.is_none() {
-                record.title = existing.title;
-            }
-            if record.model.is_none() {
-                record.model = existing.model;
-            }
-            if record.status.is_none() {
-                record.status = existing.status;
-            }
-            if record.token_usage == serde_json::json!({}) {
-                record.token_usage = existing.token_usage;
-            }
-            record.created_at = existing.created_at;
-        }
-        record.updated_at = now_iso();
-        self.upsert_session(&record)?;
-        Ok(record)
-    }
-
     /// 列出全部会话，按 updated_at 降序（同时间戳按 session_id）排序。
     pub fn list_sessions(&self) -> SessionIndexResult<Vec<SessionRecord>> {
         let sessions = self.sessions.lock().map_err(lock_poisoned)?;

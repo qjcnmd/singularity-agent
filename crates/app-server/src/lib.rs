@@ -87,122 +87,9 @@ pub enum AppServerError {
 /// `AppServer` 请求处理和生命周期操作使用的结果类型。
 pub type AppServerResult<T> = Result<T, AppServerError>;
 
-/// 已进入 Running Turn 的失败阶段；仅暴露稳定分类，不携带底层错误文本。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnFailureStage {
-    AgentLoop,
-    TerminalOutcome,
-}
-
-impl TurnFailureStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentLoop => "agent_loop",
-            Self::TerminalOutcome => "terminal_outcome",
-        }
-    }
-}
-
-impl fmt::Display for TurnFailureStage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// 模型提供方及调用边界失败的具体分类枚举。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderFailureKind {
-    RateLimited,
-    Network,
-    Timeout,
-    Auth,
-    Validation,
-    Overloaded,
-    Cancelled,
-    ContextOverflow,
-    Unknown,
-}
-
-/// 已进入 Running Turn 后失败的稳定原始原因分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnFailureCause {
-    Store,
-    Workspace,
-    ProjectInstructions,
-    Serialization,
-    /// provider/模型边界失败（限流/配额/网络/校验等，见 `ProviderFailureKind`）。
-    Provider(ProviderFailureKind),
-    Internal,
-}
-
-impl TurnFailureCause {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Store => "store",
-            Self::Workspace => "workspace",
-            Self::ProjectInstructions => "project_instructions",
-            Self::Serialization => "serialization",
-            Self::Provider(kind) => match kind {
-                ProviderFailureKind::RateLimited => "provider_rate_limited",
-                ProviderFailureKind::Network => "provider_network",
-                ProviderFailureKind::Timeout => "provider_timeout",
-                ProviderFailureKind::Auth => "provider_auth",
-                ProviderFailureKind::Validation => "provider_validation",
-                ProviderFailureKind::Overloaded => "provider_overloaded",
-                ProviderFailureKind::Cancelled => "provider_cancelled",
-                ProviderFailureKind::ContextOverflow => "provider_context_overflow",
-                ProviderFailureKind::Unknown => "provider_unknown",
-            },
-            Self::Internal => "internal",
-        }
-    }
-}
-
-impl fmt::Display for TurnFailureCause {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl From<singularity_runtime::ProviderFailureKind> for ProviderFailureKind {
-    fn from(kind: singularity_runtime::ProviderFailureKind) -> Self {
-        use singularity_runtime::ProviderFailureKind as R;
-        match kind {
-            R::RateLimited => Self::RateLimited,
-            R::Network => Self::Network,
-            R::Timeout => Self::Timeout,
-            R::Auth => Self::Auth,
-            R::Validation => Self::Validation,
-            R::Overloaded => Self::Overloaded,
-            R::Cancelled => Self::Cancelled,
-            R::ContextOverflow => Self::ContextOverflow,
-            R::Unknown => Self::Unknown,
-        }
-    }
-}
-
-impl From<singularity_runtime::TurnFailureCause> for TurnFailureCause {
-    fn from(cause: singularity_runtime::TurnFailureCause) -> Self {
-        use singularity_runtime::TurnFailureCause as R;
-        match cause {
-            R::Store => Self::Store,
-            R::Workspace => Self::Workspace,
-            R::ProjectInstructions => Self::ProjectInstructions,
-            R::Serialization => Self::Serialization,
-            R::Provider(kind) => Self::Provider(kind.into()),
-            R::Internal => Self::Internal,
-        }
-    }
-}
-
-impl From<singularity_runtime::TurnFailureStage> for TurnFailureStage {
-    fn from(stage: singularity_runtime::TurnFailureStage) -> Self {
-        match stage {
-            singularity_runtime::TurnFailureStage::AgentLoop => Self::AgentLoop,
-            singularity_runtime::TurnFailureStage::TerminalOutcome => Self::TerminalOutcome,
-        }
-    }
-}
+/// 已进入 Running Turn 的失败阶段与原因分类：直接复用 runtime 的类型化
+/// taxonomy（wire 词形在 runtime 单点定义），不在本边界复制第二套枚举。
+pub use singularity_runtime::{ProviderFailureKind, TurnFailureCause, TurnFailureStage};
 
 /// 终态补偿失败的稳定分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,11 +103,6 @@ impl fmt::Display for TurnTerminalizationFailure {
             Self::Store => "store",
         })
     }
-}
-
-/// 将 provider 层聚合 usage 投影为协议线格式。
-pub fn usage_to_wire(usage: &ModelUsage) -> singularity_protocol::TurnModelUsage {
-    usage_to_wire_with_completeness(usage, true)
 }
 
 /// 将 provider 聚合 usage 与其完整性投影为协议线格式。
