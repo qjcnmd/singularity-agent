@@ -28,7 +28,7 @@ crates/app-server（stdio JSON-RPC 适配器）：GUI 接入面，执行全部�
 cargo build --release --locked --package singularity_cli
 ```
 
-将生成的 `sg.exe` 所在目录加入 `PATH`。目标项目所需工具链由用户安装并加入宿主机 `PATH`。
+将生成的 `sg.exe` 所在目录加入 `PATH`。Windows 运行前必须安装 [Git for Windows](https://git-scm.com/install/windows)，使 `bash.exe` 可从宿主机 `PATH` 发现；目标项目所需的其他工具链由用户安装并加入宿主机 `PATH`。
 
 完整安装、源码构建和更新说明见 [`docs/INSTALL.md`](docs/INSTALL.md)。
 

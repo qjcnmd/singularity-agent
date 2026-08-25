@@ -24,7 +24,7 @@
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
-  - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config/discovery。
+  - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config。
 - **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
 - **依赖方向**：cli → runtime → {core, model, agent}；app-server → {runtime, protocol}；runtime 与 agent 不依赖 protocol/UI；protocol 类型仅服务 app-server 适配器。
@@ -55,7 +55,7 @@ sg --print|--json <goal>
 
 runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来源，方法名稳定：
 
-`thread/started · turn/started · item/started · item/agentMessage/delta · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt(/summary) · turn/completed · turn/error · thread/settingsApplied`
+`thread/started · turn/started · item/started · item/agentMessage/delta · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error · thread/settingsApplied`
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影；app-server 据此把索引行的 model 同步到已落盘值。空闲路径无此事件（提交点内已立即持久化）。
 
@@ -74,12 +74,12 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 - 固定注册 read/glob/grep/bash/edit/write 六工具；多工具批按模型给定顺序串行，`parallel_tool_calls` 恒 false。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include 按 basename 过滤；上限 500 条。
-- **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`；输出泵有界排空（2s 宽限）。
+- **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
 - **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff、in-place 写入。
 
 ## 5. 会话持久化与恢复
 
-- 严格 JSONL v1：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started/completed/failed/interrupted、thread_settings、usage）不进入模型上下文。
+- 严格 JSONL v1：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started/completed/failed/interrupted、thread_settings、thread_name、usage）不进入模型上下文；runtime 与 app-server 共用同一只读投影 API。
 - **单写者**：一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束关闭写者。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
