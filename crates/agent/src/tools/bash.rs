@@ -706,7 +706,7 @@ fn find_bash_on_windows() -> Option<String> {
 
 /// 截断发生时保存完整输出的临时文件写入器。位于
 /// `<TEMP>/singularity-tool-output/<uuid>/<命令slug>.log`，不主动清理
-/// （生命周期交由 OS 临时目录策略负责）。
+/// 创建新 spill 时惰性删除同根目录下超过七天的旧文件。
 struct SpillWriter {
     path: std::path::PathBuf,
     file: std::fs::File,
@@ -715,9 +715,10 @@ struct SpillWriter {
 impl SpillWriter {
     /// 以 `initial` 为完整初始内容创建 spill 文件。
     fn create(slug: &str, initial: &str) -> io::Result<Self> {
-        let dir = std::env::temp_dir()
-            .join("singularity-tool-output")
-            .join(Uuid::new_v4().to_string());
+        let root = std::env::temp_dir().join("singularity-tool-output");
+        std::fs::create_dir_all(&root)?;
+        cleanup_old_spills(&root, std::time::SystemTime::now());
+        let dir = root.join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{slug}.log"));
         let mut file = std::fs::File::create(&path)?;
@@ -727,6 +728,34 @@ impl SpillWriter {
 
     fn append(&mut self, text: &str) -> io::Result<()> {
         self.file.write_all(text.as_bytes())
+    }
+}
+
+const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn cleanup_old_spills(root: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age <= SPILL_RETENTION {
+            continue;
+        }
+        if metadata.is_file() {
+            let _ = std::fs::remove_file(path);
+        } else if metadata.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
