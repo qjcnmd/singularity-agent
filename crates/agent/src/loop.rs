@@ -36,6 +36,46 @@ use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
 
+/// Agent 层重试上限：模型调用失败（HTTP 层重试耗尽后）仍属可重试类别时，
+/// 在此层指数退避重试（pi 的 agent 重试策略，默认 maxRetries=3）。
+const MAX_TURN_RETRIES: u32 = 3;
+/// 重试基础退避毫秒：delay = base × 2^(attempt-1)，再乘 ±10% 抖动。
+const TURN_RETRY_BASE_DELAY_MS: u64 = 2_000;
+/// 退避等待的取消轮询间隔。
+const RETRY_POLL_INTERVAL_MS: u64 = 50;
+
+/// 判断 provider 错误是否属于 agent 层可重试类别。
+///
+/// 与 pi 的 `isRetryableAssistantError` 同向：限流、网络、超时、过载与未知
+/// 错误可重试；认证、校验、配额、取消与上下文溢出（后者走强制压缩路径）
+/// 不重试。
+fn is_retryable_provider_error(kind: &ModelErrorKind) -> bool {
+    use ModelErrorKind::*;
+    matches!(
+        kind,
+        RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
+    )
+}
+
+/// 指数退避 + ±10% 抖动（Codex `retry.rs` 同款范围；确定性伪随机避免新增依赖）。
+fn retry_delay_ms(base_delay_ms: u64, attempt: u32) -> u64 {
+    let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
+    let jitter = 0.9 + (u64::from(attempt) * 37 % 21) as f64 / 105.0;
+    (base as f64 * jitter) as u64
+}
+
+/// 可中断的同步退避等待；返回 false 表示等待期间被取消。
+fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+    while std::time::Instant::now() < deadline {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
+    }
+    !cancellation.is_cancelled()
+}
+
 /// Typed severity for non-fatal runtime diagnostics emitted by the AgentLoop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentDiagnosticSeverity {
@@ -54,6 +94,14 @@ pub struct AgentDiagnostic {
 }
 
 impl AgentDiagnostic {
+    pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: AgentDiagnosticSeverity::Info,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             severity: AgentDiagnosticSeverity::Warning,
@@ -121,6 +169,24 @@ impl Default for AgentEvents<'_> {
     }
 }
 
+/// Agent 层重试配置（pi 策略：可重试 provider 错误指数退避重试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnRetryConfig {
+    /// 重试上限；0 表示禁用 agent 层重试。
+    pub max_retries: u32,
+    /// 基础退避毫秒：delay = base × 2^(attempt-1) × 抖动。
+    pub base_delay_ms: u64,
+}
+
+impl Default for TurnRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: MAX_TURN_RETRIES,
+            base_delay_ms: TURN_RETRY_BASE_DELAY_MS,
+        }
+    }
+}
+
 /// Agent 运行配置。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -132,6 +198,8 @@ pub struct AgentConfig {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub compaction: CompactionConfig,
+    /// Agent 层重试（HTTP 重试耗尽后的可重试 provider 错误）。
+    pub retry: TurnRetryConfig,
 }
 
 impl Default for AgentConfig {
@@ -142,6 +210,7 @@ impl Default for AgentConfig {
             context_window: 128_000,
             max_output_tokens: 4_096,
             compaction: CompactionConfig::default(),
+            retry: TurnRetryConfig::default(),
         }
     }
 }
@@ -468,6 +537,8 @@ impl Agent {
         };
         // 显式上下文溢出每轮只允许一次强制压缩重试。
         let mut context_overflow_retried = false;
+        // Agent 层重试计数：成功调用或退出循环时重置。
+        let mut retry_attempt = 0u32;
         self.session.append_message(user_message(input))?;
 
         let mut preferences = ModelPreferences::default();
@@ -594,6 +665,35 @@ impl Agent {
                     }
                     Err(error) => {
                         record_error_attempts(&mut outcome, &error, model_turn_ordinal);
+                        // Agent 层重试（pi 策略）：HTTP 重试耗尽后仍可重试的
+                        // provider 错误指数退避重试；历史与会话状态保留，不重复
+                        // 已执行的工具副作用。
+                        if let AgentError::Provider(provider) = &error
+                            && retry_attempt < self.config.retry.max_retries
+                            && is_retryable_provider_error(&provider.error.kind)
+                        {
+                            retry_attempt += 1;
+                            let delay_ms =
+                                retry_delay_ms(self.config.retry.base_delay_ms, retry_attempt);
+                            emit_diagnostic(
+                                events,
+                                AgentDiagnostic::info(
+                                    "provider_retry_scheduled",
+                                    format!(
+                                        "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
+                                        provider.error.message,
+                                        max = self.config.retry.max_retries,
+                                    ),
+                                ),
+                            );
+                            if !sleep_abortable(delay_ms, cancellation) {
+                                outcome.terminal_reason = AgentTerminalReason::Aborted;
+                                outcome.usage_complete = false;
+                                lock_inbox(&self.inbox).close();
+                                return Ok(outcome);
+                            }
+                            continue;
+                        }
                         return self.fail_after_progress(error, outcome);
                     }
                 };
@@ -617,6 +717,8 @@ impl Agent {
                 }
                 outcome.turns += 1;
                 context_overflow_retried = false;
+                // 成功调用后重置 agent 层重试计数（pi 的 _retryAttempt 语义）。
+                retry_attempt = 0;
                 record_usage(&mut outcome, &response.usage);
                 let assistant_text = response
                     .assistant_message

@@ -17,14 +17,12 @@ pub fn thread_from_record(record: &SessionRecord) -> singularity_protocol::Threa
 }
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
-pub const BACKUPS_DIR_NAME: &str = "backups";
 
 /// `~/.singularity` 下的固定路径集合。
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub home_dir: PathBuf,
     pub sessions_dir: PathBuf,
-    pub backups_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -33,16 +31,14 @@ impl AppPaths {
             .ok_or_else(|| "cannot resolve SINGULARITY_HOME for session index".to_string())?;
         Ok(Self {
             sessions_dir: home.join(SESSIONS_DIR_NAME),
-            backups_dir: home.join(BACKUPS_DIR_NAME),
             home_dir: home,
         })
     }
 
-    /// 创建会话目录与备份目录（在 Unix 系统上收紧为 0700 权限）。
+    /// 创建 home 与会话目录（在 Unix 系统上收紧为 0700 权限）。
     pub fn prepare(&self) -> Result<(), String> {
         create_owner_only_dir(&self.home_dir)?;
         create_owner_only_dir(&self.sessions_dir)?;
-        create_owner_only_dir(&self.backups_dir)?;
         Ok(())
     }
 }

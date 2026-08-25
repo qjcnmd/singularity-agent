@@ -72,7 +72,7 @@ impl AppServerControlHandle {
 
     pub(crate) fn turn_interrupt(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = crate::dispatch::parse_params(&message)?;
-        if !self.interrupt_turn(&params.turn_id) {
+        if !self.interrupt_turn(&params.turn_id)? {
             return crate::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
         }
         Ok(vec![
@@ -145,25 +145,27 @@ impl AppServerControlHandle {
         )
     }
 
-    fn interrupt_turn(&self, turn_id: &str) -> bool {
+    fn interrupt_turn(&self, turn_id: &str) -> AppServerResult<bool> {
         let owner = self
             .live_turns
             .lock()
-            .ok()
-            .and_then(|turns| turns.get(turn_id).cloned());
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(turn_id)
+            .cloned();
         let Some(thread_id) = owner else {
-            return false;
+            return Ok(false);
         };
         let Some(conversation) = self
             .conversations
             .lock()
-            .ok()
-            .and_then(|map| map.get(&thread_id).cloned())
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .get(&thread_id)
+            .cloned()
         else {
-            return false;
+            return Ok(false);
         };
         conversation.interrupt();
-        true
+        Ok(true)
     }
 }
 
@@ -246,7 +248,7 @@ impl AppServer {
         }
     }
 
-    /// 仅测试：覆盖会话目录。
+    /// 覆盖会话目录（transport 接线与 crate 内测试使用）。
     #[doc(hidden)]
     pub fn with_sessions_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.sessions_dir = dir.as_ref().to_path_buf();
@@ -254,13 +256,6 @@ impl AppServer {
             self.sessions_dir.clone(),
             self.provider_snapshot.clone(),
         ));
-        self
-    }
-
-    /// 仅测试：替换共享 turn 执行核心（可注入 provider 覆盖与故障钩子）。
-    #[doc(hidden)]
-    pub fn with_turn_runner(mut self, runner: Arc<TurnRunner>) -> Self {
-        self.turn_runner = runner;
         self
     }
 

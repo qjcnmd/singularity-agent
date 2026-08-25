@@ -22,7 +22,6 @@ pub struct ThreadSummary {
 }
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
-pub const BACKUPS_DIR_NAME: &str = "backups";
 
 /// 解析默认的会话目录（`SINGULARITY_HOME/sessions`）。
 pub fn default_sessions_dir() -> Result<PathBuf, String> {
@@ -31,10 +30,9 @@ pub fn default_sessions_dir() -> Result<PathBuf, String> {
     Ok(home.join(SESSIONS_DIR_NAME))
 }
 
-/// 创建 home 下的 sessions 与 backups 目录（Unix 收紧为属主专用）。
+/// 创建 home 下的 sessions 目录（Unix 收紧为属主专用）。
 pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
     singularity_core::create_owner_only_dir(&home.join(SESSIONS_DIR_NAME))?;
-    singularity_core::create_owner_only_dir(&home.join(BACKUPS_DIR_NAME))?;
     Ok(())
 }
 

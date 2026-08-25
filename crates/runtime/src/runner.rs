@@ -1137,6 +1137,7 @@ fn agent_config_for_thread(
             context_window,
             max_output_tokens,
             compaction: CompactionConfig::default(),
+            retry: singularity_agent::agent::TurnRetryConfig::default(),
         },
         instructions_truncated,
     ))

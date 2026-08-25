@@ -694,7 +694,7 @@ impl Provider for InvalidStatusProvider {
     }
 }
 
-/// Provider 失败路径：`Err(ProviderError)` 中不可重试错误（挂起超时）不被转换为
+/// Provider 失败路径：`Err(ProviderError)` 中不可重试错误（认证失败）不被转换为
 /// `Ok(Failed)`，保持 `Err(AgentError::Provider)` 传播，agent 直接失败且一次尝试。
 #[test]
 fn non_retryable_err_provider_error_fails_immediately() {
@@ -703,8 +703,8 @@ fn non_retryable_err_provider_error_fails_immediately() {
     let provider = Arc::new(ErrReturningProvider::new(
         fake_contract(),
         vec![Err(ModelError::new(
-            ModelErrorKind::Timeout,
-            "request hung and timed out",
+            ModelErrorKind::AuthError,
+            "credentials rejected",
         ))],
     ));
     let mut agent = Agent::new(
@@ -719,14 +719,14 @@ fn non_retryable_err_provider_error_fails_immediately() {
         .unwrap_err();
     // 不可重试错误原样传播为 Provider 错误（含原 kind 消息）。
     assert!(
-        err.to_string().contains("request hung and timed out"),
+        err.to_string().contains("credentials rejected"),
         "non-retryable Err must propagate as provider error, got: {}",
         err
     );
     assert_eq!(
         provider.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "Timeout Err(ProviderError) must not be retried"
+        "AuthError Err(ProviderError) must not be retried"
     );
 }
 
@@ -742,7 +742,7 @@ fn second_provider_error_returns_accumulated_outcome() {
             vec![
                 Ok("first".to_string()),
                 Err(ModelError::new(
-                    ModelErrorKind::Timeout,
+                    ModelErrorKind::AuthError,
                     "second request failed",
                 )),
             ],
@@ -808,6 +808,143 @@ fn second_provider_cancellation_returns_aborted_accumulated_outcome() {
         .expect("typed provider cancellation is a normal aborted outcome");
     assert_eq!(outcome.turns, 1);
     assert_eq!(outcome.usage.total_tokens, 12);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
+    assert!(!outcome.usage_complete);
+}
+
+/// 可重试 provider 错误（NetworkError）重试上限内成功：agent 调用 3 次后成功收敛。
+#[test]
+fn retryable_provider_error_retries_then_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![
+            Err(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "net failure 1",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "net failure 2",
+            )),
+            Ok("success".to_string()),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect("retryable errors must recover after retries");
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Completed);
+    // 前两次失败 + 一次成功 = 3 次调用。
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+/// 可重试 provider 错误耗尽后收敛为失败（无 progress 时原样传播 Provider 错误）。
+#[test]
+fn retryable_provider_error_exhausts_and_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![
+            Err(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "net failure 1",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "net failure 2",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "net failure 3",
+            )),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 2,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let error = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect_err("retryable errors must exhaust after max retries");
+    assert!(
+        error.to_string().contains("net failure 3"),
+        "exhausted retries must propagate the final provider error, got: {error}"
+    );
+    // 初始调用 + 2 次重试耗尽 = 3 次调用。
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn retry_backoff_has_bounded_jitter() {
+    for attempt in 1..=10 {
+        let delay = retry_delay_ms(1000, attempt);
+        let base = 1000 * 2u64.saturating_pow(attempt - 1);
+        let ratio = delay as f64 / base as f64;
+        assert!(
+            ratio >= 0.9 && ratio <= 1.1,
+            "attempt={attempt} base={base} delay={delay} ratio={ratio} out of [0.9, 1.1]"
+        );
+    }
+}
+
+#[test]
+fn retry_cancelled_during_backoff_returns_aborted() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![Err(ModelError::new(
+            ModelErrorKind::NetworkError,
+            "net failure",
+        ))],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 5000, // 长退避确保取消在退避期间发生
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let cancel_handle = cancellation.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cancel_handle.cancel();
+    });
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &cancellation)
+        .expect("cancelled retry must return aborted outcome");
     assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
     assert!(!outcome.usage_complete);
 }
