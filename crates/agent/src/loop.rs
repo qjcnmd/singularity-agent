@@ -913,9 +913,8 @@ impl Agent {
     /// 用户显式请求的压缩：沿正常保留预算选择安全切点，但不要求上下文先
     /// 达到自动阈值。没有可摘要历史时返回 `NotNeeded`。
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let mut budget =
+        let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        budget.retain_ratio = 0.0;
         let capabilities = self.provider.protocol_contract();
         let tools = self.tool_schemas(&capabilities);
         let entries = self.session.build_context_entries()?;

@@ -901,6 +901,73 @@ fn assembled_fallback_estimate_includes_provider_reasoning_replay() {
     assert!(with_replay > without_replay + 500);
 }
 
+#[test]
+fn manual_compaction_keeps_the_configured_recent_twenty_percent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::User,
+            "first user ".repeat(40),
+        ))
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "first assistant ".repeat(40),
+        ))
+        .unwrap();
+    let expected_first_kept = session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::User,
+            "recent user ".repeat(40),
+        ))
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "recent assistant ".repeat(40),
+        ))
+        .unwrap();
+    let provider = Arc::new(FakeProvider::new(
+        fake_contract(),
+        vec![
+            FakeStep {
+                text: "summary".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(20, 5),
+            },
+            FakeStep {
+                text: "turn prefix".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(20, 5),
+            },
+        ],
+    ));
+    let config = AgentConfig {
+        system_prompt: String::new(),
+        context_window: 1_000,
+        max_output_tokens: 10,
+        compaction: CompactionConfig {
+            reserve_tokens: 100,
+            retain_ratio: 0.20,
+            summary_max_tokens: 10,
+        },
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::new(provider, ToolRegistry::new(), config, session).unwrap();
+
+    let outcome = agent.compact_now(&CancellationToken::new()).unwrap();
+
+    assert!(matches!(
+        outcome,
+        CompactionOutcome::Compacted {
+            first_kept_entry_id,
+            ..
+        } if first_kept_entry_id == expected_first_kept
+    ));
+}
+
 impl Provider for OverflowProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         self.contract.clone()
@@ -1047,6 +1114,25 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             .iter()
             .any(|entry| matches!(entry.entry_type, SessionEntryType::Compaction(_)))
     );
+    let compaction = agent
+        .session
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.entry_type {
+            SessionEntryType::Compaction(compaction) => Some(compaction),
+            _ => None,
+        })
+        .unwrap();
+    let first_kept = compaction.first_kept_entry_id.as_deref().unwrap();
+    assert!(agent.session.entries().iter().any(|entry| {
+        entry.id == first_kept
+            && matches!(
+                &entry.entry_type,
+                SessionEntryType::Message(message)
+                    if message.role == AgentMessageRole::User
+                        && message.content_text() == "task"
+            )
+    }));
 }
 
 #[test]
