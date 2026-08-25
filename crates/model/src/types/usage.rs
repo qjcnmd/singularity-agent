@@ -19,6 +19,21 @@ fn default_usage_present() -> bool {
     true
 }
 
+impl ModelUsage {
+    /// 把另一次完成的真实 usage 聚合进本对象（计数器 saturating add，
+    /// `usage_present` 按或合并）。agent 层与压缩引擎共用这一个聚合实现。
+    pub fn merge(&mut self, other: &ModelUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.usage_present |= other.usage_present;
+    }
+}
+
 /// 模型侧请求或响应的校验错误和非致命警告。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelValidationResult {

@@ -170,15 +170,6 @@ impl ProviderReasoningReplay {
         }
     }
 
-    /// replay 是否包含某 tool-call id（不暴露 id 列表）。
-    pub fn has_tool_call_id(&self, id: &str) -> bool {
-        match self {
-            Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
-                tool_call_ids.iter().any(|candidate| candidate == id)
-            }
-        }
-    }
-
     /// 给定模型历史中是否恰好一条 assistant 消息携带本 replay 的
     /// 有序 tool-call 绑定。
     pub fn is_bound_to_messages(&self, messages: &[ModelMessage]) -> bool {

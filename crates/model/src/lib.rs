@@ -35,7 +35,7 @@ pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 pub(crate) const MAX_CONFIG_AUTH_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
-/// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
+/// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
 /// 协议无规范化文本流时使用的 provider 边界码。
 pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
@@ -73,9 +73,8 @@ pub use provider::contract::{
 pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStarted, ProviderAttemptStatus, ProviderStreamEvent,
-    ProviderStreamingCapability,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
+    ProviderStreamEvent, ProviderStreamingCapability,
 };
 pub use transport::OpenAiProvider;
 pub use types::*;

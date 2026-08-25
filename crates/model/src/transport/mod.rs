@@ -24,14 +24,13 @@ use crate::openai::{
 use crate::provider::Provider;
 use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
-    provider_request_validation_error, request_uses_tool_protocol, validate_model_request,
+    provider_request_validation_error, request_uses_tool_protocol,
     validate_model_request_with_capabilities,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStarted, ProviderAttemptStatus, ProviderStreamEvent,
-    ProviderStreamingCapability, provider_streaming_unsupported_error,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
+    ProviderStreamEvent, ProviderStreamingCapability, provider_streaming_unsupported_error,
 };
 use crate::types::{
     ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderToolReasoningMode,
@@ -80,6 +79,17 @@ impl ProtocolAdapter {
         let reasoning_effort =
             selection.and_then(|selection| selection.wire_reasoning_effort.as_deref());
         let supports_tool_choice = selection.is_none_or(|selection| selection.supports_tool_choice);
+        // developer 角色缺省为不支持（流式与非流式共用同一缺省值）：无
+        // SelectedModel 的 legacy/env 路径没有 per-model 声明，wire 必须用
+        // 通用的 system role——OpenAI 兼容端点普遍不接受 developer 角色。
+        // 有 SelectedModel 时以模型声明的 supports_developer_role 为准。
+        let supports_developer_role =
+            selection.is_some_and(|selection| selection.supports_developer_role);
+        let requires_assistant_content_for_tool_calls =
+            selection.is_some_and(|selection| selection.requires_assistant_content_for_tool_calls);
+        let thinking_wire_format = selection
+            .map(|selection| selection.thinking_wire_format)
+            .unwrap_or(ThinkingWireFormat::ThinkingType);
         match (self, streaming) {
             (Self::Chat, true) => openai_chat_stream_request_payload(
                 request,
@@ -88,13 +98,10 @@ impl ProtocolAdapter {
                 reasoning_enabled,
                 disable_reasoning,
                 reasoning_effort,
-                selection
-                    .map(|selection| selection.thinking_wire_format)
-                    .unwrap_or(ThinkingWireFormat::ThinkingType),
-                selection.is_none_or(|selection| selection.supports_developer_role),
+                thinking_wire_format,
+                supports_developer_role,
                 supports_tool_choice,
-                selection
-                    .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
+                requires_assistant_content_for_tool_calls,
             ),
             (Self::Chat, false) => openai_request_payload(
                 request,
@@ -103,13 +110,10 @@ impl ProtocolAdapter {
                 reasoning_enabled,
                 disable_reasoning,
                 reasoning_effort,
-                selection
-                    .map(|selection| selection.thinking_wire_format)
-                    .unwrap_or(ThinkingWireFormat::ThinkingType),
-                selection.is_some_and(|selection| selection.supports_developer_role),
+                thinking_wire_format,
+                supports_developer_role,
                 supports_tool_choice,
-                selection
-                    .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
+                requires_assistant_content_for_tool_calls,
             ),
             (Self::Responses, true) => openai_responses_stream_request_payload(
                 request,
@@ -171,7 +175,6 @@ impl ProtocolAdapter {
 
 /// 一次真实 provider HTTP attempt 的可变计时状态。
 struct ProviderAttemptInProgress {
-    operation_phase: ProviderAttemptOperationPhase,
     provider_name: String,
     model_name: String,
     actual_api_protocol: ProviderApiProtocol,
@@ -184,14 +187,12 @@ struct ProviderAttemptInProgress {
 
 impl ProviderAttemptInProgress {
     fn new(
-        operation_phase: ProviderAttemptOperationPhase,
         provider_name: &str,
         model_name: &str,
         actual_api_protocol: ProviderApiProtocol,
         attempt_index: u32,
     ) -> Self {
         Self {
-            operation_phase,
             provider_name: provider_name.to_string(),
             model_name: model_name.to_string(),
             actual_api_protocol,
@@ -205,7 +206,6 @@ impl ProviderAttemptInProgress {
 
     fn started_event(&self) -> ProviderAttemptEvent {
         ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            operation_phase: self.operation_phase,
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             actual_api_protocol: self.actual_api_protocol,
@@ -226,7 +226,6 @@ impl ProviderAttemptInProgress {
         self,
         error: Option<&ModelError>,
         usage: Option<ModelUsage>,
-        retry_backoff: Option<Duration>,
     ) -> ProviderAttemptOccurrence {
         let terminal_status = match error.map(|error| &error.kind) {
             None => ProviderAttemptStatus::Ok,
@@ -235,7 +234,6 @@ impl ProviderAttemptInProgress {
         };
         let ended_at_unix_ms = unix_timestamp_ms().max(self.started_at_unix_ms);
         ProviderAttemptOccurrence {
-            operation_phase: self.operation_phase,
             provider_name: self.provider_name,
             model_name: self.model_name,
             actual_api_protocol: self.actual_api_protocol,
@@ -245,10 +243,7 @@ impl ProviderAttemptInProgress {
             ended_at_unix_ms,
             attempt_duration_ms: duration_millis(self.started_at.elapsed()),
             request_send_to_headers_ms: self.request_send_to_headers_ms,
-            queue_duration_ms: None,
             time_to_first_text_delta_ms: self.time_to_first_text_delta_ms,
-            retry_scheduled: retry_backoff.is_some(),
-            retry_backoff_ms: retry_backoff.map(duration_millis),
             error_category: error.map(ModelError::category),
             error_stage: error.and_then(|error| error.stage.clone()),
             diagnostic_code: error.and_then(|error| error.code.clone()),
@@ -666,13 +661,6 @@ impl OpenAiProvider {
         &self,
         request: &ModelTurnRequest,
     ) -> Result<CompletionContext, ProviderError> {
-        let local_validation = validate_model_request(request);
-        if !local_validation.valid {
-            return Err(provider_request_validation_error(
-                local_validation,
-                &self.config,
-            ));
-        }
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // selected_model 或 endpoint 后缀决定。
         let capabilities = self.protocol_contract();
@@ -695,28 +683,46 @@ impl OpenAiProvider {
         })
     }
 
-    fn complete_with_contract_observed(
+    /// 一次完成的单一编排入口：`on_event` 为 `Some` 时走流式解码并强制
+    /// 协议流能力声明，为 `None` 时走有界 body 读取。请求归一、能力校验、
+    /// wire 协议选择与 tool-reasoning 契约校验只在这一个入口实现，杜绝
+    /// 流式/非流式双轨各自维护导致的静默漂移。
+    fn complete_internal(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        capabilities: &ProviderProtocolContract,
-        api_protocol: ProviderApiProtocol,
-        model_name: &str,
+        on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ModelTurnResponse, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        let request = self.normalize_request_model(request)?;
+        let context = self.prepare_completion_context_observed(&request)?;
+        if on_event.is_some()
+            && self.streaming_capability(context.api_protocol)
+                != ProviderStreamingCapability::OutputTextDelta
+        {
+            return Err(provider_streaming_unsupported_error());
+        }
+        let model_name = request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(&self.config.model_name);
         let completion = self.complete_protocol(
-            request,
+            &request,
             cancellation,
-            capabilities,
-            api_protocol,
+            &context.capabilities,
+            context.api_protocol,
             model_name,
-            None,
+            on_event,
             on_attempt,
         )?;
         validate_response_tool_reasoning_contract(
-            request_uses_tool_protocol(request),
+            request_uses_tool_protocol(&request),
             &completion,
-            capabilities,
+            &context.capabilities,
             self.selected_model
                 .as_ref()
                 .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
@@ -813,13 +819,8 @@ impl OpenAiProvider {
             return Err(provider_cancelled_error());
         }
 
-        let mut occurrence = ProviderAttemptInProgress::new(
-            ProviderAttemptOperationPhase::Completion,
-            &self.config.provider_name,
-            model_name,
-            api_protocol,
-            1,
-        );
+        let mut occurrence =
+            ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol, 1);
         emit_provider_attempt_started(&occurrence, on_attempt)?;
         let response = match block_on_provider_future(
             runtime,
@@ -1018,41 +1019,7 @@ impl Provider for OpenAiProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
-        }
-        let request = self.normalize_request_model(request)?;
-        let context = self.prepare_completion_context_observed(&request)?;
-        if self.streaming_capability(context.api_protocol)
-            != ProviderStreamingCapability::OutputTextDelta
-        {
-            return Err(provider_streaming_unsupported_error());
-        }
-        let model_name = request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(&self.config.model_name);
-        let completion = self.complete_protocol(
-            &request,
-            cancellation,
-            &context.capabilities,
-            context.api_protocol,
-            model_name,
-            Some(on_event),
-            on_attempt,
-        )?;
-        Ok(completion).and_then(|completion| {
-            validate_response_tool_reasoning_contract(
-                request_uses_tool_protocol(&request),
-                &completion,
-                &context.capabilities,
-                self.selected_model
-                    .as_ref()
-                    .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
-            )
-            .map(|()| completion.response)
-        })
+        self.complete_internal(request, cancellation, Some(on_event), on_attempt)
     }
 
     fn complete(
@@ -1070,24 +1037,7 @@ impl Provider for OpenAiProvider {
         cancellation: &CancellationToken,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
-        }
-        let request = self.normalize_request_model(request)?;
-        let context = self.prepare_completion_context_observed(&request)?;
-        let effective_model_name = request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(&self.config.model_name);
-        self.complete_with_contract_observed(
-            &request,
-            cancellation,
-            &context.capabilities,
-            context.api_protocol,
-            effective_model_name,
-            on_attempt,
-        )
+        self.complete_internal(request, cancellation, None, on_attempt)
     }
 }
 
@@ -1109,7 +1059,7 @@ fn record_provider_attempt(
     usage: Option<ModelUsage>,
     on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
 ) -> Result<(), ProviderError> {
-    let occurrence = occurrence.finish(error, usage, None);
+    let occurrence = occurrence.finish(error, usage);
     if !on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence))) {
         return Err(provider_attempt_observer_error());
     }

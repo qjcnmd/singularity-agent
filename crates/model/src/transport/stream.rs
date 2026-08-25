@@ -650,7 +650,7 @@ pub(super) fn provider_responses_stream_terminal_error(
 pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
-        "provider Responses stream exceeded the fixed safety limit",
+        "provider stream exceeded the fixed safety limit",
     )
     .with_provider_diagnostic(
         "provider_response_stream_too_large",

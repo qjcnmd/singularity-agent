@@ -20,7 +20,6 @@ pub enum ProviderAttemptEvent {
 /// provider HTTP attempt 开始时已知的稳定、非敏感字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAttemptStarted {
-    pub operation_phase: ProviderAttemptOperationPhase,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
@@ -50,14 +49,6 @@ impl ProviderStreamingCapability {
     }
 }
 
-/// 一次真实 provider HTTP attempt 所属的运行期操作阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderAttemptOperationPhase {
-    /// 调用方请求的模型补全。
-    Completion,
-}
-
 /// 一次真实 provider HTTP attempt 的终态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +64,6 @@ pub enum ProviderAttemptStatus {
 /// 一次真实 provider HTTP attempt 的脱敏运行期观测。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderAttemptOccurrence {
-    pub operation_phase: ProviderAttemptOperationPhase,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
@@ -84,18 +74,12 @@ pub struct ProviderAttemptOccurrence {
     pub started_at_unix_ms: u64,
     /// 该 transport attempt 被终态化时的墙钟时间戳。
     pub ended_at_unix_ms: u64,
-    /// 从 attempt 创建到响应解析或失败终结的墙钟时长，不含 retry backoff。
+    /// 从 attempt 创建到响应解析或失败终结的墙钟时长。
     pub attempt_duration_ms: u64,
     /// 从发送请求到收到响应 headers；未收到 headers 时不可用。
     pub request_send_to_headers_ms: Option<u64>,
-    /// 当前 transport 没有 admission queue，因此保持不可用。
-    pub queue_duration_ms: Option<u64>,
     /// 仅流式 Responses 首个非空 output_text delta 的真实到达时长。
     pub time_to_first_text_delta_ms: Option<u64>,
-    /// 该失败是否触发了有界 retry 调度。
-    pub retry_scheduled: bool,
-    /// retry 被调度时使用的独立 backoff，不计入发送时长。
-    pub retry_backoff_ms: Option<u64>,
     pub error_category: Option<ModelErrorCategory>,
     pub error_stage: Option<ProviderErrorStage>,
     pub diagnostic_code: Option<String>,
