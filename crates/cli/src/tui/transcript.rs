@@ -4,9 +4,9 @@
 //! [`ToolItem`] 为单位就地刷新（运行中更新预览，结束后固化为稳定记录），
 //! 不向会话流追加重复行。可视行计算覆盖显式换行、CJK 宽字符与长行折行。
 
+use super::wrapped_lines;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 3;
 /// 展开态下的结果行上限：防超长输出撑爆视口。
@@ -459,29 +459,6 @@ fn item_row_count(item: &FlowItem, width: usize, thinking_collapsed: bool) -> us
 }
 
 /// 贪心折行：按显示宽度断行，显式 `\n` 强制换行；空文本产出一空行。
-fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for logical in text.split('\n') {
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        for ch in logical.chars() {
-            let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
-            if current_width + ch_width > width && !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += ch_width;
-        }
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();

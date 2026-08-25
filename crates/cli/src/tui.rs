@@ -40,6 +40,30 @@ pub(crate) fn char_display_width(ch: char) -> usize {
     UnicodeWidthStr::width(ch.to_string().as_str())
 }
 
+/// Greedy display-width wrapping shared by transcript and editor rendering.
+pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for logical in text.split('\n') {
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in logical.chars() {
+            let ch_width = char_display_width(ch);
+            if current_width + ch_width > width && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 const SPINNER_TICK: Duration = Duration::from_millis(120);
 

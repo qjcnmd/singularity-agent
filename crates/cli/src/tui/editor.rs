@@ -7,6 +7,8 @@
 
 use unicode_width::UnicodeWidthStr;
 
+use super::wrapped_lines;
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Editor {
     lines: Vec<String>,
@@ -175,19 +177,7 @@ impl Editor {
         let width = width.max(1) as usize;
         self.lines
             .iter()
-            .map(|line| {
-                let mut rows = 1usize;
-                let mut current = 0usize;
-                for ch in line.chars() {
-                    let w = UnicodeWidthStr::width(ch.to_string().as_str());
-                    if current + w > width && current > 0 {
-                        rows += 1;
-                        current = 0;
-                    }
-                    current += w;
-                }
-                rows
-            })
+            .map(|line| wrapped_lines(line, width).len())
             .sum::<usize>()
             .max(1)
     }

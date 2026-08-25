@@ -5,6 +5,7 @@
 //! [`TuiApp::on_turn_event`] 投影进会话流。业务队列只有一份——followUp
 //! 与设置意图全部存放在 `Conversation`，这里只提交输入并展示计数。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ratatui::Frame;
@@ -19,6 +20,7 @@ use singularity_runtime::{Conversation, ReasoningPatch, SettingsPatch};
 use super::editor::Editor;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
+use super::wrapped_lines;
 use unicode_width::UnicodeWidthStr;
 
 const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
@@ -199,6 +201,7 @@ pub(crate) struct TuiApp {
     last_stop_cols: Option<(u16, u16)>,
     /// 滚轮归一化状态（滚轮/触控板加速）。
     wheel: WheelNormalizer,
+    tool_item_ids: HashSet<String>,
 }
 
 impl TuiApp {
@@ -230,6 +233,7 @@ impl TuiApp {
             last_status_area: None,
             last_stop_cols: None,
             wheel: WheelNormalizer::default(),
+            tool_item_ids: HashSet::new(),
         }
     }
 
@@ -266,7 +270,7 @@ impl TuiApp {
                 self.turn_started_at = Some(std::time::Instant::now());
             }
             TurnEvent::AssistantDelta { delta, item_id, .. } => {
-                if Self::is_assistant(item_id) {
+                if !self.tool_item_ids.contains(item_id) {
                     self.transcript.assistant_delta(delta);
                 }
                 self.set_waiting(WaitingTarget::Model);
@@ -279,7 +283,7 @@ impl TuiApp {
             // 聚合遥测不改变等待对象，也不进入会话流。
             TurnEvent::ItemStarted { .. } => {}
             TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
-                if !Self::is_assistant(item_id) {
+                if self.tool_item_ids.contains(item_id) {
                     self.set_waiting(WaitingTarget::Model);
                 }
             }
@@ -289,6 +293,7 @@ impl TuiApp {
                 args,
                 ..
             } => {
+                self.tool_item_ids.insert(tool_call_id.clone());
                 self.transcript.flush_assistant();
                 self.transcript.tool_start(tool_call_id, tool_name, args);
                 self.set_waiting(WaitingTarget::Tool(tool_name.clone()));
@@ -347,10 +352,6 @@ impl TuiApp {
             // selector，无需额外文案（提交点已提示过生效时点）。
             TurnEvent::ThreadSettingsApplied { .. } => {}
         }
-    }
-
-    fn is_assistant(item_id: &str) -> bool {
-        item_id.ends_with("_assistant")
     }
 
     /// 整个 run_turn 调用结束（含其后续队列执行完毕）。
@@ -913,7 +914,7 @@ impl TuiApp {
         self.last_editor_scroll_top = scroll_top;
         let mut editor_lines: Vec<Line<'static>> = Vec::new();
         for logical in self.editor.lines() {
-            for piece in wrap_plain(logical, editor_inner_w as usize) {
+            for piece in wrapped_lines(logical, editor_inner_w as usize) {
                 editor_lines.push(Line::from(Span::raw(piece)));
             }
         }
@@ -1208,29 +1209,6 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     }
     let cut: String = text.chars().take(max_chars.saturating_sub(3)).collect();
     format!("{cut}…")
-}
-
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for logical in text.split('\n') {
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        for ch in logical.chars() {
-            let w = crate::tui::char_display_width(ch);
-            if current_width + w > width && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += w;
-        }
-        out.push(current);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
