@@ -43,9 +43,9 @@ impl ProviderConfigSource {
 
 /// 构建模型提供方前解析得到的来源和脱敏配置状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderConfigResolution {
-    pub source: Option<ProviderConfigSource>,
-    pub config: ModelProviderConfig,
+pub(crate) struct ProviderConfigResolution {
+    pub(crate) source: Option<ProviderConfigSource>,
+    pub(crate) config: ModelProviderConfig,
 }
 
 /// 模型提供方初始化无法继续时报告的稳定阻塞类别。

@@ -1,8 +1,7 @@
 use crate::config::schema::{validate_model_id, validate_provider_identifier};
 use crate::config::{
-    ResolvedProviderValues, configuration_error, missing_provider_config_error,
-    parse_provider_limit, provider_source_missing_error, resolve_provider_values,
-    validate_base_url, validate_provider_value,
+    ResolvedProviderValues, missing_provider_config_error, parse_provider_limit,
+    provider_source_missing_error, validate_base_url, validate_provider_value,
 };
 use crate::error::{ModelError, ModelErrorKind, ProviderErrorStage};
 use crate::openai::chat_completions_endpoint;
@@ -44,31 +43,6 @@ impl fmt::Debug for OpenAiProviderConfig {
 }
 
 impl OpenAiProviderConfig {
-    /// 从环境加载并验证 OpenAI-compatible 配置。
-    pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        let mut get_env = get_env;
-        let mut captured_env = std::collections::HashMap::<String, Option<String>>::new();
-        let mut get_env_once = |name: &str| {
-            if let Some(value) = captured_env.get(name) {
-                return value.clone();
-            }
-            let value = get_env(name);
-            captured_env.insert(name.to_string(), value.clone());
-            value
-        };
-        let values = resolve_provider_values(&mut get_env_once);
-        if values.user_config.is_some() {
-            return Err(configuration_error(
-                "OpenAiProviderConfig cannot represent a composite models selection; use ProviderConfigSnapshot::capture",
-                "provider_configuration_composite_selection_required",
-            ));
-        }
-        Self::from_resolved_values(values)
-    }
-
     pub(crate) fn from_resolved_values(
         values: ResolvedProviderValues,
     ) -> Result<Self, ProviderError> {

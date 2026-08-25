@@ -58,6 +58,7 @@ pub struct TurnOutcome {
 pub struct TurnRunner {
     sessions_dir: PathBuf,
     provider_snapshot: ProviderConfigSnapshot,
+    #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
@@ -66,11 +67,13 @@ impl TurnRunner {
         Self {
             sessions_dir,
             provider_snapshot,
+            #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
         }
     }
 
-    /// 测试/诊断注入：以固定 provider 取代快照解析结果。
+    /// 测试注入：以固定 provider 取代快照解析结果。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
         self.provider_override = Some(provider);
         self
@@ -341,13 +344,23 @@ impl TurnRunner {
         &self,
         thread: &Thread,
     ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool), PreparationFailure> {
-        let provider: Arc<dyn Provider + Send + Sync> = match &self.provider_override {
-            Some(provider) => Arc::clone(provider),
-            None => Arc::new(
+        let provider: Arc<dyn Provider + Send + Sync> = {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(provider) = &self.provider_override {
+                Arc::clone(provider)
+            } else {
+                Arc::new(
+                    self.provider_snapshot
+                        .provider_for_selector(thread.model.as_deref())
+                        .map_err(|error| PreparationFailure::internal(error.to_string()))?,
+                )
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            Arc::new(
                 self.provider_snapshot
                     .provider_for_selector(thread.model.as_deref())
                     .map_err(|error| PreparationFailure::internal(error.to_string()))?,
-            ),
+            )
         };
         let (config, instructions_truncated) =
             agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;

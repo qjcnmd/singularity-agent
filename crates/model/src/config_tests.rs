@@ -1,4 +1,5 @@
 use super::*;
+use crate::Provider;
 use crate::{USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
 use std::path::Path;
 
@@ -20,6 +21,167 @@ fn test_runtime_handle() -> tokio::runtime::Handle {
 fn test_provider_factory()
 -> impl Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, crate::ProviderError> {
     |config| OpenAiProvider::new(config, test_runtime_handle())
+}
+
+fn process_provider_config<F>(get_env: F) -> Result<OpenAiProviderConfig, ProviderError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut get_env = get_env;
+    let mut captured = std::collections::HashMap::<String, Option<String>>::new();
+    let values = resolve_provider_values(|name| {
+        if let Some(value) = captured.get(name) {
+            return value.clone();
+        }
+        let value = get_env(name);
+        captured.insert(name.to_string(), value.clone());
+        value
+    });
+    OpenAiProviderConfig::from_resolved_values(values)
+}
+
+#[test]
+fn process_provider_config_uses_the_default_registered_adapter() {
+    let config = process_provider_config(|name| match name {
+        ENV_MODEL => Some("test-model".to_string()),
+        ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+        ENV_API_KEY => Some("test-key-placeholder".to_string()),
+        _ => None,
+    })
+    .expect("provider config");
+
+    assert_eq!(config.provider_name, DEFAULT_PROVIDER_NAME);
+    assert_eq!(config.source, ProviderConfigSource::ProcessEnvironment);
+}
+
+#[test]
+fn process_provider_config_rejects_an_unregistered_adapter() {
+    let error = process_provider_config(|name| match name {
+        ENV_PROVIDER => Some("unregistered_provider".to_string()),
+        ENV_MODEL => Some("test-model".to_string()),
+        ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+        ENV_API_KEY => Some("test-key-placeholder".to_string()),
+        _ => None,
+    })
+    .expect_err("unknown provider must fail closed");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_adapter_unsupported")
+    );
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ClientInitialization)
+    );
+    assert_eq!(
+        error.error.provider_name.as_deref(),
+        Some("unregistered_provider")
+    );
+    assert!(!error.message.contains("test-key-placeholder"));
+    assert!(!error.message.contains("provider.example"));
+}
+
+#[test]
+fn process_provider_limits_are_explicit_and_bounded() {
+    let default_config = process_provider_config(|name| match name {
+        ENV_MODEL => Some("test-model".to_string()),
+        ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+        ENV_API_KEY => Some("test-key-placeholder".to_string()),
+        _ => None,
+    })
+    .expect("provider config");
+    assert_eq!(
+        default_config.protocol_contract().max_context_tokens,
+        Some(crate::DEFAULT_MAX_CONTEXT_TOKENS)
+    );
+    assert_eq!(
+        default_config.protocol_contract().max_output_tokens,
+        crate::DEFAULT_MAX_OUTPUT_TOKENS
+    );
+    assert!(default_config.protocol_contract().supports_system_message);
+    assert!(
+        !default_config
+            .protocol_contract()
+            .supports_strict_tool_schema
+    );
+
+    let configured = process_provider_config(|name| match name {
+        ENV_MODEL => Some("test-model".to_string()),
+        ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+        ENV_API_KEY => Some("test-key-placeholder".to_string()),
+        ENV_CONTEXT_TOKENS => Some("131072".to_string()),
+        ENV_MAX_OUTPUT_TOKENS => Some("8192".to_string()),
+        _ => None,
+    })
+    .expect("configured provider");
+    let capabilities = configured.protocol_contract();
+    assert_eq!(capabilities.max_context_tokens, Some(131_072));
+    assert_eq!(capabilities.max_output_tokens, 8_192);
+    assert!(!capabilities.supports_strict_tool_schema);
+
+    let provider = test_provider_factory()(configured).expect("provider");
+    assert_eq!(Provider::protocol_contract(&provider), capabilities);
+}
+
+#[test]
+fn process_provider_limit_errors_are_bounded_and_secret_free() {
+    for (name, value) in [
+        (ENV_CONTEXT_TOKENS, "zero-limit"),
+        (ENV_CONTEXT_TOKENS, "2000001"),
+        (ENV_MAX_OUTPUT_TOKENS, "256001"),
+        (ENV_MAX_OUTPUT_TOKENS, "not-a-token-limit"),
+    ] {
+        let result = process_provider_config(|candidate| match candidate {
+            ENV_MODEL => Some("test-model".to_string()),
+            ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+            ENV_API_KEY => Some("test-key-placeholder".to_string()),
+            candidate if candidate == name => Some(value.to_string()),
+            _ => None,
+        });
+        let error = result.expect_err("invalid token limit");
+
+        assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+        assert!(error.message.contains(name));
+        assert!(!error.message.contains(value));
+    }
+}
+
+#[test]
+fn process_provider_config_ignores_removed_tool_capability_envs() {
+    let config = process_provider_config(|name| {
+        assert!(!matches!(
+            name,
+            "SINGULARITY_MODEL_MAX_TOOL_CALLS" | "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA"
+        ));
+        match name {
+            ENV_MODEL => Some("test-model".to_string()),
+            ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+            ENV_API_KEY => Some("test-key-placeholder".to_string()),
+            _ => None,
+        }
+    })
+    .expect("provider configuration");
+
+    assert!(!config.protocol_contract().supports_strict_tool_schema);
+}
+
+#[test]
+fn process_provider_rejects_output_limit_equal_to_context_window() {
+    let error = process_provider_config(|name| match name {
+        ENV_MODEL => Some("test-model".to_string()),
+        ENV_BASE_URL => Some("https://provider.example/v1".to_string()),
+        ENV_API_KEY => Some("test-key-placeholder".to_string()),
+        ENV_CONTEXT_TOKENS => Some("4096".to_string()),
+        ENV_MAX_OUTPUT_TOKENS => Some("4096".to_string()),
+        _ => None,
+    })
+    .expect_err("inconsistent provider token limits");
+
+    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+    assert!(error.message.contains(ENV_MAX_OUTPUT_TOKENS));
+    assert!(error.message.contains(ENV_CONTEXT_TOKENS));
+    assert!(!error.message.contains("test-key-placeholder"));
 }
 
 fn executable_user_model() -> UserConfigModel {

@@ -17,13 +17,13 @@ mod lifecycle;
 pub mod paths;
 mod session_index;
 mod state;
+mod transport;
 
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use singularity_core::user_singularity_home;
 use singularity_model::ModelUsage;
 use singularity_protocol::{
     AppEvent, ErrorCode, HistoryItem, InitializeParams, InitializeResult, JsonRpcId,
@@ -46,6 +46,12 @@ const SESSION_DELETE_TURN_ACTIVE: &str =
 const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
+
+/// 运行 stdio JSON-Lines app-server，供同包二进制入口调用。
+#[doc(hidden)]
+pub async fn run_stdio(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
+    transport::run(runtime_handle).await
+}
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]

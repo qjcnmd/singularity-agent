@@ -1,7 +1,7 @@
 //! Transport-to-JSON-RPC error projection.
 
+use crate::AppServerError;
 use serde_json::Value;
-use singularity_app_server::AppServerError;
 use singularity_protocol::{ErrorCode, JSON_RPC_INTERNAL_ERROR, JsonRpcId, JsonRpcMessage};
 pub(crate) fn transport_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
     let diagnostic = match error {

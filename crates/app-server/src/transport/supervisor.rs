@@ -3,10 +3,10 @@
 //! The supervisor owns frame classification, ordinary/control dispatch workers, turn workers,
 //! and bounded shutdown/join.
 use super::*;
-use serde_json::Value;
-use singularity_app_server::{
+use crate::{
     AppServer, AppServerCancellationHandle, AppServerControlHandle, AppServerError, AppServerOutput,
 };
+use serde_json::Value;
 use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{JsonRpcInbound, JsonRpcMessage, Method, parse_json_rpc_payload};
 use std::sync::Arc;
@@ -424,10 +424,10 @@ async fn handle_streaming_turn_start(
             )
             .await
         }
-        Ok(singularity_app_server::TurnClaim::Responded(response)) => {
+        Ok(crate::TurnClaim::Responded(response)) => {
             send_output_async(output_tx.clone(), cancellation.clone(), response).await
         }
-        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => {
+        Ok(crate::TurnClaim::Accepted(claim)) => {
             // turn_worker 仅克隆共享 Arc，无需 spawn_blocking 线程池跳转。
             match turn_factory.turn_worker() {
                 Ok(worker) => {
@@ -461,16 +461,19 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
             .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
         singularity_core::ensure_singularity_home_outside_workspace(&home, &cwd)?;
     }
-    let paths = singularity_app_server::paths::AppPaths::resolve()?;
+    let paths = crate::paths::AppPaths::resolve()?;
     paths.prepare()?;
     // 进程内会话索引：启动时从 sessions 目录的 JSONL rollout 重建（JSONL 是
     // 唯一持久事实源，索引不落盘）。
-    let session_index =
-        singularity_app_server::SessionIndex::from_sessions_dir(&paths.sessions_dir)
-            .map_err(|error| format!("failed to scan app-server session index: {error}"))?;
+    let session_index = crate::SessionIndex::from_sessions_dir(&paths.sessions_dir)
+        .map_err(|error| format!("failed to scan app-server session index: {error}"))?;
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), runtime_handle);
-    Ok(AppServer::new(session_index, provider_snapshot).with_sessions_dir(paths.sessions_dir))
+    Ok(AppServer::new(
+        session_index,
+        provider_snapshot,
+        paths.sessions_dir,
+    ))
 }
 
 /// 判断单请求是否需要后台 turn worker。
@@ -594,7 +597,7 @@ pub(crate) fn run_turn_request(
     mut worker: AppServer,
     outputs: mpsc::Sender<Value>,
     cancellation: AppServerCancellationHandle,
-    claim: singularity_app_server::TurnStartClaim,
+    claim: crate::TurnStartClaim,
 ) -> Result<(), String> {
     let request_id = claim.request_id.clone();
     let mut output_error = None;

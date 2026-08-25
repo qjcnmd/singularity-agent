@@ -6,18 +6,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use crate::events::TurnEvent;
+use crate::objects::{ThreadStatus, TurnStatus};
+use crate::runner::{TurnOutcome, TurnRunner};
+use crate::store::{create_thread, persisted_model_selector, resume_thread};
+use crate::{
+    Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
+    compose_merged_selector,
+};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderProtocolContract, ProviderReasoningReplay,
 };
-use singularity_runtime::events::TurnEvent;
-use singularity_runtime::objects::{ThreadStatus, TurnStatus};
-use singularity_runtime::runner::{TurnOutcome, TurnRunner};
-use singularity_runtime::store::{create_thread, persisted_model_selector, resume_thread};
-use singularity_runtime::{Conversation, ConversationError, SettingsApplyTiming, SettingsPatch};
-use singularity_runtime::{ReasoningPatch, compose_merged_selector};
 
 fn temp_sessions() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("temp home");
@@ -241,7 +243,7 @@ fn collected_turn_ids(sink_log: &[&'static str]) -> usize {
 struct EventCollector {
     methods: Arc<std::sync::Mutex<Vec<&'static str>>>,
     started_turn_ids: Arc<std::sync::Mutex<Vec<String>>>,
-    applied_threads: Arc<std::sync::Mutex<Vec<singularity_runtime::Thread>>>,
+    applied_threads: Arc<std::sync::Mutex<Vec<crate::Thread>>>,
 }
 
 impl EventCollector {

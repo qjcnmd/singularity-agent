@@ -1,12 +1,12 @@
 use super::framing::read_bounded_line_with_limit;
 use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
-use serde_json::{Value, json};
-use singularity_agent::session::{SessionManager, SessionMetadataKind};
-use singularity_app_server::{
+use crate::{
     AppServer, AppServerCancellationHandle, AppServerError, ProviderFailureKind, SessionIndex,
     SessionIndexError, SessionRecord, TurnFailureCause, TurnFailureStage,
 };
+use serde_json::{Value, json};
+use singularity_agent::session::{SessionManager, SessionMetadataKind};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, Provider, ProviderConfigSnapshot, ProviderError,
@@ -79,7 +79,7 @@ fn test_output_channel(capacity: usize) -> (mpsc::Sender<Value>, mpsc::Receiver<
 fn test_cancellation_handle() -> AppServerCancellationHandle {
     let store = SessionIndex::new();
     let snapshot = ProviderConfigSnapshot::capture(|_| None, shared_provider_runtime_handle());
-    AppServer::new(store, snapshot).cancellation_handle()
+    AppServer::new(store, snapshot, ".singularity/sessions").cancellation_handle()
 }
 
 /// transport 测试共享的注入 runtime：provider 异步执行一律由上层提供。
@@ -451,7 +451,7 @@ fn transport_error_carries_original_terminalization_text() {
         &AppServerError::TurnTerminalization {
             stage: TurnFailureStage::TerminalOutcome,
             cause: TurnFailureCause::Store,
-            failure: singularity_app_server::TurnTerminalizationFailure::Store,
+            failure: crate::TurnTerminalizationFailure::Store,
             original: Some(original.to_string()),
         },
     );
@@ -480,7 +480,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
         },
         shared_provider_runtime_handle(),
     );
-    let mut server = AppServer::new(store, snapshot).with_sessions_dir(&sessions_dir);
+    let mut server = AppServer::new(store, snapshot, &sessions_dir);
     server
             .handle_json(
                 r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
@@ -517,7 +517,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     let cancellation = server.cancellation_handle();
     let (outputs, mut receiver) = mpsc::channel(16);
     let claim = match server.claim_turn(message) {
-        Ok(singularity_app_server::TurnClaim::Accepted(claim)) => claim,
+        Ok(crate::TurnClaim::Accepted(claim)) => claim,
         Ok(other) => panic!("claim must accept the turn: {other:?}"),
         Err(error) => panic!("claim failed: {error}"),
     };
@@ -708,8 +708,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             handle,
         );
 
-        let server = AppServer::new(store, snapshot)
-            .with_sessions_dir(&server_sessions_dir)
+        let server = AppServer::new(store, snapshot, &server_sessions_dir)
             .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
 
         let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
@@ -868,12 +867,12 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         },
         shared_provider_runtime_handle(),
     );
-    let mut new_server = AppServer::new(new_store, new_snapshot)
-        .with_sessions_dir(&sessions_dir)
-        .with_test_provider(Arc::new(ReopenProvider {
+    let mut new_server = AppServer::new(new_store, new_snapshot, &sessions_dir).with_test_provider(
+        Arc::new(ReopenProvider {
             response: ModelTurnResponse::completed("reopen_1", "reopen_response", "done"),
             seen_requests: Arc::clone(&seen_requests),
-        }));
+        }),
+    );
 
     new_server
         .handle_json(
@@ -960,8 +959,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
             },
             handle,
         );
-        let server = AppServer::new(store, snapshot)
-            .with_sessions_dir(&sessions_dir_inside)
+        let server = AppServer::new(store, snapshot, &sessions_dir_inside)
             .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
 
         let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
@@ -1058,7 +1056,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     let reopened = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
     assert_eq!(
         reopened.get_session(session_id).expect("record").status,
-        Some(singularity_app_server::SessionStatus::Completed)
+        Some(crate::SessionStatus::Completed)
     );
     let session_on_disk =
         SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))

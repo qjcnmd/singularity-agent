@@ -23,4 +23,5 @@ time.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+singularity_runtime = { path = "../runtime", features = ["test-support"] }
 tempfile.workspace = true

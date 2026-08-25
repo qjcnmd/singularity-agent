@@ -40,3 +40,7 @@ pub use store::{
     ResumeError, ThreadSummary, canonical_thread_cwd, create_thread, list_threads, rename_thread,
     resume_thread, thread_session_path,
 };
+
+#[cfg(test)]
+#[path = "../tests/conversation_tests.rs"]
+mod conversation_tests;

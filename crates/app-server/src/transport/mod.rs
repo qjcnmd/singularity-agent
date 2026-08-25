@@ -15,7 +15,7 @@ pub(crate) use output::{
 };
 pub(crate) use supervisor::run;
 
-use singularity_app_server::AppServerCancellationHandle;
+use crate::AppServerCancellationHandle;
 use std::time::Duration;
 
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);

@@ -35,8 +35,8 @@ fn app_server(store: SessionIndex, sessions_dir: &Path) -> AppServer {
             },
             test_runtime_handle(),
         ),
+        sessions_dir,
     )
-    .with_sessions_dir(sessions_dir)
 }
 
 fn initialize(server: &mut AppServer) {

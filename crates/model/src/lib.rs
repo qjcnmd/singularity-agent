@@ -57,9 +57,9 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution,
-    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
-    compose_model_selector, split_model_selector,
+    ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderConfigurationStatus, compose_model_selector,
+    split_model_selector,
 };
 pub use error::*;
 pub use openai::{chat_completions_endpoint, provider_error_response, responses_endpoint};

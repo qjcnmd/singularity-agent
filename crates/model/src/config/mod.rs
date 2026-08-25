@@ -11,8 +11,7 @@ pub use runtime::ProviderConfigSnapshot;
 pub(crate) use runtime::*;
 pub(crate) use schema::*;
 pub use schema::{
-    ModelBlockerKind, ModelProviderConfig, ProviderConfigResolution, ProviderConfigSource,
-    ProviderConfigurationStatus,
+    ModelBlockerKind, ModelProviderConfig, ProviderConfigSource, ProviderConfigurationStatus,
 };
 pub(crate) use user::*;
 
@@ -548,6 +547,7 @@ fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfig
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_provider_values<F>(mut get_env: F) -> ResolvedProviderValues
 where
     F: FnMut(&str) -> Option<String>,

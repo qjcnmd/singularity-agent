@@ -225,10 +225,12 @@ impl Drop for LiveTurnGuard {
 }
 
 impl AppServer {
-    pub fn new(store: SessionIndex, provider_snapshot: ProviderConfigSnapshot) -> Self {
-        let sessions_dir = user_singularity_home()
-            .map(|home| home.join(paths::SESSIONS_DIR_NAME))
-            .unwrap_or_else(|| PathBuf::from(".singularity/sessions"));
+    pub fn new(
+        store: SessionIndex,
+        provider_snapshot: ProviderConfigSnapshot,
+        sessions_dir: impl AsRef<Path>,
+    ) -> Self {
+        let sessions_dir = sessions_dir.as_ref().to_path_buf();
         let turn_runner = Arc::new(TurnRunner::new(
             sessions_dir.clone(),
             provider_snapshot.clone(),
@@ -247,20 +249,9 @@ impl AppServer {
         }
     }
 
-    /// 覆盖会话目录（transport 接线与 crate 内测试使用）。
-    #[doc(hidden)]
-    pub fn with_sessions_dir(mut self, dir: impl AsRef<Path>) -> Self {
-        self.sessions_dir = dir.as_ref().to_path_buf();
-        self.turn_runner = Arc::new(TurnRunner::new(
-            self.sessions_dir.clone(),
-            self.provider_snapshot.clone(),
-        ));
-        self
-    }
-
     /// 仅测试：以固定 provider 取代快照解析结果。
-    #[doc(hidden)]
-    pub fn with_test_provider(
+    #[cfg(test)]
+    pub(crate) fn with_test_provider(
         mut self,
         provider: Arc<dyn singularity_model::Provider + Send + Sync>,
     ) -> Self {
@@ -271,11 +262,7 @@ impl AppServer {
         self
     }
 
-    pub fn sessions_dir(&self) -> &Path {
-        &self.sessions_dir
-    }
-
-    pub fn store(&self) -> &SessionIndex {
+    pub(crate) fn store(&self) -> &SessionIndex {
         &self.store
     }
 

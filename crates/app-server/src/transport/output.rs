@@ -2,8 +2,8 @@
 //!
 //! Output queue ownership, backpressure, and writer lifecycle are kept together.
 use super::ExecutionStop;
+use crate::{AppServerCancellationHandle, AppServerOutput};
 use serde_json::Value;
-use singularity_app_server::{AppServerCancellationHandle, AppServerOutput};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
