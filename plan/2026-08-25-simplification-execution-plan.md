@@ -3,7 +3,7 @@ goal: 执行 2026-08-25 审查裁决：修复行为正确性缺陷并收敛多�
 version: 1.0
 date_created: 2026-08-25
 owner: Singularity maintainer
-status: 'In Progress'
+status: 'Completed'
 tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, session]
 ---
 
@@ -114,7 +114,7 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 |------|-------------|------|------|
 | TASK-501 | docs/singularity.md 全量同步（§2 事件流/§3 压缩触发/§5 metadata/§6 目录移除/§8 TUI）；README（限额显式声明、Git Bash 前置）；INSTALL。只写当前事实。 | [x] | 2026-08-25 |
 | TASK-502 | 最终门禁：fmt --check / clippy -D warnings / test --workspace / build --bins / git diff --check 全绿；汇总执行日志（提交清单、评估对照、偏差、遗留风险）。 | [x] | 2026-08-25 |
-| TASK-503 | EVAL-002 终局完整评估，结果记入执行日志。 | [ ] | |
+| TASK-503 | EVAL-002 终局完整评估，结果记入执行日志。 | [x] | 2026-08-25 |
 
 ## 3. Alternatives（已否决方向，勿重开）
 
@@ -190,4 +190,5 @@ tags: [architecture, refactor, reliability, retry, compaction, tools, protocol, 
 - TASK-403 — commit `ce64507`; TDD/定向验证：`cargo test -p singularity_agent tools::bash::tests::small_output_never_spills --locked` 1 passed，`cargo fmt --all -- --check` exit 0。新 spill 创建时扫描专用根目录并惰性删除超过 7 天的旧项，无后台线程或退出钩子。偏差：无；按 EVAL-001 未运行 TASK 评估。
 - TASK-404 — commit `75a6d26`; structure-only 等价验证：`cargo test -p singularity_agent -p singularity_runtime -p singularity_model --locked --no-fail-fast` 全部通过（71/15/38+24+23+22），`cargo test -p singularity_app_server --locked --no-fail-fast` 35 lib + 4 integration + 3 transport passed，`cargo clippy -p singularity_agent -p singularity_runtime -p singularity_model -p singularity_app_server --all-targets --all-features --locked --no-deps -- -D warnings` exit 0，`cargo fmt --all -- --check` exit 0，`git diff --check` exit 0。删除 TurnRunner 尾部委托、合并 split_lines 与 tool_choice payload、移除 classify_model_error 别名、清理 editor consumed、SessionRepository 改只读、修正 edit hunk 起始行号，并将 ConversationError 杂项拆为 Configuration/State。偏差：无；按 EVAL-001 未运行 TASK 评估。
 - TASK-501 — commit `cac8e9c`; 文档终态检查：`rg` 确认 docs/singularity.md、README.md、docs/INSTALL.md 无 models.dev/discovery/provider summary/旧脱敏描述残留，`git diff --check` exit 0。同步压缩、事件、metadata、spill 清理、Git Bash 前置与未知模型限额当前事实。偏差：无。
-- TASK-502 — commit `PENDING`; 五项终局门禁全部 exit 0：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings`、`cargo test --workspace --all-targets --locked --no-fail-fast`（provider smoke 1 ignored）、`cargo build --workspace --bins --locked`、`git diff --check`。偏差：无。
+- TASK-502 — commit `1213df0`; 五项终局门禁全部 exit 0：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings`、`cargo test --workspace --all-targets --locked --no-fail-fast`（provider smoke 1 ignored）、`cargo build --workspace --bins --locked`、`git diff --check`。偏差：无。
+- TASK-503 — EVAL-002 run `run-1787666363-310`; 使用 `D:\CargoTargets\singularity-agent\debug\sg.exe` 完整 12-cell 评估。`opencode-go/deepseek-v4-flash#max`: 6/6 passed；`longcat/LongCat-2.0#high`: 5/6 passed、1 timed_out（`repo-wide-rename`），无 crashed/partial。首次误用 `target\debug\sg.exe` 导致 12 cells 因 CLI binary 不匹配全部 crashed（run `run-1787666298-647`），随后按可执行文件路径事实复核后执行唯一有效终局评估；未重采样超时 cell。按 provider-evaluation 归因，超时 cell 为评估任务/工具时长阻断，非 provider crash。
