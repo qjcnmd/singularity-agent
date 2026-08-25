@@ -221,12 +221,7 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
         ),
     ] {
         let body = r#"{"error":{"message":"provider body must not leak"}}"#;
-        let responses =
-            if status_line.starts_with("HTTP/1.1 4") && !status_line.starts_with("HTTP/1.1 429") {
-                vec![(status_line, body)]
-            } else {
-                vec![(status_line, body); 6]
-            };
+        let responses = vec![(status_line, body)];
         let (base_url, attempts) = sequence_response_server(responses);
         let provider = test_provider(provider_test_config(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
@@ -248,15 +243,10 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
             .provider_attempt_metadata
             .as_ref()
             .expect("http attempt metadata");
-        if status_line.starts_with("HTTP/1.1 429") || status_line.starts_with("HTTP/1.1 5") {
-            assert_eq!(metadata.attempt_count, 6);
-            assert_eq!(metadata.retry_count, 5);
-        } else {
-            assert_eq!(metadata.attempt_count, 1);
-            assert_eq!(metadata.retry_count, 0);
-        }
+        assert_eq!(metadata.attempt_count, 1);
+        assert_eq!(metadata.retry_count, 0);
         assert!(!serialized.contains("provider body must not leak"));
-        assert!(attempts.try_iter().count() >= 1);
+        assert_eq!(attempts.try_iter().count(), 1);
     }
 }
 

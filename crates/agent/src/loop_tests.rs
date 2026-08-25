@@ -162,8 +162,8 @@ fn setup(steps: Vec<FakeStep>) -> (Agent, tempfile::TempDir, Arc<FakeProvider>) 
 }
 type OnCallHook = Box<dyn Fn(usize) + Send>;
 struct ErrReturningProvider {
-    /// 每次 `complete_stream` 弹出的结果：`Err(model_error)` 或 `Ok(text)`。
-    steps: Mutex<VecDeque<std::result::Result<String, ModelError>>>,
+    /// 每次 `complete_stream` 弹出的结果：`Err(provider_error)` 或 `Ok(text)`。
+    steps: Mutex<VecDeque<std::result::Result<String, ProviderError>>>,
     calls: std::sync::atomic::AtomicUsize,
     contract: ProviderProtocolContract,
     on_call: Mutex<Option<OnCallHook>>,
@@ -172,6 +172,19 @@ impl ErrReturningProvider {
     fn new(
         contract: ProviderProtocolContract,
         steps: Vec<std::result::Result<String, ModelError>>,
+    ) -> Self {
+        Self::with_provider_errors(
+            contract,
+            steps
+                .into_iter()
+                .map(|step| step.map_err(ProviderError::from_model_error))
+                .collect(),
+        )
+    }
+
+    fn with_provider_errors(
+        contract: ProviderProtocolContract,
+        steps: Vec<std::result::Result<String, ProviderError>>,
     ) -> Self {
         Self {
             steps: Mutex::new(steps.into()),
@@ -195,7 +208,7 @@ impl ErrReturningProvider {
             hook(call_index);
         }
         match self.steps.lock().unwrap().pop_front() {
-            Some(Err(error)) => Err(ProviderError::from_model_error(error)),
+            Some(Err(error)) => Err(error),
             Some(Ok(text)) => {
                 let mut response = ModelTurnResponse::completed(
                     request.request_id.clone(),
@@ -328,6 +341,154 @@ fn retryable_provider_error_exhausts_and_fails() {
     );
     // 初始调用 + 2 次重试耗尽 = 3 次调用。
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn persistent_rate_limit_makes_at_most_four_provider_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::new(
+        fake_contract(),
+        vec![
+            Err(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited 1",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited 2",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited 3",
+            )),
+            Err(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited 4",
+            )),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+
+    agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect_err("persistent rate limiting exhausts the turn retry budget");
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+#[test]
+fn retry_after_controls_the_agent_retry_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::with_provider_errors(
+        fake_contract(),
+        vec![
+            Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited",
+            ))
+            .with_retry_after(Some(std::time::Duration::from_millis(80)))),
+            Ok("success".to_string()),
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect("retry succeeds");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(70));
+}
+
+#[test]
+fn replay_unsafe_provider_error_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::with_provider_errors(
+        fake_contract(),
+        vec![Err(ProviderError::from_model_error(ModelError::new(
+            ModelErrorKind::NetworkError,
+            "stream failed after visible output",
+        ))
+        .without_automatic_retry())],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+
+    agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect_err("a replay-unsafe failure is terminal");
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancellation_interrupts_retry_after_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let provider = Arc::new(ErrReturningProvider::with_provider_errors(
+        fake_contract(),
+        vec![Err(ProviderError::from_model_error(ModelError::new(
+            ModelErrorKind::RateLimited,
+            "rate limited",
+        ))
+        .with_retry_after(Some(std::time::Duration::from_secs(5))))],
+    ));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let trigger = cancellation.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        trigger.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &cancellation)
+        .expect("cancellation converges to an aborted outcome");
+    canceller.join().unwrap();
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
 }
 
 /// 2. 工具调用序列：tool call → 工具执行 → 结果回写 session → 下一轮。

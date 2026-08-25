@@ -1,4 +1,4 @@
-//! provider HTTP transport、retry、bounded body read 和取消传播。
+//! provider HTTP transport、bounded body read 和取消传播。
 
 pub(crate) mod http;
 pub(crate) mod retry;
@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
-use crate::MAX_PROVIDER_ATTEMPTS;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::openai::{
     OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
@@ -134,10 +133,8 @@ impl ProviderAttemptInProgress {
 }
 
 /// Outcome of the protocol-specific work performed on a successful HTTP
-/// response inside one attempt. `Retry` asserts that this protocol side fully
-/// permits resending the request (for streams additionally that no visible
-/// delta has reached the caller yet); the shared loop only adds its
-/// remaining-attempts budget on top.
+/// response inside one attempt. `Retry` asserts that the protocol side permits
+/// the owning caller to resend the request; `Failed` forbids automatic replay.
 enum AttemptBodyOutcome {
     Completed {
         completion: Box<OpenAiCompletion>,
@@ -176,14 +173,10 @@ fn streaming_outcome(
                 },
             }
         }
-        Err(failure)
-            if !failure.emitted_text_delta && provider_error_is_retryable(&failure.error) =>
-        {
-            AttemptBodyOutcome::Retry {
-                error: failure.error,
-                time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
-            }
-        }
+        Err(failure) if !failure.emitted_text_delta => AttemptBodyOutcome::Retry {
+            error: failure.error,
+            time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
+        },
         Err(failure) => AttemptBodyOutcome::Failed {
             error: failure.error,
             time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
@@ -595,7 +588,7 @@ impl OpenAiProvider {
             .selected_model
             .as_ref()
             .and_then(|selection| selection.reasoning_variant.as_deref());
-        self.complete_attempts(
+        self.complete_attempt(
             cancellation,
             ProviderApiProtocol::OpenAiChatCompletions,
             model_name,
@@ -670,7 +663,7 @@ impl OpenAiProvider {
             .selected_model
             .as_ref()
             .and_then(|selection| selection.reasoning_variant.as_deref());
-        self.complete_attempts(
+        self.complete_attempt(
             cancellation,
             ProviderApiProtocol::OpenAiResponses,
             model_name,
@@ -787,7 +780,7 @@ impl OpenAiProvider {
             .selected_model
             .as_ref()
             .and_then(|selection| selection.reasoning_variant.as_deref());
-        self.complete_attempts(
+        self.complete_attempt(
             cancellation,
             api_protocol,
             model_name,
@@ -803,16 +796,9 @@ impl OpenAiProvider {
                 ) {
                     Ok(body) => body,
                     Err(error) => {
-                        return if provider_error_is_retryable(&error) {
-                            AttemptBodyOutcome::Retry {
-                                error,
-                                time_to_first_text_delta_ms: None,
-                            }
-                        } else {
-                            AttemptBodyOutcome::Failed {
-                                error,
-                                time_to_first_text_delta_ms: None,
-                            }
+                        return AttemptBodyOutcome::Retry {
+                            error,
+                            time_to_first_text_delta_ms: None,
                         };
                     }
                 };
@@ -873,14 +859,10 @@ impl OpenAiProvider {
     }
 
     /// Shared completion skeleton for both wire protocols and both streaming
-    /// shapes: one bounded attempt loop owning the cancellation check, attempt
-    /// telemetry, retry classification (`Retry-After` first, full-jitter
-    /// backoff otherwise) and the observable start/finish event pairs. The
-    /// protocol-specific body read, decode and parse run through
-    /// `read_response`; its `Retry` outcome carries everything needed to
-    /// schedule the next attempt.
+    /// Execute one HTTP attempt and return either its parsed completion or a
+    /// typed failure carrying the replay safety and provider-directed delay.
     #[allow(clippy::too_many_arguments)]
-    fn complete_attempts(
+    fn complete_attempt(
         &self,
         cancellation: &CancellationToken,
         api_protocol: ProviderApiProtocol,
@@ -893,240 +875,181 @@ impl OpenAiProvider {
         let runtime = &self.runtime;
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(provider_cancelled_error().with_provider_attempt_metadata(
-                    provider_attempt_metadata(&metadata, started_at),
-                ));
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error()
+                .with_provider_attempt_metadata(provider_attempt_metadata(&metadata, started_at)));
+        }
+
+        metadata.attempt_count = 1;
+        let mut occurrence = ProviderAttemptInProgress::new(
+            ProviderAttemptOperationPhase::Completion,
+            &self.config.provider_name,
+            model_name,
+            api_protocol,
+            1,
+        );
+        emit_provider_attempt_started(&occurrence, on_attempt)?;
+        let response = match block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_request_send_failed",
+            ProviderErrorStage::RequestSend,
+            self.request_timeout_seconds,
+            || {
+                self.client
+                    .post(endpoint)
+                    .bearer_auth(&self.config.api_key)
+                    .json(request_payload)
+                    .send()
+            },
+        ) {
+            Ok(response) => {
+                occurrence.mark_response_headers_received();
+                response
             }
-            metadata.attempt_count += 1;
-            let mut occurrence = ProviderAttemptInProgress::new(
-                ProviderAttemptOperationPhase::Completion,
-                &self.config.provider_name,
-                model_name,
-                api_protocol,
-                metadata.attempt_count,
-            );
-            emit_provider_attempt_started(&occurrence, on_attempt)?;
-            let response =
-                match block_on_provider_future(
-                    runtime,
-                    cancellation,
-                    "provider_request_send_failed",
-                    ProviderErrorStage::RequestSend,
-                    self.request_timeout_seconds,
-                    || {
-                        self.client
-                            .post(endpoint)
-                            .bearer_auth(&self.config.api_key)
-                            .json(request_payload)
-                            .send()
-                    },
-                ) {
-                    Ok(response) => {
-                        occurrence.mark_response_headers_received();
-                        response
-                    }
-                    Err(error)
-                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                            && provider_error_is_retryable(&error) =>
-                    {
-                        let retry_backoff = record_provider_retry(
-                            &mut metadata,
-                            occurrence,
-                            &error.error,
-                            None,
-                            on_attempt,
-                        )?;
-                        wait_retry_backoff(
-                            runtime,
-                            cancellation,
-                            retry_backoff,
-                            &metadata,
-                            started_at,
-                        )?;
-                        continue;
-                    }
-                    Err(error) => {
-                        record_provider_attempt(
-                            &mut metadata,
-                            occurrence,
-                            Some(&error.error),
-                            None,
-                            on_attempt,
-                        )?;
-                        return Err(error.with_provider_attempt_metadata(
-                            provider_attempt_metadata(&metadata, started_at),
-                        ));
-                    }
-                };
-            let status = response.status();
-            let status_code = status.as_u16();
-            if !status.is_success() {
-                // Retry-After 必须在响应体读取消费 response 之前提取。
-                let retry_after = retry_after_delay(response.headers());
-                // 有界读取非 2xx 响应体，供结构化解析与诊断增强；读取失败
-                // 不掩盖原始状态码错误，降级为无 body 继续。
-                let error_body = read_bounded_provider_response_body(
-                    runtime,
-                    cancellation,
-                    self.request_timeout_seconds,
-                    response,
-                )
-                .ok();
-                let error_fields = error_body.as_deref().map(parse_provider_error_body);
-                let context_length_exceeded = is_context_length_exceeded_code(
-                    error_fields
-                        .as_ref()
-                        .and_then(|fields| fields.code.as_deref()),
-                );
-                let model_error = if context_length_exceeded {
-                    let mut context_error = ModelError::new(
-                        ModelErrorKind::ContextLengthExceeded,
-                        "provider rejected the request: context length exceeded",
-                    )
-                    .with_provider(self.config.provider_name.clone())
-                    .with_model(model_name.to_string())
-                    .with_provider_diagnostic(
-                        "provider_context_length_exceeded",
-                        ProviderErrorStage::ResponseStatus,
-                    );
-                    context_error.http_status = Some(status_code);
-                    context_error
-                } else {
-                    model_error_from_http_status(
-                        status_code,
-                        &self.config.provider_name,
-                        model_name,
-                    )
-                };
-                // 有界诊断只进入对外展示文本（ProviderError.message），不写入
-                // 序列化的 ModelError：错误体内容经过有界、单行化与脱敏后仍不
-                // 进入结构化边界字段。结构化上下文超限使用固定文案。
-                let provider_diagnostic = if context_length_exceeded {
-                    None
-                } else {
-                    error_fields
-                        .as_ref()
-                        .and_then(|fields| fields.message.as_deref())
-                        .map(|message| {
-                            bounded_provider_error_diagnostic(message, &self.config.api_key)
-                        })
-                        .or_else(|| {
-                            error_body.as_deref().map(|body| {
-                                bounded_provider_error_diagnostic(
-                                    &String::from_utf8_lossy(body),
-                                    &self.config.api_key,
-                                )
-                            })
-                        })
-                        .filter(|diagnostic| !diagnostic.is_empty())
-                };
-                let mut display_message = model_error.message.clone();
-                if let Some(diagnostic) = provider_diagnostic {
-                    display_message.push_str(" Provider diagnostic: ");
-                    display_message.push_str(&diagnostic);
-                }
-                // 结构化上下文超限不可重试：重发同一请求必然再次超限，即使
-                // provider 将其映射到通常可重试的状态码（429/5xx）上。
-                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
-                    && !context_length_exceeded
-                    && http_status_is_retryable(status_code)
-                {
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &model_error,
-                        retry_after,
-                        on_attempt,
-                    )?;
-                    wait_retry_backoff(
-                        runtime,
-                        cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
+            Err(error) => {
                 record_provider_attempt(
                     &mut metadata,
                     occurrence,
-                    Some(&model_error),
+                    Some(&error.error),
                     None,
                     on_attempt,
                 )?;
-                let mut error = ProviderError::from_model_error(model_error)
-                    .with_provider_attempt_metadata(provider_attempt_metadata(
+                return Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
                         &metadata, started_at,
-                    ));
-                error.message = display_message;
-                return Err(error);
+                    )),
+                );
             }
-            let response_retry_after = retry_after_delay(response.headers());
-            let failure = match read_response(response, occurrence.started_at) {
-                AttemptBodyOutcome::Completed {
-                    completion,
-                    wire_usage_present,
-                    time_to_first_text_delta_ms,
-                } => {
-                    occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
-                    let occurrence_error = completion.response.error.as_ref();
-                    let usage = (wire_usage_present && occurrence_error.is_none())
-                        .then(|| completion.response.usage.clone());
-                    record_provider_attempt(
-                        &mut metadata,
-                        occurrence,
-                        occurrence_error,
-                        usage,
-                        on_attempt,
-                    )?;
-                    let mut completion = *completion;
-                    completion.response.provider_attempt_metadata =
-                        Some(provider_attempt_metadata(&metadata, started_at));
-                    return Ok(completion);
-                }
-                AttemptBodyOutcome::Retry {
-                    error,
-                    time_to_first_text_delta_ms,
-                } if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS => {
-                    occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
-                    let retry_backoff = record_provider_retry(
-                        &mut metadata,
-                        occurrence,
-                        &error.error,
-                        response_retry_after,
-                        on_attempt,
-                    )?;
-                    wait_retry_backoff(
-                        runtime,
-                        cancellation,
-                        retry_backoff,
-                        &metadata,
-                        started_at,
-                    )?;
-                    continue;
-                }
-                AttemptBodyOutcome::Retry {
-                    error,
-                    time_to_first_text_delta_ms,
-                }
-                | AttemptBodyOutcome::Failed {
-                    error,
-                    time_to_first_text_delta_ms,
-                } => (error, time_to_first_text_delta_ms),
+        };
+
+        let status = response.status();
+        let status_code = status.as_u16();
+        if !status.is_success() {
+            let retry_after = retry_after_delay(response.headers());
+            let error_body = read_bounded_provider_response_body(
+                runtime,
+                cancellation,
+                self.request_timeout_seconds,
+                response,
+            )
+            .ok();
+            let error_fields = error_body.as_deref().map(parse_provider_error_body);
+            let context_length_exceeded = is_context_length_exceeded_code(
+                error_fields
+                    .as_ref()
+                    .and_then(|fields| fields.code.as_deref()),
+            );
+            let model_error = if context_length_exceeded {
+                let mut context_error = ModelError::new(
+                    ModelErrorKind::ContextLengthExceeded,
+                    "provider rejected the request: context length exceeded",
+                )
+                .with_provider(self.config.provider_name.clone())
+                .with_model(model_name.to_string())
+                .with_provider_diagnostic(
+                    "provider_context_length_exceeded",
+                    ProviderErrorStage::ResponseStatus,
+                );
+                context_error.http_status = Some(status_code);
+                context_error
+            } else {
+                model_error_from_http_status(status_code, &self.config.provider_name, model_name)
             };
-            let (error, time_to_first_text_delta_ms) = failure;
-            occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+            let provider_diagnostic = if context_length_exceeded {
+                None
+            } else {
+                error_fields
+                    .as_ref()
+                    .and_then(|fields| fields.message.as_deref())
+                    .map(|message| bounded_provider_error_diagnostic(message, &self.config.api_key))
+                    .or_else(|| {
+                        error_body.as_deref().map(|body| {
+                            bounded_provider_error_diagnostic(
+                                &String::from_utf8_lossy(body),
+                                &self.config.api_key,
+                            )
+                        })
+                    })
+                    .filter(|diagnostic| !diagnostic.is_empty())
+            };
+            let mut display_message = model_error.message.clone();
+            if let Some(diagnostic) = provider_diagnostic {
+                display_message.push_str(" Provider diagnostic: ");
+                display_message.push_str(&diagnostic);
+            }
             record_provider_attempt(
                 &mut metadata,
                 occurrence,
-                Some(&error.error),
+                Some(&model_error),
                 None,
                 on_attempt,
             )?;
-            return Err(error
-                .with_provider_attempt_metadata(provider_attempt_metadata(&metadata, started_at)));
+            let mut error = ProviderError::from_model_error(model_error)
+                .with_retry_after(retry_after)
+                .with_provider_attempt_metadata(provider_attempt_metadata(&metadata, started_at));
+            error.message = display_message;
+            return Err(error);
+        }
+
+        match read_response(response, occurrence.started_at) {
+            AttemptBodyOutcome::Completed {
+                completion,
+                wire_usage_present,
+                time_to_first_text_delta_ms,
+            } => {
+                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+                let occurrence_error = completion.response.error.as_ref();
+                let usage = (wire_usage_present && occurrence_error.is_none())
+                    .then(|| completion.response.usage.clone());
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    occurrence_error,
+                    usage,
+                    on_attempt,
+                )?;
+                let mut completion = *completion;
+                completion.response.provider_attempt_metadata =
+                    Some(provider_attempt_metadata(&metadata, started_at));
+                Ok(completion)
+            }
+            AttemptBodyOutcome::Retry {
+                error,
+                time_to_first_text_delta_ms,
+            } => {
+                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    on_attempt,
+                )?;
+                Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )),
+                )
+            }
+            AttemptBodyOutcome::Failed {
+                error,
+                time_to_first_text_delta_ms,
+            } => {
+                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    on_attempt,
+                )?;
+                Err(error
+                    .without_automatic_retry()
+                    .with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )))
+            }
         }
     }
 }
@@ -1298,20 +1221,6 @@ impl Provider for OpenAiProvider {
     }
 }
 
-/// Cancellation-aware backoff sleep that attaches the aggregate attempt
-/// telemetry when the wait is interrupted by cancellation.
-fn wait_retry_backoff(
-    runtime: &tokio::runtime::Handle,
-    cancellation: &CancellationToken,
-    duration: Duration,
-    metadata: &ProviderAttemptMetadata,
-    started_at: Instant,
-) -> Result<(), ProviderError> {
-    wait_provider_backoff(runtime, cancellation, duration).map_err(|error| {
-        error.with_provider_attempt_metadata(provider_attempt_metadata(metadata, started_at))
-    })
-}
-
 /// Record one terminal attempt without changing aggregate retry semantics.
 fn emit_provider_attempt_started(
     occurrence: &ProviderAttemptInProgress,
@@ -1337,24 +1246,6 @@ fn record_provider_attempt(
     }
     metadata.occurrences.push(occurrence);
     Ok(())
-}
-
-/// Atomically record the retry aggregate and the occurrence that scheduled it.
-fn record_provider_retry(
-    metadata: &mut ProviderAttemptMetadata,
-    occurrence: ProviderAttemptInProgress,
-    error: &ModelError,
-    retry_after: Option<Duration>,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-) -> Result<Duration, ProviderError> {
-    metadata.retry_count += 1;
-    let retry_backoff = retry_after.unwrap_or_else(|| provider_retry_backoff(metadata.retry_count));
-    let occurrence = occurrence.finish(Some(error), None, Some(retry_backoff));
-    if !on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence.clone()))) {
-        return Err(provider_attempt_observer_error());
-    }
-    metadata.occurrences.push(occurrence);
-    Ok(retry_backoff)
 }
 
 fn provider_attempt_observer_error() -> ProviderError {

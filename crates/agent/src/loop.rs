@@ -36,8 +36,7 @@ use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
 
-/// Agent 层重试上限：模型调用失败（HTTP 层重试耗尽后）仍属可重试类别时，
-/// 在此层指数退避重试（pi 的 agent 重试策略，默认 maxRetries=3）。
+/// Agent 层重试上限：模型调用返回可重试错误时，在此层指数退避重试。
 const MAX_TURN_RETRIES: u32 = 3;
 /// 重试基础退避毫秒：delay = base × 2^(attempt-1)，再乘 ±10% 抖动。
 const TURN_RETRY_BASE_DELAY_MS: u64 = 2_000;
@@ -49,16 +48,24 @@ const RETRY_POLL_INTERVAL_MS: u64 = 50;
 /// 与 pi 的 `isRetryableAssistantError` 同向：限流、网络、超时、过载与未知
 /// 错误可重试；认证、校验、配额、取消与上下文溢出（后者走强制压缩路径）
 /// 不重试。
-fn is_retryable_provider_error(kind: &ModelErrorKind) -> bool {
+fn is_retryable_provider_error(error: &ProviderError) -> bool {
     use ModelErrorKind::*;
-    matches!(
-        kind,
-        RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
-    )
+    error.automatic_retry_allowed
+        && matches!(
+            error.error.kind,
+            RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
+        )
 }
 
 /// 指数退避 + ±10% 抖动（Codex `retry.rs` 同款范围；确定性伪随机避免新增依赖）。
-fn retry_delay_ms(base_delay_ms: u64, attempt: u32) -> u64 {
+fn retry_delay_ms(
+    base_delay_ms: u64,
+    attempt: u32,
+    retry_after: Option<std::time::Duration>,
+) -> u64 {
+    if let Some(retry_after) = retry_after {
+        return retry_after.as_millis().min(u128::from(u64::MAX)) as u64;
+    }
     let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
     let jitter = 0.9 + (u64::from(attempt) * 37 % 21) as f64 / 105.0;
     (base as f64 * jitter) as u64
@@ -198,7 +205,7 @@ pub struct AgentConfig {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub compaction: CompactionConfig,
-    /// Agent 层重试（HTTP 重试耗尽后的可重试 provider 错误）。
+    /// Agent 层的唯一自动重试策略。
     pub retry: TurnRetryConfig,
 }
 
@@ -665,16 +672,18 @@ impl Agent {
                     }
                     Err(error) => {
                         record_error_attempts(&mut outcome, &error, model_turn_ordinal);
-                        // Agent 层重试（pi 策略）：HTTP 重试耗尽后仍可重试的
-                        // provider 错误指数退避重试；历史与会话状态保留，不重复
-                        // 已执行的工具副作用。
+                        // 可重试 provider 错误在 Agent 层统一退避；历史与会话
+                        // 状态保留，不重复已执行的工具副作用。
                         if let AgentError::Provider(provider) = &error
                             && retry_attempt < self.config.retry.max_retries
-                            && is_retryable_provider_error(&provider.error.kind)
+                            && is_retryable_provider_error(provider)
                         {
                             retry_attempt += 1;
-                            let delay_ms =
-                                retry_delay_ms(self.config.retry.base_delay_ms, retry_attempt);
+                            let delay_ms = retry_delay_ms(
+                                self.config.retry.base_delay_ms,
+                                retry_attempt,
+                                provider.retry_after,
+                            );
                             emit_diagnostic(
                                 events,
                                 AgentDiagnostic::info(
@@ -1146,7 +1155,8 @@ impl Agent {
                     .map_err(AgentError::Provider)
             }
             Err(error) => {
-                // 传输层重试耗尽后向上传播错误，避免循环层进行无意义的整轮盲目重试。
+                // 保留传输层给出的类型、重放安全性与 Retry-After，交由调用处
+                // 的唯一重试策略裁决。
                 Err(AgentError::Provider(error))
             }
         }

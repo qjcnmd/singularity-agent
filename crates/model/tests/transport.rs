@@ -418,53 +418,23 @@ fn streaming_capability_is_bound_to_the_selected_protocol() {
 }
 
 #[test]
-fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
+fn openai_responses_stream_marks_retry_safety_around_first_text_delta() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream retry provider");
     let address = listener
         .local_addr()
         .expect("stream retry provider address");
     let server = thread::spawn(move || {
-        for attempt in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept stream retry request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            read_provider_request(&mut reader);
-            if attempt == 0 {
-                let body = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len() + 16,
-                    body
-                )
-                .expect("write truncated stream retry body");
-            } else {
-                let delta = serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "delta": "done"
-                });
-                let completed = serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": "response_retry",
-                        "object": "response",
-                        "status": "completed",
-                        "output": [{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "done"}]
-                        }]
-                    }
-                });
-                let body = format!(
-                    "event: response.output_text.delta\ndata: {delta}\n\nevent: response.completed\ndata: {completed}\n\n"
-                );
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
-                )
-                .expect("write successful stream retry body");
-            }
-        }
+        let (mut stream, _) = listener.accept().expect("accept stream retry request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        read_provider_request(&mut reader);
+        let body = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len() + 16,
+            body
+        )
+        .expect("write truncated stream body");
     });
     let provider = test_provider(provider_config_with_base_url(format!(
         "http://{address}/v1/responses"
@@ -475,42 +445,21 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     let mut events = Vec::new();
-    let response = provider
+    let error = provider
         .complete_stream(
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |event| events.push(event),
         )
-        .expect("retry before delta");
-    let metadata = response
+        .expect_err("the transport returns the first stream failure");
+    let metadata = error
         .provider_attempt_metadata
-        .expect("stream retry metadata");
-    assert_eq!(metadata.attempt_count, 2);
-    assert_eq!(metadata.retry_count, 1);
-    assert_eq!(metadata.occurrences.len(), 2);
-    assert_eq!(metadata.occurrences[0].attempt_index, 1);
-    assert_eq!(
-        metadata.occurrences[0].terminal_status,
-        ProviderAttemptStatus::Error
-    );
-    assert!(metadata.occurrences[0].retry_scheduled);
-    assert!(
-        metadata.occurrences[0]
-            .time_to_first_text_delta_ms
-            .is_none()
-    );
-    assert_eq!(metadata.occurrences[1].attempt_index, 2);
-    assert_eq!(
-        metadata.occurrences[1].terminal_status,
-        ProviderAttemptStatus::Ok
-    );
-    assert!(
-        metadata.occurrences[1]
-            .time_to_first_text_delta_ms
-            .is_some()
-    );
-    assert_eq!(events.len(), 1);
-    server.join().expect("join stream retry server");
+        .expect("stream attempt metadata");
+    assert!(error.automatic_retry_allowed);
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    assert_eq!(events.len(), 0);
+    server.join().expect("join stream server");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream no-retry provider");
     let address = listener
@@ -557,6 +506,7 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
     );
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
+    assert!(!error.automatic_retry_allowed);
     let [occurrence] = metadata.occurrences.as_slice() else {
         panic!("one post-delta occurrence expected");
     };
@@ -829,127 +779,59 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
 }
 
 #[test]
-fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
-    let success_body = r#"{
-        "id": "resp_retry",
-        "choices": [{
-            "message": {"role": "assistant", "content": "done"},
-            "finish_reason": "stop"
-        }]
-    }"#;
-    let (base_url, attempts) = sequence_response_server(vec![
-        ("HTTP/1.1 429 Too Many Requests", "{}"),
-        ("HTTP/1.1 503 Service Unavailable", "{}"),
-        ("HTTP/1.1 200 OK", success_body),
-    ]);
+fn openai_provider_returns_transient_http_error_after_one_attempt() {
+    let (base_url, attempts) =
+        sequence_response_server(vec![("HTTP/1.1 429 Too Many Requests", "{}")]);
     let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_retry",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
 
-    let response = provider
+    let error = provider
         .complete(&request, &singularity_core::CancellationToken::new())
-        .expect("provider response after bounded retries");
-    let metadata = response
-        .provider_attempt_metadata
-        .expect("attempt metadata");
+        .expect_err("transport owns exactly one HTTP attempt");
+    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
 
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(metadata.attempt_count, 3);
-    assert_eq!(metadata.retry_count, 2);
-    assert!(metadata.latency_ms >= 100);
-    assert_eq!(metadata.occurrences.len(), 3);
-    for (offset, occurrence) in metadata.occurrences.iter().enumerate() {
-        assert_eq!(occurrence.attempt_index, offset as u32 + 1);
-        assert_eq!(
-            occurrence.operation_phase,
-            ProviderAttemptOperationPhase::Completion
-        );
-        assert_eq!(
-            occurrence.actual_api_protocol,
-            ProviderApiProtocol::OpenAiChatCompletions
-        );
-        assert!(occurrence.request_send_to_headers_ms.is_some());
-        assert!(occurrence.queue_duration_ms.is_none());
-        assert!(occurrence.time_to_first_text_delta_ms.is_none());
-        assert!(occurrence.ended_at_unix_ms >= occurrence.started_at_unix_ms);
-        assert!(
-            occurrence.attempt_duration_ms
-                <= occurrence.ended_at_unix_ms - occurrence.started_at_unix_ms + 1
-        );
-    }
-    for occurrence in &metadata.occurrences[..2] {
-        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-        assert!(occurrence.retry_scheduled);
-        assert!(occurrence.retry_backoff_ms.is_some());
-        assert_eq!(
-            occurrence.error_stage,
-            Some(ProviderErrorStage::ResponseStatus)
-        );
-        assert_eq!(
-            occurrence.diagnostic_code.as_deref(),
-            Some("provider_http_status")
-        );
-        assert!(occurrence.usage.is_none());
-    }
-    let success = &metadata.occurrences[2];
-    assert_eq!(success.terminal_status, ProviderAttemptStatus::Ok);
-    assert!(!success.retry_scheduled);
-    assert!(success.error_category.is_none());
-    assert!(success.usage.is_none());
-    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(error.error.kind, ModelErrorKind::RateLimited);
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one HTTP attempt occurrence expected");
+    };
+    assert_eq!(occurrence.attempt_index, 1);
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert!(!occurrence.retry_scheduled);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
 }
 
 #[test]
-fn openai_provider_honors_retry_after_ms_before_retrying() {
-    let success_body = r#"{
-        "id": "resp_retry_header",
-        "choices": [{
-            "message": {"role": "assistant", "content": "done"},
-            "finish_reason": "stop"
-        }]
-    }"#;
-    let (base_url, attempts) = sequence_response_server_with_headers(vec![
-        (
-            "HTTP/1.1 429 Too Many Requests",
-            "{}",
-            "retry-after-ms: 200\r\nretry-after: 9\r\n",
-        ),
-        ("HTTP/1.1 200 OK", success_body, ""),
-    ]);
+fn openai_provider_carries_retry_after_to_the_caller() {
+    let (base_url, attempts) = sequence_response_server_with_headers(vec![(
+        "HTTP/1.1 429 Too Many Requests",
+        "{}",
+        "retry-after-ms: 200\r\nretry-after: 9\r\n",
+    )]);
     let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_retry_header",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
 
-    let response = provider
+    let error = provider
         .complete(&request, &singularity_core::CancellationToken::new())
-        .expect("provider response after header-directed retry");
-    let metadata = response
-        .provider_attempt_metadata
-        .expect("attempt metadata");
+        .expect_err("transport returns the first transient failure");
+    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
 
-    assert_eq!(metadata.retry_count, 1);
-    assert_eq!(metadata.occurrences[0].retry_backoff_ms, Some(200));
-    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(error.retry_after, Some(Duration::from_millis(200)));
+    assert_eq!(metadata.retry_count, 0);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
 }
 
 #[test]
-fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
-    let success_body = r#"{
-        "id": "resp_observed_retry",
-        "choices": [{
-            "message": {"role": "assistant", "content": "done"},
-            "finish_reason": "stop"
-        }]
-    }"#;
-    let (base_url, attempts) = sequence_response_server(vec![
-        ("HTTP/1.1 429 Too Many Requests", "{}"),
-        ("HTTP/1.1 503 Service Unavailable", "{}"),
-        ("HTTP/1.1 200 OK", success_body),
-    ]);
+fn openai_provider_observes_one_ordered_start_end_pair() {
+    let (base_url, attempts) =
+        sequence_response_server(vec![("HTTP/1.1 429 Too Many Requests", "{}")]);
     let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_observed_retry",
@@ -957,7 +839,7 @@ fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
     );
     let mut events = Vec::new();
 
-    let response = Provider::complete_observed(
+    let error = Provider::complete_observed(
         &provider,
         &request,
         &singularity_core::CancellationToken::new(),
@@ -966,26 +848,24 @@ fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
             true
         },
     )
-    .expect("provider response after observed retries");
+    .expect_err("one observed attempt returns its typed error");
 
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
-    assert_eq!(events.len(), 6);
-    for (offset, pair) in events.chunks_exact(2).enumerate() {
-        let ProviderAttemptEvent::Started(started) = &pair[0] else {
-            panic!("attempt must start before its terminal event");
-        };
-        let ProviderAttemptEvent::Finished(finished) = &pair[1] else {
-            panic!("attempt must finish before the next attempt starts");
-        };
-        assert_eq!(started.attempt_index, offset as u32 + 1);
-        assert_eq!(started.operation_phase, finished.operation_phase);
-        assert_eq!(started.provider_name, finished.provider_name);
-        assert_eq!(started.model_name, finished.model_name);
-        assert_eq!(started.actual_api_protocol, finished.actual_api_protocol);
-        assert_eq!(started.attempt_index, finished.attempt_index);
-        assert_eq!(started.started_at_unix_ms, finished.started_at_unix_ms);
-    }
+    assert_eq!(error.error.kind, ModelErrorKind::RateLimited);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
+    let [
+        ProviderAttemptEvent::Started(started),
+        ProviderAttemptEvent::Finished(finished),
+    ] = events.as_slice()
+    else {
+        panic!("one ordered start/end pair expected");
+    };
+    assert_eq!(started.attempt_index, 1);
+    assert_eq!(started.operation_phase, finished.operation_phase);
+    assert_eq!(started.provider_name, finished.provider_name);
+    assert_eq!(started.model_name, finished.model_name);
+    assert_eq!(started.actual_api_protocol, finished.actual_api_protocol);
+    assert_eq!(started.attempt_index, finished.attempt_index);
+    assert_eq!(started.started_at_unix_ms, finished.started_at_unix_ms);
 }
 
 #[test]
@@ -1026,7 +906,7 @@ fn openai_provider_rejects_observer_start_before_network_side_effect() {
 }
 
 #[test]
-fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
+fn openai_provider_uses_external_runtime_handle_for_http_body() {
     let success_body = r#"{
         "id": "resp_external_runtime",
         "choices": [{
@@ -1034,10 +914,7 @@ fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
             "finish_reason": "stop"
         }]
     }"#;
-    let (base_url, attempts) = sequence_response_server(vec![
-        ("HTTP/1.1 429 Too Many Requests", "{}"),
-        ("HTTP/1.1 200 OK", success_body),
-    ]);
+    let (base_url, attempts) = sequence_response_server(vec![("HTTP/1.1 200 OK", success_body)]);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1068,27 +945,25 @@ fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
             .provider_attempt_metadata
             .expect("attempt metadata")
             .attempt_count,
-        2
+        1
     );
-    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
     runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
+fn openai_provider_returns_body_transport_failure_after_one_attempt() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated provider");
     let address = listener.local_addr().expect("truncated provider address");
     let server = thread::spawn(move || {
-        for _ in 0..6 {
-            let (mut stream, _) = listener.accept().expect("accept provider retry");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
-            read_provider_request(&mut reader);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{}",
-                )
-                .expect("write truncated provider response");
-        }
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+        read_provider_request(&mut reader);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{}",
+            )
+            .expect("write truncated provider response");
     });
     let provider =
         test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
@@ -1107,33 +982,28 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
         error.error.stage,
         Some(ProviderErrorStage::ResponseBodyRead)
     );
-    assert_eq!(metadata.attempt_count, 6);
-    assert_eq!(metadata.retry_count, 5);
-    // Full Jitter samples each backoff independently from [0, window], so the
-    // summed wait is random; the window arithmetic is covered by the pure
-    // function unit tests. Keep a small floor that still fails if retries do
-    // not wait at all, without a statistically reachable flaky ceiling.
-    assert!(metadata.latency_ms >= 100);
-    assert_eq!(metadata.occurrences.len(), 6);
-    for (index, occurrence) in metadata.occurrences.iter().enumerate() {
-        assert_eq!(occurrence.attempt_index, index as u32 + 1);
-        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-        assert_eq!(
-            occurrence.error_stage,
-            Some(ProviderErrorStage::ResponseBodyRead)
-        );
-        assert_eq!(
-            occurrence.diagnostic_code.as_deref(),
-            Some("provider_response_body_read_failed")
-        );
-        assert_eq!(occurrence.retry_scheduled, index < 5);
-        assert!(occurrence.time_to_first_text_delta_ms.is_none());
-    }
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one failed attempt expected");
+    };
+    assert_eq!(occurrence.attempt_index, 1);
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert_eq!(
+        occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseBodyRead)
+    );
+    assert_eq!(
+        occurrence.diagnostic_code.as_deref(),
+        Some("provider_response_body_read_failed")
+    );
+    assert!(!occurrence.retry_scheduled);
+    assert!(occurrence.time_to_first_text_delta_ms.is_none());
     server.join().expect("join truncated provider");
 }
 
 #[test]
-fn openai_provider_records_each_send_failure_without_headers_or_sensitive_request_data() {
+fn openai_provider_records_send_failure_without_headers_or_sensitive_request_data() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused provider address");
     let address = listener.local_addr().expect("unused provider address");
     drop(listener);
@@ -1154,99 +1024,31 @@ fn openai_provider_records_each_send_failure_without_headers_or_sensitive_reques
         .provider_attempt_metadata
         .expect("send failure attempt metadata");
 
-    assert_eq!(metadata.attempt_count, 6);
-    assert_eq!(metadata.retry_count, 5);
-    assert_eq!(metadata.occurrences.len(), 6);
-    for (index, occurrence) in metadata.occurrences.iter().enumerate() {
-        assert_eq!(occurrence.attempt_index, index as u32 + 1);
-        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-        assert_eq!(occurrence.error_category, Some(ModelErrorCategory::Network));
-        assert_eq!(
-            occurrence.error_stage,
-            Some(ProviderErrorStage::RequestSend)
-        );
-        assert_eq!(
-            occurrence.diagnostic_code.as_deref(),
-            Some("provider_request_send_failed")
-        );
-        assert!(occurrence.request_send_to_headers_ms.is_none());
-        assert!(occurrence.time_to_first_text_delta_ms.is_none());
-        assert!(occurrence.queue_duration_ms.is_none());
-        assert!(occurrence.usage.is_none());
-        assert_eq!(occurrence.retry_scheduled, index < 5);
-    }
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one send failure occurrence expected");
+    };
+    assert_eq!(occurrence.attempt_index, 1);
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert_eq!(occurrence.error_category, Some(ModelErrorCategory::Network));
+    assert_eq!(
+        occurrence.error_stage,
+        Some(ProviderErrorStage::RequestSend)
+    );
+    assert_eq!(
+        occurrence.diagnostic_code.as_deref(),
+        Some("provider_request_send_failed")
+    );
+    assert!(occurrence.request_send_to_headers_ms.is_none());
+    assert!(occurrence.time_to_first_text_delta_ms.is_none());
+    assert!(occurrence.queue_duration_ms.is_none());
+    assert!(occurrence.usage.is_none());
+    assert!(!occurrence.retry_scheduled);
     let serialized = serde_json::to_string(&metadata).expect("serialize aggregate metadata");
     assert!(!serialized.contains("occurrences"));
     assert!(!serialized.contains("sensitive prompt marker"));
     assert!(!serialized.contains("test-key-placeholder"));
-}
-
-#[test]
-fn openai_provider_cancels_during_retry_backoff() {
-    let (base_url, attempts) =
-        sequence_response_server(vec![("HTTP/1.1 429 Too Many Requests", "{}")]);
-    let provider = test_provider(provider_test_config(base_url)).expect("provider");
-    let request = ModelTurnRequest::new(
-        "request_retry_cancel",
-        vec![ModelMessage::text(ModelRole::User, "hello")],
-    );
-    let cancellation = singularity_core::CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let (backoff_ready_tx, backoff_ready_rx) = mpsc::channel();
-    let (backoff_release_tx, backoff_release_rx) = mpsc::channel();
-    let (result_tx, result_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut backoff_release_rx = Some(backoff_release_rx);
-        let mut on_attempt = |event| {
-            if let ProviderAttemptEvent::Finished(occurrence) = event
-                && occurrence.retry_scheduled
-                && let Some(release_rx) = backoff_release_rx.take()
-            {
-                backoff_ready_tx
-                    .send(())
-                    .expect("send retry backoff signal");
-                release_rx.recv().expect("release retry backoff handshake");
-            }
-            true
-        };
-        result_tx
-            .send(Provider::complete_observed(
-                &provider,
-                &request,
-                &worker_cancellation,
-                &mut on_attempt,
-            ))
-            .expect("send provider result");
-    });
-
-    assert_eq!(attempts.recv_timeout(Duration::from_secs(1)), Ok(1));
-    backoff_ready_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("provider retry backoff was scheduled");
-    cancellation.cancel();
-    backoff_release_tx
-        .send(())
-        .expect("release retry backoff handshake");
-    let error = result_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("provider cancellation during backoff was bounded")
-        .expect_err("provider request cancelled");
-    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
-    let metadata = error
-        .provider_attempt_metadata
-        .expect("cancelled backoff attempt metadata");
-    let [occurrence] = metadata.occurrences.as_slice() else {
-        panic!("one failed attempt before cancelled backoff expected");
-    };
-    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-    assert!(occurrence.request_send_to_headers_ms.is_some());
-    assert!(occurrence.retry_scheduled);
-    assert_eq!(
-        occurrence.error_stage,
-        Some(ProviderErrorStage::ResponseStatus)
-    );
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 1);
 }
 
 #[test]
@@ -1281,6 +1083,7 @@ fn openai_provider_rejects_multiple_choices_without_retrying_or_selecting_one() 
     );
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
+    assert!(!error.automatic_retry_allowed);
 }
 
 #[test]

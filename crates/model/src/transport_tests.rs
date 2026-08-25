@@ -9,20 +9,17 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue};
 use singularity_core::CancellationToken;
 
-use super::{
-    full_jitter_delay_ms, provider_retry_backoff, retry_after_delay, retry_backoff_window_ms,
-};
+use super::retry_after_delay;
 use crate::error::{
     ModelErrorCategory, ModelErrorKind, ProviderErrorStage, ProviderTransportCategory,
 };
 use crate::provider::telemetry::ProviderAttemptStatus;
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, HTTP_STATUS_RATE_LIMITED,
-    HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_ATTEMPTS, ModelMessage, ModelRole, ModelToolCall,
-    ModelToolParseStatus, ModelTurnRequest, OpenAiProvider, OpenAiProviderConfig,
-    PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RETRY_MAX_BACKOFF_MS, Provider, ProviderApiProtocol,
-    ProviderConfigSource, ProviderReasoningReplay, ProviderToolReasoningMode, SelectedModel,
-    ThinkingWireFormat,
+    HTTP_STATUS_UNAUTHORIZED, MAX_RETRY_AFTER_MS, ModelMessage, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelTurnRequest, OpenAiProvider, OpenAiProviderConfig, Provider,
+    ProviderApiProtocol, ProviderConfigSource, ProviderReasoningReplay, ProviderToolReasoningMode,
+    SelectedModel, ThinkingWireFormat,
 };
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
@@ -159,7 +156,7 @@ fn retry_after_parser_prefers_milliseconds_and_accepts_seconds_and_http_date() {
     headers.remove("retry-after-ms");
     assert_eq!(
         retry_after_delay(&headers),
-        Some(Duration::from_secs(9).min(Duration::from_millis(PROVIDER_RETRY_MAX_BACKOFF_MS),))
+        Some(Duration::from_secs(9).min(Duration::from_millis(MAX_RETRY_AFTER_MS),))
     );
 
     headers.insert(
@@ -168,33 +165,7 @@ fn retry_after_parser_prefers_milliseconds_and_accepts_seconds_and_http_date() {
     );
     assert_eq!(
         retry_after_delay(&headers),
-        Some(Duration::from_millis(PROVIDER_RETRY_MAX_BACKOFF_MS)),
-    );
-}
-
-#[test]
-fn provider_retry_backoff_uses_full_jitter_window() {
-    for retry_count in 1..=6 {
-        let window = retry_backoff_window_ms(retry_count);
-        assert_eq!(
-            window,
-            (PROVIDER_RETRY_BASE_BACKOFF_MS.saturating_mul(1_u64 << (retry_count - 1)))
-                .min(PROVIDER_RETRY_MAX_BACKOFF_MS)
-        );
-        assert_eq!(full_jitter_delay_ms(retry_count, 0), 0);
-        assert_eq!(full_jitter_delay_ms(retry_count, window), window);
-        assert_eq!(full_jitter_delay_ms(retry_count, window + 1), 0);
-
-        let delay = provider_retry_backoff(retry_count);
-        assert!(
-            delay <= Duration::from_millis(window),
-            "retry {retry_count} produced {delay:?} outside full-jitter window"
-        );
-    }
-    assert_eq!(retry_backoff_window_ms(8), PROVIDER_RETRY_MAX_BACKOFF_MS);
-    assert_eq!(
-        retry_backoff_window_ms(u32::MAX),
-        PROVIDER_RETRY_MAX_BACKOFF_MS
+        Some(Duration::from_millis(MAX_RETRY_AFTER_MS)),
     );
 }
 
@@ -713,16 +684,14 @@ fn oversized_non_2xx_body_falls_back_to_status_classification() {
 fn unknown_structured_code_keeps_http_status_classification() {
     let (listener, base_url) = error_response_listener();
     let server = thread::spawn(move || {
-        for _ in 0..MAX_PROVIDER_ATTEMPTS {
-            let (mut stream, _) = listener.accept().expect("accept rate-limited request");
-            read_full_test_provider_request(&stream);
-            write_provider_error_response(
-                &mut stream,
-                "429 Too Many Requests",
-                "retry-after-ms: 0\r\n",
-                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
-            );
-        }
+        let (mut stream, _) = listener.accept().expect("accept rate-limited request");
+        read_full_test_provider_request(&stream);
+        write_provider_error_response(
+            &mut stream,
+            "429 Too Many Requests",
+            "retry-after-ms: 0\r\n",
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        );
     });
     let provider = test_provider(test_provider_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
@@ -732,7 +701,7 @@ fn unknown_structured_code_keeps_http_status_classification() {
 
     let error = provider
         .complete(&request, &CancellationToken::new())
-        .expect_err("rate-limited request must fail after bounded retries");
+        .expect_err("rate-limited request must return after one attempt");
 
     assert_eq!(error.error.kind, ModelErrorKind::RateLimited);
     assert_ne!(error.error.kind, ModelErrorKind::ContextLengthExceeded);
@@ -745,8 +714,8 @@ fn unknown_structured_code_keeps_http_status_classification() {
         .provider_attempt_metadata
         .as_ref()
         .expect("attempt metadata");
-    assert_eq!(metadata.attempt_count, MAX_PROVIDER_ATTEMPTS);
-    assert_eq!(metadata.retry_count, MAX_PROVIDER_ATTEMPTS - 1);
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
     server.join().expect("join rate-limited provider");
 }
 

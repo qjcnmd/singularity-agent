@@ -1,6 +1,7 @@
 use crate::provider::ProviderAttemptMetadata;
 use crate::provider::contract;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 /// 从模型提供方边界保留下来的具体失败类型。
@@ -141,6 +142,10 @@ pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
+    /// Provider-directed minimum delay before an automatic retry.
+    pub retry_after: Option<Duration>,
+    /// Whether a caller may automatically resend the same logical request.
+    pub automatic_retry_allowed: bool,
 }
 
 impl ProviderError {
@@ -150,12 +155,26 @@ impl ProviderError {
             message: error.message.clone(),
             error: Box::new(error),
             provider_attempt_metadata: None,
+            retry_after: None,
+            automatic_retry_allowed: true,
         }
     }
 
     /// 附加一次 provider attempt 的脱敏元数据。
     pub fn with_provider_attempt_metadata(mut self, metadata: ProviderAttemptMetadata) -> Self {
         self.provider_attempt_metadata = Some(metadata);
+        self
+    }
+
+    /// Preserve a provider-directed delay for the owning retry policy.
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
+    /// Mark a failure as unsafe to replay automatically.
+    pub fn without_automatic_retry(mut self) -> Self {
+        self.automatic_retry_allowed = false;
         self
     }
 }
