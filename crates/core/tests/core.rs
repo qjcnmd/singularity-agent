@@ -1,6 +1,6 @@
-//! core 公共类型、脱敏和 JSON-RPC 基础合同测试。
+//! core 公共类型和 JSON-RPC 基础合同测试。
 
-use singularity_core::{CancellationToken, ClientInfo, ErrorCode, contains_sensitive_text};
+use singularity_core::{CancellationToken, ClientInfo, ErrorCode};
 
 #[test]
 fn client_metadata_round_trips_as_json() {
@@ -12,30 +12,6 @@ fn client_metadata_round_trips_as_json() {
     assert_eq!(value["version"], "0.1.0");
 
     assert_eq!(ErrorCode::not_initialized().message(), "Not initialized");
-}
-
-#[test]
-fn sensitive_text_detects_common_secret_label_formats() {
-    for text in [
-        "X-API-Key: abcdefgh",
-        "api-key=abcdefgh",
-        "apikey=abcdefgh",
-        "token: abcdefgh",
-        "--api-key abcdefgh",
-        "--token abcdefgh",
-        "-----BEGIN PRIVATE KEY-----",
-        "-----BEGIN RSA PRIVATE KEY-----",
-        "-----BEGIN OPENSSH PRIVATE KEY-----",
-    ] {
-        assert!(contains_sensitive_text(text), "{text} should be sensitive");
-    }
-
-    assert!(!contains_sensitive_text(
-        "token count is 42 and token budget is 100"
-    ));
-    assert!(!contains_sensitive_text(
-        "at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:661:26)"
-    ));
 }
 
 #[test]

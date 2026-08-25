@@ -663,17 +663,12 @@ impl TurnRunner {
             let message = metadata_error
                 .as_deref()
                 .unwrap_or("failed to persist terminal failure state");
-            let safe_message = if singularity_core::contains_sensitive_text(message) {
-                "fatal storage error: failed to persist terminal metadata"
-            } else {
-                message
-            };
             sink.emit(TurnEvent::Diagnostic {
                 thread_id: session.session_id().to_string(),
                 turn_id: turn_id.to_string(),
                 severity: "error".to_string(),
                 code: "storage_fatal".to_string(),
-                message: safe_message.to_string(),
+                message: message.to_string(),
             });
             return Err(TurnRunError::Terminalization(failure));
         }
@@ -738,11 +733,6 @@ impl TurnRunner {
                 failure.cause.as_str()
             )
         });
-        let message = if singularity_core::contains_sensitive_text(&message) {
-            "Internal error".to_string()
-        } else {
-            message
-        };
         if !self.consume_terminal_event_failure("turn/error") {
             sink.emit(TurnEvent::TurnFailed {
                 turn: Turn {

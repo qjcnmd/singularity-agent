@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Response;
 use serde_json::Value;
-use singularity_core::{CancellationToken, contains_sensitive_text};
+use singularity_core::CancellationToken;
 
 use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
@@ -53,7 +53,7 @@ pub(crate) fn model_error_from_http_status(
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 附加到非 2xx 错误的 provider 诊断文本上界（字符数）。
 const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
-/// 诊断文本命中敏感内容或无法安全展示时的固定替代文案。
+/// 诊断文本包含当前请求凭据时的固定替代文案。
 const REDACTED_PROVIDER_ERROR_DIAGNOSTIC: &str =
     "provider error diagnostic withheld: it may contain credentials";
 
@@ -99,10 +99,11 @@ pub(crate) fn is_context_length_exceeded_code(code: Option<&str>) -> bool {
 }
 
 /// 有界单行 provider 诊断：控制字符与空白合并为单个空格后截断到上限。
-/// 先在全文上做敏感判定再截断，避免把密钥切成两半绕过检测；
-/// 命中 `contains_sensitive_text` 或包含调用方凭据值时整体替换为固定文案，
-/// 凭据绝不进入错误文本。
+/// 截断前精确匹配调用方凭据值；命中时整体替换，凭据绝不进入错误文本。
 pub(crate) fn bounded_provider_error_diagnostic(text: &str, credential: &str) -> String {
+    if !credential.is_empty() && text.contains(credential) {
+        return REDACTED_PROVIDER_ERROR_DIAGNOSTIC.to_string();
+    }
     let flattened: String = text
         .chars()
         .map(|character| {
@@ -117,10 +118,6 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str, credential: &str) ->
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ");
-    let credential_present = !credential.is_empty() && collapsed.contains(credential);
-    if credential_present || contains_sensitive_text(&collapsed) {
-        return REDACTED_PROVIDER_ERROR_DIAGNOSTIC.to_string();
-    }
     collapsed
         .chars()
         .take(MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS)

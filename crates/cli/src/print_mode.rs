@@ -5,7 +5,6 @@
 
 use std::io::Write;
 
-use singularity_core::contains_sensitive_text;
 use singularity_runtime::events::TurnEvent;
 
 pub struct PrintRenderer;
@@ -25,14 +24,9 @@ impl PrintRenderer {
         } = event
             && (severity == "warning" || severity == "error")
         {
-            let safe_message = if contains_sensitive_text(message) {
-                "Internal error"
-            } else {
-                message.as_str()
-            };
             let stderr = std::io::stderr();
             let mut lock = stderr.lock();
-            let _ = writeln!(lock, "sg: [{severity}] {code}: {safe_message}");
+            let _ = writeln!(lock, "sg: [{severity}] {code}: {message}");
             let _ = lock.flush();
         }
     }

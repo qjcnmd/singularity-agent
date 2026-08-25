@@ -358,8 +358,8 @@ fn bounded_line_reader_accepts_frame_at_limit() {
 }
 
 #[test]
-fn streaming_worker_maps_invalid_params_without_exposing_diagnostics() {
-    // 非敏感详情：流式 lane 与 ordinary lane 一致透出可行动的错误原因。
+fn streaming_worker_maps_invalid_params_with_diagnostics() {
+    // 流式 lane 与 ordinary lane 一致透出可行动的错误原因。
     let response = request_error_value(
         Some(JsonRpcId::Number(7)),
         &AppServerError::InvalidParams("invalid model selector: base-model#unknown".to_string()),
@@ -374,18 +374,18 @@ fn streaming_worker_maps_invalid_params_without_exposing_diagnostics() {
 }
 
 #[test]
-fn streaming_worker_redacts_sensitive_invalid_params() {
-    // 敏感文本命中敏感检测时回退为固定文案，不泄露可识别的凭据形态。
+fn streaming_worker_preserves_invalid_params_diagnostic() {
     let response = request_error_value(
         Some(JsonRpcId::Number(8)),
-        &AppServerError::InvalidParams("api_key=sk-1234567890abcdef".to_string()),
+        &AppServerError::InvalidParams("provider: unsupported selector".to_string()),
     );
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 8);
     assert_eq!(response["error"]["code"], -32602);
-    assert_eq!(response["error"]["message"], "Invalid params");
-    assert!(!response.to_string().contains("api_key"));
-    assert!(!response.to_string().contains("sk-1234567890abcdef"));
+    assert_eq!(
+        response["error"]["message"],
+        "provider: unsupported selector"
+    );
 }
 
 #[test]
@@ -397,11 +397,11 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
                 "locked by another process".to_string(),
             )),
         ),
-        ("provider unavailable", {
+        ("provider: unavailable", {
             AppServerError::TurnExecution {
                 stage: TurnFailureStage::AgentLoop,
                 cause: TurnFailureCause::Provider(ProviderFailureKind::Unknown),
-                original: Some("provider unavailable".to_string()),
+                original: Some("provider: unavailable".to_string()),
             }
         }),
         ("workspace error: write denied", {
@@ -551,15 +551,15 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
 }
 
 #[test]
-fn transport_error_redacts_sensitive_diagnostic_text() {
-    let error = AppServerError::Workspace(
-        "cannot open SINGULARITY_API_KEY=sk-shape must-not-leak".to_string(),
-    );
+fn transport_error_preserves_workspace_diagnostic_text() {
+    let error = AppServerError::Workspace("cannot open provider: local".to_string());
     let response = transport_error_value(Some(JsonRpcId::Number(7)), &error);
 
     assert_eq!(response["error"]["code"], -32603);
-    assert_eq!(response["error"]["message"], "Internal error");
-    assert!(!response.to_string().contains("sk-shape"));
+    assert_eq!(
+        response["error"]["message"],
+        "workspace error: cannot open provider: local"
+    );
 }
 
 #[test]

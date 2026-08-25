@@ -719,10 +719,10 @@ fn unknown_structured_code_keeps_http_status_classification() {
     server.join().expect("join rate-limited provider");
 }
 
-/// 错误体含密钥形状文本（与配置的 API key 同值）时，诊断整体替换为固定文案；
+/// 错误体含与配置 API key 精确相同的值时，诊断整体替换为固定文案；
 /// 凭据绝不能进入错误文本。
 #[test]
-fn secret_shaped_error_body_is_replaced_with_fixed_diagnostic() {
+fn configured_credential_in_error_body_is_replaced_with_fixed_diagnostic() {
     const CREDENTIAL_VALUE: &str = "sk-test-credential-value-123";
 
     let (listener, base_url) = error_response_listener();
@@ -762,7 +762,7 @@ fn secret_shaped_error_body_is_replaced_with_fixed_diagnostic() {
     server.join().expect("join secret error provider");
 }
 
-/// 401 + 结构化 message：保持 AuthError 分类，诊断保留有界短文本。
+/// 401 + 结构化 message：即使含普通 provider 标签，也保留有界短文本。
 #[test]
 fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
     let (listener, base_url) = error_response_listener();
@@ -773,7 +773,7 @@ fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
             &mut stream,
             "401 Unauthorized",
             "",
-            r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided."}}"#,
+            r#"{"error":{"code":"invalid_api_key","message":"provider: Incorrect API key provided."}}"#,
         );
     });
     let provider = test_provider(test_provider_config(base_url)).expect("provider");
@@ -797,7 +797,7 @@ fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
     assert!(
         error
             .message
-            .contains("Provider diagnostic: Incorrect API key provided.")
+            .contains("Provider diagnostic: provider: Incorrect API key provided.")
     );
     let metadata = error
         .provider_attempt_metadata

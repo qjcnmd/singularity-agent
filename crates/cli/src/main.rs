@@ -6,7 +6,6 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
-use singularity_core::contains_sensitive_text;
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 use singularity_runtime::objects::TurnStatus;
 
@@ -222,7 +221,7 @@ fn drain_print(
             TurnStatus::Interrupted => Ok(130),
             _ => Ok(1),
         },
-        Err(message) => Err(sanitize_message(Some(message))),
+        Err(message) => Err(message),
     }
 }
 
@@ -248,14 +247,7 @@ fn drain_json(
         Err(message) => {
             // 失败也必须以终态 summary 收尾，保证机器解析总能看到终态行。
             renderer.emit_summary(TurnStatus::Failed, None);
-            Err(sanitize_message(Some(message)))
+            Err(message)
         }
-    }
-}
-
-fn sanitize_message(original: Option<String>) -> String {
-    match original {
-        Some(message) if !contains_sensitive_text(&message) => message,
-        _ => "Internal error".to_string(),
     }
 }
