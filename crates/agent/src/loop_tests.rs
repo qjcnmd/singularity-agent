@@ -4,8 +4,7 @@ use crate::session::SessionEntryType;
 use serde_json::{Value, json};
 use singularity_model::{
     ModelMessage, ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
-    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderReasoningReplay,
-    ProviderStreamingCapability,
+    ProviderAttemptStarted, ProviderReasoningReplay, ProviderStreamingCapability,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -96,7 +95,6 @@ impl Provider for FakeProvider {
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let _ = on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            operation_phase: ProviderAttemptOperationPhase::Completion,
             provider_name: "fake".to_string(),
             model_name: "fake-model".to_string(),
             actual_api_protocol: ProviderApiProtocol::Declared,
@@ -747,7 +745,7 @@ fn session_file_roundtrip_after_run() {
         .unwrap();
     drop(agent);
 
-    let reopened = SessionManager::open(&file).unwrap();
+    let reopened = SessionManager::open_existing(&file).unwrap();
     let entries = reopened.build_context_entries().unwrap();
     let messages: Vec<&AgentMessage> = entries
         .iter()

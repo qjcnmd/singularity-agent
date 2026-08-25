@@ -79,7 +79,40 @@ impl SessionManager {
                 path.display()
             )));
         }
-        Self::open(path)
+        let file = path.to_path_buf();
+        let metadata = std::fs::symlink_metadata(&file)?;
+        if metadata.len() == 0 {
+            return Err(SessionError::InvalidSession(format!(
+                "Session file is empty and cannot be opened: {}",
+                file.display()
+            )));
+        }
+        let parsed = parse_session_lines(&file)?;
+        if parsed.entries.is_empty() {
+            return Err(SessionError::InvalidSession(format!(
+                "Session file is not a valid session: {}",
+                file.display()
+            )));
+        }
+        let header = &parsed.entries[0];
+        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
+        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
+        if !matches!(parsed.repair, TailRepair::None) {
+            rewrite_file(&file, &parsed.entries)?;
+        }
+        let cwd = header_cwd
+            .map(|cwd| normalize_abs_path(Path::new(&cwd)))
+            .transpose()?
+            .unwrap_or(std::env::current_dir()?);
+        let file_state = SessionFileState::capture(&file)?;
+        Ok(Self {
+            file,
+            cwd,
+            entries,
+            session_id,
+            header_timestamp,
+            file_state,
+        })
     }
 
     /// 为有界 discovery/index 重建打开既有 rollout。
@@ -128,54 +161,6 @@ impl SessionManager {
         })
     }
 
-    /// 打开会话文件：严格逐行解析。
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_unlocked(path)
-    }
-
-    fn open_unlocked(path: &Path) -> Result<Self> {
-        let file = path.to_path_buf();
-        let metadata = match std::fs::symlink_metadata(&file) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self::create_empty_at(&file);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.len() == 0 {
-            return Err(SessionError::InvalidSession(format!(
-                "Session file is empty and cannot be opened: {}",
-                file.display()
-            )));
-        }
-        let parsed = parse_session_lines(&file)?;
-        if parsed.entries.is_empty() {
-            return Err(SessionError::InvalidSession(format!(
-                "Session file is not a valid session: {}",
-                file.display()
-            )));
-        }
-        let header = &parsed.entries[0];
-        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
-        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
-        if !matches!(parsed.repair, TailRepair::None) {
-            rewrite_file(&file, &parsed.entries)?;
-        }
-        let cwd = header_cwd
-            .map(|cwd| normalize_abs_path(Path::new(&cwd)))
-            .transpose()?
-            .unwrap_or(std::env::current_dir()?);
-        let file_state = SessionFileState::capture(&file)?;
-        Ok(Self {
-            file,
-            cwd,
-            entries,
-            session_id,
-            header_timestamp,
-            file_state,
-        })
-    }
-
     fn open_read_only(path: &Path) -> Result<Self> {
         let file = path.to_path_buf();
         let metadata = std::fs::symlink_metadata(&file)?;
@@ -208,35 +193,6 @@ impl SessionManager {
             entries,
             session_id,
             header_timestamp,
-            file_state,
-        })
-    }
-
-    fn create_empty_at(file: &Path) -> Result<Self> {
-        let cwd = std::env::current_dir()?;
-        let session_id = Uuid::now_v7().to_string();
-        let timestamp = now_iso();
-        let header = json!({
-            "type": "session",
-            "version": CURRENT_SESSION_VERSION,
-            "id": session_id,
-            "timestamp": timestamp,
-            "cwd": normalize_cwd_string(&cwd),
-        });
-        let mut handle = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file)?;
-        writeln!(handle, "{}", serde_json::to_string(&header)?)?;
-        handle.flush()?;
-        let file_state = SessionFileState::capture(file)?;
-        Ok(Self {
-            file: file.to_path_buf(),
-            cwd,
-            entries: Vec::new(),
-            session_id,
-            header_timestamp: timestamp,
             file_state,
         })
     }

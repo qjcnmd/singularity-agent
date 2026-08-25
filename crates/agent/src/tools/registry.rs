@@ -67,7 +67,7 @@ pub struct ToolSpec {
     pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
-/// 名称 → 工具规格的注册表；`new()` 注册默认工具集（read/bash/edit/write）。
+/// 名称 → 工具规格的注册表；`new()` 注册默认工具集（read/glob/grep/bash/edit/write）。
 #[derive(Debug, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<&'static str, ToolSpec>,

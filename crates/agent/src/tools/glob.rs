@@ -108,14 +108,16 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     };
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
-    let _ = walk_files(&root, &mut |relative| {
+    if let Err(error) = walk_files(&root, &mut |relative| {
         if regex.is_match(&display_path(&relative)) {
             total_matches += 1;
             if matches.len() < MAX_MATCHES {
                 matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
             }
         }
-    });
+    }) {
+        return error_result(format!("failed to walk {path}: {error}"));
+    }
     matches.sort();
     let mut content = matches.join("\n");
     let truncated = total_matches > MAX_MATCHES;

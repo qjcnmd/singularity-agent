@@ -57,8 +57,8 @@ fn is_retryable_provider_error(error: &ProviderError) -> bool {
         )
 }
 
-/// 指数退避 + ±10% 抖动（Codex `retry.rs` 同款范围；确定性伪随机避免新增依赖）。
-/// 抖动因子在 0.9~1.0 之间，由 attempt 派生，保证同一 attempt 的等待时间可复现。
+/// 指数退避 + ±10% 确定性抖动（Codex `retry.rs` 同款范围；由 attempt
+/// 派生的 21 步周期伪随机，避免随机依赖并使同一 attempt 可复现）。
 fn retry_delay_ms(
     base_delay_ms: u64,
     attempt: u32,
@@ -68,7 +68,8 @@ fn retry_delay_ms(
         return retry_after.as_millis().min(u128::from(u64::MAX)) as u64;
     }
     let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
-    let jitter = 0.9 + (u64::from(attempt) * 37 % 21) as f64 / 105.0;
+    // 抖动因子 ∈ [0.90, 1.10)。
+    let jitter = 0.9 + (u64::from(attempt) * 37 % 21) as f64 / 100.0;
     (base as f64 * jitter) as u64
 }
 
@@ -580,10 +581,7 @@ impl Agent {
             // 内层循环：工具调用与 steer 注入。
             loop {
                 if cancellation.is_cancelled() {
-                    outcome.terminal_reason = AgentTerminalReason::Aborted;
-                    outcome.usage_complete = false;
-                    lock_inbox(&self.inbox).close();
-                    return Ok(outcome);
+                    return self.abort_outcome(outcome);
                 }
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文）。
                 let steer_messages = lock_inbox(&self.inbox).drain();
@@ -613,10 +611,11 @@ impl Agent {
                 let compaction_tokens =
                     previous_context_tokens.take().unwrap_or(assembled_estimate);
                 if self.compaction.should_compact(compaction_tokens, &budget) {
-                    match self.compaction.compact(
+                    match self.compaction.compact_with_reason(
                         &mut self.session,
                         &budget,
                         compaction_tokens,
+                        CompactionReason::Threshold,
                         cancellation,
                     ) {
                         Ok(result) => {
@@ -704,10 +703,7 @@ impl Agent {
                                 ),
                             );
                             if !sleep_abortable(delay_ms, cancellation) {
-                                outcome.terminal_reason = AgentTerminalReason::Aborted;
-                                outcome.usage_complete = false;
-                                lock_inbox(&self.inbox).close();
-                                return Ok(outcome);
+                                return self.abort_outcome(outcome);
                             }
                             continue;
                         }
@@ -814,10 +810,7 @@ impl Agent {
                         }
                     }
                     if cancellation.is_cancelled() {
-                        outcome.terminal_reason = AgentTerminalReason::Aborted;
-                        outcome.usage_complete = false;
-                        lock_inbox(&self.inbox).close();
-                        return Ok(outcome);
+                        return self.abort_outcome(outcome);
                     }
                     continue;
                 }
@@ -906,6 +899,16 @@ impl Agent {
     fn assembled_context_estimate(&self) -> Result<u64> {
         let capabilities = self.provider.protocol_contract();
         let tools = self.tool_schemas(&capabilities);
+        let (messages, replays) = self.assemble_messages()?;
+        let max_output_tokens =
+            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
+        Ok(self.estimate_assembled(&messages, &tools, &replays, max_output_tokens))
+    }
+
+    /// 上下文装配的单一 seam：指令消息 + compaction 感知会话历史 + reasoning
+    /// replay 只在此一次完成。`build_request` 与 `assembled_context_estimate`
+    /// 共用同一份装配成品，防止请求与估算各拼一遍产生不一致。
+    fn assemble_messages(&self) -> Result<(Vec<ModelMessage>, Vec<ProviderReasoningReplay>)> {
         let entries = self.session.build_context_entries()?;
         let replays = self.reasoning_replays_from_entries(&entries);
         let mut messages = Vec::with_capacity(entries.len() + 1);
@@ -913,9 +916,7 @@ impl Agent {
             messages.push(instruction);
         }
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
-        let max_output_tokens =
-            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        Ok(self.estimate_assembled(&messages, &tools, &replays, max_output_tokens))
+        Ok((messages, replays))
     }
 
     /// 对本轮装配结果做保守 Token 估算，供首轮或 provider usage 缺失时
@@ -971,17 +972,7 @@ impl Agent {
         max_output_tokens: u32,
         turn: u32,
     ) -> Result<(ModelTurnRequest, u64)> {
-        let entries = self.session.build_context_entries()?;
-        let context_messages = entries
-            .iter()
-            .flat_map(entry_to_llm_messages)
-            .collect::<Vec<_>>();
-        let replays = self.reasoning_replays_from_entries(&entries);
-        let mut messages = Vec::with_capacity(context_messages.len() + 1);
-        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
-            messages.push(instruction);
-        }
-        messages.extend(context_messages);
+        let (messages, replays) = self.assemble_messages()?;
         let assembled_estimate =
             self.estimate_assembled(&messages, tools, &replays, max_output_tokens);
         let mut request = ModelTurnRequest::new(
@@ -1158,17 +1149,24 @@ impl Agent {
         }
     }
 
+    /// 取消/中止的收敛出口：标记中止原因并关闭 inbox（消费者因此退出），
+    /// 返回带中止语义的 outcome。循环内所有取消分支共用此出口。
+    fn abort_outcome(&self, mut outcome: AgentOutcome) -> Result<AgentOutcome> {
+        outcome.terminal_reason = AgentTerminalReason::Aborted;
+        outcome.usage_complete = false;
+        lock_inbox(&self.inbox).close();
+        Ok(outcome)
+    }
+
     fn fail_after_progress(
         &self,
         error: AgentError,
-        mut outcome: AgentOutcome,
+        outcome: AgentOutcome,
     ) -> Result<AgentOutcome> {
         if is_cancelled_agent_error(&error) {
-            outcome.terminal_reason = AgentTerminalReason::Aborted;
-            outcome.usage_complete = false;
-            lock_inbox(&self.inbox).close();
-            return Ok(outcome);
+            return self.abort_outcome(outcome);
         }
+        let mut outcome = outcome;
         outcome.terminal_reason = AgentTerminalReason::Failed;
         outcome.usage_complete = false;
         lock_inbox(&self.inbox).close();
@@ -1203,25 +1201,10 @@ fn is_context_overflow_error(error: &ModelError) -> bool {
 
 /// 逐轮聚合 provider 返回的真实 token/cache usage。
 fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
-    aggregate_usage(&mut outcome.usage, response);
+    outcome.usage.merge(response);
     if !response.usage_present {
         outcome.usage_complete = false;
     }
-}
-
-fn aggregate_usage(aggregate: &mut ModelUsage, response: &ModelUsage) {
-    aggregate.input_tokens = aggregate.input_tokens.saturating_add(response.input_tokens);
-    aggregate.output_tokens = aggregate
-        .output_tokens
-        .saturating_add(response.output_tokens);
-    aggregate.total_tokens = aggregate.total_tokens.saturating_add(response.total_tokens);
-    aggregate.cached_input_tokens = aggregate
-        .cached_input_tokens
-        .saturating_add(response.cached_input_tokens);
-    aggregate.reasoning_tokens = aggregate
-        .reasoning_tokens
-        .saturating_add(response.reasoning_tokens);
-    aggregate.usage_present |= response.usage_present;
 }
 
 fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
@@ -1234,7 +1217,7 @@ fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
         return;
     };
     outcome.compacted = true;
-    aggregate_usage(&mut outcome.usage, usage);
+    outcome.usage.merge(usage);
     outcome.usage_complete &= *usage_complete;
 }
 

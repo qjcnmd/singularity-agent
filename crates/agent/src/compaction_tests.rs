@@ -189,7 +189,13 @@ fn compact_full_flow_and_reopen_slicing() {
     let (mut engine, mock) = mock_engine(vec!["## Goal\nsummary of history".to_string()]);
     let budget = budget(100_000, 4_000);
     let outcome = engine
-        .compact(&mut session, &budget, 90_001, &CancellationToken::new())
+        .compact_with_reason(
+            &mut session,
+            &budget,
+            90_001,
+            CompactionReason::Threshold,
+            &CancellationToken::new(),
+        )
         .unwrap();
     assert_eq!(
         outcome,
@@ -204,7 +210,13 @@ fn compact_full_flow_and_reopen_slicing() {
     // 未触发 → NotNeeded。
     assert_eq!(
         engine
-            .compact(&mut session, &budget, 10_000, &CancellationToken::new())
+            .compact_with_reason(
+                &mut session,
+                &budget,
+                10_000,
+                CompactionReason::Threshold,
+                &CancellationToken::new()
+            )
             .unwrap(),
         CompactionOutcome::NotNeeded
     );
@@ -239,7 +251,7 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["details"]["modifiedFiles"], json!([]));
 
     // 重开：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，旧消息被摘要取代。
-    let reopened = SessionManager::open(session.path()).unwrap();
+    let reopened = SessionManager::open_existing(session.path()).unwrap();
     let ctx = reopened.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(ctx_ids.len(), 4);
@@ -266,7 +278,13 @@ fn compact_full_flow_and_reopen_slicing() {
         .unwrap();
     let (mut engine, mock) = mock_engine(vec!["## Goal\nupdated summary".to_string()]);
     let outcome = engine
-        .compact(&mut session, &budget, 90_001, &CancellationToken::new())
+        .compact_with_reason(
+            &mut session,
+            &budget,
+            90_001,
+            CompactionReason::Threshold,
+            &CancellationToken::new(),
+        )
         .unwrap();
     assert_eq!(
         outcome,
@@ -292,7 +310,7 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["firstKeptEntryId"], id_u2);
     // 文件列表从历史 details 累积。
     assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
-    let reopened = SessionManager::open(session.path()).unwrap();
+    let reopened = SessionManager::open_existing(session.path()).unwrap();
     let ctx = reopened.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(
@@ -317,14 +335,26 @@ fn compact_nothing_to_summarize() {
     let cfg = budget(100_000, 1_000_000);
     assert_eq!(
         engine
-            .compact(&mut session, &cfg, 90_000, &CancellationToken::new())
+            .compact_with_reason(
+                &mut session,
+                &cfg,
+                90_000,
+                CompactionReason::Threshold,
+                &CancellationToken::new()
+            )
             .unwrap(),
         CompactionOutcome::NotNeeded
     );
     assert!(mock.requests().is_empty(), "不应发起摘要调用");
     // 再次 compact：仍然没有新内容，不产生 compaction 条目。
     let _ = engine
-        .compact(&mut session, &cfg, 90_000, &CancellationToken::new())
+        .compact_with_reason(
+            &mut session,
+            &cfg,
+            90_000,
+            CompactionReason::Threshold,
+            &CancellationToken::new(),
+        )
         .unwrap();
     let content = std::fs::read_to_string(session.path()).unwrap();
     let lines: Vec<&str> = content.lines().skip(1).collect();
@@ -381,7 +411,7 @@ fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
     assert!(!prompt.contains("ffff"), "摘要不得包含当前轮工具结果");
 
     // 重开：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult 成对保留。
-    let reopened = SessionManager::open(session.path()).unwrap();
+    let reopened = SessionManager::open_existing(session.path()).unwrap();
     let ctx = reopened.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(ctx_ids.len(), 4);

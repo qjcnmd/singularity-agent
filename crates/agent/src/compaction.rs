@@ -12,7 +12,7 @@
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。
 //! 4. **持久化落盘**（`SessionManager::append_compaction`）：将生成的 `CompactionEntry` 写入会话文件，
-//!    后续上下文构建（`build_session_context`）即可基于最新压缩节点快速重建。
+//!    `build_context_entries` 即可基于最新压缩节点快速重建上下文。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -210,16 +210,6 @@ impl CompactionBudget {
     }
 }
 
-/// 摘要产物：结构化摘要文本以及跨轮次累积读取与修改的文件列表。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompactionSummary {
-    pub text: String,
-    pub read_files: Vec<String>,
-    pub modified_files: Vec<String>,
-    pub usage: ModelUsage,
-    pub usage_complete: bool,
-}
-
 /// `compact` 入口的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
@@ -304,11 +294,8 @@ impl CompactionEngine {
 
     /// 在给定的会话条目列表中查找安全切点，返回保留区域起始条目的索引。
     /// 若条目为空则返回 `None`。
-    pub fn find_cut_point(
-        &self,
-        entries: &[SessionEntry],
-        budget: &CompactionBudget,
-    ) -> Option<usize> {
+    #[cfg(test)]
+    fn find_cut_point(&self, entries: &[SessionEntry], budget: &CompactionBudget) -> Option<usize> {
         if entries.is_empty() {
             return None;
         }
@@ -365,51 +352,27 @@ impl CompactionEngine {
 
     /// 调用模型生成或更新会话结构化摘要。
     ///
-    /// 对话内容使用 `<conversation>` 标签包裹；若存在历史摘要，则放入 `<previous-summary>` 标签中
-    /// 并使用 UPDATE 模板引导模型进行增量合并。支持通过取消信号提前终止。
-    pub fn generate_summary(
+    /// 对话内容使用 `<conversation>` 标签包裹；若存在历史摘要，则把其文本放入
+    /// `<previous-summary>` 标签并使用 UPDATE 模板引导模型进行增量合并。
+    /// 支持通过取消信号提前终止。
+    fn generate_summary(
         &self,
         conversation: &str,
-        previous: Option<&CompactionSummary>,
+        previous_text: Option<&str>,
         cancellation: &CancellationToken,
-    ) -> Result<CompactionSummary> {
+    ) -> Result<SummaryResponse> {
         let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
-        if let Some(previous) = previous {
+        if let Some(previous_text) = previous_text {
             prompt.push_str(&format!(
-                "<previous-summary>\n{}\n</previous-summary>\n\n",
-                previous.text
+                "<previous-summary>\n{previous_text}\n</previous-summary>\n\n"
             ));
         }
-        prompt.push_str(if previous.is_some() {
+        prompt.push_str(if previous_text.is_some() {
             UPDATE_SUMMARIZATION_PROMPT
         } else {
             SUMMARIZATION_PROMPT
         });
-        let result = self.complete_summarization(&prompt, "summarization failed", cancellation)?;
-        Ok(CompactionSummary {
-            text: result.text,
-            read_files: Vec::new(),
-            modified_files: Vec::new(),
-            usage: result.usage,
-            usage_complete: result.usage_complete,
-        })
-    }
-
-    /// 执行会话压缩全流程：触发检查 -> 计算切点 -> 生成摘要与提取文件操作 -> 写入 CompactionEntry。
-    pub fn compact(
-        &mut self,
-        session: &mut SessionManager,
-        budget: &CompactionBudget,
-        usage_or_estimate: u64,
-        cancellation: &CancellationToken,
-    ) -> Result<CompactionOutcome> {
-        self.compact_with_reason(
-            session,
-            budget,
-            usage_or_estimate,
-            CompactionReason::Threshold,
-            cancellation,
-        )
+        self.complete_summarization(&prompt, "summarization failed", cancellation)
     }
 
     /// 执行一次带显式原因的压缩。ContextOverflow 与 Manual 绕过阈值判定，
@@ -477,34 +440,21 @@ impl CompactionEngine {
             return Ok(CompactionOutcome::NotNeeded);
         }
         let first_kept_entry_id = entries[cut.first_kept_entry_index].id.clone();
-        // 获取前次摘要（包含文本与累积文件清单），用于增量更新与文件合并。
-        let previous = match &entries[0].entry_type {
+        // 从被压缩消息和上一代摘要的 details 中累积文件读取与修改清单。
+        let mut file_ops = FileOps::default();
+        let previous_text = match &entries[0].entry_type {
             SessionEntryType::Compaction(comp) => {
                 let (read_files, modified_files) = file_lists_from_details(comp.details.as_ref());
-                Some(CompactionSummary {
-                    text: comp.summary.clone(),
-                    read_files,
-                    modified_files,
-                    usage: comp.usage.clone().unwrap_or_default(),
-                    usage_complete: comp
-                        .usage
-                        .as_ref()
-                        .map(|usage| usage.usage_present)
-                        .unwrap_or(false),
-                })
+                for file in read_files {
+                    file_ops.read.insert(file);
+                }
+                for file in modified_files {
+                    file_ops.edited.insert(file);
+                }
+                Some(comp.summary.clone())
             }
             _ => None,
         };
-        // 从被压缩消息和历史记录中累积文件读取与修改清单。
-        let mut file_ops = FileOps::default();
-        if let Some(previous) = &previous {
-            for file in &previous.read_files {
-                file_ops.read.insert(file.clone());
-            }
-            for file in &previous.modified_files {
-                file_ops.edited.insert(file.clone());
-            }
-        }
         for message in messages_to_summarize
             .iter()
             .chain(turn_prefix_messages.iter())
@@ -515,49 +465,33 @@ impl CompactionEngine {
 
         let mut summary_usage = ModelUsage::default();
         let mut summary_usage_complete = true;
+        // 历史摘要只写一份（无历史时以占位文本表达）；split-turn 前缀摘要
+        // 是其后可选的一个追加步骤，不复制第二份摘要调用流程。
+        let summary_text = if messages_to_summarize.is_empty() {
+            NO_PRIOR_HISTORY.to_string()
+        } else {
+            let summary = self.generate_summary(
+                &self.serialize_conversation(&messages_to_summarize),
+                previous_text.as_deref(),
+                cancellation,
+            )?;
+            summary_usage.merge(&summary.usage);
+            summary_usage_complete &= summary.usage_complete;
+            summary.text
+        };
         let mut summary_text = if cut.is_split_turn && !turn_prefix_messages.is_empty() {
-            // Split Turn 场景：历史记录与超长轮前缀分别摘要后进行组合。
-            let history_text = if messages_to_summarize.is_empty() {
-                NO_PRIOR_HISTORY.to_string()
-            } else {
-                let summary = self.generate_summary(
-                    &self.serialize_conversation(&messages_to_summarize),
-                    previous.as_ref(),
-                    cancellation,
-                )?;
-                merge_compaction_usage(
-                    &mut summary_usage,
-                    &mut summary_usage_complete,
-                    &summary.usage,
-                    summary.usage_complete,
-                );
-                summary.text
-            };
             let prefix = self.generate_turn_prefix_summary(
                 &self.serialize_conversation(&turn_prefix_messages),
                 cancellation,
             )?;
-            merge_compaction_usage(
-                &mut summary_usage,
-                &mut summary_usage_complete,
-                &prefix.usage,
-                prefix.usage_complete,
-            );
-            let turn_prefix_text = prefix.text;
-            format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_text}")
+            summary_usage.merge(&prefix.usage);
+            summary_usage_complete &= prefix.usage_complete;
+            format!(
+                "{summary_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+                prefix.text
+            )
         } else {
-            let summary = self.generate_summary(
-                &self.serialize_conversation(&messages_to_summarize),
-                previous.as_ref(),
-                cancellation,
-            )?;
-            merge_compaction_usage(
-                &mut summary_usage,
-                &mut summary_usage_complete,
-                &summary.usage,
-                summary.usage_complete,
-            );
-            summary.text
+            summary_text
         };
         summary_text.push_str(&format_file_operations(&read_files, &modified_files));
 
@@ -732,25 +666,6 @@ struct SummaryResponse {
     text: String,
     usage: ModelUsage,
     usage_complete: bool,
-}
-
-fn merge_compaction_usage(
-    aggregate: &mut ModelUsage,
-    complete: &mut bool,
-    usage: &ModelUsage,
-    usage_complete: bool,
-) {
-    aggregate.input_tokens = aggregate.input_tokens.saturating_add(usage.input_tokens);
-    aggregate.output_tokens = aggregate.output_tokens.saturating_add(usage.output_tokens);
-    aggregate.total_tokens = aggregate.total_tokens.saturating_add(usage.total_tokens);
-    aggregate.cached_input_tokens = aggregate
-        .cached_input_tokens
-        .saturating_add(usage.cached_input_tokens);
-    aggregate.reasoning_tokens = aggregate
-        .reasoning_tokens
-        .saturating_add(usage.reasoning_tokens);
-    aggregate.usage_present |= usage.usage_present;
-    *complete &= usage_complete;
 }
 
 /// 基于 UTF-16 字符数的启发式 Token 估算函数（`ceil(chars / 4)`）。

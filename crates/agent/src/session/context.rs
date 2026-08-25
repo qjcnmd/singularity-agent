@@ -4,7 +4,6 @@ use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseSt
 
 use crate::message::{
     AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
-    LlmMessage,
 };
 
 use super::format::{Result, SessionEntry, SessionEntryType};
@@ -40,18 +39,9 @@ impl SessionManager {
         context.extend_from_slice(&self.entries[compaction_index + 1..]);
         Ok(context)
     }
-
-    /// 构建发送给 LLM 的会话上下文消息序列。
-    pub fn build_session_context(&self) -> Result<Vec<LlmMessage>> {
-        Ok(self
-            .build_context_entries()?
-            .iter()
-            .flat_map(entry_to_llm_messages)
-            .collect())
-    }
 }
 
-pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<LlmMessage> {
+pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
     match &entry.entry_type {
         SessionEntryType::Message(message) => match message.role {
             AgentMessageRole::User => {

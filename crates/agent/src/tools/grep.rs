@@ -107,7 +107,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let mut output = String::new();
     let mut matches = 0usize;
     let mut scanned_files = 0usize;
-    let _ = walk_files(&root, &mut |relative| {
+    if let Err(error) = walk_files(&root, &mut |relative| {
         if matches >= MAX_MATCHES {
             return;
         }
@@ -162,7 +162,9 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             }
             line_bytes.clear();
         }
-    });
+    }) {
+        return error_result(format!("failed to walk {path}: {error}"));
+    }
     if matches >= MAX_MATCHES {
         output.push_str(&format!(
             "\n[grep] results truncated at {MAX_MATCHES} matches; narrow the pattern or include filter."

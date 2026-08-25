@@ -110,7 +110,7 @@ pub fn truncate_tail(content: &str) -> Truncation {
 }
 
 /// 从行尾截断到 `max_bytes` 字节内（保持 UTF-8 字符完整）。
-fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
     if line.len() <= max_bytes {
         return line.to_string();
     }

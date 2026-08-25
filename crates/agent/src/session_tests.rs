@@ -88,7 +88,7 @@ fn create_append_reopen_roundtrip() {
     assert_eq!(file_name, format!("{header_id}.jsonl"));
     drop(manager);
 
-    let opened = SessionManager::open(&file).unwrap();
+    let opened = SessionManager::open_existing(&file).unwrap();
     assert_eq!(opened.entries().last().expect("content entry").id, leaf);
     let entries = opened.build_context_entries().unwrap();
     assert_eq!(entry_ids(&entries), vec![id1, id2, id3]);
@@ -111,7 +111,7 @@ fn empty_existing_session_file_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("empty.jsonl");
     std::fs::write(&file, b"").unwrap();
-    let result = SessionManager::open(&file);
+    let result = SessionManager::open_existing(&file);
     assert!(
         matches!(result, Err(SessionError::InvalidSession(_))),
         "empty session file must fail closed"
@@ -131,7 +131,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
 
     // 单写者语义下，写者交接必须经重开（drop 后再 open），同一时刻至多一个
     // 存活的写者。后续 owner 追加 metadata，再后续 owner 继续追加消息。
-    let mut settings_writer = SessionManager::open(&file).unwrap();
+    let mut settings_writer = SessionManager::open_existing(&file).unwrap();
     let s1 = settings_writer
         .append_metadata(
             SessionMetadata::thread_settings("openai", "test-model", Some("high".to_string()))
@@ -139,11 +139,11 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
         )
         .unwrap();
     drop(settings_writer);
-    let mut turn_worker = SessionManager::open(&file).unwrap();
+    let mut turn_worker = SessionManager::open_existing(&file).unwrap();
     let m3 = turn_worker.append_message(user("third")).unwrap();
 
     // 重开从 JSONL 重建完整线性链。
-    let reopened = SessionManager::open(&file).unwrap();
+    let reopened = SessionManager::open_existing(&file).unwrap();
     let entries = reopened.build_context_entries().unwrap();
     assert_eq!(
         entry_ids(&entries),

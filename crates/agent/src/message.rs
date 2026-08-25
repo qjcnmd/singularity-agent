@@ -4,9 +4,6 @@
 //! 以及工具执行结果 `ToolResult`，确保单次模型交互的完整语义（含推理过程与多工具调用）
 //! 能够精确持久化与协议重放。
 
-/// 交由模型提供方执行的模型层消息类型别名。
-pub type LlmMessage = singularity_model::ModelMessage;
-
 use singularity_model::{ModelStopReason, ModelTurnResponse, ProviderReasoningReplay};
 
 use crate::tools::ToolExecution;

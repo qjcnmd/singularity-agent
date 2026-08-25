@@ -625,9 +625,9 @@ impl Utf8Decoder {
 }
 
 fn sanitize_decoded_output(text: &str) -> String {
+    // 保留制表符与换行，剔除其余控制字符（含 CRLF 的 \r，行尾由换行重建）。
     text.chars()
-        .filter(|character| matches!(character, '\t' | '\n' | '\r') || (*character as u32) > 0x1f)
-        .filter(|&character| character != '\r')
+        .filter(|character| matches!(character, '\t' | '\n') || (*character as u32) > 0x1f)
         .collect()
 }
 
@@ -912,16 +912,10 @@ struct BashProgress {
     note: Option<String>,
 }
 
-/// 保留字符串最后 `max_bytes` 字节（截到 UTF-8 字符边界，原地操作）。
+/// 保留字符串最后 `max_bytes` 字节（截到 UTF-8 字符边界）；与 truncate 模块
+/// 共用同一实现，避免两份 UTF-8 边界回退副本。
 fn trim_to_last_bytes(text: &mut String, max_bytes: usize) {
-    if text.len() <= max_bytes {
-        return;
-    }
-    let mut start = text.len() - max_bytes;
-    while start < text.len() && (text.as_bytes()[start] & 0b1100_0000) == 0b1000_0000 {
-        start += 1;
-    }
-    text.drain(..start);
+    *text = super::truncate::truncate_string_to_bytes_from_end(text, max_bytes);
 }
 
 #[cfg(test)]
