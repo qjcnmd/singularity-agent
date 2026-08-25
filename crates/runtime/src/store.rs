@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use singularity_agent::session::{SessionManager, SessionMetadataKind};
+use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_core::user_singularity_home;
 use uuid::Uuid;
 
@@ -127,9 +127,10 @@ pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
             continue;
         };
         let title = session.metadata_entries().iter().rev().find_map(|entry| {
-            (entry.kind() == SessionMetadataKind::ThreadName)
-                .then(|| entry.field_string("name").map(str::to_string))
-                .flatten()
+            let SessionMetadata::ThreadName { name } = entry else {
+                return None;
+            };
+            Some(name.clone())
         });
         let turn_count = session
             .metadata_entries()
@@ -139,8 +140,10 @@ pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
         let total_tokens = session
             .metadata_entries()
             .iter()
-            .filter(|entry| entry.kind() == SessionMetadataKind::Usage)
-            .filter_map(|entry| entry.field("usage"))
+            .filter_map(|entry| match entry {
+                SessionMetadata::Usage { usage, .. } => Some(usage),
+                _ => None,
+            })
             .filter_map(|usage| usage.get("totalTokens").and_then(serde_json::Value::as_u64))
             .sum();
         threads.push(ThreadSummary {
@@ -178,19 +181,20 @@ pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result
 /// 从最新 `thread_settings` metadata 投影模型 selector（含推理档位段）。
 pub fn persisted_model_selector(session: &SessionManager) -> Option<String> {
     session.metadata_entries().iter().rev().find_map(|entry| {
-        if entry.kind() != SessionMetadataKind::ThreadSettings {
+        let SessionMetadata::ThreadSettings {
+            provider,
+            model,
+            reasoning,
+        } = entry
+        else {
             return None;
-        }
-        let provider = entry.field_string("provider");
-        let model = entry.field_string("model")?;
-        let reasoning = entry
-            .field_string("reasoning")
-            .filter(|value| !value.is_empty());
-        Some(match provider {
+        };
+        let reasoning = reasoning.as_deref().filter(|value| !value.is_empty());
+        Some(match provider.as_deref() {
             Some(provider) => singularity_model::compose_model_selector(provider, model, reasoning),
             None => match reasoning {
                 Some(reasoning) => format!("{model}#{reasoning}"),
-                None => model.to_string(),
+                None => model.clone(),
             },
         })
     })

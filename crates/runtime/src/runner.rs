@@ -906,11 +906,13 @@ fn persisted_usage_for_turn(session: &SessionManager, turn_id: &str) -> Option<T
         .metadata_entries()
         .iter()
         .rev()
-        .find(|entry| {
-            entry.kind() == SessionMetadataKind::Usage && entry.turn_id() == Some(turn_id)
-        })?
-        .field("usage")
-        .cloned()?;
+        .find_map(|entry| match entry {
+            SessionMetadata::Usage {
+                turn_id: entry_turn_id,
+                usage,
+            } if entry_turn_id == turn_id => Some(usage.clone()),
+            _ => None,
+        })?;
     serde_json::from_value(value).ok()
 }
 

@@ -197,20 +197,73 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
 
 #[test]
 fn thread_settings_reject_sensitive_fields() {
-    let bad_fields = [
-        ("apiKey", json!("secret")),
-        ("authorization", json!("Bearer xyz")),
-        ("auth_token", json!("token")),
-        ("password", json!("pw")),
-    ];
-    for (key, val) in bad_fields {
-        let mut map = Map::new();
-        map.insert(key.to_string(), val);
+    for key in ["apiKey", "authorization", "auth_token", "password"] {
+        let mut value = json!({
+            "metadataType": "thread_settings",
+            "provider": "openai",
+            "model": "test-model"
+        });
+        value
+            .as_object_mut()
+            .expect("settings object")
+            .insert(key.to_string(), json!("secret"));
         assert!(
-            SessionMetadata::new(SessionMetadataKind::ThreadSettings, map).is_err(),
+            serde_json::from_value::<SessionMetadata>(value).is_err(),
             "{key} must be rejected"
         );
     }
+}
+
+#[test]
+fn typed_metadata_round_trips_existing_flat_wire_shape() {
+    let cases = [
+        json!({"metadataType": "turn_started", "turnId": "turn-1"}),
+        json!({"metadataType": "turn_completed", "turnId": "turn-1"}),
+        json!({"metadataType": "turn_failed", "turnId": "turn-1", "error": "failed"}),
+        json!({
+            "metadataType": "turn_interrupted",
+            "turnId": "turn-1",
+            "reason": "cancelled",
+            "synthetic": false
+        }),
+        json!({
+            "metadataType": "thread_settings",
+            "provider": "openai",
+            "model": "test-model",
+            "reasoning": "high"
+        }),
+        json!({"metadataType": "thread_name", "name": "Typed metadata"}),
+        json!({
+            "metadataType": "usage",
+            "turnId": "turn-1",
+            "usage": {"totalTokens": 42}
+        }),
+        json!({"metadataType": "thread_settings", "model": "legacy-model"}),
+    ];
+    for value in cases {
+        let metadata: SessionMetadata =
+            serde_json::from_value(value.clone()).expect("read metadata");
+        assert_eq!(
+            serde_json::to_value(metadata).expect("write metadata"),
+            value
+        );
+    }
+
+    let metadata: SessionMetadata = serde_json::from_value(json!({
+        "metadataType": "thread_settings",
+        "provider": "openai",
+        "model": "test-model",
+        "reasoning": "high"
+    }))
+    .expect("read typed settings");
+    assert!(matches!(
+        metadata,
+        SessionMetadata::ThreadSettings {
+            ref provider,
+            ref model,
+            reasoning: Some(ref reasoning),
+        } if provider.as_deref() == Some("openai") && model == "test-model" && reasoning == "high"
+    ));
 }
 
 #[test]

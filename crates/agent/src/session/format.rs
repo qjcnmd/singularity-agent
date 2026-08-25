@@ -88,66 +88,97 @@ impl SessionMetadataKind {
     }
 }
 
-/// 一条可恢复的 session metadata。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionMetadata {
-    kind: SessionMetadataKind,
-    fields: Map<String, Value>,
+/// 一条可恢复的 session metadata；variant 直接携带其合法 payload。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMetadata {
+    TurnStarted {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+    TurnCompleted {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+    TurnFailed {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        error: String,
+    },
+    TurnInterrupted {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        reason: String,
+        synthetic: bool,
+    },
+    ThreadSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
+    ThreadName {
+        name: String,
+    },
+    Usage {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        usage: Value,
+    },
 }
 
 impl SessionMetadata {
-    /// 构造 metadata；公开字段必须是对象，且 settings 禁止敏感键。
-    pub fn new(kind: SessionMetadataKind, fields: Map<String, Value>) -> Result<Self> {
-        if fields.keys().any(|key| is_reserved_metadata_key(key)) {
-            return Err(SessionError::InvalidStructure(
-                "metadata contains a reserved session entry field".to_string(),
-            ));
-        }
-        if matches!(kind, SessionMetadataKind::ThreadSettings)
-            && fields.keys().any(|key| is_sensitive_metadata_key(key))
-        {
-            return Err(SessionError::InvalidStructure(
-                "thread settings metadata contains a sensitive field".to_string(),
-            ));
-        }
-        Ok(Self { kind, fields })
-    }
-
     pub fn kind(&self) -> SessionMetadataKind {
-        self.kind
-    }
-
-    pub fn field(&self, name: &str) -> Option<&Value> {
-        self.fields.get(name)
-    }
-
-    pub fn field_string(&self, name: &str) -> Option<&str> {
-        self.field(name).and_then(Value::as_str)
+        match self {
+            Self::TurnStarted { .. } => SessionMetadataKind::TurnStarted,
+            Self::TurnCompleted { .. } => SessionMetadataKind::TurnCompleted,
+            Self::TurnFailed { .. } => SessionMetadataKind::TurnFailed,
+            Self::TurnInterrupted { .. } => SessionMetadataKind::TurnInterrupted,
+            Self::ThreadSettings { .. } => SessionMetadataKind::ThreadSettings,
+            Self::ThreadName { .. } => SessionMetadataKind::ThreadName,
+            Self::Usage { .. } => SessionMetadataKind::Usage,
+        }
     }
 
     pub fn turn_id(&self) -> Option<&str> {
-        self.field_string("turnId")
+        match self {
+            Self::TurnStarted { turn_id }
+            | Self::TurnCompleted { turn_id }
+            | Self::TurnFailed { turn_id, .. }
+            | Self::TurnInterrupted { turn_id, .. }
+            | Self::Usage { turn_id, .. } => Some(turn_id),
+            Self::ThreadSettings { .. } | Self::ThreadName { .. } => None,
+        }
     }
 
     pub fn synthetic(&self) -> bool {
-        self.field("synthetic")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        matches!(
+            self,
+            Self::TurnInterrupted {
+                synthetic: true,
+                ..
+            }
+        )
     }
 
     pub fn turn_started(turn_id: impl Into<String>) -> Self {
-        Self::simple(SessionMetadataKind::TurnStarted, "turnId", turn_id.into())
+        Self::TurnStarted {
+            turn_id: turn_id.into(),
+        }
     }
 
     pub fn turn_completed(turn_id: impl Into<String>) -> Self {
-        Self::simple(SessionMetadataKind::TurnCompleted, "turnId", turn_id.into())
+        Self::TurnCompleted {
+            turn_id: turn_id.into(),
+        }
     }
 
     pub fn turn_failed(turn_id: impl Into<String>, error: impl Into<String>) -> Self {
-        let mut fields = Map::new();
-        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
-        fields.insert("error".to_string(), Value::String(error.into()));
-        Self::unchecked(SessionMetadataKind::TurnFailed, fields)
+        Self::TurnFailed {
+            turn_id: turn_id.into(),
+            error: error.into(),
+        }
     }
 
     pub fn turn_interrupted(
@@ -155,11 +186,11 @@ impl SessionMetadata {
         reason: impl Into<String>,
         synthetic: bool,
     ) -> Self {
-        let mut fields = Map::new();
-        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
-        fields.insert("reason".to_string(), Value::String(reason.into()));
-        fields.insert("synthetic".to_string(), Value::Bool(synthetic));
-        Self::unchecked(SessionMetadataKind::TurnInterrupted, fields)
+        Self::TurnInterrupted {
+            turn_id: turn_id.into(),
+            reason: reason.into(),
+            synthetic,
+        }
     }
 
     pub fn thread_settings(
@@ -167,13 +198,11 @@ impl SessionMetadata {
         model: impl Into<String>,
         reasoning: Option<String>,
     ) -> Result<Self> {
-        let mut fields = Map::new();
-        fields.insert("provider".to_string(), Value::String(provider.into()));
-        fields.insert("model".to_string(), Value::String(model.into()));
-        if let Some(reasoning) = reasoning {
-            fields.insert("reasoning".to_string(), Value::String(reasoning));
-        }
-        Self::new(SessionMetadataKind::ThreadSettings, fields)
+        Ok(Self::ThreadSettings {
+            provider: Some(provider.into()),
+            model: model.into(),
+            reasoning,
+        })
     }
 
     pub fn thread_name(name: impl Into<String>) -> Result<Self> {
@@ -183,7 +212,7 @@ impl SessionMetadata {
                 "thread name must not be empty".to_string(),
             ));
         }
-        Ok(Self::simple(SessionMetadataKind::ThreadName, "name", name))
+        Ok(Self::ThreadName { name })
     }
 
     pub fn usage(turn_id: impl Into<String>, usage: Value) -> Result<Self> {
@@ -192,82 +221,23 @@ impl SessionMetadata {
                 "usage metadata must be a JSON object".to_string(),
             ));
         }
-        let mut fields = Map::new();
-        fields.insert("turnId".to_string(), Value::String(turn_id.into()));
-        fields.insert("usage".to_string(), usage);
-        Self::new(SessionMetadataKind::Usage, fields)
+        Ok(Self::Usage {
+            turn_id: turn_id.into(),
+            usage,
+        })
     }
 
     pub(super) fn validate(self) -> Result<Self> {
-        Self::new(self.kind, self.fields)
-    }
-
-    fn simple(kind: SessionMetadataKind, key: &str, value: String) -> Self {
-        let mut fields = Map::new();
-        fields.insert(key.to_string(), Value::String(value));
-        Self::unchecked(kind, fields)
-    }
-
-    fn unchecked(kind: SessionMetadataKind, fields: Map<String, Value>) -> Self {
-        Self { kind, fields }
-    }
-}
-
-impl Serialize for SessionMetadata {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut map = self.fields.clone();
-        map.insert("metadataType".to_string(), json!(self.kind));
-        Value::Object(map).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SessionMetadata {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut map = Map::<String, Value>::deserialize(deserializer)?;
-        let kind_value = map
-            .remove("metadataType")
-            .ok_or_else(|| serde::de::Error::custom("metadata entry has no metadataType"))?;
-        let kind = serde_json::from_value(kind_value)
-            .map_err(|error| serde::de::Error::custom(format!("invalid metadataType: {error}")))?;
-        if map.keys().any(|key| is_reserved_metadata_key(key)) {
-            return Err(serde::de::Error::custom(
-                "metadata contains a reserved session entry field",
-            ));
+        match &self {
+            Self::ThreadName { name } if name.trim().is_empty() => Err(
+                SessionError::InvalidStructure("thread name must not be empty".to_string()),
+            ),
+            Self::Usage { usage, .. } if !usage.is_object() => Err(SessionError::InvalidStructure(
+                "usage metadata must be a JSON object".to_string(),
+            )),
+            _ => Ok(self),
         }
-        if matches!(kind, SessionMetadataKind::ThreadSettings)
-            && map.keys().any(|key| is_sensitive_metadata_key(key))
-        {
-            return Err(serde::de::Error::custom(
-                "thread settings metadata contains a sensitive field",
-            ));
-        }
-        Ok(Self { kind, fields: map })
     }
-}
-
-fn is_sensitive_metadata_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    [
-        "api_key",
-        "apikey",
-        "authorization",
-        "auth_token",
-        "token",
-        "secret",
-        "password",
-    ]
-    .iter()
-    .any(|sensitive| key.contains(sensitive))
-}
-
-fn is_reserved_metadata_key(key: &str) -> bool {
-    matches!(key, "id" | "timestamp" | "type" | "metadataType")
 }
 
 fn metadata_payload(value: &Value) -> Value {

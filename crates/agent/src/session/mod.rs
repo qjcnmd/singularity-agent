@@ -27,7 +27,7 @@ pub(crate) use file::{AppendLimits, normalize_cwd_string};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
 #[cfg(test)]
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 #[cfg(test)]
 #[path = "../session_tests.rs"]

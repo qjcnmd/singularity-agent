@@ -8,7 +8,7 @@
 use super::*;
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{SessionEntry, SessionEntryType, SessionMetadataKind},
+    session::{SessionEntry, SessionEntryType, SessionMetadata, SessionMetadataKind},
 };
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
@@ -68,41 +68,32 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
             id: entry.id.clone(),
             summary: compaction.summary.clone(),
         }],
-        SessionEntryType::Metadata(metadata) => match metadata.kind() {
-            SessionMetadataKind::TurnStarted => metadata
-                .turn_id()
-                .map(|id| HistoryItem::Turn {
-                    id: id.to_string(),
-                    status: TurnStatus::Running,
-                })
-                .into_iter()
-                .collect(),
-            SessionMetadataKind::TurnCompleted
-            | SessionMetadataKind::TurnFailed
-            | SessionMetadataKind::TurnInterrupted => metadata
-                .turn_id()
-                .map(|id| HistoryItem::Turn {
-                    id: id.to_string(),
-                    status: terminal_turn_status(metadata.kind()),
-                })
-                .into_iter()
-                .collect(),
-            SessionMetadataKind::ThreadSettings => vec![HistoryItem::Settings {
-                id: entry.id.clone(),
-                provider: metadata.field_string("provider").map(str::to_string),
-                model: metadata.field_string("model").map(str::to_string),
-                reasoning: metadata.field_string("reasoning").map(str::to_string),
+        SessionEntryType::Metadata(metadata) => match metadata {
+            SessionMetadata::TurnStarted { turn_id } => vec![HistoryItem::Turn {
+                id: turn_id.clone(),
+                status: TurnStatus::Running,
             }],
-            SessionMetadataKind::ThreadName => Vec::new(),
-            SessionMetadataKind::Usage => metadata
-                .field("usage")
-                .cloned()
-                .map(|usage| HistoryItem::Usage {
-                    id: entry.id.clone(),
-                    usage,
-                })
-                .into_iter()
-                .collect(),
+            SessionMetadata::TurnCompleted { turn_id }
+            | SessionMetadata::TurnFailed { turn_id, .. }
+            | SessionMetadata::TurnInterrupted { turn_id, .. } => vec![HistoryItem::Turn {
+                id: turn_id.clone(),
+                status: terminal_turn_status(metadata.kind()),
+            }],
+            SessionMetadata::ThreadSettings {
+                provider,
+                model,
+                reasoning,
+            } => vec![HistoryItem::Settings {
+                id: entry.id.clone(),
+                provider: provider.clone(),
+                model: Some(model.clone()),
+                reasoning: reasoning.clone(),
+            }],
+            SessionMetadata::ThreadName { .. } => Vec::new(),
+            SessionMetadata::Usage { usage, .. } => vec![HistoryItem::Usage {
+                id: entry.id.clone(),
+                usage: usage.clone(),
+            }],
         },
     }
 }
