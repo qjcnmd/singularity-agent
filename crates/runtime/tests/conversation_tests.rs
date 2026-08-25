@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
@@ -183,6 +184,22 @@ fn wait_for_requested(requested: &std::sync::atomic::AtomicBool) {
 }
 
 struct FailingProvider;
+
+struct PanickingProvider;
+
+impl Provider for PanickingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        panic!("compaction provider panic")
+    }
+}
 
 impl Provider for FailingProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
@@ -928,5 +945,42 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model")
+    );
+}
+
+#[test]
+fn compact_releases_its_busy_window_when_the_provider_panics() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(&sessions, Arc::new(PanickingProvider), None);
+    let thread_id = conversation.thread().unwrap().thread_id;
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (role, text) in [
+        (AgentMessageRole::User, "first user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "first assistant ".repeat(5_000),
+        ),
+        (AgentMessageRole::User, "recent user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "recent assistant ".repeat(5_000),
+        ),
+    ] {
+        session
+            .append_message(AgentMessage::text(role, text))
+            .expect("append history");
+    }
+    drop(session);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = conversation.compact();
+    }));
+
+    assert!(panic.is_err(), "the provider panic must propagate");
+    assert!(
+        !conversation.has_active_turn(),
+        "compaction must release the single-writer window while unwinding"
     );
 }

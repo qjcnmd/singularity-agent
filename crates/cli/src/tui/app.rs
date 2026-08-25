@@ -179,7 +179,7 @@ pub(crate) struct TuiApp {
     settings: Option<SettingsMenu>,
     resume: Option<ResumeMenu>,
     thread_id: String,
-    /// 二次确认退出已生效：下一次 Ctrl+C 直接退出（空闲 0 / 运行中 130）。
+    /// 二次确认退出已生效：下一次 Ctrl+C 正常退出（exit 0）。
     /// 复位规则：任何非 Ctrl+C 按键、提交输入或 turn 链结束都会清除；
     /// 按下期间提示行持续显示再次确认文案。
     quit_armed: bool,
@@ -409,8 +409,8 @@ impl TuiApp {
             return Action::Continue;
         }
 
-        // Ctrl+C 是应用级按键语义，先于 settings 模态消费：行为只由 turn
-        // 相位决定，模态不改变它；其余任何按键都取消已 armed 的二次确认。
+        // Ctrl+C 是应用级按键语义，先于 settings 模态消费，且不受 turn
+        // 相位或模态影响；其余任何按键都取消已 armed 的二次确认。
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             return self.handle_ctrl_c();
         }

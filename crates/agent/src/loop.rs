@@ -148,7 +148,7 @@ pub enum AgentEvent {
     Diagnostic(AgentDiagnostic),
     /// provider HTTP attempt 生命周期观测；model-turn 序号已在循环内绑定。
     ///
-    /// 投影失败即中止本轮，并丢弃当轮 provider 结果。
+    /// 投影为尽力而为；消费方自行吸收投影失败，不影响 provider 结果。
     ProviderAttempt {
         model_turn_ordinal: u32,
         event: ProviderAttemptEvent,
@@ -157,9 +157,8 @@ pub enum AgentEvent {
 
 /// Agent 运行生命周期事件出口。
 ///
-/// 单一回调统一承载全部事件。诊断事件为尽力而为：投递失败被忽略，
-/// 不改变轮次结果；其余事件的投影失败会使循环立即中止本轮并丢弃
-/// 当轮结果，错误经 `run` 返回。
+/// 单一回调统一承载全部事件。投影为尽力而为：消费方自行吸收失败，
+/// 不改变轮次结果。
 pub struct AgentEvents<'a> {
     pub on_event: Option<&'a mut dyn FnMut(AgentEvent)>,
 }

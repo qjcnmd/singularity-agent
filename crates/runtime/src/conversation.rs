@@ -298,16 +298,10 @@ impl Conversation {
     pub fn compact(
         &self,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
-        let thread = {
-            let mut state = self.lock_state()?;
-            if state.turn.is_busy() {
-                return Err(ConversationError::TurnAlreadyActive);
-            }
-            state.turn = TurnLifecycle::Reserved;
-            state.thread.clone()
-        };
+        let reservation = self.reserve_start()?;
+        let thread = reservation.conversation.thread()?;
         let result = self.runner.compact_thread(&thread);
-        self.release_reservation();
+        drop(reservation);
         result.map_err(ConversationError::Settings)
     }
 

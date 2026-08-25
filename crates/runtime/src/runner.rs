@@ -577,9 +577,7 @@ impl TurnRunner {
         failure: &TurnFailure,
         sink: &mut dyn TurnEventSink,
     ) {
-        if item_events.appeared() {
-            item_events.emit_assistant_terminal_failed(sink);
-        }
+        item_events.emit_assistant_terminal_failed(sink);
         for tool_call_id in item_events.open_tool_items() {
             self.emit_tool_terminal(item_events, &tool_call_id, true, sink);
         }
@@ -993,7 +991,6 @@ struct AssistantItemEvents {
     turn_id: String,
     item_id: String,
     first_delta_observed: bool,
-    appeared: bool,
     assistant_terminal_generated: bool,
     tool_items: std::collections::HashMap<String, bool>,
 }
@@ -1005,7 +1002,6 @@ impl AssistantItemEvents {
             turn_id,
             item_id,
             first_delta_observed: false,
-            appeared: false,
             assistant_terminal_generated: false,
             tool_items: std::collections::HashMap::new(),
         }
@@ -1015,10 +1011,6 @@ impl AssistantItemEvents {
         self.tool_items
             .entry(tool_call_id.to_string())
             .or_insert(false);
-    }
-
-    fn appeared(&self) -> bool {
-        self.appeared
     }
 
     fn open_tool_items(&self) -> Vec<String> {
@@ -1031,7 +1023,6 @@ impl AssistantItemEvents {
     fn project_assistant_delta(&mut self, sink: &mut dyn TurnEventSink, delta: &str) {
         if !self.first_delta_observed {
             self.first_delta_observed = true;
-            self.appeared = true;
             sink.emit(TurnEvent::ItemStarted {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
@@ -1057,7 +1048,6 @@ impl AssistantItemEvents {
             Some(already) if *already => {}
             Some(already) => {
                 *already = true;
-                self.appeared = true;
                 let event = if is_error {
                     TurnEvent::ItemFailed {
                         thread_id: self.thread_id.clone(),
@@ -1079,7 +1069,7 @@ impl AssistantItemEvents {
     }
 
     fn emit_assistant_terminal_failed(&mut self, sink: &mut dyn TurnEventSink) {
-        if self.assistant_terminal_generated {
+        if !self.first_delta_observed || self.assistant_terminal_generated {
             return;
         }
         self.assistant_terminal_generated = true;
@@ -1092,7 +1082,7 @@ impl AssistantItemEvents {
     }
 
     fn emit_assistant_terminal_completed(&mut self, sink: &mut dyn TurnEventSink) {
-        if !self.appeared || self.assistant_terminal_generated {
+        if !self.first_delta_observed || self.assistant_terminal_generated {
             return;
         }
         self.assistant_terminal_generated = true;
@@ -1121,5 +1111,27 @@ impl TurnRunner {
         sink: &mut dyn TurnEventSink,
     ) {
         item_events.emit_assistant_terminal_completed(sink);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_appearance_does_not_create_an_assistant_terminal_item() {
+        let mut item_events =
+            AssistantItemEvents::new("thread".into(), "turn".into(), "assistant".into());
+        let mut events = Vec::new();
+
+        item_events.start_tool_item("tool");
+        item_events.emit_tool_terminal(&mut |event| events.push(event), "tool", false);
+        item_events.emit_assistant_terminal_completed(&mut |event| events.push(event));
+        item_events.emit_assistant_terminal_failed(&mut |event| events.push(event));
+
+        assert!(matches!(
+            events.as_slice(),
+            [TurnEvent::ItemCompleted { item_id, .. }] if item_id == "tool"
+        ));
     }
 }

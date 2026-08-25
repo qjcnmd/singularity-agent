@@ -17,7 +17,6 @@ struct SmokeFixture {
     home: PathBuf,
     workspace: PathBuf,
     config_path: PathBuf,
-    app_server: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -31,7 +30,6 @@ impl SmokeFixture {
         command
             .current_dir(&self.workspace)
             .env("SINGULARITY_HOME", &self.home)
-            .env("SINGULARITY_APP_SERVER_BIN", &self.app_server)
             .env_remove("SINGULARITY_MODEL_PROVIDER")
             .env_remove("SINGULARITY_MODEL")
             .env_remove("SINGULARITY_MODEL_CONTEXT_TOKENS")
@@ -75,28 +73,11 @@ fn fixture(scenario: SmokeScenario) -> Result<SmokeFixture, String> {
     set_owner_only_permissions(&config_path)?;
     set_owner_only_permissions(&isolated_auth)?;
 
-    let app_server = env::var_os("SINGULARITY_APP_SERVER_BIN")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let cli = PathBuf::from(env!("CARGO_BIN_EXE_sg"));
-            let name = if cfg!(windows) {
-                "singularity_app_server.exe"
-            } else {
-                "singularity_app_server"
-            };
-            cli.parent().map(|parent| parent.join(name))
-        })
-        .ok_or_else(|| "could not locate singularity_app_server".to_string())?;
-    if !app_server.is_file() {
-        return Err("singularity_app_server binary is unavailable".to_string());
-    }
-
     Ok(SmokeFixture {
         _root: root,
         home,
         workspace,
         config_path,
-        app_server,
     })
 }
 
