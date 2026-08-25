@@ -1,11 +1,10 @@
 //! 收缩后协议合同测试：stdio JSON-RPC registry、wire shape 与稳定状态文本。
 
 use serde_json::json;
-use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, EmptyParams, InitializeParams, JsonRpcInbound, JsonRpcMessage, Method, MethodKind,
-    ThreadReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams, TurnStartParams,
-    TurnStatus, parse_json_rpc_payload, rpc_methods,
+    AppEvent, ClientInfo, EmptyParams, ErrorCode, InitializeParams, JsonRpcInbound, JsonRpcMessage,
+    Method, MethodKind, ThreadReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams,
+    TurnStartParams, TurnStatus, parse_json_rpc_payload, rpc_methods,
 };
 
 #[test]
@@ -292,6 +291,7 @@ fn initialize_params_keep_client_info_contract() {
     );
     let _: rpc_methods::Initialize = rpc_methods::Initialize;
     assert!(Method::Initialize.spec().validate_params(params).is_ok());
+    assert_eq!(ErrorCode::not_initialized().message(), "Not initialized");
 }
 
 #[test]

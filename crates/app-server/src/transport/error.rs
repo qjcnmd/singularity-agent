@@ -2,8 +2,7 @@
 
 use serde_json::Value;
 use singularity_app_server::AppServerError;
-use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
-use singularity_protocol::{JsonRpcId, JsonRpcMessage};
+use singularity_protocol::{ErrorCode, JSON_RPC_INTERNAL_ERROR, JsonRpcId, JsonRpcMessage};
 pub(crate) fn transport_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
     let diagnostic = match error {
         AppServerError::TurnExecution { original, .. }

@@ -23,15 +23,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use singularity_core::{ErrorCode, user_singularity_home};
+use singularity_core::user_singularity_home;
 use singularity_model::ModelUsage;
 use singularity_protocol::{
-    AppEvent, HistoryItem, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
-    MethodKind, ProviderConfigurationStatus, ServerShutdownResult, SessionDeleteResult,
-    SessionIdParams, Thread, ThreadListResult, ThreadReadParams, ThreadReadResult,
-    ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus,
-    ThreadTurn, Turn, TurnIdParams, TurnInjectionParams, TurnInjectionResult, TurnInterruptResult,
-    TurnStartParams, TurnStatus,
+    AppEvent, ErrorCode, HistoryItem, InitializeParams, InitializeResult, JsonRpcId,
+    JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus, ServerShutdownResult,
+    SessionDeleteResult, SessionIdParams, Thread, ThreadListResult, ThreadReadParams,
+    ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams,
+    ThreadStartResult, ThreadStatus, ThreadTurn, Turn, TurnIdParams, TurnInjectionParams,
+    TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
 };
 use thiserror::Error;
 
