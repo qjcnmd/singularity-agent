@@ -3,15 +3,27 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{
+    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
+    validate_args,
+};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
 const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    path: String,
+    offset: Option<u64>,
+    limit: Option<u64>,
+}
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -31,28 +43,28 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
+        validate: validate_args::<ReadArgs>,
         execute,
     }
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let Some(path) = ctx.args.get("path").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"path\"");
+    let args = match deserialize_args::<ReadArgs>(&ctx.args) {
+        Ok(args) => args,
+        Err(message) => return error_result(message),
     };
-    let offset = ctx.args.get("offset").and_then(Value::as_u64);
-    let limit = ctx.args.get("limit").and_then(Value::as_u64);
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }
-    let full_path = resolve_path(ctx.cwd, path);
+    let full_path = resolve_path(ctx.cwd, &args.path);
     let file = match File::open(&full_path) {
         Ok(file) => file,
         Err(error) => {
-            return error_result(format!("Could not read file: {path}. {error}"));
+            return error_result(format!("Could not read file: {}. {error}", args.path));
         }
     };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
-    execute_reader(path, offset, limit, &mut reader, ctx.signal)
+    execute_reader(&args.path, args.offset, args.limit, &mut reader, ctx.signal)
 }
 
 fn execute_reader(

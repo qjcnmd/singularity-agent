@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
@@ -63,6 +64,7 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
+    pub(crate) validate: fn(&Value) -> Result<(), String>,
     pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
@@ -127,7 +129,7 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| ToolError(format!("unknown tool: {name}")))?;
-        if let Err(message) = validate_arguments(&spec.parameters, args) {
+        if let Err(message) = (spec.validate)(args) {
             return Ok(ToolPreflight::Rejected(ToolExecution {
                 content: format!("tool arguments failed validation: {message}"),
                 is_error: true,
@@ -168,43 +170,12 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// 依据工具定义的 JSON Schema（properties / required / type）进行参数合法性校验。
-/// 缺少必填参数、参数类型不匹配或出现未知未声明参数均作为校验错误拦截。
-fn validate_arguments(parameters: &Value, args: &Value) -> Result<(), String> {
-    let Some(object) = args.as_object() else {
-        return Err("tool arguments must be a JSON object".to_string());
-    };
-    let properties = parameters.get("properties").and_then(Value::as_object);
-    if let Some(required) = parameters.get("required").and_then(Value::as_array) {
-        for name in required.iter().filter_map(Value::as_str) {
-            if !object.contains_key(name) {
-                return Err(format!("missing required parameter \"{name}\""));
-            }
-        }
-    }
-    for (name, value) in object {
-        let Some(schema) = properties.and_then(|properties| properties.get(name)) else {
-            return Err(format!("unknown parameter \"{name}\""));
-        };
-        let expected = schema.get("type").and_then(Value::as_str).unwrap_or("any");
-        if !json_value_matches_type(value, expected) {
-            return Err(format!("parameter \"{name}\" must be of type {expected}"));
-        }
-    }
-    Ok(())
+pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
+    serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))
 }
 
-fn json_value_matches_type(value: &Value, expected: &str) -> bool {
-    match expected {
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.is_i64() || value.is_u64(),
-        "boolean" => value.is_boolean(),
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "null" => value.is_null(),
-        _ => true,
-    }
+pub(crate) fn validate_args<T: DeserializeOwned>(args: &Value) -> Result<(), String> {
+    deserialize_args::<T>(args).map(|_| ())
 }
 
 #[cfg(test)]
@@ -225,9 +196,14 @@ mod tests {
             name: "ping",
             description: "custom test tool",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+            validate: validate_args::<EmptyArgs>,
             execute: ping_execute,
         }
     }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EmptyArgs {}
 
     #[test]
     fn default_tools_include_read_bash_edit_write() {
@@ -262,5 +238,16 @@ mod tests {
                 .execute("nope", context(json!({}), Path::new(".")))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn typed_preflight_rejects_zero_bash_timeout() {
+        let registry = ToolRegistry::new();
+        assert!(matches!(
+            registry
+                .preflight("bash", &json!({"command": "echo no", "timeout_ms": 0}))
+                .expect("known tool"),
+            ToolPreflight::Rejected(_)
+        ));
     }
 }

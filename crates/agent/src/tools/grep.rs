@@ -5,10 +5,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::glob::glob_regex;
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{
+    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
+    validate_args,
+};
 use super::walk::{to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
@@ -18,6 +22,14 @@ const MAX_MATCHES: usize = 500;
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
 /// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
 const BINARY_SNIFF_BYTES: usize = 8192;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepArgs {
+    pattern: String,
+    path: Option<String>,
+    include: Option<String>,
+}
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -37,6 +49,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "grep",
         description: DESCRIPTION,
         parameters: parameters(),
+        validate: validate_args::<GrepArgs>,
         execute,
     }
 }
@@ -62,11 +75,12 @@ fn truncate_for_display(line: &str) -> String {
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let Some(pattern) = ctx.args.get("pattern").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"pattern\"");
+    let args = match deserialize_args::<GrepArgs>(&ctx.args) {
+        Ok(args) => args,
+        Err(message) => return error_result(message),
     };
-    let path = ctx.args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let include = ctx.args.get("include").and_then(Value::as_str);
+    let path = args.path.as_deref().unwrap_or(".");
+    let include = args.include.as_deref();
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }
@@ -74,10 +88,13 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     if !root.is_dir() {
         return error_result(format!("path is not a directory: {path}"));
     }
-    let regex = match Regex::new(pattern) {
+    let regex = match Regex::new(&args.pattern) {
         Ok(regex) => regex,
         Err(error) => {
-            return error_result(format!("invalid regular expression {pattern:?}: {error}"));
+            return error_result(format!(
+                "invalid regular expression {:?}: {error}",
+                args.pattern
+            ));
         }
     };
     let include_regex = match include {
@@ -153,7 +170,8 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     }
     if output.is_empty() {
         output = format!(
-            "no matches for {pattern:?} under {path}{}",
+            "no matches for {:?} under {path}{}",
+            args.pattern,
             include
                 .map(|include| format!(" (include: {include})"))
                 .unwrap_or_default()

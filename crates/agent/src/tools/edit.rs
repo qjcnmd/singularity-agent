@@ -9,14 +9,26 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{
+    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
+    validate_args,
+};
 use super::truncate::format_size;
 
 const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
 
 pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. oldString must match exactly once in the file (unique). If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+}
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -36,20 +48,19 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "edit",
         description: DESCRIPTION,
         parameters: parameters(),
+        validate: validate_args::<EditArgs>,
         execute,
     }
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let Some(path) = ctx.args.get("path").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"path\"");
+    let args = match deserialize_args::<EditArgs>(&ctx.args) {
+        Ok(args) => args,
+        Err(message) => return error_result(message),
     };
-    let Some(old_string) = ctx.args.get("oldString").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"oldString\"");
-    };
-    let Some(new_string) = ctx.args.get("newString").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"newString\"");
-    };
+    let path = &args.path;
+    let old_string = &args.old_string;
+    let new_string = &args.new_string;
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }

@@ -2,11 +2,22 @@
 
 use std::fs;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{
+    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, resolve_path,
+    validate_args,
+};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -25,17 +36,18 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
+        validate: validate_args::<WriteArgs>,
         execute,
     }
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let Some(path) = ctx.args.get("path").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"path\"");
+    let args = match deserialize_args::<WriteArgs>(&ctx.args) {
+        Ok(args) => args,
+        Err(message) => return error_result(message),
     };
-    let Some(content) = ctx.args.get("content").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"content\"");
-    };
+    let path = &args.path;
+    let content = &args.content;
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }

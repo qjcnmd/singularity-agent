@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Deserializer, de::Error as _};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -100,7 +101,9 @@ mod job_object {
 
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result};
+use super::registry::{
+    ExecuteContext, ToolError, ToolExecution, deserialize_args, error_result, validate_args,
+};
 use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail,
 };
@@ -121,6 +124,26 @@ const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
 
 /// 命令执行超时仅在显式提供 `timeout_ms`（正整数毫秒）时生效；未提供时不主动超时。
 pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Provide timeout_ms to bound execution; without it a command runs until completion or interruption.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashArgs {
+    command: String,
+    #[serde(default, deserialize_with = "deserialize_timeout_ms")]
+    timeout_ms: Option<u64>,
+}
+
+fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value
+        .as_u64()
+        .filter(|timeout| *timeout > 0)
+        .map(Some)
+        .ok_or_else(|| D::Error::custom("invalid timeout_ms: must be a positive integer"))
+}
 
 pub(crate) fn parameters() -> Value {
     json!({
@@ -143,31 +166,25 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "bash",
         description: DESCRIPTION,
         parameters: parameters(),
+        validate: validate_args::<BashArgs>,
         execute,
     }
 }
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let ExecuteContext {
-        args,
+        args: raw_args,
         cwd,
         signal,
         mut on_update,
     } = ctx;
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
-        return error_result("missing required parameter \"command\"");
+    let args = match deserialize_args::<BashArgs>(&raw_args) {
+        Ok(args) => args,
+        Err(message) => return error_result(message),
     };
-    // 只有字段缺失才表示不主动超时；字段存在但类型错误/非正数必须返回
-    // typed argument error，不能静默回退。
-    let timeout = match args.get("timeout_ms") {
-        None => None,
-        Some(Value::Number(number)) => match number.as_u64() {
-            Some(timeout) if timeout > 0 => Some(timeout),
-            _ => return error_result("invalid timeout_ms: must be a positive integer"),
-        },
-        Some(_) => return error_result("invalid timeout_ms: must be a positive integer"),
-    };
-    let (shell, shell_args) = match shell_command(command) {
+    let command = args.command;
+    let timeout = args.timeout_ms;
+    let (shell, shell_args) = match shell_command(&command) {
         Ok(command) => command,
         Err(error) => return error_result(error),
     };
@@ -206,7 +223,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     }
 
     let mut state = CaptureState {
-        command_slug: command_slug(command),
+        command_slug: command_slug(&command),
         ..CaptureState::default()
     };
     let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
