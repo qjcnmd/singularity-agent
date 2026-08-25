@@ -25,6 +25,109 @@ pub(super) struct StreamAttemptSuccess {
     pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
+struct SseFrame {
+    event_name: Option<String>,
+    data: Vec<u8>,
+}
+
+/// Protocol-independent incremental SSE framing with one total byte bound.
+#[derive(Default)]
+struct SseFrameDecoder {
+    pending: Vec<u8>,
+    event_data: Vec<u8>,
+    event_name: Option<String>,
+    total_bytes: usize,
+}
+
+impl SseFrameDecoder {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        malformed: fn(&'static str) -> ProviderError,
+    ) -> Result<Vec<SseFrame>, ProviderError> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(provider_response_stream_too_large_error)?;
+        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_stream_too_large_error());
+        }
+        self.pending.extend_from_slice(chunk);
+        let mut frames = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if let Some(frame) = self.process_line(&line, malformed)? {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        malformed: fn(&'static str) -> ProviderError,
+    ) -> Result<Option<SseFrame>, ProviderError> {
+        if line.is_empty() {
+            if self.event_data.is_empty() {
+                self.event_name = None;
+                return Ok(None);
+            }
+            return Ok(Some(SseFrame {
+                event_name: self.event_name.take(),
+                data: std::mem::take(&mut self.event_data),
+            }));
+        }
+        if line.first() == Some(&b':') {
+            return Ok(None);
+        }
+        let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
+            let value = line.get(separator + 1..).unwrap_or_default();
+            let value = if value.first() == Some(&b' ') {
+                value.get(1..).unwrap_or_default()
+            } else {
+                value
+            };
+            (line.get(..separator).unwrap_or_default(), value)
+        } else {
+            (line, &[] as &[u8])
+        };
+        match field {
+            b"data" => {
+                let additional = value.len().saturating_add(1);
+                if self.event_data.len().saturating_add(additional)
+                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
+                {
+                    return Err(provider_response_stream_too_large_error());
+                }
+                if !self.event_data.is_empty() {
+                    self.event_data.push(b'\n');
+                }
+                self.event_data.extend_from_slice(value);
+            }
+            b"event" => {
+                let event =
+                    std::str::from_utf8(value).map_err(|_| malformed("event_name_invalid"))?;
+                self.event_name = Some(event.to_string());
+            }
+            b"id" | b"retry" => {}
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn finish(&self, malformed: fn(&'static str) -> ProviderError) -> Result<(), ProviderError> {
+        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
+            return Err(malformed("event_frame_unterminated"));
+        }
+        Ok(())
+    }
+}
+
 /// Decode one Chat Completions body while preserving arbitrary HTTP chunk and SSE frame boundaries.
 pub(super) fn read_openai_chat_sse(
     runtime: &tokio::runtime::Handle,
@@ -95,10 +198,7 @@ pub(super) struct ChatToolAccumulator {
 /// content deltas; reasoning and tool-call fragments remain provider-private
 /// until the final normalized response is parsed.
 pub(super) struct ChatSseDecoder<'a> {
-    pending: Vec<u8>,
-    event_data: Vec<u8>,
-    event_name: Option<String>,
-    total_bytes: usize,
+    frames: SseFrameDecoder,
     response_id: Option<String>,
     content: String,
     reasoning_content: String,
@@ -119,10 +219,7 @@ impl<'a> ChatSseDecoder<'a> {
         attempt_started_at: Instant,
     ) -> Self {
         Self {
-            pending: Vec::new(),
-            event_data: Vec::new(),
-            event_name: None,
-            total_bytes: 0,
+            frames: SseFrameDecoder::default(),
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
@@ -139,78 +236,20 @@ impl<'a> ChatSseDecoder<'a> {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(chunk.len())
-            .ok_or_else(provider_response_stream_too_large_error)?;
-        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
-            return Err(provider_response_stream_too_large_error());
-        }
-        self.pending.extend_from_slice(chunk);
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.process_line(&line)?;
+        for frame in self
+            .frames
+            .push(chunk, provider_chat_stream_malformed_error)?
+        {
+            self.dispatch_event(frame)?;
         }
         Ok(())
     }
 
-    fn process_line(&mut self, line: &[u8]) -> Result<(), ProviderError> {
-        if line.is_empty() {
-            return self.dispatch_event();
-        }
-        if line.first() == Some(&b':') {
-            return Ok(());
-        }
-        let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
-            let value = line.get(separator + 1..).unwrap_or_default();
-            let value = if value.first() == Some(&b' ') {
-                value.get(1..).unwrap_or_default()
-            } else {
-                value
-            };
-            (line.get(..separator).unwrap_or_default(), value)
-        } else {
-            (line, &[] as &[u8])
-        };
-        match field {
-            b"data" => {
-                let additional = value.len().saturating_add(1);
-                if self.event_data.len().saturating_add(additional)
-                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
-                {
-                    return Err(provider_response_stream_too_large_error());
-                }
-                if !self.event_data.is_empty() {
-                    self.event_data.push(b'\n');
-                }
-                self.event_data.extend_from_slice(value);
-            }
-            b"event" => {
-                let event = std::str::from_utf8(value)
-                    .map_err(|_| provider_chat_stream_malformed_error("event_name_invalid"))?;
-                self.event_name = Some(event.to_string());
-            }
-            b"id" | b"retry" => {}
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn dispatch_event(&mut self) -> Result<(), ProviderError> {
-        if self.event_data.is_empty() {
-            self.event_name = None;
-            return Ok(());
-        }
-        let raw = std::str::from_utf8(&self.event_data)
+    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
+        let raw = std::str::from_utf8(&frame.data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim()
             .to_string();
-        self.event_data.clear();
-        self.event_name = None;
         if raw == "[DONE]" {
             if self.done {
                 return Err(provider_chat_stream_malformed_error("event_after_done"));
@@ -304,11 +343,7 @@ impl<'a> ChatSseDecoder<'a> {
     }
 
     pub fn finish(&mut self) -> Result<Value, ProviderError> {
-        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
-            return Err(provider_chat_stream_malformed_error(
-                "event_frame_unterminated",
-            ));
-        }
+        self.frames.finish(provider_chat_stream_malformed_error)?;
         if !self.done {
             return Err(provider_chat_stream_malformed_error(
                 "terminal_done_missing",
@@ -425,10 +460,7 @@ pub(super) fn read_openai_responses_sse(
 
 /// Incremental, total-size-bounded SSE decoder for the Responses event contract.
 pub struct ResponsesSseDecoder<'a> {
-    pending: Vec<u8>,
-    event_data: Vec<u8>,
-    event_name: Option<String>,
-    total_bytes: usize,
+    frames: SseFrameDecoder,
     terminal_response: Option<Value>,
     pub emitted_text_delta: bool,
     attempt_started_at: Instant,
@@ -442,10 +474,7 @@ impl<'a> ResponsesSseDecoder<'a> {
         attempt_started_at: Instant,
     ) -> Self {
         Self {
-            pending: Vec::new(),
-            event_data: Vec::new(),
-            event_name: None,
-            total_bytes: 0,
+            frames: SseFrameDecoder::default(),
             terminal_response: None,
             emitted_text_delta: false,
             attempt_started_at,
@@ -455,80 +484,23 @@ impl<'a> ResponsesSseDecoder<'a> {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(chunk.len())
-            .ok_or_else(provider_response_stream_too_large_error)?;
-        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
-            return Err(provider_response_stream_too_large_error());
-        }
-        self.pending.extend_from_slice(chunk);
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.process_line(&line)?;
+        for frame in self
+            .frames
+            .push(chunk, provider_responses_stream_malformed_error)?
+        {
+            self.dispatch_event(frame)?;
         }
         Ok(())
     }
 
-    fn process_line(&mut self, line: &[u8]) -> Result<(), ProviderError> {
-        if line.is_empty() {
-            return self.dispatch_event();
-        }
-        if line.first() == Some(&b':') {
-            return Ok(());
-        }
-        let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
-            let value = line.get(separator + 1..).unwrap_or_default();
-            let value = if value.first() == Some(&b' ') {
-                value.get(1..).unwrap_or_default()
-            } else {
-                value
-            };
-            (line.get(..separator).unwrap_or_default(), value)
-        } else {
-            (line, &[] as &[u8])
-        };
-        match field {
-            b"data" => {
-                let additional = value.len().saturating_add(1);
-                if self.event_data.len().saturating_add(additional)
-                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
-                {
-                    return Err(provider_response_stream_too_large_error());
-                }
-                if !self.event_data.is_empty() {
-                    self.event_data.push(b'\n');
-                }
-                self.event_data.extend_from_slice(value);
-            }
-            b"event" => {
-                let event = std::str::from_utf8(value)
-                    .map_err(|_| provider_responses_stream_malformed_error("event_name_invalid"))?;
-                self.event_name = Some(event.to_string());
-            }
-            b"id" | b"retry" => {}
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn dispatch_event(&mut self) -> Result<(), ProviderError> {
-        if self.event_data.is_empty() {
-            self.event_name = None;
-            return Ok(());
-        }
-        let payload = serde_json::from_slice::<Value>(&self.event_data)
+    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
+        let payload = serde_json::from_slice::<Value>(&frame.data)
             .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
-        self.event_data.clear();
         let payload_type = payload
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
-        if self
+        if frame
             .event_name
             .as_deref()
             .is_some_and(|event_name| event_name != payload_type)
@@ -537,7 +509,6 @@ impl<'a> ResponsesSseDecoder<'a> {
                 "event_type_mismatch",
             ));
         }
-        self.event_name = None;
         if payload_type == "ping" {
             return Ok(());
         }
@@ -609,11 +580,8 @@ impl<'a> ResponsesSseDecoder<'a> {
     }
 
     pub fn finish(&mut self) -> Result<Value, ProviderError> {
-        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
-            return Err(provider_responses_stream_malformed_error(
-                "event_frame_unterminated",
-            ));
-        }
+        self.frames
+            .finish(provider_responses_stream_malformed_error)?;
         self.terminal_response
             .clone()
             .ok_or_else(provider_responses_stream_terminal_missing_error)

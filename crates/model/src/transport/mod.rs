@@ -43,6 +43,132 @@ struct CompletionContext {
     api_protocol: ProviderApiProtocol,
 }
 
+#[derive(Clone, Copy)]
+enum ProtocolAdapter {
+    Chat,
+    Responses,
+}
+
+impl ProtocolAdapter {
+    fn for_api_protocol(api_protocol: ProviderApiProtocol) -> Self {
+        match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => Self::Responses,
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                Self::Chat
+            }
+        }
+    }
+
+    fn endpoint(self, config: &OpenAiProviderConfig) -> String {
+        match self {
+            Self::Chat => config.endpoint(),
+            Self::Responses => responses_endpoint(&config.base_url),
+        }
+    }
+
+    fn request_payload(
+        self,
+        provider: &OpenAiProvider,
+        request: &ModelTurnRequest,
+        model_name: &str,
+        capabilities: &ProviderProtocolContract,
+        streaming: bool,
+    ) -> Value {
+        let selection = provider.selected_model.as_ref();
+        let reasoning_enabled = selection.is_some_and(|selection| selection.reasoning_enabled);
+        let disable_reasoning = selection.is_some_and(|selection| !selection.reasoning_enabled);
+        let reasoning_effort =
+            selection.and_then(|selection| selection.wire_reasoning_effort.as_deref());
+        let supports_tool_choice = selection.is_none_or(|selection| selection.supports_tool_choice);
+        match (self, streaming) {
+            (Self::Chat, true) => openai_chat_stream_request_payload(
+                request,
+                model_name,
+                capabilities,
+                reasoning_enabled,
+                disable_reasoning,
+                reasoning_effort,
+                selection
+                    .map(|selection| selection.thinking_wire_format)
+                    .unwrap_or(ThinkingWireFormat::ThinkingType),
+                selection.is_none_or(|selection| selection.supports_developer_role),
+                supports_tool_choice,
+                selection
+                    .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
+            ),
+            (Self::Chat, false) => openai_request_payload(
+                request,
+                model_name,
+                capabilities,
+                reasoning_enabled,
+                disable_reasoning,
+                reasoning_effort,
+                selection
+                    .map(|selection| selection.thinking_wire_format)
+                    .unwrap_or(ThinkingWireFormat::ThinkingType),
+                selection.is_some_and(|selection| selection.supports_developer_role),
+                supports_tool_choice,
+                selection
+                    .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
+            ),
+            (Self::Responses, true) => openai_responses_stream_request_payload(
+                request,
+                model_name,
+                capabilities,
+                reasoning_enabled,
+                disable_reasoning,
+                reasoning_effort,
+                supports_tool_choice,
+            ),
+            (Self::Responses, false) => openai_responses_request_payload(
+                request,
+                model_name,
+                capabilities,
+                reasoning_enabled,
+                disable_reasoning,
+                reasoning_effort,
+                supports_tool_choice,
+            ),
+        }
+    }
+
+    fn reasoning_present(self, payload: &Value) -> bool {
+        match self {
+            Self::Chat => openai_reasoning_content_present(payload),
+            Self::Responses => openai_responses_reasoning_content_present(payload),
+        }
+    }
+
+    fn parse_response(
+        self,
+        request: &ModelTurnRequest,
+        config: &OpenAiProviderConfig,
+        payload: Value,
+        capabilities: &ProviderProtocolContract,
+        model_name: &str,
+        reasoning_variant: Option<&str>,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        match self {
+            Self::Chat => parse_openai_response(
+                request,
+                config,
+                payload,
+                capabilities,
+                model_name,
+                reasoning_variant,
+            ),
+            Self::Responses => parse_openai_responses_response(
+                request,
+                config,
+                payload,
+                capabilities,
+                model_name,
+                reasoning_variant,
+            ),
+        }
+    }
+}
+
 /// Mutable timing state for exactly one real provider HTTP attempt.
 struct ProviderAttemptInProgress {
     operation_phase: ProviderAttemptOperationPhase,
@@ -181,6 +307,102 @@ fn streaming_outcome(
             error: failure.error,
             time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
         },
+    }
+}
+
+fn non_streaming_outcome(
+    body: Result<Vec<u8>, ProviderError>,
+    parse_payload: impl FnOnce(Value) -> Result<(OpenAiCompletion, bool), ProviderError>,
+) -> AttemptBodyOutcome {
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return AttemptBodyOutcome::Retry {
+                error,
+                time_to_first_text_delta_ms: None,
+            };
+        }
+    };
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return AttemptBodyOutcome::Failed {
+                error: ProviderError::from_model_error(provider_response_json_error()),
+                time_to_first_text_delta_ms: None,
+            };
+        }
+    };
+    match parse_payload(payload) {
+        Ok((completion, wire_usage_present)) => AttemptBodyOutcome::Completed {
+            completion: Box::new(completion),
+            wire_usage_present,
+            time_to_first_text_delta_ms: None,
+        },
+        Err(error) => AttemptBodyOutcome::Failed {
+            error,
+            time_to_first_text_delta_ms: None,
+        },
+    }
+}
+
+fn parse_protocol_payload(
+    adapter: ProtocolAdapter,
+    request: &ModelTurnRequest,
+    config: &OpenAiProviderConfig,
+    payload: Value,
+    capabilities: &ProviderProtocolContract,
+    model_name: &str,
+    reasoning_variant: Option<&str>,
+) -> Result<(OpenAiCompletion, bool), ProviderError> {
+    let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
+    let reasoning_content_present = adapter.reasoning_present(&payload);
+    adapter
+        .parse_response(
+            request,
+            config,
+            payload,
+            capabilities,
+            model_name,
+            reasoning_variant,
+        )
+        .map(|response| {
+            (
+                OpenAiCompletion {
+                    response,
+                    reasoning_content_present,
+                },
+                wire_usage_present,
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_protocol_sse(
+    adapter: ProtocolAdapter,
+    runtime: &tokio::runtime::Handle,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    response: reqwest::Response,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+    attempt_started_at: Instant,
+) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
+    match adapter {
+        ProtocolAdapter::Chat => read_openai_chat_sse(
+            runtime,
+            cancellation,
+            request_timeout_seconds,
+            response,
+            on_event,
+            attempt_started_at,
+        ),
+        ProtocolAdapter::Responses => read_openai_responses_sse(
+            runtime,
+            cancellation,
+            request_timeout_seconds,
+            response,
+            on_event,
+            attempt_started_at,
+        ),
     }
 }
 
@@ -536,167 +758,6 @@ impl OpenAiProvider {
         Ok(completion.response)
     }
 
-    /// Execute a bounded Chat Completions SSE attempt sequence without exposing raw events.
-    fn complete_chat_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        capabilities: &ProviderProtocolContract,
-        model_name: &str,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<OpenAiCompletion, ProviderError> {
-        self.validate_reasoning_history(request)?;
-        let request_payload = openai_chat_stream_request_payload(
-            request,
-            model_name,
-            capabilities,
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| selection.reasoning_enabled),
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| !selection.reasoning_enabled),
-            self.selected_model
-                .as_ref()
-                .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
-            self.selected_model
-                .as_ref()
-                .map(|selection| selection.thinking_wire_format)
-                .unwrap_or(ThinkingWireFormat::ThinkingType),
-            self.selected_model
-                .as_ref()
-                .is_none_or(|selection| selection.supports_developer_role),
-            self.selected_model
-                .as_ref()
-                .is_none_or(|selection| selection.supports_tool_choice),
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| selection.requires_assistant_content_for_tool_calls),
-        );
-        let reasoning_variant = self
-            .selected_model
-            .as_ref()
-            .and_then(|selection| selection.reasoning_variant.as_deref());
-        self.complete_attempt(
-            cancellation,
-            ProviderApiProtocol::OpenAiChatCompletions,
-            model_name,
-            &self.config.endpoint(),
-            &request_payload,
-            on_attempt,
-            &mut |response, attempt_started_at| {
-                streaming_outcome(
-                    read_openai_chat_sse(
-                        &self.runtime,
-                        cancellation,
-                        self.request_timeout_seconds,
-                        response,
-                        on_event,
-                        attempt_started_at,
-                    ),
-                    |payload| {
-                        let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
-                        let reasoning_content_present = openai_reasoning_content_present(&payload);
-                        parse_openai_response(
-                            request,
-                            &self.config,
-                            payload,
-                            capabilities,
-                            model_name,
-                            reasoning_variant,
-                        )
-                        .map(|response| {
-                            (
-                                OpenAiCompletion {
-                                    response,
-                                    reasoning_content_present,
-                                },
-                                wire_usage_present,
-                            )
-                        })
-                    },
-                )
-            },
-        )
-    }
-
-    /// Execute a bounded Responses SSE attempt sequence without exposing raw events.
-    fn complete_responses_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        capabilities: &ProviderProtocolContract,
-        model_name: &str,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-    ) -> Result<OpenAiCompletion, ProviderError> {
-        self.validate_reasoning_history(request)?;
-        let request_payload = openai_responses_stream_request_payload(
-            request,
-            model_name,
-            capabilities,
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| selection.reasoning_enabled),
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| !selection.reasoning_enabled),
-            self.selected_model
-                .as_ref()
-                .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
-            self.selected_model
-                .as_ref()
-                .is_none_or(|selection| selection.supports_tool_choice),
-        );
-        let reasoning_variant = self
-            .selected_model
-            .as_ref()
-            .and_then(|selection| selection.reasoning_variant.as_deref());
-        self.complete_attempt(
-            cancellation,
-            ProviderApiProtocol::OpenAiResponses,
-            model_name,
-            &responses_endpoint(&self.config.base_url),
-            &request_payload,
-            on_attempt,
-            &mut |response, attempt_started_at| {
-                streaming_outcome(
-                    read_openai_responses_sse(
-                        &self.runtime,
-                        cancellation,
-                        self.request_timeout_seconds,
-                        response,
-                        on_event,
-                        attempt_started_at,
-                    ),
-                    |payload| {
-                        let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
-                        let reasoning_content_present =
-                            openai_responses_reasoning_content_present(&payload);
-                        parse_openai_responses_response(
-                            request,
-                            &self.config,
-                            payload,
-                            capabilities,
-                            model_name,
-                            reasoning_variant,
-                        )
-                        .map(|response| {
-                            (
-                                OpenAiCompletion {
-                                    response,
-                                    reasoning_content_present,
-                                },
-                                wire_usage_present,
-                            )
-                        })
-                    },
-                )
-            },
-        )
-    }
-
     pub(super) fn complete_with_contract_details_until(
         &self,
         request: &ModelTurnRequest,
@@ -706,66 +767,36 @@ impl OpenAiProvider {
         model_name: &str,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
-        let endpoint = match api_protocol {
-            ProviderApiProtocol::OpenAiResponses => responses_endpoint(&self.config.base_url),
-            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                self.config.endpoint()
-            }
-        };
-        let request_payload = match api_protocol {
-            ProviderApiProtocol::OpenAiResponses => openai_responses_request_payload(
-                request,
-                model_name,
-                capabilities,
-                self.selected_model
-                    .as_ref()
-                    .is_some_and(|selection| selection.reasoning_enabled),
-                self.selected_model
-                    .as_ref()
-                    .is_some_and(|selection| !selection.reasoning_enabled),
-                self.selected_model
-                    .as_ref()
-                    .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
-                self.selected_model
-                    .as_ref()
-                    .is_none_or(|selection| selection.supports_tool_choice),
-            ),
-            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                openai_request_payload(
-                    request,
-                    model_name,
-                    capabilities,
-                    self.selected_model
-                        .as_ref()
-                        .is_some_and(|selection| selection.reasoning_enabled),
-                    self.selected_model
-                        .as_ref()
-                        .is_some_and(|selection| !selection.reasoning_enabled),
-                    self.selected_model
-                        .as_ref()
-                        .and_then(|selection| selection.wire_reasoning_effort.as_deref()),
-                    self.selected_model
-                        .as_ref()
-                        .map(|selection| selection.thinking_wire_format)
-                        .unwrap_or(ThinkingWireFormat::ThinkingType),
-                    // 无 selected_model（env 配置路径）时按 false 处理：OpenAI
-                    // 兼容 chat 端点对 developer role 的支持并不通用（dashscope
-                    // compatible-mode 实测 HTTP 400），wire 统一投影为 system；
-                    // 显式声明的模型保持用户配置的投影行为。
-                    self.selected_model
-                        .as_ref()
-                        .is_some_and(|selection| selection.supports_developer_role),
-                    self.selected_model
-                        .as_ref()
-                        .is_none_or(|selection| selection.supports_tool_choice),
-                    self.selected_model.as_ref().is_some_and(|selection| {
-                        selection.requires_assistant_content_for_tool_calls
-                    }),
-                )
-            }
-        };
-        let runtime = &self.runtime;
-        let request_timeout_seconds = self.request_timeout_seconds;
+        self.complete_protocol(
+            request,
+            cancellation,
+            capabilities,
+            api_protocol,
+            model_name,
+            None,
+            on_attempt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_protocol(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+        mut on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        let streaming = on_event.is_some();
+        if streaming {
+            self.validate_reasoning_history(request)?;
+        }
+        let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
+        let endpoint = adapter.endpoint(&self.config);
+        let request_payload =
+            adapter.request_payload(self, request, model_name, capabilities, streaming);
         let reasoning_variant = self
             .selected_model
             .as_ref()
@@ -777,78 +808,48 @@ impl OpenAiProvider {
             &endpoint,
             &request_payload,
             on_attempt,
-            &mut |response, _attempt_started_at| {
-                let body = match read_bounded_provider_response_body(
-                    runtime,
-                    cancellation,
-                    request_timeout_seconds,
-                    response,
-                ) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        return AttemptBodyOutcome::Retry {
-                            error,
-                            time_to_first_text_delta_ms: None,
-                        };
-                    }
-                };
-                let payload = match serde_json::from_slice::<Value>(&body) {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        return AttemptBodyOutcome::Failed {
-                            error: ProviderError::from_model_error(provider_response_json_error()),
-                            time_to_first_text_delta_ms: None,
-                        };
-                    }
-                };
-                let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
-                let reasoning_content_present = match api_protocol {
-                    ProviderApiProtocol::OpenAiResponses => {
-                        openai_responses_reasoning_content_present(&payload)
-                    }
-                    ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                        openai_reasoning_content_present(&payload)
-                    }
-                };
-                let parsed = match api_protocol {
-                    ProviderApiProtocol::OpenAiResponses => parse_openai_responses_response(
+            &mut |response, attempt_started_at| {
+                let parse_payload = |payload| {
+                    parse_protocol_payload(
+                        adapter,
                         request,
                         &self.config,
                         payload,
                         capabilities,
                         model_name,
                         reasoning_variant,
-                    ),
-                    ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                        parse_openai_response(
-                            request,
-                            &self.config,
-                            payload,
-                            capabilities,
-                            model_name,
-                            reasoning_variant,
-                        )
-                    }
+                    )
                 };
-                match parsed {
-                    Ok(response) => AttemptBodyOutcome::Completed {
-                        completion: Box::new(OpenAiCompletion {
+                if let Some(on_event) = on_event.as_deref_mut() {
+                    streaming_outcome(
+                        read_protocol_sse(
+                            adapter,
+                            &self.runtime,
+                            cancellation,
+                            self.request_timeout_seconds,
                             response,
-                            reasoning_content_present,
-                        }),
-                        wire_usage_present,
-                        time_to_first_text_delta_ms: None,
-                    },
-                    Err(error) => AttemptBodyOutcome::Failed {
-                        error,
-                        time_to_first_text_delta_ms: None,
-                    },
+                            on_event,
+                            attempt_started_at,
+                        ),
+                        parse_payload,
+                    )
+                } else {
+                    non_streaming_outcome(
+                        read_bounded_provider_response_body(
+                            &self.runtime,
+                            cancellation,
+                            self.request_timeout_seconds,
+                            response,
+                        ),
+                        parse_payload,
+                    )
                 }
             },
         )
     }
 
     /// Shared completion skeleton for both wire protocols and both streaming
+    /// and non-streaming responses.
     /// Execute one HTTP attempt and return either its parsed completion or a
     /// typed failure carrying the replay safety and provider-directed delay.
     #[allow(clippy::too_many_arguments)]
@@ -1142,25 +1143,15 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let completion = match context.api_protocol {
-            ProviderApiProtocol::OpenAiResponses => self.complete_responses_stream(
-                &request,
-                cancellation,
-                &context.capabilities,
-                model_name,
-                on_event,
-                on_attempt,
-            ),
-            ProviderApiProtocol::OpenAiChatCompletions => self.complete_chat_stream(
-                &request,
-                cancellation,
-                &context.capabilities,
-                model_name,
-                on_event,
-                on_attempt,
-            ),
-            ProviderApiProtocol::Declared => Err(provider_streaming_unsupported_error()),
-        }?;
+        let completion = self.complete_protocol(
+            &request,
+            cancellation,
+            &context.capabilities,
+            context.api_protocol,
+            model_name,
+            Some(on_event),
+            on_attempt,
+        )?;
         Ok(completion).and_then(|completion| {
             validate_response_tool_reasoning_contract(
                 request_uses_tool_protocol(&request),
