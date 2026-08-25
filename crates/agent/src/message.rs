@@ -7,7 +7,7 @@
 /// 交由模型提供方执行的模型层消息类型别名。
 pub type LlmMessage = singularity_model::ModelMessage;
 
-use singularity_model::{ModelTurnResponse, ProviderReasoningReplay};
+use singularity_model::{ModelStopReason, ModelTurnResponse, ProviderReasoningReplay};
 
 use crate::tools::ToolExecution;
 
@@ -49,6 +49,9 @@ pub enum ContentBlock {
 pub struct AgentMessage {
     pub role: AgentMessageRole,
     pub content: Vec<ContentBlock>,
+    /// Provider 给出的 assistant 停止原因；仅 assistant 消息设置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<ModelStopReason>,
     /// 模型提供方私有推理状态（用于支持 Responses 等协议的推理连续性重放）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_reasoning_replay: Option<ProviderReasoningReplay>,
@@ -71,6 +74,7 @@ impl AgentMessage {
             content: vec![ContentBlock::Text {
                 text: content.into(),
             }],
+            stop_reason: None,
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
@@ -127,6 +131,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,
@@ -164,6 +169,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     AgentMessage {
         role: AgentMessageRole::Assistant,
         content,
+        stop_reason: response.stop_reason(),
         provider_reasoning_replay: response.provider_reasoning_history.first().cloned(),
         tool_call_id: None,
         tool_name: None,
@@ -195,6 +201,7 @@ pub(crate) fn tool_result_message(
         content: vec![ContentBlock::Text {
             text: execution.content.clone(),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),

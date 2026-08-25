@@ -44,6 +44,16 @@ impl PrintRenderer {
         let _ = writeln!(lock, "{text}");
         let _ = lock.flush();
     }
+
+    pub fn warn_truncated(&self) {
+        let stderr = std::io::stderr();
+        let mut lock = stderr.lock();
+        let _ = writeln!(
+            lock,
+            "sg: [warning] Response was truncated before completion."
+        );
+        let _ = lock.flush();
+    }
 }
 
 impl Default for PrintRenderer {

@@ -105,6 +105,7 @@ impl SessionManager {
                     content: vec![ContentBlock::Text {
                         text: "[previous execution outcome unknown; do not retry]".to_string(),
                     }],
+                    stop_reason: None,
                     provider_reasoning_replay: None,
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,

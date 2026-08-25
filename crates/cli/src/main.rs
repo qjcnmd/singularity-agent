@@ -214,6 +214,9 @@ fn drain_print(
         Ok(view) => match view.turn_status {
             TurnStatus::Completed => {
                 renderer.write_final_text(view.final_text.trim_end());
+                if view.truncated {
+                    renderer.warn_truncated();
+                }
                 Ok(0)
             }
             TurnStatus::Interrupted => Ok(130),
@@ -235,7 +238,11 @@ fn drain_json(
     match outcome {
         Ok(outcome) => {
             let usage = serde_json::to_value(outcome.usage).unwrap_or(serde_json::Value::Null);
-            renderer.emit_summary(outcome.turn_status, Some(usage));
+            renderer.emit_summary_with_truncation(
+                outcome.turn_status,
+                Some(usage),
+                outcome.truncated,
+            );
             Ok(exit_code_for(outcome.turn_status))
         }
         Err(message) => {

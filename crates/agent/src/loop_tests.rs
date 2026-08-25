@@ -1057,6 +1057,7 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             content: vec![ContentBlock::Text {
                 text: "old user".to_string(),
             }],
+            stop_reason: None,
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
@@ -1069,6 +1070,7 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             content: vec![ContentBlock::Text {
                 text: "old assistant".to_string(),
             }],
+            stop_reason: None,
             provider_reasoning_replay: None,
             tool_call_id: None,
             tool_name: None,
@@ -1155,6 +1157,7 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
                     args: json!({"path": target, "content": "must not be written"}),
                 },
             ],
+            stop_reason: None,
             tool_call_id: Some("orphan_write_1".to_string()),
             tool_name: Some("write".to_string()),
             provider_reasoning_replay: None,

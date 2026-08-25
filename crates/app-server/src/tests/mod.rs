@@ -324,6 +324,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
                 name: "write".to_string(),
                 args: json!({"path":"out.txt","content":"ok"}),
             }],
+            stop_reason: None,
             provider_reasoning_replay: Some(ProviderReasoningReplay::Responses {
                 provider_name: "private-provider".to_string(),
                 model_name: "private-model".to_string(),
@@ -345,6 +346,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
             content: vec![singularity_agent::message::ContentBlock::Text {
                 text: "write failed".to_string(),
             }],
+            stop_reason: None,
             provider_reasoning_replay: None,
             tool_call_id: Some("call-1".to_string()),
             tool_name: Some("write".to_string()),
@@ -989,6 +991,7 @@ fn seed_turned_session(
                     content: vec![singularity_agent::message::ContentBlock::Text {
                         text: format!("tool-output-{index}"),
                     }],
+                    stop_reason: None,
                     provider_reasoning_replay: None,
                     tool_call_id: Some(format!("call-{index}")),
                     tool_name: Some("bash".to_string()),

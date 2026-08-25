@@ -9,6 +9,7 @@ fn user(text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,
@@ -22,6 +23,7 @@ fn assistant(text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,
@@ -35,6 +37,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
@@ -50,6 +53,7 @@ fn file_call(tool_name: &str, path: &str) -> AgentMessage {
             name: tool_name.to_string(),
             args: json!({"path": path}),
         }],
+        stop_reason: None,
         provider_reasoning_replay: None,
         tool_call_id: None,
         tool_name: None,

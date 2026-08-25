@@ -282,6 +282,8 @@ pub enum AgentTerminalReason {
 pub struct AgentOutcome {
     /// 最后一次无工具调用的 assistant 文本（中断/轮数上限时可能为空）。
     pub final_text: String,
+    /// 最终 assistant 响应是否因 provider 输出预算耗尽而截断。
+    pub truncated: bool,
     pub turns: u32,
     /// 各轮 provider 调用的聚合 usage。
     pub usage: ModelUsage,
@@ -535,6 +537,7 @@ impl Agent {
     ) -> Result<AgentOutcome> {
         let mut outcome = AgentOutcome {
             final_text: String::new(),
+            truncated: false,
             turns: 0,
             usage: ModelUsage::default(),
             compacted: false,
@@ -843,6 +846,7 @@ impl Agent {
                     return self.fail_after_progress(AgentError::Session(error), outcome);
                 }
                 outcome.final_text = assistant_text;
+                outcome.truncated = length_truncated;
                 break;
             }
             // 代理将要停止：消费停止窗口内到达的转向输入后回到内层循环。

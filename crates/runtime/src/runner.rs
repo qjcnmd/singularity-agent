@@ -55,6 +55,7 @@ pub struct TurnOutcome {
     pub turn_status: TurnStatus,
     /// 最终 assistant 文本；中断/失败时可能为空。
     pub final_text: String,
+    pub truncated: bool,
     pub usage: TurnUsage,
 }
 
@@ -393,6 +394,7 @@ impl TurnRunner {
             turn_id,
             turn_status: final_turn.status,
             final_text: status.final_answer.unwrap_or_default(),
+            truncated: status.truncated,
             usage: final_turn
                 .usage
                 .unwrap_or_else(|| TurnUsage::from_model_usage(&ModelUsage::default(), false)),
@@ -898,6 +900,7 @@ struct RunStatus {
     turn_status: TurnStatus,
     session_status: ThreadStatus,
     final_answer: Option<String>,
+    truncated: bool,
     model_usage: ModelUsage,
     usage_complete: bool,
     error: Option<String>,
@@ -908,6 +911,7 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
         turn_status: TurnStatus::Failed,
         session_status: ThreadStatus::Failed,
         final_answer: None,
+        truncated: outcome.truncated,
         model_usage: outcome.usage,
         usage_complete: outcome.usage_complete,
         error: None,

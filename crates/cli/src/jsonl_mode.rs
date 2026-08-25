@@ -2,7 +2,8 @@
 //!
 //! 事件行形状为 `{"method": <稳定方法名>, "params": <typed payload>}`；
 //! 终态行固定为 `{"summary":{"thread":…,"turn":…}}`，turn 携带
-//! `status`/`threadId`/`usage`，供外部评估器等机器解析方消费。
+//! `status`/`threadId`/`usage`，截断终态额外携带 `truncated: true`，供外部
+//! 评估器等机器解析方消费。
 
 use std::io::Write;
 
@@ -37,13 +38,25 @@ impl JsonlRenderer {
         let _ = lock.flush();
     }
 
-    /// 终态 summary 行。usage 仅在已知时输出。
+    /// 终态 summary 行。usage 仅在已知时输出；普通终态不输出截断字段。
     pub fn emit_summary(&self, status: TurnStatus, usage: Option<Value>) {
-        let turn = json!({
+        self.emit_summary_with_truncation(status, usage, false);
+    }
+
+    pub fn emit_summary_with_truncation(
+        &self,
+        status: TurnStatus,
+        usage: Option<Value>,
+        truncated: bool,
+    ) {
+        let mut turn = json!({
             "threadId": self.thread_id,
             "status": status.as_str(),
             "usage": usage,
         });
+        if truncated {
+            turn["truncated"] = Value::Bool(true);
+        }
         let line = json!({
             "summary": {
                 "thread": {"threadId": self.thread_id},
