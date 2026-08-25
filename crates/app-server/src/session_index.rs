@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use singularity_agent::session::{SessionManager, SessionMetadata};
+use singularity_agent::session::{SessionManager, SessionProjectionStatus, project_session};
 use thiserror::Error;
 
 /// 会话索引状态：最近一次 turn 的状态。`None` 表示尚无 turn（新会话）；`Active`
@@ -263,84 +263,24 @@ fn lock_poisoned<T>(_: std::sync::PoisonError<T>) -> SessionIndexError {
 /// thread_settings、status 取最新 terminal 标记、usage 取最新 factual usage、
 /// title 取首条 user 消息。
 fn record_from_session(session: &SessionManager, rollout_path: &Path) -> SessionRecord {
-    let metadata = session.metadata_entries();
-    let model = metadata.iter().rev().find_map(|entry| {
-        let SessionMetadata::ThreadSettings {
-            provider,
-            model,
-            reasoning,
-        } = entry
-        else {
-            return None;
-        };
-        match provider.as_deref().filter(|value| !value.is_empty()) {
-            None => {
-                // 旧版裸 model 记录：保持原样，不套 provider/。
-                Some(model.clone())
-            }
-            Some(provider) => Some(singularity_model::compose_model_selector(
-                provider,
-                model,
-                reasoning.as_deref(),
-            )),
-        }
+    let projection = project_session(session);
+    let status = projection.status.map(|status| match status {
+        SessionProjectionStatus::Active => SessionStatus::Active,
+        SessionProjectionStatus::Completed => SessionStatus::Completed,
+        SessionProjectionStatus::Failed => SessionStatus::Failed,
+        SessionProjectionStatus::Interrupted => SessionStatus::Interrupted,
     });
-    let status = metadata.iter().rev().find_map(|entry| match entry.kind() {
-        singularity_agent::session::SessionMetadataKind::TurnStarted => Some(SessionStatus::Active),
-        singularity_agent::session::SessionMetadataKind::TurnCompleted => {
-            Some(SessionStatus::Completed)
-        }
-        singularity_agent::session::SessionMetadataKind::TurnFailed => Some(SessionStatus::Failed),
-        singularity_agent::session::SessionMetadataKind::TurnInterrupted => {
-            Some(SessionStatus::Interrupted)
-        }
-        _ => None,
-    });
-    let token_usage = metadata
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionMetadata::Usage { usage, .. } => Some(usage.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| serde_json::json!({}));
-    let title = metadata
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionMetadata::ThreadName { name } => Some(name.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            session.entries().iter().find_map(|entry| {
-                if let singularity_agent::session::SessionEntryType::Message(msg) =
-                    &entry.entry_type
-                    && msg.role == singularity_agent::message::AgentMessageRole::User
-                {
-                    let text = msg.content_text();
-                    let title = crate::dispatch::title_from_input(&text);
-                    if !title.is_empty() {
-                        return Some(title);
-                    }
-                }
-                None
-            })
-        });
-    let created_at = session.created_at().to_string();
-    let updated_at = session
-        .entries()
-        .last()
-        .and_then(|e| e.timestamp.clone())
-        .unwrap_or_else(|| created_at.clone());
     SessionRecord {
-        session_id: session.session_id().to_string(),
+        session_id: projection.session_id,
         rollout_path: rollout_path.to_string_lossy().to_string(),
-        cwd: session.cwd().to_string_lossy().to_string(),
-        title,
-        model,
+        cwd: projection.cwd,
+        title: projection.title,
+        model: projection.model,
         status,
-        created_at,
-        updated_at,
-        token_usage,
+        created_at: projection.created_at,
+        updated_at: projection.updated_at,
+        token_usage: projection
+            .latest_usage
+            .unwrap_or_else(|| serde_json::json!({})),
     }
 }

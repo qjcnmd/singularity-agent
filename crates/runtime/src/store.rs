@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
+use singularity_agent::session::{SessionManager, SessionProjectionStatus, project_session};
 use singularity_core::user_singularity_home;
 use uuid::Uuid;
 
@@ -103,11 +103,17 @@ pub fn resume_thread(sessions_dir: &Path, thread_id: &str) -> Result<Thread, Res
     session
         .repair_orphaned_tool_calls()
         .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let projection = project_session(&session);
     let thread = Thread {
         thread_id: thread_id.to_string(),
         cwd: session.cwd().to_string_lossy().to_string(),
-        model: persisted_model_selector(&session),
-        last_turn_status: persisted_thread_status(&session),
+        model: projection.model,
+        last_turn_status: projection.status.and_then(|status| match status {
+            SessionProjectionStatus::Completed => Some(ThreadStatus::Completed),
+            SessionProjectionStatus::Failed => Some(ThreadStatus::Failed),
+            SessionProjectionStatus::Interrupted => Some(ThreadStatus::Interrupted),
+            SessionProjectionStatus::Active => None,
+        }),
     };
     Ok(thread)
 }
@@ -126,32 +132,13 @@ pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
         let Ok(session) = SessionManager::open_existing_read_only(&path) else {
             continue;
         };
-        let title = session.metadata_entries().iter().rev().find_map(|entry| {
-            let SessionMetadata::ThreadName { name } = entry else {
-                return None;
-            };
-            Some(name.clone())
-        });
-        let turn_count = session
-            .metadata_entries()
-            .iter()
-            .filter(|entry| entry.kind() == SessionMetadataKind::TurnStarted)
-            .count();
-        let total_tokens = session
-            .metadata_entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionMetadata::Usage { usage, .. } => Some(usage),
-                _ => None,
-            })
-            .filter_map(|usage| usage.get("totalTokens").and_then(serde_json::Value::as_u64))
-            .sum();
+        let projection = project_session(&session);
         threads.push(ThreadSummary {
-            thread_id: session.session_id().to_string(),
-            title,
-            created_at: session.created_at().to_string(),
-            turn_count,
-            total_tokens,
+            thread_id: projection.session_id,
+            title: projection.title,
+            created_at: projection.created_at,
+            turn_count: projection.turn_count,
+            total_tokens: projection.total_tokens,
         });
     }
     threads.sort_by(|left, right| right.created_at.cmp(&left.created_at));
@@ -180,40 +167,7 @@ pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result
 
 /// 从最新 `thread_settings` metadata 投影模型 selector（含推理档位段）。
 pub fn persisted_model_selector(session: &SessionManager) -> Option<String> {
-    session.metadata_entries().iter().rev().find_map(|entry| {
-        let SessionMetadata::ThreadSettings {
-            provider,
-            model,
-            reasoning,
-        } = entry
-        else {
-            return None;
-        };
-        let reasoning = reasoning.as_deref().filter(|value| !value.is_empty());
-        Some(match provider.as_deref() {
-            Some(provider) => singularity_model::compose_model_selector(provider, model, reasoning),
-            None => match reasoning {
-                Some(reasoning) => format!("{model}#{reasoning}"),
-                None => model.clone(),
-            },
-        })
-    })
-}
-
-/// 从最新终态 metadata 投影 Thread 状态；无终态记录时为 None。
-fn persisted_thread_status(session: &SessionManager) -> Option<ThreadStatus> {
-    session.metadata_entries().iter().rev().find_map(|entry| {
-        let kind = entry.kind();
-        if kind.matches_turn_terminal() {
-            match kind {
-                SessionMetadataKind::TurnCompleted => Some(ThreadStatus::Completed),
-                SessionMetadataKind::TurnFailed => Some(ThreadStatus::Failed),
-                _ => Some(ThreadStatus::Interrupted),
-            }
-        } else {
-            None
-        }
-    })
+    project_session(session).model
 }
 
 /// 把 [`TurnFailureCause`] 中与存储相关的失败映射为统一文本。
