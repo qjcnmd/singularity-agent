@@ -77,13 +77,14 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let mut file = open_user_config_file(path, true)?;
     ensure_private_secret_handle(&file)?;
-    let text = read_bounded_text_from_file(&mut file, crate::MAX_DISCOVERY_RESPONSE_BYTES)
-        .map_err(|error| match error {
+    let text = read_bounded_text_from_file(&mut file, crate::MAX_CONFIG_AUTH_FILE_BYTES).map_err(
+        |error| match error {
             BoundedTextError::TooLarge => {
                 user_config_error("user provider auth exceeds the size limit")
             }
             BoundedTextError::Read => user_config_error("user provider auth could not be read"),
-        })?;
+        },
+    )?;
     let auth: UserAuthFile = serde_json::from_str(&text)
         .map_err(|_| user_config_error("user provider auth is invalid JSON"))?;
     if auth.schema_version != USER_AUTH_SCHEMA_VERSION {

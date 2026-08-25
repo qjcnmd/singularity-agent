@@ -10,7 +10,9 @@ use crate::provider::runtime::OpenAiProviderConfig;
 use crate::transport::http::{
     block_on_provider_future, model_error_from_http_status, read_bounded_provider_response_body,
 };
-use crate::{MAX_DISCOVERED_MODEL_IDS, MAX_DISCOVERY_RESPONSE_BYTES, MAX_MODEL_ID_LENGTH};
+use crate::{MAX_DISCOVERED_MODEL_IDS, MAX_MODEL_ID_LENGTH};
+
+const MAX_MODELS_ENDPOINT_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Discover public model ids from the provider's standard `/models` endpoint using a client and runtime.
 pub(crate) fn discover_provider_models(
@@ -41,7 +43,7 @@ pub(crate) fn discover_provider_models(
         request_timeout_seconds,
         response,
     )?;
-    if body.len() > MAX_DISCOVERY_RESPONSE_BYTES {
+    if body.len() > MAX_MODELS_ENDPOINT_RESPONSE_BYTES {
         return Err(ProviderError::from_model_error(
             ModelError::new(
                 ModelErrorKind::JsonSchemaViolation,

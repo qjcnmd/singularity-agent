@@ -250,7 +250,6 @@ fn configured_model_from_user_file(
     model_file: &UserConfigModel,
     provider_name: &str,
     model_name: &str,
-    cache: Option<&crate::catalog::CachedCatalog>,
 ) -> Result<ConfiguredModel, ProviderError> {
     // api_protocol 必须由用户显式声明。
     let Some(api_protocol) = model_file.api_protocol.as_deref() else {
@@ -261,11 +260,11 @@ fn configured_model_from_user_file(
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
     let max_context_tokens = model_file.max_context_tokens.unwrap_or_else(|| {
-        let (ctx, _, _) = crate::catalog::resolve_model_limits(provider_name, model_name, cache);
+        let (ctx, _) = crate::catalog::resolve_model_limits(provider_name, model_name);
         ctx
     });
     let max_output_tokens = model_file.max_output_tokens.unwrap_or_else(|| {
-        let (_, out, _) = crate::catalog::resolve_model_limits(provider_name, model_name, cache);
+        let (_, out) = crate::catalog::resolve_model_limits(provider_name, model_name);
         out
     });
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
@@ -378,8 +377,6 @@ where
         ));
     }
     let mut providers = BTreeMap::new();
-    // 目录投影缓存读取一次供全部模型解析复用（TTL 内、损坏 fail-soft）。
-    let catalog_cache = crate::catalog::CachedCatalog::load_default();
     for (provider_name, provider_file) in &user_config.config.providers {
         if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
             if provider_name.as_str() == default_provider_name {
@@ -420,12 +417,7 @@ where
                 }
                 continue;
             }
-            match configured_model_from_user_file(
-                model_file,
-                provider_name,
-                model_name,
-                catalog_cache.as_ref(),
-            ) {
+            match configured_model_from_user_file(model_file, provider_name, model_name) {
                 Ok(model) => {
                     models.insert(model_name.clone(), model);
                 }

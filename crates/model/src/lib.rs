@@ -33,7 +33,7 @@ pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_DISCOVERED_MODEL_IDS: usize = 1024;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
-pub(crate) const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CONFIG_AUTH_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
@@ -83,14 +83,3 @@ pub use provider::telemetry::{
 };
 pub use transport::OpenAiProvider;
 pub use types::*;
-
-/// 默认目录投影缓存是否过期或缺失（启动时据此决定是否触发后台刷新）。
-pub fn catalog_cache_is_stale() -> bool {
-    catalog::metadata_cache_is_stale()
-}
-
-/// 从 models.dev 目录拉取并原子写入默认投影缓存；失败返回 Err，
-/// 调用方应 fail-soft（不影响配置解析）。同步入口，供后台任务调用。
-pub fn refresh_catalog_cache(runtime_handle: &tokio::runtime::Handle) -> Result<(), String> {
-    catalog::refresh_metadata_cache_default(runtime_handle)
-}

@@ -85,13 +85,25 @@ fn user_model_without_limits_falls_back_to_conservative_defaults() {
         api_protocol: Some("responses".to_string()),
         ..UserConfigModel::default()
     };
-    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model", None)
+    let resolved = configured_model_from_user_file(&model, "test-provider", "test-model")
         .expect("missing limits resolve to conservative defaults");
     assert_eq!(
         resolved.max_context_tokens,
         Some(crate::DEFAULT_MAX_CONTEXT_TOKENS)
     );
     assert_eq!(resolved.max_output_tokens, crate::DEFAULT_MAX_OUTPUT_TOKENS);
+}
+
+#[test]
+fn user_model_without_limits_uses_the_builtin_table_when_available() {
+    let model = UserConfigModel {
+        api_protocol: Some("responses".to_string()),
+        ..UserConfigModel::default()
+    };
+    let resolved = configured_model_from_user_file(&model, "openai", "gpt-5")
+        .expect("known model resolves from the builtin table");
+    assert_eq!(resolved.max_context_tokens, Some(400_000));
+    assert_eq!(resolved.max_output_tokens, 128_000);
 }
 
 #[test]
@@ -115,7 +127,7 @@ fn user_model_override_without_api_protocol_still_fails_closed() {
         max_output_tokens: Some(4_096),
         ..UserConfigModel::default()
     };
-    let error = match configured_model_from_user_file(&model, "test-provider", "test-model", None) {
+    let error = match configured_model_from_user_file(&model, "test-provider", "test-model") {
         Ok(_) => panic!("api_protocol cannot be guessed"),
         Err(error) => error,
     };
@@ -326,7 +338,7 @@ fn selected_invalid_endpoint_precedes_missing_auth() {
 #[test]
 fn oversized_user_config_and_private_auth_reads_are_rejected() {
     let directory = tempfile::tempdir().expect("user config directory");
-    let oversized_contents = "x".repeat(crate::MAX_DISCOVERY_RESPONSE_BYTES + 1);
+    let oversized_contents = "x".repeat(crate::MAX_CONFIG_AUTH_FILE_BYTES + 1);
     let config_path = directory.path().join(USER_CONFIG_FILE_NAME);
     std::fs::write(&config_path, &oversized_contents).expect("write oversized user config");
     let config_error = match read_user_config_data_from_directory(directory.path().to_path_buf()) {

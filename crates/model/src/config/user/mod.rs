@@ -298,16 +298,16 @@ pub(crate) fn read_user_config_data_from_directory(
     ensure_no_reparse_point(&config_path, false)?;
     let mut config_file = open_user_config_file(&config_path, false)
         .map_err(|_| user_config_error("user provider config could not be opened"))?;
-    let config_text =
-        read_bounded_text_from_file(&mut config_file, crate::MAX_DISCOVERY_RESPONSE_BYTES)
-            .map_err(|error| match error {
-                BoundedTextError::TooLarge => {
-                    user_config_error("user provider config exceeds the size limit")
-                }
-                BoundedTextError::Read => {
-                    user_config_error("user provider config could not be read")
-                }
-            })?;
+    let config_text = read_bounded_text_from_file(
+        &mut config_file,
+        crate::MAX_CONFIG_AUTH_FILE_BYTES,
+    )
+    .map_err(|error| match error {
+        BoundedTextError::TooLarge => {
+            user_config_error("user provider config exceeds the size limit")
+        }
+        BoundedTextError::Read => user_config_error("user provider config could not be read"),
+    })?;
     let config: UserConfigFile = serde_json::from_str(&config_text)
         .map_err(|_| user_config_error("user provider config is invalid JSON"))?;
     if config.version != 1 {

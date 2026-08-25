@@ -44,7 +44,7 @@ SINGULARITY_API_KEY=replace-with-your-api-key
 SINGULARITY_MODEL=your-model-name
 ```
 
-用户配置文件中每个模型必须显式声明 `api_protocol: chat|responses`；不会根据 URL 推断协议或跨协议 fallback。模型条目不接受未知字段。
+用户配置文件中每个模型必须显式声明 `api_protocol: chat|responses`；不会根据 URL 推断协议或跨协议 fallback。模型条目不接受未知字段。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`。
 
 ### 思考档位
 
