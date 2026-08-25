@@ -239,12 +239,6 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
         if status_line.starts_with("HTTP/1.1 404") {
             assert_eq!(error.error.message, "Provider returned HTTP 404.");
         }
-        let metadata = error
-            .provider_attempt_metadata
-            .as_ref()
-            .expect("http attempt metadata");
-        assert_eq!(metadata.attempt_count, 1);
-        assert_eq!(metadata.retry_count, 0);
         assert!(!serialized.contains("provider body must not leak"));
         assert_eq!(attempts.try_iter().count(), 1);
     }

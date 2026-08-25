@@ -91,14 +91,6 @@ pub enum TurnEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostic_code: Option<String>,
     },
-    ProviderAttemptSummary {
-        thread_id: String,
-        turn_id: String,
-        model_turn_ordinal: u32,
-        attempt_count: u32,
-        retry_count: u32,
-        latency_ms: u64,
-    },
     TurnCompleted {
         turn: Turn,
     },
@@ -135,7 +127,6 @@ impl TurnEvent {
             Self::ItemFailed { .. } => "item/failed",
             Self::Diagnostic { .. } => "agent/diagnostic",
             Self::ProviderAttempt { .. } => "provider/attempt",
-            Self::ProviderAttemptSummary { .. } => "provider/attempt/summary",
             Self::TurnCompleted { .. } => "turn/completed",
             Self::TurnFailed { .. } => "turn/error",
             Self::ThreadSettingsApplied { .. } => "thread/settingsApplied",

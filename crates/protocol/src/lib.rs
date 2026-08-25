@@ -1062,28 +1062,6 @@ impl AppEvent {
         }
     }
 
-    /// 构造一个 model turn 的 Provider attempt aggregate 终态事件。
-    pub fn provider_attempt_summary(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        model_turn_ordinal: u32,
-        attempt_count: u32,
-        retry_count: u32,
-        latency_ms: u64,
-    ) -> Self {
-        Self {
-            method: "provider/attempt/summary".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "modelTurnOrdinal": model_turn_ordinal,
-                "attemptCount": attempt_count,
-                "retryCount": retry_count,
-                "latencyMs": latency_ms,
-            }),
-        }
-    }
-
     /// 构造 item started 事件。
     pub fn item_started(
         thread_id: impl Into<String>,

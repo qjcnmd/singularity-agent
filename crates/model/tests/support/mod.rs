@@ -6,13 +6,12 @@ pub(crate) use singularity_model::{
     ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, ProviderError, ProviderErrorStage,
-    ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderStreamingCapability, ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
-    validate_model_response, validate_model_turn_response, validate_provider_config,
+    ProviderApiProtocol, ProviderAttemptEvent, ProviderConfigSnapshot, ProviderConfigSource,
+    ProviderConfigurationStatus, ProviderError, ProviderErrorStage, ProviderProtocolContract,
+    ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability, ToolChoicePolicy,
+    chat_completions_endpoint, classify_model_error, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
+    validate_model_turn_response, validate_provider_config,
 };
 pub(crate) use std::io::{BufRead, BufReader, Read, Write};
 pub(crate) use std::net::{TcpListener, TcpStream};

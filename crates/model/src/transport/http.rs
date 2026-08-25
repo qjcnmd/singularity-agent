@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Response;
 use serde_json::Value;
@@ -8,8 +8,7 @@ use singularity_core::CancellationToken;
 use crate::error::{
     ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
 };
-use crate::provider::telemetry::ProviderAttemptMetadata;
-use crate::types::{ModelTurnResponse, ProviderToolReasoningMode};
+use crate::types::ProviderToolReasoningMode;
 use crate::{
     HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
@@ -173,7 +172,6 @@ pub(super) fn provider_cancelled_error() -> ProviderError {
 }
 
 pub(super) fn provider_tool_reasoning_history_error(
-    response: &ModelTurnResponse,
     mode: ProviderToolReasoningMode,
 ) -> ProviderError {
     let (code, evidence) = if mode == ProviderToolReasoningMode::DisabledForToolCalls {
@@ -193,24 +191,7 @@ pub(super) fn provider_tool_reasoning_history_error(
     )
     .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
     error.validation_errors.push(evidence.to_string());
-    let provider_error = ProviderError::from_model_error(error);
-    if let Some(metadata) = &response.provider_attempt_metadata {
-        provider_error.with_provider_attempt_metadata(metadata.clone())
-    } else {
-        provider_error
-    }
-}
-
-pub(super) fn provider_attempt_metadata(
-    metadata: &ProviderAttemptMetadata,
-    started_at: Instant,
-) -> ProviderAttemptMetadata {
-    ProviderAttemptMetadata {
-        attempt_count: metadata.attempt_count,
-        retry_count: metadata.retry_count,
-        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        occurrences: metadata.occurrences.clone(),
-    }
+    ProviderError::from_model_error(error)
 }
 
 pub(crate) fn block_on_provider_future<C, F, T>(

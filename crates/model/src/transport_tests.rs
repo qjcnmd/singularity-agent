@@ -13,7 +13,6 @@ use super::retry_after_delay;
 use crate::error::{
     ModelErrorCategory, ModelErrorKind, ProviderErrorStage, ProviderTransportCategory,
 };
-use crate::provider::telemetry::ProviderAttemptStatus;
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, HTTP_STATUS_RATE_LIMITED,
     HTTP_STATUS_UNAUTHORIZED, MAX_RETRY_AFTER_MS, ModelMessage, ModelRole, ModelToolCall,
@@ -285,29 +284,6 @@ fn configured_deadline_is_reported_from_a_real_transport_timeout() {
         Some(ProviderTransportCategory::Timeout)
     );
     assert_eq!(error.error.timeout_seconds, Some(1));
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("timeout attempt metadata");
-    // 超时（挂起）不再重试：单次 120s 超时即失败，避免 6 次重试拖 12 分钟。
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
-    assert_eq!(metadata.occurrences.len(), 1);
-    for (index, occurrence) in metadata.occurrences.iter().enumerate() {
-        assert_eq!(occurrence.attempt_index, index as u32 + 1);
-        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
-        assert_eq!(occurrence.error_category, Some(ModelErrorCategory::Network));
-        assert_eq!(
-            occurrence.error_stage,
-            Some(ProviderErrorStage::RequestSend)
-        );
-        assert_eq!(
-            occurrence.diagnostic_code.as_deref(),
-            Some("provider_request_send_failed")
-        );
-        assert!(occurrence.request_send_to_headers_ms.is_none());
-        assert!(!occurrence.retry_scheduled);
-    }
     let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
     for secret in [
         "test-key-placeholder",
@@ -377,12 +353,6 @@ fn oversized_success_body_is_rejected_before_buffering() {
         error.error.validation_errors,
         ["provider_response_body_too_large"]
     );
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("oversized response attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
     server.join().expect("provider server");
 }
 
@@ -621,17 +591,6 @@ fn structured_context_length_error_is_classified_and_never_retried() {
         error.error.code.as_deref(),
         Some("provider_context_length_exceeded")
     );
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("attempt metadata");
-    assert_eq!(
-        metadata.attempt_count, 1,
-        "context-length errors must not be retried"
-    );
-    assert_eq!(metadata.retry_count, 0);
-    assert_eq!(metadata.occurrences.len(), 1);
-    assert!(!metadata.occurrences[0].retry_scheduled);
     server.join().expect("join context-length provider");
 }
 
@@ -669,12 +628,6 @@ fn oversized_non_2xx_body_falls_back_to_status_classification() {
             .message
             .starts_with("Provider returned HTTP 413.")
     );
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
     server.join().expect("join oversized error provider");
 }
 
@@ -710,12 +663,6 @@ fn unknown_structured_code_keeps_http_status_classification() {
         ModelErrorCategory::ProviderUnavailable
     );
     assert_eq!(error.error.http_status, Some(HTTP_STATUS_RATE_LIMITED));
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
-    assert_eq!(metadata.retry_count, 0);
     server.join().expect("join rate-limited provider");
 }
 
@@ -799,11 +746,6 @@ fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
             .message
             .contains("Provider diagnostic: provider: Incorrect API key provided.")
     );
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
     server.join().expect("join auth error provider");
 }
 
@@ -849,10 +791,5 @@ fn unparseable_error_body_attaches_bounded_single_line_summary() {
     let diagnostic = &error.message[marker_position + DIAGNOSTIC_MARKER.len()..];
     assert!(diagnostic.chars().count() <= 256);
     assert!(!error.message.chars().any(char::is_control));
-    let metadata = error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("attempt metadata");
-    assert_eq!(metadata.attempt_count, 1);
     server.join().expect("join plain error provider");
 }

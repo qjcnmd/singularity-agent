@@ -277,7 +277,6 @@ impl TuiApp {
                 }
             }
             // 聚合遥测不改变等待对象，也不进入会话流。
-            TurnEvent::ProviderAttemptSummary { .. } => {}
             TurnEvent::ItemStarted { .. } => {}
             TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
                 if !Self::is_assistant(item_id) {

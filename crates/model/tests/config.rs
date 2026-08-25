@@ -160,10 +160,6 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
             error.error.stage,
             Some(ProviderErrorStage::ClientInitialization)
         );
-        assert!(
-            error.provider_attempt_metadata.is_none(),
-            "configuration rejection must not create provider attempts"
-        );
         assert!(!error.message.contains(malformed));
         assert!(
             !serde_json::to_string(&error.error)
@@ -192,29 +188,6 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
         decode_error.error.stage,
         Some(ProviderErrorStage::ResponseJsonDecode)
     );
-    let decode_metadata = decode_error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("decode attempt metadata");
-    assert_eq!(decode_metadata.attempt_count, 1);
-    assert_eq!(decode_metadata.retry_count, 0);
-    let [decode_occurrence] = decode_metadata.occurrences.as_slice() else {
-        panic!("one decode failure occurrence expected");
-    };
-    assert_eq!(
-        decode_occurrence.terminal_status,
-        ProviderAttemptStatus::Error
-    );
-    assert_eq!(
-        decode_occurrence.error_stage,
-        Some(ProviderErrorStage::ResponseJsonDecode)
-    );
-    assert_eq!(
-        decode_occurrence.diagnostic_code.as_deref(),
-        Some("provider_response_json_decode_failed")
-    );
-    assert!(decode_occurrence.request_send_to_headers_ms.is_some());
-    assert!(decode_occurrence.time_to_first_text_delta_ms.is_none());
 
     let missing_choices_url = single_response_server("HTTP/1.1 200 OK", r#"{"id":"response_1"}"#);
     let missing_choices =
@@ -233,21 +206,6 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
     assert_eq!(
         envelope_error.error.validation_errors,
         vec!["response_choices_missing"]
-    );
-    let envelope_metadata = envelope_error
-        .provider_attempt_metadata
-        .as_ref()
-        .expect("envelope attempt metadata");
-    let [envelope_occurrence] = envelope_metadata.occurrences.as_slice() else {
-        panic!("one response validation occurrence expected");
-    };
-    assert_eq!(
-        envelope_occurrence.error_stage,
-        Some(ProviderErrorStage::ResponseValidation)
-    );
-    assert_eq!(
-        envelope_occurrence.diagnostic_code.as_deref(),
-        Some("provider_response_invalid")
     );
     let serialized = serde_json::to_string(&envelope_error.error).expect("serialize error");
     assert!(!serialized.contains("hello"));
@@ -1153,60 +1111,14 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let model_error = ModelError::new(ModelErrorKind::Timeout, "provider timed out")
         .with_provider("openai_compatible")
         .with_model("test-model");
-    let attempt_metadata = ProviderAttemptMetadata {
-        attempt_count: 3,
-        retry_count: 2,
-        latency_ms: 150,
-        occurrences: Vec::new(),
-    };
-    let mut runtime_attempt_metadata = attempt_metadata.clone();
-    runtime_attempt_metadata
-        .occurrences
-        .push(ProviderAttemptOccurrence {
-            operation_phase: ProviderAttemptOperationPhase::Completion,
-            provider_name: "runtime-provider-marker".to_string(),
-            model_name: "runtime-model-marker".to_string(),
-            actual_api_protocol: ProviderApiProtocol::OpenAiResponses,
-            attempt_index: 1,
-            terminal_status: ProviderAttemptStatus::Ok,
-            started_at_unix_ms: 1,
-            ended_at_unix_ms: 2,
-            attempt_duration_ms: 25,
-            request_send_to_headers_ms: Some(10),
-            queue_duration_ms: None,
-            time_to_first_text_delta_ms: Some(15),
-            retry_scheduled: false,
-            retry_backoff_ms: None,
-            error_category: None,
-            error_stage: None,
-            diagnostic_code: None,
-            usage: Some(ModelUsage::default()),
-            model_turn_ordinal: None,
-        });
-    let runtime_wire = serde_json::to_value(&runtime_attempt_metadata)
-        .expect("serialize runtime attempt metadata");
-    assert_eq!(
-        runtime_wire,
-        serde_json::json!({
-            "attempt_count": 3,
-            "retry_count": 2,
-            "latency_ms": 150
-        })
-    );
-    let restored_runtime: ProviderAttemptMetadata =
-        serde_json::from_value(runtime_wire).expect("deserialize aggregate attempt metadata");
-    assert_eq!(restored_runtime, attempt_metadata);
     let restored_schema: ModelToolSchema =
         serde_json::from_value(serde_json::to_value(&tool_schema).unwrap()).unwrap();
     let restored_config: ModelProviderConfig =
         serde_json::from_value(serde_json::to_value(&provider_config).unwrap()).unwrap();
     let restored_error: ModelError =
         serde_json::from_value(serde_json::to_value(&model_error).unwrap()).unwrap();
-    let restored_attempt_metadata: ProviderAttemptMetadata =
-        serde_json::from_value(serde_json::to_value(&attempt_metadata).unwrap()).unwrap();
 
     assert_eq!(restored_schema, tool_schema);
     assert_eq!(restored_config, provider_config);
     assert_eq!(restored_error, model_error);
-    assert_eq!(restored_attempt_metadata, attempt_metadata);
 }

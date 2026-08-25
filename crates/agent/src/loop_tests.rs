@@ -56,7 +56,6 @@ impl FakeProvider {
             error: None,
             provider_name: Some("fake".to_string()),
             model_name: Some("fake-model".to_string()),
-            provider_attempt_metadata: None,
             provider_reasoning_history: Vec::new(),
         }
     }
@@ -1089,7 +1088,6 @@ impl Provider for OverflowProvider {
             error: None,
             provider_name: Some("overflow".to_string()),
             model_name: Some("overflow-model".to_string()),
-            provider_attempt_metadata: None,
             provider_reasoning_history: Vec::new(),
         })
     }
@@ -1121,7 +1119,6 @@ impl Provider for OverflowProvider {
             error: None,
             provider_name: Some("overflow".to_string()),
             model_name: Some("overflow-model".to_string()),
-            provider_attempt_metadata: None,
             provider_reasoning_history: Vec::new(),
         })
     }

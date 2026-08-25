@@ -327,9 +327,4 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     assert_eq!(attempt.params["modelTurnOrdinal"], 2);
     assert_eq!(attempt.params["retryScheduled"], true);
     assert!(attempt.params.get("raw").is_none());
-
-    let summary = AppEvent::provider_attempt_summary("thread-1", "turn-1", 2, 2, 1, 20);
-    assert_eq!(summary.method(), "provider/attempt/summary");
-    assert_eq!(summary.params["attemptCount"], 2);
-    assert_eq!(summary.params["latencyMs"], 20);
 }

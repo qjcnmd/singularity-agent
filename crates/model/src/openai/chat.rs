@@ -289,7 +289,6 @@ pub fn finalize_provider_response(
         error: None,
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(model_name.to_string()),
-        provider_attempt_metadata: None,
         provider_reasoning_history: Vec::new(),
     };
     let available_tool_names = request

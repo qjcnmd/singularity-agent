@@ -101,29 +101,6 @@ pub struct ProviderAttemptOccurrence {
     pub diagnostic_code: Option<String>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,
-    /// Bound by AgentLoop at the model-response ownership boundary.
-    pub model_turn_ordinal: Option<u32>,
-}
-
-/// 一次模型提供方操作记录的 aggregate 尝试次数、重试次数和运行期 occurrences。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ProviderAttemptMetadata {
-    pub attempt_count: u32,
-    pub retry_count: u32,
-    pub latency_ms: u64,
-    /// 运行期 typed observation；不进入公共 schema。
-    #[serde(skip)]
-    pub occurrences: Vec<ProviderAttemptOccurrence>,
-}
-impl ProviderAttemptMetadata {
-    pub(crate) fn zero() -> Self {
-        Self {
-            attempt_count: 0,
-            retry_count: 0,
-            latency_ms: 0,
-            occurrences: Vec::new(),
-        }
-    }
 }
 
 /// Build the stable unsupported result used by Chat, Declared, and legacy providers.

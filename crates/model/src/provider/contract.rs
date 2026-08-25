@@ -5,7 +5,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use super::runtime::OpenAiProviderConfig;
-use super::telemetry::ProviderAttemptMetadata;
 use crate::error::{
     ModelError, ModelErrorCategory, ModelErrorKind, ProviderError, ProviderErrorStage,
 };
@@ -117,7 +116,6 @@ pub(crate) fn provider_request_validation_error(
     .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
     error.validation_errors = validation.errors;
     ProviderError::from_model_error(error)
-        .with_provider_attempt_metadata(ProviderAttemptMetadata::zero())
 }
 
 pub(crate) fn provider_response_validation_error(

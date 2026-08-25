@@ -73,9 +73,9 @@ pub use provider::contract::{
 pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent, ProviderStreamingCapability,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
+    ProviderAttemptStarted, ProviderAttemptStatus, ProviderStreamEvent,
+    ProviderStreamingCapability,
 };
 pub use transport::OpenAiProvider;
 pub use types::*;

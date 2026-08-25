@@ -6,7 +6,6 @@
 //! - 一个 turn 只打开一次会话文件，同一 [`SessionManager`] 贯穿全程；
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,8 +21,7 @@ use singularity_agent::session::{
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent,
-    ProviderAttemptMetadata, ProviderConfigSnapshot,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent, ProviderConfigSnapshot,
 };
 use uuid::Uuid;
 
@@ -493,85 +491,8 @@ impl TurnRunner {
             agent.run(input_text, &mut events, cancellation)
         };
         match run_result {
-            Ok(outcome) => {
-                self.emit_provider_attempt_summaries(&thread.thread_id, turn_id, &outcome, sink);
-                Ok(outcome_to_run_status(outcome))
-            }
-            Err(error) => {
-                if let AgentError::RunFailed { outcome, .. } = &error {
-                    self.emit_provider_attempt_summaries(&thread.thread_id, turn_id, outcome, sink);
-                } else if let AgentError::Provider(provider) = &error
-                    && let Some(metadata) = provider.provider_attempt_metadata.as_ref()
-                {
-                    self.emit_provider_attempt_metadata_summaries(
-                        &thread.thread_id,
-                        turn_id,
-                        metadata,
-                        1,
-                        sink,
-                    );
-                }
-                Err(RunnerError::Agent(error))
-            }
-        }
-    }
-
-    fn emit_provider_attempt_summaries(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        outcome: &AgentOutcome,
-        sink: &mut dyn TurnEventSink,
-    ) {
-        let Some(metadata) = outcome.provider_attempt_metadata.as_ref() else {
-            return;
-        };
-        self.emit_provider_attempt_metadata_summaries(
-            thread_id,
-            turn_id,
-            metadata,
-            outcome.turns.max(1),
-            sink,
-        );
-    }
-
-    fn emit_provider_attempt_metadata_summaries(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        metadata: &ProviderAttemptMetadata,
-        fallback_ordinal: u32,
-        sink: &mut dyn TurnEventSink,
-    ) {
-        let mut groups = BTreeMap::<u32, (u32, u32, u64)>::new();
-        for occurrence in &metadata.occurrences {
-            let ordinal = occurrence.model_turn_ordinal.unwrap_or(fallback_ordinal);
-            let group = groups.entry(ordinal).or_default();
-            group.0 = group.0.saturating_add(1);
-            group.1 = group
-                .1
-                .saturating_add(u32::from(occurrence.retry_scheduled));
-            group.2 = group.2.saturating_add(occurrence.attempt_duration_ms);
-        }
-        if groups.is_empty() && metadata.attempt_count > 0 {
-            groups.insert(
-                fallback_ordinal,
-                (
-                    metadata.attempt_count,
-                    metadata.retry_count,
-                    metadata.latency_ms,
-                ),
-            );
-        }
-        for (ordinal, (attempt_count, retry_count, latency_ms)) in groups {
-            sink.emit(TurnEvent::ProviderAttemptSummary {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                model_turn_ordinal: ordinal,
-                attempt_count,
-                retry_count,
-                latency_ms,
-            });
+            Ok(outcome) => Ok(outcome_to_run_status(outcome)),
+            Err(error) => Err(RunnerError::Agent(error)),
         }
     }
 

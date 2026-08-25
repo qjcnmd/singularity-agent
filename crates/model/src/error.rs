@@ -1,4 +1,3 @@
-use crate::provider::ProviderAttemptMetadata;
 use crate::provider::contract;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -137,11 +136,10 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
 
 #[derive(Debug, Clone, PartialEq, Error)]
 #[error("{message}")]
-/// 模型提供方失败，包含类型化模型错误和尝试元数据。
+/// 模型提供方失败，包含类型化模型错误与重试合同。
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
-    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
     /// Provider-directed minimum delay before an automatic retry.
     pub retry_after: Option<Duration>,
     /// Whether a caller may automatically resend the same logical request.
@@ -154,16 +152,9 @@ impl ProviderError {
         Self {
             message: error.message.clone(),
             error: Box::new(error),
-            provider_attempt_metadata: None,
             retry_after: None,
             automatic_retry_allowed: true,
         }
-    }
-
-    /// 附加一次 provider attempt 的脱敏元数据。
-    pub fn with_provider_attempt_metadata(mut self, metadata: ProviderAttemptMetadata) -> Self {
-        self.provider_attempt_metadata = Some(metadata);
-        self
     }
 
     /// Preserve a provider-directed delay for the owning retry policy.

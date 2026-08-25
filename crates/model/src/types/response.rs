@@ -3,7 +3,6 @@ use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolCall;
 use super::usage::{ModelUsage, ModelValidationResult};
 use crate::error::ModelError;
-use crate::provider::ProviderAttemptMetadata;
 use serde::{Deserialize, Serialize};
 
 /// Typed terminal reason normalized across Chat Completions and Responses.
@@ -40,8 +39,6 @@ pub struct ModelTurnResponse {
     pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
     /// 内部 opaque reasoning continuation state；never serialized to the
     /// app-server or trace/evidence projections.
     #[serde(skip)]
@@ -67,7 +64,6 @@ impl ModelTurnResponse {
             error: None,
             provider_name: None,
             model_name: None,
-            provider_attempt_metadata: None,
             provider_reasoning_history: Vec::new(),
         }
     }

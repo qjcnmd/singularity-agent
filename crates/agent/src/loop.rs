@@ -16,8 +16,8 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelMessage, ModelPreferences,
     ModelRole, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
-    ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
+    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderError,
+    ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
     ProviderToolReasoningMode, ToolChoicePolicy, is_strict_tool_schema_compatible,
     split_model_selector,
 };
@@ -292,10 +292,6 @@ pub struct AgentOutcome {
     /// 取消/失败时未知的末次请求保持 `false`，不得估算成精确值。
     pub usage_complete: bool,
     pub terminal_reason: AgentTerminalReason,
-    /// Aggregated terminal provider-attempt telemetry, when the provider
-    /// exposed it. Detailed occurrences are runtime-only and never persisted
-    /// in Session JSONL.
-    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -551,7 +547,6 @@ impl Agent {
             compacted: false,
             usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
-            provider_attempt_metadata: None,
         };
         // 显式上下文溢出每轮只允许一次强制压缩重试。
         let mut context_overflow_retried = false;
@@ -667,7 +662,6 @@ impl Agent {
                 ) {
                     Ok(response) => response,
                     Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
-                        record_provider_attempts(&mut outcome, &error, model_turn_ordinal);
                         // The rejected request has no complete usage record;
                         // later successful turns cannot make this aggregate
                         // exact again.
@@ -688,7 +682,6 @@ impl Agent {
                         continue;
                     }
                     Err(error) => {
-                        record_error_attempts(&mut outcome, &error, model_turn_ordinal);
                         // 可重试 provider 错误在 Agent 层统一退避；历史与会话
                         // 状态保留，不重复已执行的工具副作用。
                         if let AgentError::Provider(provider) = &error
@@ -723,11 +716,6 @@ impl Agent {
                         return self.fail_after_progress(error, outcome);
                     }
                 };
-                record_response_attempts(
-                    &mut outcome,
-                    response.provider_attempt_metadata.as_ref(),
-                    model_turn_ordinal,
-                );
                 // 非 Success 响应（如校验失败 Invalid 等）：强类型向上传播，不在此层盲目重试。
                 if response.status != ModelTurnStatus::Success {
                     let model_error = response.error.clone().unwrap_or_else(|| {
@@ -1164,13 +1152,12 @@ impl Agent {
             &mut on_stream,
             &mut observed_attempt,
         ) {
-            Ok(response) => Ok(bind_response_attempt_ordinal(response, model_turn_ordinal)),
+            Ok(response) => Ok(response),
             Err(error)
                 if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
             {
                 self.provider
                     .complete_observed(request, cancellation, &mut observed_attempt)
-                    .map(|response| bind_response_attempt_ordinal(response, model_turn_ordinal))
                     .map_err(AgentError::Provider)
             }
             Err(error) => {
@@ -1259,59 +1246,6 @@ fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
     outcome.compacted = true;
     aggregate_usage(&mut outcome.usage, usage);
     outcome.usage_complete &= *usage_complete;
-}
-
-fn record_response_attempts(
-    outcome: &mut AgentOutcome,
-    metadata: Option<&ProviderAttemptMetadata>,
-    model_turn_ordinal: u32,
-) {
-    let Some(metadata) = metadata else {
-        return;
-    };
-    let aggregate = outcome
-        .provider_attempt_metadata
-        .get_or_insert_with(ProviderAttemptMetadata::default);
-    aggregate.attempt_count = aggregate
-        .attempt_count
-        .saturating_add(metadata.attempt_count);
-    aggregate.retry_count = aggregate.retry_count.saturating_add(metadata.retry_count);
-    aggregate.latency_ms = aggregate.latency_ms.saturating_add(metadata.latency_ms);
-    for mut occurrence in metadata.occurrences.clone() {
-        occurrence.model_turn_ordinal = Some(model_turn_ordinal);
-        aggregate.occurrences.push(occurrence);
-    }
-}
-
-fn record_error_attempts(outcome: &mut AgentOutcome, error: &AgentError, model_turn_ordinal: u32) {
-    let AgentError::Provider(provider) = error else {
-        return;
-    };
-    record_provider_attempts(outcome, provider, model_turn_ordinal);
-}
-
-fn record_provider_attempts(
-    outcome: &mut AgentOutcome,
-    provider: &ProviderError,
-    model_turn_ordinal: u32,
-) {
-    record_response_attempts(
-        outcome,
-        provider.provider_attempt_metadata.as_ref(),
-        model_turn_ordinal,
-    );
-}
-
-fn bind_response_attempt_ordinal(
-    mut response: ModelTurnResponse,
-    model_turn_ordinal: u32,
-) -> ModelTurnResponse {
-    if let Some(metadata) = response.provider_attempt_metadata.as_mut() {
-        for occurrence in &mut metadata.occurrences {
-            occurrence.model_turn_ordinal = Some(model_turn_ordinal);
-        }
-    }
-    response
 }
 
 fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {

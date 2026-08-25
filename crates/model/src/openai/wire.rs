@@ -33,7 +33,6 @@ pub fn provider_error_response(
     request: &ModelTurnRequest,
     error: ProviderError,
 ) -> ModelTurnResponse {
-    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
     ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id: format!("{}_provider_error", request.request_id),
@@ -46,7 +45,6 @@ pub fn provider_error_response(
         error: Some(*error.error),
         provider_name: None,
         model_name: request.model_preferences.model_name.clone(),
-        provider_attempt_metadata,
         provider_reasoning_history: Vec::new(),
     }
 }

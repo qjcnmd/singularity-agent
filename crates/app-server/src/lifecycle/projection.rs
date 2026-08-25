@@ -372,21 +372,6 @@ impl TurnEventSink for TurnProjection<'_> {
                 error_category,
                 diagnostic_code,
             )),
-            TurnEvent::ProviderAttemptSummary {
-                thread_id,
-                turn_id,
-                model_turn_ordinal,
-                attempt_count,
-                retry_count,
-                latency_ms,
-            } => self.emit_notification(AppEvent::provider_attempt_summary(
-                thread_id,
-                turn_id,
-                model_turn_ordinal,
-                attempt_count,
-                retry_count,
-                latency_ms,
-            )),
         }
     }
 }
