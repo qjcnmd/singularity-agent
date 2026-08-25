@@ -4,7 +4,8 @@ use crate::session::SessionEntryType;
 use serde_json::{Value, json};
 use singularity_model::{
     ModelMessage, ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
-    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderStreamingCapability,
+    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderReasoningReplay,
+    ProviderStreamingCapability,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -145,6 +146,20 @@ fn usage(input: u64, output: u64) -> ModelUsage {
         cached_input_tokens: 0,
         reasoning_tokens: 0,
         usage_present: true,
+    }
+}
+
+fn compaction_test_config() -> AgentConfig {
+    AgentConfig {
+        system_prompt: String::new(),
+        context_window: 6_000,
+        max_output_tokens: 10,
+        compaction: CompactionConfig {
+            reserve_tokens: 1_000,
+            retain_ratio: 0.005,
+            summary_max_tokens: 10,
+        },
+        ..AgentConfig::default()
     }
 }
 fn setup(steps: Vec<FakeStep>) -> (Agent, tempfile::TempDir, Arc<FakeProvider>) {
@@ -706,6 +721,186 @@ struct OverflowProvider {
     fail_summary: bool,
     contract: ProviderProtocolContract,
 }
+
+#[test]
+fn previous_provider_usage_triggers_compaction_before_the_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::text(AgentMessageRole::User, "u".repeat(600)))
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "a".repeat(600),
+        ))
+        .unwrap();
+    let provider = Arc::new(FakeProvider::new(
+        fake_contract(),
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![tool_call("call-1", "missing", json!({}))],
+                usage: usage(5_500, 500),
+            },
+            FakeStep {
+                text: "summary".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(20, 5),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(30, 5),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        compaction_test_config(),
+        session,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "done");
+    assert!(outcome.compacted);
+    assert!(
+        agent
+            .session
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry.entry_type, SessionEntryType::Compaction(_)))
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn first_request_without_previous_usage_falls_back_to_the_assembled_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::User,
+            "old user context ".repeat(1_000),
+        ))
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "old assistant context ".repeat(1_000),
+        ))
+        .unwrap();
+    let provider = Arc::new(FakeProvider::new(
+        fake_contract(),
+        vec![
+            FakeStep {
+                text: "summary".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(20, 5),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(30, 5),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        compaction_test_config(),
+        session,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "done");
+    assert!(outcome.compacted);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn missing_provider_usage_falls_back_to_the_next_assembled_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::User,
+            "old user ".repeat(100),
+        ))
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "old assistant ".repeat(100),
+        ))
+        .unwrap();
+    let provider = Arc::new(FakeProvider::new(
+        fake_contract(),
+        vec![
+            FakeStep {
+                text: String::new(),
+                tool_calls: vec![tool_call(
+                    "call-1",
+                    "missing",
+                    json!({ "payload": "x".repeat(24_000) }),
+                )],
+                usage: ModelUsage::default(),
+            },
+            FakeStep {
+                text: "summary".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(20, 5),
+            },
+            FakeStep {
+                text: "done".to_string(),
+                tool_calls: Vec::new(),
+                usage: usage(30, 5),
+            },
+        ],
+    ));
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        compaction_test_config(),
+        session,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "done");
+    assert!(outcome.compacted);
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn assembled_fallback_estimate_includes_provider_reasoning_replay() {
+    let (agent, _dir, _provider) = setup(Vec::new());
+    let replay = ProviderReasoningReplay::Chat {
+        provider_name: "fake".to_string(),
+        model_name: "fake-model".to_string(),
+        reasoning_effort: None,
+        tool_call_ids: vec!["call-1".to_string()],
+        reasoning_content: "reasoning ".repeat(300),
+    };
+
+    let without_replay = agent.estimate_assembled(&[], &[], &[], 0);
+    let with_replay = agent.estimate_assembled(&[], &[], &[replay], 0);
+
+    assert!(with_replay > without_replay + 500);
+}
+
 impl Provider for OverflowProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         self.contract.clone()

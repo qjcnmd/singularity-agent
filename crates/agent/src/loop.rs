@@ -546,6 +546,9 @@ impl Agent {
         let mut context_overflow_retried = false;
         // Agent 层重试计数：成功调用或退出循环时重置。
         let mut retry_attempt = 0u32;
+        // 上一轮成功响应的 provider usage 只用于判定下一次请求前是否压缩。
+        // 首轮或 usage 缺失时由装配估算兜底。
+        let mut previous_context_tokens = None;
         self.session.append_message(user_message(input))?;
 
         let mut preferences = ModelPreferences::default();
@@ -594,18 +597,21 @@ impl Agent {
                     Ok(request) => request,
                     Err(error) => return self.fail_after_progress(error, outcome),
                 };
-                // 请求前主动判定：装配成品估算（含 max_output_tokens 预算）超过
-                // 「窗口 − reserve_tokens」时先压缩再重装请求。压缩失败降级为
-                // 警告继续发送，交由 provider 溢出强制压缩路径兜底。
+                // 请求前主动判定：优先使用上一轮 provider usage；首轮或
+                // usage 缺失时使用本轮装配估算。超过「窗口 − reserve_tokens」
+                // 时先压缩再重装请求。压缩失败降级为警告继续发送，交由
+                // provider 溢出强制压缩路径兜底。
                 let budget = CompactionBudget::from_config(
                     self.config.context_window,
                     &self.config.compaction,
                 );
-                if self.compaction.should_compact(assembled_estimate, &budget) {
+                let compaction_tokens =
+                    previous_context_tokens.take().unwrap_or(assembled_estimate);
+                if self.compaction.should_compact(compaction_tokens, &budget) {
                     match self.compaction.compact(
                         &mut self.session,
                         &budget,
-                        assembled_estimate,
+                        compaction_tokens,
                         cancellation,
                     ) {
                         Ok(result) => {
@@ -728,6 +734,10 @@ impl Agent {
                 context_overflow_retried = false;
                 // 成功调用后重置 agent 层重试计数（pi 的 _retryAttempt 语义）。
                 retry_attempt = 0;
+                previous_context_tokens = response
+                    .usage
+                    .usage_present
+                    .then_some(response.usage.total_tokens);
                 record_usage(&mut outcome, &response.usage);
                 let assistant_text = response
                     .assistant_message
@@ -867,6 +877,7 @@ impl Agent {
         let capabilities = self.provider.protocol_contract();
         let tools = self.tool_schemas(&capabilities);
         let entries = self.session.build_context_entries()?;
+        let replays = self.reasoning_replays_from_entries(&entries);
         let mut messages = Vec::with_capacity(entries.len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
@@ -874,7 +885,7 @@ impl Agent {
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        let tokens_before = self.estimate_assembled(&messages, &tools, max_output_tokens);
+        let tokens_before = self.estimate_assembled(&messages, &tools, &replays, max_output_tokens);
         match self.compaction.compact_with_reason(
             &mut self.session,
             &budget,
@@ -908,6 +919,7 @@ impl Agent {
         let capabilities = self.provider.protocol_contract();
         let tools = self.tool_schemas(&capabilities);
         let entries = self.session.build_context_entries()?;
+        let replays = self.reasoning_replays_from_entries(&entries);
         let mut messages = Vec::with_capacity(entries.len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
@@ -915,7 +927,7 @@ impl Agent {
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        let tokens_before = self.estimate_assembled(&messages, &tools, max_output_tokens);
+        let tokens_before = self.estimate_assembled(&messages, &tools, &replays, max_output_tokens);
         self.compaction
             .compact_with_reason(
                 &mut self.session,
@@ -927,14 +939,16 @@ impl Agent {
             .map_err(AgentError::Compaction)
     }
 
-    /// 在本轮已装配的请求成品上做 Token 估算（请求前压缩判定的估算基础）。
+    /// 对本轮装配结果做保守 Token 估算，供首轮或 provider usage 缺失时
+    /// 的请求前压缩判定使用。
     ///
-    /// 覆盖最终 wire 请求：除 content 外，provider 还会重放每条 tool 消息的
-    /// tool_call_id 与 assistant tool_calls 的 id/name/raw_arguments。
+    /// 估算覆盖消息 content、工具调用标识与参数、工具 schema、provider
+    /// reasoning replay 的序列化尺寸、输出预算及固定封装余量。
     fn estimate_assembled(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelToolSchema],
+        replays: &[ProviderReasoningReplay],
         max_output_tokens: u32,
     ) -> u64 {
         let estimate = |text: &str| self.compaction.estimate_tokens(text);
@@ -956,8 +970,11 @@ impl Agent {
             .sum::<u64>();
         let tool_tokens =
             estimate(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        let replay_tokens =
+            estimate(&serde_json::to_string(replays).unwrap_or_else(|_| "[]".to_string()));
         message_tokens
             .saturating_add(tool_tokens)
+            .saturating_add(replay_tokens)
             .saturating_add(max_output_tokens as u64)
             .saturating_add(32)
     }
@@ -986,7 +1003,8 @@ impl Agent {
             messages.push(instruction);
         }
         messages.extend(context_messages);
-        let assembled_estimate = self.estimate_assembled(&messages, tools, max_output_tokens);
+        let assembled_estimate =
+            self.estimate_assembled(&messages, tools, &replays, max_output_tokens);
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), turn),
             messages,

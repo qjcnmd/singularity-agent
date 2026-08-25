@@ -19,7 +19,7 @@
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
-  - `AgentLoop`（双层循环）：单一原子 `TurnInbox` 承载 steer；每轮**请求前**以装配成品估算对比 `context_window − reserve_tokens` 决定主动压缩；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次；
+  - `AgentLoop`（双层循环）：单一原子 `TurnInbox` 承载 steer；每轮**请求后**保存真实 provider usage，下一请求前优先据此对比 `context_window − reserve_tokens` 决定主动压缩，usage 缺失时回退到装配估算；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次；
   - `session` 子系统：严格 JSONL v1（format/file/manager/context/repair/repository）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
@@ -65,7 +65,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 ## 3. Compaction（请求前两道闸门）
 
-- **第一道（请求前主动）**：每轮请求发出前，以本轮装配成品估算（消息+reasoning replay+预算，含 max_output_tokens）对比 `context_window − reserve_tokens`；超过则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
+- **第一道（请求前主动）**：每轮成功响应后保存其真实 provider usage，下一请求发出前优先以该值对比 `context_window − reserve_tokens`；首轮或 usage 缺失时使用本轮装配估算，估算覆盖消息、工具 schema、reasoning replay 的序列化尺寸、`max_output_tokens` 预算与固定封装余量。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
 - **第二道（Provider 精确拒绝后）**：非 2xx body 有界读取并结构化解析，**仅当** `error.code == "context_length_exceeded"` 时分类为 `ContextLengthExceeded`（不可重试）；此时以 ContextOverflow 原因强制压缩一次并同轮重试；二次失败原样返回。其余错误体保持状态码分类并附有界脱敏短诊断。
 - 切点策略：从最新往回累积至保留预算（retain_ratio），取其后最近合法切点；toolResult 永不作切点且 ToolCall/ToolResult 成对保留；尾部跨预算时回退到当前轮起点——摘要更早历史，当前轮完整保留；只有当前轮即全部历史时才返回 NotNeeded。
 - 摘要调用的 usage 计入 turn 总量；强制压缩的 tokensBefore 取真实重建估算。

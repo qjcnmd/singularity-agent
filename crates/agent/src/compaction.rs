@@ -4,8 +4,9 @@
 //! 压缩引擎会自动提取历史对话的结构化摘要，修剪早期详细历史并保留最新对话上下文。
 //!
 //! 核心流程：
-//! 1. **触发判定**（`should_compact`）：请求发出前基于本轮装配成品估算判定，
-//!    估算超过「上下文窗口 − `reserve_tokens` 预留」即触发；预留空间供模型回答使用。
+//! 1. **触发判定**（`should_compact`）：请求发出前优先基于上一轮 provider usage
+//!    判定，首轮或 usage 缺失时使用本轮装配估算；超过「上下文窗口 −
+//!    `reserve_tokens` 预留」即触发，预留空间供模型回答使用。
 //! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `retain_ratio` 预算内的最新消息；
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
@@ -30,7 +31,8 @@ use crate::session::{
     CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionManager,
 };
 
-/// 默认为模型回答预留的 Token 空间：装配成品估算超过 `context_window - reserve_tokens` 时触发压缩。
+/// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
+/// `context_window - reserve_tokens` 时触发压缩。
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
 /// 默认保留上下文窗口 20% 的最近内容。
 pub const DEFAULT_RETAIN_RATIO: f64 = 0.20;
@@ -140,7 +142,7 @@ const NO_PRIOR_HISTORY: &str = "No prior history.";
 /// 上下文压缩的用户可配置策略。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
-    /// 为模型回答预留的 Token 空间；装配成品估算超过
+    /// 为模型回答预留的 Token 空间；usage 或 fallback 估算超过
     /// `context_window - reserve_tokens` 时在请求前触发压缩。
     pub reserve_tokens: u64,
     pub retain_ratio: f64,
