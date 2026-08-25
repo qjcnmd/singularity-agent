@@ -8,6 +8,7 @@ Singularity 当前发布目标是 Windows x86-64。`sg` 是单一可执行文件
 
 - Rust 1.96.0（MSVC 工具链）
 - Visual Studio Build Tools 的 Desktop development with C++ 组件
+- [Git for Windows](https://git-scm.com/install/windows)（提供 Git Bash；`sg` 启动时必须能发现 `bash.exe`）
 - PowerShell 7（可选）
 
 仓库通过 `rust-toolchain.toml` 固定 toolchain：

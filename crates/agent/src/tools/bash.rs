@@ -637,6 +637,12 @@ fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
     }
 }
 
+/// Validate the shell prerequisite once at a process entry point using the
+/// same discovery rules as the bash tool.
+pub fn ensure_available() -> Result<(), String> {
+    shell_command(":").map(|_| ())
+}
+
 #[cfg(windows)]
 fn bash_shell_command(
     command: &str,
@@ -644,7 +650,7 @@ fn bash_shell_command(
 ) -> Result<(String, Vec<String>), String> {
     let Some(bash) = bash else {
         return Err(
-            "bash executable not found; install Git for Windows or add bash.exe to PATH"
+            "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
                 .to_string(),
         );
     };
@@ -1225,7 +1231,12 @@ mod tests {
     #[test]
     fn missing_bash_reports_configuration_error_instead_of_cmd_fallback() {
         let error = bash_shell_command("echo should-not-run", None).expect_err("missing bash");
-        assert!(error.contains("bash executable not found"), "{error}");
+        assert!(error.contains("Git for Windows"), "{error}");
+        assert!(error.contains("bash.exe"), "{error}");
+        assert!(
+            error.contains("https://git-scm.com/install/windows"),
+            "{error}"
+        );
         assert!(!error.to_ascii_lowercase().contains("cmd"), "{error}");
     }
 }

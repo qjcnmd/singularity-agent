@@ -89,7 +89,15 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    let Some(mode) = cli.mode()? else {
+    let mode = cli.mode()?;
+    if let Err(error) = singularity_runtime::ensure_bash_available() {
+        if mode == Some(Mode::Json) {
+            JsonlRenderer::new(fallback_thread_id(cli.session.as_deref()))
+                .emit_summary(TurnStatus::Failed, None);
+        }
+        return Err(error);
+    }
+    let Some(mode) = mode else {
         if let Err(message) = tui::ensure_terminal() {
             eprintln!("sg: {message}");
             return Ok(2);

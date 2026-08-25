@@ -150,6 +150,58 @@ fn help_shows_only_new_entry_contract() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn all_execution_modes_fail_at_startup_without_git_bash() {
+    let home = isolated_home();
+    let cases: &[&[&str]] = &[
+        &[],
+        &["--print", "must not start"],
+        &["--json", "must not start"],
+    ];
+    for args in cases {
+        let output = sg()
+            .args(*args)
+            .env("SINGULARITY_HOME", &home.path)
+            .env("PATH", "")
+            .env_remove("ProgramFiles")
+            .env_remove("ProgramFiles(x86)")
+            .env_remove("ProgramW6432")
+            .env_remove("SINGULARITY_MODEL")
+            .env_remove("SINGULARITY_BASE_URL")
+            .env_remove("SINGULARITY_API_KEY")
+            .env_remove("SINGULARITY_MODEL_PROVIDER")
+            .output()
+            .expect("run sg without Git Bash");
+
+        assert!(!output.status.success(), "args: {args:?}");
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(stderr.contains("Git for Windows"), "stderr: {stderr}");
+        assert!(stderr.contains("bash.exe"), "stderr: {stderr}");
+        assert!(
+            stderr.contains("https://git-scm.com/install/windows"),
+            "stderr: {stderr}"
+        );
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        if args.first() == Some(&"--json") {
+            let summary: Value = serde_json::from_str(
+                stdout_lines(&stdout)
+                    .last()
+                    .expect("JSON mode must retain its failed summary"),
+            )
+            .expect("summary JSON");
+            assert_eq!(
+                summary
+                    .pointer("/summary/turn/status")
+                    .and_then(Value::as_str),
+                Some("failed")
+            );
+        } else {
+            assert!(stdout.is_empty(), "args: {args:?}");
+        }
+    }
+}
+
 #[test]
 fn print_writes_only_final_assistant_text() {
     let home = isolated_home();
