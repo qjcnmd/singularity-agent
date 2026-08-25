@@ -31,7 +31,7 @@ cap-std = "4.0.2"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 insta = { version = "1.41", features = ["json"] }
-ratatui = "0.29"
+ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls" ] }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{USER_AUTH_SCHEMA_VERSION, USER_CONFIG_FILE_NAME};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
 fn test_runtime_handle() -> tokio::runtime::Handle {
@@ -230,8 +230,8 @@ fn repository_boundary_comparison_is_case_insensitive_with_missing_tail() {
     std::fs::create_dir_all(&nested).expect("create repository tree");
     std::fs::create_dir(repository.join(".git")).expect("create repository marker");
     let root = repository_boundary_root(&nested).expect("discover repository root");
-    let case_variant =
-        PathBuf::from(repository.to_string_lossy().to_ascii_lowercase()).join("missing-home");
+    let case_variant = std::path::PathBuf::from(repository.to_string_lossy().to_ascii_lowercase())
+        .join("missing-home");
     assert!(
         ensure_home_outside_root(&case_variant, &root).is_err(),
         "case variants of repository descendants must be rejected"
