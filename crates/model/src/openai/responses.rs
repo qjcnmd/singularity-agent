@@ -442,11 +442,10 @@ pub fn openai_responses_input(
             ModelRole::System | ModelRole::Developer | ModelRole::User => {
                 let role = match message.role {
                     ModelRole::System => "system",
-                    // Leading system/developer messages are collapsed into the
-                    // Responses instructions field above. A developer message
-                    // that appears after user/assistant history must use a role
-                    // accepted by the OpenAI-compatible Responses input schema;
-                    // system preserves its instruction semantics.
+                    // 开头的 system/developer 消息已折叠进上方 Responses
+                    // instructions 字段；出现在 user/assistant 历史之后的
+                    // developer 消息必须使用 OpenAI 兼容 Responses 输入
+                    // schema 接受的角色；system 保留其指令语义。
                     ModelRole::Developer => "system",
                     ModelRole::User => "user",
                     ModelRole::Assistant | ModelRole::Tool => unreachable!(),

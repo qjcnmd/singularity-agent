@@ -1,4 +1,4 @@
-//! Transport-to-JSON-RPC error projection.
+//! Transport 到 JSON-RPC 的错误投影。
 
 use crate::AppServerError;
 use serde_json::Value;

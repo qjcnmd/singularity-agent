@@ -575,9 +575,8 @@ fn pump_output(
                     break;
                 }
             }
-            // A read error is not a real EOF.  Keep the incomplete carry
-            // private to this stream and do not synthesize a replacement byte
-            // for a pipe that was interrupted or closed abnormally.
+            // 读错误不是真正的 EOF：保留本流未完成的多字节 carry，
+            // 不为被中断或异常关闭的管道合成替换字节。
             Err(_) => break,
         }
     }
@@ -655,8 +654,7 @@ fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
     }
 }
 
-/// Validate the shell prerequisite once at a process entry point using the
-/// same discovery rules as the bash tool.
+/// 在进程入口点用与 bash 工具相同的发现规则一次性校验 shell 前置。
 pub fn ensure_available() -> Result<(), String> {
     shell_command(":").map(|_| ())
 }
@@ -1138,8 +1136,8 @@ mod tests {
         let token = singularity_core::CancellationToken::new();
         let worker_token = token.clone();
         let cwd = dir.path().to_path_buf();
-        // Keep a descendant alive so the platform tree-containment path,
-        // rather than only terminating the shell, is exercised.
+        // 保持一个后代存活，使平台进程树包含路径（而不只是终止 shell）
+        // 得到实际验证。
         let command = "sleep 30 & wait".to_string();
         let started = Instant::now();
         let worker = thread::spawn(move || {

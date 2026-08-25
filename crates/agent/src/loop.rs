@@ -58,6 +58,7 @@ fn is_retryable_provider_error(error: &ProviderError) -> bool {
 }
 
 /// 指数退避 + ±10% 抖动（Codex `retry.rs` 同款范围；确定性伪随机避免新增依赖）。
+/// 抖动因子在 0.9~1.0 之间，由 attempt 派生，保证同一 attempt 的等待时间可复现。
 fn retry_delay_ms(
     base_delay_ms: u64,
     attempt: u32,
@@ -83,7 +84,7 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled()
 }
 
-/// Typed severity for non-fatal runtime diagnostics emitted by the AgentLoop.
+/// 非致命运行时诊断的严重级别（AgentLoop 发射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentDiagnosticSeverity {
     Info,
@@ -91,8 +92,8 @@ pub enum AgentDiagnosticSeverity {
     Error,
 }
 
-/// A safe, non-persistent diagnostic.  The code is stable for projections;
-/// message text is intentionally kept free of raw provider payloads.
+/// 安全、非持久化的诊断。`code` 对投影方稳定；`message` 文本刻意
+/// 不包含原始 provider payload（脱敏边界）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDiagnostic {
     pub severity: AgentDiagnosticSeverity,
@@ -255,9 +256,8 @@ pub enum AgentError {
     Compaction(#[from] crate::compaction::CompactionError),
     #[error("agent loop error: {0}")]
     Loop(String),
-    /// A provider/session failure after the run has already accumulated
-    /// durable facts.  The inner error remains the authoritative cause while
-    /// `outcome` carries the lower-bound turns/usage observed before it.
+    /// 轮次已积累持久事实后的 provider/session 失败。
+    /// 内部错误保持权威根因，`outcome` 携带失败前已观察到的下限 turns/usage。
     #[error("agent run failed after partial progress: {error}")]
     RunFailed {
         error: Box<AgentError>,
@@ -326,8 +326,8 @@ impl TurnInbox {
         self.entries.drain(..).collect()
     }
 
-    /// Atomic natural-stop barrier.  A non-empty box remains open and hands
-    /// all accepted inputs to the next loop; an empty box closes permanently.
+    /// 自然停止点原子屏障：箱内已有输入时保持开启并交给下一轮消费；
+    /// 箱为空时永久关闭，之后的输入明确拒绝（不存在“已接受但丢失”）。
     fn take_at_stop(&mut self) -> Option<Vec<String>> {
         if self.entries.is_empty() {
             self.state = TurnInboxState::Closed;
@@ -560,7 +560,7 @@ impl Agent {
         if !self.config.model.is_empty() {
             preferences.model_name = Some(self.config.model.clone());
         }
-        // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略（旧 AgentLoop 同款）。
+        // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略。
         let capabilities = self.provider.protocol_contract();
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
@@ -661,9 +661,8 @@ impl Agent {
                 ) {
                     Ok(response) => response,
                     Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
-                        // The rejected request has no complete usage record;
-                        // later successful turns cannot make this aggregate
-                        // exact again.
+                        // 被拒绝的请求没有完整的 usage 记录；后续 turn 即使成功
+                        // 也不能让这个聚合重新精确。
                         outcome.usage_complete = false;
                         let original_error = AgentError::Provider(error);
                         if context_overflow_retried {
@@ -745,10 +744,9 @@ impl Agent {
                 let tool_calls = response.tool_calls.clone();
                 let length_truncated = response.is_length_truncated();
                 if length_truncated && !tool_calls.is_empty() {
-                    // A length-truncated response may contain only partially
-                    // parsed tool calls. Persist the assistant turn and a
-                    // model-visible failure for each call, but never execute
-                    // those calls or surface them as successful tool events.
+                    // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant
+                    // 消息和为每个调用生成模型可见失败，但绝不执行这些调用或将
+                    // 它们显示为成功的工具事件。
                     if let Err(error) = self
                         .session
                         .append_message(assistant_response_message(&response))
@@ -804,8 +802,8 @@ impl Agent {
                         cancellation,
                         events,
                     )?;
-                    // Durable toolResult entries are always appended in assistant source order,
-                    // regardless of completion/event order.
+                    // 持久的 toolResult 条目始终按 assistant source order 追加，
+                    // 与完成/事件顺序无关。
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
                         if let Err(error) = self.session.append_message(tool_result_message(
                             &call.tool_call_id,
@@ -857,9 +855,8 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let mut budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        // Forced overflow recovery is an explicit mode: do not preserve the
-        // normal recent-content ratio when the provider has already rejected
-        // the request for exceeding its context window.
+        // 强制溢出恢复是显式模式：provider 已拒绝该请求时，不保留正常
+        // 近期内容比例。
         budget.retain_ratio = 0.0;
         let tokens_before = self.assembled_context_estimate()?;
         match self.compaction.compact_with_reason(
@@ -1032,9 +1029,9 @@ impl Agent {
                 continue;
             }
             if let Some(replay) = &message.provider_reasoning_replay {
-                // A provider/model switch invalidates the opaque continuation. Keep
-                // visible thinking/messages/tool results in Session, but never send a
-                // private replay across an incompatible provider boundary.
+                // provider/model 切换会使 opaque continuation 失效。保留会话中
+                // 可见的 thinking/messages/tool results，但绝不跨不兼容的
+                // provider 边界发送私有 replay。
                 let Some((provider_name, model_name, variant)) = selector else {
                     continue;
                 };

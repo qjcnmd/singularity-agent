@@ -165,9 +165,8 @@ impl OpenAiProviderConfig {
     }
 }
 
-/// One fully resolved catalog selection. Keeping the canonical variant,
-/// enabled state and the single wire effort together prevents a second runtime
-/// mapping table from silently changing the provider request.
+/// 一个完全解析的目录选择。把规范变体、启用状态与单一 wire effort 放在
+/// 一起，避免第二张运行时映射表悄悄改变 provider 请求。
 #[derive(Clone)]
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,

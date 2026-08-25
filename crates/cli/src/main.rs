@@ -32,26 +32,26 @@ const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 #[derive(Debug, Parser)]
 #[command(name = "sg", about = "Singularity coding agent")]
 struct Cli {
-    /// Run once and print only the final assistant text.
+    /// 只运行一次，仅打印最终 assistant 文本。
     #[arg(long)]
     print: bool,
 
-    /// Run once and stream JSONL events with a terminal summary line.
+    /// 只运行一次，流式输出 JSONL 事件并带终态 summary 行。
     #[arg(long)]
     json: bool,
 
-    /// Goal for non-interactive modes (required with --print/--json).
+    /// 无交互模式的目标（与 --print/--json 一起必需）。
     goal: Option<String>,
 
-    /// Override the model selection for this execution only.
+    /// 仅本次执行覆盖模型选择。
     #[arg(long)]
     model: Option<String>,
 
-    /// Resume an existing thread by id.
+    /// 按 id 恢复既有 thread。
     #[arg(long)]
     session: Option<String>,
 
-    /// Disable persistence for this execution.
+    /// 本次执行禁用持久化。
     #[arg(long, conflicts_with = "session")]
     no_session: bool,
 }

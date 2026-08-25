@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-// Tokio's stdio adapter owns an OS read that cannot be cancelled; bound runtime teardown after
-// the transport has stopped so a lost peer cannot extend process shutdown indefinitely.
+// Tokio 的 stdio 适配器持有一个无法取消的 OS 读；在传输停止后限定
+// runtime 拆除时间，使丢失的对端不能无限延长进程关闭。
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 fn main() {

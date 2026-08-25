@@ -29,7 +29,7 @@ pub struct ProjectInstructions {
 }
 
 impl ProjectInstructions {
-    /// Returns the model-visible merged instruction text.
+    /// 返回模型可见的合并指令正文。
     pub fn content(&self) -> &str {
         &self.content
     }

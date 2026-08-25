@@ -1,8 +1,7 @@
-//! Runtime provider selection, transport capability assembly, and immutable snapshots.
+//! Runtime provider selection、transport capability 组装与不可变快照。
 //!
-//! User config and auth reading lives in the sibling `user` module. This module
-//! only assembles the provider instance and protocol capabilities required by
-//! AgentLoop execution.
+//! 用户配置与认证读取位于兄弟 `user` 模块；本模块只组装 AgentLoop
+//! 执行所需的 provider 实例与协议能力。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,9 +10,8 @@ use uuid::Uuid;
 use super::*;
 use crate::error::ModelErrorCategory;
 
-/// Immutable, secret-bearing provider instances and their allowlisted model
-/// selections. This type never implements `Debug`; the enclosing snapshot only
-/// prints redacted status.
+/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型绝不实现
+/// `Debug`；外层快照只打印脱敏状态。
 #[derive(Clone)]
 pub(crate) struct ModelSelectionSnapshot {
     pub(crate) default_model: String,
@@ -159,9 +157,8 @@ impl ProviderConfigSnapshot {
         self.provider_for_selector(None)
     }
 
-    /// Resolve a persisted `provider_id/model_id` reference against this
-    /// immutable snapshot. The returned provider clone has a bare model id and
-    /// exactly one configured protocol.
+    /// 对照此不可变快照解析持久化的 `provider_id/model_id` 引用；返回的
+    /// provider 克隆带裸 model id 与恰好一个配置协议。
     pub fn provider_for_selector(
         &self,
         selector: Option<&str>,

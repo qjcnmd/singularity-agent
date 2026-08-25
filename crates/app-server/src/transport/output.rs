@@ -1,6 +1,4 @@
-//! Ordered, bounded stdout output.
-//!
-//! Output queue ownership, backpressure, and writer lifecycle are kept together.
+//! 有序、有界 stdout 输出：输出队列所有权、背压与 writer 生命周期集中管理。
 use super::ExecutionStop;
 use crate::{AppServerCancellationHandle, AppServerOutput};
 use serde_json::Value;

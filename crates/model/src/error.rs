@@ -135,9 +135,9 @@ impl ModelError {
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
-    /// Provider-directed minimum delay before an automatic retry.
+    /// provider 定向的自动重试前最小延迟。
     pub retry_after: Option<Duration>,
-    /// Whether a caller may automatically resend the same logical request.
+    /// 调用方是否可自动重发同一逻辑请求。
     pub automatic_retry_allowed: bool,
 }
 
@@ -152,13 +152,13 @@ impl ProviderError {
         }
     }
 
-    /// Preserve a provider-directed delay for the owning retry policy.
+    /// 为所属重试策略保留 provider 定向延迟。
     pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
         self.retry_after = retry_after;
         self
     }
 
-    /// Mark a failure as unsafe to replay automatically.
+    /// 标记该失败不可自动重放。
     pub fn without_automatic_retry(mut self) -> Self {
         self.automatic_retry_allowed = false;
         self

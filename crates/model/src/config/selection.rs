@@ -1,8 +1,5 @@
-//! Provider/model selector parsing and selection seam.
-//!
-//! The implementation remains owned by the parent configuration module so
-//! secret-bearing snapshots and validation share one authority. This module
-//! exposes only the narrow selection-facing seam used by sibling code.
+//! Provider/model selector 解析与选择接缝：实现仍归父配置模块所有，使含
+//! 密钥的快照与校验共享同一权威；本模块只暴露兄弟代码使用的窄选择接缝。
 
 use super::*;
 

@@ -1,13 +1,12 @@
-//! Session deletion: JSONL is the only persistent authority, so deleting a
-//! session removes its rollout file and drops the in-memory index record.
+//! Session deletion：JSONL 是唯一持久权威，删除会话即移除其 rollout 文件
+//! 并丢弃内存索引记录。
 
 use std::io;
 use std::path::Path;
 
 use super::*;
 
-/// Delete one session: remove the JSONL rollout (missing file is an error),
-/// then drop the in-memory index record.
+/// 删除一个会话：移除 JSONL rollout（文件缺失是错误），随后丢弃内存索引记录。
 pub(super) fn delete_session(record: &SessionRecord, store: &SessionIndex) -> AppServerResult<()> {
     let rollout = Path::new(&record.rollout_path);
     let identity = std::fs::symlink_metadata(rollout).map_err(|error| {

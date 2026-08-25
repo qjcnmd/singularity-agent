@@ -1,4 +1,4 @@
-//! Session discovery and bounded read projection.
+//! 会话发现与有界读投影。
 
 use std::path::PathBuf;
 

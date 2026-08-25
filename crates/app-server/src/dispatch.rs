@@ -1,4 +1,4 @@
-//! JSON-RPC registry validation and request dispatch handlers.
+//! JSON-RPC 注册表校验与请求分发处理器。
 
 use singularity_agent::session::{SessionManager, SessionRepository};
 use singularity_model::ProviderConfigSnapshot;

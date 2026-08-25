@@ -1,7 +1,5 @@
-//! User-level configuration and authentication seam.
-//!
-//! User config and auth remain one lifecycle: read, validate, and expose to
-//! the parent module's single source of truth.
+//! 用户级配置与认证接缝：用户配置与认证保持同一生命周期——读取、校验
+//! 并暴露给父模块的单一事实源。
 
 pub(crate) mod auth;
 
@@ -80,7 +78,7 @@ pub(crate) struct UserConfigData {
     pub(crate) auth: UserAuthFile,
 }
 
-/// Resolve the user-level directory shared by all worktrees.
+/// 解析所有工作树共享的用户级目录。
 pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
     let explicit_home = std::env::var_os("SINGULARITY_HOME");
     let home = explicit_home

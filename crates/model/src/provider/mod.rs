@@ -15,10 +15,10 @@ pub trait Provider {
     /// 返回模型提供方声明的基线契约。
     fn protocol_contract(&self) -> ProviderProtocolContract;
 
-    /// Report the typed stream capability for the protocol selected by this provider.
+    /// 报告本 provider 所选协议的规范化流式能力。
     ///
-    /// Legacy providers default to unsupported, even if their unrelated protocol metadata uses
-    /// the same enum values as the OpenAI-compatible adapter.
+    /// Legacy provider 默认不支持流式，即使其无关的协议元数据与
+    /// OpenAI 兼容适配器使用相同的枚举值。
     fn streaming_capability(
         &self,
         _selected_protocol: ProviderApiProtocol,
@@ -26,10 +26,10 @@ pub trait Provider {
         ProviderStreamingCapability::Unsupported
     }
 
-    /// Stream normalized visible text when the selected protocol supports it.
+    /// 当所选协议支持时，流式输出规范化后的可见文本。
     ///
-    /// The callback never receives reasoning, raw provider payloads, or tool argument deltas.
-    /// Providers without this protocol capability keep using `complete` unchanged.
+    /// 回调绝不接收 reasoning、原始 provider payload 或工具参数增量。
+    /// 无此协议能力的 provider 保持使用 `complete` 不变。
     fn complete_stream(
         &self,
         _request: &ModelTurnRequest,
@@ -39,7 +39,7 @@ pub trait Provider {
         Err(provider_streaming_unsupported_error())
     }
 
-    /// Stream visible text and expose each underlying HTTP attempt in real time.
+    /// 流式输出可见文本，并实时暴露每一次底层 HTTP attempt。
     fn complete_stream_observed(
         &self,
         request: &ModelTurnRequest,
@@ -57,7 +57,7 @@ pub trait Provider {
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError>;
 
-    /// Complete a request and expose each underlying HTTP attempt in real time.
+    /// 完成一个请求，并实时暴露每一次底层 HTTP attempt。
     fn complete_observed(
         &self,
         request: &ModelTurnRequest,

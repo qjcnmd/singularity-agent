@@ -1,4 +1,4 @@
-//! Session JSONL schema, strict validation, and public format types.
+//! 会话 JSONL schema、严格校验与公开格式类型。
 
 use std::collections::HashSet;
 

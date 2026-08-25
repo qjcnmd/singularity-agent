@@ -1,7 +1,5 @@
-//! Stdio supervisor and worker lifecycle.
-//!
-//! The supervisor owns frame classification, ordinary/control dispatch workers, turn workers,
-//! and bounded shutdown/join.
+//! Stdio supervisor 与 worker 生命周期：supervisor 拥有帧分类、ordinary/control
+//! 分发 worker、turn worker 与有界关闭/join。
 use super::*;
 use crate::{
     AppServer, AppServerCancellationHandle, AppServerControlHandle, AppServerError, AppServerOutput,
@@ -52,9 +50,8 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let cancellation = server.cancellation_handle();
-    // Ordinary requests retain the single AppServer owner. The control
-    // lane receives only cloneable active-turn/inbox handles and therefore
-    // cannot create a second mutable state owner.
+    // 普通请求保留单一 AppServer owner；控制 lane 只接收可克隆的
+    // 活动 turn/inbox 句柄，因此不可能产生第二个可变状态 owner。
     let control_handle = server.control_handle();
     let turn_factory = server
         .turn_worker()

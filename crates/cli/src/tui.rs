@@ -40,7 +40,7 @@ pub(crate) fn char_display_width(ch: char) -> usize {
     UnicodeWidthStr::width(ch.to_string().as_str())
 }
 
-/// Greedy display-width wrapping shared by transcript and editor rendering.
+/// transcript 与 editor 渲染共享的贪心显示宽度换行。
 pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();

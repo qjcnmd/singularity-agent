@@ -1,4 +1,4 @@
-//! Crash recovery and orphan-tool-result repair.
+//! 崩溃恢复与孤立工具结果修复。
 
 use std::collections::{BTreeSet, HashSet};
 

@@ -1,6 +1,4 @@
-//! Bounded JSON-Lines framing.
-//!
-//! One UTF-8 JSON value is read per line with a hard byte limit.
+//! 有界 JSON-Lines 帧切分：每行读取一个 UTF-8 JSON 值，带硬字节上限。
 use super::MAX_FRAME_BYTES;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 

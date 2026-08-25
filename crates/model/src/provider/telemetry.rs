@@ -1,23 +1,23 @@
 use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol, ProviderErrorStage};
 use serde::{Deserialize, Serialize};
 
-/// Normalized provider stream data safe for the `AgentLoop` boundary.
+/// 面向 `AgentLoop` 边界的规范化、安全的 provider 流数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
-    /// A visible text delta from the Responses `response.output_text.delta` event.
+    /// 来自 Responses `response.output_text.delta` 事件的可见文本增量。
     OutputTextDelta { delta: String },
 }
 
-/// One safe runtime boundary event for a real provider HTTP attempt.
+/// 一次真实 provider HTTP attempt 的安全运行时边界事件。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderAttemptEvent {
-    /// Emitted immediately before the HTTP request is sent.
+    /// 在 HTTP 请求发送前立即发射。
     Started(ProviderAttemptStarted),
-    /// Emitted once when that same request reaches a terminal outcome.
+    /// 同一请求到达终态时发射一次。
     Finished(Box<ProviderAttemptOccurrence>),
 }
 
-/// The stable, non-sensitive fields known when a provider HTTP attempt starts.
+/// provider HTTP attempt 开始时已知的稳定、非敏感字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAttemptStarted {
     pub operation_phase: ProviderAttemptOperationPhase,
@@ -28,19 +28,19 @@ pub struct ProviderAttemptStarted {
     pub started_at_unix_ms: u64,
 }
 
-/// Typed normalized text-stream capability for one selected provider protocol.
+/// 某个所选 provider 协议的类型化规范化文本流能力。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStreamingCapability {
-    /// The selected protocol has no normalized text stream at this boundary.
+    /// 该协议在本边界没有规范化文本流。
     #[default]
     Unsupported,
-    /// The selected protocol emits ordered visible text deltas.
+    /// 该协议按序发射可见文本增量。
     OutputTextDelta,
 }
 
 impl ProviderStreamingCapability {
-    /// Resolve the normalized stream capability from the actual selected protocol.
+    /// 从实际所选协议解析规范化流能力。
     pub const fn for_protocol(protocol: ProviderApiProtocol) -> Self {
         match protocol {
             ProviderApiProtocol::OpenAiResponses => Self::OutputTextDelta,
@@ -54,7 +54,7 @@ impl ProviderStreamingCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptOperationPhase {
-    /// A caller-requested model completion.
+    /// 调用方请求的模型补全。
     Completion,
 }
 
@@ -62,11 +62,11 @@ pub enum ProviderAttemptOperationPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
-    /// The attempt produced a valid provider response.
+    /// attempt 产出了有效 provider 响应。
     Ok,
-    /// The attempt ended with a non-cancellation error.
+    /// attempt 以非取消错误结束。
     Error,
-    /// The attempt ended because cancellation was observed.
+    /// attempt 因观察到取消而结束。
     Cancelled,
 }
 
@@ -80,9 +80,9 @@ pub struct ProviderAttemptOccurrence {
     /// 该 aggregate 内按真实 HTTP attempt 顺序排列的 1-based 索引。
     pub attempt_index: u32,
     pub terminal_status: ProviderAttemptStatus,
-    /// The wall-clock timestamp captured when this transport attempt was created.
+    /// 创建该 transport attempt 时的墙钟时间戳。
     pub started_at_unix_ms: u64,
-    /// The wall-clock timestamp captured when this transport attempt was terminalized.
+    /// 该 transport attempt 被终态化时的墙钟时间戳。
     pub ended_at_unix_ms: u64,
     /// 从 attempt 创建到响应解析或失败终结的墙钟时长，不含 retry backoff。
     pub attempt_duration_ms: u64,
@@ -103,7 +103,7 @@ pub struct ProviderAttemptOccurrence {
     pub usage: Option<ModelUsage>,
 }
 
-/// Build the stable unsupported result used by Chat, Declared, and legacy providers.
+/// 构建 Chat、Declared 与 legacy provider 使用的稳定 unsupported 结果。
 pub(crate) fn provider_streaming_unsupported_error() -> crate::error::ProviderError {
     crate::error::ProviderError::from_model_error(
         crate::error::ModelError::new(

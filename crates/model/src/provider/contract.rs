@@ -28,14 +28,14 @@ pub enum ProviderApiProtocol {
     OpenAiChatCompletions,
 }
 
-/// Chat Completions reasoning fields are selected explicitly by the model
-/// catalog. No provider or model name is interpreted to choose a wire shape.
+/// Chat Completions reasoning 字段由模型目录显式选择；不解释任何
+/// provider 或模型名来决定 wire 形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingWireFormat {
-    /// Existing `thinking: {"type": "enabled|disabled"}` fields.
+    /// 既有 `thinking: {"type": "enabled|disabled"}` 字段。
     ThinkingType,
-    /// Top-level `enable_thinking` boolean used by providers that document it.
+    /// 文档化此能力的 provider 使用顶层 `enable_thinking` 布尔。
     EnableThinking,
 }
 

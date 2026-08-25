@@ -10,17 +10,16 @@ pub enum ProviderToolReasoningMode {
     #[default]
     Unspecified,
     DisabledForToolCalls,
-    /// The adapter must preserve Chat Completions `reasoning_content` on every
-    /// assistant tool-call continuation.
+    /// 适配器必须在每条 assistant 工具调用续接上保留 Chat Completions
+    /// `reasoning_content`。
     ReplayReasoningContent,
-    /// The adapter must preserve Responses reasoning output items verbatim.
+    /// 适配器必须逐字保留 Responses reasoning 输出项。
     ReplayResponsesItems,
 }
 
-/// Provider-private reasoning state that is safe to replay at the adapter
-/// boundary but must never be displayed or projected into public conversation,
-/// trace, Evaluation, or error schemas. The Rust type is public only because
-/// the harness owns the reasoning-replay boundary between turns.
+/// Provider 私有 reasoning 状态：可在适配器边界安全重放，但绝不展示或
+/// 投影进公开会话、trace、评估或错误 schema。Rust 类型公开仅因 harness
+/// 拥有 turn 之间的 reasoning-replay 边界。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderReasoningReplay {
@@ -38,8 +37,8 @@ pub enum ProviderReasoningReplay {
         model_name: String,
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
-        /// The complete provider output sequence is retained verbatim.  The
-        /// adapter only appends later `function_call_output` items.
+        /// 完整 provider 输出序列逐字保留；适配器只追加后续的
+        /// `function_call_output` 项。
         items: Vec<Value>,
     },
 }
@@ -75,8 +74,7 @@ impl fmt::Debug for ProviderReasoningReplay {
 }
 
 impl ProviderReasoningReplay {
-    /// Validate the opaque replay at the owning provider boundary without
-    /// exposing its private payload in an error.
+    /// 在所属 provider 边界校验 opaque replay，且错误中不暴露私有 payload。
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Chat {
@@ -107,13 +105,13 @@ impl ProviderReasoningReplay {
         Ok(())
     }
 
-    /// Return only the validation result at non-model boundaries.
+    /// 在非模型边界只返回校验结果。
     pub fn is_valid(&self) -> bool {
         self.validate().is_ok()
     }
 
-    /// Check the private replay binding without exposing its opaque payload. The
-    /// agent uses this gate when a persisted thread switches provider/model.
+    /// 检查私有 replay 绑定而不暴露其 opaque payload；持久化 thread
+    /// 切换 provider/model 时 agent 使用此门。
     pub fn is_compatible_with(
         &self,
         provider_name: &str,
@@ -125,7 +123,7 @@ impl ProviderReasoningReplay {
             .is_ok()
     }
 
-    /// Validate the replay against one selected provider/model/variant and mode.
+    /// 对照一个选定的 provider/model/变体与模式校验 replay。
     /// 变体比较为 Option 语义：双侧同为空或 `Some` 相等即过。
     pub(crate) fn validate_for(
         &self,
@@ -163,7 +161,7 @@ impl ProviderReasoningReplay {
         }
     }
 
-    /// Returns whether the replay is bound to all supplied tool-call ids in order.
+    /// replay 是否按序绑定到全部给定 tool-call id。
     pub fn matches_tool_call_ids(&self, ids: &[String]) -> bool {
         match self {
             Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
@@ -172,7 +170,7 @@ impl ProviderReasoningReplay {
         }
     }
 
-    /// Return true when the replay contains a tool-call id without exposing ids.
+    /// replay 是否包含某 tool-call id（不暴露 id 列表）。
     pub fn has_tool_call_id(&self, id: &str) -> bool {
         match self {
             Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
@@ -181,13 +179,13 @@ impl ProviderReasoningReplay {
         }
     }
 
-    /// Return true when one assistant message in the supplied model history
-    /// carries exactly this replay's ordered tool-call binding.
+    /// 给定模型历史中是否恰好一条 assistant 消息携带本 replay 的
+    /// 有序 tool-call 绑定。
     pub fn is_bound_to_messages(&self, messages: &[ModelMessage]) -> bool {
         self.bound_assistant_count(messages) == 1
     }
 
-    /// Count assistant tool-call messages with this exact ordered binding.
+    /// 统计携带本 replay 精确有序绑定的 assistant 工具调用消息条数。
     pub fn bound_assistant_count(&self, messages: &[ModelMessage]) -> usize {
         messages
             .iter()
@@ -204,7 +202,7 @@ impl ProviderReasoningReplay {
             .count()
     }
 
-    /// Returns the protocol-specific reasoning mode inside the model crate.
+    /// 返回 model crate 内部的协议专属 reasoning 模式。
     pub(crate) fn mode_internal(&self) -> ProviderToolReasoningMode {
         match self {
             Self::Chat { .. } => ProviderToolReasoningMode::ReplayReasoningContent,

@@ -40,7 +40,7 @@ pub struct AppServerCancellationHandle {
     pub(super) execution_stopped: Arc<AtomicBool>,
 }
 
-/// Narrow cloneable control seam for active-turn cancellation and input.
+/// 活动 turn 取消与输入的可克隆窄控制接缝。
 ///
 /// 只携带存活 turn 注册表与 Thread 协调器映射：steer/followUp/interrupt
 /// 全部路由到协调器，不复制执行状态。
@@ -51,14 +51,12 @@ pub struct AppServerControlHandle {
 }
 
 impl AppServerControlHandle {
-    /// Dispatch one control-lane JSON-RPC message against active-turn handles.
+    /// 对活动 turn 句柄分发一条控制 lane JSON-RPC 消息。
     ///
-    /// Notifications are intentionally side-effect free at the protocol layer:
-    /// they are accepted without producing a response, while request messages
-    /// receive the typed control result or an error response from the caller.
+    /// 通知在协议层刻意无副作用：被接受但不产生响应；请求消息则由调用方
+    /// 收到类型化控制结果或错误响应。
     pub fn handle(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        // Request-only control methods arriving as notifications are true
-        // no-ops: no cancellation, enqueue, or response is allowed.
+        // 以通知到达的纯请求控制方法是真 no-op：不允许取消、入队或响应。
         if message.is_notification() {
             return Ok(Vec::new());
         }

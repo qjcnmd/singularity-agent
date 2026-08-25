@@ -37,7 +37,7 @@ use crate::types::{
     ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderToolReasoningMode,
 };
 
-/// The single validated protocol choice shared by one provider completion.
+/// 一次 provider 补全共享的单一已验证协议选择。
 struct CompletionContext {
     capabilities: ProviderProtocolContract,
     api_protocol: ProviderApiProtocol,
@@ -169,7 +169,7 @@ impl ProtocolAdapter {
     }
 }
 
-/// Mutable timing state for exactly one real provider HTTP attempt.
+/// 一次真实 provider HTTP attempt 的可变计时状态。
 struct ProviderAttemptInProgress {
     operation_phase: ProviderAttemptOperationPhase,
     provider_name: String,
@@ -257,9 +257,8 @@ impl ProviderAttemptInProgress {
     }
 }
 
-/// Outcome of the protocol-specific work performed on a successful HTTP
-/// response inside one attempt. `Retry` asserts that the protocol side permits
-/// the owning caller to resend the request; `Failed` forbids automatic replay.
+/// 一次 attempt 内、成功 HTTP 响应上的协议侧工作结果。`Retry` 表示协议侧
+/// 允许调用方重发请求；`Failed` 禁止自动重放。
 enum AttemptBodyOutcome {
     Completed {
         completion: Box<OpenAiCompletion>,
@@ -276,9 +275,8 @@ enum AttemptBodyOutcome {
     },
 }
 
-/// Fold one streaming decode attempt into [`AttemptBodyOutcome`]. A stream
-/// failure stays retryable only before the first visible delta: afterwards a
-/// resend could duplicate already-emitted output.
+/// 把一次流式解码 attempt 折叠进 [`AttemptBodyOutcome`]。流失败仅在首个
+/// 可见 delta 之前可重试：之后重发会重复已输出的内容。
 fn streaming_outcome(
     attempt: Result<StreamAttemptSuccess, StreamAttemptFailure>,
     parse_payload: impl FnOnce(Value) -> Result<(OpenAiCompletion, bool), ProviderError>,
@@ -465,8 +463,8 @@ impl OpenAiProvider {
         })
     }
 
-    /// Clone a provider for one allowlisted model while freezing its protocol
-    /// and token limits. The clone shares the HTTP client, runtime and caches.
+    /// 为单个白名单模型克隆 provider，同时冻结其协议与 token 限额；
+    /// 克隆共享 HTTP 客户端、runtime 与缓存。
     pub(crate) fn with_selected_model(&self, selected_model: SelectedModel) -> Self {
         let mut selected = self.clone();
         selected.config.model_name = selected_model.model_name.clone();
@@ -480,9 +478,8 @@ impl OpenAiProvider {
         &self.config.provider_name
     }
 
-    /// Return the fully resolved selector (`provider/model#effort`) for catalog
-    /// clones, or the bare legacy model id otherwise. `None` when the provider
-    /// has no resolved model (unconfigured legacy provider).
+    /// 返回目录克隆的完整选择器（`provider/model#effort`），否则返回裸
+    /// legacy model id；未解析出模型时（未配置的 legacy provider）返回 `None`。
     pub(crate) fn resolved_selector(&self) -> Option<String> {
         let Some(selection) = self.selected_model.as_ref() else {
             return Some(self.config.model_name.clone());
@@ -499,16 +496,15 @@ impl OpenAiProvider {
         self.config.clone()
     }
 
-    /// Return the immutable catalog protocol, if this is a catalog selection.
+    /// 返回目录选择的不可变 catalog 协议（若非目录选择则为 `None`）。
     pub fn selected_api_protocol(&self) -> Option<ProviderApiProtocol> {
         self.selected_model
             .as_ref()
             .map(|selection| selection.api_protocol)
     }
 
-    /// Convert the internal composite selector to the bare upstream model id.
-    /// Explicit catalog clones also reject attempts to change their selected
-    /// model inside a turn.
+    /// 把内部复合选择器转换为裸上游 model id；显式目录克隆还会拒绝
+    /// 在 turn 内更换所选模型。
     fn normalize_request_model(
         &self,
         request: &ModelTurnRequest,
@@ -798,10 +794,9 @@ impl OpenAiProvider {
         )
     }
 
-    /// Shared completion skeleton for both wire protocols and both streaming
-    /// and non-streaming responses.
-    /// Execute one HTTP attempt and return either its parsed completion or a
-    /// typed failure carrying the replay safety and provider-directed delay.
+    /// 两种 wire 协议、流式与非流式响应的共享完成骨架：执行一次 HTTP
+    /// attempt，返回解析后的完成或携带重放安全性与 provider 定向延时的
+    /// 类型化失败。
     #[allow(clippy::too_many_arguments)]
     fn complete_attempt(
         &self,
@@ -945,13 +940,10 @@ impl OpenAiProvider {
     }
 }
 
-/// Enforce the declared tool-reasoning contract on a completed response.
-///
-/// A response is rejected only when the contract is actually violated: the
-/// provider returned reasoning content despite `DisabledForToolCalls`, or the
-/// response carries tool calls without a mode-matching reasoning replay. A
-/// reasoning-only final answer without tool calls is legal and does not
-/// require a replay.
+/// 在完成的响应上强制执行已声明的工具推理契约：仅在契约确实被违反时
+/// 拒绝——provider 返回了 reasoning 但声明为 `DisabledForToolCalls`，
+/// 或响应携带工具调用但缺少模式匹配的 reasoning replay。仅有 reasoning
+/// 的无工具调用回复是合法、不需要 replay 的。
 fn validate_response_tool_reasoning_contract(
     request_used_tool_protocol: bool,
     completion: &OpenAiCompletion,
@@ -1099,7 +1091,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
-/// Record one terminal attempt without changing aggregate retry semantics.
+/// 记录一次终态 attempt，不改变聚合重试语义。
 fn emit_provider_attempt_started(
     occurrence: &ProviderAttemptInProgress,
     on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,

@@ -891,9 +891,8 @@ pub struct TurnModelUsage {
     /// 旧服务端数据无此字段时按存在解释。
     #[serde(default = "default_usage_present_protocol")]
     pub usage_present: bool,
-    /// Whether every provider request represented by this aggregate reported
-    /// exact usage. Missing/unknown final-request usage remains partial rather
-    /// than being represented as zero.
+    /// 该聚合表示的每个 provider 请求是否都报告了精确 usage；缺失/未知的
+    /// 末次请求 usage 保持 partial 而非表示为 0。
     #[serde(default = "default_usage_complete_protocol")]
     pub usage_complete: bool,
 }

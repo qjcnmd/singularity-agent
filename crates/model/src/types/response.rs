@@ -5,10 +5,10 @@ use super::usage::{ModelUsage, ModelValidationResult};
 use crate::error::ModelError;
 use serde::{Deserialize, Serialize};
 
-/// Typed terminal reason normalized across Chat Completions and Responses.
+/// 跨 Chat Completions 与 Responses 归一化的类型化终态原因。
 ///
-/// The wire-compatible `finish_reason` string remains serialized for v1
-/// callers; this enum is the only control-flow interpretation of that field.
+/// wire 兼容的 `finish_reason` 字符串仍为 v1 调用方序列化；此枚举是该
+/// 字段的唯一控制流解释。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelStopReason {
@@ -39,8 +39,8 @@ pub struct ModelTurnResponse {
     pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    /// 内部 opaque reasoning continuation state；never serialized to the
-    /// app-server or trace/evidence projections.
+    /// 内部 opaque reasoning continuation 状态；不序列化到 app-server
+    /// 或 trace/evidence 投影。
     #[serde(skip)]
     pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }
@@ -68,7 +68,7 @@ impl ModelTurnResponse {
         }
     }
 
-    /// Interpret the provider finish reason without exposing string matching to callers.
+    /// 解释 provider finish reason，不向调用方暴露字符串匹配。
     pub fn stop_reason(&self) -> Option<ModelStopReason> {
         match self.finish_reason.as_deref() {
             Some("length") => Some(ModelStopReason::Length),
@@ -77,7 +77,7 @@ impl ModelTurnResponse {
         }
     }
 
-    /// Return true when the provider stopped because its output budget was reached.
+    /// provider 是否因输出预算耗尽而停止。
     pub fn is_length_truncated(&self) -> bool {
         self.stop_reason() == Some(ModelStopReason::Length)
     }

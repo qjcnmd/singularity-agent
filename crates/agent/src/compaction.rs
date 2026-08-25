@@ -233,8 +233,8 @@ pub enum CompactionOutcome {
     },
 }
 
-/// Why a compaction was requested.  `ContextOverflow` bypasses only the
-/// threshold decision; its persisted `tokens_before` remains a real estimate.
+/// 请求压缩的原因。`ContextOverflow` 只绕过阈值判定；其持久化的
+/// `tokens_before` 仍是真实估算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionReason {
     Threshold,

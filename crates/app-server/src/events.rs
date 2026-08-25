@@ -1,4 +1,4 @@
-//! Lifecycle event projection.
+//! 生命周期事件投影。
 //!
 //! stdio 单连接传输下事件随请求响应全量发送；协议中不存在 `event/subscribe`
 //! 或订阅状态，客户端把 matching response 之前的 notification 关联到本次请求。

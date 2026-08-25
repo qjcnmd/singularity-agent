@@ -132,9 +132,8 @@ pub fn openai_chat_stream_request_payload(
         requires_assistant_content_for_tool_calls,
     );
     payload["stream"] = json!(true);
-    // Request usage in the final stream chunk when the provider implements
-    // the OpenAI-compatible include_usage extension. Providers that omit it
-    // still produce a valid response with usage_present=false.
+    // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
+    // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
     payload["stream_options"] = json!({"include_usage": true});
     payload
 }
@@ -303,10 +302,9 @@ pub fn finalize_provider_response(
         Some(capabilities),
     );
     let mut validation = validation;
-    // Unknown names are warnings in the generic model contract so callers can
-    // report them without losing the rest of the response. The OpenAI adapter
-    // is the native tool trust boundary, however: an unregistered name (or a
-    // missing call identity) must never enter AgentLoop's argument-repair path.
+    // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
+    // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
+    // 能进入 AgentLoop 的参数修复路径。
     let unknown_tool = response.tool_calls.iter().any(|call| {
         call.parse_status == ModelToolParseStatus::UnknownTool
             || (!call.tool_name.trim().is_empty()
@@ -354,9 +352,8 @@ pub fn finalize_provider_response(
     Ok(response)
 }
 
-/// Only malformed arguments for a registered, fully identified native call may
-/// continue to `AgentLoop` for a typed validation result. Every other response
-/// validation error remains a provider failure at this boundary.
+/// 只有已注册、身份完整的原生调用的畸形参数可以继续进入 `AgentLoop` 取得
+/// 类型化校验结果；其余响应校验错误在本边界保持为 provider 失败。
 fn recoverable_tool_argument_validation(
     response: &ModelTurnResponse,
     validation_errors: &[String],

@@ -18,8 +18,8 @@ pub struct ModelTurnRequest {
     pub tools: Vec<ModelToolSchema>,
     pub tool_choice: ToolChoicePolicy,
     pub model_preferences: ModelPreferences,
-    /// Internal provider continuation state. It is deliberately omitted from
-    /// all public/request schemas and is only consumed by the adapter.
+    /// 内部 provider continuation 状态；刻意从所有公开/请求 schema 中省略，
+    /// 仅由适配器消费。
     #[serde(skip)]
     pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }

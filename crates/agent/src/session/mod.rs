@@ -20,7 +20,7 @@ pub use format::{
 pub use manager::SessionManager;
 pub use repository::{SessionRepository, ThreadRead};
 
-/// JSONL-derived facts shared by runtime and app-server projections.
+/// runtime 与 app-server 投影共享的 JSONL 派生事实。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionProjection {
     pub session_id: String,
@@ -45,7 +45,7 @@ pub enum SessionProjectionStatus {
 
 pub const MAX_SESSION_TITLE_CHARS: usize = 120;
 
-/// Project bounded, read-only JSONL facts without repairing or mutating the session.
+/// 投影有界、只读的 JSONL 事实，不修复或修改会话。
 pub fn project_session(session: &SessionManager) -> SessionProjection {
     use crate::message::AgentMessageRole;
 

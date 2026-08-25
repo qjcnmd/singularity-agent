@@ -30,7 +30,7 @@ pub(super) const DEFAULT_APPEND_LIMITS: AppendLimits = AppendLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionFileState {
-    /// Byte offset after the last validated complete line.
+    /// 最后一个已校验完整行之后的字节偏移。
     pub(super) len: u64,
 }
 

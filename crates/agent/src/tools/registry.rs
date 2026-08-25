@@ -22,15 +22,14 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
-/// Result of the lookup and argument-validation preflight performed before a
-/// tool batch starts.
+/// 工具批次开始前执行查找与参数校验 preflight 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedTool {
     pub(crate) name: &'static str,
 }
 
-/// Preflight either produces an executable tool or a model-visible rejection.
-/// Unknown names remain registry errors so callers can preserve that boundary.
+/// preflight 要么产出可执行工具，要么产出模型可见的拒绝。
+/// 未知名称保持为注册表错误，使调用方能保留该边界。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolPreflight {
     Ready(PreparedTool),
@@ -122,8 +121,8 @@ impl ToolRegistry {
         }
     }
 
-    /// Lookup and validate a call without executing it. Agent batches use this
-    /// before executing each call in model-given source order.
+    /// 查找并校验调用而不执行。Agent 批次在按模型给定 source order 执行
+    /// 每个调用前使用本方法。
     pub fn preflight(&self, name: &str, args: &Value) -> Result<ToolPreflight, ToolError> {
         let spec = self
             .tools
@@ -138,7 +137,7 @@ impl ToolRegistry {
         Ok(ToolPreflight::Ready(PreparedTool { name: spec.name }))
     }
 
-    /// Execute a call that has already passed [`Self::preflight`].
+    /// 执行一个已通过 [`Self::preflight`] 的调用。
     pub fn execute_prepared<'a>(
         &self,
         prepared: PreparedTool,

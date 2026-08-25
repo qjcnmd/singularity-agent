@@ -1,4 +1,4 @@
-//! Mutable Session lifecycle and append manager.
+//! 可变会话生命周期与追加管理器。
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -82,11 +82,10 @@ impl SessionManager {
         Self::open(path)
     }
 
-    /// Open an existing rollout for a bounded discovery/index rebuild.
+    /// 为有界 discovery/index 重建打开既有 rollout。
     ///
-    /// This seam validates the complete file while holding the normal append
-    /// lock, but it never truncates a torn tail or adds a final newline. A
-    /// file that would require the normal reopen repair path is rejected.
+    /// 此接缝在持有正常追加锁时校验完整文件，但绝不截断 torn tail 或
+    /// 补末尾换行；需要正常重开修复路径的文件被拒绝。
     pub fn open_existing_read_only(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(SessionError::InvalidSession(format!(
@@ -300,7 +299,7 @@ impl SessionManager {
         &self.session_id
     }
 
-    /// Header timestamp is the authoritative creation fact for index rebuilds.
+    /// header 时间戳是索引重建的权威创建事实。
     pub fn created_at(&self) -> &str {
         &self.header_timestamp
     }

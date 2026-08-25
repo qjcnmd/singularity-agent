@@ -1,4 +1,4 @@
-//! Session context projection and LLM message conversion.
+//! 会话上下文投影与 LLM 消息转换。
 
 use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus};
 

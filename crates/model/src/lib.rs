@@ -37,7 +37,7 @@ pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 provider complete 的最大 HTTP attempt 次数（首次尝试之外最多重试 5 次）。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
-/// Provider boundary code used when a protocol has no normalized text stream.
+/// 协议无规范化文本流时使用的 provider 边界码。
 pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
 pub(crate) const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 pub(crate) const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";

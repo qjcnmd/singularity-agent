@@ -12,14 +12,14 @@ use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::http::{block_on_provider_future, duration_millis};
 
-/// A stream attempt error plus whether retrying could duplicate visible text.
+/// 流 attempt 错误 + 重试是否可能重复可见文本。
 pub(super) struct StreamAttemptFailure {
     pub(super) error: ProviderError,
     pub(super) emitted_text_delta: bool,
     pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
-/// A completed stream decode plus timing captured at the decoder boundary.
+/// 一次完成的流解码 + 解码器边界捕获的计时。
 pub(super) struct StreamAttemptSuccess {
     pub(super) payload: Value,
     pub(super) time_to_first_text_delta_ms: Option<u64>,
@@ -30,7 +30,7 @@ struct SseFrame {
     data: Vec<u8>,
 }
 
-/// Protocol-independent incremental SSE framing with one total byte bound.
+/// 协议无关的增量 SSE 帧切分，带单一总字节上限。
 #[derive(Default)]
 struct SseFrameDecoder {
     pending: Vec<u8>,
@@ -128,7 +128,7 @@ impl SseFrameDecoder {
     }
 }
 
-/// Decode one Chat Completions body while preserving arbitrary HTTP chunk and SSE frame boundaries.
+/// 解码一个 Chat Completions body，保留任意 HTTP chunk 与 SSE 帧边界。
 pub(super) fn read_openai_chat_sse(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -194,9 +194,8 @@ pub(super) struct ChatToolAccumulator {
     pub(super) arguments: String,
 }
 
-/// Incremental, total-size-bounded Chat SSE decoder. It emits only visible
-/// content deltas; reasoning and tool-call fragments remain provider-private
-/// until the final normalized response is parsed.
+/// 增量、总量有界的 Chat SSE 解码器。只发射可见内容增量；reasoning 与
+/// 工具调用片段保持 provider 私有，直到最终规范化响应解析。
 pub(super) struct ChatSseDecoder<'a> {
     frames: SseFrameDecoder,
     response_id: Option<String>,
@@ -277,7 +276,7 @@ impl<'a> ChatSseDecoder<'a> {
             self.usage = Some(usage.clone());
         }
         let Some(choices) = payload.get("choices").and_then(Value::as_array) else {
-            // A usage-only chunk is legal in the OpenAI include_usage extension.
+            // 仅有 usage 的块在 OpenAI include_usage 扩展中是合法的。
             return Ok(());
         };
         for choice in choices {
@@ -396,7 +395,7 @@ impl<'a> ChatSseDecoder<'a> {
     }
 }
 
-/// Decode one Responses body while preserving arbitrary HTTP chunk and SSE frame boundaries.
+/// 解码一个 Responses body，保留任意 HTTP chunk 与 SSE 帧边界。
 pub(super) fn read_openai_responses_sse(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -458,7 +457,7 @@ pub(super) fn read_openai_responses_sse(
     }
 }
 
-/// Incremental, total-size-bounded SSE decoder for the Responses event contract.
+/// 增量、总量有界的 Responses 事件契约 SSE 解码器。
 pub struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
@@ -560,10 +559,9 @@ impl<'a> ResponsesSseDecoder<'a> {
                 ));
             }
             "response.incomplete" => {
-                // The response object is still the authoritative partial fact.
-                // `parse_openai_responses_response` maps max_output_tokens to
-                // the typed length stop reason; other incomplete reasons fail
-                // closed there without discarding visible/tool fragments.
+                // response 对象仍是权威的部分事实；`parse_openai_responses_response`
+                // 把 max_output_tokens 映射为类型化 length 终止原因；其他不完整
+                // 原因在此 fail closed，不丢弃可见/工具片段。
                 let response = payload.get("response").cloned().ok_or_else(|| {
                     provider_responses_stream_malformed_error("incomplete_response_missing")
                 })?;

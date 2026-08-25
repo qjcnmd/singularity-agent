@@ -563,10 +563,9 @@ where
     F: FnMut(&str) -> Option<String>,
     U: FnOnce() -> Option<ProviderConfigLayer>,
 {
-    // Provenance is selected atomically: any process-environment provider
-    // field makes that complete layer authoritative. Never merge missing
-    // process fields from user config, because doing so would make a snapshot
-    // depend on two mutable sources and hide an incomplete process setup.
+    // 来源原子选择：任何进程环境 provider 字段使该完整层具有权威性。
+    // 绝不从用户配置合并缺失的进程字段——否则快照会依赖两个可变来源，
+    // 隐藏不完整的进程设置。
     let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
     if process_layer.any_present() {
         return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);

@@ -1,10 +1,7 @@
-//! Filesystem trust-boundary seam for provider configuration.
-//!
-//! Path-bounded reads keep provider config and auth files within the
-//! configuration module's existing helpers.
+//! provider 配置的文件系统信任边界接缝：有界路径读取使 provider 配置和
+//! 认证文件保持在配置模块既有 helper 内。
 
-/// Failure modes of bounded text reads: the content exceeded the configured
-/// byte bound, or the read itself failed before a complete value was produced.
+/// 有界文本读取的失败模式：内容超过配置字节上限，或读取在产出完整值前失败。
 pub(crate) enum BoundedTextError {
     TooLarge,
     Read,
