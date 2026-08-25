@@ -1,7 +1,6 @@
 use super::framing::read_bounded_line_with_limit;
 use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
-use crate::state_paths::ensure_home_outside_repo;
 use serde_json::{Value, json};
 use singularity_agent::session::{SessionManager, SessionMetadataKind};
 use singularity_app_server::{
@@ -121,18 +120,25 @@ fn home_inside_current_repository_is_rejected_before_state_preparation() {
     std::fs::create_dir_all(&nested_cwd).expect("nested cwd");
 
     // home 位于仓库边界内（含尚不存在的尾部组件）→ 拒绝。
-    let error = ensure_home_outside_repo(&inside, &nested_cwd).expect_err("inside rejected");
+    let error = singularity_core::ensure_singularity_home_outside_workspace(&inside, &nested_cwd)
+        .expect_err("inside rejected");
     assert!(error.contains("must not be inside"), "{error}");
     // 仓库外 home → 通过。
-    ensure_home_outside_repo(&outside, &nested_cwd).expect("outside accepted");
+    singularity_core::ensure_singularity_home_outside_workspace(&outside, &nested_cwd)
+        .expect("outside accepted");
     // 无 `.git` 边界时以 cwd 为边界。若测试临时目录本身位于另一个
     // Git 仓库（例如本机 D:\Temp\.git）内，则该前提不成立，跳过这段。
     let plain = directory.path().join("plain");
     std::fs::create_dir_all(&plain).expect("plain cwd");
     if singularity_core::find_workspace_root(&plain).expect("find plain root") == plain {
-        let error = ensure_home_outside_repo(&plain.join("home"), &plain).expect_err("cwd inside");
+        let error = singularity_core::ensure_singularity_home_outside_workspace(
+            &plain.join("home"),
+            &plain,
+        )
+        .expect_err("cwd inside");
         assert!(error.contains("must not be inside"), "{error}");
-        ensure_home_outside_repo(&outside, &plain).expect("outside cwd accepted");
+        singularity_core::ensure_singularity_home_outside_workspace(&outside, &plain)
+            .expect("outside cwd accepted");
     }
 }
 

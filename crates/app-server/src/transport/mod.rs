@@ -8,7 +8,6 @@ pub(crate) mod framing;
 pub(crate) mod output;
 pub(crate) mod supervisor;
 
-pub(crate) use crate::state_paths::ensure_home_outside_current_repo;
 pub(crate) use error::{internal_error_value, request_error_value, transport_error_value};
 pub(crate) use framing::read_bounded_line;
 pub(crate) use output::{

@@ -457,7 +457,9 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     if std::env::var_os("SINGULARITY_HOME").is_some() {
         let home = singularity_core::user_singularity_home()
             .ok_or_else(|| "cannot resolve SINGULARITY_HOME for session index".to_string())?;
-        ensure_home_outside_current_repo(&home)?;
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
+        singularity_core::ensure_singularity_home_outside_workspace(&home, &cwd)?;
     }
     let paths = singularity_app_server::paths::AppPaths::resolve()?;
     paths.prepare()?;

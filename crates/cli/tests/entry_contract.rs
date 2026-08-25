@@ -395,6 +395,29 @@ fn print_and_json_are_mutually_exclusive() {
 }
 
 #[test]
+fn home_inside_repository_is_rejected_before_directory_creation() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let repository = directory.path().join("repo");
+    std::fs::create_dir_all(repository.join(".git")).expect("git marker");
+    let home = repository.join("nested").join("home");
+
+    let output = sg()
+        .args(["--print", "must not start"])
+        .current_dir(&repository)
+        .env("SINGULARITY_HOME", &home)
+        .output()
+        .expect("run sg with repository-contained home");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must not be inside"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!home.exists(), "validation must run before creating home");
+}
+
+#[test]
 fn no_session_persists_nothing() {
     let home = isolated_home();
     let base_url = fake_server::spawn("done");

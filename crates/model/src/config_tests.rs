@@ -213,44 +213,6 @@ fn relative_home_is_rejected_before_path_use() {
 }
 
 #[test]
-fn repository_boundary_uses_nearest_git_root_and_allows_ancestors() {
-    let directory = tempfile::tempdir().expect("repository boundary directory");
-    let workspace = directory.path().join("workspace");
-    let repository = workspace.join("repository");
-    let nested = repository.join("nested");
-    std::fs::create_dir_all(&nested).expect("create repository tree");
-    std::fs::write(repository.join(".git"), b"gitdir: test").expect("create worktree marker");
-
-    let root = repository_boundary_root(&nested).expect("discover nearest repository root");
-    assert_eq!(
-        root,
-        canonicalize_existing_prefix(&repository).expect("canonical repository root")
-    );
-    ensure_home_outside_root(&workspace, &root).expect("repository ancestors remain usable");
-    let inside = repository.join("missing-home");
-    let error = ensure_home_outside_root(&inside, &root)
-        .expect_err("repository root descendants must be rejected");
-    assert!(error.message.contains("current repository"));
-}
-
-#[cfg(windows)]
-#[test]
-fn repository_boundary_comparison_is_case_insensitive_with_missing_tail() {
-    let directory = tempfile::tempdir().expect("repository boundary directory");
-    let repository = directory.path().join("CaseSensitiveRepo");
-    let nested = repository.join("nested");
-    std::fs::create_dir_all(&nested).expect("create repository tree");
-    std::fs::create_dir(repository.join(".git")).expect("create repository marker");
-    let root = repository_boundary_root(&nested).expect("discover repository root");
-    let case_variant = std::path::PathBuf::from(repository.to_string_lossy().to_ascii_lowercase())
-        .join("missing-home");
-    assert!(
-        ensure_home_outside_root(&case_variant, &root).is_err(),
-        "case variants of repository descendants must be rejected"
-    );
-}
-
-#[test]
 fn metadata_errors_are_not_treated_as_missing_paths() {
     let directory = tempfile::tempdir().expect("metadata directory");
     let missing = directory.path().join("missing.json");

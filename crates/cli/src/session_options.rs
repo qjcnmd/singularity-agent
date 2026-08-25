@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use singularity_core::user_singularity_home;
+use singularity_core::{ensure_singularity_home_outside_workspace, user_singularity_home};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_runtime::store::{
     ResumeError, canonical_thread_cwd, create_thread, prepare_session_dirs, resume_thread,
@@ -47,18 +47,20 @@ fn prepare_inner(
     session: Option<&str>,
     no_session: bool,
 ) -> Result<SessionSetup, String> {
-    let tokio_runtime =
-        Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     let (home, temporary_home) = if no_session {
         let temp =
             tempfile::TempDir::new().map_err(|error| format!("temporary session home: {error}"))?;
         (temp.path().to_path_buf(), Some(temp))
     } else {
-        (
-            user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?,
-            None,
-        )
+        let home =
+            user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to read current directory: {error}"))?;
+        ensure_singularity_home_outside_workspace(&home, &cwd)?;
+        (home, None)
     };
+    let tokio_runtime =
+        Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(&home)?;
     let sessions_dir = home.join(singularity_runtime::store::SESSIONS_DIR_NAME);
     let snapshot = ProviderConfigSnapshot::capture(

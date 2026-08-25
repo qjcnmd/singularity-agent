@@ -15,7 +15,7 @@ pub use project_instructions::{
     ProjectInstructions, find_workspace_root, load_project_instructions,
     load_project_instructions_from_cwd,
 };
-pub use user_home::user_singularity_home;
+pub use user_home::{ensure_singularity_home_outside_workspace, user_singularity_home};
 
 /// 创建仅属主可访问的新文件（在 Unix 系统上以 0600 权限创建）。
 pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
