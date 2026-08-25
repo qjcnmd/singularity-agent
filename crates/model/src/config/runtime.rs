@@ -235,8 +235,6 @@ pub(crate) fn provider_initialization_blocker(error: &ModelError) -> Option<Mode
         | ModelErrorCategory::UnsupportedCapability => Some(ModelBlockerKind::ModelNameConfigError),
         ModelErrorCategory::Cancelled
         | ModelErrorCategory::ContextLengthExceeded
-        | ModelErrorCategory::BudgetExceeded
-        | ModelErrorCategory::ToolCallParse
         | ModelErrorCategory::JsonSchema
         | ModelErrorCategory::ContentFilter
         | ModelErrorCategory::UnknownProviderError => None,

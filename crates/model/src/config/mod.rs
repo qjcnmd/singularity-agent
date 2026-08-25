@@ -30,14 +30,6 @@ pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
-pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    let values = resolve_provider_values(get_env);
-    provider_config_resolution(&values)
-}
-
 pub(crate) fn missing_provider_config_error(
     name: &str,
     source: Option<ProviderConfigSource>,

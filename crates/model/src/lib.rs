@@ -20,7 +20,8 @@ pub(crate) const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
 pub(crate) const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
 pub(crate) const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 pub(crate) const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
-pub(crate) const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
+/// 默认 provider 名称；适配器回显、selector 组合与元数据落盘共用这一个事实源。
+pub const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 pub(crate) const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub(crate) const RESPONSES_PATH: &str = "/responses";
@@ -62,7 +63,7 @@ mod types;
 pub use config::{
     ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigResolution,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus,
-    compose_model_selector, resolve_provider_config, split_model_selector,
+    compose_model_selector, split_model_selector,
 };
 pub use error::*;
 pub use openai::{
@@ -84,3 +85,14 @@ pub use provider::telemetry::{
 };
 pub use transport::OpenAiProvider;
 pub use types::*;
+
+/// 默认目录投影缓存是否过期或缺失（启动时据此决定是否触发后台刷新）。
+pub fn catalog_cache_is_stale() -> bool {
+    catalog::metadata_cache_is_stale()
+}
+
+/// 从 models.dev 目录拉取并原子写入默认投影缓存；失败返回 Err，
+/// 调用方应 fail-soft（不影响配置解析）。同步入口，供后台任务调用。
+pub fn refresh_catalog_cache(runtime_handle: &tokio::runtime::Handle) -> Result<(), String> {
+    catalog::refresh_metadata_cache_default(runtime_handle)
+}

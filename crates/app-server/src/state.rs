@@ -101,8 +101,7 @@ impl AppServerControlHandle {
         follow_up: bool,
     ) -> AppServerResult<Vec<Value>> {
         let params: TurnInjectionParams = crate::dispatch::parse_params(&message)?;
-        let payload = serde_json::to_value(&params.input)?;
-        let text = crate::dispatch::input_items_to_text(&payload)?;
+        let text = crate::dispatch::input_items_to_text(&params.input)?;
         let owner = self
             .live_turns
             .lock()

@@ -68,6 +68,10 @@ pub(crate) fn wire_error_cause(cause: &str) -> String {
 ///
 /// 所有投影失败都通过 [`Self::poisoned`] 暂存并在 run 返回后以错误返回，
 /// 不再发布后续事件；JSONL 事实已在 runtime 侧先行落盘。
+///
+/// 边界（窗口极窄，仅锁中毒等异常触发）：投影 poisoned 后 transport 向
+/// 客户端发送 error response，但 turn 继续执行并写 JSONL——客户端视角的
+/// "失败"与执行事实可能短暂背离；turn 自身的终态仍由 runtime 收敛。
 pub(crate) struct TurnProjection<'a> {
     server: &'a AppServer,
     conversation: Arc<Conversation>,

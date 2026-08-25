@@ -401,7 +401,6 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, Option<Stri
             ))
         })?;
     let cwd = match object.get("cwd") {
-        Some(Value::String(cwd)) if !cwd.trim().is_empty() => Some(cwd.clone()),
         Some(Value::String(cwd)) => Some(cwd.clone()),
         Some(_) => {
             return Err(SessionError::InvalidHeader(

@@ -47,6 +47,11 @@ pub fn openai_request_payload(
             .collect::<Vec<_>>(),
         "stream": false,
     });
+    // 输出上限 wire 字段取舍：chat completions 走 `max_tokens`（第三方兼容
+    // 端点如 DeepSeek/dashscope 接受），responses 走 `max_output_tokens`
+    // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
+    // `max_completion_tokens`，本层不针对推理模型切换字段；推理模型经
+    // chat 兼容端点使用时若需输出上限，由用户在配置中显式声明。
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
     }

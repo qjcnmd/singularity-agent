@@ -14,13 +14,13 @@ pub(super) fn json_response<T: serde::Serialize>(
     ])
 }
 
-pub(super) fn input_items_to_text(input: &Value) -> AppServerResult<String> {
-    let items: Vec<singularity_protocol::InputItem> =
-        serde_json::from_value(input.clone()).map_err(AppServerError::InvalidJson)?;
+pub(super) fn input_items_to_text(
+    items: &[singularity_protocol::InputItem],
+) -> AppServerResult<String> {
     let text = items
-        .into_iter()
+        .iter()
         .map(|item| match item {
-            singularity_protocol::InputItem::Text { text } => text,
+            singularity_protocol::InputItem::Text { text } => text.as_str(),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -81,26 +81,11 @@ impl AppServer {
     /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
         let message: JsonRpcMessage = serde_json::from_str(line)?;
-        self.handle(message)
-    }
-
-    /// 处理一个已解析的 JSON-RPC 请求，并返回零个或多个协议响应或事件。
-    pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.handle_with_output(message)
     }
 
     /// 处理请求并返回生成的协议消息；传输 writer 负责全局输出顺序，dispatch 不假设 turn 执行顺序。
-    pub fn handle_with_output(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<AppServerOutput>> {
-        self.handle_unsequenced(message)
-    }
-
-    pub(super) fn handle_unsequenced(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
+    pub fn handle_with_output(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let notification = message.is_notification();
         let id = message.id().cloned();
         let Some(method_name) = message.method_name() else {
@@ -254,7 +239,7 @@ impl AppServer {
         let provider = parts
             .provider
             .map(str::to_string)
-            .unwrap_or_else(|| "openai_compatible".to_string());
+            .unwrap_or_else(|| singularity_model::DEFAULT_PROVIDER_NAME.to_string());
         let model = parts.model.map(str::to_string);
         let reasoning = parts.effort.map(str::to_string);
         let mut queued = false;
@@ -520,8 +505,7 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let payload = serde_json::to_value(&params.input)?;
-        let input_text = match input_items_to_text(&payload) {
+        let input_text = match input_items_to_text(&params.input) {
             Ok(text) => text,
             Err(_) => {
                 return Ok(TurnClaim::Responded(

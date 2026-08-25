@@ -62,7 +62,7 @@ impl OpenAiProviderConfig {
         let values = resolve_provider_values(&mut get_env_once);
         if values.user_config.is_some() {
             return Err(configuration_error(
-                "OpenAiProviderConfig cannot represent a composite models selection; use OpenAiProvider::from_env",
+                "OpenAiProviderConfig cannot represent a composite models selection; use ProviderConfigSnapshot::capture",
                 "provider_configuration_composite_selection_required",
             ));
         }

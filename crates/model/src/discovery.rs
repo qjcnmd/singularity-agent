@@ -180,4 +180,17 @@ mod tests {
             Some("provider_models_empty")
         );
     }
+
+    #[test]
+    fn discovery_rejects_too_many_entries() {
+        let entries: Vec<Value> = (0..=super::MAX_DISCOVERED_MODEL_IDS)
+            .map(|i| serde_json::json!({"id": format!("model-{i}")}))
+            .collect();
+        let error = parse_discovery_payload(&payload(serde_json::json!(entries)))
+            .expect_err("too many entries must fail");
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_models_too_many_ids")
+        );
+    }
 }

@@ -2,15 +2,17 @@
 //!
 //! 限额解析优先级为用户配置声明 > 内置表 > 目录缓存 > 保守默认（不猜测）。
 //! 缓存读路径只读本地文件、永不联网；坏条目单条剔除，整体损坏视为无缓存。
+//! 刷新仅由调用方在启动时后台触发（拉取 models.dev 目录，失败 fail-soft）。
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::user::user_config_directory_result;
-use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS};
+use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME};
 
 /// 目录投影缓存文件的生命周期（与决策记录 D-045 的 TTL 一致）。
 pub(crate) const METADATA_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -18,6 +20,12 @@ pub(crate) const METADATA_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60
 pub(crate) const METADATA_CACHE_FILE_NAME: &str = "metadata-cache.json";
 /// 单次读取缓存文件的字节上限（有界读取，超限视为无缓存）。
 const MAX_CACHE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// models.dev 公开模型目录的 api.json 地址。
+const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
+/// 目录拉取超时（秒）；网络失败 fail-soft，不影响配置解析。
+const MODELS_DEV_FETCH_TIMEOUT_SECONDS: u64 = 15;
+/// 目录响应体字节上限（api.json 约 4.3 MB，留出增长余量）。
+const MAX_MODELS_DEV_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// 一个模型的窗口限额。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +102,130 @@ impl CachedCatalog {
                 output: cached.output,
             })
     }
+}
+
+/// 默认缓存路径是否过期或缺失（供启动时决定是否触发后台刷新）。
+pub(crate) fn metadata_cache_is_stale() -> bool {
+    let Some(directory) = user_config_directory_result().ok().flatten() else {
+        return false;
+    };
+    let path = directory.join(METADATA_CACHE_FILE_NAME);
+    let Some(catalog) = load_catalog_file(&path) else {
+        return true;
+    };
+    !catalog.is_fresh()
+}
+
+/// 从 models.dev 目录拉取并原子写入默认缓存路径；任何失败返回 Err，
+/// 由调用方 fail-soft（不影响配置解析）。同步入口，供后台任务调用。
+pub(crate) fn refresh_metadata_cache_default(
+    runtime_handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
+    let directory = user_config_directory_result()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "cannot resolve user config directory for catalog refresh".to_string())?;
+    refresh_metadata_cache_to(runtime_handle, &directory)
+}
+
+/// 拉取并写入指定目录下的缓存文件（测试可直接指定目录）。
+fn refresh_metadata_cache_to(
+    runtime_handle: &tokio::runtime::Handle,
+    directory: &Path,
+) -> Result<(), String> {
+    let payload = fetch_models_dev_payload(runtime_handle)?;
+    let catalog = parse_models_dev_payload(&payload)
+        .ok_or_else(|| "models.dev payload did not match the expected catalog shape".to_string())?;
+    let path = directory.join(METADATA_CACHE_FILE_NAME);
+    write_catalog_file(&path, &catalog)
+}
+
+/// 拉取 models.dev api.json（有界、超时）；失败以 String 返回。
+fn fetch_models_dev_payload(runtime_handle: &tokio::runtime::Handle) -> Result<Value, String> {
+    runtime_handle.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                MODELS_DEV_FETCH_TIMEOUT_SECONDS,
+            ))
+            .build()
+            .map_err(|error| format!("failed to build catalog client: {error}"))?;
+        let response = client
+            .get(MODELS_DEV_API_URL)
+            .send()
+            .await
+            .map_err(|error| format!("failed to fetch models.dev catalog: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "models.dev catalog returned HTTP {}",
+                response.status()
+            ));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("failed to read models.dev catalog: {error}"))?;
+        if body.len() > MAX_MODELS_DEV_BODY_BYTES {
+            return Err("models.dev catalog exceeded the byte limit".to_string());
+        }
+        serde_json::from_slice(&body)
+            .map_err(|error| format!("models.dev catalog was not valid JSON: {error}"))
+    })
+}
+
+/// 解析 models.dev api.json（顶层 provider → models → `limit.context/output`）
+/// 为投影缓存；结构级缺陷返回 None，坏条目跳过。
+fn parse_models_dev_payload(payload: &Value) -> Option<CachedCatalog> {
+    let providers_value = payload.as_object()?;
+    let mut providers = BTreeMap::new();
+    for (provider_name, provider_value) in providers_value {
+        let Some(models_value) = provider_value.get("models").and_then(Value::as_object) else {
+            continue;
+        };
+        let mut models = BTreeMap::new();
+        for (model_id, model_value) in models_value {
+            let Some(limit) = model_value.get("limit") else {
+                continue;
+            };
+            let Some(context) = limit.get("context").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(output) = limit.get("output").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Ok(context) = u32::try_from(context) else {
+                continue;
+            };
+            let Ok(output) = u32::try_from(output) else {
+                continue;
+            };
+            models.insert(model_id.clone(), CachedModel { context, output });
+        }
+        if !models.is_empty() {
+            providers.insert(provider_name.clone(), CachedProvider { models });
+        }
+    }
+    if providers.is_empty() {
+        return None;
+    }
+    let fetched_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+    Some(CachedCatalog {
+        version: 1,
+        fetched_at,
+        providers,
+    })
+}
+
+/// 原子写入缓存文件（临时文件 + 同卷改名）。
+fn write_catalog_file(path: &Path, catalog: &CachedCatalog) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(catalog)
+        .map_err(|error| format!("failed to serialize catalog: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, text)
+        .map_err(|error| format!("failed to write catalog: {error}"))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("failed to commit catalog: {error}"))?;
+    Ok(())
 }
 
 /// 从磁盘解析缓存文件；任何结构级缺陷（非 JSON、缺 version、超限）返回 None。
@@ -220,7 +352,7 @@ fn builtin_table(provider: &str) -> Option<&'static BTreeMap<String, ModelLimits
     static ANTHROPIC: OnceLock<BTreeMap<String, ModelLimits>> = OnceLock::new();
     match provider {
         "deepseek" => Some(DEEPSEEK.get_or_init(builtin_table_deepseek)),
-        "openai" | "openai_compatible" => Some(OPENAI.get_or_init(builtin_table_openai)),
+        "openai" | DEFAULT_PROVIDER_NAME => Some(OPENAI.get_or_init(builtin_table_openai)),
         "anthropic" => Some(ANTHROPIC.get_or_init(builtin_table_anthropic)),
         _ => None,
     }
@@ -254,6 +386,103 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn models_dev_sample() -> serde_json::Value {
+        serde_json::json!({
+            "deepseek": {
+                "models": {
+                    "deepseek-v4-flash": {
+                        "limit": {"context": 1_000_000, "output": 384_000}
+                    },
+                    "deepseek-chat": {
+                        "limit": {"context": 1_000_000, "output": 384_000}
+                    }
+                }
+            },
+            "openai": {
+                "models": {
+                    "gpt-5": {
+                        "limit": {"context": 400_000, "output": 128_000}
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parse_models_dev_yields_valid_catalog() {
+        let catalog = parse_models_dev_payload(&models_dev_sample()).expect("valid catalog");
+        assert_eq!(catalog.version, 1);
+        let deepseek = catalog
+            .providers
+            .get("deepseek")
+            .expect("deepseek provider");
+        let flash = deepseek.models.get("deepseek-v4-flash").expect("model");
+        assert_eq!(flash.context, 1_000_000);
+        assert_eq!(flash.output, 384_000);
+        assert!(catalog.is_fresh());
+    }
+
+    #[test]
+    fn parse_models_dev_skips_entries_without_limits() {
+        let payload = serde_json::json!({
+            "good-provider": {
+                "models": {
+                    "ok": {"limit": {"context": 1000, "output": 500}},
+                    "no-limit": {"name": "x"}
+                }
+            },
+            "no-models": {"name": "just a name"}
+        });
+        let catalog = parse_models_dev_payload(&payload).expect("provider with valid models");
+        assert!(
+            catalog
+                .providers
+                .get("good-provider")
+                .unwrap()
+                .models
+                .contains_key("ok")
+        );
+        assert!(catalog.providers.get("no-models").is_none());
+    }
+
+    #[test]
+    fn parse_models_dev_empty_providers_returns_none() {
+        assert!(parse_models_dev_payload(&serde_json::json!({})).is_none());
+        assert!(parse_models_dev_payload(&serde_json::json!({"p": {"models": {}}})).is_none());
+    }
+
+    #[test]
+    fn write_and_read_back_catalog_is_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata-cache.json");
+        let original = parse_models_dev_payload(&models_dev_sample()).unwrap();
+        write_catalog_file(&path, &original).expect("write");
+        let loaded = load_catalog_file(&path).expect("read back");
+        assert_eq!(loaded.version, original.version);
+        assert_eq!(loaded.providers.len(), original.providers.len());
+        assert_eq!(
+            loaded
+                .lookup("deepseek", "deepseek-v4-flash")
+                .unwrap()
+                .context,
+            1_000_000
+        );
+    }
+
+    /// 真实拉取 models.dev 目录并写入缓存（需网络；手动运行验证完整链路）。
+    #[test]
+    #[ignore = "manual: requires network access to models.dev"]
+    fn refresh_catalog_from_models_dev_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        refresh_metadata_cache_to(&runtime.handle().clone(), dir.path())
+            .expect("models.dev refresh must succeed");
+        let cached = load_catalog_file(&dir.path().join(METADATA_CACHE_FILE_NAME))
+            .expect("cached catalog must be readable");
+        assert!(cached.providers.contains_key("deepseek"));
+        assert!(cached.lookup("deepseek", "deepseek-chat").is_some());
     }
 
     #[test]

@@ -18,12 +18,11 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match &entry.entry_type {
         SessionEntryType::Message(message) => match message.role {
             AgentMessageRole::User | AgentMessageRole::Assistant => {
-                let role = match message.role {
-                    AgentMessageRole::User => "user",
-                    AgentMessageRole::Assistant => "assistant",
-                    _ => unreachable!(),
-                }
-                .to_string();
+                let role = if matches!(message.role, AgentMessageRole::User) {
+                    "user"
+                } else {
+                    "assistant"
+                };
                 let mut items = Vec::new();
                 let mut text_index = 0usize;
                 let mut thinking_index = 0usize;
@@ -32,7 +31,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             items.push(HistoryItem::Message {
                                 id: format!("{}:text:{text_index}", entry.id),
-                                role: role.clone(),
+                                role: role.to_string(),
                                 text: text.clone(),
                             });
                             text_index += 1;
@@ -84,12 +83,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 .turn_id()
                 .map(|id| HistoryItem::Turn {
                     id: id.to_string(),
-                    status: match metadata.kind() {
-                        SessionMetadataKind::TurnCompleted => TurnStatus::Completed,
-                        SessionMetadataKind::TurnFailed => TurnStatus::Failed,
-                        SessionMetadataKind::TurnInterrupted => TurnStatus::Interrupted,
-                        _ => unreachable!(),
-                    },
+                    status: terminal_turn_status(metadata.kind()),
                 })
                 .into_iter()
                 .collect(),

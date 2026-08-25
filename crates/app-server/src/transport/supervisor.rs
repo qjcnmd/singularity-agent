@@ -428,16 +428,8 @@ async fn handle_streaming_turn_start(
             send_output_async(output_tx.clone(), cancellation.clone(), response).await
         }
         Ok(singularity_app_server::TurnClaim::Accepted(claim)) => {
-            let factory = turn_factory.clone();
-            let task = tokio::task::spawn_blocking(move || {
-                let worker = factory.turn_worker();
-                (factory, worker)
-            });
-            let (next_factory, worker_result) = task
-                .await
-                .map_err(|error| format!("turn worker setup failed: {error}"))?;
-            *turn_factory = next_factory;
-            match worker_result {
+            // turn_worker 仅克隆共享 Arc，无需 spawn_blocking 线程池跳转。
+            match turn_factory.turn_worker() {
                 Ok(worker) => {
                     let worker_outputs = output_tx.clone();
                     let worker_cancellation = cancellation.clone();
@@ -469,6 +461,12 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     }
     let paths = singularity_app_server::paths::AppPaths::resolve()?;
     paths.prepare()?;
+    // 目录投影缓存过期时后台刷新（拉取 models.dev，失败 fail-soft 不阻塞启动）。
+    if singularity_model::catalog_cache_is_stale() {
+        let refresh_handle = runtime_handle.clone();
+        let _ = runtime_handle
+            .spawn(async move { singularity_model::refresh_catalog_cache(&refresh_handle) });
+    }
     // 进程内会话索引：启动时从 sessions 目录的 JSONL rollout 重建（JSONL 是
     // 唯一持久事实源，索引不落盘）。
     let session_index =
@@ -490,6 +488,10 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
 
 /// 三个活动 turn 控制请求走独立 lane；它们只触碰 active-turn maps，
 /// 不读取会话索引，也不等待 ordinary owner。
+///
+/// 控制 lane 的就绪点 = initialize 请求处理完成（`ready_for_turn`），
+/// 不等待 `initialized` 通知；与 turn lane 共用同一就绪合同。ordinary
+/// 方法仍以 `initialized` 通知为门禁（dispatch 层）。
 fn is_turn_control(message: &JsonRpcMessage) -> bool {
     matches!(
         message.method_name(),

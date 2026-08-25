@@ -496,7 +496,9 @@ impl Conversation {
                 SessionManager::open_existing(&path).map_err(|error| error.to_string())?;
             let parts = split_model_selector(&selector);
             let metadata = singularity_agent::session::SessionMetadata::thread_settings(
-                parts.provider.unwrap_or("openai_compatible"),
+                parts
+                    .provider
+                    .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME),
                 parts.model.unwrap_or_default(),
                 parts.effort.map(str::to_string),
             )
@@ -567,7 +569,7 @@ pub fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> 
         .provider
         .clone()
         .or_else(|| parts.provider.map(str::to_string))
-        .unwrap_or_else(|| "openai_compatible".to_string());
+        .unwrap_or_else(|| singularity_model::DEFAULT_PROVIDER_NAME.to_string());
     let model = patch
         .model
         .clone()
@@ -596,7 +598,9 @@ fn compose_validated_selector(
     if model.trim().is_empty() {
         return Err("thread settings require a model".to_string());
     }
-    let provider = parts.provider.unwrap_or("openai_compatible");
+    let provider = parts
+        .provider
+        .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME);
     let reasoning = parts.effort;
     if provider.trim().is_empty()
         || provider.chars().any(char::is_whitespace)

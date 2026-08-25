@@ -80,13 +80,10 @@ impl ProviderFailureKind {
         use ModelErrorKind::*;
         match kind {
             RateLimited => Self::RateLimited,
-            BudgetExceeded => Self::QuotaExceeded,
             NetworkError => Self::Network,
             Timeout => Self::Timeout,
             AuthError => Self::Auth,
-            InvalidRequest | ToolCallParseError | JsonSchemaViolation | ContentFilter => {
-                Self::Validation
-            }
+            InvalidRequest | JsonSchemaViolation | ContentFilter => Self::Validation,
             ProviderOverloaded => Self::Overloaded,
             Cancelled => Self::Cancelled,
             ContextLengthExceeded => Self::ContextOverflow,

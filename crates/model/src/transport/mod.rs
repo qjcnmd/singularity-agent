@@ -251,17 +251,6 @@ impl OpenAiProvider {
         })
     }
 
-    /// 从环境加载 OpenAI-compatible provider。
-    pub fn from_env<F>(
-        get_env: F,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Result<Self, ProviderError>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        crate::config::ProviderConfigSnapshot::capture(get_env, runtime_handle).provider()
-    }
-
     /// Discover public model ids from the provider's standard `/models` endpoint.
     pub fn discover_model_ids(&self) -> Result<Vec<String>, ProviderError> {
         crate::discovery::discover_provider_models(

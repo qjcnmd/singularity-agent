@@ -478,8 +478,6 @@ pub(crate) fn model_error_category(error: &ModelError) -> ModelErrorCategory {
         }
         ModelErrorKind::InvalidRequest => ModelErrorCategory::InvalidRequest,
         ModelErrorKind::ContextLengthExceeded => ModelErrorCategory::ContextLengthExceeded,
-        ModelErrorKind::BudgetExceeded => ModelErrorCategory::BudgetExceeded,
-        ModelErrorKind::ToolCallParseError => ModelErrorCategory::ToolCallParse,
         ModelErrorKind::JsonSchemaViolation => ModelErrorCategory::JsonSchema,
         ModelErrorKind::ContentFilter => ModelErrorCategory::ContentFilter,
         ModelErrorKind::UnsupportedCapability => ModelErrorCategory::UnsupportedCapability,
