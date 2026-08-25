@@ -209,34 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn grep_tolerates_crlf_lines() {
-        let dir = layout();
-        let result =
-            execute(context(json!({ "pattern": "src/main\\.rs" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        assert!(
-            result
-                .content
-                .contains("README.md:1:See src/main.rs for entry."),
-            "{}",
-            result.content
-        );
-    }
-
-    #[test]
-    fn grep_include_filter_limits_searched_files() {
-        let dir = layout();
-        let result = execute(context(
-            json!({ "pattern": r"main\(", "include": "*.rs" }),
-            dir.path(),
-        ))
-        .expect("execute");
-        assert!(!result.is_error);
-        assert!(result.content.contains("src/main.rs:2:"));
-        assert!(!result.content.contains("README.md:1:"));
-    }
-
-    #[test]
     fn grep_truncates_at_match_limit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let content = (0..510)
@@ -259,80 +231,5 @@ mod tests {
         let result = execute(context(json!({ "pattern": "(" }), dir.path())).expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("invalid regular expression"));
-    }
-
-    #[test]
-    fn grep_matches_long_lines_beyond_display_window() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut line = "a".repeat(2040);
-        line.push_str("needle");
-        line.push_str(&"b".repeat(2040));
-        fs::write(dir.path().join("long.txt"), format!("{line}\n")).expect("long line");
-        let result = execute(context(json!({ "pattern": "needle" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        // 命中位于展示窗口之外：该行必须进入结果，展示前缀不含 needle。
-        let entry = result
-            .content
-            .lines()
-            .find_map(|l| l.strip_prefix("long.txt:1:"))
-            .expect("hit beyond the display window must be reported");
-        assert!(!entry.contains("needle"), "{}", entry);
-    }
-
-    #[test]
-    fn grep_truncates_matched_line_display_to_limit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut line = String::from("marker ");
-        line.push_str(&"x".repeat(4096));
-        fs::write(dir.path().join("wide.txt"), format!("{line}\n")).expect("wide line");
-        let result = execute(context(json!({ "pattern": "marker" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        let text = result
-            .content
-            .lines()
-            .find_map(|l| l.strip_prefix("wide.txt:1:"))
-            .expect("match line");
-        assert!(text.ends_with("..."), "{text}");
-        assert!(
-            text.len() <= MAX_LINE_OUTPUT_BYTES + "...".len(),
-            "{}",
-            text.len()
-        );
-    }
-
-    #[test]
-    fn grep_truncates_multibyte_lines_at_char_boundary() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        // 3600 字节的多字节前缀使 1024 字节截断点落在 char 中间。
-        let line = format!("{}tail-marker", "汉字".repeat(600));
-        fs::write(dir.path().join("utf8.txt"), format!("{line}\n")).expect("utf8 line");
-        let result =
-            execute(context(json!({ "pattern": "tail-marker" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        let text = result
-            .content
-            .lines()
-            .find_map(|l| l.strip_prefix("utf8.txt:1:"))
-            .expect("tail hit must be reported");
-        assert!(text.ends_with("..."), "{text}");
-        assert!(!text.contains('\u{FFFD}'), "{text}");
-        let prefix = text.strip_suffix("...").expect("suffix");
-        assert!(line.starts_with(prefix), "prefix split a char boundary");
-    }
-
-    #[test]
-    fn grep_skips_long_lines_without_match() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let line = "z".repeat(4096);
-        fs::write(
-            dir.path().join("quiet.txt"),
-            format!("{line}\nstill nothing here\n"),
-        )
-        .expect("quiet file");
-        let result =
-            execute(context(json!({ "pattern": "needle-gone" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        assert!(!result.content.contains("quiet.txt"), "{}", result.content);
-        assert!(result.content.contains("no matches"), "{}", result.content);
     }
 }

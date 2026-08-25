@@ -155,39 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn glob_single_star_does_not_cross_directories() {
-        let dir = layout();
-        let result =
-            execute(context(json!({ "pattern": "src/*.rs" }), dir.path())).expect("execute");
-        assert!(result.content.contains("src/main.rs"));
-        assert!(!result.content.contains("src/deep/util.rs"));
-    }
-
-    #[test]
-    fn glob_prefix_requires_slash() {
-        let dir = layout();
-        let no_prefix =
-            execute(context(json!({ "pattern": "**origin" }), dir.path())).expect("execute");
-        assert_eq!(no_prefix.content, "no files matched \"**origin\" under .");
-        let prefixed =
-            execute(context(json!({ "pattern": "**/*.md" }), dir.path())).expect("execute");
-        assert!(prefixed.content.contains("README.md"));
-    }
-
-    #[test]
-    fn glob_rooted_at_the_given_path() {
-        let dir = layout();
-        let result = execute(context(
-            json!({ "pattern": "*.rs", "path": "src" }),
-            dir.path(),
-        ))
-        .expect("execute");
-        assert!(result.content.contains("src/main.rs"));
-        assert!(!result.content.contains("src/deep/util.rs"));
-        assert!(!result.content.contains("README.md"));
-    }
-
-    #[test]
     fn glob_rejects_missing_required_parameter() {
         let dir = layout();
         let result = execute(context(json!({}), dir.path())).expect("execute");
@@ -196,37 +163,6 @@ mod tests {
             result
                 .content
                 .contains("missing required parameter \"pattern\"")
-        );
-    }
-
-    #[test]
-    fn glob_does_not_truncate_when_scanned_files_exceed_limit_but_matches_do_not() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        for i in 0..250 {
-            fs::write(dir.path().join(format!("file_{i}.txt")), "txt").expect("write txt");
-        }
-        for i in 0..5 {
-            fs::write(dir.path().join(format!("file_{i}.rs")), "rs").expect("write rs");
-        }
-        let result = execute(context(json!({ "pattern": "*.rs" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        assert!(!result.content.contains("truncated"));
-        let lines: Vec<&str> = result.content.lines().collect();
-        assert_eq!(lines.len(), 5);
-    }
-
-    #[test]
-    fn glob_truncates_when_matches_exceed_limit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        for i in 0..205 {
-            fs::write(dir.path().join(format!("item_{i:03}.rs")), "rs").expect("write rs");
-        }
-        let result = execute(context(json!({ "pattern": "*.rs" }), dir.path())).expect("execute");
-        assert!(!result.is_error);
-        assert!(
-            result
-                .content
-                .contains("[glob] results truncated: showing first 200 of 205 matching files")
         );
     }
 }

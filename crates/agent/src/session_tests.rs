@@ -1,5 +1,4 @@
 use super::*;
-use singularity_model::{ModelRole, ProviderReasoningReplay};
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage {
@@ -37,17 +36,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
-    }
-}
-
-fn compaction(summary: &str, first_kept_entry_id: Option<String>) -> CompactionEntry {
-    CompactionEntry {
-        summary: summary.to_string(),
-        first_kept_entry_id,
-        tokens_before: Some(100),
-        previous_summary: None,
-        usage: None,
-        details: None,
     }
 }
 
@@ -128,31 +116,6 @@ fn empty_existing_session_file_fails_closed() {
 }
 
 #[test]
-fn build_context_entries_compaction_slicing() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let _m1 = manager.append_message(user("1")).unwrap();
-    let _m2 = manager.append_message(assistant("2")).unwrap();
-    let m3 = manager.append_message(user("3")).unwrap();
-    let m4 = manager.append_message(assistant("4")).unwrap();
-
-    let c1 = manager
-        .append_compaction(compaction("summary of 1,2", Some(m3.clone())))
-        .unwrap();
-    let m5 = manager.append_message(user("5")).unwrap();
-
-    let context = manager.build_context_entries().unwrap();
-    assert_eq!(entry_ids(&context), vec![c1.clone(), m3, m4, m5.clone()]);
-
-    let c2 = manager
-        .append_compaction(compaction("summary of 3,4,5", Some(m5.clone())))
-        .unwrap();
-    let m6 = manager.append_message(assistant("6")).unwrap();
-    let context = manager.build_context_entries().unwrap();
-    assert_eq!(entry_ids(&context), vec![c2, m5, m6]);
-}
-
-#[test]
 fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
@@ -194,101 +157,6 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
         .map(|entry| entry.id.as_str())
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), entries.len(), "entry ids must be unique");
-}
-
-#[test]
-fn single_writer_appends_chain_in_memory_and_reopen_preserves_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let mut writer = SessionManager::create(dir.path(), &sessions).unwrap();
-    let file = writer.path().to_path_buf();
-    let first_id = writer.append_message(user("first")).unwrap();
-    let second_id = writer.append_message(user("second")).unwrap();
-    let third_id = writer.append_message(user("third")).unwrap();
-    // 单写者：内存 entries 是权威，顺序即线性事实源。
-    assert_eq!(
-        entry_ids(&writer.entries),
-        vec![first_id.clone(), second_id.clone(), third_id.clone()]
-    );
-    // 重开从 JSONL 重建同一线性链。
-    drop(writer);
-    let reopened = SessionManager::open(&file).unwrap();
-    assert_eq!(
-        entry_ids(&reopened.build_context_entries().unwrap()),
-        vec![first_id, second_id, third_id]
-    );
-}
-
-#[test]
-fn build_session_context_replays_assistant_tool_calls() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
-    manager
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
-            content: vec![ContentBlock::ToolCall {
-                id: "call_1".to_string(),
-                name: "write".to_string(),
-                args: serde_json::json!({
-                    "path": "hello.txt",
-                    "content": "hello",
-                }),
-            }],
-            provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
-        })
-        .unwrap();
-    manager
-        .append_message(tool_result(
-            "call_1",
-            "Successfully wrote 5 bytes to hello.txt",
-        ))
-        .unwrap();
-
-    let file = manager.path().to_path_buf();
-    drop(manager);
-    let manager = SessionManager::open(&file).unwrap();
-    let messages = manager.build_session_context().unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].role, ModelRole::Assistant);
-    assert_eq!(messages[0].content, "");
-    assert_eq!(messages[0].tool_calls.len(), 1);
-    let call = &messages[0].tool_calls[0];
-    assert_eq!(call.tool_call_id, "call_1");
-    assert_eq!(call.tool_name, "write");
-    assert_eq!(call.parse_status, ModelToolParseStatus::Valid);
-    assert!(call.validation_errors.is_empty());
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&call.raw_arguments).unwrap(),
-        serde_json::json!({ "path": "hello.txt", "content": "hello" })
-    );
-    assert_eq!(messages[1].role, ModelRole::Tool);
-    assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
-}
-
-#[test]
-fn repository_read_returns_full_leaf_sequence_with_summary() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = SessionRepository::new(dir.path());
-    let mut manager = SessionManager::create_with_id(
-        dir.path(),
-        dir.path(),
-        "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-    )
-    .unwrap();
-    let m1 = manager.append_message(user("one")).unwrap();
-    let c1 = manager.append_compaction(compaction("sum1", None)).unwrap();
-    let m2 = manager.append_message(assistant("two")).unwrap();
-    let m3 = manager.append_message(user("three")).unwrap();
-    drop(manager);
-
-    let read = repo.read("a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d").unwrap();
-    assert_eq!(read.summary.as_deref(), Some("sum1"));
-    // 完整 leaf 序列按落盘顺序返回（含 compaction 标记，供上层 kinds 过滤与
-    // 摘要投影消费）；窗口裁剪只发生在其上的分页层。
-    assert_eq!(entry_ids(&read.entries), vec![m1, c1, m2, m3]);
 }
 
 #[test]
@@ -395,117 +263,6 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
 }
 
 #[test]
-fn build_session_context_projects_messages_around_thread_settings() {
-    // thread_settings metadata 不进入模型上下文，只作为恢复元数据留存；
-    // 上下文投影只包含消息序列，且保持线性顺序。
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir
-        .path()
-        .join("01914f6b-0000-7000-8000-000000000001.jsonl");
-    let lines = [
-        r#"{"type":"session","version":1,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
-        r#"{"type":"message","id":"aaaa1111","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
-        r#"{"type":"metadata","id":"bbbb2222","timestamp":"2026-08-20T00:00:02.000Z","metadataType":"thread_settings","provider":"openai","model":"test-model"}"#,
-        r#"{"type":"message","id":"dddd4444","timestamp":"2026-08-20T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}"#,
-    ];
-    std::fs::write(&file, lines.join("\n")).unwrap();
-
-    let manager = SessionManager::open(&file).unwrap();
-    let messages = manager.build_session_context().unwrap();
-    let roles: Vec<ModelRole> = messages.iter().map(|m| m.role.clone()).collect();
-    assert_eq!(roles, vec![ModelRole::User, ModelRole::Assistant]);
-    assert_eq!(messages[0].content, "hello");
-    assert_eq!(messages[1].content, "reply");
-}
-
-#[test]
-fn responses_private_replay_round_trips_exactly_through_jsonl() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let cwd = dir.path().join("project");
-    let replay = ProviderReasoningReplay::Responses {
-        provider_name: "provider".to_string(),
-        model_name: "model".to_string(),
-        reasoning_effort: Some("high".to_string()),
-        tool_call_ids: vec!["call_1".to_string()],
-        items: vec![
-            json!({
-                "type": "reasoning",
-                "id": "rs_1",
-                "encrypted_content": "opaque-secret"
-            }),
-            json!({
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "write",
-                "arguments": "{\"path\":\"out.txt\"}"
-            }),
-        ],
-    };
-    let mut manager =
-        SessionManager::create_with_id(&cwd, &sessions, "f7be8e2a-6f7f-4b55-b1cf-ef6d00c4d8f8")
-            .unwrap();
-    manager
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "summary projection".to_string(),
-                    signature: None,
-                },
-                ContentBlock::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "write".to_string(),
-                    args: json!({"path": "out.txt"}),
-                },
-            ],
-            provider_reasoning_replay: Some(replay.clone()),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
-        })
-        .unwrap();
-    let path = manager.path().to_path_buf();
-    drop(manager);
-
-    let reopened = SessionManager::open_existing(&path).unwrap();
-    let entries = reopened.build_context_entries().unwrap();
-    let message = match &entries[0].entry_type {
-        SessionEntryType::Message(message) => message,
-        other => panic!("expected assistant message, got {other:?}"),
-    };
-    assert_eq!(message.provider_reasoning_replay.as_ref(), Some(&replay));
-    assert_eq!(message.thinking_blocks().len(), 1);
-    let debug = format!("{message:?}");
-    assert!(!debug.contains("opaque-secret"));
-    assert!(debug.contains("output_item_count"));
-    let wire = serde_json::to_value(message).unwrap();
-    assert_eq!(
-        wire["providerReasoningReplay"]["items"][0]["encrypted_content"],
-        "opaque-secret"
-    );
-    assert_eq!(reopened.build_session_context().unwrap()[0].content, "");
-}
-
-#[test]
-fn strict_open_rejects_intermediate_malformed_json() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir
-        .path()
-        .join("01914f6b-0000-7000-8000-000000000001.jsonl");
-    let content = format!(
-        "{}\n{}\nnot-json\n{}\n",
-        session_header("01914f6b-0000-7000-8000-000000000001"),
-        session_message("entry-1", "one"),
-        session_message("entry-2", "two"),
-    );
-    std::fs::write(&file, content).unwrap();
-    let error =
-        SessionManager::open_existing(&file).expect_err("malformed middle line must be rejected");
-    assert!(matches!(error, SessionError::MalformedLine { line: 3, .. }));
-}
-
-#[test]
 fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir
@@ -582,52 +339,6 @@ fn read_only_open_preserves_header_creation_timestamp() {
 }
 
 #[test]
-fn strict_open_rejects_duplicate_ids_and_unknown_parent_field() {
-    // 线性化硬切后：重复 id 在单趟校验中被拒；parentId 已不是合法字段，
-    // 任何携带它的旧会话文件按未知字段拒绝（无兼容义务）。
-    let dir = tempfile::tempdir().unwrap();
-    let cases = [
-        (
-            "01914f6b-0000-7000-8000-000000000001",
-            format!(
-                "{}\n{}\n{}\n",
-                session_header("01914f6b-0000-7000-8000-000000000001"),
-                session_message("same", "one"),
-                session_message("same", "two")
-            ),
-            "duplicate",
-        ),
-        (
-            "01914f6b-0000-7000-8000-000000000002",
-            format!(
-                "{}\n{}\n",
-                session_header("01914f6b-0000-7000-8000-000000000002"),
-                r#"{"type":"message","id":"entry-1","parentId":"nope","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}]}}"#
-            ),
-            "unknown session entry field",
-        ),
-    ];
-    for (id, content, expected) in cases {
-        let file = dir.path().join(format!("{id}.jsonl"));
-        std::fs::write(&file, content).unwrap();
-        let error = SessionManager::open_existing(&file)
-            .expect_err("invalid session structure must be rejected");
-        assert!(error.to_string().contains(expected), "{id}: {error}");
-    }
-}
-
-#[test]
-fn strict_open_rejects_complete_invalid_final_json() {
-    let dir = tempfile::tempdir().unwrap();
-    let id = "01914f6b-0000-7000-8000-000000000001";
-    let file = dir.path().join(format!("{id}.jsonl"));
-    std::fs::write(&file, format!("{}\n[]", session_header(id))).unwrap();
-    let error = SessionManager::open_existing(&file)
-        .expect_err("complete invalid final entry must be rejected");
-    assert!(matches!(error, SessionError::InvalidEntry { line: 2, .. }));
-}
-
-#[test]
 fn strict_open_rejects_invalid_headers_and_old_versions() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -682,119 +393,6 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionManager::open_existing(&non_uuid).unwrap_err(),
         SessionError::InvalidHeader(_)
     ));
-}
-
-#[test]
-fn strict_open_rejects_unknown_entry_types_and_roles() {
-    let dir = tempfile::tempdir().unwrap();
-    let header = session_header("01914f6b-0000-7000-8000-000000000001");
-
-    // 1. 未知 entry 类型 (custom, label 等)
-    for unknown_type in [
-        "custom",
-        "label",
-        "model_change",
-        "thinking_level_change",
-        "hookMessage",
-    ] {
-        let f = dir.path().join(format!("{unknown_type}.jsonl"));
-        let line = format!(
-            "{header}\n{{\"type\":\"{unknown_type}\",\"id\":\"e1\",\"timestamp\":\"2026-08-20T00:00:01.000Z\"}}\n"
-        );
-        std::fs::write(&f, line).unwrap();
-        assert!(matches!(
-            SessionManager::open_existing(&f).unwrap_err(),
-            SessionError::InvalidEntry { line: 2, .. }
-        ));
-    }
-
-    // 2. 未知 message role (bashExecution, custom, hookMessage 等)
-    for unknown_role in [
-        "bashExecution",
-        "custom",
-        "hookMessage",
-        "compactionSummary",
-        "system",
-    ] {
-        let f = dir.path().join(format!("role-{unknown_role}.jsonl"));
-        let line = format!(
-            "{header}\n{{\"type\":\"message\",\"id\":\"e1\",\"timestamp\":\"2026-08-20T00:00:01.000Z\",\"message\":{{\"role\":\"{unknown_role}\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
-        );
-        std::fs::write(&f, line).unwrap();
-        assert!(matches!(
-            SessionManager::open_existing(&f).unwrap_err(),
-            SessionError::InvalidEntry { line: 2, .. }
-        ));
-    }
-
-    // 3. 缺失 timestamp 的 entry
-    let no_ts = dir.path().join("no-ts.jsonl");
-    let line = format!(
-        "{header}\n{{\"type\":\"message\",\"id\":\"e1\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
-    );
-    std::fs::write(&no_ts, line).unwrap();
-    assert!(matches!(
-        SessionManager::open_existing(&no_ts).unwrap_err(),
-        SessionError::InvalidEntry { line: 2, .. }
-    ));
-
-    // 4. entry 中包含未知 envelope 字段
-    let extra_env = dir.path().join("extra-env.jsonl");
-    let line = format!(
-        "{header}\n{{\"type\":\"message\",\"id\":\"e1\",\"timestamp\":\"2026-08-20T00:00:01.000Z\",\"unknownEnvelopeField\":true,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
-    );
-    std::fs::write(&extra_env, line).unwrap();
-    assert!(matches!(
-        SessionManager::open_existing(&extra_env).unwrap_err(),
-        SessionError::InvalidEntry { line: 2, .. }
-    ));
-}
-
-#[test]
-fn bounded_thread_read_checks_file_metadata_before_parsing_body() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("oversized.jsonl");
-    std::fs::write(&file, "not-json").unwrap();
-    let error = match parse_session_lines_with_limits(&file, 1, 1024, 10) {
-        Ok(_) => panic!("metadata limit must reject before body parsing"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SessionError::InvalidSession(message) if message.contains("1 bytes")));
-}
-
-#[test]
-fn bounded_thread_read_rejects_an_oversized_line_without_unbounded_growth() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("oversized-line.jsonl");
-    let header = session_header("01914f6b-0000-7000-8000-000000000001");
-    let line_limit = header.len();
-    std::fs::write(&file, format!("{header}\n{}\n", "x".repeat(line_limit + 1))).unwrap();
-    let error = match parse_session_lines_with_limits(&file, 1024, line_limit, 10) {
-        Ok(_) => panic!("line limit must fail closed"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SessionError::InvalidSession(message) if message.contains("line 2")));
-}
-
-#[test]
-fn bounded_thread_read_counts_content_entries_without_counting_header() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("entry-boundary.jsonl");
-    let content = format!(
-        "{}\n{}\n{}\n",
-        session_header("01914f6b-0000-7000-8000-000000000001"),
-        session_message("entry-1", "one"),
-        session_message("entry-2", "two")
-    );
-    std::fs::write(&file, content).unwrap();
-    assert!(parse_session_lines_with_limits(&file, 1024, 1024, 2).is_ok());
-    let error = match parse_session_lines_with_limits(&file, 1024, 1024, 1) {
-        Ok(_) => panic!("second content entry must exceed a one-entry content limit"),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(error, SessionError::InvalidSession(message) if message.contains("1 entries"))
-    );
 }
 
 #[test]

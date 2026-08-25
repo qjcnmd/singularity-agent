@@ -464,8 +464,10 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     // 目录投影缓存过期时后台刷新（拉取 models.dev，失败 fail-soft 不阻塞启动）。
     if singularity_model::catalog_cache_is_stale() {
         let refresh_handle = runtime_handle.clone();
-        let _ = runtime_handle
-            .spawn(async move { singularity_model::refresh_catalog_cache(&refresh_handle) });
+        drop(
+            runtime_handle
+                .spawn(async move { singularity_model::refresh_catalog_cache(&refresh_handle) }),
+        );
     }
     // 进程内会话索引：启动时从 sessions 目录的 JSONL rollout 重建（JSONL 是
     // 唯一持久事实源，索引不落盘）。

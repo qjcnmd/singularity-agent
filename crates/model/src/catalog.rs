@@ -444,7 +444,7 @@ mod tests {
                 .models
                 .contains_key("ok")
         );
-        assert!(catalog.providers.get("no-models").is_none());
+        assert!(!catalog.providers.contains_key("no-models"));
     }
 
     #[test]
@@ -567,7 +567,7 @@ mod tests {
             .expect("format");
         let catalog = parse_catalog_payload(&cache_payload(&fetched)).expect("parse");
 
-        let (context, output, fallback) =
+        let (context, _output, fallback) =
             resolve_model_limits("deepseek", "deepseek-v4-flash", Some(&catalog));
         assert_eq!(fallback, LimitsFallback::Builtin);
         assert_eq!(context, 1_000_000);
