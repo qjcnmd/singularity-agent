@@ -78,8 +78,8 @@ fn process_provider_config_rejects_an_unregistered_adapter() {
         error.error.provider_name.as_deref(),
         Some("unregistered_provider")
     );
-    assert!(!error.message.contains("test-key-placeholder"));
-    assert!(!error.message.contains("provider.example"));
+    assert!(!error.error.message.contains("test-key-placeholder"));
+    assert!(!error.error.message.contains("provider.example"));
 }
 
 #[test]
@@ -142,8 +142,8 @@ fn process_provider_limit_errors_are_bounded_and_secret_free() {
         let error = result.expect_err("invalid token limit");
 
         assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
-        assert!(error.message.contains(name));
-        assert!(!error.message.contains(value));
+        assert!(error.error.message.contains(name));
+        assert!(!error.error.message.contains(value));
     }
 }
 
@@ -179,9 +179,9 @@ fn process_provider_rejects_output_limit_equal_to_context_window() {
     .expect_err("inconsistent provider token limits");
 
     assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
-    assert!(error.message.contains(ENV_MAX_OUTPUT_TOKENS));
-    assert!(error.message.contains(ENV_CONTEXT_TOKENS));
-    assert!(!error.message.contains("test-key-placeholder"));
+    assert!(error.error.message.contains(ENV_MAX_OUTPUT_TOKENS));
+    assert!(error.error.message.contains(ENV_CONTEXT_TOKENS));
+    assert!(!error.error.message.contains("test-key-placeholder"));
 }
 
 fn executable_user_model() -> UserConfigModel {
@@ -293,7 +293,7 @@ fn user_model_override_without_api_protocol_still_fails_closed() {
         Ok(_) => panic!("api_protocol cannot be guessed"),
         Err(error) => error,
     };
-    assert!(error.message.contains("api_protocol"));
+    assert!(error.error.message.contains("api_protocol"));
     assert_eq!(
         error.error.code.as_deref(),
         Some("provider_configuration_invalid")
@@ -315,7 +315,7 @@ fn provider_config_snapshot_preserves_the_original_configuration_error() {
         .provider()
         .expect_err("same missing provider config");
     assert_eq!(first, second);
-    assert!(first.message.contains("SINGULARITY_MODEL"));
+    assert!(first.error.message.contains("SINGULARITY_MODEL"));
     assert_eq!(
         first.error.code.as_deref(),
         Some("provider_configuration_missing")
@@ -364,14 +364,14 @@ fn partial_process_environment_is_authoritative_over_user_config_layer() {
         error.error.code.as_deref(),
         Some("provider_configuration_missing")
     );
-    assert!(error.message.contains("SINGULARITY_BASE_URL"));
+    assert!(error.error.message.contains("SINGULARITY_BASE_URL"));
 }
 
 #[test]
 fn relative_home_is_rejected_before_path_use() {
     let error = normalize_absolute_path(Path::new("relative-home"))
         .expect_err("relative user home must fail closed");
-    assert!(error.message.contains("absolute path"));
+    assert!(error.error.message.contains("absolute path"));
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn metadata_errors_are_not_treated_as_missing_paths() {
     let invalid = Path::new("\0");
     let error = path_exists_or_missing(invalid, "metadata failed")
         .expect_err("metadata errors must fail closed");
-    assert_eq!(error.message, "metadata failed");
+    assert_eq!(error.error.message, "metadata failed");
 }
 
 #[test]
@@ -456,7 +456,7 @@ fn selected_invalid_endpoint_precedes_missing_auth() {
         error.error.code.as_deref(),
         Some("provider_configuration_invalid")
     );
-    assert!(error.message.contains("absolute URL"));
+    assert!(error.error.message.contains("absolute URL"));
 }
 
 #[test]
@@ -470,7 +470,7 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
         Err(error) => error,
     };
     assert_eq!(
-        config_error.message,
+        config_error.error.message,
         "user provider config exceeds the size limit"
     );
     assert_eq!(
@@ -483,6 +483,7 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     );
     assert!(
         !config_error
+            .error
             .message
             .contains(&config_path.display().to_string())
     );
@@ -498,7 +499,7 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     let auth_error =
         read_private_auth_file(&auth_path).expect_err("oversized private auth must fail");
     assert_eq!(
-        auth_error.message,
+        auth_error.error.message,
         "user provider auth exceeds the size limit"
     );
     assert_eq!(
@@ -511,10 +512,11 @@ fn oversized_user_config_and_private_auth_reads_are_rejected() {
     );
     assert!(
         !auth_error
+            .error
             .message
             .contains(&auth_path.display().to_string())
     );
-    assert!(!auth_error.message.contains(&oversized_contents));
+    assert!(!auth_error.error.message.contains(&oversized_contents));
 }
 
 /// 凭据目录只认唯一 `auth.json`：读侧合并 config.json + auth.json，

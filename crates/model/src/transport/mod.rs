@@ -896,15 +896,14 @@ impl OpenAiProvider {
                     })
                     .filter(|diagnostic| !diagnostic.is_empty())
             };
-            let mut display_message = model_error.message.clone();
-            if let Some(diagnostic) = provider_diagnostic {
-                display_message.push_str(" Provider diagnostic: ");
-                display_message.push_str(&diagnostic);
-            }
             record_provider_attempt(occurrence, Some(&model_error), None, on_attempt)?;
             let mut error =
                 ProviderError::from_model_error(model_error).with_retry_after(retry_after);
-            error.message = display_message;
+            if let Some(diagnostic) = provider_diagnostic {
+                // 追加到内层 message：Display 与重试诊断都从单一内层文案读取。
+                error.error.message.push_str(" Provider diagnostic: ");
+                error.error.message.push_str(&diagnostic);
+            }
             return Err(error);
         }
 

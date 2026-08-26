@@ -232,14 +232,21 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
         let error = provider
             .complete(&request, &singularity_core::CancellationToken::new())
             .expect_err("http error");
-        let serialized = serde_json::to_string(&error.error).expect("serialize error");
 
         assert_eq!(error.error.kind, expected_kind);
         assert_eq!(error.error.category(), expected_category);
         if status_line.starts_with("HTTP/1.1 404") {
-            assert_eq!(error.error.message, "Provider returned HTTP 404.");
+            assert!(
+                error
+                    .error
+                    .message
+                    .starts_with("Provider returned HTTP 404.")
+            );
         }
-        assert!(!serialized.contains("provider body must not leak"));
+        // 单一文案来源：有界单行诊断进入规范 message（Display 与序列化
+        // 形式同源），且始终保持单行、无控制字符。
+        assert!(error.error.message.contains("provider body must not leak"));
+        assert!(!error.error.message.chars().any(char::is_control));
         assert_eq!(attempts.try_iter().count(), 1);
     }
 }

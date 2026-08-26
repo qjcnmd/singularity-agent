@@ -1,7 +1,6 @@
 use crate::provider::contract;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use thiserror::Error;
 
 /// 从模型提供方边界保留下来的具体失败类型。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,11 +128,12 @@ impl ModelError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Error)]
-#[error("{message}")]
+#[derive(Debug, Clone, PartialEq)]
 /// 模型提供方失败，包含类型化模型错误与重试合同。
+///
+/// 对外展示文本单一来源为 [`Self::error`] 的 `message`：Display 直接委托，
+/// 调用方读取展示文案统一走 Display，杜绝顶层与内层文案分叉。
 pub struct ProviderError {
-    pub message: String,
     pub error: Box<ModelError>,
     /// provider 定向的自动重试前最小延迟。
     pub retry_after: Option<Duration>,
@@ -141,11 +141,18 @@ pub struct ProviderError {
     pub automatic_retry_allowed: bool,
 }
 
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.error.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 impl ProviderError {
     /// 从模型错误创建 provider 错误。
     pub fn from_model_error(error: ModelError) -> Self {
         Self {
-            message: error.message.clone(),
             error: Box::new(error),
             retry_after: None,
             automatic_retry_allowed: true,

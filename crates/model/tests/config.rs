@@ -160,7 +160,7 @@ fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
             error.error.stage,
             Some(ProviderErrorStage::ClientInitialization)
         );
-        assert!(!error.message.contains(malformed));
+        assert!(!error.error.message.contains(malformed));
         assert!(
             !serde_json::to_string(&error.error)
                 .expect("serialize configuration error")
@@ -786,8 +786,8 @@ fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
     let error = snapshot
         .provider()
         .expect_err("invalid explicit limits must fail closed");
-    assert!(error.message.contains("max_output_tokens"));
-    assert!(error.message.contains("max_context_tokens"));
+    assert!(error.error.message.contains("max_output_tokens"));
+    assert!(error.error.message.contains("max_context_tokens"));
 }
 
 #[test]

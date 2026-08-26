@@ -700,12 +700,18 @@ fn configured_credential_in_error_body_is_replaced_with_fixed_diagnostic() {
     assert_eq!(error.error.http_status, Some(HTTP_STATUS_UNAUTHORIZED));
     // 替换而非省略：诊断槽位仍在，只是内容为固定文案；序列化的 ModelError
     // 与对外展示文本都不含凭据或错误体原文。
-    assert!(error.message.contains("Provider diagnostic:"));
-    assert!(!error.message.contains("invalid credential"));
+    assert!(error.error.message.contains("Provider diagnostic:"));
+    assert!(!error.error.message.contains("invalid credential"));
     let serialized = serde_json::to_string(&error.error).expect("serialize model error");
     assert!(!serialized.contains(CREDENTIAL_VALUE));
     assert!(!serialized.contains("invalid credential"));
-    assert!(!error.message.contains(CREDENTIAL_VALUE));
+    assert!(!error.error.message.contains(CREDENTIAL_VALUE));
+    // 展示文案单一来源：Display 与内层 message 完全一致。
+    assert_eq!(
+        format!("{error}"),
+        error.error.message,
+        "Display delegates to the single inner message"
+    );
     server.join().expect("join secret error provider");
 }
 
@@ -736,15 +742,24 @@ fn unauthorized_structured_body_keeps_auth_kind_and_short_message() {
     assert_eq!(error.error.kind, ModelErrorKind::AuthError);
     assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
     assert_eq!(error.error.http_status, Some(HTTP_STATUS_UNAUTHORIZED));
-    assert_eq!(
-        error.error.message, "Provider returned HTTP 401.",
-        "serialized model error keeps the stable status message"
-    );
-    assert!(error.message.starts_with("Provider returned HTTP 401."));
     assert!(
         error
+            .error
+            .message
+            .starts_with("Provider returned HTTP 401."),
+        "inner message keeps the stable status message before the diagnostic"
+    );
+    assert!(
+        error
+            .error
             .message
             .contains("Provider diagnostic: provider: Incorrect API key provided.")
+    );
+    // 展示文案单一来源：Display 与内层 message 完全一致。
+    assert_eq!(
+        format!("{error}"),
+        error.error.message,
+        "Display delegates to the single inner message"
     );
     server.join().expect("join auth error provider");
 }
@@ -774,22 +789,27 @@ fn unparseable_error_body_attaches_bounded_single_line_summary() {
 
     assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
     assert_eq!(error.error.http_status, Some(404));
-    assert_eq!(
-        error.error.message, "Provider returned HTTP 404.",
-        "serialized model error keeps the stable status message"
+    assert!(
+        error
+            .error
+            .message
+            .starts_with("Provider returned HTTP 404."),
+        "inner message keeps the stable status message before the diagnostic"
     );
     assert!(
         error
+            .error
             .message
             .contains("Provider diagnostic: upstream gateway exploded second line tabbed")
     );
     const DIAGNOSTIC_MARKER: &str = "Provider diagnostic: ";
     let marker_position = error
+        .error
         .message
         .find(DIAGNOSTIC_MARKER)
         .expect("diagnostic marker present");
-    let diagnostic = &error.message[marker_position + DIAGNOSTIC_MARKER.len()..];
+    let diagnostic = &error.error.message[marker_position + DIAGNOSTIC_MARKER.len()..];
     assert!(diagnostic.chars().count() <= 256);
-    assert!(!error.message.chars().any(char::is_control));
+    assert!(!error.error.message.chars().any(char::is_control));
     server.join().expect("join plain error provider");
 }
