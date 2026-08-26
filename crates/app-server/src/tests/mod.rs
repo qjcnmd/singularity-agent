@@ -74,8 +74,12 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
         discovered.status,
         Some(singularity_runtime::ThreadStatus::Active)
     );
-    let discovered_session = SessionManager::open_existing(session.path()).expect("reopen");
+    let discovered_session =
+        SessionManager::open_existing_read_only(session.path()).expect("reopen");
     assert_eq!(discovered_session.metadata_entries().len(), 1);
+    // 持久投影验证完毕，释放写者锁，重开路径才能进入同一会话。
+    let session_path = session.path().to_path_buf();
+    drop(session);
 
     // 重开路径（continue 直接走 turn/start）在 turn 开始前完成一次幂等 repair：
     // 残留无终态 turn 收敛为 interrupted，不阻碍新 turn。
@@ -96,7 +100,7 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
         "reopened turn must complete after repair: {reopened:?}"
     );
     assert_eq!(
-        SessionManager::open_existing(session.path())
+        SessionManager::open_existing(&session_path)
             .unwrap()
             .metadata_entries()
             .iter()
@@ -113,7 +117,7 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
         ))
         .expect("second reopen turn");
     assert_eq!(
-        SessionManager::open_existing(session.path())
+        SessionManager::open_existing(&session_path)
             .unwrap()
             .metadata_entries()
             .iter()

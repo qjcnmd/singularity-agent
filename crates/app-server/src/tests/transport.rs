@@ -827,6 +827,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         }),
         "terminal metadata must not have been persisted during double fault"
     );
+    drop(session_on_disk);
 
     let initial_requests = seen_requests.lock().unwrap().len();
     assert_eq!(

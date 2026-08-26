@@ -355,7 +355,7 @@ fn wait_steer_accepted(conversation: &Conversation, text: &str) {
 }
 
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
-    SessionManager::open_existing(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
         .metadata_entries()
         .iter()
@@ -699,6 +699,7 @@ fn persisted_selector_keeps_reasoning_effort_across_resume() {
             .expect("thread settings metadata"),
         )
         .expect("append settings");
+    drop(session);
 
     let resumed = resume_thread(&sessions, thread_id).expect("resume thread");
     assert_eq!(

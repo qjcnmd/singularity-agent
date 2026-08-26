@@ -1,6 +1,6 @@
 //! JSON-RPC 注册表校验与请求分发处理器。
 
-use singularity_agent::session::{SessionManager, SessionRepository};
+use singularity_agent::session::{SessionError, SessionManager, SessionRepository};
 use singularity_model::ProviderConfigSnapshot;
 
 use super::*;
@@ -425,8 +425,13 @@ impl AppServer {
         // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。
         let rollout_path =
             singularity_runtime::store::thread_session_path(&self.sessions_dir, &record.thread_id);
-        let session =
-            SessionManager::open_existing(&rollout_path).map_err(AppServerError::Session)?;
+        let session = match SessionManager::open_existing(&rollout_path) {
+            Ok(session) => session,
+            Err(SessionError::WriterConflict { .. }) => {
+                return invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE);
+            }
+            Err(error) => return Err(AppServerError::Session(error)),
+        };
         if session.session_id() != record.thread_id {
             return Err(AppServerError::Store(format!(
                 "rollout header id {} does not match requested session id {}",
@@ -434,8 +439,10 @@ impl AppServer {
                 record.thread_id
             )));
         }
-        drop(session);
+        // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在
+        // 删除窗口内开始 append。
         crate::delete::delete_session(&rollout_path)?;
+        drop(session);
         json_response(
             message.required_id(),
             SessionDeleteResult {

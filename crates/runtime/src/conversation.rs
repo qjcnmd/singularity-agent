@@ -502,6 +502,10 @@ impl Conversation {
 
     /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回
     /// `None`（不产生事件）。持久化失败时意图保留在队列中等待重试。
+    ///
+    /// 时序前提：调用时点上个 turn 的 SessionManager 已关闭（`run_single_turn`
+    /// 中 `runner.run` 返回后其局部 session 已析构），本打开的 OS 写者锁不会
+    /// 与同一会话的已释放写者冲突。
     fn apply_pending_settings(&self) -> Result<Option<Thread>, ConversationError> {
         let mut state = self.lock_state()?;
         if state.queued_settings.is_none() {

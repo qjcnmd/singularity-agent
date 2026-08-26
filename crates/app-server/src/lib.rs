@@ -37,6 +37,8 @@ const THREAD_NOT_FOUND: &str = "Thread not found";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const SESSION_DELETE_TURN_ACTIVE: &str =
     "session/delete rejected: a turn is still active for this session";
+const SESSION_DELETE_WRITER_ACTIVE: &str =
+    "session/delete rejected: session is being written by an active writer";
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
 

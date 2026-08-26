@@ -3,6 +3,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
@@ -18,9 +19,11 @@ use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionEntryType, SessionError,
     SessionMetadata, validate_entries, validate_header,
 };
+use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
+
 /// JSONL 会话管理器。会话是严格的线性序列，`entries` 的物理顺序即事实源顺序；
-/// 会话由单个写者在整轮 turn 内独占持有，因此 append 不需要跨写者协调（同一
-/// 会话同一时刻至多一个存活写者，由 AppServer 的 activate_turn 保证）。
+/// 会话由单个写者在整轮 turn 内独占持有（由 OS 文件锁跨进程强制执行），因此
+/// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
 pub struct SessionManager {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
@@ -28,6 +31,8 @@ pub struct SessionManager {
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
     pub(super) file_state: SessionFileState,
+    /// 写者锁守卫：随实例释放并清理锁文件；`None` 表示只读打开。
+    _writer_lock: Option<WriterLockGuard>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -72,6 +77,8 @@ impl SessionManager {
     }
 
     /// 打开必须已存在的会话文件；缺失或损坏直接报错，不静默创建新会话。
+    /// 打开时获取该会话的 OS 写者锁（文件名 stem 为锁键），解锁前其他写者
+    /// 被拒绝。修复重写与后续 append 全程持锁。
     pub fn open_existing(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(SessionError::InvalidSession(format!(
@@ -80,6 +87,20 @@ impl SessionManager {
             )));
         }
         let file = path.to_path_buf();
+        let sessions_dir = path.parent().ok_or_else(|| {
+            SessionError::InvalidSession(format!(
+                "session file has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        let lock_key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+            SessionError::InvalidSession(format!(
+                "session file name is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
+        let writer_lock = coordinator.acquire(lock_key)?;
         let metadata = std::fs::symlink_metadata(&file)?;
         if metadata.len() == 0 {
             return Err(SessionError::InvalidSession(format!(
@@ -112,6 +133,7 @@ impl SessionManager {
             session_id,
             header_timestamp,
             file_state,
+            _writer_lock: Some(writer_lock),
         })
     }
 
@@ -129,7 +151,7 @@ impl SessionManager {
         Self::open_read_only(path)
     }
 
-    /// 共用的新建会话实现：写入 header 并打开新文件。
+    /// 共用的新建会话实现：先取写者锁，再写入 header 并打开新文件。
     fn create_with_file(
         cwd: &Path,
         sessions_dir: &Path,
@@ -139,6 +161,9 @@ impl SessionManager {
     ) -> Result<Self> {
         let cwd = normalize_abs_path(cwd)?;
         std::fs::create_dir_all(sessions_dir)?;
+        // 锁先于文件：会话文件一旦出现就受单写者保护。
+        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
+        let writer_lock = coordinator.acquire(&session_id)?;
         let file = sessions_dir.join(file_name);
         let header = json!({
             "type": "session",
@@ -158,6 +183,7 @@ impl SessionManager {
             session_id,
             header_timestamp: timestamp,
             file_state,
+            _writer_lock: Some(writer_lock),
         })
     }
 
@@ -194,6 +220,7 @@ impl SessionManager {
             session_id,
             header_timestamp,
             file_state,
+            _writer_lock: None,
         })
     }
 

@@ -249,9 +249,9 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
     assert_eq!(last["details"]["modifiedFiles"], json!([]));
 
-    // 重开：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，旧消息被摘要取代。
-    let reopened = SessionManager::open_existing(session.path()).unwrap();
-    let ctx = reopened.build_context_entries().unwrap();
+    // 重开视角：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，
+    // 旧消息被摘要取代。写者自身即最新持久事实，直接以它投影。
+    let ctx = session.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(ctx_ids.len(), 4);
     assert!(matches!(ctx[0].entry_type, SessionEntryType::Compaction(_)));
@@ -309,8 +309,8 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["firstKeptEntryId"], id_u2);
     // 文件列表从历史 details 累积。
     assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
-    let reopened = SessionManager::open_existing(session.path()).unwrap();
-    let ctx = reopened.build_context_entries().unwrap();
+    // 二次压缩后的重开视角：写者自身即最新持久事实，直接以它投影。
+    let ctx = session.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(
         ctx_ids,
@@ -409,9 +409,9 @@ fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
     assert!(!prompt.contains("dddd"), "摘要不得包含当前轮内容");
     assert!(!prompt.contains("ffff"), "摘要不得包含当前轮工具结果");
 
-    // 重开：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult 成对保留。
-    let reopened = SessionManager::open_existing(session.path()).unwrap();
-    let ctx = reopened.build_context_entries().unwrap();
+    // 重开视角：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult
+    // 成对保留。写者自身即最新持久事实，直接以它投影。
+    let ctx = session.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
     assert_eq!(ctx_ids.len(), 4);
     assert!(matches!(ctx[0].entry_type, SessionEntryType::Compaction(_)));

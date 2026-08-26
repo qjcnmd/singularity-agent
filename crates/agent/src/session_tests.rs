@@ -141,6 +141,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     drop(settings_writer);
     let mut turn_worker = SessionManager::open_existing(&file).unwrap();
     let m3 = turn_worker.append_message(user("third")).unwrap();
+    drop(turn_worker);
 
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
@@ -190,6 +191,7 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .expect("turn_interrupted entry exists");
     assert_eq!(interrupted.turn_id(), Some("turn_2"));
     assert!(interrupted.synthetic());
+    drop(reopened);
 
     let mut reopened = SessionManager::open_existing(&file).unwrap();
     assert_eq!(reopened.repair_interrupted_turns().unwrap(), 0);
@@ -314,6 +316,7 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
             .contains("previous execution outcome unknown")
     );
     assert!(tool_results[0].content_text().contains("do not retry"));
+    drop(reopened);
 
     let mut reopened = SessionManager::open_existing(&file).unwrap();
     assert_eq!(reopened.repair_orphaned_tool_calls().unwrap(), 0);
@@ -338,6 +341,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     let mut reopened = SessionManager::open_existing(&file).unwrap();
     assert_eq!(reopened.build_context_entries().unwrap().len(), 1);
     reopened.append_message(user("after repair")).unwrap();
+    drop(reopened);
     let reopened_again = SessionManager::open_existing(&file).unwrap();
     assert_eq!(reopened_again.build_context_entries().unwrap().len(), 2);
 
