@@ -10,6 +10,7 @@ use tempfile::tempdir;
 use super::capture::{CaptureState, INTERNAL_TAIL_MAX_BYTES};
 use super::exec::{OUTPUT_TRUNCATED_BACKGROUND_NOTE, spawn_shell};
 use super::pump::Utf8Decoder;
+#[cfg(windows)]
 use super::shell::bash_shell_command;
 use crate::tools::registry::{ExecuteContext, ToolExecution, ToolRegistry};
 use crate::tools::test_support::context;
