@@ -17,9 +17,11 @@ use singularity_runtime::events::{AgentDiagnosticSeverity, ProviderAttemptStatus
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ReasoningPatch, SettingsPatch};
 
+use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
+use super::view;
 use super::wrapped_lines;
 use unicode_width::UnicodeWidthStr;
 
@@ -34,16 +36,6 @@ pub(crate) enum Phase {
     Running,
     Interrupting,
 }
-
-const COMMANDS: [(&str, &str); 7] = [
-    ("/model", "select the thread model"),
-    ("/settings", "edit provider, model, and reasoning"),
-    ("/resume", "resume a saved session"),
-    ("/new", "start a new session"),
-    ("/session", "show session facts"),
-    ("/compact", "compact context now"),
-    ("/name", "name this session"),
-];
 
 /// 设置菜单提示：菜单内与状态行提示共用同一文案（行为与提示同源，防漂移）。
 const SETTINGS_MENU_HINT: &str = "Enter apply · Tab next field · Esc close";
@@ -160,14 +152,6 @@ impl SettingsMenu {
 pub(crate) struct ResumeMenu {
     threads: Vec<singularity_runtime::ThreadSummary>,
     selected: usize,
-}
-
-/// 键盘处理结果：继续、提交一轮输入或以指定退出码结束进程。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Action {
-    Continue,
-    Submit(String),
-    Exit(i32),
 }
 
 /// 交互式会话的应用状态。
@@ -638,9 +622,13 @@ impl TuiApp {
     }
 
     fn execute_command(&mut self, text: &str) {
-        let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
+        let Some((command, argument)) = SlashCommand::parse(text) else {
+            self.transcript
+                .push_note(format!("unknown command: {text}"), NoteStyle::Warning);
+            return;
+        };
         match command {
-            "/model" => {
+            SlashCommand::Model => {
                 let current = self
                     .conversation
                     .thread()
@@ -648,7 +636,7 @@ impl TuiApp {
                     .and_then(|thread| thread.model);
                 self.settings = Some(SettingsMenu::open_field(current.as_deref(), 1));
             }
-            "/settings" => {
+            SlashCommand::Settings => {
                 let current = self
                     .conversation
                     .thread()
@@ -656,7 +644,7 @@ impl TuiApp {
                     .and_then(|thread| thread.model);
                 self.settings = Some(SettingsMenu::open(current.as_deref()));
             }
-            "/resume" => {
+            SlashCommand::Resume => {
                 match singularity_runtime::list_threads(self.conversation.runner().sessions_dir()) {
                     Ok(threads) if !threads.is_empty() => {
                         self.resume = Some(ResumeMenu {
@@ -670,7 +658,7 @@ impl TuiApp {
                     Err(error) => self.transcript.push_note(error, NoteStyle::Error),
                 }
             }
-            "/new" => {
+            SlashCommand::New => {
                 let runner = self.conversation.runner_handle();
                 let current = self.conversation.thread().ok();
                 let cwd = current
@@ -694,7 +682,7 @@ impl TuiApp {
                     Err(error) => self.transcript.push_note(error, NoteStyle::Error),
                 }
             }
-            "/session" => {
+            SlashCommand::Session => {
                 let summary =
                     singularity_runtime::list_threads(self.conversation.runner().sessions_dir())
                         .ok()
@@ -716,7 +704,7 @@ impl TuiApp {
                         .push_note("session facts unavailable", NoteStyle::Warning),
                 }
             }
-            "/compact" => match self.conversation.compact() {
+            SlashCommand::Compact => match self.conversation.compact() {
                 Ok(singularity_runtime::CompactionOutcome::Compacted { tokens_before, .. }) => {
                     self.transcript.push_note(
                         format!("context compacted from {tokens_before} estimated tokens"),
@@ -730,7 +718,7 @@ impl TuiApp {
                     .transcript
                     .push_note(format!("compaction failed: {error}"), NoteStyle::Error),
             },
-            "/name" if !argument.trim().is_empty() => {
+            SlashCommand::Name if !argument.trim().is_empty() => {
                 match self.conversation.rename(argument.trim()) {
                     Ok(()) => self.transcript.push_note(
                         format!("session named {}", argument.trim()),
@@ -741,12 +729,9 @@ impl TuiApp {
                         .push_note(error.to_string(), NoteStyle::Error),
                 }
             }
-            "/name" => self
+            SlashCommand::Name => self
                 .transcript
                 .push_note("usage: /name <session name>", NoteStyle::Warning),
-            _ => self
-                .transcript
-                .push_note(format!("unknown command: {command}"), NoteStyle::Warning),
         }
     }
 
@@ -1024,10 +1009,7 @@ impl TuiApp {
 
     fn render_command_menu(&self, frame: &mut Frame<'_>) {
         let prefix = self.editor.text();
-        let matches = COMMANDS
-            .iter()
-            .filter(|(command, _)| command.starts_with(&prefix))
-            .collect::<Vec<_>>();
+        let matches = view::command_matches(&prefix);
         if matches.is_empty() {
             return;
         }
@@ -1035,10 +1017,13 @@ impl TuiApp {
         frame.render_widget(Clear, popup);
         let lines = matches
             .into_iter()
-            .map(|(command, description)| {
+            .map(|command| {
                 Line::from(vec![
-                    Span::styled(format!("{command:<12}"), Style::new().fg(Color::Cyan)),
-                    Span::styled(*description, Style::new().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<12}", command.as_str()),
+                        Style::new().fg(Color::Cyan),
+                    ),
+                    Span::styled(command.description(), Style::new().fg(Color::DarkGray)),
                 ])
             })
             .collect::<Vec<_>>();
@@ -1211,17 +1196,7 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
-    let width = area.width.saturating_mul(percent_x) / 100;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
-}
+use super::view::centered_rect;
 
 #[cfg(test)]
 mod tests {

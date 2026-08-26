@@ -20,9 +20,11 @@
 //! （CSI-u 修饰键）；所有退出路径（正常、错误、panic）统一恢复终端状态。
 
 mod app;
+mod commands;
 mod editor;
 mod scroll;
 mod transcript;
+mod view;
 
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc;
@@ -32,7 +34,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use unicode_width::UnicodeWidthStr;
 
-use app::{Action, TuiApp};
+use app::TuiApp;
+use commands::Action;
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 use singularity_runtime::objects::TurnStatus;
 

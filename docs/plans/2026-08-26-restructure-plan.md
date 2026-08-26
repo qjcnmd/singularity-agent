@@ -82,7 +82,7 @@
 1. 全量门禁：`cargo fmt --all -- --check`、clippy `-D warnings`、`cargo test --workspace --all-targets --locked`（应 300+ 测试全绿）。
 2. 一次真实 provider 冒烟（longcat chat 协议，隔离 `SINGULARITY_HOME`，输出 `outputs/restructure-final-smoke.log`），确认 summary 终态行形状与基线一致。
 3. 可选（用户未强制）：Singularity-Evaluator 全量收尾一次。
-4. 提交顺序与汇总：按 Phase 1→6 每个 commit 一个主题；commit message 中文约定格式 `refactor(...): …`；push 到 origin/main；监控 CI（`gh run watch`）直至全绿。
+4. 提交与验证：按 Phase 1→6 本地提交（每阶段一个主题），commit message 约定格式 `refactor(...): …`；远程推送与 CI 由用户决定时机，不在执行流程内。
 5. docs/singularity.md 同步：§2.1（typed 字段说明）、§5（会话列表按需投影说明）、§2（TUI 命令模型说明视需要）。
 
 ## 四、风险与注意
@@ -106,3 +106,4 @@
 - Phase 1：typed `TurnEvent` 已贯穿 runtime、protocol、app-server 与 CLI；协议构造器由 typed DTO 序列化，wire 词形不变。验证：`cargo test -p singularity_runtime -p singularity_protocol -p singularity_app_server -p singularity_cli` 全绿；隔离 LongCat 真实调用 completed，`provider/attempt.status` 为 `started/ok`；隔离失败形状冒烟覆盖 `agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}`，词形与基线一致。提交：`a9bb59f`。
 - Phase 2：删除 `SessionIndex`，列表、存在性、设置基线、读取头字段与删除均按需从 JSONL 投影；`ThreadSummary` 扩展为列表载体并统一按 `updated_at` 降序、thread id 升序稳定排序。验证：`cargo test -p singularity_runtime -p singularity_app_server` 全绿（runtime 17、app-server lib 35、stdio 4、steer 3）；隔离 LongCat `sg --json` 冒烟 completed，输出包含 `turn/started`、`provider/attempt`、`item/*`、`turn/completed`，session 文件 1 个。提交：待提交。
 - Phase 3：`Agent::run` 拆出采样请求层 `attempt_request` 与既有流处理入口 `stream_completion`；重试、主动/强制压缩与哨兵状态收拢到请求层，未引入 `AgentState`。验证：`cargo test -p singularity_agent` 全绿（71 tests）。提交：待提交。
+- Phase 4：新增强类型 `SlashCommand`/补全模型与渲染辅助模块，TUI 命令分派改用枚举，保留现有交互行为。验证：`cargo test -p singularity_cli --no-run` 编译通过。提交：待提交。
