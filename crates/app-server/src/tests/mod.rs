@@ -734,6 +734,45 @@ fn session_delete_rejects_reserved_turn_and_succeeds_after_reservation_drops() {
 }
 
 #[test]
+fn session_delete_rejects_active_writer_with_conflict_and_releases_lock() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let sessions_dir = temp.path().join("sessions");
+    let session_id = "2e3f4a5b-6c7d-4e8f-9a01-2b3c4d5e6f70";
+    // 持锁但无活动 turn：打开的 SessionManager 模拟另一进程的活动写者。
+    let session =
+        SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("create");
+    let mut server = app_server(&sessions_dir);
+    initialize(&mut server);
+
+    // OS 写者锁被占用时 delete 必须快速失败为 invalid_state，绝不删活文件。
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/delete","id":2,"params":{{"sessionId":"{session_id}"}}}}"#
+        ))
+        .expect("delete rejected");
+    assert_eq!(responses[0]["error"]["code"], -32005);
+    assert!(
+        responses[0]["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("session is being written by an active writer"),
+        "conflict must surface the writer lock reason: {responses:?}"
+    );
+    assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());
+
+    // 释放写者锁后同一请求成功删除。
+    drop(session);
+    let responses = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"session/delete","id":3,"params":{{"sessionId":"{session_id}"}}}}"#
+        ))
+        .expect("delete after release");
+    assert_eq!(responses[0]["result"]["deleted"], true);
+}
+
+#[test]
 fn project_instructions_load_from_workspace_root_to_cwd() {
     // 回归固定：root→cwd 逐层加载。
     let temp = tempfile::tempdir().expect("temp dir");

@@ -256,4 +256,21 @@ mod tests {
         drop(secondary_owner);
         drop(active_owner);
     }
+
+    #[test]
+    fn competing_acquire_across_threads_fails_fast() {
+        let home = TempDir::new().expect("temp dir");
+        let sessions = home.path().join("sessions");
+        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions));
+        let _owner = coordinator.acquire("thread-x").expect("first owner");
+
+        let contender = Arc::clone(&coordinator);
+        let result = std::thread::spawn(move || contender.acquire("thread-x"))
+            .join()
+            .expect("contender thread");
+        assert!(
+            matches!(result, Err(SessionError::WriterConflict { .. })),
+            "competing acquire from another thread must fail fast"
+        );
+    }
 }

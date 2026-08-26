@@ -218,3 +218,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 ### D-050：协议与认证文件硬切命名
 
 问题：桌面端历史读取方法需要与 Thread 领域统一，认证文件名不需要版本后缀。参考实现：Codex app-server 的 `thread/read` 与 `$CODEX_HOME/auth.json`。当前代码事实：协议面尚无外部消费者，认证文件只有单文件读路径。选择：按 D-039 硬切为 `thread/read` 与 `auth.json`，不保留 wire 或文件读取兼容层；app-server crate 与其余协议方法保留。影响：protocol、app-server、runtime 配置读取、测试和文档同步使用新名称。
+
+### D-051：会话单写者由 OS 文件锁强制执行
+
+问题：单写者此前只由进程内约定（activate_turn 预订）保证，跨进程无法互斥；`session/delete` 的「活动 turn 检查 → 打开校验 → unlink」之间存在 TOCTOU 窗口，另一进程可在校验后开始 append，删除后写入落入 unlinked inode。参考实现：codex-rs `thread-store/src/local/writer_lock.rs`——每会话一把锁文件 + `std::fs::File::try_lock()` 快速失败 + 协调锁串行化 stale 锁清理 + Guard Drop 先关句柄再删锁文件（Windows 必须先关句柄才能删文件）。当前代码事实：SessionManager 是 JSONL 唯一可变持有者，`open_existing` 已含 repair 重写；toolchain 1.96 ≥ try_lock 稳定版 1.89，标准库直用零新依赖。选择：任何可能写 JSONL 的打开（create_with_file、open_existing 含 repair）都先获取会话写者锁，Guard 为 SessionManager 字段随实例释放；锁目录为 sessions 同级 `thread-writer-locks/`，目录创建走 `create_owner_only_dir`；`open_existing_read_only` 不加锁。`session/delete` 先 try_lock 快速失败，冲突映射为 `APP_ERROR_INVALID_STATE` + 「session is being written by an active writer」，校验与 unlink 全程持锁，TOCTOU 随之消失。影响：跨进程双开同一会话的第二写者被快速拒绝；同进程测试中原「顺序双开」按新语义改为先释放再打开；只读投影路径不受影响。验收方式：writer_lock 单元测试（竞争拒绝/释放后复用/stale 清理/跨线程快速失败）、delete vs 活动写者集成测试、resume 双开冲突测试。

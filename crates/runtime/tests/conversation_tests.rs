@@ -1239,3 +1239,28 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
         "compaction must release the single-writer window while unwinding"
     );
 }
+
+#[test]
+fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let thread_id = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    let session = SessionManager::create_with_id(Path::new("."), &sessions, thread_id)
+        .expect("create session file");
+
+    // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
+    let conflict = match resume_thread(&sessions, thread_id) {
+        Ok(_) => panic!("resume must conflict with an active writer"),
+        Err(crate::store::ResumeError::Store(message)) => message,
+        Err(other) => panic!("expected store conflict, got {other:?}"),
+    };
+    assert!(
+        conflict.contains("active writer"),
+        "conflict reason must mention the active writer: {conflict}"
+    );
+
+    // 写者释放后 resume 恢复正常。
+    drop(session);
+    let resumed = resume_thread(&sessions, thread_id).expect("resume after release");
+    assert_eq!(resumed.thread_id, thread_id);
+}
