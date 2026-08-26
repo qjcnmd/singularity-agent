@@ -959,6 +959,132 @@ pub struct ServerShutdownResult {
     pub shutdown: bool,
 }
 
+/// 对外广播的应用事件方法名（事件信封 method 字段的唯一来源）。
+pub mod event_method {
+    pub const THREAD_STARTED: &str = "thread/started";
+    pub const TURN_STARTED: &str = "turn/started";
+    pub const TURN_COMPLETED: &str = "turn/completed";
+    pub const TURN_ERROR: &str = "turn/error";
+    pub const AGENT_DIAGNOSTIC: &str = "agent/diagnostic";
+    pub const PROVIDER_ATTEMPT: &str = "provider/attempt";
+    pub const ITEM_STARTED: &str = "item/started";
+    pub const ITEM_AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
+    pub const ITEM_COMPLETED: &str = "item/completed";
+    pub const ITEM_FAILED: &str = "item/failed";
+    pub const TOOL_EXECUTION_START: &str = "tool/execution/start";
+    pub const TOOL_EXECUTION_UPDATE: &str = "tool/execution/update";
+    pub const TOOL_EXECUTION_END: &str = "tool/execution/end";
+}
+
+/// `thread/started` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadEventParams {
+    pub thread: Thread,
+}
+
+/// `turn/started` 与 `turn/completed` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEventParams {
+    pub turn: Turn,
+}
+
+/// item 事件的条目引用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemRef {
+    #[serde(rename = "itemId")]
+    pub item_id: String,
+}
+
+/// item 生命周期事件参数（started/completed/delta/failed 共用）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemEventParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub item: ItemRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `tool/execution/start` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionStartParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub args: Value,
+}
+
+/// `tool/execution/update` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionUpdateParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub args: Value,
+    #[serde(rename = "partialResult")]
+    pub partial_result: String,
+}
+
+/// `tool/execution/end` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionEndParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub result: ToolExecutionResult,
+}
+
+/// 工具执行结果的类型化载体。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionResult {
+    pub content: Vec<ToolExecutionTextPart>,
+    #[serde(rename = "isError")]
+    pub is_error: bool,
+}
+
+/// 工具执行结果中的一段纯文本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionTextPart {
+    #[serde(rename = "type")]
+    pub kind: ToolResultPartType,
+    pub text: String,
+}
+
+/// 工具执行结果片段类型词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultPartType {
+    Text,
+}
+
 /// 对外广播的应用事件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1065,24 +1191,29 @@ impl AppEvent {
     /// 构造 thread started 事件。
     pub fn thread_started(thread: &Thread) -> Self {
         Self {
-            method: "thread/started".to_string(),
-            params: serde_json::json!({"thread": thread}),
+            method: event_method::THREAD_STARTED.to_string(),
+            params: serde_json::to_value(ThreadEventParams {
+                thread: thread.clone(),
+            })
+            .expect("typed event params serialize"),
         }
     }
 
     /// 构造 turn started 事件。
     pub fn turn_started(turn: &Turn) -> Self {
         Self {
-            method: "turn/started".to_string(),
-            params: serde_json::json!({"turn": turn}),
+            method: event_method::TURN_STARTED.to_string(),
+            params: serde_json::to_value(TurnEventParams { turn: turn.clone() })
+                .expect("typed event params serialize"),
         }
     }
 
     /// 构造 turn completed 事件。
     pub fn turn_completed(turn: &Turn) -> Self {
         Self {
-            method: "turn/completed".to_string(),
-            params: serde_json::json!({"turn": turn}),
+            method: event_method::TURN_COMPLETED.to_string(),
+            params: serde_json::to_value(TurnEventParams { turn: turn.clone() })
+                .expect("typed event params serialize"),
         }
     }
 
@@ -1104,7 +1235,7 @@ impl AppEvent {
             },
         };
         Self {
-            method: "turn/error".to_string(),
+            method: event_method::TURN_ERROR.to_string(),
             params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
@@ -1125,39 +1256,15 @@ impl AppEvent {
             message: message.into(),
         };
         Self {
-            method: "agent/diagnostic".to_string(),
+            method: event_method::AGENT_DIAGNOSTIC.to_string(),
             params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
     /// 构造单次 Provider attempt 的脱敏进度/终态事件。
-    #[allow(clippy::too_many_arguments)]
-    pub fn provider_attempt(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        model_turn_ordinal: u32,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-        protocol: impl Into<String>,
-        status: ProviderAttemptStatus,
-        attempt_duration_ms: Option<u64>,
-        error_category: Option<String>,
-        diagnostic_code: Option<String>,
-    ) -> Self {
-        let params = ProviderAttemptParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            model_turn_ordinal,
-            provider: provider.into(),
-            model: model.into(),
-            protocol: protocol.into(),
-            status,
-            attempt_duration_ms,
-            error_category,
-            diagnostic_code,
-        };
+    pub fn provider_attempt(params: ProviderAttemptParams) -> Self {
         Self {
-            method: "provider/attempt".to_string(),
+            method: event_method::PROVIDER_ATTEMPT.to_string(),
             params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
@@ -1168,7 +1275,14 @@ impl AppEvent {
         turn_id: impl Into<String>,
         item_id: impl Into<String>,
     ) -> Self {
-        Self::item_event("item/started", thread_id, turn_id, item_id)
+        Self::item_event(
+            event_method::ITEM_STARTED,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+            None,
+        )
     }
 
     /// 构造 agent message 增量事件。
@@ -1178,15 +1292,14 @@ impl AppEvent {
         item_id: impl Into<String>,
         delta: impl Into<String>,
     ) -> Self {
-        Self {
-            method: "item/agentMessage/delta".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "item": {"itemId": item_id.into()},
-                "delta": delta.into(),
-            }),
-        }
+        Self::item_event(
+            event_method::ITEM_AGENT_MESSAGE_DELTA,
+            thread_id,
+            turn_id,
+            item_id,
+            Some(delta.into()),
+            None,
+        )
     }
 
     /// 构造 item completed 事件。
@@ -1195,7 +1308,14 @@ impl AppEvent {
         turn_id: impl Into<String>,
         item_id: impl Into<String>,
     ) -> Self {
-        Self::item_event("item/completed", thread_id, turn_id, item_id)
+        Self::item_event(
+            event_method::ITEM_COMPLETED,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+            None,
+        )
     }
 
     /// 构造 item failed 事件。
@@ -1205,15 +1325,14 @@ impl AppEvent {
         item_id: impl Into<String>,
         error: impl Into<String>,
     ) -> Self {
-        Self {
-            method: "item/failed".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "item": {"itemId": item_id.into()},
-                "error": error.into(),
-            }),
-        }
+        Self::item_event(
+            event_method::ITEM_FAILED,
+            thread_id,
+            turn_id,
+            item_id,
+            None,
+            Some(error.into()),
+        )
     }
 
     /// 构造工具开始执行事件通知。
@@ -1224,15 +1343,16 @@ impl AppEvent {
         tool_name: impl Into<String>,
         args: Value,
     ) -> Self {
+        let params = ToolExecutionStartParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            args,
+        };
         Self {
-            method: "tool/execution/start".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "toolCallId": tool_call_id.into(),
-                "toolName": tool_name.into(),
-                "args": args,
-            }),
+            method: event_method::TOOL_EXECUTION_START.to_string(),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
@@ -1245,16 +1365,17 @@ impl AppEvent {
         args: Value,
         partial_result: impl Into<String>,
     ) -> Self {
+        let params = ToolExecutionUpdateParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            args,
+            partial_result: partial_result.into(),
+        };
         Self {
-            method: "tool/execution/update".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "toolCallId": tool_call_id.into(),
-                "toolName": tool_name.into(),
-                "args": args,
-                "partialResult": partial_result.into(),
-            }),
+            method: event_method::TOOL_EXECUTION_UPDATE.to_string(),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
@@ -1267,19 +1388,22 @@ impl AppEvent {
         result: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        let result = result.into();
+        let params = ToolExecutionEndParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            result: ToolExecutionResult {
+                content: vec![ToolExecutionTextPart {
+                    kind: ToolResultPartType::Text,
+                    text: result.into(),
+                }],
+                is_error,
+            },
+        };
         Self {
-            method: "tool/execution/end".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "toolCallId": tool_call_id.into(),
-                "toolName": tool_name.into(),
-                "result": {
-                    "content": [{"type": "text", "text": result}],
-                    "isError": is_error,
-                },
-            }),
+            method: event_method::TOOL_EXECUTION_END.to_string(),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
@@ -1288,14 +1412,21 @@ impl AppEvent {
         thread_id: impl Into<String>,
         turn_id: impl Into<String>,
         item_id: impl Into<String>,
+        delta: Option<String>,
+        error: Option<String>,
     ) -> Self {
+        let params = ItemEventParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            item: ItemRef {
+                item_id: item_id.into(),
+            },
+            delta,
+            error,
+        };
         Self {
             method: method.to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "item": {"itemId": item_id.into()},
-            }),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 

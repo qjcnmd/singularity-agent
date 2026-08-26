@@ -334,18 +334,18 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
         singularity_protocol::DiagnosticSeverity::Warning
     );
 
-    let attempt = AppEvent::provider_attempt(
-        "thread-1",
-        "turn-1",
-        2,
-        "openai",
-        "test-model",
-        "open_ai_responses",
-        singularity_protocol::ProviderAttemptStatus::Error,
-        Some(12),
-        Some("network".to_string()),
-        Some("provider_timeout".to_string()),
-    );
+    let attempt = AppEvent::provider_attempt(singularity_protocol::ProviderAttemptParams {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        model_turn_ordinal: 2,
+        provider: "openai".to_string(),
+        model: "test-model".to_string(),
+        protocol: "open_ai_responses".to_string(),
+        status: singularity_protocol::ProviderAttemptStatus::Error,
+        attempt_duration_ms: Some(12),
+        error_category: Some("network".to_string()),
+        diagnostic_code: Some("provider_timeout".to_string()),
+    });
     assert_eq!(attempt.method(), "provider/attempt");
     assert_eq!(attempt.params["modelTurnOrdinal"], 2);
     assert!(attempt.params.get("retryScheduled").is_none());

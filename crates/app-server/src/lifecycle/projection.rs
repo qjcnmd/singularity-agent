@@ -7,7 +7,7 @@
 use std::sync::atomic::Ordering;
 
 use singularity_protocol::{
-    DiagnosticSeverity, JsonRpcId, JsonRpcMessage,
+    DiagnosticSeverity, JsonRpcId, JsonRpcMessage, ProviderAttemptParams,
     ProviderAttemptStatus as ProtocolProviderAttemptStatus,
     TurnFailureCause as ProtocolFailureCause, TurnFailureStage as ProtocolFailureStage,
     TurnStartResult,
@@ -244,18 +244,18 @@ impl TurnEventSink for TurnProjection<'_> {
                 attempt_duration_ms,
                 error_category,
                 diagnostic_code,
-            } => self.emit_notification(AppEvent::provider_attempt(
+            } => self.emit_notification(AppEvent::provider_attempt(ProviderAttemptParams {
                 thread_id,
                 turn_id,
                 model_turn_ordinal,
                 provider,
                 model,
-                enum_wire_word(protocol),
-                protocol_provider_attempt_status(status),
+                protocol: enum_wire_word(protocol),
+                status: protocol_provider_attempt_status(status),
                 attempt_duration_ms,
-                error_category.map(enum_wire_word),
+                error_category: error_category.map(enum_wire_word),
                 diagnostic_code,
-            )),
+            })),
         }
     }
 }
