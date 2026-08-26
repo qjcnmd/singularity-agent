@@ -4,7 +4,7 @@ use serde_json::json;
 use singularity_protocol::{
     AppEvent, ClientInfo, EmptyParams, ErrorCode, InitializeParams, JsonRpcInbound, JsonRpcMessage,
     Method, MethodKind, ThreadReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams,
-    TurnStartParams, TurnStatus, parse_json_rpc_payload, rpc_methods,
+    TurnStartParams, TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -309,7 +309,6 @@ fn initialize_params_keep_client_info_contract() {
         }))
         .is_err()
     );
-    let _: rpc_methods::Initialize = rpc_methods::Initialize;
     assert!(Method::Initialize.spec().validate_params(params).is_ok());
     assert_eq!(ErrorCode::not_initialized().message(), "Not initialized");
 }

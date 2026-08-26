@@ -132,22 +132,15 @@ fn validate_params<T: DeserializeOwned>(params: Value) -> Result<(), String> {
         .map_err(|_| "params do not match the registered method contract".to_string())
 }
 
-/// 由 method registry 生成的 typed params/result 关联。
-pub trait RpcMethod {
-    const METHOD: Method;
-    type Params: Serialize;
-    type Result: DeserializeOwned;
-}
-
 macro_rules! method_registry {
-    ($( $variant:ident => ($name:literal, $kind:ident, $params:ty, $result:ty) ),+ $(,)?) => {
+    ($( $variant:ident => ($name:literal, $kind:ident, $params:ty) ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         /// JSON-RPC 方法名。
         pub enum Method {
             $( $variant, )+
         }
 
-        /// 唯一的公共 method registry；方法查找和参数/结果合同都由此生成。
+        /// 唯一的公共 method registry；方法查找和参数合同都由此生成。
         pub const METHOD_REGISTRY: &[MethodSpec] = &[
             $( MethodSpec {
                 method: Method::$variant,
@@ -179,38 +172,23 @@ macro_rules! method_registry {
                     .expect("every Method variant is registered")
             }
         }
-
-        /// 每个 marker 的 associated types 都由同一 method registry 条目生成。
-        pub mod rpc_methods {
-            use super::*;
-
-            $(
-                pub struct $variant;
-
-                impl RpcMethod for $variant {
-                    const METHOD: Method = Method::$variant;
-                    type Params = $params;
-                    type Result = $result;
-                }
-            )+
-        }
     };
 }
 
 method_registry! {
-    Initialize => ("initialize", Request, InitializeParams, InitializeResult),
-    Initialized => ("initialized", Notification, EmptyParams, EmptyResult),
-    ThreadList => ("thread/list", Request, EmptyParams, ThreadListResult),
-    ThreadStart => ("thread/start", Request, ThreadStartParams, ThreadStartResult),
-    ThreadSettings => ("thread/settings", Request, ThreadSettingsParams, ThreadSettingsResult),
-    ThreadRead => ("thread/read", Request, ThreadReadParams, ThreadReadResult),
-    SessionDelete => ("session/delete", Request, SessionIdParams, SessionDeleteResult),
-    TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
-    TurnSteer => ("turn/steer", Request, TurnInjectionParams, TurnInjectionResult),
-    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams, TurnInjectionResult),
-    ProviderStatus => ("provider/status", Request, EmptyParams, ProviderConfigurationStatus),
-    TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
-    ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
+    Initialize => ("initialize", Request, InitializeParams),
+    Initialized => ("initialized", Notification, EmptyParams),
+    ThreadList => ("thread/list", Request, EmptyParams),
+    ThreadStart => ("thread/start", Request, ThreadStartParams),
+    ThreadSettings => ("thread/settings", Request, ThreadSettingsParams),
+    ThreadRead => ("thread/read", Request, ThreadReadParams),
+    SessionDelete => ("session/delete", Request, SessionIdParams),
+    TurnStart => ("turn/start", Request, TurnStartParams),
+    TurnSteer => ("turn/steer", Request, TurnInjectionParams),
+    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams),
+    ProviderStatus => ("provider/status", Request, EmptyParams),
+    TurnInterrupt => ("turn/interrupt", Request, TurnIdParams),
+    ServerShutdown => ("server/shutdown", Request, EmptyParams),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
