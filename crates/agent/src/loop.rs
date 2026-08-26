@@ -1,8 +1,13 @@
 //! Singularity 核心 Agent 执行循环。
 //!
-//! 采用双层状态机循环结构：
-//! - **内层循环**：处理单轮任务执行中的模型流式请求、工具批次按模型给定顺序串行执行、中间引导（Steer）注入与上下文压缩；
-//! - **外层循环**：在代理将要停止时，消费停止窗口内到达的引导输入继续执行。
+//! 采用三层结构：
+//! - **轮步层（`run`）**：内层循环逐轮驱动，发送前基于上一轮真实 usage（缺失时用
+//!   装配估算）做主动压缩，调用采样层，并在 provider 明确返回 ContextOverflow 时
+//!   强制压缩、恰好一次重发；外层循环在代理将要停止时消费停止窗口内到达的引导输入；
+//! - **采样请求层（`sample_request`）**：按 `TurnRequestSpec` 装配请求一次，独立的
+//!   重试包装——可重试 provider 错误指数退避重试，ContextOverflow 上抛由轮步层处理；
+//! - **发送层（`attempt_request`）**：纯发送，仅调用流式 completion，不感知压缩、
+//!   重试与溢出。
 //!
 //! 会话状态持久化、上下文压缩、工具注册分发与模型调用分别由
 //! `session/` facade、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
@@ -28,7 +33,8 @@ use crate::compaction::{
     CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, CompactionReason,
 };
 use crate::message::{
-    AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message, user_message,
+    AgentMessage, AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message,
+    user_message,
 };
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{SessionEntry, SessionEntryType, SessionError, SessionManager};
@@ -363,10 +369,25 @@ impl TurnInbox {
 /// 活动 turn 转向输入箱的线程安全句柄。
 pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
+/// 单轮 provider 请求的静态规格：除轮次序号外，一次 `run` 内恒定不变。
+struct TurnRequestSpec {
+    preferences: ModelPreferences,
+    tools: Vec<ModelToolSchema>,
+    tool_choice: ToolChoicePolicy,
+    max_output_tokens: u32,
+    turn: u32,
+}
+
+/// preflight 判定结果：可执行工具，或模型可见的拒绝执行。
+enum Prepared {
+    Ready(PreparedTool),
+    Rejected(ToolExecution),
+}
+
+/// 一次模型工具调用及其 preflight 判定。
 struct PreparedToolCall {
     call: singularity_model::ModelToolCall,
-    prepared: Option<PreparedTool>,
-    preflight_execution: Option<ToolExecution>,
+    prepared: Prepared,
 }
 
 enum AttemptOutcome {
@@ -433,45 +454,47 @@ fn execute_tool_batch(
                 arguments: item.call.arguments.clone(),
             },
         );
-        if let Some(execution) = &item.preflight_execution {
-            emit(
-                events,
-                AgentEvent::ToolExecutionEnded {
-                    tool_name: item.call.tool_name.clone(),
-                    tool_call_id: item.call.tool_call_id.clone(),
-                    execution: execution.clone(),
-                },
-            );
-            results.push(execution.clone());
-            continue;
-        }
-        let prepared = item
-            .prepared
-            .expect("runnable tool call must have a prepared tool");
-        let call = item.call.clone();
-        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
+        match &item.prepared {
+            Prepared::Rejected(execution) => {
                 emit(
                     events,
-                    AgentEvent::ToolExecutionUpdate {
-                        tool_name: call.tool_name.clone(),
-                        tool_call_id: call.tool_call_id.clone(),
-                        arguments: call.arguments.clone(),
-                        partial_result: text.to_string(),
+                    AgentEvent::ToolExecutionEnded {
+                        tool_name: item.call.tool_name.clone(),
+                        tool_call_id: item.call.tool_call_id.clone(),
+                        execution: execution.clone(),
                     },
                 );
-            })
-        }))
-        .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
-        emit(
-            events,
-            AgentEvent::ToolExecutionEnded {
-                tool_name: call.tool_name.clone(),
-                tool_call_id: call.tool_call_id.clone(),
-                execution: execution.clone(),
-            },
-        );
-        results.push(execution);
+                results.push(execution.clone());
+                continue;
+            }
+            Prepared::Ready(prepared) => {
+                let prepared = *prepared;
+                let call = item.call.clone();
+                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
+                        emit(
+                            events,
+                            AgentEvent::ToolExecutionUpdate {
+                                tool_name: call.tool_name.clone(),
+                                tool_call_id: call.tool_call_id.clone(),
+                                arguments: call.arguments.clone(),
+                                partial_result: text.to_string(),
+                            },
+                        );
+                    })
+                }))
+                .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
+                emit(
+                    events,
+                    AgentEvent::ToolExecutionEnded {
+                        tool_name: call.tool_name.clone(),
+                        tool_call_id: call.tool_call_id.clone(),
+                        execution: execution.clone(),
+                    },
+                );
+                results.push(execution);
+            }
+        }
     }
     Ok(results)
 }
@@ -491,6 +514,51 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
 fn effective_max_output_tokens(provider: &dyn Provider, configured: u64) -> u32 {
     u32::try_from(configured.min(provider.protocol_contract().max_output_tokens as u64))
         .unwrap_or(u32::MAX)
+}
+
+fn is_cancelled_agent_error(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
+    )
+}
+
+fn is_context_overflow_error(error: &ModelError) -> bool {
+    error.kind == ModelErrorKind::ContextLengthExceeded
+}
+
+/// 逐轮聚合 provider 返回的真实 token/cache usage。
+fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
+    outcome.usage.merge(response);
+    if !response.usage_present {
+        outcome.usage_complete = false;
+    }
+}
+
+fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
+    let CompactionOutcome::Compacted {
+        usage,
+        usage_complete,
+        ..
+    } = result
+    else {
+        return;
+    };
+    outcome.compacted = true;
+    outcome.usage.merge(usage);
+    outcome.usage_complete &= *usage_complete;
+}
+
+fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
+    // 诊断是尽力而为的观测侧信道。
+    emit(events, AgentEvent::Diagnostic(diagnostic));
+}
+
+/// 加锁活动 turn inbox；中毒时恢复，避免一次工具 panic 使输入通道永久不可用。
+fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 新 headless core 的 Agent：会话 + compaction + 工具注册表 + 模型提供方。
@@ -594,6 +662,13 @@ impl Agent {
                     .iter()
                     .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema)),
         };
+        let mut spec = TurnRequestSpec {
+            preferences,
+            tools,
+            tool_choice,
+            max_output_tokens,
+            turn: 0,
+        };
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
@@ -605,18 +680,13 @@ impl Agent {
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文）。
                 let steer_messages = lock_inbox(&self.inbox).drain();
                 for text in steer_messages {
-                    if let Err(error) = self.session.append_message(user_message(&text)) {
-                        return self.fail_after_progress(AgentError::Session(error), outcome);
-                    }
+                    self.append_session_or_fail(&mut outcome, user_message(&text))?;
                 }
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
-                let response = match self.attempt_request(
-                    &preferences,
-                    &tools,
-                    &tool_choice,
-                    max_output_tokens,
-                    outcome.turns,
-                    previous_context_tokens.take(),
+                spec.turn = outcome.turns;
+                let response = match self.run_turn(
+                    &spec,
+                    previous_context_tokens,
                     &mut outcome,
                     events,
                     cancellation,
@@ -656,53 +726,49 @@ impl Agent {
                 let length_truncated = response.is_length_truncated();
                 if length_truncated && !tool_calls.is_empty() {
                     // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant
-                    // 消息和为每个调用生成模型可见失败，但绝不执行这些调用或将
+                    // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
                     // 它们显示为成功的工具事件。
-                    if let Err(error) = self
-                        .session
-                        .append_message(assistant_response_message(&response))
-                    {
-                        return self.fail_after_progress(AgentError::Session(error), outcome);
-                    }
+                    self.append_session_or_fail(
+                        &mut outcome,
+                        assistant_response_message(&response),
+                    )?;
                     for call in &tool_calls {
-                        if let Err(error) = self.session.append_message(tool_result_message(
-                            &call.tool_call_id,
-                            &call.tool_name,
-                            &tool_error_execution(
-                                "model output was truncated before the tool call completed",
+                        self.append_session_or_fail(
+                            &mut outcome,
+                            tool_result_message(
+                                &call.tool_call_id,
+                                &call.tool_name,
+                                &tool_error_execution(
+                                    "model output was truncated before the tool call completed",
+                                ),
                             ),
-                        )) {
-                            return self.fail_after_progress(AgentError::Session(error), outcome);
-                        }
+                        )?;
                     }
                     outcome.final_text = assistant_text;
                     continue;
                 }
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
-                    if let Err(error) = self
-                        .session
-                        .append_message(assistant_response_message(&response))
-                    {
-                        return self.fail_after_progress(AgentError::Session(error), outcome);
-                    }
+                    self.append_session_or_fail(
+                        &mut outcome,
+                        assistant_response_message(&response),
+                    )?;
                     // 查找、参数校验和执行模式判定先按 source order 完成；
                     // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
                     let prepared_calls = tool_calls
                         .iter()
                         .map(|call| {
-                            let (prepared, preflight_execution) = match self
-                                .registry
-                                .preflight(&call.tool_name, &call.arguments)
-                            {
-                                Ok(ToolPreflight::Ready(prepared)) => (Some(prepared), None),
-                                Ok(ToolPreflight::Rejected(execution)) => (None, Some(execution)),
-                                Err(error) => (None, Some(tool_error_execution(error))),
-                            };
+                            let prepared =
+                                match self.registry.preflight(&call.tool_name, &call.arguments) {
+                                    Ok(ToolPreflight::Ready(prepared)) => Prepared::Ready(prepared),
+                                    Ok(ToolPreflight::Rejected(execution)) => {
+                                        Prepared::Rejected(execution)
+                                    }
+                                    Err(error) => Prepared::Rejected(tool_error_execution(error)),
+                                };
                             PreparedToolCall {
                                 call: call.clone(),
                                 prepared,
-                                preflight_execution,
                             }
                         })
                         .collect::<Vec<_>>();
@@ -716,13 +782,10 @@ impl Agent {
                     // 持久的 toolResult 条目始终按 assistant source order 追加，
                     // 与完成/事件顺序无关。
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
-                        if let Err(error) = self.session.append_message(tool_result_message(
-                            &call.tool_call_id,
-                            &call.tool_name,
-                            execution,
-                        )) {
-                            return self.fail_after_progress(AgentError::Session(error), outcome);
-                        }
+                        self.append_session_or_fail(
+                            &mut outcome,
+                            tool_result_message(&call.tool_call_id, &call.tool_name, execution),
+                        )?;
                     }
                     if cancellation.is_cancelled() {
                         return self.abort_outcome(outcome);
@@ -730,12 +793,7 @@ impl Agent {
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
-                if let Err(error) = self
-                    .session
-                    .append_message(assistant_response_message(&response))
-                {
-                    return self.fail_after_progress(AgentError::Session(error), outcome);
-                }
+                self.append_session_or_fail(&mut outcome, assistant_response_message(&response))?;
                 outcome.final_text = assistant_text;
                 outcome.truncated = length_truncated;
                 break;
@@ -745,9 +803,7 @@ impl Agent {
                 return Ok(outcome);
             };
             for input in pending_inputs {
-                if let Err(error) = self.session.append_message(user_message(&input)) {
-                    return self.fail_after_progress(AgentError::Session(error), outcome);
-                }
+                self.append_session_or_fail(&mut outcome, user_message(&input))?;
             }
         }
     }
@@ -874,34 +930,34 @@ impl Agent {
             .saturating_add(32)
     }
 
-    /// 组装单轮 provider 请求：首条指令消息恒以 Developer 角色构造（wire 层
-    /// 按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
+    /// 按 `TurnRequestSpec` 组装单轮 provider 请求：首条指令消息恒以 Developer
+    /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     ///
     /// 上下文条目只装配一次：messages、reasoning replay 与预算估算全部在
     /// 同一份装配成品上完成；返回 (请求, 装配成品估算)。
-    fn build_request(
-        &self,
-        preferences: &ModelPreferences,
-        tools: &[ModelToolSchema],
-        tool_choice: &ToolChoicePolicy,
-        max_output_tokens: u32,
-        turn: u32,
-    ) -> Result<(ModelTurnRequest, u64)> {
+    fn build_request(&self, spec: &TurnRequestSpec) -> Result<(ModelTurnRequest, u64)> {
         let (messages, replays) = self.assemble_messages()?;
         let assembled_estimate =
-            self.estimate_assembled(&messages, tools, &replays, max_output_tokens);
+            self.estimate_assembled(&messages, &spec.tools, &replays, spec.max_output_tokens);
         let mut request = ModelTurnRequest::new(
-            format!("turn_{}_{}", Uuid::new_v4().simple(), turn),
+            format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
             messages,
         );
-        request.tools = tools.to_vec();
-        request.tool_choice = tool_choice.clone();
+        request.tools = spec.tools.clone();
+        request.tool_choice = spec.tool_choice.clone();
         request.provider_reasoning_history = replays;
         request.model_preferences = ModelPreferences {
-            model_name: preferences.model_name.clone(),
-            max_output_tokens: Some(max_output_tokens),
+            model_name: spec.preferences.model_name.clone(),
+            max_output_tokens: Some(spec.max_output_tokens),
         };
         Ok((request, assembled_estimate))
+    }
+
+    /// 基于当前会话按同一装配 seam 重建请求；只返回请求本身（丢弃装配估算）。
+    /// 主动压缩与溢出恢复在会话被修改后用它重建下一次发送的请求。
+    fn rebuild_request(&self, spec: &TurnRequestSpec) -> Result<ModelTurnRequest> {
+        let (request, _estimate) = self.build_request(spec)?;
+        Ok(request)
     }
 
     /// 从 durable assistant entries 恢复 provider-private continuation。
@@ -1010,26 +1066,18 @@ impl Agent {
             .collect()
     }
 
-    /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
-    #[allow(clippy::too_many_arguments)]
-    fn attempt_request(
+    /// 装配单轮请求一次，并在发送前按上一轮真实 usage（缺失时用装配估算）
+    /// 判定是否主动压缩；实际压缩后基于压缩后的会话重建请求。非 session
+    /// 压缩失败只发射诊断并跳过压缩，返回原始请求。
+    fn prepare_request(
         &mut self,
-        preferences: &ModelPreferences,
-        tools: &[ModelToolSchema],
-        tool_choice: &ToolChoicePolicy,
-        max_output_tokens: u32,
-        turns: u32,
+        spec: &TurnRequestSpec,
         previous_context_tokens: Option<u64>,
         outcome: &mut AgentOutcome,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
-        model_turn_ordinal: u32,
-    ) -> AttemptOutcome {
-        let (mut request, assembled_estimate) =
-            match self.build_request(preferences, tools, tool_choice, max_output_tokens, turns) {
-                Ok(request) => request,
-                Err(error) => return AttemptOutcome::Failed(error),
-            };
+    ) -> Result<ModelTurnRequest> {
+        let (mut request, assembled_estimate) = self.build_request(spec)?;
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let compaction_tokens = previous_context_tokens.unwrap_or(assembled_estimate);
@@ -1044,20 +1092,11 @@ impl Agent {
                 Ok(result) => {
                     record_compaction(outcome, &result);
                     if matches!(result, CompactionOutcome::Compacted { .. }) {
-                        match self.build_request(
-                            preferences,
-                            tools,
-                            tool_choice,
-                            max_output_tokens,
-                            turns,
-                        ) {
-                            Ok((rebuilt, _)) => request = rebuilt,
-                            Err(error) => return AttemptOutcome::Failed(error),
-                        }
+                        request = self.rebuild_request(spec)?;
                     }
                 }
                 Err(crate::compaction::CompactionError::Session(error)) => {
-                    return AttemptOutcome::Failed(AgentError::Session(error));
+                    return Err(AgentError::Session(error));
                 }
                 Err(_error) => {
                     outcome.usage_complete = false;
@@ -1071,37 +1110,82 @@ impl Agent {
                 }
             }
         }
+        Ok(request)
+    }
 
-        let mut context_overflow_retried = false;
+    /// 单个轮步：先经 `prepare_request` 装配请求（含发送前主动压缩），再交给
+    /// 采样层发送。provider 明确返回 ContextOverflow 时强制压缩并基于压缩后的
+    /// 会话重建请求，恰好一次重发。
+    fn run_turn(
+        &mut self,
+        spec: &TurnRequestSpec,
+        previous_context_tokens: Option<u64>,
+        outcome: &mut AgentOutcome,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
+    ) -> AttemptOutcome {
+        let mut request = match self.prepare_request(
+            spec,
+            previous_context_tokens,
+            outcome,
+            events,
+            cancellation,
+        ) {
+            Ok(request) => request,
+            Err(error) => return AttemptOutcome::Failed(error),
+        };
+        let mut overflow_retried = false;
+        loop {
+            match self.sample_request(&request, events, cancellation, model_turn_ordinal) {
+                AttemptOutcome::Response(response) => return AttemptOutcome::Response(response),
+                AttemptOutcome::Aborted => return AttemptOutcome::Aborted,
+                AttemptOutcome::Failed(error) => {
+                    if matches!(
+                        &error,
+                        AgentError::Provider(provider)
+                            if is_context_overflow_error(&provider.error)
+                    ) {
+                        outcome.usage_complete = false;
+                        if overflow_retried {
+                            return AttemptOutcome::Failed(error);
+                        }
+                        overflow_retried = true;
+                        let forced = match self.force_compact(cancellation, events) {
+                            Ok(result) => result,
+                            Err(_) => return AttemptOutcome::Failed(error),
+                        };
+                        record_compaction(outcome, &forced);
+                        // 强制压缩只修改了 self.session；重试必须基于压缩后的
+                        // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
+                        match self.rebuild_request(spec) {
+                            Ok(rebuilt) => request = rebuilt,
+                            Err(rebuild_error) => return AttemptOutcome::Failed(rebuild_error),
+                        }
+                        continue;
+                    }
+                    return AttemptOutcome::Failed(error);
+                }
+            }
+        }
+    }
+
+    /// 采样层：对一次纯发送做 agent 层重试包装。可重试 provider 错误指数退避
+    /// 重试，重试预算按次独立；ContextOverflow 原样上抛交给轮步层处理；退避
+    /// 等待被取消时返回 Aborted。
+    fn sample_request(
+        &self,
+        request: &ModelTurnRequest,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
+    ) -> AttemptOutcome {
         let mut retry_attempt = 0u32;
         loop {
-            match self.stream_completion(&request, events, cancellation, model_turn_ordinal) {
+            match self.attempt_request(request, events, cancellation, model_turn_ordinal) {
                 Ok(response) => return AttemptOutcome::Response(Box::new(response)),
                 Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
-                    outcome.usage_complete = false;
-                    let original_error = AgentError::Provider(error);
-                    if context_overflow_retried {
-                        return AttemptOutcome::Failed(original_error);
-                    }
-                    context_overflow_retried = true;
-                    let forced = match self.force_compact(cancellation, events) {
-                        Ok(result) => result,
-                        Err(_) => return AttemptOutcome::Failed(original_error),
-                    };
-                    record_compaction(outcome, &forced);
-                    // 强制压缩只修改了 self.session；重试必须基于压缩后的
-                    // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
-                    match self.build_request(
-                        preferences,
-                        tools,
-                        tool_choice,
-                        max_output_tokens,
-                        turns,
-                    ) {
-                        Ok((rebuilt, _)) => request = rebuilt,
-                        Err(error) => return AttemptOutcome::Failed(error),
-                    }
-                    continue;
+                    return AttemptOutcome::Failed(AgentError::Provider(error));
                 }
                 Err(error) => {
                     if let AgentError::Provider(provider) = &error
@@ -1134,6 +1218,18 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// 发送层：纯发送，仅调用流式 completion（协议不支持流式时回退 complete）；
+    /// 不感知压缩、重试与 ContextOverflow。
+    fn attempt_request(
+        &self,
+        request: &ModelTurnRequest,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
+    ) -> Result<ModelTurnResponse> {
+        self.stream_completion(request, events, cancellation, model_turn_ordinal)
     }
 
     /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
@@ -1189,6 +1285,22 @@ impl Agent {
         }
     }
 
+    /// 追加一条会话消息；失败时按「已积累 progress 则包装为 RunFailed」收敛并
+    /// 返回错误。session 错误不可能触发 abort，故 `fail_after_progress` 必然
+    /// 返回 Err。
+    fn append_session_or_fail(
+        &mut self,
+        outcome: &mut AgentOutcome,
+        message: AgentMessage,
+    ) -> Result<()> {
+        if let Err(error) = self.session.append_message(message) {
+            return Err(self
+                .fail_after_progress(AgentError::Session(error), outcome.clone())
+                .expect_err("session errors cannot abort"));
+        }
+        Ok(())
+    }
+
     /// 取消/中止的收敛出口：标记中止原因并关闭 inbox（消费者因此退出），
     /// 返回带中止语义的 outcome。循环内所有取消分支共用此出口。
     fn abort_outcome(&self, mut outcome: AgentOutcome) -> Result<AgentOutcome> {
@@ -1219,51 +1331,6 @@ impl Agent {
             })
         }
     }
-}
-
-/// 加锁活动 turn inbox；中毒时恢复，避免一次工具 panic 使输入通道永久不可用。
-fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
-    queue
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn is_cancelled_agent_error(error: &AgentError) -> bool {
-    matches!(
-        error,
-        AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
-    )
-}
-
-fn is_context_overflow_error(error: &ModelError) -> bool {
-    error.kind == ModelErrorKind::ContextLengthExceeded
-}
-
-/// 逐轮聚合 provider 返回的真实 token/cache usage。
-fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
-    outcome.usage.merge(response);
-    if !response.usage_present {
-        outcome.usage_complete = false;
-    }
-}
-
-fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
-    let CompactionOutcome::Compacted {
-        usage,
-        usage_complete,
-        ..
-    } = result
-    else {
-        return;
-    };
-    outcome.compacted = true;
-    outcome.usage.merge(usage);
-    outcome.usage_complete &= *usage_complete;
-}
-
-fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
-    // 诊断是尽力而为的观测侧信道。
-    emit(events, AgentEvent::Diagnostic(diagnostic));
 }
 
 #[cfg(test)]

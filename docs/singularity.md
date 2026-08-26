@@ -19,7 +19,7 @@
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
-  - `AgentLoop`（分层循环）：turn 步循环（steer 注入→采样请求→响应持久化→工具批次→循环决策）→ `attempt_request` 采样请求层（构建→触发压缩→发送→重试→溢出强制压缩并重建请求）→ `stream_completion` 流处理层；单一原子 `TurnInbox` 承载 steer；每轮**请求后**保存真实 provider usage，下一请求前优先据此对比 `context_window − reserve_tokens` 决定主动压缩，usage 缺失时回退到装配估算；Provider 显式 `ContextLengthExceeded` 时强制压缩并同轮重试一次（重试基于压缩后会话重新装配请求）；
+  - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
   - `session` 子系统：严格 JSONL v1（format/file/manager/context/repair/repository）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
@@ -41,7 +41,7 @@ sg --print|--json <goal>
   │    ├─ TurnRunner::run（每轮独立控制面；当前轮可取消/可转向）
   │    │    ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
   │    │    ├─ turn_started metadata 落盘 → 发布 turn/started
-  │    │    ├─ AgentLoop 执行（压缩、工具批、steer 注入）
+  │    │    ├─ AgentLoop 执行(三层分层:轮步/采样请求/纯发送,工具批、steer 注入)
   │    │    ├─ 终态 metadata + usage 落盘（有界重试一次，失败即 fail-stop）
   │    │    └─ 发布 item/turn 终态事件
   │    ├─ 终态后自动持久化待生效设置（若有）→ 下一轮用新 selector

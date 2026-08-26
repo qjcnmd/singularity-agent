@@ -800,6 +800,16 @@ struct OverflowProvider {
     contract: ProviderProtocolContract,
 }
 
+/// 交错提供者:第一次流式调用返回可重试瞬时错误,第二次返回 ContextOverflow,
+/// 其后成功。用于验证「瞬态重试(重发同一请求)→ 溢出强制压缩 → 重建重发」的
+/// 交错恢复路径。摘要生成(`complete`)恒成功并返回压缩摘要。
+struct InterleaveProvider {
+    stream_calls: std::sync::atomic::AtomicUsize,
+    complete_calls: std::sync::atomic::AtomicUsize,
+    request_texts: std::sync::Mutex<Vec<String>>,
+    contract: ProviderProtocolContract,
+}
+
 #[test]
 fn previous_provider_usage_triggers_compaction_before_the_next_request() {
     let dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1141,93 @@ impl Provider for OverflowProvider {
     }
 }
 
+impl Provider for InterleaveProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.contract.clone()
+    }
+
+    fn streaming_capability(
+        &self,
+        _selected_protocol: singularity_model::ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        ProviderStreamingCapability::OutputTextDelta
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        _on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let call = self
+            .stream_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.request_texts.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
+        match call {
+            // 第一次:可重试瞬时错误,触发重试包装重发同一请求。
+            0 => Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::NetworkError,
+                "transient network failure",
+            ))),
+            // 第二次:上下文溢出,触发强制压缩与重建重发。
+            1 => Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::ContextLengthExceeded,
+                "context window overflow",
+            ))),
+            _ => {
+                let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+                assistant.content = "done after recovery".to_string();
+                Ok(ModelTurnResponse {
+                    request_id: request.request_id.clone(),
+                    response_id: "interleave-ok".to_string(),
+                    status: ModelTurnStatus::Success,
+                    assistant_message: Some(assistant),
+                    tool_calls: Vec::new(),
+                    usage: ModelUsage::default(),
+                    finish_reason: Some("stop".to_string()),
+                    validation: None,
+                    error: None,
+                    provider_name: Some("interleave".to_string()),
+                    model_name: Some("interleave-model".to_string()),
+                    provider_reasoning_history: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        self.complete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+        assistant.content = "## Goal\ncompacted".to_string();
+        Ok(ModelTurnResponse {
+            request_id: request.request_id.clone(),
+            response_id: "compaction-ok".to_string(),
+            status: ModelTurnStatus::Success,
+            assistant_message: Some(assistant),
+            tool_calls: Vec::new(),
+            usage: ModelUsage::default(),
+            finish_reason: Some("stop".to_string()),
+            validation: None,
+            error: None,
+            provider_name: Some("interleave".to_string()),
+            model_name: Some("interleave-model".to_string()),
+            provider_reasoning_history: Vec::new(),
+        })
+    }
+}
+
 #[test]
 fn context_overflow_forces_one_compaction_retry_then_succeeds() {
     let dir = tempfile::tempdir().unwrap();
@@ -1238,6 +1335,97 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
                         && message.content_text() == "task"
             )
     }));
+}
+
+/// 交错回归:瞬态可重试错误触发重试(重发同一请求)后,下一发送遇到
+/// ContextOverflow,轮步层强制压缩、重建请求并恰好一次重发成功。
+#[test]
+fn transient_retry_then_overflow_recovers_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage {
+            role: AgentMessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "old user".to_string(),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        })
+        .unwrap();
+    session
+        .append_message(AgentMessage {
+            role: AgentMessageRole::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "old assistant".to_string(),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        })
+        .unwrap();
+    let provider = Arc::new(InterleaveProvider {
+        stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        complete_calls: std::sync::atomic::AtomicUsize::new(0),
+        request_texts: std::sync::Mutex::new(Vec::new()),
+        contract: fake_contract(),
+    });
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            // 瞬时错误重试一次(≤MAX_TURN_RETRIES 预算的轻量验证)。
+            retry: TurnRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(outcome.final_text, "done after recovery");
+    assert!(outcome.compacted, "overflow must force a compaction");
+    assert_eq!(
+        provider
+            .stream_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "initial + transient retry + overflow resend"
+    );
+    // 瞬态重试必须重发同一请求;溢出恢复后的重发必须携带压缩摘要。
+    let request_texts = provider.request_texts.lock().unwrap();
+    assert_eq!(request_texts.len(), 3, "one per stream call");
+    assert_eq!(
+        request_texts[0], request_texts[1],
+        "transient retry must resend the identical request"
+    );
+    assert!(
+        request_texts[2].contains("## Goal"),
+        "overflow recovery must carry the compaction summary: {}",
+        request_texts[2]
+    );
+    assert!(
+        !request_texts[2].contains("old user"),
+        "overflow recovery must drop the overflowed context: {}",
+        request_texts[2]
+    );
+    assert_eq!(
+        provider
+            .complete_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one forced compaction summary"
+    );
 }
 
 #[test]
