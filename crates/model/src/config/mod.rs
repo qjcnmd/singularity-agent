@@ -375,98 +375,25 @@ where
             "provider_selector_invalid",
         ));
     }
+
+    // 阶段 1：把全部 provider 条目规范化为类型化配置。阻断启动的错误只可能
+    // 发生在默认提供者上；非默认条目的同类错误以 provider_error 记录或整体
+    // 跳过，属于显式的降级策略，不混入默认项解析。
     let mut providers = BTreeMap::new();
     for (provider_name, provider_file) in &user_config.config.providers {
-        if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
-            if provider_name.as_str() == default_provider_name {
-                return Err(error);
-            }
+        let Some(configured) = normalize_provider_entry(
+            provider_name,
+            provider_file,
+            &user_config.auth,
+            source,
+            provider_name == &default_provider_name,
+            parsed_default.model_name,
+            provider_factory,
+        )?
+        else {
             continue;
-        }
-        let endpoint_error = validate_base_url(Some(&provider_file.base_url), source).err();
-        if provider_name.as_str() == default_provider_name
-            && let Some(error) = endpoint_error.clone()
-        {
-            return Err(error);
-        }
-        let api_key = user_config
-            .auth
-            .providers
-            .get(provider_name)
-            .map(|provider| provider.api_key.clone())
-            .filter(|value| !value.is_empty());
-        if provider_name.as_str() == default_provider_name && api_key.is_none() {
-            return Err(missing_provider_auth_error(source));
-        }
-        let auth_error = api_key
-            .as_deref()
-            .and_then(|api_key| validate_provider_value(Some(api_key), ENV_API_KEY, source).err());
-        if provider_name.as_str() == default_provider_name
-            && let Some(error) = auth_error.clone()
-        {
-            return Err(error);
-        }
-        let mut models = BTreeMap::new();
-        for (model_name, model_file) in &provider_file.models {
-            if let Err(error) = validate_model_id(model_name, "model id") {
-                if provider_name.as_str() == default_provider_name
-                    && model_name == parsed_default.model_name
-                {
-                    return Err(error);
-                }
-                continue;
-            }
-            match configured_model_from_user_file(model_file, provider_name, model_name) {
-                Ok(model) => {
-                    models.insert(model_name.clone(), model);
-                }
-                Err(error)
-                    if provider_name.as_str() == default_provider_name
-                        && model_name == parsed_default.model_name =>
-                {
-                    return Err(error);
-                }
-                Err(_) => continue,
-            }
-        }
-        if models.is_empty() {
-            continue;
-        }
-        let (provider, provider_error) = match (api_key, endpoint_error, auth_error) {
-            (None, _, _) => (None, Some(missing_provider_auth_error(source))),
-            (_, Some(error), _) => (None, Some(error)),
-            (_, _, Some(error)) => (None, Some(error)),
-            (Some(api_key), None, None) => {
-                let base_model = models
-                    .keys()
-                    .next()
-                    .cloned()
-                    .expect("models checked non-empty");
-                let base_model_config = models.get(&base_model).expect("base model exists");
-                let config = OpenAiProviderConfig {
-                    provider_name: provider_name.clone(),
-                    model_name: base_model,
-                    base_url: provider_file.base_url.clone(),
-                    api_key,
-                    source: source.ok_or_else(provider_source_missing_error)?,
-                    max_context_tokens: base_model_config.max_context_tokens,
-                    max_output_tokens: base_model_config.max_output_tokens,
-                };
-                match provider_factory(config) {
-                    Ok(provider) => (Some(provider), None),
-                    Err(error) if provider_name == &default_provider_name => return Err(error),
-                    Err(error) => (None, Some(error)),
-                }
-            }
         };
-        providers.insert(
-            provider_name.clone(),
-            ConfiguredProvider {
-                provider,
-                provider_error,
-                models,
-            },
-        );
+        providers.insert(provider_name.clone(), configured);
     }
     if providers.is_empty() {
         return Err(configuration_error(
@@ -474,6 +401,7 @@ where
             "provider_configuration_invalid",
         ));
     }
+    // 阶段 2：单点解析默认 selector，构造最终选择。
     let default_provider = providers.get(&default_provider_name).ok_or_else(|| {
         model_selector_error(
             "default_model references an unknown provider",
@@ -507,6 +435,101 @@ where
             api_key_present: true,
         },
     ))
+}
+
+/// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化
+/// provider 配置（含按需的 adapter 实例）。阻断错误只作用于默认提供者
+/// （`is_default`）；非默认条目的同类错误以 `provider_error` 记录、无效模型
+/// 跳过、无有效模型时整体跳过（返回 `None`），不阻断启动。
+fn normalize_provider_entry<P>(
+    provider_name: &str,
+    provider_file: &UserConfigProvider,
+    auth: &UserAuthFile,
+    source: Option<ProviderConfigSource>,
+    is_default: bool,
+    default_model_name: &str,
+    provider_factory: &P,
+) -> Result<Option<ConfiguredProvider>, ProviderError>
+where
+    P: Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
+{
+    let is_default_model = |model_name: &str| is_default && model_name == default_model_name;
+
+    if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
+        if is_default {
+            return Err(error);
+        }
+        return Ok(None);
+    }
+    let endpoint_error = validate_base_url(Some(&provider_file.base_url), source).err();
+    if is_default && let Some(error) = endpoint_error.clone() {
+        return Err(error);
+    }
+    let api_key = auth
+        .providers
+        .get(provider_name)
+        .map(|provider| provider.api_key.clone())
+        .filter(|value| !value.is_empty());
+    if is_default && api_key.is_none() {
+        return Err(missing_provider_auth_error(source));
+    }
+    let auth_error = api_key
+        .as_deref()
+        .and_then(|api_key| validate_provider_value(Some(api_key), ENV_API_KEY, source).err());
+    if is_default && let Some(error) = auth_error.clone() {
+        return Err(error);
+    }
+    let mut models = BTreeMap::new();
+    for (model_name, model_file) in &provider_file.models {
+        if let Err(error) = validate_model_id(model_name, "model id") {
+            if is_default_model(model_name) {
+                return Err(error);
+            }
+            continue;
+        }
+        match configured_model_from_user_file(model_file, provider_name, model_name) {
+            Ok(model) => {
+                models.insert(model_name.clone(), model);
+            }
+            Err(error) if is_default_model(model_name) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    if models.is_empty() {
+        return Ok(None);
+    }
+    let (provider, provider_error) = match (api_key, endpoint_error, auth_error) {
+        (None, _, _) => (None, Some(missing_provider_auth_error(source))),
+        (_, Some(error), _) => (None, Some(error)),
+        (_, _, Some(error)) => (None, Some(error)),
+        (Some(api_key), None, None) => {
+            let base_model = models
+                .keys()
+                .next()
+                .cloned()
+                .expect("models checked non-empty");
+            let base_model_config = models.get(&base_model).expect("base model exists");
+            let config = OpenAiProviderConfig {
+                provider_name: provider_name.to_string(),
+                model_name: base_model,
+                base_url: provider_file.base_url.clone(),
+                api_key,
+                source: source.ok_or_else(provider_source_missing_error)?,
+                max_context_tokens: base_model_config.max_context_tokens,
+                max_output_tokens: base_model_config.max_output_tokens,
+            };
+            match provider_factory(config) {
+                Ok(provider) => (Some(provider), None),
+                Err(error) if is_default => return Err(error),
+                Err(error) => (None, Some(error)),
+            }
+        }
+    };
+    Ok(Some(ConfiguredProvider {
+        provider,
+        provider_error,
+        models,
+    }))
 }
 
 fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfigResolution {
