@@ -1230,7 +1230,8 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
     drop(session);
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = conversation.compact();
+        let cancellation = singularity_core::CancellationToken::new();
+        let _ = conversation.compact(&cancellation);
     }));
 
     assert!(panic.is_err(), "the provider panic must propagate");

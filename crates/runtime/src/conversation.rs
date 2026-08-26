@@ -313,13 +313,15 @@ impl Conversation {
             .and_then(|mut state| state.pending_follow_ups.pop_back())
     }
 
-    /// 空闲时执行一次用户请求的上下文压缩。
+    /// 空闲时执行一次用户请求的上下文压缩；`cancellation` 允许调用方
+    /// 随时中止压缩（TUI 中 Esc 取消）。
     pub fn compact(
         &self,
+        cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
         let reservation = self.reserve_start()?;
         let thread = reservation.conversation.thread()?;
-        let result = self.runner.compact_thread(&thread);
+        let result = self.runner.compact_thread(&thread, cancellation);
         drop(reservation);
         result.map_err(ConversationError::Configuration)
     }

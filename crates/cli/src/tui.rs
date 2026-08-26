@@ -22,7 +22,10 @@
 mod app;
 mod commands;
 mod editor;
+mod modals;
+mod mouse;
 mod scroll;
+mod session_actions;
 mod transcript;
 mod view;
 
@@ -36,6 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use app::TuiApp;
 use commands::Action;
+use singularity_runtime::CompactionOutcome;
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 use singularity_runtime::objects::TurnStatus;
 
@@ -151,6 +155,8 @@ fn install_panic_hook() {
 enum UiEvent {
     FromTurn(Box<TurnEvent>),
     ChainFinished(Result<TurnStatus, String>),
+    /// /compact 后台压缩线程的结果。
+    CompactFinished(Result<CompactionOutcome, String>),
 }
 
 struct Forward {
@@ -178,6 +184,22 @@ fn spawn_turn(
             Err(error) => Err(error.to_string()),
         };
         let _ = tx.send(UiEvent::ChainFinished(finished));
+    });
+}
+
+/// 后台执行 /compact：不阻塞事件循环，结果经 `UiEvent::CompactFinished`
+/// 回送；`cancellation` 由调用方持有（TUI 中 Esc 取消本次压缩）。
+fn spawn_compact(
+    conversation: &std::sync::Arc<singularity_runtime::Conversation>,
+    cancellation: singularity_core::CancellationToken,
+    tx: mpsc::Sender<UiEvent>,
+) {
+    let conversation = std::sync::Arc::clone(conversation);
+    std::thread::spawn(move || {
+        let result = conversation
+            .compact(&cancellation)
+            .map_err(|error| error.to_string());
+        let _ = tx.send(UiEvent::CompactFinished(result));
     });
 }
 
@@ -210,6 +232,7 @@ fn event_loop(
             match event {
                 UiEvent::FromTurn(turn_event) => app.on_turn_event(turn_event.as_ref()),
                 UiEvent::ChainFinished(result) => app.on_chain_finished(&result),
+                UiEvent::CompactFinished(result) => app.on_compact_finished(result),
             }
         }
 
@@ -220,6 +243,10 @@ fn event_loop(
                     Action::Continue => {}
                     Action::Submit(goal) => {
                         spawn_turn(&app.conversation_handle(), goal, tx.clone())
+                    }
+                    Action::Compact => {
+                        let cancellation = app.compact_token();
+                        spawn_compact(&app.conversation_handle(), cancellation, tx.clone())
                     }
                     Action::Exit(code) => return Ok(code),
                 },

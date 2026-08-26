@@ -147,9 +147,11 @@ impl TurnRunner {
     }
 
     /// 在 turn 之外压缩既有 Thread，不写入 turn 生命周期 metadata。
+    /// `cancellation` 由调用方持有，可随时中止压缩（TUI 中 Esc 取消）。
     pub fn compact_thread(
         &self,
         thread: &Thread,
+        cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, String> {
         workspace_path(thread)?;
         let (provider, config, _) = self
@@ -161,7 +163,7 @@ impl TurnRunner {
         let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)
             .map_err(|error| error.to_string())?;
         agent
-            .compact_now(&CancellationToken::new())
+            .compact_now(cancellation)
             .map_err(|error| error.to_string())
     }
 

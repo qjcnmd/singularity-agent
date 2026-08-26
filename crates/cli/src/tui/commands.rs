@@ -66,6 +66,8 @@ pub(crate) enum Action {
     Continue,
     Submit(String),
     Exit(i32),
+    /// 后台执行上下文压缩（/compact）；事件循环负责 spawn 线程并转发结果。
+    Compact,
 }
 
 #[cfg(test)]
