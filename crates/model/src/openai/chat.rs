@@ -221,7 +221,6 @@ pub fn parse_openai_response(
         capabilities,
         response_id,
         assistant_message,
-        tool_calls,
         parse_openai_usage(payload.get("usage")),
         finish_reason,
     )
@@ -239,7 +238,6 @@ pub fn finalize_provider_response(
     capabilities: &ProviderProtocolContract,
     response_id: String,
     assistant_message: Option<ModelMessage>,
-    tool_calls: Vec<ModelToolCall>,
     usage: ModelUsage,
     finish_reason: Option<String>,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -248,7 +246,6 @@ pub fn finalize_provider_response(
         response_id,
         status: ModelTurnStatus::Success,
         assistant_message,
-        tool_calls,
         usage,
         finish_reason,
         validation: None,
@@ -272,7 +269,7 @@ pub fn finalize_provider_response(
     // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
     // 能进入 AgentLoop 的参数修复路径。
-    let unknown_tool = response.tool_calls.iter().any(|call| {
+    let unknown_tool = response.tool_calls().iter().any(|call| {
         call.parse_status == ModelToolParseStatus::UnknownTool
             || (!call.tool_name.trim().is_empty()
                 && !available_tool_names
@@ -280,7 +277,7 @@ pub fn finalize_provider_response(
                     .any(|tool_name| tool_name == &call.tool_name))
     });
     let invalid_tool_identity = response
-        .tool_calls
+        .tool_calls()
         .iter()
         .any(|call| call.tool_call_id.trim().is_empty() || call.tool_name.trim().is_empty());
     if unknown_tool
@@ -325,12 +322,12 @@ fn recoverable_tool_argument_validation(
     response: &ModelTurnResponse,
     validation_errors: &[String],
 ) -> bool {
-    !response.tool_calls.is_empty()
+    !response.tool_calls().is_empty()
         && !validation_errors.is_empty()
         && validation_errors
             .iter()
             .all(|error| is_recoverable_tool_argument_error(error))
-        && response.tool_calls.iter().all(|call| {
+        && response.tool_calls().iter().all(|call| {
             !call.tool_call_id.trim().is_empty()
                 && !call.tool_name.trim().is_empty()
                 && call.parse_status != ModelToolParseStatus::UnknownTool

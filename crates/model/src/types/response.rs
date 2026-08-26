@@ -32,7 +32,6 @@ pub struct ModelTurnResponse {
     pub response_id: String,
     pub status: ModelTurnStatus,
     pub assistant_message: Option<ModelMessage>,
-    pub tool_calls: Vec<ModelToolCall>,
     pub usage: ModelUsage,
     pub finish_reason: Option<String>,
     pub validation: Option<ModelValidationResult>,
@@ -57,7 +56,6 @@ impl ModelTurnResponse {
             response_id: response_id.into(),
             status: ModelTurnStatus::Success,
             assistant_message: Some(ModelMessage::text(ModelRole::Assistant, content)),
-            tool_calls: Vec::new(),
             usage: ModelUsage::default(),
             finish_reason: None,
             validation: None,
@@ -66,6 +64,14 @@ impl ModelTurnResponse {
             model_name: None,
             provider_reasoning_history: Vec::new(),
         }
+    }
+
+    /// 响应携带的已解析 tool calls；唯一存储于 assistant message 内。
+    pub fn tool_calls(&self) -> &[ModelToolCall] {
+        self.assistant_message
+            .as_ref()
+            .map(|message| message.tool_calls.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 解释 provider finish reason，不向调用方暴露字符串匹配。

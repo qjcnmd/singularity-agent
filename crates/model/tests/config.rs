@@ -28,7 +28,12 @@ fn model_turn_schema_excludes_runtime_and_trace_metadata() {
     let response_value = serde_json::to_value(&response).expect("serialize model response");
 
     assert_eq!(response_value["assistant_message"]["role"], "assistant");
-    assert_eq!(response_value["tool_calls"], serde_json::json!([]));
+    // tool_calls 唯一存储于 assistant message；空数组按 ModelMessage 惯例省略键。
+    assert!(response_value.get("tool_calls").is_none());
+    assert_eq!(
+        response_value["assistant_message"]["tool_calls"],
+        serde_json::Value::Null
+    );
     assert_eq!(response_value["usage"]["total_tokens"], 0);
     assert_eq!(response_value["request_id"], "request_1");
     assert_eq!(response_value["response_id"], "response_1");

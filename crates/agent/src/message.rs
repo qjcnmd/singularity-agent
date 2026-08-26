@@ -186,7 +186,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
             text: assistant_text,
         });
     }
-    for call in &response.tool_calls {
+    for call in response.tool_calls() {
         content.push(ContentBlock::from_model_tool_call(call));
     }
     AgentMessage {

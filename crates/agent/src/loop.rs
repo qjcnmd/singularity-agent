@@ -720,7 +720,7 @@ impl Agent {
                     .as_ref()
                     .map(|message| message.content.clone())
                     .unwrap_or_default();
-                let tool_calls = response.tool_calls.clone();
+                let tool_calls = response.tool_calls().to_vec();
                 let length_truncated = response.is_length_truncated();
                 if length_truncated && !tool_calls.is_empty() {
                     // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant

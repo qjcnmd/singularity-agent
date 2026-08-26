@@ -38,7 +38,6 @@ pub fn provider_error_response(
         response_id: format!("{}_provider_error", request.request_id),
         status: ModelTurnStatus::Failed,
         assistant_message: None,
-        tool_calls: Vec::new(),
         usage: ModelUsage::default(),
         finish_reason: None,
         validation: None,

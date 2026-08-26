@@ -176,8 +176,8 @@ fn openai_responses_stream_length_preserves_partial_response() {
         response.assistant_message.as_ref().unwrap().content,
         "partial"
     );
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_read");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_read");
     assert_eq!(response.usage.total_tokens, 7);
     requests
         .recv_timeout(Duration::from_secs(1))
@@ -250,14 +250,14 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         )
         .expect("final function call envelope");
     assert!(events.is_empty());
-    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls().len(), 1);
     assert!(
         response.provider_reasoning_history.is_empty(),
         "Responses tool calls without reasoning must not synthesize an off replay"
     );
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(
-        response.tool_calls[0].raw_arguments,
+        response.tool_calls()[0].raw_arguments,
         r#"{"path":"README.md"}"#
     );
     requests
@@ -314,9 +314,9 @@ fn openai_chat_streaming_normalizes_visible_deltas_and_tool_fragments() {
         response.stop_reason(),
         Some(singularity_model::ModelStopReason::Stop)
     );
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(
-        response.tool_calls[0].raw_arguments,
+        response.tool_calls()[0].raw_arguments,
         r#"{"path":"README.md"}"#
     );
     assert_eq!(response.usage.total_tokens, 7);
@@ -523,7 +523,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
         .expect("invalid provider response remains observable");
 
     assert_eq!(response.status, ModelTurnStatus::Invalid);
-    assert!(response.tool_calls.is_empty());
+    assert!(response.tool_calls().is_empty());
     assert_eq!(
         response.validation.expect("response validation").errors,
         vec!["text_tool_call_envelope_not_supported"]
@@ -576,7 +576,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
     assert_eq!(response.response_id, "resp_1");
     assert_eq!(response.usage.total_tokens, 5);
     assert_eq!(
-        response.tool_calls[0].arguments,
+        response.tool_calls()[0].arguments,
         serde_json::json!({"path": "README.md"})
     );
     assert!(!serialized.contains("test-key-placeholder"));
@@ -662,7 +662,7 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
     assert_eq!(response.status, ModelTurnStatus::Success);
     assert!(response.is_length_truncated());
     assert_eq!(response.finish_reason.as_deref(), Some("length"));
-    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls().len(), 1);
     assert_eq!(response.usage.total_tokens, 7);
 
     let filter_body = r#"{"id":"chat_filter","choices":[{"message":{"role":"assistant","content":"blocked"},"finish_reason":"content_filter"}]}"#;

@@ -330,7 +330,7 @@ pub fn validate_model_turn_response(
 ) -> ModelValidationResult {
     let mut result = validate_model_response_with_protocol_context(
         response.assistant_message.as_ref(),
-        &response.tool_calls,
+        response.tool_calls(),
         &request.tool_choice,
         available_tool_names,
         capabilities,

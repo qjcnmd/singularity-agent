@@ -899,7 +899,7 @@ fn validate_response_tool_reasoning_contract(
     if !request_used_tool_protocol {
         return Ok(());
     }
-    let response_has_tool_calls = !completion.response.tool_calls.is_empty();
+    let response_has_tool_calls = !completion.response.tool_calls().is_empty();
     let disabled_mode_not_honored = capabilities.tool_reasoning_mode
         == ProviderToolReasoningMode::DisabledForToolCalls
         && completion.reasoning_content_present;

@@ -288,7 +288,6 @@ pub fn parse_openai_responses_response(
             .unwrap_or("response")
             .to_string(),
         assistant_message,
-        tool_calls,
         parse_openai_responses_usage(payload.get("usage")),
         Some(response_finish_reason.to_string()),
     )

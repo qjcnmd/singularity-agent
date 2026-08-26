@@ -134,7 +134,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
         captured["tools"][0]["function"].get("strict").is_none(),
         "strict field must be omitted when the request is not strict"
     );
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(response.status, ModelTurnStatus::Success);
 }
 
@@ -182,7 +182,7 @@ fn openai_provider_accepts_multiple_tool_calls_in_one_response() {
     // 多工具调用响应是合法的：Agent loop 按模型给定顺序串行执行全部调用，
     // 响应校验不再因调用数超过请求上限或并行能力声明而拒绝。
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 2);
+    assert_eq!(response.tool_calls().len(), 2);
     assert!(response.error.is_none());
     assert!(
         response
@@ -303,9 +303,9 @@ fn openai_provider_recovers_native_argument_parse_errors_for_agent_repair() {
                 .collect::<Vec<_>>(),
             "{case_name}"
         );
-        assert_eq!(response.tool_calls.len(), 1, "{case_name}");
+        assert_eq!(response.tool_calls().len(), 1, "{case_name}");
         assert_eq!(
-            response.tool_calls[0].tool_call_id,
+            response.tool_calls()[0].tool_call_id,
             format!("call_{case_name}")
         );
     }
@@ -623,7 +623,7 @@ fn reasoning_replay_obligation_chat_reasoning_only_response_is_legal_without_rep
             .map(|message| message.content.as_str()),
         Some("reasoned answer")
     );
-    assert!(response.tool_calls.is_empty());
+    assert!(response.tool_calls().is_empty());
     assert!(
         response.provider_reasoning_history.is_empty(),
         "reasoning-only final answer must not create a replay obligation"
@@ -700,11 +700,11 @@ fn reasoning_replay_obligation_chat_tool_call_with_replay_succeeds() {
         )
         .expect("Chat tool call with replay must be accepted");
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(
-        response.tool_calls[0].parse_status,
+        response.tool_calls()[0].parse_status,
         ModelToolParseStatus::Valid
     );
     assert_eq!(response.provider_reasoning_history.len(), 1);
@@ -1011,7 +1011,7 @@ fn reasoning_replay_obligation_responses_reasoning_only_is_legal_without_replay(
             .map(|message| message.content.as_str()),
         Some("done")
     );
-    assert!(response.tool_calls.is_empty());
+    assert!(response.tool_calls().is_empty());
     assert!(
         response.provider_reasoning_history.is_empty(),
         "reasoning-only final answer must not create an orphan replay"
@@ -1095,7 +1095,7 @@ fn reasoning_replay_obligation_responses_stream_reasoning_only_is_legal() {
             .map(|message| message.content.as_str()),
         Some("done")
     );
-    assert!(response.tool_calls.is_empty());
+    assert!(response.tool_calls().is_empty());
     assert!(
         response.provider_reasoning_history.is_empty(),
         "reasoning-only stream must not create an orphan replay"
@@ -1166,11 +1166,11 @@ fn reasoning_replay_obligation_responses_tool_call_with_replay_succeeds() {
         )
         .expect("Responses function call with replay must be accepted");
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(
-        response.tool_calls[0].parse_status,
+        response.tool_calls()[0].parse_status,
         ModelToolParseStatus::Valid
     );
     assert_eq!(response.provider_reasoning_history.len(), 1);
@@ -1251,8 +1251,8 @@ fn reasoning_replay_obligation_responses_tool_call_without_replay_succeeds() {
         )
         .expect("Responses function call without reasoning must be accepted");
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_1");
     assert!(response.provider_reasoning_history.is_empty());
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
@@ -1332,9 +1332,9 @@ fn reasoning_replay_obligation_responses_stream_tool_call_with_replay_succeeds()
         .expect("Responses stream function call with replay must be accepted");
     assert!(events.is_empty());
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
-    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls()[0].tool_name, "read");
     assert_eq!(response.provider_reasoning_history.len(), 1);
     match &response.provider_reasoning_history[0] {
         ProviderReasoningReplay::Responses {
@@ -1423,8 +1423,8 @@ fn reasoning_replay_obligation_responses_stream_tool_call_without_replay_succeed
         )
         .expect("Responses stream function call without reasoning must be accepted");
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(response.tool_calls().len(), 1);
+    assert_eq!(response.tool_calls()[0].tool_call_id, "call_1");
     assert!(response.provider_reasoning_history.is_empty());
     let payload: serde_json::Value = serde_json::from_str(
         &requests
