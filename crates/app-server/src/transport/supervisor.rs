@@ -64,7 +64,6 @@ where
     });
     let mut writer_done = false;
     let mut writer_result = None;
-    let mut writer_timeout = false;
     let ready_for_turn = Arc::new(AtomicBool::new(false));
     let ready_notify = Arc::new(tokio::sync::Notify::new());
     let (ordinary_tx, ordinary_rx) = mpsc::channel::<JsonRpcMessage>(64);
@@ -239,79 +238,54 @@ where
         .request_execution_stop()
         .map_err(|error| format!("failed to stop executions during shutdown: {error}"));
     let mut worker_error = None;
-    if !turn_dispatcher_done
-        && let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
-    {
+    if !turn_dispatcher_done {
         // dispatcher 在 turn_rx 关闭且 worker 全部收敛后退出；宽限到点 abort。
-        match tokio::time::timeout(remaining, &mut turn_dispatcher_task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                worker_error.get_or_insert(error);
-            }
-            Ok(Err(error)) => {
-                worker_error.get_or_insert(format!("turn dispatcher task failed: {error}"));
-            }
-            Err(_) => {
-                worker_error.get_or_insert(
-                    "timed out waiting for turn dispatcher during shutdown".to_string(),
-                );
-                turn_dispatcher_task.abort();
-            }
+        if let Some(error) = wait_task_graceful(
+            &mut turn_dispatcher_task,
+            shutdown_deadline,
+            "turn dispatcher",
+            true,
+        )
+        .await
+        {
+            worker_error.get_or_insert(error);
         }
     }
     if !ordinary_done
-        && let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
+        && let Some(error) = wait_task_graceful(
+            &mut ordinary_task,
+            shutdown_deadline,
+            "ordinary dispatch",
+            false,
+        )
+        .await
     {
-        match tokio::time::timeout(remaining, &mut ordinary_task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                worker_error.get_or_insert(error);
-            }
-            Ok(Err(error)) => {
-                worker_error.get_or_insert(format!("ordinary dispatch task failed: {error}"));
-            }
-            Err(_) => {
-                worker_error.get_or_insert(
-                    "timed out waiting for ordinary dispatch during shutdown".to_string(),
-                );
-            }
-        }
+        worker_error.get_or_insert(error);
     }
     if !control_done
-        && let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
+        && let Some(error) = wait_task_graceful(
+            &mut control_task,
+            shutdown_deadline,
+            "control dispatch",
+            false,
+        )
+        .await
     {
-        match tokio::time::timeout(remaining, &mut control_task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                worker_error.get_or_insert(error);
-            }
-            Ok(Err(error)) => {
-                worker_error.get_or_insert(format!("control dispatch task failed: {error}"));
-            }
-            Err(_) => {
-                worker_error.get_or_insert(
-                    "timed out waiting for control dispatch during shutdown".to_string(),
-                );
-            }
-        }
+        worker_error.get_or_insert(error);
     }
     drop(output_tx);
 
-    if !writer_done {
-        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
-            match tokio::time::timeout(remaining, &mut writer).await {
-                Ok(result) => {
-                    writer_result = Some(result);
-                }
-                Err(_) => {
-                    writer.abort();
-                    writer_timeout = true;
-                }
-            }
+    if !writer_done
+        && let Some(error) =
+            wait_task_graceful(&mut writer, shutdown_deadline, "stdout writer", true).await
+    {
+        // 保留既有的 writer 错误措辞（内部错误带来源前缀，超时文本原样）。
+        let error = if error.starts_with("timed out waiting for") {
+            error
         } else {
-            writer.abort();
-            writer_timeout = true;
-        }
+            format!("stdout writer task failed: {error}")
+        };
+        worker_error.get_or_insert(error);
     }
 
     let mut errors = Vec::new();
@@ -324,9 +298,6 @@ where
     if let Some(error) = terminal_error {
         errors.push(error);
     }
-    if writer_timeout {
-        errors.push("timed out waiting for stdout writer during shutdown".to_string());
-    }
     if let Some(Err(error)) = writer_result {
         errors.push(format!("stdout writer task failed: {error}"));
     }
@@ -334,6 +305,38 @@ where
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+/// 在宽限期内等待后台任务收敛。超时按调用方策略 abort（有界 worker 强制
+/// 终止；普通/控制 dispatch 依赖 channel 关闭自然收敛）。返回终止错误文本。
+async fn wait_task_graceful(
+    task: &mut tokio::task::JoinHandle<Result<(), String>>,
+    deadline: Instant,
+    label: &str,
+    abort_on_timeout: bool,
+) -> Option<String> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        // 宽限期已耗尽：writer 强制 abort 并报告；dispatch 任务让关闭中的
+        // channel 自然收敛（等待可能已被前面的 join 用尽）。
+        if abort_on_timeout {
+            task.abort();
+            return Some(format!("timed out waiting for {label} during shutdown"));
+        }
+        return None;
+    };
+    match tokio::time::timeout(remaining, &mut *task).await {
+        Ok(Ok(Ok(()))) => None,
+        // 任务自身返回的错误（worker 内部错误文本）原样透出。
+        Ok(Ok(Err(error))) => Some(error),
+        // join 层面失败（任务 panic）带上任务来源。
+        Ok(Err(error)) => Some(format!("{label} task failed: {error}")),
+        Err(_) => {
+            if abort_on_timeout {
+                task.abort();
+            }
+            Some(format!("timed out waiting for {label} during shutdown"))
+        }
     }
 }
 
@@ -484,10 +487,10 @@ fn is_turn_control(message: &JsonRpcMessage) -> bool {
     matches!(
         message.method_name(),
         Some(method)
-            if matches!(
+            if Method::parse(method).is_some_and(|method| matches!(
                 method,
-                "turn/interrupt" | "turn/steer" | "turn/followUp"
-            )
+                Method::TurnInterrupt | Method::TurnSteer | Method::TurnFollowUp
+            ))
     )
 }
 

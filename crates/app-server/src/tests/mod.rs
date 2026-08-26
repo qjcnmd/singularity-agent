@@ -55,6 +55,21 @@ fn insert_session(sessions_dir: &Path, session_id: &str, cwd: &Path) -> String {
     session_id.to_string()
 }
 
+/// 同步执行一次 turn/start 并收集全部输出消息（事件通知 + 最终响应）。
+/// 取代旧的 dispatch 同步 turn_start 路径（生产只走 stream lane 的
+/// claim + 后台 worker；测试直接驱动同一 pair）。
+fn run_turn_json(server: &mut AppServer, body: impl AsRef<str>) -> AppServerResult<Vec<Value>> {
+    let message: JsonRpcMessage = serde_json::from_str(body.as_ref()).expect("turn/start message");
+    let mut messages = Vec::new();
+    match server.claim_turn(message)? {
+        crate::TurnClaim::Accepted(claim) => {
+            server.run_turn_started(claim, &mut |output| messages.push(output))?
+        }
+        crate::TurnClaim::Responded(response) => messages.push(response),
+    }
+    Ok(messages)
+}
+
 #[test]
 fn jsonl_projection_does_not_repair_incomplete_turn() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -89,11 +104,12 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
         seen_requests: Arc::new(Mutex::new(Vec::new())),
     }));
     initialize(&mut server);
-    let reopened = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen"}}]}}}}"#
-        ))
-        .expect("reopen turn repairs session");
+    let reopened = run_turn_json(
+        &mut server,
+        r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"reopen"}]}}"#
+            .replace("__SESSION__", session_id),
+    )
+    .expect("reopen turn repairs session");
     assert!(
         reopened
             .iter()
@@ -112,11 +128,12 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
         1,
         "residual turn must be repaired to interrupted exactly once"
     );
-    server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen again"}}]}}}}"#
-        ))
-        .expect("second reopen turn");
+    run_turn_json(
+        &mut server,
+        r#"{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"reopen again"}]}}"#
+            .replace("__SESSION__", session_id),
+    )
+    .expect("second reopen turn");
     assert_eq!(
         SessionManager::open_existing(&session_path)
             .unwrap()
@@ -496,10 +513,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     );
 
     // completed → continue 必须保持 completed，不提前置 active。
-    let first = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"first"}}]}}}}"#
-        ))
+    let first = run_turn_json(&mut server,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"first"}]}}"#
+                .replace("__SESSION__", &session_id),
+        )
         .expect("first turn");
     assert_eq!(
         first.iter().find(|m| m["id"] == 3).expect("response")["result"]["turn"]["status"],
@@ -520,10 +537,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     );
 
     // 失败 turn 把展示状态变为 failed；随后仍可 continue。
-    let failed = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"fail"}}]}}}}"#
-        ))
+    let failed = run_turn_json(&mut server,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"fail"}]}}"#
+                .replace("__SESSION__", &session_id),
+        )
         .expect("turn start returns ok");
     let error_notif = failed
         .iter()
@@ -541,10 +558,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         Some(singularity_runtime::ThreadStatus::Failed)
     );
 
-    let third = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":7,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"third"}}]}}}}"#
-        ))
+    let third = run_turn_json(&mut server,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":7,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"third"}]}}"#
+                .replace("__SESSION__", &session_id),
+        )
         .expect("third turn");
     assert_eq!(
         third.iter().find(|m| m["id"] == 7).expect("response")["result"]["turn"]["status"],
@@ -559,10 +576,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     );
 
     // completed 会话可以继续执行下一轮。
-    let reopened = server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":8,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen"}}]}}}}"#
-        ))
+    let reopened = run_turn_json(&mut server,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":8,"params":{"threadId":"__SESSION__","input":[{"type":"text","text":"reopen"}]}}"#
+                .replace("__SESSION__", &session_id),
+        )
         .expect("reopen interrupted");
     assert_eq!(
         reopened
@@ -798,11 +815,11 @@ fn project_instructions_load_from_workspace_root_to_cwd() {
         &nested,
     );
 
-    server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d","input":[{"type":"text","text":"do it"}]}}"#,
-        )
-        .expect("turn start");
+    run_turn_json(
+        &mut server,
+        r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d","input":[{"type":"text","text":"do it"}]}}"#,
+    )
+    .expect("turn start");
     let seen = requests.lock().expect("seen requests");
     let request = seen.last().expect("provider request");
     let joined: String = request
@@ -849,11 +866,11 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
         &workspace,
     );
 
-    let responses = server
-        .handle_json(
-            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"3d4e5f6a-9b8c-4d1e-a2f3-b4c5d6e7f8a9","input":[{"type":"text","text":"do it"}]}}"#,
-        )
-        .expect("oversized instructions must not fail the turn");
+    let responses = run_turn_json(
+        &mut server,
+        r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"3d4e5f6a-9b8c-4d1e-a2f3-b4c5d6e7f8a9","input":[{"type":"text","text":"do it"}]}}"#,
+    )
+    .expect("oversized instructions must not fail the turn");
     assert_eq!(
         responses
             .iter()
@@ -907,19 +924,6 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
     );
 }
 
-fn turn_start_message(id: i64, session_id: &str) -> JsonRpcMessage {
-    serde_json::from_value(json!({
-        "jsonrpc": "2.0",
-        "method": "turn/start",
-        "id": id,
-        "params": {
-            "threadId": session_id,
-            "input": [{"type": "text", "text": "run the task"}]
-        }
-    }))
-    .expect("turn/start message")
-}
-
 #[test]
 fn project_instruction_errors_fail_closed_before_provider_call() {
     // 预算超限不在其中：超限走截断 + 告警路径
@@ -960,8 +964,12 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
         }
 
         // 准备阶段失败：turn/start 直接回错误响应，不产生任何 turn 语义。
-        let result = server
-            .handle_turn_start_streaming_with_output(turn_start_message(2, session_id), |_| {});
+        let result = run_turn_json(&mut server, serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/start",
+            "id": 2,
+            "params": {"threadId": session_id, "input": [{"type": "text", "text": "run the task"}]}
+        }).to_string());
         assert!(
             result.is_err(),
             "{name}: prepare failure must error turn/start directly: {result:?}"

@@ -135,7 +135,9 @@ impl AppServer {
             Method::ThreadRead => self.thread_read(message),
             Method::SessionDelete => self.session_delete(message),
             Method::ThreadSettings => self.thread_settings(message),
-            Method::TurnStart => self.turn_start(message),
+            Method::TurnStart => Err(AppServerError::InvalidParams(
+                "turn/start must be claimed via the turn lane".to_string(),
+            )),
             Method::TurnSteer => self.turn_steer(message),
             Method::TurnFollowUp => self.turn_follow_up(message),
             Method::ProviderStatus => self.provider_status(message),
@@ -511,35 +513,6 @@ impl AppServer {
                     cause: TurnFailureCause::Internal,
                     original: Some(error.to_string()),
                 })
-            }
-        }
-    }
-
-    pub(crate) fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let mut messages = Vec::new();
-        self.run_turn_start(message, &mut |output| messages.push(output))?;
-        Ok(messages)
-    }
-
-    /// 执行 `turn/start`：委托共享核心运行 turn，事件经投影适配器流出。
-    pub fn handle_turn_start_streaming_with_output(
-        &mut self,
-        message: JsonRpcMessage,
-        mut emit: impl FnMut(AppServerOutput),
-    ) -> AppServerResult<()> {
-        self.run_turn_start(message, &mut emit)
-    }
-
-    fn run_turn_start(
-        &mut self,
-        message: JsonRpcMessage,
-        emit: &mut impl FnMut(AppServerOutput),
-    ) -> AppServerResult<()> {
-        match self.claim_turn(message)? {
-            TurnClaim::Accepted(claim) => self.run_turn_started(claim, emit),
-            TurnClaim::Responded(response) => {
-                emit(response);
-                Ok(())
             }
         }
     }

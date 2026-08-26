@@ -862,16 +862,33 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         .expect("initialized new server");
 
     // 8. reopen via turn/start：收敛残留 turn 并运行新 turn
-    let reopen_response = new_server
-        .handle_json(&format!(
-            r#"{{"jsonrpc":"2.0","method":"turn/start","id":11,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen"}}]}}}}"#
-        ))
-        .expect("turn/start after fail-stop");
+    let reopen_message: JsonRpcMessage = serde_json::from_value(json!({
+        "jsonrpc": "2.0",
+        "method": "turn/start",
+        "id": 11,
+        "params": {
+            "threadId": session_id,
+            "input": [{"type": "text", "text": "reopen"}],
+        }
+    }))
+    .expect("turn/start");
+    let mut reopen_outputs = Vec::new();
+    let reopen_result = match new_server.claim_turn(reopen_message) {
+        Ok(crate::TurnClaim::Accepted(claim)) => {
+            new_server.run_turn_started(claim, &mut |output| reopen_outputs.push(output))
+        }
+        Ok(crate::TurnClaim::Responded(response)) => {
+            reopen_outputs.push(response);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    reopen_result.expect("turn/start after fail-stop");
     assert!(
-        reopen_response
+        reopen_outputs
             .iter()
             .any(|value| value["method"] == "turn/completed"),
-        "reopened turn must complete: {reopen_response:?}"
+        "reopened turn must complete: {reopen_outputs:?}"
     );
 
     // 9. 重开不重放旧 turn 的 provider 调用；新 turn 恰好调用一次
