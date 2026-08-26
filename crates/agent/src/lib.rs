@@ -16,5 +16,6 @@
 pub mod agent;
 pub mod compaction;
 pub mod message;
+pub mod prompts;
 pub mod session;
 pub mod tools;
