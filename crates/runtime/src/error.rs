@@ -89,18 +89,16 @@ impl<'de> Deserialize<'de> for TurnFailureCause {
 }
 
 impl TurnFailureCause {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Store => "store",
-            Self::ProjectInstructions => "project_instructions",
-            Self::Workspace => "workspace",
-            Self::Provider(kind) => kind.as_str(),
-            Self::Serialization => "serialization",
-            Self::Internal => "internal",
-        }
+    /// 基础词形（展示/内部文本）：由 [`Self::wire_str`] 派生，去掉 `provider_`
+    /// 前缀即得，避免第二份手写词形表。
+    pub fn as_str(self) -> &'static str {
+        self.wire_str()
+            .strip_prefix("provider_")
+            .unwrap_or_else(|| self.wire_str())
     }
 
-    /// 协议线格式的稳定 cause 词形；`Provider` 变体带 `provider_` 前缀。
+    /// 协议线格式的稳定 cause 词形（`Provider` 变体带 `provider_` 前缀）——
+    /// 单一事实源；`as_str`、serde 序列化与 Display 全部由它派生。
     pub const fn wire_str(self) -> &'static str {
         match self {
             Self::Store => "store",
@@ -139,18 +137,12 @@ pub enum ProviderFailureKind {
 }
 
 impl ProviderFailureKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RateLimited => "rate_limited",
-            Self::Network => "network",
-            Self::Timeout => "timeout",
-            Self::Auth => "auth",
-            Self::Validation => "validation",
-            Self::Overloaded => "overloaded",
-            Self::Cancelled => "cancelled",
-            Self::ContextOverflow => "context_overflow",
-            Self::Unknown => "unknown",
-        }
+    /// 基础词形（展示/内部文本）：由 [`Self::wire_str`] 派生，去掉 `provider_`
+    /// 前缀即得，避免第二份手写词形表。
+    pub fn as_str(self) -> &'static str {
+        self.wire_str()
+            .strip_prefix("provider_")
+            .unwrap_or_else(|| self.wire_str())
     }
 
     /// 协议线格式的稳定 cause 词形（`provider_` 前缀）——app-server 与

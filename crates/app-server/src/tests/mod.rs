@@ -1156,3 +1156,50 @@ fn thread_read_projects_crash_leftover_turn_as_interrupted() {
     );
     assert!(!result["turns"][0]["items"].as_array().unwrap().is_empty());
 }
+
+/// 跨 crate 词形一致性门禁：runtime 的 `TurnFailureCause::wire_str` 词形必须
+/// 与 protocol 的 serde snake_case 词形一一对应，且双向 round-trip 不漂移。
+/// protocol 侧的枚举定义是词形的第二事实源，本测试锁定两者同步。
+#[test]
+fn failure_cause_wire_words_round_trip_across_crates() {
+    use singularity_protocol::TurnFailureCause as ProtocolCause;
+    let runtime_causes: &[TurnFailureCause] = &[
+        TurnFailureCause::Store,
+        TurnFailureCause::ProjectInstructions,
+        TurnFailureCause::Workspace,
+        TurnFailureCause::Provider(ProviderFailureKind::RateLimited),
+        TurnFailureCause::Provider(ProviderFailureKind::Network),
+        TurnFailureCause::Provider(ProviderFailureKind::Timeout),
+        TurnFailureCause::Provider(ProviderFailureKind::Auth),
+        TurnFailureCause::Provider(ProviderFailureKind::Validation),
+        TurnFailureCause::Provider(ProviderFailureKind::Overloaded),
+        TurnFailureCause::Provider(ProviderFailureKind::Cancelled),
+        TurnFailureCause::Provider(ProviderFailureKind::ContextOverflow),
+        TurnFailureCause::Provider(ProviderFailureKind::Unknown),
+        TurnFailureCause::Serialization,
+        TurnFailureCause::Internal,
+    ];
+    for cause in runtime_causes {
+        let wire_word = cause.wire_str();
+        // runtime 词形 → protocol 枚举解析（snake_case 反序列化必须成功）。
+        let protocol_cause: ProtocolCause = serde_json::from_str(&format!("\"{wire_word}\""))
+            .unwrap_or_else(|error| {
+                panic!("runtime wire word {wire_word:?} must parse as protocol cause: {error}")
+            });
+        // protocol 枚举序列化词形 → 必须回到同一 wire 词形（对称）。
+        let protocol_word = serde_json::to_string(&protocol_cause)
+            .expect("protocol cause serializes")
+            .trim_matches('"')
+            .to_string();
+        assert_eq!(
+            protocol_word, wire_word,
+            "protocol serde word must equal runtime wire word"
+        );
+        // 反序列化 → 序列化 round-trip：protocol 枚举自身不漂移。
+        let re_parsed: ProtocolCause = serde_json::from_str(
+            &serde_json::to_string(&protocol_cause).expect("protocol cause serializes"),
+        )
+        .expect("protocol cause round-trips");
+        assert_eq!(re_parsed, protocol_cause);
+    }
+}
