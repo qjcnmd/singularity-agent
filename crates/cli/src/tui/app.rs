@@ -13,7 +13,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use singularity_runtime::events::TurnEvent;
+use singularity_runtime::events::{AgentDiagnosticSeverity, ProviderAttemptStatus, TurnEvent};
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ReasoningPatch, SettingsPatch};
 
@@ -276,7 +276,7 @@ impl TuiApp {
                 self.set_waiting(WaitingTarget::Model);
             }
             TurnEvent::ProviderAttempt { status, .. } => {
-                if status == "started" {
+                if *status == ProviderAttemptStatus::Started {
                     self.set_waiting(WaitingTarget::Thinking);
                 }
             }
@@ -320,10 +320,10 @@ impl TuiApp {
                 message,
                 ..
             } => {
-                let style = match severity.as_str() {
-                    "error" => NoteStyle::Error,
-                    "warning" => NoteStyle::Warning,
-                    _ => NoteStyle::Dim,
+                let style = match severity {
+                    AgentDiagnosticSeverity::Error => NoteStyle::Error,
+                    AgentDiagnosticSeverity::Warning => NoteStyle::Warning,
+                    AgentDiagnosticSeverity::Info => NoteStyle::Dim,
                 };
                 self.transcript
                     .push_note(format!("⚠ [{severity}] {code}: {message}"), style);

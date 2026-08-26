@@ -967,6 +967,101 @@ pub struct AppEvent {
     pub params: Value,
 }
 
+/// `agent/diagnostic` 的稳定严重级别词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// `provider/attempt` 的稳定进度与终态词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptStatus {
+    Started,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+/// `turn/error.error.stage` 的稳定管线阶段词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureStage {
+    AgentLoop,
+    TerminalOutcome,
+}
+
+/// `turn/error.error.cause` 的稳定失败来源词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureCause {
+    Store,
+    ProjectInstructions,
+    Workspace,
+    ProviderRateLimited,
+    ProviderNetwork,
+    ProviderTimeout,
+    ProviderAuth,
+    ProviderValidation,
+    ProviderOverloaded,
+    ProviderCancelled,
+    ProviderContextOverflow,
+    ProviderUnknown,
+    Serialization,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnErrorParams {
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    pub error: TurnError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnError {
+    pub stage: TurnFailureStage,
+    pub cause: TurnFailureCause,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDiagnosticParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub severity: DiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttemptParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub model_turn_ordinal: u32,
+    pub provider: String,
+    pub model: String,
+    pub protocol: String,
+    pub attempt_index: u32,
+    pub status: ProviderAttemptStatus,
+    pub attempt_duration_ms: Option<u64>,
+    pub error_category: Option<String>,
+    pub diagnostic_code: Option<String>,
+}
+
 impl AppEvent {
     /// 构造 thread started 事件。
     pub fn thread_started(thread: &Thread) -> Self {
@@ -996,21 +1091,22 @@ impl AppEvent {
     pub fn turn_error(
         turn_id: &str,
         thread_id: &str,
-        stage: &str,
-        cause: &str,
+        stage: TurnFailureStage,
+        cause: TurnFailureCause,
         message: &str,
     ) -> Self {
+        let params = TurnErrorParams {
+            turn_id: turn_id.to_string(),
+            thread_id: thread_id.to_string(),
+            error: TurnError {
+                stage,
+                cause,
+                message: message.to_string(),
+            },
+        };
         Self {
             method: "turn/error".to_string(),
-            params: serde_json::json!({
-                "turnId": turn_id,
-                "threadId": thread_id,
-                "error": {
-                    "stage": stage,
-                    "cause": cause,
-                    "message": message,
-                },
-            }),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
@@ -1018,19 +1114,20 @@ impl AppEvent {
     pub fn agent_diagnostic(
         thread_id: impl Into<String>,
         turn_id: impl Into<String>,
-        severity: impl Into<String>,
+        severity: DiagnosticSeverity,
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
+        let params = AgentDiagnosticParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            severity,
+            code: code.into(),
+            message: message.into(),
+        };
         Self {
             method: "agent/diagnostic".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "severity": severity.into(),
-                "code": code.into(),
-                "message": message.into(),
-            }),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 
@@ -1044,26 +1141,27 @@ impl AppEvent {
         model: impl Into<String>,
         protocol: impl Into<String>,
         attempt_index: u32,
-        status: impl Into<String>,
+        status: ProviderAttemptStatus,
         attempt_duration_ms: Option<u64>,
         error_category: Option<String>,
         diagnostic_code: Option<String>,
     ) -> Self {
+        let params = ProviderAttemptParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            model_turn_ordinal,
+            provider: provider.into(),
+            model: model.into(),
+            protocol: protocol.into(),
+            attempt_index,
+            status,
+            attempt_duration_ms,
+            error_category,
+            diagnostic_code,
+        };
         Self {
             method: "provider/attempt".to_string(),
-            params: serde_json::json!({
-                "threadId": thread_id.into(),
-                "turnId": turn_id.into(),
-                "modelTurnOrdinal": model_turn_ordinal,
-                "provider": provider.into(),
-                "model": model.into(),
-                "protocol": protocol.into(),
-                "attemptIndex": attempt_index,
-                "status": status.into(),
-                "attemptDurationMs": attempt_duration_ms,
-                "errorCategory": error_category,
-                "diagnosticCode": diagnostic_code,
-            }),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
         }
     }
 

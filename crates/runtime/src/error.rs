@@ -4,11 +4,13 @@
 //! 的管线阶段，cause 描述失败来源，original 保留脱敏前的真实原因（对外输出
 //! 前必须经过敏感文本边界）。
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use singularity_model::ModelErrorKind;
 use thiserror::Error;
 
 /// 失败发生的管线阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnFailureStage {
     AgentLoop,
     TerminalOutcome,
@@ -31,6 +33,59 @@ pub enum TurnFailureCause {
     Provider(ProviderFailureKind),
     Serialization,
     Internal,
+}
+
+impl Serialize for TurnFailureCause {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnFailureCause {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "store" => Ok(Self::Store),
+            "project_instructions" => Ok(Self::ProjectInstructions),
+            "workspace" => Ok(Self::Workspace),
+            "provider_rate_limited" => Ok(Self::Provider(ProviderFailureKind::RateLimited)),
+            "provider_network" => Ok(Self::Provider(ProviderFailureKind::Network)),
+            "provider_timeout" => Ok(Self::Provider(ProviderFailureKind::Timeout)),
+            "provider_auth" => Ok(Self::Provider(ProviderFailureKind::Auth)),
+            "provider_validation" => Ok(Self::Provider(ProviderFailureKind::Validation)),
+            "provider_overloaded" => Ok(Self::Provider(ProviderFailureKind::Overloaded)),
+            "provider_cancelled" => Ok(Self::Provider(ProviderFailureKind::Cancelled)),
+            "provider_context_overflow" => Ok(Self::Provider(ProviderFailureKind::ContextOverflow)),
+            "provider_unknown" => Ok(Self::Provider(ProviderFailureKind::Unknown)),
+            "serialization" => Ok(Self::Serialization),
+            "internal" => Ok(Self::Internal),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &[
+                    "store",
+                    "project_instructions",
+                    "workspace",
+                    "provider_rate_limited",
+                    "provider_network",
+                    "provider_timeout",
+                    "provider_auth",
+                    "provider_validation",
+                    "provider_overloaded",
+                    "provider_cancelled",
+                    "provider_context_overflow",
+                    "provider_unknown",
+                    "serialization",
+                    "internal",
+                ],
+            )),
+        }
+    }
 }
 
 impl TurnFailureCause {

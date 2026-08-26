@@ -21,14 +21,15 @@ use singularity_agent::session::{
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent, ProviderConfigSnapshot,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent,
+    ProviderAttemptStatus as ModelProviderAttemptStatus, ProviderConfigSnapshot,
 };
 use uuid::Uuid;
 
 use crate::error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
 };
-use crate::events::{TurnErrorDetail, TurnEvent, TurnEventSink};
+use crate::events::{ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
@@ -221,7 +222,7 @@ impl TurnRunner {
             sink.emit(TurnEvent::Diagnostic {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
-                severity: "warning".to_string(),
+                severity: AgentDiagnosticSeverity::Warning,
                 code: PROJECT_INSTRUCTIONS_TRUNCATED_CODE.to_string(),
                 message:
                     "project instructions were truncated because they exceeded the size budget"
@@ -475,15 +476,10 @@ impl TurnRunner {
                     item_events.emit_tool_terminal(sink, &tool_call_id, execution.is_error);
                 }
                 AgentEvent::Diagnostic(diagnostic) => {
-                    let severity = match diagnostic.severity {
-                        AgentDiagnosticSeverity::Info => "info",
-                        AgentDiagnosticSeverity::Warning => "warning",
-                        AgentDiagnosticSeverity::Error => "error",
-                    };
                     sink.emit(TurnEvent::Diagnostic {
                         thread_id: thread.thread_id.clone(),
                         turn_id: turn_id.to_string(),
-                        severity: severity.to_string(),
+                        severity: diagnostic.severity,
                         code: diagnostic.code,
                         message: diagnostic.message,
                     });
@@ -536,7 +532,7 @@ impl TurnRunner {
             sink.emit(TurnEvent::Diagnostic {
                 thread_id: session.session_id().to_string(),
                 turn_id: turn_id.to_string(),
-                severity: "error".to_string(),
+                severity: AgentDiagnosticSeverity::Error,
                 code: "storage_fatal".to_string(),
                 message: message.to_string(),
             });
@@ -609,8 +605,8 @@ impl TurnRunner {
                 usage: None,
             },
             error: TurnErrorDetail {
-                stage: failure.stage.as_str().to_string(),
-                cause: failure.cause.wire_str().to_string(),
+                stage: failure.stage,
+                cause: failure.cause,
                 message,
             },
         });
@@ -651,7 +647,7 @@ impl TurnRunner {
         sink.emit(TurnEvent::Diagnostic {
             thread_id: session.session_id().to_string(),
             turn_id: turn_id.to_string(),
-            severity: "error".to_string(),
+            severity: AgentDiagnosticSeverity::Error,
             code: "storage_fatal".to_string(),
             message: safe_message.to_string(),
         });
@@ -877,7 +873,7 @@ fn provider_attempt_event(
             model: started.model_name.clone(),
             protocol: serialized_enum_text(&started.actual_api_protocol),
             attempt_index: started.attempt_index,
-            status: "started".to_string(),
+            status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,
             diagnostic_code: None,
@@ -890,7 +886,11 @@ fn provider_attempt_event(
             model: occurrence.model_name.clone(),
             protocol: serialized_enum_text(&occurrence.actual_api_protocol),
             attempt_index: occurrence.attempt_index,
-            status: serialized_enum_text(&occurrence.terminal_status),
+            status: match occurrence.terminal_status {
+                ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
+                ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
+                ModelProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
+            },
             attempt_duration_ms: Some(occurrence.attempt_duration_ms),
             error_category: occurrence.error_category.as_ref().map(serialized_enum_text),
             diagnostic_code: occurrence.diagnostic_code.clone(),

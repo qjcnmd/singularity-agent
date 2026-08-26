@@ -318,13 +318,21 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     let diagnostic = AppEvent::agent_diagnostic(
         "thread-1",
         "turn-1",
-        "warning",
+        singularity_protocol::DiagnosticSeverity::Warning,
         "compaction_skipped",
         "automatic context compaction skipped",
     );
     assert_eq!(diagnostic.method(), "agent/diagnostic");
     assert_eq!(diagnostic.params["code"], "compaction_skipped");
     assert!(!diagnostic.params.to_string().contains("raw"));
+    let diagnostic_params = serde_json::from_value::<singularity_protocol::AgentDiagnosticParams>(
+        diagnostic.params.clone(),
+    )
+    .expect("typed diagnostic params");
+    assert_eq!(
+        diagnostic_params.severity,
+        singularity_protocol::DiagnosticSeverity::Warning
+    );
 
     let attempt = AppEvent::provider_attempt(
         "thread-1",
@@ -334,7 +342,7 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
         "test-model",
         "open_ai_responses",
         1,
-        "error",
+        singularity_protocol::ProviderAttemptStatus::Error,
         Some(12),
         Some("network".to_string()),
         Some("provider_timeout".to_string()),
@@ -343,4 +351,29 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     assert_eq!(attempt.params["modelTurnOrdinal"], 2);
     assert!(attempt.params.get("retryScheduled").is_none());
     assert!(attempt.params.get("raw").is_none());
+    let attempt_params = serde_json::from_value::<singularity_protocol::ProviderAttemptParams>(
+        attempt.params.clone(),
+    )
+    .expect("typed provider attempt params");
+    assert_eq!(
+        attempt_params.status,
+        singularity_protocol::ProviderAttemptStatus::Error
+    );
+
+    let error = AppEvent::turn_error(
+        "turn-1",
+        "thread-1",
+        singularity_protocol::TurnFailureStage::AgentLoop,
+        singularity_protocol::TurnFailureCause::ProviderTimeout,
+        "provider timed out",
+    );
+    assert_eq!(error.params["error"]["stage"], "agent_loop");
+    assert_eq!(error.params["error"]["cause"], "provider_timeout");
+    let error_params =
+        serde_json::from_value::<singularity_protocol::TurnErrorParams>(error.params.clone())
+            .expect("typed turn error params");
+    assert_eq!(
+        error_params.error.cause,
+        singularity_protocol::TurnFailureCause::ProviderTimeout
+    );
 }

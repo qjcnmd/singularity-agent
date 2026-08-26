@@ -6,12 +6,23 @@
 
 use std::sync::atomic::Ordering;
 
-use singularity_protocol::{JsonRpcId, JsonRpcMessage, TurnStartResult};
-use singularity_runtime::events::{TurnEvent, TurnEventSink};
+use singularity_protocol::{
+    DiagnosticSeverity, JsonRpcId, JsonRpcMessage,
+    ProviderAttemptStatus as ProtocolProviderAttemptStatus,
+    TurnFailureCause as ProtocolFailureCause, TurnFailureStage as ProtocolFailureStage,
+    TurnStartResult,
+};
+use singularity_runtime::events::{
+    AgentDiagnosticSeverity, ProviderAttemptStatus as RuntimeProviderAttemptStatus, TurnEvent,
+    TurnEventSink,
+};
 use singularity_runtime::objects::{
     ThreadStatus as RuntimeThreadStatus, Turn as RuntimeTurn, TurnStatus as RuntimeTurnStatus,
 };
-use singularity_runtime::{Conversation, TurnOutcome, TurnRunError};
+use singularity_runtime::{
+    Conversation, ProviderFailureKind, TurnFailureCause as RuntimeFailureCause,
+    TurnFailureStage as RuntimeFailureStage, TurnOutcome, TurnRunError,
+};
 
 use super::*;
 use crate::state::LiveTurnGuard;
@@ -217,12 +228,11 @@ impl TurnEventSink for TurnProjection<'_> {
             TurnEvent::TurnFailed { turn, error } => {
                 self.sync_terminal_index(&turn);
                 self.live_turn = None;
-                // cause/stage 已是 runtime 单点定义的 wire 词形，直接透传。
                 self.emit_notification(AppEvent::turn_error(
                     &turn.turn_id,
                     &turn.thread_id,
-                    &error.stage,
-                    &error.cause,
+                    protocol_failure_stage(error.stage),
+                    protocol_failure_cause(error.cause),
                     &error.message,
                 ));
             }
@@ -318,7 +328,11 @@ impl TurnEventSink for TurnProjection<'_> {
                 code,
                 message,
             } => self.emit_notification(AppEvent::agent_diagnostic(
-                thread_id, turn_id, severity, code, message,
+                thread_id,
+                turn_id,
+                protocol_diagnostic_severity(severity),
+                code,
+                message,
             )),
             TurnEvent::ProviderAttempt {
                 thread_id,
@@ -340,12 +354,75 @@ impl TurnEventSink for TurnProjection<'_> {
                 model,
                 protocol,
                 attempt_index,
-                status,
+                protocol_provider_attempt_status(status),
                 attempt_duration_ms,
                 error_category,
                 diagnostic_code,
             )),
         }
+    }
+}
+
+fn protocol_diagnostic_severity(severity: AgentDiagnosticSeverity) -> DiagnosticSeverity {
+    match severity {
+        AgentDiagnosticSeverity::Info => DiagnosticSeverity::Info,
+        AgentDiagnosticSeverity::Warning => DiagnosticSeverity::Warning,
+        AgentDiagnosticSeverity::Error => DiagnosticSeverity::Error,
+    }
+}
+
+fn protocol_provider_attempt_status(
+    status: RuntimeProviderAttemptStatus,
+) -> ProtocolProviderAttemptStatus {
+    match status {
+        RuntimeProviderAttemptStatus::Started => ProtocolProviderAttemptStatus::Started,
+        RuntimeProviderAttemptStatus::Ok => ProtocolProviderAttemptStatus::Ok,
+        RuntimeProviderAttemptStatus::Error => ProtocolProviderAttemptStatus::Error,
+        RuntimeProviderAttemptStatus::Cancelled => ProtocolProviderAttemptStatus::Cancelled,
+    }
+}
+
+fn protocol_failure_stage(stage: RuntimeFailureStage) -> ProtocolFailureStage {
+    match stage {
+        RuntimeFailureStage::AgentLoop => ProtocolFailureStage::AgentLoop,
+        RuntimeFailureStage::TerminalOutcome => ProtocolFailureStage::TerminalOutcome,
+    }
+}
+
+fn protocol_failure_cause(cause: RuntimeFailureCause) -> ProtocolFailureCause {
+    match cause {
+        RuntimeFailureCause::Store => ProtocolFailureCause::Store,
+        RuntimeFailureCause::ProjectInstructions => ProtocolFailureCause::ProjectInstructions,
+        RuntimeFailureCause::Workspace => ProtocolFailureCause::Workspace,
+        RuntimeFailureCause::Provider(ProviderFailureKind::RateLimited) => {
+            ProtocolFailureCause::ProviderRateLimited
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Network) => {
+            ProtocolFailureCause::ProviderNetwork
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Timeout) => {
+            ProtocolFailureCause::ProviderTimeout
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Auth) => {
+            ProtocolFailureCause::ProviderAuth
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Validation) => {
+            ProtocolFailureCause::ProviderValidation
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Overloaded) => {
+            ProtocolFailureCause::ProviderOverloaded
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Cancelled) => {
+            ProtocolFailureCause::ProviderCancelled
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::ContextOverflow) => {
+            ProtocolFailureCause::ProviderContextOverflow
+        }
+        RuntimeFailureCause::Provider(ProviderFailureKind::Unknown) => {
+            ProtocolFailureCause::ProviderUnknown
+        }
+        RuntimeFailureCause::Serialization => ProtocolFailureCause::Serialization,
+        RuntimeFailureCause::Internal => ProtocolFailureCause::Internal,
     }
 }
 

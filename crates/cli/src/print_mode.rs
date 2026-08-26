@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use singularity_runtime::events::TurnEvent;
+use singularity_runtime::events::{AgentDiagnosticSeverity, TurnEvent};
 
 pub struct PrintRenderer;
 
@@ -22,7 +22,10 @@ impl PrintRenderer {
             message,
             ..
         } = event
-            && (severity == "warning" || severity == "error")
+            && matches!(
+                severity,
+                AgentDiagnosticSeverity::Warning | AgentDiagnosticSeverity::Error
+            )
         {
             let stderr = std::io::stderr();
             let mut lock = stderr.lock();

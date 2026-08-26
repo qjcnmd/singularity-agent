@@ -5,8 +5,37 @@
 //! 给出该事件在流式输出中的稳定方法名，字段序列化为 camelCase。
 
 use serde::{Deserialize, Serialize};
+pub use singularity_agent::agent::AgentDiagnosticSeverity;
 
+use crate::error::{TurnFailureCause, TurnFailureStage};
 use crate::objects::{Thread, Turn};
+
+/// provider attempt 在事件流中的进度或终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptStatus {
+    Started,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+impl ProviderAttemptStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderAttemptStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// turn 执行事件的唯一类型化出口。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,7 +95,7 @@ pub enum TurnEvent {
     Diagnostic {
         thread_id: String,
         turn_id: String,
-        severity: String,
+        severity: AgentDiagnosticSeverity,
         code: String,
         message: String,
     },
@@ -78,7 +107,7 @@ pub enum TurnEvent {
         model: String,
         protocol: String,
         attempt_index: u32,
-        status: String,
+        status: ProviderAttemptStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,8 +131,8 @@ pub enum TurnEvent {
 /// 终态失败的分类信息；message 已经过脱敏边界处理。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnErrorDetail {
-    pub stage: String,
-    pub cause: String,
+    pub stage: TurnFailureStage,
+    pub cause: TurnFailureCause,
     pub message: String,
 }
 
@@ -141,5 +170,49 @@ where
 {
     fn emit(&mut self, event: TurnEvent) {
         self(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ProviderFailureKind, TurnFailureCause, TurnFailureStage};
+
+    #[test]
+    fn typed_event_fields_keep_their_wire_words() {
+        let diagnostic = TurnEvent::Diagnostic {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            severity: AgentDiagnosticSeverity::Warning,
+            code: "warning_code".to_string(),
+            message: "warning message".to_string(),
+        };
+        let attempt = TurnEvent::ProviderAttempt {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            model_turn_ordinal: 1,
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            protocol: "open_ai_chat_completions".to_string(),
+            attempt_index: 1,
+            status: ProviderAttemptStatus::Started,
+            attempt_duration_ms: None,
+            error_category: None,
+            diagnostic_code: None,
+        };
+        let error = TurnErrorDetail {
+            stage: TurnFailureStage::AgentLoop,
+            cause: TurnFailureCause::Provider(ProviderFailureKind::Timeout),
+            message: "provider timed out".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap()["severity"],
+            "warning"
+        );
+        assert_eq!(serde_json::to_value(attempt).unwrap()["status"], "started");
+        let error = serde_json::to_value(error).unwrap();
+        assert_eq!(error["stage"], "agent_loop");
+        assert_eq!(error["cause"], "provider_timeout");
     }
 }

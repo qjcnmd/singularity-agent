@@ -86,11 +86,28 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
 }
 
 /// 非致命运行时诊断的严重级别（AgentLoop 发射）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentDiagnosticSeverity {
     Info,
     Warning,
     Error,
+}
+
+impl AgentDiagnosticSeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for AgentDiagnosticSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// 安全、非持久化的诊断。`code` 对投影方稳定；`message` 文本刻意
