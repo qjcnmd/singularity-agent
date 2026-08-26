@@ -98,6 +98,8 @@ pub(crate) struct TuiApp {
     /// /compact 后台压缩进行中；Esc 通过 `compact_cancel` 中止本次压缩。
     pub(super) compacting: bool,
     pub(super) compact_cancel: Option<singularity_core::CancellationToken>,
+    /// /compact 排队中：活动 turn 结束后自动启动压缩。
+    pub(super) compact_queued: bool,
 }
 
 impl TuiApp {
@@ -129,6 +131,7 @@ impl TuiApp {
             wheel: WheelNormalizer::default(),
             compacting: false,
             compact_cancel: None,
+            compact_queued: false,
         }
     }
 
@@ -250,7 +253,9 @@ impl TuiApp {
     }
 
     /// 整个 run_turn 调用结束（含其后续队列执行完毕）。
-    pub fn on_chain_finished(&mut self, result: &Result<TurnStatus, String>) {
+    /// turn 链终态回调：复位运行相位，并在存在排队压缩时武装并返回
+    /// `Action::Compact` 由事件循环 spawn 后台压缩线程。
+    pub fn on_chain_finished(&mut self, result: &Result<TurnStatus, String>) -> Action {
         self.phase = Phase::Idle;
         self.set_waiting(WaitingTarget::None);
         self.quit_armed = false;
@@ -266,6 +271,16 @@ impl TuiApp {
                     .push_note(format!("✖ {message}"), NoteStyle::Error);
             }
         }
+        // 排队压缩在 turn 终态后自动启动（复用同一压缩路径与取消令牌）。
+        if self.compact_queued {
+            self.compact_queued = false;
+            self.compacting = true;
+            self.compact_cancel = Some(singularity_core::CancellationToken::new());
+            self.transcript
+                .push_note("compacting context…", NoteStyle::Dim);
+            return Action::Compact;
+        }
+        Action::Continue
     }
 
     #[cfg(test)]
@@ -351,6 +366,10 @@ impl TuiApp {
                 // 压缩进行中：Esc 取消本次压缩（与中断同一按键语义）。
                 if self.compacting {
                     self.cancel_compact();
+                } else if self.compact_queued {
+                    self.compact_queued = false;
+                    self.transcript
+                        .push_note("compaction cancelled", NoteStyle::Warning);
                 }
             }
             KeyCode::Char('d') if ctrl && self.editor.is_empty() => return Action::Exit(0),

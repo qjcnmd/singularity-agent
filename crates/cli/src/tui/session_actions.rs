@@ -32,6 +32,8 @@ impl TuiApp {
         self.transcript = Transcript::new();
         self.scroll = ScrollState::default();
         self.session_tokens = session_tokens;
+        // 换绑会话丢弃待执行的排队压缩（旧会话的请求不再有效）。
+        self.compact_queued = false;
     }
 
     /// 换绑到已持久化的会话；失败时只记 note，状态不变。
@@ -142,6 +144,16 @@ impl TuiApp {
                 if self.compacting {
                     self.transcript
                         .push_note("compaction already in progress", NoteStyle::Dim);
+                } else if self.compact_queued {
+                    self.transcript
+                        .push_note("compaction already queued", NoteStyle::Dim);
+                } else if self.conversation.has_active_turn() {
+                    // 活动 turn 期间排队，turn 到达终态后由
+                    // `on_chain_finished` 自动启动压缩（与 pi 的
+                    // "waiting until idle" 语义一致）。
+                    self.compact_queued = true;
+                    self.transcript
+                        .push_note("compaction queued; will run when the turn finishes", NoteStyle::Dim);
                 } else {
                     self.compacting = true;
                     self.compact_cancel = Some(CancellationToken::new());

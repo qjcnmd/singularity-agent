@@ -231,7 +231,14 @@ fn event_loop(
         while let Ok(event) = rx.try_recv() {
             match event {
                 UiEvent::FromTurn(turn_event) => app.on_turn_event(turn_event.as_ref()),
-                UiEvent::ChainFinished(result) => app.on_chain_finished(&result),
+                UiEvent::ChainFinished(result) => {
+                    // 终态后可能带出排队中的 /compact（Action::Compact），
+                    // 与键盘触发的压缩走同一 spawn 路径。
+                    if let Action::Compact = app.on_chain_finished(&result) {
+                        let cancellation = app.compact_token();
+                        spawn_compact(&app.conversation_handle(), cancellation, tx.clone());
+                    }
+                }
                 UiEvent::CompactFinished(result) => app.on_compact_finished(result),
             }
         }

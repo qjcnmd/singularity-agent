@@ -469,3 +469,122 @@ fn compact_command_arms_state_and_returns_the_async_action() {
         "finished compaction drops the token"
     );
 }
+
+#[test]
+fn compact_queues_when_turn_active_and_runs_on_chain_finished() {
+    let (_home, sessions) = test_home();
+    let (release_tx, release_rx) = mpsc::channel();
+    let conversation = test_conversation(
+        &sessions,
+        Arc::new(GatedOnceProvider {
+            release: std::sync::Mutex::new(release_rx),
+        }),
+    );
+    let mut app = TuiApp::new(Arc::clone(&conversation));
+    let (tx, rx) = mpsc::channel::<crate::tui::UiEvent>();
+
+    // 启动活动 turn（provider 阻塞直到放行）。
+    for ch in "initial".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        Action::Submit(goal) => crate::tui::spawn_turn(&conversation, goal, tx.clone()),
+        other => panic!("expected Submit action, got {other:?}"),
+    }
+    for _ in 0..400 {
+        if conversation.has_active_turn() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(conversation.has_active_turn(), "gated turn must be active");
+
+    // 活动 turn 期间按 /compact：排队而非立即执行。
+    for ch in "/compact".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    let action = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(action, Action::Continue, "/compact queues during a turn");
+    assert!(app.compact_queued, "compaction is queued");
+    assert!(!app.compacting, "not yet compacting");
+
+    // 放行 turn：链条结束后排队压缩自动触发。
+    release_tx.send(()).expect("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(16)) {
+            Ok(crate::tui::UiEvent::ChainFinished(result)) => {
+                let action = app.on_chain_finished(&result);
+                assert_eq!(
+                    action,
+                    Action::Compact,
+                    "queued compaction fires after chain finish"
+                );
+                assert!(!app.compact_queued, "queue is consumed");
+                assert!(app.compacting, "compaction armed");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("chain should finish"),
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for chain finish");
+        }
+    }
+}
+
+#[test]
+fn compact_queued_cancelled_by_esc() {
+    let (_home, sessions) = test_home();
+    let (release_tx, release_rx) = mpsc::channel();
+    let conversation = test_conversation(
+        &sessions,
+        Arc::new(GatedOnceProvider {
+            release: std::sync::Mutex::new(release_rx),
+        }),
+    );
+    let mut app = TuiApp::new(Arc::clone(&conversation));
+    let (tx, rx) = mpsc::channel::<crate::tui::UiEvent>();
+
+    for ch in "initial".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        Action::Submit(goal) => crate::tui::spawn_turn(&conversation, goal, tx.clone()),
+        other => panic!("expected Submit action, got {other:?}"),
+    }
+    for _ in 0..400 {
+        if conversation.has_active_turn() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(conversation.has_active_turn(), "gated turn must be active");
+
+    for ch in "/compact".chars() {
+        app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        Action::Continue
+    );
+    assert!(app.compact_queued, "compaction is queued");
+
+    // Esc 取消排队压缩（turn 中断 + 排队取消同一按键语义）。
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.compact_queued, "Esc cancels queued compaction");
+
+    // 放行 turn 并等待链条结束，保证夹具线程干净退出。
+    release_tx.send(()).expect("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(16)) {
+            Ok(crate::tui::UiEvent::ChainFinished(_)) => break,
+            Ok(_) => {}
+            Err(_) => panic!("chain should finish"),
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for chain finish");
+        }
+    }
+}
