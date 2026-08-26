@@ -23,7 +23,6 @@ use singularity_runtime::{
 };
 
 use super::*;
-use crate::state::LiveTurnGuard;
 
 /// 把一个 runtime turn 投影为协议线格式。
 pub(crate) fn wire_turn(turn: &RuntimeTurn) -> Turn {
@@ -55,7 +54,6 @@ pub(crate) struct TurnProjection<'a> {
     conversation: Arc<Conversation>,
     request_id: JsonRpcId,
     emit: &'a mut dyn FnMut(Value),
-    live_turn: Option<LiveTurnGuard>,
     response_sent: bool,
     poisoned: Option<AppServerError>,
 }
@@ -72,7 +70,6 @@ impl<'a> TurnProjection<'a> {
             conversation,
             request_id,
             emit,
-            live_turn: None,
             response_sent: false,
             poisoned: None,
         }
@@ -108,10 +105,6 @@ impl<'a> TurnProjection<'a> {
         if self.server.execution_stopped.load(Ordering::SeqCst) {
             self.conversation.interrupt();
         }
-        self.live_turn = Some(
-            self.server
-                .register_live_turn(&turn.turn_id, &turn.thread_id),
-        );
         self.emit_notification(AppEvent::turn_started(&wire_turn(turn)));
         if !self.response_sent {
             self.response_sent = true;
@@ -136,11 +129,9 @@ impl TurnEventSink for TurnProjection<'_> {
         match event {
             TurnEvent::TurnStarted { turn } => self.on_turn_started(&turn),
             TurnEvent::TurnCompleted { turn } => {
-                self.live_turn = None;
                 self.emit_notification(AppEvent::turn_completed(&wire_turn(&turn)));
             }
             TurnEvent::TurnFailed { turn, error } => {
-                self.live_turn = None;
                 self.emit_notification(AppEvent::turn_error(
                     &turn.turn_id,
                     &turn.thread_id,

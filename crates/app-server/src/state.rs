@@ -1,7 +1,7 @@
 //! 唯一 AppServer 运行时状态容器与 Thread 协调器注册表。
 //!
 //! Turn 执行全部委托给 [`singularity_runtime::Conversation`]；这里只维护
-//! 线程→协调器映射、存活 turn 注册表（供控制通道与投影判定），
+//! 线程→协调器映射（供控制通道与投影判定），
 //! 不复制 Agent 状态、取消或 usage。
 
 use std::collections::HashMap;
@@ -27,8 +27,6 @@ pub struct AppServer {
     pub(super) turn_runner: Arc<TurnRunner>,
     /// thread_id → 长驻协调器；首次接触时按 JSONL 重开并修复。
     pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
-    /// turn_id → thread_id：仅登记执行窗口（TurnStarted 后、终态事件前）。
-    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
 }
 
@@ -45,7 +43,6 @@ pub struct AppServerCancellationHandle {
 /// 全部路由到协调器，不复制执行状态。
 #[derive(Clone)]
 pub struct AppServerControlHandle {
-    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
 }
 
@@ -99,24 +96,22 @@ impl AppServerControlHandle {
     ) -> AppServerResult<Vec<Value>> {
         let params: TurnInjectionParams = crate::dispatch::parse_params(&message)?;
         let text = crate::dispatch::input_items_to_text(&params.input)?;
-        let owner = self
-            .live_turns
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(&params.turn_id)
-            .cloned();
-        let Some(thread_id) = owner else {
-            return super::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
-        };
-        let Some(conversation) = self
+        let conversation = self
             .conversations
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(&thread_id)
-            .cloned()
-        else {
+            .values()
+            .find(|conversation| {
+                conversation.active_turn_id().as_deref() == Some(params.turn_id.as_str())
+            })
+            .cloned();
+        let Some(conversation) = conversation else {
             return super::dispatch::not_found_response(message.required_id(), TURN_NOT_FOUND);
         };
+        let thread_id = conversation
+            .thread()
+            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .thread_id;
         let accepted = if follow_up {
             conversation.submit_follow_up(text)
         } else {
@@ -142,22 +137,14 @@ impl AppServerControlHandle {
     }
 
     fn interrupt_turn(&self, turn_id: &str) -> AppServerResult<bool> {
-        let owner = self
-            .live_turns
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(turn_id)
-            .cloned();
-        let Some(thread_id) = owner else {
-            return Ok(false);
-        };
-        let Some(conversation) = self
+        let conversation = self
             .conversations
             .lock()
             .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
-            .get(&thread_id)
-            .cloned()
-        else {
+            .values()
+            .find(|conversation| conversation.active_turn_id().as_deref() == Some(turn_id))
+            .cloned();
+        let Some(conversation) = conversation else {
             return Ok(false);
         };
         conversation.interrupt();
@@ -188,39 +175,6 @@ impl AppServerCancellationHandle {
     }
 }
 
-/// 存活 turn 的执行窗口守卫：drop 时从注册表移除。
-pub(super) struct LiveTurnGuard {
-    pub(super) turn_id: String,
-    pub(super) live_turns: Arc<Mutex<HashMap<String, String>>>,
-}
-
-impl LiveTurnGuard {
-    /// 登记 turn 执行窗口；同 id 重复登记保持首见归属。
-    pub(super) fn register(
-        live_turns: Arc<Mutex<HashMap<String, String>>>,
-        turn_id: &str,
-        thread_id: &str,
-    ) -> Self {
-        if let Ok(mut turns) = live_turns.lock() {
-            turns
-                .entry(turn_id.to_string())
-                .or_insert(thread_id.to_string());
-        }
-        Self {
-            turn_id: turn_id.to_string(),
-            live_turns,
-        }
-    }
-}
-
-impl Drop for LiveTurnGuard {
-    fn drop(&mut self) {
-        if let Ok(mut turns) = self.live_turns.lock() {
-            turns.remove(&self.turn_id);
-        }
-    }
-}
-
 impl AppServer {
     pub fn new(provider_snapshot: ProviderConfigSnapshot, sessions_dir: impl AsRef<Path>) -> Self {
         let sessions_dir = sessions_dir.as_ref().to_path_buf();
@@ -236,7 +190,6 @@ impl AppServer {
             provider_snapshot,
             turn_runner,
             conversations: Arc::new(Mutex::new(HashMap::new())),
-            live_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -277,7 +230,6 @@ impl AppServer {
 
     pub fn control_handle(&self) -> AppServerControlHandle {
         AppServerControlHandle {
-            live_turns: Arc::clone(&self.live_turns),
             conversations: Arc::clone(&self.conversations),
         }
     }
@@ -292,7 +244,6 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             turn_runner: Arc::clone(&self.turn_runner),
             conversations: Arc::clone(&self.conversations),
-            live_turns: Arc::clone(&self.live_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
         })
     }
@@ -338,16 +289,6 @@ impl AppServer {
 
     /// 该会话当前是否存在存活 turn（执行窗口内）。
     pub(crate) fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        let has_live = self
-            .live_turns
-            .lock()
-            .ok()
-            .is_some_and(|turns| turns.values().any(|owner| owner == session_id));
-        if has_live {
-            return true;
-        }
-        // 单写者执行期不经过 live_turns（inline 执行路径）：协调器自身的
-        // 活动标记是权威。
         self.conversations
             .lock()
             .ok()
@@ -364,11 +305,6 @@ impl AppServer {
         self.turn_runner
             .validate_model_selector(selector)
             .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))
-    }
-
-    /// 注册活动窗口；返回的守卫在终态事件后 drop 时移除注册。
-    pub(super) fn register_live_turn(&self, turn_id: &str, thread_id: &str) -> LiveTurnGuard {
-        LiveTurnGuard::register(Arc::clone(&self.live_turns), turn_id, thread_id)
     }
 
     /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的

@@ -78,13 +78,15 @@ impl SettingsPatch {
 /// 保证 started 后立即注入必成功；终态化前由 runner 关闭注入窗口。
 #[derive(Default)]
 pub struct TurnControls {
+    pub(crate) turn_id: Mutex<String>,
     pub cancellation: CancellationToken,
     pub(crate) inbox: Mutex<Option<TurnInboxHandle>>,
 }
 
 impl TurnControls {
-    pub fn new() -> Self {
+    pub fn new(turn_id: impl Into<String>) -> Self {
         Self {
+            turn_id: Mutex::new(turn_id.into()),
             cancellation: CancellationToken::new(),
             inbox: Mutex::new(None),
         }
@@ -102,7 +104,10 @@ impl TurnControls {
         })
     }
 
-    pub(crate) fn register_inbox(&self, _turn_id: &str, inbox: TurnInboxHandle) {
+    pub(crate) fn register_inbox(&self, turn_id: &str, inbox: TurnInboxHandle) {
+        if let Ok(mut id) = self.turn_id.lock() {
+            *id = turn_id.to_string();
+        }
         if let Ok(mut guard) = self.inbox.lock() {
             *guard = Some(inbox);
         }
@@ -267,6 +272,14 @@ impl Conversation {
             // 状态未知时保持删除与并发启动护栏关闭，避免把潜在写者误判为空闲。
             Err(_) => true,
         }
+    }
+
+    /// 当前 turn id；预订阶段与空闲阶段均无活动 turn。
+    pub fn active_turn_id(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|state| match &state.turn {
+            TurnLifecycle::Running(controls) => controls.turn_id.lock().ok().map(|id| id.clone()),
+            TurnLifecycle::Idle | TurnLifecycle::Reserved => None,
+        })
     }
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时为 false。
@@ -460,7 +473,7 @@ impl Conversation {
             if !matches!(state.turn, TurnLifecycle::Reserved) {
                 return Err(ConversationError::TurnAlreadyActive);
             }
-            let controls = Arc::new(TurnControls::new());
+            let controls = Arc::new(TurnControls::new(String::new()));
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             controls
         };
