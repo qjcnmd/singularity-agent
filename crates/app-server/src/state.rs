@@ -99,7 +99,9 @@ impl AppServerControlHandle {
         let conversation = self
             .conversations
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+            })?
             .values()
             .find(|conversation| {
                 conversation.active_turn_id().as_deref() == Some(params.turn_id.as_str())
@@ -110,7 +112,9 @@ impl AppServerControlHandle {
         };
         let thread_id = conversation
             .thread()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation thread unavailable: {error}"))
+            })?
             .thread_id;
         let accepted = if follow_up {
             conversation.submit_follow_up(text)
@@ -140,7 +144,9 @@ impl AppServerControlHandle {
         let conversation = self
             .conversations
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+            })?
             .values()
             .find(|conversation| conversation.active_turn_id().as_deref() == Some(turn_id))
             .cloned();
@@ -159,7 +165,9 @@ impl AppServerCancellationHandle {
         let conversations: Vec<Arc<Conversation>> = self
             .conversations
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+            })?
             .values()
             .cloned()
             .collect();
@@ -258,17 +266,18 @@ impl AppServer {
         if let Some(conversation) = self
             .conversations
             .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+            })?
             .get(session_id)
             .cloned()
         {
             return Ok(conversation);
         }
         // 慢路径：持锁完成重投影与回插；锁内二次检查挡住并发未命中。
-        let mut guard = self
-            .conversations
-            .lock()
-            .map_err(|_| AppServerError::Workspace(SAFE_WORKSPACE_FAILURE.into()))?;
+        let mut guard = self.conversations.lock().map_err(|error| {
+            AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+        })?;
         if let Some(conversation) = guard.get(session_id).cloned() {
             return Ok(conversation);
         }
@@ -294,11 +303,6 @@ impl AppServer {
             .ok()
             .and_then(|map| map.get(session_id).cloned())
             .is_some_and(|conversation| conversation.has_active_turn())
-    }
-
-    /// 该会话当前是否正被删除拒绝（存在存活 turn 或活动协调器）。
-    pub(crate) fn thread_turn_active(&self, session_id: &str) -> bool {
-        self.thread_has_live_turn(session_id)
     }
 
     pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {

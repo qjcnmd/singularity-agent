@@ -25,7 +25,7 @@ pub(super) fn input_items_to_text(
         .collect::<Vec<_>>()
         .join("\n");
     if text.trim().is_empty() {
-        return Err(AppServerError::Workspace(
+        return Err(AppServerError::InvalidParams(
             "persisted turn input is empty".to_string(),
         ));
     }
@@ -301,11 +301,7 @@ impl AppServer {
             model.clone(),
         ) {
             Ok(thread) => thread,
-            Err(_) => {
-                return Err(AppServerError::Workspace(
-                    SAFE_WORKSPACE_FAILURE.to_string(),
-                ));
-            }
+            Err(error) => return Err(AppServerError::Store(error)),
         };
         let protocol_thread = Thread {
             thread_id: thread.thread_id,
@@ -415,7 +411,7 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode。
-        if self.thread_turn_active(&record.thread_id) {
+        if self.thread_has_live_turn(&record.thread_id) {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
         // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。

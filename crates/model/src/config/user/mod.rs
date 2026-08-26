@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ProviderConfigLayer;
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
-use crate::config::{ProviderConfigLayer, parse_model_selector};
 use crate::error::ProviderError;
 use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
 
@@ -244,39 +244,11 @@ pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool,
 
 pub(crate) fn user_config_layer() -> Option<ProviderConfigLayer> {
     match read_user_config_data() {
-        Ok(Some(user_config)) => {
-            let mut layer = ProviderConfigLayer {
-                user_config: Some(user_config.clone()),
-                user_config_error: None,
-                ..ProviderConfigLayer::default()
-            };
-            let default_provider = user_config
-                .config
-                .default_provider
-                .clone()
-                .or_else(|| {
-                    user_config
-                        .config
-                        .default_model
-                        .as_deref()
-                        .and_then(|selector| parse_model_selector(selector).ok())
-                        .map(|selector| selector.provider_name.to_string())
-                })
-                .or_else(|| user_config.config.providers.keys().next().cloned());
-            if let Some(provider_name) = default_provider
-                && let Some(provider) = user_config.config.providers.get(&provider_name)
-            {
-                layer.provider_name = Some(provider_name.clone());
-                layer.base_url = Some(provider.base_url.clone());
-                layer.api_key = user_config
-                    .auth
-                    .providers
-                    .get(&provider_name)
-                    .map(|provider| provider.api_key.clone());
-                layer.model_name = user_config.config.default_model.clone();
-            }
-            Some(layer)
-        }
+        Ok(Some(user_config)) => Some(ProviderConfigLayer {
+            user_config: Some(user_config),
+            user_config_error: None,
+            ..ProviderConfigLayer::default()
+        }),
         Ok(None) => None,
         Err(error) => Some(ProviderConfigLayer {
             user_config_error: Some(error),

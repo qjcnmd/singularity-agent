@@ -23,9 +23,7 @@ pub fn thread_from_summary(
     }
 }
 
-pub const SESSIONS_DIR_NAME: &str = "sessions";
-
-/// `~/.singularity` 下的固定路径集合。
+/// `~/.singularity` 下的固定路径集合（会话目录名复用 runtime 单一事实源）。
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub home_dir: PathBuf,
@@ -37,7 +35,7 @@ impl AppPaths {
         let home = user_singularity_home()
             .ok_or_else(|| "cannot resolve SINGULARITY_HOME for sessions".to_string())?;
         Ok(Self {
-            sessions_dir: home.join(SESSIONS_DIR_NAME),
+            sessions_dir: home.join(singularity_runtime::store::SESSIONS_DIR_NAME),
             home_dir: home,
         })
     }

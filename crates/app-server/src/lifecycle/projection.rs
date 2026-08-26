@@ -4,8 +4,6 @@
 //! 事件配对（item/started 与终端、turn 开始与终态）由 runtime 保证；这里
 //! 不做任何执行侧状态机，只做纯投影。
 
-use std::sync::atomic::Ordering;
-
 use singularity_protocol::{
     DiagnosticSeverity, JsonRpcId, JsonRpcMessage, ProviderAttemptParams,
     ProviderAttemptStatus as ProtocolProviderAttemptStatus,
@@ -111,7 +109,7 @@ impl<'a> TurnProjection<'a> {
     /// turn/started 到达时 JSONL 已落盘。执行停止请求在入场时立即取消，
     /// 使被取消的轮快速收敛为 interrupted。
     fn on_turn_started(&mut self, turn: &RuntimeTurn) {
-        if self.server.execution_stopped.load(Ordering::SeqCst) {
+        if self.server.cancellation_handle().execution_stop_requested() {
             self.conversation.interrupt();
         }
         self.emit_notification(AppEvent::turn_started(&wire_turn(turn)));
