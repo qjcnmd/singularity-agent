@@ -588,7 +588,7 @@ pub(crate) fn run_turn_request(
     cancellation: AppServerCancellationHandle,
     claim: crate::TurnStartClaim,
 ) -> Result<(), String> {
-    let request_id = claim.request_id.clone();
+    let request_id = claim.request_id;
     let mut output_error = None;
     let mut emit = |output: AppServerOutput| {
         if output_error.is_none()

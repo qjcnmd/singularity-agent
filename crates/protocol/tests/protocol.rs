@@ -2,9 +2,9 @@
 
 use serde_json::json;
 use singularity_protocol::{
-    AppEvent, ClientInfo, EmptyParams, ErrorCode, InitializeParams, JsonRpcInbound, JsonRpcMessage,
-    Method, MethodKind, ThreadReadParams, ThreadStartParams, ThreadStatus, TurnInjectionParams,
-    TurnStartParams, TurnStatus, parse_json_rpc_payload,
+    AppEvent, ClientInfo, EmptyParams, ErrorCode, InitializeParams, JsonRpcId, JsonRpcInbound,
+    JsonRpcMessage, Method, MethodKind, ThreadReadParams, ThreadStartParams, ThreadStatus,
+    TurnInjectionParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -241,12 +241,40 @@ fn json_rpc_payload_yields_single_message_or_invalid_marker() {
     assert_eq!(
         invalid,
         JsonRpcInbound::Invalid {
-            id: Some(singularity_protocol::JsonRpcId::Number(42))
+            id: Some(singularity_protocol::JsonRpcId(42))
         }
     );
 
     let array = parse_json_rpc_payload(r#"[]"#).expect("empty array");
     assert_eq!(array, JsonRpcInbound::Invalid { id: None });
+}
+
+#[test]
+fn json_rpc_id_is_numeric_only_and_rejects_large_u64_and_string_ids() {
+    // 数字 id 双向往返。
+    let request = JsonRpcMessage::request(Method::ThreadList, JsonRpcId(7), json!({}))
+        .expect("numeric id request");
+    assert_eq!(request.id(), Some(&JsonRpcId(7)));
+    assert_eq!(request.to_wire_value()["id"], 7);
+
+    // 大 u64（超出 i64 范围）id 无法形成请求：解析为 Invalid 且不可恢复 id，
+    // 错误响应关联回 null。
+    let huge = parse_json_rpc_payload(
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":18446744073709551615,"params":{}}"#,
+    )
+    .expect("huge u64 id frame");
+    assert_eq!(huge, JsonRpcInbound::Invalid { id: None });
+
+    // 字符串 id 同样不被接受，无法关联回 null。
+    let string_id = parse_json_rpc_payload(
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
+    )
+    .expect("string id frame");
+    assert_eq!(string_id, JsonRpcInbound::Invalid { id: None });
+
+    // 无法关联的 error response 在 wire 上输出 id: null。
+    let error = JsonRpcMessage::parse_error();
+    assert_eq!(error.to_wire_value()["id"], serde_json::Value::Null);
 }
 
 #[test]

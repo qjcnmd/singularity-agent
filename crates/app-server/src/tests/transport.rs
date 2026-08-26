@@ -365,7 +365,7 @@ fn bounded_line_reader_accepts_frame_at_limit() {
 fn streaming_worker_maps_invalid_params_with_diagnostics() {
     // 流式 lane 与 ordinary lane 一致透出可行动的错误原因。
     let response = request_error_value(
-        Some(JsonRpcId::Number(7)),
+        Some(JsonRpcId(7)),
         &AppServerError::InvalidParams("invalid model selector: base-model#unknown".to_string()),
     );
     assert_eq!(response["jsonrpc"], "2.0");
@@ -380,7 +380,7 @@ fn streaming_worker_maps_invalid_params_with_diagnostics() {
 #[test]
 fn streaming_worker_preserves_invalid_params_diagnostic() {
     let response = request_error_value(
-        Some(JsonRpcId::Number(8)),
+        Some(JsonRpcId(8)),
         &AppServerError::InvalidParams("provider: unsupported selector".to_string()),
     );
     assert_eq!(response["jsonrpc"], "2.0");
@@ -412,7 +412,7 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
     ];
 
     for (expected, error) in cases {
-        let response = transport_error_value(Some(JsonRpcId::Number(7)), &error);
+        let response = transport_error_value(Some(JsonRpcId(7)), &error);
         assert_eq!(response["error"]["code"], -32603, "{expected}");
         let message = response["error"]["message"].as_str().expect("message");
         assert_ne!(message, "Internal error", "real text must not be masked");
@@ -427,7 +427,7 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
 fn transport_error_carries_original_turn_execution_text() {
     let original = "agent loop failed: provider returned 500";
     let response = transport_error_value(
-        Some(JsonRpcId::Number(7)),
+        Some(JsonRpcId(7)),
         &AppServerError::TurnExecution {
             stage: TurnFailureStage::AgentLoop,
             cause: TurnFailureCause::Internal,
@@ -443,7 +443,7 @@ fn transport_error_carries_original_turn_execution_text() {
 fn transport_error_carries_original_terminalization_text() {
     let original = "terminal metadata write failed: database locked";
     let response = transport_error_value(
-        Some(JsonRpcId::Number(7)),
+        Some(JsonRpcId(7)),
         &AppServerError::TurnTerminalization {
             stage: TurnFailureStage::TerminalOutcome,
             cause: TurnFailureCause::Store,
@@ -553,7 +553,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
 #[test]
 fn transport_error_preserves_workspace_diagnostic_text() {
     let error = AppServerError::Workspace("cannot open provider: local".to_string());
-    let response = transport_error_value(Some(JsonRpcId::Number(7)), &error);
+    let response = transport_error_value(Some(JsonRpcId(7)), &error);
 
     assert_eq!(response["error"]["code"], -32603);
     assert_eq!(

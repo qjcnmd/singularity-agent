@@ -191,49 +191,20 @@ method_registry! {
     ServerShutdown => ("server/shutdown", Request, EmptyParams),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-/// JSON-RPC id；请求仅允许字符串或合法整数，无法关联的错误响应使用 null。
-pub enum JsonRpcId {
-    String(String),
-    Number(i64),
-    Unsigned(u64),
-    Null,
-}
+/// JSON-RPC id：单一数字（i64）。请求、响应与错误响应只接受数字 id；
+/// 无法关联的响应（parse error 等）以 `id: null` 表示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonRpcId(pub i64);
 
 impl From<i64> for JsonRpcId {
     fn from(value: i64) -> Self {
-        Self::Number(value)
-    }
-}
-
-impl From<String> for JsonRpcId {
-    fn from(value: String) -> Self {
-        Self::String(value)
+        Self(value)
     }
 }
 
 impl From<i32> for JsonRpcId {
     fn from(value: i32) -> Self {
-        Self::Number(i64::from(value))
-    }
-}
-
-impl From<u64> for JsonRpcId {
-    fn from(value: u64) -> Self {
-        Self::Unsigned(value)
-    }
-}
-
-impl From<u32> for JsonRpcId {
-    fn from(value: u32) -> Self {
-        Self::Unsigned(u64::from(value))
-    }
-}
-
-impl From<&str> for JsonRpcId {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_string())
+        Self(i64::from(value))
     }
 }
 
@@ -249,7 +220,6 @@ enum JsonRpcVersion {
 pub struct JsonRpcRequest {
     jsonrpc: JsonRpcVersion,
     pub method: String,
-    #[serde(deserialize_with = "deserialize_request_id")]
     pub id: JsonRpcId,
     #[serde(default = "empty_params")]
     pub params: Value,
@@ -276,10 +246,10 @@ pub struct JsonRpcSuccess {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// JSON-RPC error response。
+/// JSON-RPC error response；无法关联到请求 id 时以 `null` 表示。
 pub struct JsonRpcErrorResponse {
     jsonrpc: JsonRpcVersion,
-    pub id: JsonRpcId,
+    pub id: Option<JsonRpcId>,
     pub error: JsonRpcError,
 }
 
@@ -326,24 +296,7 @@ pub fn parse_json_rpc_payload(input: &str) -> Result<JsonRpcInbound, JsonRpcPars
 
 fn recover_typed_id(value: &Value) -> Option<JsonRpcId> {
     let id = value.as_object()?.get("id")?;
-    match serde_json::from_value(id.clone()).ok()? {
-        JsonRpcId::Null => None,
-        id => Some(id),
-    }
-}
-
-/// 请求 envelope 只接受字符串或合法整数；Null 仅保留给 response/error 关联边界。
-fn deserialize_request_id<'de, D>(deserializer: D) -> Result<JsonRpcId, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let id = JsonRpcId::deserialize(deserializer)?;
-    if matches!(id, JsonRpcId::Null) {
-        return Err(serde::de::Error::custom(
-            "JSON-RPC request id must be a string or integer",
-        ));
-    }
-    Ok(id)
+    serde_json::from_value(id.clone()).ok()
 }
 
 impl JsonRpcMessage {
@@ -371,11 +324,11 @@ impl JsonRpcMessage {
         })
     }
 
-    /// 构造 error response；未知 request id 以标准 null 表示。
+    /// 构造 error response；无法关联的请求 id 以标准 null 表示。
     pub fn error(id: impl Into<Option<JsonRpcId>>, error: ErrorCode) -> Self {
         Self::Error(JsonRpcErrorResponse {
             jsonrpc: JsonRpcVersion::V2,
-            id: id.into().unwrap_or(JsonRpcId::Null),
+            id: id.into(),
             error: JsonRpcError {
                 code: error.code,
                 message: error.message,
@@ -428,12 +381,13 @@ impl JsonRpcMessage {
         }
     }
 
-    /// 返回 request 或 response 的 typed id。
+    /// 返回 request 或 response 的 typed id；error response 无法关联时为
+    /// `None`（wire 上为 null）。
     pub fn id(&self) -> Option<&JsonRpcId> {
         match self {
             Self::Request(message) => Some(&message.id),
             Self::Success(message) => Some(&message.id),
-            Self::Error(message) => Some(&message.id),
+            Self::Error(message) => message.id.as_ref(),
             Self::Notification(_) => None,
         }
     }
@@ -462,19 +416,6 @@ impl JsonRpcMessage {
         self.id()
             .cloned()
             .expect("dispatcher supplies a request id")
-    }
-
-    /// 将 notification 转为只供 dispatcher 内部执行的带 id 请求。
-    pub fn into_request_with_id(self, id: JsonRpcId) -> Self {
-        match self {
-            Self::Notification(message) => Self::Request(JsonRpcRequest {
-                jsonrpc: JsonRpcVersion::V2,
-                method: message.method,
-                id,
-                params: message.params,
-            }),
-            message => message,
-        }
     }
 
     /// 生成发送到 stdio 的 JSON 值。

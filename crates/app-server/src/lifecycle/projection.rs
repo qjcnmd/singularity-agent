@@ -127,7 +127,7 @@ impl<'a> TurnProjection<'a> {
                 }
             };
             self.emit_value(
-                JsonRpcMessage::response(self.request_id.clone(), value).to_wire_value(),
+                JsonRpcMessage::response(self.request_id, value).to_wire_value(),
             );
         }
     }

@@ -132,17 +132,13 @@ impl AppServer {
             };
         }
 
-        let message = if notification {
-            message.into_request_with_id(JsonRpcId::Number(0))
-        } else {
-            message
-        };
-
+        // 通知直达处理器：不合成 id，无响应路径；Request-kind 方法的
+        // notification 已在上面静默忽略，此处只可能是 Notification-kind 方法。
         let result = match method {
             Method::Initialize => self.initialize(message),
             Method::Initialized => {
                 self.initialized_acknowledged = true;
-                json_response(message.required_id(), singularity_protocol::EmptyResult {})
+                Ok(Vec::new())
             }
             Method::ThreadList => self.thread_list(message),
             Method::ThreadStart => self.thread_start(message),
