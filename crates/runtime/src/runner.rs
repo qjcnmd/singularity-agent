@@ -851,13 +851,6 @@ fn workspace_path(thread: &Thread) -> Result<String, String> {
     Ok(thread.cwd.clone())
 }
 
-fn serialized_enum_text<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn provider_attempt_event(
     thread: &Thread,
     turn_id: &str,
@@ -871,7 +864,7 @@ fn provider_attempt_event(
             model_turn_ordinal,
             provider: started.provider_name.clone(),
             model: started.model_name.clone(),
-            protocol: serialized_enum_text(&started.actual_api_protocol),
+            protocol: started.actual_api_protocol,
             status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,
@@ -883,14 +876,14 @@ fn provider_attempt_event(
             model_turn_ordinal,
             provider: occurrence.provider_name.clone(),
             model: occurrence.model_name.clone(),
-            protocol: serialized_enum_text(&occurrence.actual_api_protocol),
+            protocol: occurrence.actual_api_protocol,
             status: match occurrence.terminal_status {
                 ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
                 ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
                 ModelProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
             },
             attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-            error_category: occurrence.error_category.as_ref().map(serialized_enum_text),
+            error_category: occurrence.error_category.clone(),
             diagnostic_code: occurrence.diagnostic_code.clone(),
         },
     }

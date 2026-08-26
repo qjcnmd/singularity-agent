@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 pub use singularity_agent::agent::AgentDiagnosticSeverity;
+use singularity_model::{ModelErrorCategory, ProviderApiProtocol};
 
 use crate::error::{TurnFailureCause, TurnFailureStage};
 use crate::objects::{Thread, Turn};
@@ -105,12 +106,12 @@ pub enum TurnEvent {
         model_turn_ordinal: u32,
         provider: String,
         model: String,
-        protocol: String,
+        protocol: ProviderApiProtocol,
         status: ProviderAttemptStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        error_category: Option<String>,
+        error_category: Option<ModelErrorCategory>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostic_code: Option<String>,
     },
@@ -192,7 +193,7 @@ mod tests {
             model_turn_ordinal: 1,
             provider: "provider".to_string(),
             model: "model".to_string(),
-            protocol: "open_ai_chat_completions".to_string(),
+            protocol: ProviderApiProtocol::OpenAiChatCompletions,
             status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,
@@ -208,7 +209,9 @@ mod tests {
             serde_json::to_value(diagnostic).unwrap()["severity"],
             "warning"
         );
-        assert_eq!(serde_json::to_value(attempt).unwrap()["status"], "started");
+        let attempt_value = serde_json::to_value(&attempt).unwrap();
+        assert_eq!(attempt_value["status"], "started");
+        assert_eq!(attempt_value["protocol"], "open_ai_chat_completions");
         let error = serde_json::to_value(error).unwrap();
         assert_eq!(error["stage"], "agent_loop");
         assert_eq!(error["cause"], "provider_timeout");

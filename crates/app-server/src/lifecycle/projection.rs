@@ -24,6 +24,15 @@ use singularity_runtime::{
 
 use super::*;
 
+/// 把 runtime typed 枚举转换为协议 wire 词形（serde snake_case 单一来源，
+/// 与 JSONL 渲染共用同一词形）。
+fn enum_wire_word<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// 把一个 runtime turn 投影为协议线格式。
 pub(crate) fn wire_turn(turn: &RuntimeTurn) -> Turn {
     Turn {
@@ -241,10 +250,10 @@ impl TurnEventSink for TurnProjection<'_> {
                 model_turn_ordinal,
                 provider,
                 model,
-                protocol,
+                enum_wire_word(protocol),
                 protocol_provider_attempt_status(status),
                 attempt_duration_ms,
-                error_category,
+                error_category.map(enum_wire_word),
                 diagnostic_code,
             )),
         }
