@@ -128,14 +128,23 @@ impl SseFrameDecoder {
     }
 }
 
-/// 解码一个 Chat Completions body，保留任意 HTTP chunk 与 SSE 帧边界。
-pub(super) fn read_openai_chat_sse(
+/// 流式解码器的统一读取契约：`read_sse_stream` 以该 trait 泛型驱动 chunk
+/// 循环；协议差异只保留在 `push`/`finish` 与各自的 malformed 构造器里。
+trait SseStreamDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError>;
+    fn finish(&mut self) -> Result<Value, ProviderError>;
+    fn emitted_text_delta(&self) -> bool;
+    fn time_to_first_text_delta_ms(&self) -> Option<u64>;
+}
+
+/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，任一失败路径都带
+/// 解码器边界快照（是否已发射文本增量、首增量耗时）。
+fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
     mut response: Response,
-    on_event: &mut dyn FnMut(ProviderStreamEvent),
-    attempt_started_at: Instant,
+    mut decoder: D,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
     if response
         .content_length()
@@ -147,7 +156,6 @@ pub(super) fn read_openai_chat_sse(
             time_to_first_text_delta_ms: None,
         });
     }
-    let mut decoder = ChatSseDecoder::new(on_event, attempt_started_at);
     loop {
         let chunk = match block_on_provider_future(
             runtime,
@@ -161,8 +169,8 @@ pub(super) fn read_openai_chat_sse(
             Err(error) => {
                 return Err(StreamAttemptFailure {
                     error,
-                    emitted_text_delta: decoder.emitted_text_delta,
-                    time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+                    emitted_text_delta: decoder.emitted_text_delta(),
+                    time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
                 });
             }
         };
@@ -170,22 +178,40 @@ pub(super) fn read_openai_chat_sse(
         if let Err(error) = decoder.push(&chunk) {
             return Err(StreamAttemptFailure {
                 error,
-                emitted_text_delta: decoder.emitted_text_delta,
-                time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+                emitted_text_delta: decoder.emitted_text_delta(),
+                time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
             });
         }
     }
     match decoder.finish() {
         Ok(payload) => Ok(StreamAttemptSuccess {
             payload,
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
         }),
         Err(error) => Err(StreamAttemptFailure {
             error,
-            emitted_text_delta: decoder.emitted_text_delta,
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
+            emitted_text_delta: decoder.emitted_text_delta(),
+            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
         }),
     }
+}
+
+/// 解码一个 Chat Completions body，保留任意 HTTP chunk 与 SSE 帧边界。
+pub(super) fn read_openai_chat_sse(
+    runtime: &tokio::runtime::Handle,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    response: Response,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+    attempt_started_at: Instant,
+) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
+    read_sse_stream(
+        runtime,
+        cancellation,
+        request_timeout_seconds,
+        response,
+        ChatSseDecoder::new(on_event, attempt_started_at),
+    )
 }
 
 pub(super) struct ChatToolAccumulator {
@@ -212,6 +238,30 @@ pub(super) struct ChatSseDecoder<'a> {
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
+impl SseStreamDecoder for ChatSseDecoder<'_> {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        for frame in self
+            .frames
+            .push(chunk, provider_chat_stream_malformed_error)?
+        {
+            self.dispatch_event(frame)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Value, ProviderError> {
+        ChatSseDecoder::finish(self)
+    }
+
+    fn emitted_text_delta(&self) -> bool {
+        self.emitted_text_delta
+    }
+
+    fn time_to_first_text_delta_ms(&self) -> Option<u64> {
+        self.time_to_first_text_delta_ms
+    }
+}
+
 impl<'a> ChatSseDecoder<'a> {
     pub(super) fn new(
         on_event: &'a mut dyn FnMut(ProviderStreamEvent),
@@ -234,16 +284,6 @@ impl<'a> ChatSseDecoder<'a> {
         }
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        for frame in self
-            .frames
-            .push(chunk, provider_chat_stream_malformed_error)?
-        {
-            self.dispatch_event(frame)?;
-        }
-        Ok(())
-    }
-
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
         let raw = std::str::from_utf8(&frame.data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
@@ -262,7 +302,7 @@ impl<'a> ChatSseDecoder<'a> {
         let payload = serde_json::from_str::<Value>(&raw)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_json"))?;
         if payload.get("error").is_some_and(|error| !error.is_null()) {
-            return Err(provider_chat_stream_terminal_error(
+            return Err(provider_stream_terminal_error(
                 "chat_stream_error",
                 "provider Chat stream returned an error",
             ));
@@ -400,61 +440,17 @@ pub(super) fn read_openai_responses_sse(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
-    mut response: Response,
+    response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
     attempt_started_at: Instant,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
-    {
-        return Err(StreamAttemptFailure {
-            error: provider_response_stream_too_large_error(),
-            emitted_text_delta: false,
-            time_to_first_text_delta_ms: None,
-        });
-    }
-    let mut decoder = ResponsesSseDecoder::new(on_event, attempt_started_at);
-    loop {
-        let chunk = match block_on_provider_future(
-            runtime,
-            cancellation,
-            "provider_response_body_read_failed",
-            ProviderErrorStage::ResponseBodyRead,
-            request_timeout_seconds,
-            || response.chunk(),
-        ) {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                return Err(StreamAttemptFailure {
-                    error,
-                    emitted_text_delta: decoder.emitted_text_delta,
-                    time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
-                });
-            }
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        if let Err(error) = decoder.push(&chunk) {
-            return Err(StreamAttemptFailure {
-                error,
-                emitted_text_delta: decoder.emitted_text_delta,
-                time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
-            });
-        }
-    }
-    match decoder.finish() {
-        Ok(payload) => Ok(StreamAttemptSuccess {
-            payload,
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
-        }),
-        Err(error) => Err(StreamAttemptFailure {
-            error,
-            emitted_text_delta: decoder.emitted_text_delta,
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms,
-        }),
-    }
+    read_sse_stream(
+        runtime,
+        cancellation,
+        request_timeout_seconds,
+        response,
+        ResponsesSseDecoder::new(on_event, attempt_started_at),
+    )
 }
 
 /// 增量、总量有界的 Responses 事件契约 SSE 解码器。
@@ -465,6 +461,30 @@ pub struct ResponsesSseDecoder<'a> {
     attempt_started_at: Instant,
     pub time_to_first_text_delta_ms: Option<u64>,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
+}
+
+impl SseStreamDecoder for ResponsesSseDecoder<'_> {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        for frame in self
+            .frames
+            .push(chunk, provider_responses_stream_malformed_error)?
+        {
+            self.dispatch_event(frame)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Value, ProviderError> {
+        ResponsesSseDecoder::finish(self)
+    }
+
+    fn emitted_text_delta(&self) -> bool {
+        self.emitted_text_delta
+    }
+
+    fn time_to_first_text_delta_ms(&self) -> Option<u64> {
+        self.time_to_first_text_delta_ms
+    }
 }
 
 impl<'a> ResponsesSseDecoder<'a> {
@@ -480,16 +500,6 @@ impl<'a> ResponsesSseDecoder<'a> {
             time_to_first_text_delta_ms: None,
             on_event,
         }
-    }
-
-    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        for frame in self
-            .frames
-            .push(chunk, provider_responses_stream_malformed_error)?
-        {
-            self.dispatch_event(frame)?;
-        }
-        Ok(())
     }
 
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
@@ -547,13 +557,13 @@ impl<'a> ResponsesSseDecoder<'a> {
                 self.terminal_response = Some(response);
             }
             "error" => {
-                return Err(provider_responses_stream_terminal_error(
+                return Err(provider_stream_terminal_error(
                     "responses_stream_error",
                     "provider Responses stream returned an error",
                 ));
             }
             "response.failed" => {
-                return Err(provider_responses_stream_terminal_error(
+                return Err(provider_stream_terminal_error(
                     "responses_stream_failed",
                     "provider Responses stream failed",
                 ));
@@ -586,39 +596,41 @@ impl<'a> ResponsesSseDecoder<'a> {
     }
 }
 
-pub fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
-    let mut error = ModelError::new(
-        ModelErrorKind::JsonSchemaViolation,
-        "provider Chat stream was malformed",
-    )
-    .with_provider_diagnostic(
-        "chat_stream_malformed",
-        ProviderErrorStage::ResponseValidation,
-    );
+/// malformed 构造器的统一核心：协议字面词保留在薄包装里，构造体只写一次。
+fn provider_stream_malformed_error(
+    message: &'static str,
+    code: &'static str,
+    reason: &'static str,
+) -> ProviderError {
+    let mut error = ModelError::new(ModelErrorKind::JsonSchemaViolation, message)
+        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
     error.validation_errors.push(reason.to_string());
     ProviderError::from_model_error(error)
 }
 
-pub(super) fn provider_chat_stream_terminal_error(
+pub fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
+    provider_stream_malformed_error(
+        "provider Chat stream was malformed",
+        "chat_stream_malformed",
+        reason,
+    )
+}
+
+pub(super) fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
+    provider_stream_malformed_error(
+        "provider Responses stream was malformed",
+        "responses_stream_malformed",
+        reason,
+    )
+}
+
+pub(super) fn provider_stream_terminal_error(
     code: &'static str,
     message: &'static str,
 ) -> ProviderError {
     let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
         .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
     error.validation_errors.push(code.to_string());
-    ProviderError::from_model_error(error)
-}
-
-pub(super) fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
-    let mut error = ModelError::new(
-        ModelErrorKind::JsonSchemaViolation,
-        "provider Responses stream was malformed",
-    )
-    .with_provider_diagnostic(
-        "responses_stream_malformed",
-        ProviderErrorStage::ResponseValidation,
-    );
-    error.validation_errors.push(reason.to_string());
     ProviderError::from_model_error(error)
 }
 
@@ -634,16 +646,6 @@ pub(super) fn provider_responses_stream_terminal_missing_error() -> ProviderErro
     error
         .validation_errors
         .push("responses_stream_terminal_missing".to_string());
-    ProviderError::from_model_error(error)
-}
-
-pub(super) fn provider_responses_stream_terminal_error(
-    code: &'static str,
-    message: &'static str,
-) -> ProviderError {
-    let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
-        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
-    error.validation_errors.push(code.to_string());
     ProviderError::from_model_error(error)
 }
 
