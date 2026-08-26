@@ -762,7 +762,7 @@ impl TuiApp {
                 let (total, _) = self.flow_metrics();
                 self.scroll.pin_new_content_at(total);
                 self.phase = Phase::Running;
-                self.waiting = WaitingTarget::Model;
+                self.set_waiting(WaitingTarget::Model);
                 Action::Submit(text)
             }
             Phase::Running | Phase::Interrupting => {
@@ -1441,6 +1441,10 @@ mod tests {
         }
         assert!(conversation.has_active_turn(), "gated turn must be active");
         assert_eq!(app.phase(), Phase::Running);
+        assert!(
+            app.waiting_since.is_some(),
+            "submit must arm the waiting timer via set_waiting"
+        );
 
         // 与生产路径一致：编辑器输入 + Alt+Enter 提交 followUp。
         for ch in "second".chars() {
