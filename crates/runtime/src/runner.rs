@@ -872,7 +872,6 @@ fn provider_attempt_event(
             provider: started.provider_name.clone(),
             model: started.model_name.clone(),
             protocol: serialized_enum_text(&started.actual_api_protocol),
-            attempt_index: started.attempt_index,
             status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,
@@ -885,7 +884,6 @@ fn provider_attempt_event(
             provider: occurrence.provider_name.clone(),
             model: occurrence.model_name.clone(),
             protocol: serialized_enum_text(&occurrence.actual_api_protocol),
-            attempt_index: occurrence.attempt_index,
             status: match occurrence.terminal_status {
                 ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
                 ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,

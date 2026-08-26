@@ -106,7 +106,6 @@ pub enum TurnEvent {
         provider: String,
         model: String,
         protocol: String,
-        attempt_index: u32,
         status: ProviderAttemptStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_duration_ms: Option<u64>,
@@ -194,7 +193,6 @@ mod tests {
             provider: "provider".to_string(),
             model: "model".to_string(),
             protocol: "open_ai_chat_completions".to_string(),
-            attempt_index: 1,
             status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,

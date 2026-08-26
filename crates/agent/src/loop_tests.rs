@@ -98,7 +98,6 @@ impl Provider for FakeProvider {
             provider_name: "fake".to_string(),
             model_name: "fake-model".to_string(),
             actual_api_protocol: ProviderApiProtocol::Declared,
-            attempt_index: 1,
             started_at_unix_ms: 1,
         }));
         self.complete_stream(request, cancellation, on_event)

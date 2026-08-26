@@ -749,11 +749,9 @@ fn openai_provider_observes_one_ordered_start_end_pair() {
     else {
         panic!("one ordered start/end pair expected");
     };
-    assert_eq!(started.attempt_index, 1);
     assert_eq!(started.provider_name, finished.provider_name);
     assert_eq!(started.model_name, finished.model_name);
     assert_eq!(started.actual_api_protocol, finished.actual_api_protocol);
-    assert_eq!(started.attempt_index, finished.attempt_index);
     assert_eq!(started.started_at_unix_ms, finished.started_at_unix_ms);
 }
 

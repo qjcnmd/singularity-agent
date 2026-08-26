@@ -341,7 +341,6 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
         "openai",
         "test-model",
         "open_ai_responses",
-        1,
         singularity_protocol::ProviderAttemptStatus::Error,
         Some(12),
         Some("network".to_string()),

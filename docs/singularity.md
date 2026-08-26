@@ -59,7 +59,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影。空闲路径无此事件（提交点内已立即持久化）。
 
-`agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 在 runtime 和协议 DTO 中均为枚举，adapter 只负责一一映射，线格式词形不变。`provider/attempt` 的方法名稳定；其字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/attemptIndex/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。错误分类词形在 runtime 定义（`provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`），协议 DTO 保持同名词形；turn/error 的 cause 字段携带同一词形；外部解析方只读 status 与分类词即可，字段集变化为加法兼容。
+`agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 在 runtime 和协议 DTO 中均为枚举，adapter 只负责一一映射，线格式词形不变。`provider/attempt` 的方法名稳定；其字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。错误分类词形在 runtime 定义（`provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`），协议 DTO 保持同名词形；turn/error 的 cause 字段携带同一词形；外部解析方只读 status 与分类词即可，字段集变化为加法兼容。
 
 `--json` 行形状为 `{"method": <名>, "params": <TurnEvent 字段，snake_case>}`；终态行为
 `{"summary":{"thread":{"threadId"},"turn":{"threadId","status","usage"}}}`，

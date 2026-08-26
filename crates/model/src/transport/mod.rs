@@ -178,7 +178,6 @@ struct ProviderAttemptInProgress {
     provider_name: String,
     model_name: String,
     actual_api_protocol: ProviderApiProtocol,
-    attempt_index: u32,
     started_at: Instant,
     started_at_unix_ms: u64,
     request_send_to_headers_ms: Option<u64>,
@@ -190,13 +189,11 @@ impl ProviderAttemptInProgress {
         provider_name: &str,
         model_name: &str,
         actual_api_protocol: ProviderApiProtocol,
-        attempt_index: u32,
     ) -> Self {
         Self {
             provider_name: provider_name.to_string(),
             model_name: model_name.to_string(),
             actual_api_protocol,
-            attempt_index,
             started_at: Instant::now(),
             started_at_unix_ms: unix_timestamp_ms(),
             request_send_to_headers_ms: None,
@@ -209,7 +206,6 @@ impl ProviderAttemptInProgress {
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             actual_api_protocol: self.actual_api_protocol,
-            attempt_index: self.attempt_index,
             started_at_unix_ms: self.started_at_unix_ms,
         })
     }
@@ -237,7 +233,6 @@ impl ProviderAttemptInProgress {
             provider_name: self.provider_name,
             model_name: self.model_name,
             actual_api_protocol: self.actual_api_protocol,
-            attempt_index: self.attempt_index,
             terminal_status,
             started_at_unix_ms: self.started_at_unix_ms,
             ended_at_unix_ms,
@@ -820,7 +815,7 @@ impl OpenAiProvider {
         }
 
         let mut occurrence =
-            ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol, 1);
+            ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
         emit_provider_attempt_started(&occurrence, on_attempt)?;
         let response = match block_on_provider_future(
             runtime,

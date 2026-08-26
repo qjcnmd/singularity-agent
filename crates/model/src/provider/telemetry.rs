@@ -23,7 +23,6 @@ pub struct ProviderAttemptStarted {
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
-    pub attempt_index: u32,
     pub started_at_unix_ms: u64,
 }
 
@@ -67,8 +66,6 @@ pub struct ProviderAttemptOccurrence {
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
-    /// 该 aggregate 内按真实 HTTP attempt 顺序排列的 1-based 索引。
-    pub attempt_index: u32,
     pub terminal_status: ProviderAttemptStatus,
     /// 创建该 transport attempt 时的墙钟时间戳。
     pub started_at_unix_ms: u64,
