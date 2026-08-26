@@ -101,6 +101,29 @@ impl SessionManager {
         })?;
         let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
         let writer_lock = coordinator.acquire(lock_key)?;
+        let opened = Self::open_parsed(&file, TailPolicy::RepairAndRewrite)
+            .map(|opened| opened.with_lock(writer_lock))?;
+        Ok(opened)
+    }
+
+    /// 为有界 discovery/index 重建打开既有 rollout。
+    ///
+    /// 此接缝在持有正常追加锁时校验完整文件，但绝不截断 torn tail 或
+    /// 补末尾换行；需要正常重开修复路径的文件被拒绝。
+    pub fn open_existing_read_only(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Err(SessionError::InvalidSession(format!(
+                "session file does not exist: {}",
+                path.display()
+            )));
+        }
+        Self::open_parsed(path, TailPolicy::RejectOnRepair)
+    }
+
+    /// 共用的打开路径：解析、结构校验与状态捕获。修复策略只影响 torn
+    /// tail 的处理（重写或拒绝），其余语义在两条路径间保持一致。
+    fn open_parsed(path: &Path, tail_policy: TailPolicy) -> Result<Self> {
+        let file = path.to_path_buf();
         let metadata = std::fs::symlink_metadata(&file)?;
         if metadata.len() == 0 {
             return Err(SessionError::InvalidSession(format!(
@@ -119,7 +142,15 @@ impl SessionManager {
         let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
         let entries = validate_entries(&parsed.entries, &parsed.lines)?;
         if !matches!(parsed.repair, TailRepair::None) {
-            rewrite_file(&file, &parsed.entries)?;
+            match tail_policy {
+                TailPolicy::RepairAndRewrite => rewrite_file(&file, &parsed.entries)?,
+                TailPolicy::RejectOnRepair => {
+                    return Err(SessionError::InvalidSession(
+                        "read-only session scan rejected a rollout requiring tail repair"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         let cwd = header_cwd
             .map(|cwd| normalize_abs_path(Path::new(&cwd)))
@@ -133,22 +164,14 @@ impl SessionManager {
             session_id,
             header_timestamp,
             file_state,
-            _writer_lock: Some(writer_lock),
+            _writer_lock: None,
         })
     }
 
-    /// 为有界 discovery/index 重建打开既有 rollout。
-    ///
-    /// 此接缝在持有正常追加锁时校验完整文件，但绝不截断 torn tail 或
-    /// 补末尾换行；需要正常重开修复路径的文件被拒绝。
-    pub fn open_existing_read_only(path: &Path) -> Result<Self> {
-        if !path.is_file() {
-            return Err(SessionError::InvalidSession(format!(
-                "session file does not exist: {}",
-                path.display()
-            )));
-        }
-        Self::open_read_only(path)
+    /// 为已解析会话挂上写者锁守卫（只读路径不调用）。
+    fn with_lock(mut self, writer_lock: WriterLockGuard) -> Self {
+        self._writer_lock = Some(writer_lock);
+        self
     }
 
     /// 共用的新建会话实现：先取写者锁，再写入 header 并打开新文件。
@@ -184,43 +207,6 @@ impl SessionManager {
             header_timestamp: timestamp,
             file_state,
             _writer_lock: Some(writer_lock),
-        })
-    }
-
-    fn open_read_only(path: &Path) -> Result<Self> {
-        let file = path.to_path_buf();
-        let metadata = std::fs::symlink_metadata(&file)?;
-        if metadata.len() == 0 {
-            return Err(SessionError::InvalidSession(format!(
-                "Session file is empty and cannot be opened: {}",
-                file.display()
-            )));
-        }
-        let parsed = parse_session_lines(&file)?;
-        if !matches!(parsed.repair, TailRepair::None) {
-            return Err(SessionError::InvalidSession(
-                "read-only session scan rejected a rollout requiring tail repair".to_string(),
-            ));
-        }
-        let header = parsed
-            .entries
-            .first()
-            .ok_or_else(|| SessionError::InvalidSession("session header is missing".to_string()))?;
-        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
-        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
-        let cwd = header_cwd
-            .map(|cwd| normalize_abs_path(Path::new(&cwd)))
-            .transpose()?
-            .unwrap_or(std::env::current_dir()?);
-        let file_state = SessionFileState::capture(&file)?;
-        Ok(Self {
-            file,
-            cwd,
-            entries,
-            session_id,
-            header_timestamp,
-            file_state,
-            _writer_lock: None,
         })
     }
 
@@ -298,4 +284,11 @@ impl SessionManager {
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
     }
+}
+
+/// 尾部修复策略：正常打开修复重写，只读扫描拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailPolicy {
+    RepairAndRewrite,
+    RejectOnRepair,
 }
