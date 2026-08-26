@@ -796,6 +796,8 @@ struct OverflowProvider {
     overflow_times: usize,
     /// true 时摘要生成（`complete`）直接失败，用于验证强制压缩失败的降级路径。
     fail_summary: bool,
+    /// 每次流式请求的消息文本（按调用顺序），用于断言重试携带压缩后上下文。
+    request_texts: std::sync::Mutex<Vec<String>>,
     contract: ProviderProtocolContract,
 }
 
@@ -1066,6 +1068,14 @@ impl Provider for OverflowProvider {
         let call = self
             .stream_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.request_texts.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
         if call < self.overflow_times {
             return Err(ProviderError::from_model_error(ModelError::new(
                 ModelErrorKind::ContextLengthExceeded,
@@ -1157,6 +1167,7 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
         complete_calls: std::sync::atomic::AtomicUsize::new(0),
         overflow_times: 1,
         fail_summary: false,
+        request_texts: std::sync::Mutex::new(Vec::new()),
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
@@ -1176,6 +1187,24 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             .stream_calls
             .load(std::sync::atomic::Ordering::SeqCst),
         2
+    );
+    // 强制压缩后的重试必须携带压缩后的上下文：第二次请求包含摘要、
+    // 不再包含被压缩掉的原始会话内容。
+    let request_texts = provider.request_texts.lock().unwrap();
+    assert_eq!(request_texts.len(), 2, "first overflow + one retry");
+    assert!(
+        request_texts[0].contains("old user"),
+        "first request carries the pre-compaction context"
+    );
+    assert!(
+        request_texts[1].contains("## Goal"),
+        "retry carries the compaction summary: {}",
+        request_texts[1]
+    );
+    assert!(
+        !request_texts[1].contains("old user"),
+        "retry must not carry the overflowed context: {}",
+        request_texts[1]
     );
     assert_eq!(
         provider

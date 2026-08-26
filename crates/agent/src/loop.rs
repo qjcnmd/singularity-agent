@@ -1089,6 +1089,19 @@ impl Agent {
                         Err(_) => return AttemptOutcome::Failed(original_error),
                     };
                     record_compaction(outcome, &forced);
+                    // 强制压缩只修改了 self.session；重试必须基于压缩后的
+                    // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
+                    match self.build_request(
+                        preferences,
+                        tools,
+                        tool_choice,
+                        max_output_tokens,
+                        turns,
+                    ) {
+                        Ok((rebuilt, _)) => request = rebuilt,
+                        Err(error) => return AttemptOutcome::Failed(error),
+                    }
+                    continue;
                 }
                 Err(error) => {
                     if let AgentError::Provider(provider) = &error
