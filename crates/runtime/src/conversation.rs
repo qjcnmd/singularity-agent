@@ -157,25 +157,21 @@ pub struct Conversation {
 
 /// 单活动 turn 的执行权预订。
 ///
-/// [`Conversation::reserve_start`] 原子开启链窗口并持有到消费执行；预订可被
-/// [`Self::run`] 消费执行整条链条，或在未执行时由 drop 释放。预订与执行的
-/// 分离让请求路由层能够在负载线程启动前就获得「先到先得」的确定性。
+/// [`Conversation::reserve_start`] 原子开启链窗口并持有到消费执行；预订由
+/// [`Self::run`] 消费执行整条链条，或在未执行时由 drop 释放。窗口释放
+/// 完全依赖 Drop（重复释放幂等），执行中途 panic 也不会泄漏活动窗口。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
-    released: bool,
 }
 
 impl TurnReservation {
-    /// 消费预订：执行本轮输入及后续队列，直至链条结束并释放活动窗口。
+    /// 消费预订：执行本轮输入及后续队列，直至链条结束；窗口由 drop 释放。
     pub fn run(
-        mut self,
+        self,
         input: &str,
         sink: &mut dyn TurnEventSink,
     ) -> Result<TurnOutcome, ConversationError> {
-        self.released = true;
-        let result = self.conversation.run_chain(input, sink);
-        self.conversation.release_reservation();
-        result
+        self.conversation.run_chain(input, sink)
     }
 
     /// 访问所属协调器（投影与并发护栏需要它）。
@@ -186,9 +182,7 @@ impl TurnReservation {
 
 impl Drop for TurnReservation {
     fn drop(&mut self) {
-        if !self.released {
-            self.conversation.release_reservation();
-        }
+        self.conversation.release_reservation();
     }
 }
 
@@ -232,10 +226,7 @@ impl Conversation {
             .self_weak
             .upgrade()
             .expect("reservation requires a live conversation");
-        Ok(TurnReservation {
-            conversation,
-            released: false,
-        })
+        Ok(TurnReservation { conversation })
     }
 
     fn release_reservation(&self) {

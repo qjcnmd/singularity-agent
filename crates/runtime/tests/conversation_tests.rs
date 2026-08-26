@@ -980,7 +980,10 @@ fn follow_up_submitted_at_terminal_is_consumed_and_never_lingers() {
     );
     assert_eq!(
         log.input_sequence(),
-        vec!["initial input".to_string(), "terminal injection".to_string()],
+        vec![
+            "initial input".to_string(),
+            "terminal injection".to_string()
+        ],
         "terminal injection runs as its own turn exactly once"
     );
     assert!(
@@ -1007,7 +1010,11 @@ fn preparation_failure_requeues_current_input_at_queue_head() {
         &sessions,
         Arc::new(SequentialGatedProvider {
             gates: std::sync::Mutex::new(
-                vec![std::sync::Mutex::new(gate1_rx), std::sync::Mutex::new(gate2_rx)].into(),
+                vec![
+                    std::sync::Mutex::new(gate1_rx),
+                    std::sync::Mutex::new(gate2_rx),
+                ]
+                .into(),
             ),
             log: Arc::clone(&log),
             requests: Arc::clone(&requests),
@@ -1064,9 +1071,42 @@ fn preparation_failure_requeues_current_input_at_queue_head() {
         vec!["explicit input", "second input"],
         "failed current input never executed"
     );
-    assert!(!shared.has_active_turn(), "aborted chain releases the window");
+    assert!(
+        !shared.has_active_turn(),
+        "aborted chain releases the window"
+    );
 }
 
+#[test]
+fn panic_in_turn_releases_the_reservation_window() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(RecordingProvider {
+            text: "ok".into(),
+            log: Arc::new(RequestLog::default()),
+        }),
+        None,
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sink = |event: TurnEvent| {
+            if matches!(event, TurnEvent::TurnStarted { .. }) {
+                panic!("sink panic");
+            }
+        };
+        let _ = conversation.run_turn("hello", &mut sink);
+    }));
+    assert!(panic.is_err(), "sink panic must propagate");
+    assert!(
+        !conversation.has_active_turn(),
+        "panic must not leak the active window"
+    );
+    let reservation = conversation
+        .reserve_start()
+        .expect("reservation succeeds after a panic");
+    drop(reservation);
+}
 
 #[test]
 fn reservation_holds_window_and_releases_on_drop() {
