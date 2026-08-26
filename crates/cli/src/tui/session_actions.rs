@@ -152,8 +152,10 @@ impl TuiApp {
                     // `on_chain_finished` 自动启动压缩（与 pi 的
                     // "waiting until idle" 语义一致）。
                     self.compact_queued = true;
-                    self.transcript
-                        .push_note("compaction queued; will run when the turn finishes", NoteStyle::Dim);
+                    self.transcript.push_note(
+                        "compaction queued; will run when the turn finishes",
+                        NoteStyle::Dim,
+                    );
                 } else {
                     self.compacting = true;
                     self.compact_cancel = Some(CancellationToken::new());
