@@ -1,7 +1,7 @@
 //! read 工具：有界流式读取指定文件内容，支持基于 `offset` 与 `limit` 的行范围读取。
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{BufRead, BufReader};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -96,7 +96,8 @@ fn execute_reader(
         if signal.is_some_and(CancellationToken::is_cancelled) {
             return error_result("Operation aborted");
         }
-        let Some(line) = (match read_bounded_line(reader, signal) {
+        let Some(line) = (match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES, signal)
+        {
             Ok(line) => line,
             Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
             Err(error) => {
@@ -136,14 +137,15 @@ fn execute_reader(
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
             // 收集满 limit 即停：只需确认文件是否还有后续，不再扫到 EOF 统计行数。
-            state.selected_truncated = match read_bounded_line(reader, signal) {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
-                Err(error) => {
-                    return error_result(format!("Could not read file: {path}. {error}"));
-                }
-            };
+            state.selected_truncated =
+                match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES, signal) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
+                    Err(error) => {
+                        return error_result(format!("Could not read file: {path}. {error}"));
+                    }
+                };
             break;
         }
     }
@@ -206,69 +208,8 @@ fn render_read_output(path: &str, start_line_display: usize, state: &ReadState) 
     selected_content
 }
 
-#[derive(Debug)]
-enum ReadFailure {
-    Cancelled,
-    Io(io::Error),
-}
-
-impl std::fmt::Display for ReadFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cancelled => formatter.write_str("Operation aborted"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
-}
-
 /// 有界读取一行：单行超过 MAX_READ_LINE_BYTES 时 fail closed，不分配无界内存。
-fn read_bounded_line(
-    reader: &mut impl BufRead,
-    signal: Option<&CancellationToken>,
-) -> Result<Option<Vec<u8>>, ReadFailure> {
-    let mut bytes = Vec::new();
-    let newline_terminated = loop {
-        if signal.is_some_and(CancellationToken::is_cancelled) {
-            return Err(ReadFailure::Cancelled);
-        }
-        let (take_len, newline_terminated) = {
-            let buffer = reader.fill_buf().map_err(ReadFailure::Io)?;
-            if buffer.is_empty() {
-                break false;
-            }
-            let newline = buffer.iter().position(|byte| *byte == b'\n');
-            let take_len = newline.map_or(buffer.len(), |index| index.saturating_add(1));
-            if bytes.len().saturating_add(take_len) > MAX_READ_LINE_BYTES.saturating_add(1) {
-                return Err(ReadFailure::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("line exceeds {MAX_READ_LINE_BYTES} bytes"),
-                )));
-            }
-            bytes.extend_from_slice(&buffer[..take_len]);
-            (take_len, newline.is_some())
-        };
-        reader.consume(take_len);
-        if newline_terminated {
-            break true;
-        }
-    };
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    if !newline_terminated && bytes.len() > MAX_READ_LINE_BYTES {
-        return Err(ReadFailure::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("line exceeds {MAX_READ_LINE_BYTES} bytes"),
-        )));
-    }
-    if newline_terminated {
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-    }
-    Ok(Some(bytes))
-}
+type ReadFailure = super::line::LineFailure;
 
 #[cfg(test)]
 mod tests {

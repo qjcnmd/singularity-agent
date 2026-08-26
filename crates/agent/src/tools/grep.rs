@@ -2,7 +2,7 @@
 //! 与二进制文件），输出 `path:line:text`，匹配上限 500 条，超出截断并提示。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 
 use regex::Regex;
 use serde::Deserialize;
@@ -20,6 +20,8 @@ pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expres
 const MAX_MATCHES: usize = 500;
 /// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
+/// 单行硬上限：超过即跳过整个文件（与 read 工具的有界读取一致）。
+const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
@@ -107,6 +109,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     let mut output = String::new();
     let mut matches = 0usize;
     let mut scanned_files = 0usize;
+    let mut skipped_files = 0usize;
     if let Err(error) = walk_files(&root, &mut |relative| {
         if matches >= MAX_MATCHES {
             return;
@@ -130,28 +133,33 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             return;
         }
         let mut reader = BufReader::with_capacity(64 * 1024, file);
-        let mut line_bytes = Vec::new();
         let mut line_number = 0u64;
         loop {
             if matches >= MAX_MATCHES {
                 break;
             }
-            let bytes = match reader.read_until(b'\n', &mut line_bytes) {
-                Ok(0) => break,
-                Ok(bytes) => bytes,
+            let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES, None)
+            {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                // 畸形超长行：跳过整个文件并计数，不中止整个搜索。
+                Err(super::line::LineFailure::OverLimit(_)) => {
+                    skipped_files += 1;
+                    break;
+                }
                 Err(_) => break,
             };
             line_number += 1;
             // 正则始终对完整原始行匹配；行尾 \n 与 CRLF 的 \r 先剥除，
             // 展示截断只作用于命中行的输出文本。
-            let mut line_end = bytes;
-            if line_end > 0 && line_bytes[line_end - 1] == b'\n' {
+            let mut line_end = bytes.len();
+            if line_end > 0 && bytes[line_end - 1] == b'\n' {
                 line_end -= 1;
             }
-            if line_end > 0 && line_bytes[line_end - 1] == b'\r' {
+            if line_end > 0 && bytes[line_end - 1] == b'\r' {
                 line_end -= 1;
             }
-            let line = String::from_utf8_lossy(&line_bytes[..line_end]);
+            let line = String::from_utf8_lossy(&bytes[..line_end]);
             if regex.is_match(&line) {
                 matches += 1;
                 output.push_str(&format!(
@@ -160,7 +168,6 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
                     truncate_for_display(&line),
                 ));
             }
-            line_bytes.clear();
         }
     }) {
         return error_result(format!("failed to walk {path}: {error}"));
@@ -168,6 +175,11 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
     if matches >= MAX_MATCHES {
         output.push_str(&format!(
             "\n[grep] results truncated at {MAX_MATCHES} matches; narrow the pattern or include filter."
+        ));
+    }
+    if skipped_files > 0 {
+        output.push_str(&format!(
+            "\n[grep] {skipped_files} file(s) skipped: line exceeds {MAX_READ_LINE_BYTES} bytes"
         ));
     }
     if output.is_empty() {
@@ -251,5 +263,26 @@ mod tests {
         let result = execute(context(json!({ "pattern": "(" }), dir.path())).expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("invalid regular expression"));
+    }
+
+    #[test]
+    fn grep_skips_oversized_line_files_and_counts_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let oversized = format!("{}hit\n", "x".repeat(MAX_READ_LINE_BYTES + 1));
+        fs::write(dir.path().join("huge.txt"), oversized).expect("huge file");
+        fs::write(dir.path().join("ok.txt"), "hit\n").expect("ok file");
+        let result = execute(context(json!({ "pattern": "hit" }), dir.path())).expect("execute");
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("ok.txt:1:hit"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("1 file(s) skipped: line exceeds"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("huge.txt:1"), "{}", result.content);
     }
 }
