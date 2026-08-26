@@ -1,9 +1,4 @@
-//! bash 工具：在当前工作目录下执行 Shell 命令行指令。
-//!
-//! - **超时控制**：仅在显式提供 `timeout_ms` 时生效（正整数毫秒），到点强制终止整棵子进程树并返回超时错误；未提供时不主动超时。
-//! - **输出流式捕获与截断**：标准输出（stdout）与标准错误（stderr）合并捕获；结果输出保留尾部最后 2000 行 / 50KB，截断实际发生时完整输出写入临时文件并在结果尾部附 `Full output: <路径>`。
-//! - **中断处理**：收到外部取消信号（`CancellationToken`）时立即终止进程树并返回 `Command aborted`。
-//! - **进程树隔离**：Windows 将子进程绑定到 `KILL_ON_JOB_CLOSE` 的 Job Object，Unix 使用独立进程组；两条路径都支持内核级整树终止。
+// bash 工具执行实现。
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -14,7 +9,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Deserializer, de::Error as _};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -99,11 +93,8 @@ mod job_object {
     }
 }
 
-use serde_json::{Value, json};
-
 use super::registry::{
     ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
-    validate_args,
 };
 use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail,
@@ -125,52 +116,6 @@ const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
 
 /// 命令执行超时仅在显式提供 `timeout_ms`（正整数毫秒）时生效；未提供时不主动超时。
 pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Provide timeout_ms to bound execution; without it a command runs until completion or interruption.";
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BashArgs {
-    command: String,
-    #[serde(default, deserialize_with = "deserialize_timeout_ms")]
-    timeout_ms: Option<u64>,
-}
-
-fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    value
-        .as_u64()
-        .filter(|timeout| *timeout > 0)
-        .map(Some)
-        .ok_or_else(|| D::Error::custom("invalid timeout_ms: must be a positive integer"))
-}
-
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout_ms": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Timeout in milliseconds (optional; omit to run without a timeout)"
-            },
-        },
-        "required": ["command"],
-        "additionalProperties": false,
-    })
-}
-
-pub(crate) fn spec() -> super::registry::ToolSpec {
-    super::registry::ToolSpec {
-        name: "bash",
-        description: DESCRIPTION,
-        parameters: parameters(),
-        validate: validate_args::<BashArgs>,
-        execute,
-    }
-}
 
 pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let ExecuteContext {
@@ -472,7 +417,7 @@ fn spawn_shell(shell: &str, shell_args: &[String], cwd: &Path) -> io::Result<Man
 }
 
 fn wait_for_exit(managed: &mut ManagedChild) -> Option<ExitStatus> {
-    managed.wait_bounded(Duration::from_secs(5))
+    managed.wait_bounded(process::WAIT_GRACE)
 }
 
 /// 用于有界等待管道可读性的平台句柄。
@@ -552,7 +497,7 @@ fn pump_output(
     wait: PipeWait,
 ) {
     let mut decoder = Utf8Decoder::default();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; output::PIPE_BUFFER_BYTES];
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
