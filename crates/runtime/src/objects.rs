@@ -82,15 +82,4 @@ impl TurnUsage {
             usage_complete: complete,
         }
     }
-
-    pub fn to_model_usage(&self) -> singularity_model::ModelUsage {
-        singularity_model::ModelUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            total_tokens: self.total_tokens,
-            cached_input_tokens: self.cached_input_tokens,
-            reasoning_tokens: self.reasoning_tokens,
-            usage_present: self.usage_present,
-        }
-    }
 }

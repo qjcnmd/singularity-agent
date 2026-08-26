@@ -14,7 +14,7 @@ use singularity_runtime::events::{
     AgentDiagnosticSeverity, ProviderAttemptStatus as RuntimeProviderAttemptStatus, TurnEvent,
     TurnEventSink,
 };
-use singularity_runtime::objects::{ThreadStatus as RuntimeThreadStatus, Turn as RuntimeTurn};
+use singularity_runtime::objects::Turn as RuntimeTurn;
 use singularity_runtime::{
     Conversation, ProviderFailureKind, TurnFailureCause as RuntimeFailureCause,
     TurnFailureStage as RuntimeFailureStage, TurnOutcome, TurnRunError,
@@ -42,9 +42,7 @@ pub(crate) fn wire_turn(turn: &RuntimeTurn) -> Turn {
             singularity_runtime::objects::TurnStatus::Failed => TurnStatus::Failed,
             singularity_runtime::objects::TurnStatus::Interrupted => TurnStatus::Interrupted,
         },
-        model_usage: turn.usage.as_ref().map(|usage| {
-            usage_to_wire_with_completeness(&usage.to_model_usage(), usage.usage_complete)
-        }),
+        model_usage: turn.usage.as_ref().map(crate::wire::turn_model_usage),
     }
 }
 
@@ -146,7 +144,9 @@ impl TurnEventSink for TurnProjection<'_> {
                 ));
             }
             TurnEvent::ThreadStarted { thread } => {
-                self.emit_notification(AppEvent::thread_started(&protocol_thread(&thread)));
+                self.emit_notification(AppEvent::thread_started(&crate::wire::thread_from_object(
+                    &thread,
+                )));
             }
             TurnEvent::ThreadSettingsApplied { .. } => {}
             TurnEvent::ItemStarted {
@@ -316,20 +316,6 @@ fn protocol_failure_cause(cause: RuntimeFailureCause) -> ProtocolFailureCause {
         }
         RuntimeFailureCause::Serialization => ProtocolFailureCause::Serialization,
         RuntimeFailureCause::Internal => ProtocolFailureCause::Internal,
-    }
-}
-
-fn protocol_thread(thread: &singularity_runtime::objects::Thread) -> Thread {
-    Thread {
-        thread_id: thread.thread_id.clone(),
-        cwd: Some(thread.cwd.clone()),
-        model: thread.model.clone(),
-        last_turn_status: thread.last_turn_status.map(|status| match status {
-            RuntimeThreadStatus::Active => ThreadStatus::Active,
-            RuntimeThreadStatus::Completed => ThreadStatus::Completed,
-            RuntimeThreadStatus::Failed => ThreadStatus::Failed,
-            RuntimeThreadStatus::Interrupted => ThreadStatus::Interrupted,
-        }),
     }
 }
 

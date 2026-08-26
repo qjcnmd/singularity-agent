@@ -2,27 +2,6 @@ use std::path::PathBuf;
 
 use singularity_core::{create_owner_only_dir, user_singularity_home};
 
-/// 把 runtime 的 JSONL 只读摘要投影为协议 Thread。
-pub fn thread_from_summary(
-    record: &singularity_runtime::ThreadSummary,
-) -> singularity_protocol::Thread {
-    singularity_protocol::Thread {
-        thread_id: record.thread_id.clone(),
-        model: record.model.clone(),
-        cwd: Some(record.cwd.clone()),
-        last_turn_status: record.status.map(|status| match status {
-            singularity_runtime::ThreadStatus::Active => singularity_protocol::ThreadStatus::Active,
-            singularity_runtime::ThreadStatus::Completed => {
-                singularity_protocol::ThreadStatus::Completed
-            }
-            singularity_runtime::ThreadStatus::Failed => singularity_protocol::ThreadStatus::Failed,
-            singularity_runtime::ThreadStatus::Interrupted => {
-                singularity_protocol::ThreadStatus::Interrupted
-            }
-        }),
-    }
-}
-
 /// `~/.singularity` 下的固定路径集合（会话目录名复用 runtime 单一事实源）。
 #[derive(Debug, Clone)]
 pub struct AppPaths {

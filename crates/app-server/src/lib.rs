@@ -16,13 +16,13 @@ mod lifecycle;
 pub mod paths;
 mod state;
 mod transport;
+mod wire;
 
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
-use singularity_model::ModelUsage;
 use singularity_protocol::{
     AppEvent, ErrorCode, HistoryItem, InitializeParams, InitializeResult, JsonRpcId,
     JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus, ServerShutdownResult,
@@ -99,29 +99,14 @@ impl fmt::Display for TurnTerminalizationFailure {
     }
 }
 
-/// 将 provider 聚合 usage 与其完整性投影为协议线格式。
-pub fn usage_to_wire_with_completeness(
-    usage: &ModelUsage,
-    usage_complete: bool,
-) -> singularity_protocol::TurnModelUsage {
-    singularity_protocol::TurnModelUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
-        usage_present: usage.usage_present,
-        usage_complete,
-    }
-}
-
 /// AppServer 交给 stdout transport 的消息。
 pub type AppServerOutput = Value;
 
 pub use dispatch::{TurnClaim, TurnStartClaim};
 use events::project_turn_history;
-pub use paths::thread_from_summary;
+pub use paths::AppPaths;
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
+pub use wire::thread_from_summary;
 
 #[cfg(test)]
 mod tests;
