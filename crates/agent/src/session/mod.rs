@@ -5,6 +5,7 @@
 //! schema、I/O、上下文、恢复和仓储接缝。客户端只依赖这里的 façade。
 
 mod manager;
+pub mod writer_lock;
 
 pub mod context;
 pub mod file;

@@ -41,6 +41,10 @@ pub enum SessionError {
     InvalidSession(String),
     #[error("entry {0} not found")]
     EntryNotFound(String),
+    #[error("session is being written by an active writer: {thread_id}")]
+    WriterConflict { thread_id: String },
+    #[error("session writer lock error: {0}")]
+    WriterLock(String),
 }
 
 /// 会话操作结果。
