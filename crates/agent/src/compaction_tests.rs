@@ -83,7 +83,6 @@ fn budget(window: u64, keep_recent: u64) -> CompactionBudget {
         context_window: window,
         reserve_tokens: window / 10,
         retain_ratio: keep_recent as f64 / window as f64,
-        summary_max_tokens: 4_096,
     }
 }
 

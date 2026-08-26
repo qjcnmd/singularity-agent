@@ -370,7 +370,7 @@ struct PreparedToolCall {
 }
 
 enum AttemptOutcome {
-    Response(ModelTurnResponse),
+    Response(Box<ModelTurnResponse>),
     Aborted,
     Failed(AgentError),
 }
@@ -622,7 +622,7 @@ impl Agent {
                     cancellation,
                     model_turn_ordinal,
                 ) {
-                    AttemptOutcome::Response(response) => response,
+                    AttemptOutcome::Response(response) => *response,
                     AttemptOutcome::Aborted => return self.abort_outcome(outcome),
                     AttemptOutcome::Failed(error) => {
                         return self.fail_after_progress(error, outcome);
@@ -1011,6 +1011,7 @@ impl Agent {
     }
 
     /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
+    #[allow(clippy::too_many_arguments)]
     fn attempt_request(
         &mut self,
         preferences: &ModelPreferences,
@@ -1075,7 +1076,7 @@ impl Agent {
         let mut retry_attempt = 0u32;
         loop {
             match self.stream_completion(&request, events, cancellation, model_turn_ordinal) {
-                Ok(response) => return AttemptOutcome::Response(response),
+                Ok(response) => return AttemptOutcome::Response(Box::new(response)),
                 Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
                     outcome.usage_complete = false;
                     let original_error = AgentError::Provider(error);

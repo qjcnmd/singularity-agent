@@ -4,7 +4,10 @@
 //! 以及工具执行结果 `ToolResult`，确保单次模型交互的完整语义（含推理过程与多工具调用）
 //! 能够精确持久化与协议重放。
 
-use singularity_model::{ModelStopReason, ModelTurnResponse, ProviderReasoningReplay};
+use singularity_model::{
+    ModelStopReason, ModelToolCall, ModelToolParseStatus, ModelTurnResponse,
+    ProviderReasoningReplay,
+};
 
 use crate::tools::ToolExecution;
 
@@ -38,6 +41,33 @@ pub enum ContentBlock {
         name: String,
         args: serde_json::Value,
     },
+}
+
+impl ContentBlock {
+    pub(crate) fn from_model_tool_call(call: &ModelToolCall) -> Self {
+        Self::ToolCall {
+            id: call.tool_call_id.clone(),
+            name: call.tool_name.clone(),
+            args: call.arguments.clone(),
+        }
+    }
+
+    pub(crate) fn to_model_tool_call(&self) -> Option<ModelToolCall> {
+        let Self::ToolCall { id, name, args } = self else {
+            return None;
+        };
+        if id.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        Some(ModelToolCall {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            arguments: args.clone(),
+            raw_arguments: serde_json::to_string(args).unwrap_or_default(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        })
+    }
 }
 
 /// 核心会话消息数据结构。
@@ -157,11 +187,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
         });
     }
     for call in &response.tool_calls {
-        content.push(ContentBlock::ToolCall {
-            id: call.tool_call_id.clone(),
-            name: call.tool_name.clone(),
-            args: call.arguments.clone(),
-        });
+        content.push(ContentBlock::from_model_tool_call(call));
     }
     AgentMessage {
         role: AgentMessageRole::Assistant,

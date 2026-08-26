@@ -23,14 +23,14 @@ pub struct ToolExecution {
 }
 
 /// 工具批次开始前执行查找与参数校验 preflight 的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct PreparedTool {
-    pub(crate) name: &'static str,
+    execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
 }
 
 /// preflight 要么产出可执行工具，要么产出模型可见的拒绝。
 /// 未知名称保持为注册表错误，使调用方能保留该边界。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ToolPreflight {
     Ready(PreparedTool),
     Rejected(ToolExecution),
@@ -134,7 +134,9 @@ impl ToolRegistry {
                 is_error: true,
             }));
         }
-        Ok(ToolPreflight::Ready(PreparedTool { name: spec.name }))
+        Ok(ToolPreflight::Ready(PreparedTool {
+            execute: spec.execute,
+        }))
     }
 
     /// 执行一个已通过 [`Self::preflight`] 的调用。
@@ -143,11 +145,7 @@ impl ToolRegistry {
         prepared: PreparedTool,
         ctx: ExecuteContext<'a>,
     ) -> Result<ToolExecution, ToolError> {
-        let spec = self
-            .tools
-            .get(prepared.name)
-            .ok_or_else(|| ToolError(format!("unknown tool: {}", prepared.name)))?;
-        (spec.execute)(ctx)
+        (prepared.execute)(ctx)
     }
 }
 

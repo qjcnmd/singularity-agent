@@ -188,7 +188,6 @@ pub struct CompactionBudget {
     pub context_window: u64,
     pub reserve_tokens: u64,
     pub retain_ratio: f64,
-    pub summary_max_tokens: u32,
 }
 
 impl CompactionBudget {
@@ -197,7 +196,6 @@ impl CompactionBudget {
             context_window,
             reserve_tokens: config.reserve_tokens,
             retain_ratio: config.retain_ratio,
-            summary_max_tokens: config.summary_max_tokens,
         }
     }
 

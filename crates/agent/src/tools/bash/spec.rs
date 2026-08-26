@@ -1,8 +1,8 @@
 //! bash 参数解析与工具规格。
 
+use super::super::registry::validate_args;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
-use super::super::registry::validate_args;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

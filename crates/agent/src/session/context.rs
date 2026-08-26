@@ -1,10 +1,8 @@
 //! 会话上下文投影与 LLM 消息转换。
 
-use singularity_model::{ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus};
+use singularity_model::{ModelMessage, ModelRole};
 
-use crate::message::{
-    AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
-};
+use crate::message::{AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
 use super::format::{Result, SessionEntry, SessionEntryType};
 use super::manager::SessionManager;
@@ -51,22 +49,7 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
                 let tool_calls = message
                     .tool_calls()
                     .into_iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::ToolCall { id, name, args } => {
-                            if id.trim().is_empty() || name.trim().is_empty() {
-                                return None;
-                            }
-                            Some(ModelToolCall {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                arguments: args.clone(),
-                                raw_arguments: serde_json::to_string(args).unwrap_or_default(),
-                                parse_status: ModelToolParseStatus::Valid,
-                                validation_errors: Vec::new(),
-                            })
-                        }
-                        _ => None,
-                    })
+                    .filter_map(|block| block.to_model_tool_call())
                     .collect::<Vec<_>>();
                 if tool_calls.is_empty() {
                     return vec![ModelMessage::text(
