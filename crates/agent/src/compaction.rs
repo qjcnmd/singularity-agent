@@ -221,15 +221,6 @@ pub enum CompactionOutcome {
     },
 }
 
-/// 请求压缩的原因。`ContextOverflow` 只绕过阈值判定；其持久化的
-/// `tokens_before` 仍是真实估算。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactionReason {
-    Threshold,
-    ContextOverflow,
-    Manual,
-}
-
 /// Compaction 错误。
 #[derive(Debug, Error)]
 pub enum CompactionError {
@@ -244,15 +235,31 @@ pub enum CompactionError {
 /// `compact` 结果别名。
 pub type Result<T> = std::result::Result<T, CompactionError>;
 
-/// 切点查找的内部计算结果。
+/// 切点查找的内部计算结果（穷尽两态：切点落在条目上，或超长单轮被切开）。
 #[derive(Debug, Clone, PartialEq)]
-struct CutPointResult {
-    /// 保留区域的首个条目索引。
-    first_kept_entry_index: usize,
-    /// 若切点命中超长单轮内部，则记录该轮起始消息的索引。
-    turn_start_index: Option<usize>,
-    /// 是否为超长单轮被切开（Split Turn）。
-    is_split_turn: bool,
+enum CutWindow {
+    /// 保留区自该条目起（条目不保证是轮边界；轮起点定位失败时也回落此态）。
+    FromEntry { first_kept_entry_index: usize },
+    /// 超长单轮被切开：保留区自 `first_kept_entry_index` 起，其所属轮起始于
+    /// `turn_start_index`，轮内被切掉的前缀另出摘要。
+    SplitTurn {
+        turn_start_index: usize,
+        first_kept_entry_index: usize,
+    },
+}
+
+impl CutWindow {
+    fn first_kept_entry_index(&self) -> usize {
+        match self {
+            CutWindow::FromEntry {
+                first_kept_entry_index,
+            }
+            | CutWindow::SplitTurn {
+                first_kept_entry_index,
+                ..
+            } => *first_kept_entry_index,
+        }
+    }
 }
 
 /// 上下文压缩引擎：负责判定触发时机、查找安全切点并调用模型生成结构化摘要。
@@ -299,7 +306,7 @@ impl CompactionEngine {
         }
         Some(
             self.find_cut_point_in_range(entries, 0, entries.len(), budget.retain_tokens())
-                .first_kept_entry_index,
+                .first_kept_entry_index(),
         )
     }
 
@@ -373,21 +380,16 @@ impl CompactionEngine {
         self.complete_summarization(&prompt, "summarization failed", cancellation)
     }
 
-    /// 执行一次带显式原因的压缩。ContextOverflow 与 Manual 绕过阈值判定，
-    /// 调用方仍须传入压缩前重建上下文的真实估算值。
-    pub fn compact_with_reason(
+    /// 基于给定会话与预算执行压缩。阈值判定（`should_compact`）由调用方在
+    /// 进入前完成；此处只负责切点查找、摘要生成与压缩条目落盘。调用方须传入
+    /// 压缩前重建上下文的真实估算值。
+    pub fn compact(
         &mut self,
         session: &mut SessionManager,
         budget: &CompactionBudget,
         tokens_before: u64,
-        reason: CompactionReason,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        if matches!(reason, CompactionReason::Threshold)
-            && !self.should_compact(tokens_before, budget)
-        {
-            return Ok(CompactionOutcome::NotNeeded);
-        }
         let entries = session.build_context_entries()?;
         if entries.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
@@ -415,29 +417,35 @@ impl CompactionEngine {
             entries.len(),
             budget.retain_tokens(),
         );
-        let history_end = if cut.is_split_turn {
-            cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
-        } else {
-            cut.first_kept_entry_index
+        let (history_end, turn_prefix_range) = match &cut {
+            CutWindow::FromEntry {
+                first_kept_entry_index,
+            } => (*first_kept_entry_index, None),
+            CutWindow::SplitTurn {
+                turn_start_index,
+                first_kept_entry_index,
+            } => (
+                *turn_start_index,
+                Some((*turn_start_index, *first_kept_entry_index)),
+            ),
         };
         let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..history_end]
             .iter()
             .filter_map(message_from_entry)
             .cloned()
             .collect();
-        let turn_prefix_messages: Vec<AgentMessage> = if cut.is_split_turn {
-            entries[cut.turn_start_index.unwrap_or(boundary_start)..cut.first_kept_entry_index]
+        let turn_prefix_messages: Vec<AgentMessage> = match turn_prefix_range {
+            Some((start, end)) => entries[start..end]
                 .iter()
                 .filter_map(message_from_entry)
                 .cloned()
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            None => Vec::new(),
         };
         if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        let first_kept_entry_id = entries[cut.first_kept_entry_index].id.clone();
+        let first_kept_entry_id = entries[cut.first_kept_entry_index()].id.clone();
         // 从被压缩消息和上一代摘要的 details 中累积文件读取与修改清单。
         let mut file_ops = FileOps::default();
         let previous_text = match &entries[0].entry_type {
@@ -477,20 +485,21 @@ impl CompactionEngine {
             summary_usage_complete &= summary.usage_complete;
             summary.text
         };
-        let mut summary_text = if cut.is_split_turn && !turn_prefix_messages.is_empty() {
-            let prefix = self.generate_turn_prefix_summary(
-                &self.serialize_conversation(&turn_prefix_messages),
-                cancellation,
-            )?;
-            summary_usage.merge(&prefix.usage);
-            summary_usage_complete &= prefix.usage_complete;
-            format!(
-                "{summary_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
-                prefix.text
-            )
-        } else {
-            summary_text
-        };
+        let mut summary_text =
+            if matches!(cut, CutWindow::SplitTurn { .. }) && !turn_prefix_messages.is_empty() {
+                let prefix = self.generate_turn_prefix_summary(
+                    &self.serialize_conversation(&turn_prefix_messages),
+                    cancellation,
+                )?;
+                summary_usage.merge(&prefix.usage);
+                summary_usage_complete &= prefix.usage_complete;
+                format!(
+                    "{summary_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+                    prefix.text
+                )
+            } else {
+                summary_text
+            };
         summary_text.push_str(&format_file_operations(&read_files, &modified_files));
 
         let entry = CompactionEntry {
@@ -519,15 +528,13 @@ impl CompactionEngine {
         start_index: usize,
         end_index: usize,
         keep_recent_tokens: u64,
-    ) -> CutPointResult {
+    ) -> CutWindow {
         let cut_points: Vec<usize> = (start_index..end_index)
             .filter(|&index| is_cut_point_entry(&entries[index]))
             .collect();
         if cut_points.is_empty() {
-            return CutPointResult {
+            return CutWindow::FromEntry {
                 first_kept_entry_index: start_index,
-                turn_start_index: None,
-                is_split_turn: false,
             };
         }
         // 从最新条目向后回溯累加 Token 估算值，达到保留预算时选择 >= 当前条目的最近合法切点。
@@ -563,15 +570,20 @@ impl CompactionEngine {
             cut_index -= 1;
         }
         let starts_turn = is_turn_start_entry(&entries[cut_index]);
-        let turn_start_index = if starts_turn {
-            None
+        if starts_turn {
+            CutWindow::FromEntry {
+                first_kept_entry_index: cut_index,
+            }
         } else {
-            find_turn_start_index(entries, cut_index, start_index)
-        };
-        CutPointResult {
-            first_kept_entry_index: cut_index,
-            turn_start_index,
-            is_split_turn: !starts_turn && turn_start_index.is_some(),
+            match find_turn_start_index(entries, cut_index, start_index) {
+                Some(turn_start_index) => CutWindow::SplitTurn {
+                    turn_start_index,
+                    first_kept_entry_index: cut_index,
+                },
+                None => CutWindow::FromEntry {
+                    first_kept_entry_index: cut_index,
+                },
+            }
         }
     }
 

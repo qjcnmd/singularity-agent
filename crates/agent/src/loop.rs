@@ -29,9 +29,7 @@ use singularity_model::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::compaction::{
-    CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, CompactionReason,
-};
+use crate::compaction::{CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome};
 use crate::message::{
     AgentMessage, AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message,
     user_message,
@@ -823,13 +821,10 @@ impl Agent {
         // 近期内容比例。
         budget.retain_ratio = 0.0;
         let tokens_before = self.assembled_context_estimate()?;
-        match self.compaction.compact_with_reason(
-            &mut self.session,
-            &budget,
-            tokens_before,
-            CompactionReason::ContextOverflow,
-            cancellation,
-        ) {
+        match self
+            .compaction
+            .compact(&mut self.session, &budget, tokens_before, cancellation)
+        {
             Ok(result) => Ok(result),
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
@@ -854,13 +849,7 @@ impl Agent {
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let tokens_before = self.assembled_context_estimate()?;
         self.compaction
-            .compact_with_reason(
-                &mut self.session,
-                &budget,
-                tokens_before,
-                CompactionReason::Manual,
-                cancellation,
-            )
+            .compact(&mut self.session, &budget, tokens_before, cancellation)
             .map_err(AgentError::Compaction)
     }
 
@@ -1082,11 +1071,10 @@ impl Agent {
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let compaction_tokens = previous_context_tokens.unwrap_or(assembled_estimate);
         if self.compaction.should_compact(compaction_tokens, &budget) {
-            match self.compaction.compact_with_reason(
+            match self.compaction.compact(
                 &mut self.session,
                 &budget,
                 compaction_tokens,
-                CompactionReason::Threshold,
                 cancellation,
             ) {
                 Ok(result) => {
