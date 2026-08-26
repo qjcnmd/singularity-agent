@@ -267,7 +267,10 @@ pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
         .unwrap_or("session.jsonl");
     let temporary = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4().simple()));
     let mut handle = singularity_core::create_owner_only_file(&temporary).map_err(|error| {
-        SessionError::Repair(format!("could not create temporary session file: {error}"))
+        SessionError::Repair {
+            context: "could not create temporary session file".to_string(),
+            source: error,
+        }
     })?;
     let write_result = (|| -> std::io::Result<()> {
         for line in &serialized {
@@ -281,15 +284,17 @@ pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
     drop(handle);
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temporary);
-        return Err(SessionError::Repair(format!(
-            "could not write temporary session file: {error}"
-        )));
+        return Err(SessionError::Repair {
+            context: "could not write temporary session file".to_string(),
+            source: error,
+        });
     }
     if let Err(error) = singularity_core::atomic_replace(&temporary, file) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(SessionError::Repair(format!(
-            "could not atomically replace session file: {error}"
-        )));
+        return Err(SessionError::Repair {
+            context: "could not atomically replace session file".to_string(),
+            source: error,
+        });
     }
     Ok(())
 }

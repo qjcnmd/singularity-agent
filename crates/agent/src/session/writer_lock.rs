@@ -61,11 +61,9 @@ impl WriterLockCoordinator {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|error| {
-                SessionError::WriterLock(format!(
-                    "failed to open thread writer lock {}: {error}",
-                    path.display()
-                ))
+            .map_err(|error| SessionError::WriterLock {
+                context: format!("failed to open thread writer lock {}", path.display()),
+                source: error,
             })?;
 
         match file.try_lock() {
@@ -76,10 +74,10 @@ impl WriterLockCoordinator {
                 });
             }
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(SessionError::WriterLock(format!(
-                    "failed to acquire thread writer lock {}: {error}",
-                    path.display()
-                )));
+                return Err(SessionError::WriterLock {
+                    context: format!("failed to acquire thread writer lock {}", path.display()),
+                    source: error,
+                });
             }
         }
 
@@ -92,11 +90,12 @@ impl WriterLockCoordinator {
 
     /// 获取协调锁（持有期间串行化 stale 清理与锁文件删除）。
     fn lock_coordination(&self) -> Result<File, SessionError> {
-        create_owner_only_dir(&self.directory).map_err(|error| {
-            SessionError::WriterLock(format!(
-                "failed to create writer lock directory {}: {error}",
+        create_owner_only_dir(&self.directory).map_err(|error| SessionError::WriterLock {
+            context: format!(
+                "failed to create writer lock directory {}",
                 self.directory.display()
-            ))
+            ),
+            source: io::Error::other(error),
         })?;
         let path = self.directory.join(COORDINATION_LOCK_FILE);
         let file = OpenOptions::new()
@@ -105,17 +104,13 @@ impl WriterLockCoordinator {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|error| {
-                SessionError::WriterLock(format!(
-                    "failed to open coordination lock {}: {error}",
-                    path.display()
-                ))
+            .map_err(|error| SessionError::WriterLock {
+                context: format!("failed to open coordination lock {}", path.display()),
+                source: error,
             })?;
-        file.lock().map_err(|error| {
-            SessionError::WriterLock(format!(
-                "failed to acquire coordination lock {}: {error}",
-                path.display()
-            ))
+        file.lock().map_err(|error| SessionError::WriterLock {
+            context: format!("failed to acquire coordination lock {}", path.display()),
+            source: error,
         })?;
         Ok(file)
     }

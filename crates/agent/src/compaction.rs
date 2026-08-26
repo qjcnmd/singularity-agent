@@ -164,17 +164,17 @@ impl CompactionConfig {
     /// 留出空间），`retain_ratio` 与摘要输出上限沿用既有约束；非法配置 fail closed。
     pub fn validate(&self, context_window: u64, provider_max_output_tokens: u32) -> Result<()> {
         if !(self.retain_ratio.is_finite() && 0.0 < self.retain_ratio && self.retain_ratio < 1.0) {
-            return Err(CompactionError::InvalidResponse(
+            return Err(CompactionError::Config(
                 "retain_ratio must satisfy 0 < retain_ratio < 1".to_string(),
             ));
         }
         if self.reserve_tokens >= context_window {
-            return Err(CompactionError::InvalidResponse(format!(
+            return Err(CompactionError::Config(format!(
                 "reserve_tokens must be smaller than the model context window ({context_window})"
             )));
         }
         if self.summary_max_tokens == 0 || self.summary_max_tokens > provider_max_output_tokens {
-            return Err(CompactionError::InvalidResponse(format!(
+            return Err(CompactionError::Config(format!(
                 "summary_max_tokens must be positive and no greater than provider output limit ({provider_max_output_tokens})"
             )));
         }
@@ -230,6 +230,8 @@ pub enum CompactionError {
     Session(#[from] SessionError),
     #[error("{0}")]
     InvalidResponse(String),
+    #[error("compaction configuration error: {0}")]
+    Config(String),
 }
 
 /// `compact` 结果别名。

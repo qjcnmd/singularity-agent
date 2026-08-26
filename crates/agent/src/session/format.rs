@@ -29,8 +29,12 @@ pub enum SessionError {
     DuplicateId(String),
     #[error("session entry structure is invalid: {0}")]
     InvalidStructure(String),
-    #[error("session repair failed: {0}")]
-    Repair(String),
+    #[error("session repair failed: {context}")]
+    Repair {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("session append exceeds {kind} limit {limit}; attempted value is {actual}")]
     AppendLimitExceeded {
         kind: &'static str,
@@ -43,8 +47,12 @@ pub enum SessionError {
     EntryNotFound(String),
     #[error("session is being written by an active writer: {thread_id}")]
     WriterConflict { thread_id: String },
-    #[error("session writer lock error: {0}")]
-    WriterLock(String),
+    #[error("session writer lock error: {context}")]
+    WriterLock {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// 会话操作结果。
