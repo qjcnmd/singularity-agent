@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 
-use super::app::{Phase, TuiApp, WaitingTarget};
+use super::app::TuiApp;
 
 /// 鼠标滚轮一格对应的三行滚动。
 pub(super) const WHEEL_ROWS: usize = 3;
@@ -96,13 +96,8 @@ impl TuiApp {
             return;
         };
         match target {
-            ClickTarget::Stop => {
-                if self.phase != Phase::Idle {
-                    self.conversation.interrupt();
-                    self.phase = Phase::Interrupting;
-                    self.set_waiting(WaitingTarget::TerminalConvergence);
-                }
-            }
+            // 运行中点击 [stop] 与 Esc 同一中断路径。
+            ClickTarget::Stop => self.request_interrupt(),
             ClickTarget::Editor => {
                 let visual_row = self
                     .last_editor_scroll_top

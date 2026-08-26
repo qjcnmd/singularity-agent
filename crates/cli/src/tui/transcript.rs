@@ -222,6 +222,12 @@ impl Transcript {
         })
     }
 
+    /// 该 item_id 是否为工具条目（runtime 中工具条目的 item id 即
+    /// tool call id）。事件投影据此区分工具相关事件与 assistant 文本。
+    pub fn is_tool_item(&self, call_id: &str) -> bool {
+        self.tool_item(call_id).is_some()
+    }
+
     fn tool_item_mut(&mut self, call_id: &str) -> Option<&mut ToolItem> {
         self.items.iter_mut().find_map(|item| match item {
             FlowItem::Tool(tool) if tool.call_id == call_id => Some(tool),

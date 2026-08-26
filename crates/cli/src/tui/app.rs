@@ -4,7 +4,6 @@
 //! 设置/恢复会话模态在 `modals`，会话动作在 `session_actions`，鼠标路由在
 //! `mouse`，footer 合同在 `view`；跨模块共享的字段以 `pub(super)` 暴露。
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use ratatui::Frame;
@@ -82,7 +81,9 @@ pub(crate) struct TuiApp {
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     pub(super) waiting_since: Option<std::time::Instant>,
     pub(super) turn_started_at: Option<std::time::Instant>,
-    pub(super) last_usage: Option<singularity_runtime::TurnUsage>,
+    /// 状态行展示用累计 token 数（最后完成 turn 的聚合或 resume 时的摘要）：
+    /// 仅存在已上报 usage 时展示，故为 Option。
+    pub(super) session_tokens: Option<u64>,
     /// 最近一帧会话流宽度、总行数与视口高（键位滚动与增长检测依赖）。
     pub(super) last_flow_width: Option<u16>,
     pub(super) last_total_rows: usize,
@@ -94,7 +95,6 @@ pub(crate) struct TuiApp {
     pub(super) click_targets: Vec<(Rect, ClickTarget)>,
     /// 滚轮归一化状态（滚轮/触控板加速）。
     pub(super) wheel: WheelNormalizer,
-    pub(super) tool_item_ids: HashSet<String>,
     /// /compact 后台压缩进行中；Esc 通过 `compact_cancel` 中止本次压缩。
     pub(super) compacting: bool,
     pub(super) compact_cancel: Option<singularity_core::CancellationToken>,
@@ -120,14 +120,13 @@ impl TuiApp {
             spinner_frame: 0,
             waiting_since: None,
             turn_started_at: None,
-            last_usage: None,
+            session_tokens: None,
             last_flow_width: None,
             last_total_rows: 0,
             last_viewport_rows: 5,
             last_editor_scroll_top: 0,
             click_targets: Vec::new(),
             wheel: WheelNormalizer::default(),
-            tool_item_ids: HashSet::new(),
             compacting: false,
             compact_cancel: None,
         }
@@ -166,7 +165,7 @@ impl TuiApp {
                 self.turn_started_at = Some(std::time::Instant::now());
             }
             TurnEvent::AssistantDelta { delta, item_id, .. } => {
-                if !self.tool_item_ids.contains(item_id) {
+                if !self.transcript.is_tool_item(item_id) {
                     self.transcript.assistant_delta(delta);
                 }
                 self.set_waiting(WaitingTarget::Model);
@@ -179,7 +178,7 @@ impl TuiApp {
             // 聚合遥测不改变等待对象，也不进入会话流。
             TurnEvent::ItemStarted { .. } => {}
             TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
-                if self.tool_item_ids.contains(item_id) {
+                if self.transcript.is_tool_item(item_id) {
                     self.set_waiting(WaitingTarget::Model);
                 }
             }
@@ -189,7 +188,6 @@ impl TuiApp {
                 args,
                 ..
             } => {
-                self.tool_item_ids.insert(tool_call_id.clone());
                 self.transcript.flush_assistant();
                 self.transcript.tool_start(tool_call_id, tool_name, args);
                 self.set_waiting(WaitingTarget::Tool(tool_name.clone()));
@@ -225,7 +223,9 @@ impl TuiApp {
                     .push_note(format!("⚠ [{severity}] {code}: {message}"), style);
             }
             TurnEvent::TurnCompleted { turn } => {
-                self.last_usage = turn.usage.clone();
+                if turn.usage.as_ref().is_some_and(|usage| usage.usage_present) {
+                    self.session_tokens = turn.usage.as_ref().map(|usage| usage.total_tokens);
+                }
                 if let Ok(blocks) = self.conversation.thinking_for_turn(&turn.turn_id) {
                     for block in blocks {
                         self.transcript.push_thinking(block);
@@ -297,6 +297,17 @@ impl TuiApp {
         self.quit_armed = false;
     }
 
+    /// 请求中断活动 turn（Esc 与点击 [stop] 同一路径）：取消 provider
+    /// 调用并转入中断收敛相位；空闲时为空操作。
+    pub(super) fn request_interrupt(&mut self) {
+        if self.phase == Phase::Idle {
+            return;
+        }
+        self.conversation.interrupt();
+        self.phase = Phase::Interrupting;
+        self.set_waiting(WaitingTarget::TerminalConvergence);
+    }
+
     // -- 键盘路由 ------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
@@ -328,11 +339,7 @@ impl TuiApp {
                 self.transcript.toggle_latest_tool_expansion();
             }
             KeyCode::Esc => {
-                if self.phase != Phase::Idle {
-                    self.conversation.interrupt();
-                    self.phase = Phase::Interrupting;
-                    self.set_waiting(WaitingTarget::TerminalConvergence);
-                } else {
+                if self.phase == Phase::Idle {
                     let (total, viewport) = self.flow_metrics();
                     if !self.scroll.is_following() {
                         self.scroll.jump_to_bottom(total, viewport);
@@ -340,6 +347,7 @@ impl TuiApp {
                         self.editor.clear();
                     }
                 }
+                self.request_interrupt();
                 // 压缩进行中：Esc 取消本次压缩（与中断同一按键语义）。
                 if self.compacting {
                     self.cancel_compact();
@@ -418,7 +426,6 @@ impl TuiApp {
             );
             return Action::Continue;
         }
-        self.reset_quit_confirm();
         match self.phase {
             Phase::Idle => {
                 // 新回合 page-flip：视口钉在新内容首行，回复填满一屏后回底

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use singularity_core::CancellationToken;
-use singularity_runtime::{CompactionOutcome, Conversation, Thread, TurnRunner, TurnUsage};
+use singularity_runtime::{CompactionOutcome, Conversation, Thread, TurnRunner};
 
 use super::app::TuiApp;
 use super::commands::{Action, SlashCommand};
@@ -19,45 +19,38 @@ use super::view::{short_id, truncate_label};
 
 impl TuiApp {
     /// 会话换绑统一入口：替换 conversation、thread_id、transcript、scroll
-    /// 与 last_usage，消除 resume/new 双份换绑逻辑。
+    /// 与 session_tokens，消除 resume/new 双份换绑逻辑。
     fn rebind_conversation(
         &mut self,
         runner: Arc<TurnRunner>,
         thread: Thread,
-        last_usage: Option<TurnUsage>,
+        session_tokens: Option<u64>,
     ) {
         let thread_id = thread.thread_id.clone();
         self.conversation = Conversation::new(runner, thread);
         self.thread_id = thread_id;
         self.transcript = Transcript::new();
         self.scroll = ScrollState::default();
-        self.last_usage = last_usage;
+        self.session_tokens = session_tokens;
     }
 
     /// 换绑到已持久化的会话；失败时只记 note，状态不变。
     pub(super) fn resume_thread(&mut self, thread_id: &str) {
         let runner = self.conversation.runner_handle();
-        match singularity_runtime::resume_thread(runner.sessions_dir(), thread_id) {
+        match self.conversation.resume_thread(thread_id) {
             Ok(thread) => {
-                let last_usage =
-                    singularity_runtime::list_threads(self.conversation.runner().sessions_dir())
-                        .ok()
-                        .and_then(|threads| {
-                            threads
-                                .into_iter()
-                                .find(|summary| summary.thread_id == thread.thread_id)
-                        })
-                        .map(|summary| TurnUsage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            total_tokens: summary.total_tokens,
-                            cached_input_tokens: 0,
-                            reasoning_tokens: 0,
-                            usage_present: summary.total_tokens > 0,
-                            usage_complete: false,
-                        });
+                let session_tokens = self
+                    .conversation
+                    .list_threads()
+                    .ok()
+                    .and_then(|threads| {
+                        threads
+                            .into_iter()
+                            .find(|summary| summary.thread_id == thread.thread_id)
+                    })
+                    .and_then(|summary| (summary.total_tokens > 0).then_some(summary.total_tokens));
                 let thread_id = thread.thread_id.clone();
-                self.rebind_conversation(runner, thread, last_usage);
+                self.rebind_conversation(runner, thread, session_tokens);
                 self.transcript.push_note(
                     format!("resumed thread {}", short_id(&thread_id)),
                     NoteStyle::Accent,
@@ -94,20 +87,18 @@ impl TuiApp {
                     .and_then(|thread| thread.model);
                 self.settings = Some(SettingsMenu::open(current.as_deref()));
             }
-            SlashCommand::Resume => {
-                match singularity_runtime::list_threads(self.conversation.runner().sessions_dir()) {
-                    Ok(threads) if !threads.is_empty() => {
-                        self.resume = Some(ResumeMenu {
-                            threads,
-                            selected: 0,
-                        });
-                    }
-                    Ok(_) => self
-                        .transcript
-                        .push_note("no saved sessions", NoteStyle::Dim),
-                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
+            SlashCommand::Resume => match self.conversation.list_threads() {
+                Ok(threads) if !threads.is_empty() => {
+                    self.resume = Some(ResumeMenu {
+                        threads,
+                        selected: 0,
+                    });
                 }
-            }
+                Ok(_) => self
+                    .transcript
+                    .push_note("no saved sessions", NoteStyle::Dim),
+                Err(error) => self.transcript.push_note(error, NoteStyle::Error),
+            },
             SlashCommand::New => {
                 let runner = self.conversation.runner_handle();
                 let current = self.conversation.thread().ok();
@@ -116,7 +107,7 @@ impl TuiApp {
                     .map(|thread| thread.cwd.clone())
                     .unwrap_or_default();
                 let model = current.and_then(|thread| thread.model);
-                match singularity_runtime::create_thread(runner.sessions_dir(), &cwd, model) {
+                match self.conversation.create_thread(&cwd, model) {
                     Ok(thread) => {
                         let thread_id = thread.thread_id.clone();
                         self.rebind_conversation(runner, thread, None);
@@ -129,14 +120,11 @@ impl TuiApp {
                 }
             }
             SlashCommand::Session => {
-                let summary =
-                    singularity_runtime::list_threads(self.conversation.runner().sessions_dir())
-                        .ok()
-                        .and_then(|threads| {
-                            threads
-                                .into_iter()
-                                .find(|summary| summary.thread_id == self.thread_id)
-                        });
+                let summary = self.conversation.list_threads().ok().and_then(|threads| {
+                    threads
+                        .into_iter()
+                        .find(|summary| summary.thread_id == self.thread_id)
+                });
                 match summary {
                     Some(summary) => self.transcript.push_note(
                         format!(

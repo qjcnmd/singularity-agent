@@ -100,10 +100,8 @@ impl TuiApp {
         if self.transcript.thinking_collapsed() {
             status.push(Span::styled("[thinking folded]", dim));
         }
-        if let Some(usage) = &self.last_usage
-            && usage.usage_present
-        {
-            status.push(Span::styled(format!(" {} tokens", usage.total_tokens), dim));
+        if let Some(tokens) = self.session_tokens {
+            status.push(Span::styled(format!(" {tokens} tokens"), dim));
         }
         let queue = self.conversation.pending_follow_ups().len();
         if queue > 0 {
