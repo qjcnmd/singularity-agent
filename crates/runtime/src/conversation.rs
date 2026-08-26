@@ -422,13 +422,13 @@ impl Conversation {
         let mut last: Option<Result<TurnOutcome, ConversationError>> = None;
         loop {
             let current = match queue.pop_front() {
-                Some(current) => Some(current),
-                None => self.take_one_pending_follow_up(),
+                Some(current) => current,
+                None => match self.take_one_pending_follow_up_or_close()? {
+                    Some(input) => input,
+                    None => break,
+                },
             };
-            let Some(current) = current else {
-                break;
-            };
-            let step = self.run_single_turn(current, sink);
+            let step = self.run_single_turn(current.clone(), sink);
             // 无可信终态的轮次（终态化失败、准备失败、并发占用）中止链条：
             // 剩余输入与待生效设置原样保留，返回可行动错误。
             let untrusted = matches!(
@@ -438,6 +438,14 @@ impl Conversation {
                     | Err(ConversationError::TurnAlreadyActive)
             );
             if untrusted {
+                // 准备失败时本轮输入必然未执行过：放回队首继续可用；
+                // 终态化失败时本轮可能已部分执行，不重放。
+                if !matches!(
+                    step,
+                    Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
+                ) {
+                    queue.push_front(current);
+                }
                 self.requeue_follow_ups(queue);
                 return step;
             }
@@ -573,10 +581,18 @@ impl Conversation {
             .and_then(|state| state.turn.controls())
     }
 
-    fn take_one_pending_follow_up(&self) -> Option<String> {
-        self.lock_state()
-            .ok()
-            .and_then(|mut state| state.pending_follow_ups.pop_front())
+    /// 从状态锁内原子地取下一条 followUp；队列为空时在同一临界区关闭链
+    /// 窗口（转入 Idle），此后 submit_follow_up 自然拒绝。窗口关闭与
+    /// 取队列是同一把锁内的原子操作，不存在"取空后仍接受新输入"的窗口。
+    fn take_one_pending_follow_up_or_close(&self) -> Result<Option<String>, ConversationError> {
+        let mut state = self.lock_state()?;
+        match state.pending_follow_ups.pop_front() {
+            Some(input) => Ok(Some(input)),
+            None => {
+                state.turn = TurnLifecycle::Idle;
+                Ok(None)
+            }
+        }
     }
 
     fn requeue_follow_ups(&self, inputs: VecDeque<String>) {

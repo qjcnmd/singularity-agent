@@ -12,7 +12,7 @@ use crate::runner::{TurnOutcome, TurnRunner};
 use crate::store::{create_thread, resume_thread};
 use crate::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
-    compose_merged_selector,
+    TurnRunError, compose_merged_selector,
 };
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{
@@ -186,6 +186,51 @@ fn wait_for_requested(requested: &std::sync::atomic::AtomicBool) {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     panic!("provider should have received the request");
+}
+
+/// 顺序门控 provider：每次请求按序阻塞在各自的闸门上（无闸门时立即返回），
+/// 用于确定性构造多轮链窗口。
+struct SequentialGatedProvider {
+    gates: std::sync::Mutex<std::collections::VecDeque<std::sync::Mutex<mpsc::Receiver<()>>>>,
+    log: Arc<RequestLog>,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Provider for SequentialGatedProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(gate) = self.gates.lock().unwrap().pop_front() {
+            let _ = gate
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }
+        self.log.record(request);
+        Ok(ModelTurnResponse::completed(
+            request.request_id.clone(),
+            "r",
+            "ok",
+        ))
+    }
+}
+
+fn wait_for_request_count(requests: &std::sync::atomic::AtomicUsize, count: usize) {
+    for _ in 0..400 {
+        if requests.load(std::sync::atomic::Ordering::SeqCst) >= count {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("provider should have received {count} requests");
 }
 
 struct FailingProvider;
@@ -882,6 +927,146 @@ fn steer_affects_only_the_current_turn() {
         "steer joins the current turn's context without spawning a turn"
     );
 }
+
+#[test]
+fn follow_up_submitted_at_terminal_is_consumed_and_never_lingers() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let log = Arc::new(RequestLog::default());
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(SequentialGatedProvider {
+            gates: std::sync::Mutex::new(vec![std::sync::Mutex::new(gate_rx)].into()),
+            log: Arc::clone(&log),
+            requests: Arc::clone(&requests),
+        }),
+        None,
+    ));
+    let injection = Arc::new(std::sync::Mutex::new(None::<bool>));
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        let injection = Arc::clone(&injection);
+        let sink_shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut sink = move |event: TurnEvent| {
+                // 终态收敛瞬间注入 followUp（受控调度：sink 运行于链条线程，
+                // 先于下一次取队列；只注入一次避免自续链）。
+                if matches!(event, TurnEvent::TurnCompleted { .. }) {
+                    let mut slot = injection.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(sink_shared.submit_follow_up("terminal injection"));
+                    }
+                }
+            };
+            shared.run_turn("initial input", &mut sink)
+        })
+    };
+    wait_for_request_count(&requests, 1);
+    gate_tx.send(()).expect("release first turn");
+    let outcome = turn_thread
+        .join()
+        .expect("chain thread")
+        .expect("chain completes");
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+
+    // 终态收敛瞬间的注入被接受并恰好执行一次，不允许滞留。
+    assert_eq!(
+        *injection.lock().unwrap(),
+        Some(true),
+        "terminal injection must be accepted while the chain is closing"
+    );
+    assert_eq!(
+        log.input_sequence(),
+        vec!["initial input".to_string(), "terminal injection".to_string()],
+        "terminal injection runs as its own turn exactly once"
+    );
+    assert!(
+        shared.pending_follow_ups().is_empty(),
+        "accepted follow-up must never linger after the chain ends"
+    );
+    // 链条结束后窗口已关闭：后续提交被明确拒绝。
+    assert!(
+        !shared.submit_follow_up("after close"),
+        "closed chain window must reject follow-ups"
+    );
+    assert!(!shared.has_active_turn());
+}
+
+#[test]
+fn preparation_failure_requeues_current_input_at_queue_head() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (gate1_tx, gate1_rx) = mpsc::channel();
+    let (gate2_tx, gate2_rx) = mpsc::channel();
+    let log = Arc::new(RequestLog::default());
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(SequentialGatedProvider {
+            gates: std::sync::Mutex::new(
+                vec![std::sync::Mutex::new(gate1_rx), std::sync::Mutex::new(gate2_rx)].into(),
+            ),
+            log: Arc::clone(&log),
+            requests: Arc::clone(&requests),
+        }),
+        None,
+    ));
+    let thread_id = shared.thread().unwrap().thread_id;
+    let session_path = sessions.join(format!("{thread_id}.jsonl"));
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let mut sink = EventCollector::default().sink();
+            shared.run_turn("explicit input", &mut sink)
+        })
+    };
+    wait_for_request_count(&requests, 1);
+    assert!(
+        shared.submit_follow_up("second input"),
+        "follow-up accepted while the first turn runs"
+    );
+    assert!(
+        shared.submit_follow_up("third input"),
+        "follow-up accepted while the first turn runs"
+    );
+    gate1_tx.send(()).expect("release first turn");
+    wait_for_request_count(&requests, 2);
+    assert!(
+        shared.submit_follow_up("fourth input"),
+        "follow-up accepted while the second turn runs"
+    );
+    // 删除会话文件：下一轮准备阶段（open_and_repair_session）必然失败。
+    std::fs::remove_file(&session_path).expect("remove session file");
+    gate2_tx.send(()).expect("release second turn");
+
+    let result = turn_thread.join().expect("chain thread");
+    let error = result.expect_err("preparation failure aborts the chain");
+    assert!(
+        matches!(
+            error,
+            ConversationError::Turn(TurnRunError::Preparation { .. })
+        ),
+        "expected preparation failure, got {error:?}"
+    );
+    // 本轮输入（third input）回到队首，其余已接受输入保持相对顺序。
+    assert_eq!(
+        shared.pending_follow_ups(),
+        vec!["third input", "fourth input"],
+        "failed current input returns to the head; the rest keep order"
+    );
+    // 失败输入从未执行；窗口已释放。
+    assert_eq!(
+        log.input_sequence(),
+        vec!["explicit input", "second input"],
+        "failed current input never executed"
+    );
+    assert!(!shared.has_active_turn(), "aborted chain releases the window");
+}
+
 
 #[test]
 fn reservation_holds_window_and_releases_on_drop() {
