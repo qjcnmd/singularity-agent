@@ -103,18 +103,8 @@ impl AppServer {
             return Ok(Vec::new());
         }
 
-        if method
-            .spec()
-            .validate_params(message.params().cloned().unwrap_or_else(|| json!({})))
-            .is_err()
-        {
-            return if notification {
-                Ok(Vec::new())
-            } else {
-                json_error(id, ErrorCode::invalid_params("Invalid params"))
-            };
-        }
-
+        // 初始化门禁先于参数校验：未初始化前，任何请求方法的响应都是
+        // Not initialized，参数解析在各自 handler 内唯一进行。
         if matches!(method, Method::Initialized) && !self.initialized {
             return if notification {
                 Ok(Vec::new())

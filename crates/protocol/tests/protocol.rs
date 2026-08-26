@@ -62,18 +62,8 @@ fn injection_and_thread_read_params_are_bounded_by_registry() {
     })
     .expect("steer params");
     assert_eq!(steer["turnId"], "turn-id");
-    assert!(
-        Method::TurnSteer
-            .spec()
-            .validate_params(steer.clone())
-            .is_ok()
-    );
-    assert!(
-        Method::TurnFollowUp
-            .spec()
-            .validate_params(steer.clone())
-            .is_ok()
-    );
+    assert!(serde_json::from_value::<TurnInjectionParams>(steer.clone()).is_ok());
+    assert!(serde_json::from_value::<TurnInjectionParams>(steer.clone()).is_ok());
 
     let read = json!({"sessionId":"session-id"});
     let params: ThreadReadParams = serde_json::from_value(read).expect("session read params");
@@ -89,16 +79,9 @@ fn injection_and_thread_read_params_are_bounded_by_registry() {
     assert_eq!(wire["sessionId"], "session-id");
     assert_eq!(wire["limit"], 5);
     assert_eq!(wire["beforeItem"], "entry:item");
+    assert!(serde_json::from_value::<ThreadReadParams>(json!({"sessionId":"x"})).is_ok());
     assert!(
-        Method::ThreadRead
-            .spec()
-            .validate_params(json!({"sessionId":"x"}))
-            .is_ok()
-    );
-    assert!(
-        Method::ThreadRead
-            .spec()
-            .validate_params(json!({"sessionId":"x","unknown":true}))
+        serde_json::from_value::<ThreadReadParams>(json!({"sessionId":"x","unknown":true}))
             .is_err()
     );
 }
@@ -337,7 +320,7 @@ fn initialize_params_keep_client_info_contract() {
         }))
         .is_err()
     );
-    assert!(Method::Initialize.spec().validate_params(params).is_ok());
+    assert!(serde_json::from_value::<InitializeParams>(params).is_ok());
     assert_eq!(ErrorCode::not_initialized().message(), "Not initialized");
 }
 

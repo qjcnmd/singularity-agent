@@ -21,7 +21,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use singularity_model::ModelUsage;
 use singularity_protocol::{
     AppEvent, ErrorCode, HistoryItem, InitializeParams, InitializeResult, JsonRpcId,

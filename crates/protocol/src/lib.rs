@@ -99,13 +99,12 @@ pub enum MethodKind {
     Notification,
 }
 
-/// 单个 method 的参数和结果合同。
+/// 单个 method 的名称、调用类型与结果形状。
 #[derive(Clone, Copy)]
 pub struct MethodSpec {
     pub method: Method,
     pub name: &'static str,
     pub kind: MethodKind,
-    validate_params: fn(Value) -> Result<(), String>,
 }
 
 impl std::fmt::Debug for MethodSpec {
@@ -119,34 +118,20 @@ impl std::fmt::Debug for MethodSpec {
     }
 }
 
-impl MethodSpec {
-    /// 按该 method 唯一登记的参数合同校验 params。
-    pub fn validate_params(self, params: Value) -> Result<(), String> {
-        (self.validate_params)(params)
-    }
-}
-
-fn validate_params<T: DeserializeOwned>(params: Value) -> Result<(), String> {
-    serde_json::from_value::<T>(params)
-        .map(|_| ())
-        .map_err(|_| "params do not match the registered method contract".to_string())
-}
-
 macro_rules! method_registry {
-    ($( $variant:ident => ($name:literal, $kind:ident, $params:ty) ),+ $(,)?) => {
+    ($( $variant:ident => ($name:literal, $kind:ident) ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         /// JSON-RPC 方法名。
         pub enum Method {
             $( $variant, )+
         }
 
-        /// 唯一的公共 method registry；方法查找和参数合同都由此生成。
+        /// 唯一的公共 method registry；方法查找由此生成。
         pub const METHOD_REGISTRY: &[MethodSpec] = &[
             $( MethodSpec {
                 method: Method::$variant,
                 name: $name,
                 kind: MethodKind::$kind,
-                validate_params: validate_params::<$params>,
             }, )+
         ];
 
@@ -176,19 +161,19 @@ macro_rules! method_registry {
 }
 
 method_registry! {
-    Initialize => ("initialize", Request, InitializeParams),
-    Initialized => ("initialized", Notification, EmptyParams),
-    ThreadList => ("thread/list", Request, EmptyParams),
-    ThreadStart => ("thread/start", Request, ThreadStartParams),
-    ThreadSettings => ("thread/settings", Request, ThreadSettingsParams),
-    ThreadRead => ("thread/read", Request, ThreadReadParams),
-    SessionDelete => ("session/delete", Request, SessionIdParams),
-    TurnStart => ("turn/start", Request, TurnStartParams),
-    TurnSteer => ("turn/steer", Request, TurnInjectionParams),
-    TurnFollowUp => ("turn/followUp", Request, TurnInjectionParams),
-    ProviderStatus => ("provider/status", Request, EmptyParams),
-    TurnInterrupt => ("turn/interrupt", Request, TurnIdParams),
-    ServerShutdown => ("server/shutdown", Request, EmptyParams),
+    Initialize => ("initialize", Request),
+    Initialized => ("initialized", Notification),
+    ThreadList => ("thread/list", Request),
+    ThreadStart => ("thread/start", Request),
+    ThreadSettings => ("thread/settings", Request),
+    ThreadRead => ("thread/read", Request),
+    SessionDelete => ("session/delete", Request),
+    TurnStart => ("turn/start", Request),
+    TurnSteer => ("turn/steer", Request),
+    TurnFollowUp => ("turn/followUp", Request),
+    ProviderStatus => ("provider/status", Request),
+    TurnInterrupt => ("turn/interrupt", Request),
+    ServerShutdown => ("server/shutdown", Request),
 }
 
 /// JSON-RPC id：单一数字（i64）。请求、响应与错误响应只接受数字 id；
