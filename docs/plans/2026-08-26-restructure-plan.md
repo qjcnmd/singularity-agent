@@ -105,3 +105,4 @@
 
 - Phase 1：typed `TurnEvent` 已贯穿 runtime、protocol、app-server 与 CLI；协议构造器由 typed DTO 序列化，wire 词形不变。验证：`cargo test -p singularity_runtime -p singularity_protocol -p singularity_app_server -p singularity_cli` 全绿；隔离 LongCat 真实调用 completed，`provider/attempt.status` 为 `started/ok`；隔离失败形状冒烟覆盖 `agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}`，词形与基线一致。提交：`a9bb59f`。
 - Phase 2：删除 `SessionIndex`，列表、存在性、设置基线、读取头字段与删除均按需从 JSONL 投影；`ThreadSummary` 扩展为列表载体并统一按 `updated_at` 降序、thread id 升序稳定排序。验证：`cargo test -p singularity_runtime -p singularity_app_server` 全绿（runtime 17、app-server lib 35、stdio 4、steer 3）；隔离 LongCat `sg --json` 冒烟 completed，输出包含 `turn/started`、`provider/attempt`、`item/*`、`turn/completed`，session 文件 1 个。提交：待提交。
+- Phase 3：`Agent::run` 拆出采样请求层 `attempt_request` 与既有流处理入口 `stream_completion`；重试、主动/强制压缩与哨兵状态收拢到请求层，未引入 `AgentState`。验证：`cargo test -p singularity_agent` 全绿（71 tests）。提交：待提交。

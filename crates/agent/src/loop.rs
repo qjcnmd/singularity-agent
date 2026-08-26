@@ -369,6 +369,12 @@ struct PreparedToolCall {
     preflight_execution: Option<ToolExecution>,
 }
 
+enum AttemptOutcome {
+    Response(ModelTurnResponse),
+    Aborted,
+    Failed(AgentError),
+}
+
 /// 通过单一事件出口投递一个事件；事件投影是尽力而为的，回调不再返回
 /// 错误——投影失败由消费方（app-server/CLI）自行吸收诊断，不影响轮次结果。
 fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) {
@@ -565,10 +571,6 @@ impl Agent {
             usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        // 显式上下文溢出每轮只允许一次强制压缩重试。
-        let mut context_overflow_retried = false;
-        // Agent 层重试计数：成功调用或退出循环时重置。
-        let mut retry_attempt = 0u32;
         // 上一轮成功响应的 provider usage 只用于判定下一次请求前是否压缩。
         // 首轮或 usage 缺失时由装配估算兜底。
         let mut previous_context_tokens = None;
@@ -607,123 +609,22 @@ impl Agent {
                         return self.fail_after_progress(AgentError::Session(error), outcome);
                     }
                 }
-                let (mut request, assembled_estimate) = match self.build_request(
+                let model_turn_ordinal = outcome.turns.saturating_add(1);
+                let response = match self.attempt_request(
                     &preferences,
                     &tools,
                     &tool_choice,
                     max_output_tokens,
                     outcome.turns,
-                ) {
-                    Ok(request) => request,
-                    Err(error) => return self.fail_after_progress(error, outcome),
-                };
-                // 请求前主动判定：优先使用上一轮 provider usage；首轮或
-                // usage 缺失时使用本轮装配估算。超过「窗口 − reserve_tokens」
-                // 时先压缩再重装请求。压缩失败降级为警告继续发送，交由
-                // provider 溢出强制压缩路径兜底。
-                let budget = CompactionBudget::from_config(
-                    self.config.context_window,
-                    &self.config.compaction,
-                );
-                let compaction_tokens =
-                    previous_context_tokens.take().unwrap_or(assembled_estimate);
-                if self.compaction.should_compact(compaction_tokens, &budget) {
-                    match self.compaction.compact_with_reason(
-                        &mut self.session,
-                        &budget,
-                        compaction_tokens,
-                        CompactionReason::Threshold,
-                        cancellation,
-                    ) {
-                        Ok(result) => {
-                            record_compaction(&mut outcome, &result);
-                            if matches!(result, CompactionOutcome::Compacted { .. }) {
-                                let (rebuilt, _) = match self.build_request(
-                                    &preferences,
-                                    &tools,
-                                    &tool_choice,
-                                    max_output_tokens,
-                                    outcome.turns,
-                                ) {
-                                    Ok(rebuilt) => rebuilt,
-                                    Err(error) => {
-                                        return self.fail_after_progress(error, outcome);
-                                    }
-                                };
-                                request = rebuilt;
-                            }
-                        }
-                        Err(crate::compaction::CompactionError::Session(error)) => {
-                            return self.fail_after_progress(AgentError::Session(error), outcome);
-                        }
-                        Err(_error) => {
-                            outcome.usage_complete = false;
-                            emit_diagnostic(
-                                events,
-                                AgentDiagnostic::warning(
-                                    "compaction_skipped",
-                                    "automatic context compaction skipped".to_string(),
-                                ),
-                            );
-                        }
-                    }
-                }
-                let model_turn_ordinal = outcome.turns.saturating_add(1);
-                let response = match self.stream_completion(
-                    &request,
+                    previous_context_tokens.take(),
+                    &mut outcome,
                     events,
                     cancellation,
                     model_turn_ordinal,
                 ) {
-                    Ok(response) => response,
-                    Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
-                        // 被拒绝的请求没有完整的 usage 记录；后续 turn 即使成功
-                        // 也不能让这个聚合重新精确。
-                        outcome.usage_complete = false;
-                        let original_error = AgentError::Provider(error);
-                        if context_overflow_retried {
-                            return self.fail_after_progress(original_error, outcome);
-                        }
-                        context_overflow_retried = true;
-                        // 强制压缩失败时向上传播原始上下文溢出错误，保留真实失败根因。
-                        let forced = match self.force_compact(cancellation, events) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                return self.fail_after_progress(original_error, outcome);
-                            }
-                        };
-                        record_compaction(&mut outcome, &forced);
-                        continue;
-                    }
-                    Err(error) => {
-                        // 可重试 provider 错误在 Agent 层统一退避；历史与会话
-                        // 状态保留，不重复已执行的工具副作用。
-                        if let AgentError::Provider(provider) = &error
-                            && retry_attempt < self.config.retry.max_retries
-                            && is_retryable_provider_error(provider)
-                        {
-                            retry_attempt += 1;
-                            let delay_ms = retry_delay_ms(
-                                self.config.retry.base_delay_ms,
-                                retry_attempt,
-                                provider.retry_after,
-                            );
-                            emit_diagnostic(
-                                events,
-                                AgentDiagnostic::info(
-                                    "provider_retry_scheduled",
-                                    format!(
-                                        "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
-                                        provider.error.message,
-                                        max = self.config.retry.max_retries,
-                                    ),
-                                ),
-                            );
-                            if !sleep_abortable(delay_ms, cancellation) {
-                                return self.abort_outcome(outcome);
-                            }
-                            continue;
-                        }
+                    AttemptOutcome::Response(response) => response,
+                    AttemptOutcome::Aborted => return self.abort_outcome(outcome),
+                    AttemptOutcome::Failed(error) => {
                         return self.fail_after_progress(error, outcome);
                     }
                 };
@@ -741,9 +642,6 @@ impl Agent {
                     );
                 }
                 outcome.turns += 1;
-                context_overflow_retried = false;
-                // 成功调用后重置 agent 层重试计数（pi 的 _retryAttempt 语义）。
-                retry_attempt = 0;
                 previous_context_tokens = response
                     .usage
                     .usage_present
@@ -1110,6 +1008,118 @@ impl Agent {
                 parameters_schema: parameters,
             })
             .collect()
+    }
+
+    /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
+    fn attempt_request(
+        &mut self,
+        preferences: &ModelPreferences,
+        tools: &[ModelToolSchema],
+        tool_choice: &ToolChoicePolicy,
+        max_output_tokens: u32,
+        turns: u32,
+        previous_context_tokens: Option<u64>,
+        outcome: &mut AgentOutcome,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
+    ) -> AttemptOutcome {
+        let (mut request, assembled_estimate) =
+            match self.build_request(preferences, tools, tool_choice, max_output_tokens, turns) {
+                Ok(request) => request,
+                Err(error) => return AttemptOutcome::Failed(error),
+            };
+        let budget =
+            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
+        let compaction_tokens = previous_context_tokens.unwrap_or(assembled_estimate);
+        if self.compaction.should_compact(compaction_tokens, &budget) {
+            match self.compaction.compact_with_reason(
+                &mut self.session,
+                &budget,
+                compaction_tokens,
+                CompactionReason::Threshold,
+                cancellation,
+            ) {
+                Ok(result) => {
+                    record_compaction(outcome, &result);
+                    if matches!(result, CompactionOutcome::Compacted { .. }) {
+                        match self.build_request(
+                            preferences,
+                            tools,
+                            tool_choice,
+                            max_output_tokens,
+                            turns,
+                        ) {
+                            Ok((rebuilt, _)) => request = rebuilt,
+                            Err(error) => return AttemptOutcome::Failed(error),
+                        }
+                    }
+                }
+                Err(crate::compaction::CompactionError::Session(error)) => {
+                    return AttemptOutcome::Failed(AgentError::Session(error));
+                }
+                Err(_error) => {
+                    outcome.usage_complete = false;
+                    emit_diagnostic(
+                        events,
+                        AgentDiagnostic::warning(
+                            "compaction_skipped",
+                            "automatic context compaction skipped".to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut context_overflow_retried = false;
+        let mut retry_attempt = 0u32;
+        loop {
+            match self.stream_completion(&request, events, cancellation, model_turn_ordinal) {
+                Ok(response) => return AttemptOutcome::Response(response),
+                Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
+                    outcome.usage_complete = false;
+                    let original_error = AgentError::Provider(error);
+                    if context_overflow_retried {
+                        return AttemptOutcome::Failed(original_error);
+                    }
+                    context_overflow_retried = true;
+                    let forced = match self.force_compact(cancellation, events) {
+                        Ok(result) => result,
+                        Err(_) => return AttemptOutcome::Failed(original_error),
+                    };
+                    record_compaction(outcome, &forced);
+                }
+                Err(error) => {
+                    if let AgentError::Provider(provider) = &error
+                        && retry_attempt < self.config.retry.max_retries
+                        && is_retryable_provider_error(provider)
+                    {
+                        retry_attempt += 1;
+                        let delay_ms = retry_delay_ms(
+                            self.config.retry.base_delay_ms,
+                            retry_attempt,
+                            provider.retry_after,
+                        );
+                        emit_diagnostic(
+                            events,
+                            AgentDiagnostic::info(
+                                "provider_retry_scheduled",
+                                format!(
+                                    "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
+                                    provider.error.message,
+                                    max = self.config.retry.max_retries,
+                                ),
+                            ),
+                        );
+                        if !sleep_abortable(delay_ms, cancellation) {
+                            return AttemptOutcome::Aborted;
+                        }
+                        continue;
+                    }
+                    return AttemptOutcome::Failed(error);
+                }
+            }
+        }
     }
 
     /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
