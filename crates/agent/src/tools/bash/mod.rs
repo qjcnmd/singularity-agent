@@ -1,10 +1,16 @@
 //! bash 工具的执行、输出与规格模块。
 
-mod output;
-mod process;
+mod capture;
+mod exec;
+mod job_object;
+mod pump;
+mod shell;
 mod spec;
 
-use spec::BashArgs;
+pub(crate) use exec::{DESCRIPTION, execute};
+pub use shell::ensure_available;
 pub(crate) use spec::spec;
 
-include!("../bash_exec.rs");
+#[cfg(test)]
+#[path = "../bash_exec_tests.rs"]
+mod tests;
