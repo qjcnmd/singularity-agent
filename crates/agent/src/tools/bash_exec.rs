@@ -814,13 +814,21 @@ impl CaptureState {
                 self.has_open_line = true;
             }
         }
-        if let Some(spill) = self.spill.as_mut() {
-            let _ = spill.append(text);
+        let spill_append_failed = self
+            .spill
+            .as_mut()
+            .is_some_and(|spill| spill.append(text).is_err());
+        if spill_append_failed {
+            // 追加失败后完整输出不再可恢复：放弃 spill，后续不再输出假路径。
+            self.spill = None;
+            self.spill_failed = true;
         }
         self.tail.push_str(text);
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
-            // 首次丢弃前保存完整窗口；此后完整输出只存在于 spill。
-            self.ensure_spill(&self.tail.clone());
+            // 首次丢弃前保存完整窗口；spill 已就绪或已放弃后不再重复克隆尾部。
+            if self.spill.is_none() && !self.spill_failed {
+                self.ensure_spill(&self.tail.clone());
+            }
             trim_to_last_bytes(&mut self.tail, INTERNAL_TAIL_MAX_BYTES);
         }
     }
@@ -1076,6 +1084,39 @@ mod tests {
             !result.content.contains("Full output:"),
             "untruncated output must not reference a spill file, content: {}",
             result.content
+        );
+    }
+
+    #[test]
+    fn spill_append_failure_drops_writer_and_never_emits_full_output_path() {
+        let mut state = CaptureState {
+            command_slug: "test".to_string(),
+            ..CaptureState::default()
+        };
+        // 一次性写入超过内部尾部上限的内容，触发 spill 创建。
+        let big = "x".repeat(INTERNAL_TAIL_MAX_BYTES + 1);
+        state.ingest(&big);
+        assert!(state.spill.is_some(), "truncation must create a spill");
+        // 以同一路径的只读句柄替换写句柄：写入只读句柄必然失败
+        // （Unix O_RDONLY 写回 EBADF，Windows 非写访问句柄被拒）。
+        let mut spill = state.spill.take().expect("spill");
+        let path = spill.path.clone();
+        spill.file = std::fs::File::open(&path).expect("open spill read-only");
+        state.spill = Some(spill);
+        state.ingest("more output");
+        assert!(
+            state.spill.is_none(),
+            "spill must be dropped after an append failure"
+        );
+        assert!(state.spill_failed, "append failure must be recorded");
+        assert!(
+            state.spill_path().is_none(),
+            "no path may be exposed after an append failure"
+        );
+        let progress = state.final_progress();
+        assert!(
+            !progress.output_text.contains("Full output:"),
+            "no fake Full output line after an append failure"
         );
     }
 
