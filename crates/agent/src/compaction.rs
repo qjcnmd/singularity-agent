@@ -325,7 +325,7 @@ impl CompactionEngine {
         let mut parts = Vec::new();
         for message in messages {
             let text = message.content_text();
-            match message.role {
+            match message.role() {
                 AgentMessageRole::User => {
                     if !text.is_empty() {
                         parts.push(format!("[User]: {text}"));
@@ -698,7 +698,9 @@ fn entry_token_estimate(entry: &SessionEntry) -> u64 {
 /// 判断某条目是否为合法的压缩切点（除 ToolResult 之外的消息均可作为切点）。
 fn is_cut_point_entry(entry: &SessionEntry) -> bool {
     match &entry.entry_type {
-        SessionEntryType::Message(message) => !matches!(message.role, AgentMessageRole::ToolResult),
+        SessionEntryType::Message(message) => {
+            !matches!(message.role(), AgentMessageRole::ToolResult)
+        }
         _ => false,
     }
 }
@@ -706,7 +708,7 @@ fn is_cut_point_entry(entry: &SessionEntry) -> bool {
 /// 判断某条目是否为新轮次的起始（User 角色消息）。
 fn is_turn_start_entry(entry: &SessionEntry) -> bool {
     match &entry.entry_type {
-        SessionEntryType::Message(message) => matches!(message.role, AgentMessageRole::User),
+        SessionEntryType::Message(message) => matches!(message.role(), AgentMessageRole::User),
         _ => false,
     }
 }
@@ -784,7 +786,7 @@ struct FileOps {
 
 /// 从 Assistant 消息的 ToolCall 内容块中提取文件操作路径。
 fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps) {
-    if message.role != AgentMessageRole::Assistant {
+    if message.role() != AgentMessageRole::Assistant {
         return;
     }
     for block in message.tool_calls() {

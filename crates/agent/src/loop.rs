@@ -992,10 +992,10 @@ impl Agent {
             let SessionEntryType::Message(message) = &entry.entry_type else {
                 continue;
             };
-            if message.role != AgentMessageRole::Assistant || !message.has_tool_calls() {
+            if message.role() != AgentMessageRole::Assistant || !message.has_tool_calls() {
                 continue;
             }
-            if let Some(replay) = &message.provider_reasoning_replay {
+            if let Some(replay) = message.provider_reasoning_replay() {
                 // provider/model 切换会使 opaque continuation 失效。保留会话中
                 // 可见的 thinking/messages/tool results，但绝不跨不兼容的
                 // provider 边界发送私有 replay。

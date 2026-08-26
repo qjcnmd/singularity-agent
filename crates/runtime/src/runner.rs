@@ -107,9 +107,9 @@ impl TurnRunner {
                     break;
                 }
                 SessionEntryType::Message(message)
-                    if inside_turn && message.role == AgentMessageRole::Assistant =>
+                    if inside_turn && message.role() == AgentMessageRole::Assistant =>
                 {
-                    thinking.extend(message.content.iter().filter_map(|block| match block {
+                    thinking.extend(message.content().iter().filter_map(|block| match block {
                         ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
                             Some(thinking.clone())
                         }

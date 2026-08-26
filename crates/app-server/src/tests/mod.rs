@@ -362,8 +362,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
     session
-        .append_message(singularity_agent::message::AgentMessage {
-            role: singularity_agent::message::AgentMessageRole::Assistant,
+        .append_message(singularity_agent::message::AgentMessage::Assistant {
             content: vec![singularity_agent::message::ContentBlock::Thinking {
                 thinking: "visible reasoning".to_string(),
                 signature: None,
@@ -383,19 +382,13 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
                     json!({"type":"function_call","call_id":"call-1","name":"write","arguments":"{}"}),
                 ],
             }),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .expect("assistant");
     session
-        .append_message(singularity_agent::message::AgentMessage {
-            role: singularity_agent::message::AgentMessageRole::ToolResult,
+        .append_message(singularity_agent::message::AgentMessage::ToolResult {
             content: vec![singularity_agent::message::ContentBlock::Text {
                 text: "write failed".to_string(),
             }],
-            stop_reason: None,
-            provider_reasoning_replay: None,
             tool_call_id: Some("call-1".to_string()),
             tool_name: Some("write".to_string()),
             is_error: Some(true),
@@ -1017,13 +1010,10 @@ fn seed_turned_session(sessions_dir: &Path, session_id: &str, turn_ids: &[&str])
             .expect("user message");
         if index % 2 == 0 {
             session
-                .append_message(singularity_agent::message::AgentMessage {
-                    role: singularity_agent::message::AgentMessageRole::ToolResult,
+                .append_message(singularity_agent::message::AgentMessage::ToolResult {
                     content: vec![singularity_agent::message::ContentBlock::Text {
                         text: format!("tool-output-{index}"),
                     }],
-                    stop_reason: None,
-                    provider_reasoning_replay: None,
                     tool_call_id: Some(format!("call-{index}")),
                     tool_name: Some("bash".to_string()),
                     is_error: None,

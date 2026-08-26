@@ -4,41 +4,28 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 fn user(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::User,
+    AgentMessage::User {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
 fn assistant(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::Assistant,
+    AgentMessage::Assistant {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
         stop_reason: None,
         provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
 fn tool_result(call_id: &str, text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::ToolResult,
+    AgentMessage::ToolResult {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
@@ -46,8 +33,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
 }
 
 fn file_call(tool_name: &str, path: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::Assistant,
+    AgentMessage::Assistant {
         content: vec![ContentBlock::ToolCall {
             id: "call_file".to_string(),
             name: tool_name.to_string(),
@@ -55,9 +41,6 @@ fn file_call(tool_name: &str, path: &str) -> AgentMessage {
         }],
         stop_reason: None,
         provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 

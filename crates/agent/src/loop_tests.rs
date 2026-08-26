@@ -698,7 +698,7 @@ fn steer_at_stop_continues_one_more_turn() {
         agent.session.entries().iter().any(|entry| matches!(
             &entry.entry_type,
             SessionEntryType::Message(message)
-                if message.role == AgentMessageRole::User
+                if message.role() == AgentMessageRole::User
                     && message.content_text() == "please continue"
         )),
         "stop-window input must join the session context before the extra round"
@@ -753,9 +753,9 @@ fn session_file_roundtrip_after_run() {
         })
         .collect();
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0].role, AgentMessageRole::User);
+    assert_eq!(messages[0].role(), AgentMessageRole::User);
     assert_eq!(messages[0].content_text(), "task");
-    assert_eq!(messages[1].role, AgentMessageRole::Assistant);
+    assert_eq!(messages[1].role(), AgentMessageRole::Assistant);
     let ContentBlock::ToolCall { id, name, args } =
         messages[1].tool_calls().first().expect("tool call block")
     else {
@@ -764,10 +764,10 @@ fn session_file_roundtrip_after_run() {
     assert_eq!(id, "call_1");
     assert_eq!(name, "write");
     assert_eq!(*args, json!({ "path": "out.txt", "content": "x" }));
-    assert_eq!(messages[2].role, AgentMessageRole::ToolResult);
-    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[2].role(), AgentMessageRole::ToolResult);
+    assert_eq!(messages[2].tool_call_id(), Some(&"call_1".to_string()));
     assert!(messages[2].content_text().contains("Successfully wrote"));
-    assert_eq!(messages[3].role, AgentMessageRole::Assistant);
+    assert_eq!(messages[3].role(), AgentMessageRole::Assistant);
     assert_eq!(messages[3].content_text(), "finished");
     // 线性序列：会话事实源按落盘次序推进，条目 id 必须唯一且顺序与上下文一致。
     let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
@@ -1228,29 +1228,19 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     session
-        .append_message(AgentMessage {
-            role: AgentMessageRole::User,
+        .append_message(AgentMessage::User {
             content: vec![ContentBlock::Text {
                 text: "old user".to_string(),
             }],
-            stop_reason: None,
-            provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .unwrap();
     session
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
+        .append_message(AgentMessage::Assistant {
             content: vec![ContentBlock::Text {
                 text: "old assistant".to_string(),
             }],
             stop_reason: None,
             provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .unwrap();
     let provider = Arc::new(OverflowProvider {
@@ -1326,7 +1316,7 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             && matches!(
                 &entry.entry_type,
                 SessionEntryType::Message(message)
-                    if message.role == AgentMessageRole::User
+                    if message.role() == AgentMessageRole::User
                         && message.content_text() == "task"
             )
     }));
@@ -1339,29 +1329,19 @@ fn transient_retry_then_overflow_recovers_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     session
-        .append_message(AgentMessage {
-            role: AgentMessageRole::User,
+        .append_message(AgentMessage::User {
             content: vec![ContentBlock::Text {
                 text: "old user".to_string(),
             }],
-            stop_reason: None,
-            provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .unwrap();
     session
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
+        .append_message(AgentMessage::Assistant {
             content: vec![ContentBlock::Text {
                 text: "old assistant".to_string(),
             }],
             stop_reason: None,
             provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .unwrap();
     let provider = Arc::new(InterleaveProvider {
@@ -1431,8 +1411,7 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
     let target = workspace.join("should-not-exist.txt");
     let mut session = SessionManager::create(&workspace, &dir.path().join("sessions")).unwrap();
     session
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
+        .append_message(AgentMessage::Assistant {
             content: vec![
                 ContentBlock::Text {
                     text: "calling write".to_string(),
@@ -1444,10 +1423,7 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
                 },
             ],
             stop_reason: None,
-            tool_call_id: Some("orphan_write_1".to_string()),
-            tool_name: Some("write".to_string()),
             provider_reasoning_replay: None,
-            is_error: None,
         })
         .unwrap();
     drop(session);
@@ -1489,8 +1465,8 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
         matches!(
             &entry.entry_type,
             SessionEntryType::Message(message)
-                if message.role == AgentMessageRole::ToolResult
-                    && message.tool_call_id.as_deref() == Some("orphan_write_1")
+                if message.role() == AgentMessageRole::ToolResult
+                    && message.tool_call_id().is_some_and(|id| id == "orphan_write_1")
                     && message.content_text().contains("do not retry")
         )
     }));

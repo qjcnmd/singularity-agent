@@ -3,6 +3,11 @@
 //! 支持富文本内容块（纯文本 `Text`、思考链 `Thinking`、工具调用 `ToolCall`）
 //! 以及工具执行结果 `ToolResult`，确保单次模型交互的完整语义（含推理过程与多工具调用）
 //! 能够精确持久化与协议重放。
+//!
+//! [`AgentMessage`] 以角色为标签的枚举承载消息体：每个角色只携带其合法字段，
+//! 编译器拒绝「user 消息带 toolCallId」一类非法组合；序列化 wire 形状与历史
+//! 平铺格式逐字节一致（`tag = "role"` + 变体级 camelCase，键序由 serde_json
+//! Map 排序稳定），`wire_fixture_tests` 固化该契约。
 
 use singularity_model::{
     ModelStopReason, ModelToolCall, ModelToolParseStatus, ModelTurnResponse,
@@ -12,7 +17,7 @@ use singularity_model::{
 use crate::tools::ToolExecution;
 
 /// 会话消息角色枚举。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentMessageRole {
     /// 用户输入消息。
@@ -70,49 +75,85 @@ impl ContentBlock {
     }
 }
 
-/// 核心会话消息数据结构。
+/// 核心会话消息数据结构：以角色为标签的枚举，每个角色只携带其合法字段。
+///
+/// wire 形状与历史平铺格式逐字节一致（`role` 为内部 tag）：序列化输出
+/// `{"content":...,"role":"user"}` / `{"role":"assistant",...,"stopReason":...}`
+/// / `{"role":"toolResult",...,"toolCallId":...,"toolName":...,"isError":...}`。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentMessage {
-    pub role: AgentMessageRole,
-    pub content: Vec<ContentBlock>,
-    /// Provider 给出的 assistant 停止原因；仅 assistant 消息设置。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<ModelStopReason>,
-    /// 模型提供方私有推理状态（用于支持 Responses 等协议的推理连续性重放）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_reasoning_replay: Option<ProviderReasoningReplay>,
-    /// 对应的工具调用 ID（仅 ToolResult 角色消息使用）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    /// 对应的工具名称（仅 ToolResult 角色消息使用）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    /// 工具执行是否失败标志。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
+#[serde(tag = "role", rename_all = "camelCase")]
+pub enum AgentMessage {
+    #[serde(rename_all = "camelCase")]
+    User { content: Vec<ContentBlock> },
+    #[serde(rename_all = "camelCase")]
+    Assistant {
+        content: Vec<ContentBlock>,
+        /// Provider 给出的 assistant 停止原因。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<ModelStopReason>,
+        /// 模型提供方私有推理状态（用于支持 Responses 等协议的推理连续性重放）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_reasoning_replay: Option<ProviderReasoningReplay>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolResult {
+        content: Vec<ContentBlock>,
+        /// 对应的工具调用 ID。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        /// 对应的工具名称。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        /// 工具执行是否失败标志。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
 }
 
 impl AgentMessage {
     /// 构造纯文本内容消息。
     pub fn text(role: AgentMessageRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: vec![ContentBlock::Text {
-                text: content.into(),
-            }],
-            stop_reason: None,
-            provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
+        let content = vec![ContentBlock::Text {
+            text: content.into(),
+        }];
+        match role {
+            AgentMessageRole::User => Self::User { content },
+            AgentMessageRole::Assistant => Self::Assistant {
+                content,
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            },
+            AgentMessageRole::ToolResult => Self::ToolResult {
+                content,
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+            },
+        }
+    }
+
+    /// 消息角色投影（展示与分支逻辑使用）。
+    pub fn role(&self) -> AgentMessageRole {
+        match self {
+            Self::User { .. } => AgentMessageRole::User,
+            Self::Assistant { .. } => AgentMessageRole::Assistant,
+            Self::ToolResult { .. } => AgentMessageRole::ToolResult,
+        }
+    }
+
+    /// 消息内容的切片视图。
+    pub fn content(&self) -> &[ContentBlock] {
+        match self {
+            Self::User { content }
+            | Self::Assistant { content, .. }
+            | Self::ToolResult { content, .. } => content,
         }
     }
 
     /// 提取并拼接消息内部所有纯文本块的内容视图。
     pub fn content_text(&self) -> String {
         let mut text = String::new();
-        for block in &self.content {
+        for block in self.content() {
             if let ContentBlock::Text { text: part } = block {
                 if !text.is_empty() {
                     text.push('\n');
@@ -125,7 +166,7 @@ impl AgentMessage {
 
     /// 获取消息包含的所有工具调用块引用。
     pub fn tool_calls(&self) -> Vec<&ContentBlock> {
-        self.content
+        self.content()
             .iter()
             .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
             .collect()
@@ -133,17 +174,60 @@ impl AgentMessage {
 
     /// 判断消息是否包含至少一个工具调用块。
     pub fn has_tool_calls(&self) -> bool {
-        self.content
+        self.content()
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     }
 
     /// 获取消息包含的所有思考推理块引用。
     pub fn thinking_blocks(&self) -> Vec<&ContentBlock> {
-        self.content
+        self.content()
             .iter()
             .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
             .collect()
+    }
+
+    /// assistant 停止原因；仅 assistant 消息携带。
+    pub fn stop_reason(&self) -> Option<&ModelStopReason> {
+        match self {
+            Self::Assistant { stop_reason, .. } => stop_reason.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 对应工具调用 ID；仅 toolResult 消息携带。
+    pub fn tool_call_id(&self) -> Option<&String> {
+        match self {
+            Self::ToolResult { tool_call_id, .. } => tool_call_id.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 对应工具名称；仅 toolResult 消息携带。
+    pub fn tool_name(&self) -> Option<&String> {
+        match self {
+            Self::ToolResult { tool_name, .. } => tool_name.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 工具执行失败标志；仅 toolResult 消息携带。
+    pub fn is_error(&self) -> Option<bool> {
+        match self {
+            Self::ToolResult { is_error, .. } => *is_error,
+            _ => None,
+        }
+    }
+
+    /// provider 推理重放；仅 assistant 消息携带。
+    pub fn provider_reasoning_replay(&self) -> Option<&ProviderReasoningReplay> {
+        match self {
+            Self::Assistant {
+                provider_reasoning_replay,
+                ..
+            } => provider_reasoning_replay.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -153,16 +237,10 @@ pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before thi
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 pub(crate) fn user_message(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::User,
+    AgentMessage::User {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
@@ -189,14 +267,10 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     for call in response.tool_calls() {
         content.push(ContentBlock::from_model_tool_call(call));
     }
-    AgentMessage {
-        role: AgentMessageRole::Assistant,
+    AgentMessage::Assistant {
         content,
         stop_reason: response.stop_reason(),
         provider_reasoning_replay: response.provider_reasoning_history.first().cloned(),
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
@@ -219,13 +293,10 @@ pub(crate) fn tool_result_message(
     tool_name: &str,
     execution: &ToolExecution,
 ) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::ToolResult,
+    AgentMessage::ToolResult {
         content: vec![ContentBlock::Text {
             text: execution.content.clone(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),

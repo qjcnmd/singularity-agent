@@ -70,7 +70,7 @@ impl SessionManager {
         for entry in &self.entries {
             match &entry.entry_type {
                 SessionEntryType::Message(message)
-                    if message.role == AgentMessageRole::Assistant =>
+                    if message.role() == AgentMessageRole::Assistant =>
                 {
                     let tool_call_ids: Vec<String> = message
                         .tool_calls()
@@ -85,10 +85,10 @@ impl SessionManager {
                     }
                 }
                 SessionEntryType::Message(message)
-                    if message.role == AgentMessageRole::ToolResult =>
+                    if message.role() == AgentMessageRole::ToolResult =>
                 {
-                    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-                        paired_tool_results.insert(tool_call_id.to_string());
+                    if let Some(tool_call_id) = message.tool_call_id() {
+                        paired_tool_results.insert(tool_call_id.clone());
                     }
                 }
                 _ => {}
@@ -100,13 +100,10 @@ impl SessionManager {
                 if paired_tool_results.contains(&tool_call_id) {
                     continue;
                 }
-                self.append_entry(SessionEntryType::Message(AgentMessage {
-                    role: AgentMessageRole::ToolResult,
+                self.append_entry(SessionEntryType::Message(AgentMessage::ToolResult {
                     content: vec![ContentBlock::Text {
                         text: "[previous execution outcome unknown; do not retry]".to_string(),
                     }],
-                    stop_reason: None,
-                    provider_reasoning_replay: None,
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     is_error: Some(true),

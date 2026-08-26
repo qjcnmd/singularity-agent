@@ -94,7 +94,7 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
                 let SessionEntryType::Message(message) = &entry.entry_type else {
                     return None;
                 };
-                if message.role != AgentMessageRole::User {
+                if message.role() != AgentMessageRole::User {
                     return None;
                 }
                 let title = message
@@ -153,3 +153,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 #[path = "../session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../wire_fixture_tests.rs"]
+mod wire_fixture_tests;

@@ -41,7 +41,7 @@ impl SessionManager {
 
 pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
     match &entry.entry_type {
-        SessionEntryType::Message(message) => match message.role {
+        SessionEntryType::Message(message) => match message.role() {
             AgentMessageRole::User => {
                 vec![ModelMessage::text(ModelRole::User, message.content_text())]
             }
@@ -63,7 +63,7 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
             }
             AgentMessageRole::ToolResult => {
                 let mut llm = ModelMessage::text(ModelRole::Tool, message.content_text());
-                llm.tool_call_id = message.tool_call_id.clone();
+                llm.tool_call_id = message.tool_call_id().cloned();
                 vec![llm]
             }
         },

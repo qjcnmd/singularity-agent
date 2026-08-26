@@ -1,41 +1,28 @@
 use super::*;
 
 fn user(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::User,
+    AgentMessage::User {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
 fn assistant(text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::Assistant,
+    AgentMessage::Assistant {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
         stop_reason: None,
         provider_reasoning_replay: None,
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
     }
 }
 
 fn tool_result(call_id: &str, text: &str) -> AgentMessage {
-    AgentMessage {
-        role: AgentMessageRole::ToolResult,
+    AgentMessage::ToolResult {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
@@ -97,13 +84,13 @@ fn create_append_reopen_roundtrip() {
         assert!(entry.id.chars().all(|c| c.is_ascii_hexdigit()));
     }
     assert!(matches!(&entries[0].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::User && m.content_text() == "hello"));
+            SessionEntryType::Message(m) if m.role() == AgentMessageRole::User && m.content_text() == "hello"));
     assert!(matches!(&entries[1].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::Assistant && m.content_text() == "hi there"));
+            SessionEntryType::Message(m) if m.role() == AgentMessageRole::Assistant && m.content_text() == "hi there"));
     assert!(matches!(&entries[2].entry_type,
-            SessionEntryType::Message(m) if m.role == AgentMessageRole::ToolResult
-                && m.tool_call_id.as_deref() == Some("call_1")
-                && m.tool_name.as_deref() == Some("bash")));
+            SessionEntryType::Message(m) if m.role() == AgentMessageRole::ToolResult
+                && m.tool_call_id().is_some_and(|id| id == "call_1")
+                && m.tool_name().is_some_and(|name| name == "bash")));
 }
 
 #[test]
@@ -273,8 +260,7 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
     manager
-        .append_message(AgentMessage {
-            role: AgentMessageRole::Assistant,
+        .append_message(AgentMessage::Assistant {
             content: vec![ContentBlock::ToolCall {
                 id: "orphan_call_1".to_string(),
                 name: "bash".to_string(),
@@ -282,9 +268,6 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
             }],
             stop_reason: None,
             provider_reasoning_replay: None,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
         })
         .unwrap();
     let file = manager.path().to_path_buf();
@@ -299,7 +282,9 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
     let tool_results = entries
         .iter()
         .filter_map(|entry| match &entry.entry_type {
-            SessionEntryType::Message(message) if message.role == AgentMessageRole::ToolResult => {
+            SessionEntryType::Message(message)
+                if message.role() == AgentMessageRole::ToolResult =>
+            {
                 Some(message)
             }
             _ => None,
@@ -307,8 +292,8 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
         .collect::<Vec<_>>();
     assert_eq!(tool_results.len(), 1);
     assert_eq!(
-        tool_results[0].tool_call_id.as_deref(),
-        Some("orphan_call_1")
+        tool_results[0].tool_call_id(),
+        Some(&"orphan_call_1".to_string())
     );
     assert!(
         tool_results[0]

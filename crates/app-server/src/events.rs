@@ -16,9 +16,9 @@ use singularity_agent::{
 /// 或其 `provider_reasoning_replay`、parent/tree、迁移字段。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match &entry.entry_type {
-        SessionEntryType::Message(message) => match message.role {
+        SessionEntryType::Message(message) => match message.role() {
             AgentMessageRole::User | AgentMessageRole::Assistant => {
-                let role = if matches!(message.role, AgentMessageRole::User) {
+                let role = if matches!(message.role(), AgentMessageRole::User) {
                     "user"
                 } else {
                     "assistant"
@@ -26,7 +26,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 let mut items = Vec::new();
                 let mut text_index = 0usize;
                 let mut thinking_index = 0usize;
-                for block in &message.content {
+                for block in message.content() {
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             items.push(HistoryItem::Message {
@@ -57,11 +57,11 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
             }
             AgentMessageRole::ToolResult => vec![HistoryItem::ToolResult {
                 id: message
-                    .tool_call_id
-                    .clone()
+                    .tool_call_id()
+                    .cloned()
                     .unwrap_or_else(|| entry.id.clone()),
                 output: message.content_text(),
-                is_error: message.is_error.unwrap_or(false),
+                is_error: message.is_error().unwrap_or(false),
             }],
         },
         SessionEntryType::Compaction(compaction) => vec![HistoryItem::Compaction {
