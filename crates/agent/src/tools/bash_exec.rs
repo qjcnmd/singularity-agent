@@ -264,15 +264,20 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
             append_status(&mut content, &format!("Command timed out after {ms} ms"));
             is_error = true;
         }
-        BashOutcome::Completed => match exit_status.and_then(|status| status.code()) {
-            // 进程正常结束（退出码为 0 或不可得时判定为成功）。
-            Some(0) | None => {
+        BashOutcome::Completed => match exit_status {
+            // 进程正常结束（无信号且退出码为 0）判定为成功。
+            Some(status) if status.success() => {
                 if content.is_empty() {
                     content = "(no output)".to_string();
                 }
             }
-            Some(code) => {
-                append_status(&mut content, &format!("Command exited with code {code}"));
+            Some(status) => {
+                append_status(&mut content, &describe_exit(&status));
+                is_error = true;
+            }
+            // 完成路径的退出状态必然已回收；缺失时按失败报告，不伪装成功。
+            None => {
+                append_status(&mut content, "Command exited without a status");
                 is_error = true;
             }
         },
@@ -312,6 +317,22 @@ fn append_status(content: &mut String, status: &str) {
         content.push_str("\n\n");
     }
     content.push_str(status);
+}
+
+/// 把失败退出状态投影为错误文案：Unix 上被信号终止时报告信号号，
+/// 其余情况报告退出码。
+fn describe_exit(status: &ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("Command terminated by signal {signal}");
+        }
+    }
+    match status.code() {
+        Some(code) => format!("Command exited with code {code}"),
+        None => "Command terminated".to_string(),
+    }
 }
 
 enum BashOutcome {
@@ -1209,6 +1230,19 @@ mod tests {
             .wait_bounded(Duration::from_secs(5))
             .expect("wait child");
         assert!(!status.success(), "terminated process must not be success");
+    }
+
+    /// 信号终止的子进程必须被判为失败并报告信号号（Unix）。
+    #[cfg(unix)]
+    #[test]
+    fn signal_killed_process_is_reported_as_error() {
+        let result = run("kill -9 $$", None);
+        assert!(result.is_error, "content: {}", result.content);
+        assert!(
+            result.content.contains("Command terminated by signal 9"),
+            "content: {}",
+            result.content
+        );
     }
 
     #[cfg(windows)]
