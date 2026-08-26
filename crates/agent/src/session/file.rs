@@ -285,43 +285,13 @@ pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
             "could not write temporary session file: {error}"
         )));
     }
-    if let Err(error) = atomic_replace_file(&temporary, file) {
+    if let Err(error) = singularity_core::atomic_replace(&temporary, file) {
         let _ = std::fs::remove_file(&temporary);
         return Err(SessionError::Repair(format!(
             "could not atomically replace session file: {error}"
         )));
     }
     Ok(())
-}
-
-#[cfg_attr(windows, allow(unsafe_code))]
-fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-        let mut from_wide = from.as_os_str().encode_wide().collect::<Vec<_>>();
-        from_wide.push(0);
-        let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
-        to_wide.push(0);
-        if unsafe {
-            MoveFileExW(
-                from_wide.as_ptr(),
-                to_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(from, to)
-    }
 }
 
 pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {

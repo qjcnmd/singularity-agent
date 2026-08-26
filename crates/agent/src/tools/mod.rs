@@ -9,6 +9,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 mod line;
+pub mod mutation;
 pub mod read;
 pub mod registry;
 pub mod write;
@@ -25,13 +26,14 @@ pub(crate) mod test_support {
     use super::*;
     use std::path::Path;
 
-    /// 测试用 `ExecuteContext`：无取消信号、无流式回调。
+    /// 测试用 `ExecuteContext`：无取消信号、无流式回调、无变更队列。
     pub(crate) fn context<'a>(args: serde_json::Value, cwd: &'a Path) -> ExecuteContext<'a> {
         ExecuteContext {
             args,
             cwd,
             signal: None,
             on_update: None,
+            mutations: None,
         }
     }
 }

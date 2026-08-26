@@ -76,12 +76,14 @@ impl Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
-/// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调。
+/// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调、
+/// 进程内文件变更队列（写类工具登记修改）。
 pub struct ExecuteContext<'a> {
     pub args: Value,
     pub cwd: &'a Path,
     pub signal: Option<&'a CancellationToken>,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
+    pub mutations: Option<&'a super::mutation::FileMutationQueue>,
 }
 
 /// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实的

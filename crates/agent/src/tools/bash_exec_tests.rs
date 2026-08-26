@@ -263,6 +263,7 @@ fn cancellation_terminates_shell_tree_promptly() {
                 cwd: &cwd,
                 signal: Some(&worker_token),
                 on_update: None,
+                mutations: None,
             },
         )
     });
@@ -306,6 +307,7 @@ fn cancellation_stops_descendant_output_growth() {
                 cwd: &cwd,
                 signal: Some(&worker_token),
                 on_update: None,
+                mutations: None,
             },
         )
     });

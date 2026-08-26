@@ -36,6 +36,7 @@ use crate::message::{
 };
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{SessionEntry, SessionEntryType, SessionError, SessionManager};
+use crate::tools::mutation::FileMutationQueue;
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
 };
@@ -415,6 +416,7 @@ fn execute_prepared_tool(
     call: &singularity_model::ModelToolCall,
     cwd: &Path,
     cancellation: &CancellationToken,
+    mutations: &FileMutationQueue,
     mut on_update: impl FnMut(&str),
 ) -> ToolExecution {
     let mut update = |text: &str| on_update(text);
@@ -425,6 +427,7 @@ fn execute_prepared_tool(
             cwd,
             signal: Some(cancellation),
             on_update: Some(&mut update),
+            mutations: Some(mutations),
         },
     ) {
         Ok(execution) => execution,
@@ -440,6 +443,7 @@ fn execute_tool_batch(
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
+    mutations: &FileMutationQueue,
     events: &mut AgentEvents<'_>,
 ) -> Result<Vec<ToolExecution>> {
     let mut results = Vec::with_capacity(calls.len());
@@ -469,17 +473,25 @@ fn execute_tool_batch(
                 let prepared = prepared.clone();
                 let call = item.call.clone();
                 let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
-                        emit(
-                            events,
-                            AgentEvent::ToolExecutionUpdate {
-                                tool_name: call.tool_name.clone(),
-                                tool_call_id: call.tool_call_id.clone(),
-                                arguments: call.arguments.clone(),
-                                partial_result: text.to_string(),
-                            },
-                        );
-                    })
+                    execute_prepared_tool(
+                        registry,
+                        prepared,
+                        &call,
+                        cwd,
+                        cancellation,
+                        mutations,
+                        |text| {
+                            emit(
+                                events,
+                                AgentEvent::ToolExecutionUpdate {
+                                    tool_name: call.tool_name.clone(),
+                                    tool_call_id: call.tool_call_id.clone(),
+                                    arguments: call.arguments.clone(),
+                                    partial_result: text.to_string(),
+                                },
+                            );
+                        },
+                    )
                 }))
                 .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
                 emit(
@@ -568,6 +580,8 @@ pub struct Agent {
     config: AgentConfig,
     /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
+    /// 进程内文件变更队列：edit/write 工具登记其修改。
+    mutations: FileMutationQueue,
 }
 
 impl Agent {
@@ -599,6 +613,7 @@ impl Agent {
             provider,
             config,
             inbox: Arc::new(Mutex::new(TurnInbox::default())),
+            mutations: FileMutationQueue::new(),
         })
     }
 
@@ -775,6 +790,7 @@ impl Agent {
                         &prepared_calls,
                         self.session.cwd(),
                         cancellation,
+                        &self.mutations,
                         events,
                     )?;
                     // 持久的 toolResult 条目始终按 assistant source order 追加，
