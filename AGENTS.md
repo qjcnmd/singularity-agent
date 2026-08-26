@@ -55,32 +55,6 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 
 ## Agent Skills
 
-### 本机 Agent Skill 路由
-
-不同 Agent 或运行模式不一定自动注入 Skill 目录。无论当前使用哪种 Agent，都必须根据实际任务、仓库状态、已产生的 diff 和当前阶段主动选择 Skill；任务措辞只是辅助信号，不是读取前提。在任务开始、出现新失败或设计决策、形成实质 diff、进入审查或交付门时重新匹配下表。命中一个或多个 Skill 后，先从对应绝对路径完整读取 `SKILL.md`，再继续该阶段。只读取命中的 Skill。
-
-如果运行时已经注入并完整加载同一 Skill，不重复读取。Skill 缺失或不可读时明确报告实际路径和影响，不得声称已经使用。Skill 是工作流说明，不扩大修改、删除、Git 远程操作、发布、外部写入或子代理授权；上层指令、本项目约束和当前任务授权仍然生效。
-
-| Skill | 主动触发条件 | 固定读取路径 |
-| --- | --- | --- |
-| `diagnosing-bugs` | 任务目标或执行过程出现影响结论或交付的错误、测试失败、卡顿、性能回退、偶发行为或不符合预期的结果；先建立能捕获原症状的反馈环。 | `C:\Users\Lenovo\.agents\skills\diagnosing-bugs\SKILL.md` |
-| `research` | 标准、上游实现、API、版本或方案事实会影响决策，且外部调查构成需要沉淀为仓库 Markdown 的独立工作包。普通事实核对仍按本项目调查规则执行。 | `C:\Users\Lenovo\.agents\skills\research\SKILL.md` |
-| `find-simplifications` | 工作涉及架构或重构，或实质 diff 新增/保留了较多概念、状态、文件、接口、配置、兼容路径、重复实现或自研基础设施；在完成前主动核实哪些复杂度没有当前消费者或必要约束。 | `C:\Users\Lenovo\.agents\skills\find-simplifications\SKILL.md` |
-| `codebase-design` | 当前方案或 diff 新增、拆分或调整 module interface、seam、adapter、职责边界、依赖方向或测试接缝，或者复杂度归属不清。 | `C:\Users\Lenovo\.agents\skills\codebase-design\SKILL.md` |
-| `tdd` | 新行为或缺陷修复存在稳定、可观察的公开 seam，测试先行能形成直接 red/green 反馈，或任务采用 TDD、red-green-refactor、集成测试驱动方式；写测试前先确认 seam。 | `C:\Users\Lenovo\.agents\skills\tdd\SKILL.md` |
-| `code-review` | 已形成实质代码 diff、提交、分支或 PR 候选，尤其是跨 crate/模块、大范围重构，或涉及公共接口、协议、安全、持久化、并发和生命周期；每个重构阶段的语义审查门必须使用。纯审查阶段只报告，实施阶段可在当前授权范围内修复发现。 | `C:\Users\Lenovo\.agents\skills\code-review\SKILL.md` |
-| `pre-push-checks` | 准备 push、force-push、标记 ready for review、发布候选，或声称本地门禁已通过；依据实时 diff 选择最小充分检查。 | `C:\Users\Lenovo\.agents\skills\pre-push-checks\SKILL.md` |
-| `prose-standard` | 修改范围包含 Markdown、API/模块注释、提示词、工具描述、诊断、CLI/UI 文案、测试说明或 `AGENTS.md`；把文字视为接口和行为的一部分。 | `C:\Users\Lenovo\.agents\skills\prose-standard\SKILL.md` |
-| `trim-reasoning-leakage` | 当前状态文档、注释、提示词或可见文本出现“本次修改、以前实现、这一 PR、某轮审查、计划阶段”等创作过程视角，或 diff 正在把过程叙述写入长期事实源。 | `C:\Users\Lenovo\.agents\skills\trim-reasoning-leakage\SKILL.md` |
-| `doc-standards` | 文档改动涉及归属、拆分、移动、信息层级、教程与参考边界、重复内容、超长文档或失效状态文字，而不只是局部措辞。 | `C:\Users\Lenovo\.agents\skills\doc-standards\SKILL.md` |
-| `archive-decision-records` | ADR、RFC、设计记录或 Agent notes 出现已实施、被取代、重复、失去决策价值、引用失效或活动语料膨胀；没有既有记录制度时只提出最小约定。 | `C:\Users\Lenovo\.agents\skills\archive-decision-records\SKILL.md` |
-| `translate-docs` | 仓库存在语言配对约定，且文档新增、语义修改、重命名或删除会影响对应语言版本、术语或配对校验。 | `C:\Users\Lenovo\.agents\skills\translate-docs\SKILL.md` |
-| `doc-site-sync` | 仓库存在文档站投影，且文档变动影响页面发布、manifest、route、navigation、locale、投影链接或站点构建。部署仍需单独授权。 | `C:\Users\Lenovo\.agents\skills\doc-site-sync\SKILL.md` |
-| `record-browser-gif` | Web UI 流程、缺陷或修复需要以短 GIF 作为可核验的演示产物，且存在可运行的真实 UI；没有可录制 UI 时报告前置缺失。 | `C:\Users\Lenovo\.agents\skills\record-browser-gif\SKILL.md` |
-| `merging-stacked-prs` | 当前 GitHub 工作包含 stacked/dependent PR、若干 PR 的有序落地，或目标 PR 的 base 是另一条开放 PR 分支。任何远程变更和合并仍需明确授权。 | `C:\Users\Lenovo\.agents\skills\merging-stacked-prs\SKILL.md` |
-
-组合任务按实际阶段加载：调查/诊断/设计类 Skill 在方案或实现前使用；`prose-standard`、`trim-reasoning-leakage` 和文档类 Skill 在其内容进入修改范围时并用；`code-review` 在审查门使用；`pre-push-checks` 只在形成对外候选后使用。后续阶段出现新的触发语义时再读取对应 Skill，不提前加载无关文件。
-
 ### Issue tracker
 
 任务和需求记录在 GitHub Issues。详见 `docs/agents/issue-tracker.md`。

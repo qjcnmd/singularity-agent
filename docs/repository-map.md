@@ -2,7 +2,7 @@
 
 > 本文是仓库的浅层导航图：先看总览与依赖，再按 crate 展开到文件。
 > 深层的架构事实、协议与行为见 [`singularity.md`](singularity.md)。
-> 目录树以 2026-08-25 `main@d2cfb25` 为准。
+> 目录树以 2026-08-26 `main@5bc2d7d5` 为准。
 
 ## 1. 仓库总览
 
@@ -12,7 +12,6 @@ flowchart TD
 
     ROOT --> CRATES["crates/ — 7 个 Rust crate"]
     ROOT --> DOCS["docs/ — 架构与安装文档"]
-    ROOT --> PLAN["plan/ — 执行计划与讨论记录"]
     ROOT --> GITHUB[".github/ — CI 工作流与 Issue 模板"]
     ROOT --> ROOTFILES["根级文件：Cargo.toml · README.md · AGENTS.md · deny.toml · rust-toolchain.toml"]
 
@@ -128,15 +127,16 @@ flowchart TD
 
 ## 6. crates/agent — AgentLoop、工具、会话与压缩
 
-模型无关的执行核心：双层循环状态机、六工具注册表、线性 JSONL 会话与上下文压缩引擎。
-`runtime` 的 TurnRunner 调用这里的 `Agent`。
+模型无关的执行核心：分层执行循环（turn 步循环 → 采样请求层 → 流处理层）、六工具注册表、
+线性 JSONL 会话与上下文压缩引擎。`runtime` 的 TurnRunner 调用这里的 `Agent`。
 
 ```mermaid
 flowchart TD
     subgraph agent["crates/agent"]
-        loop_["loop.rs — 双层循环：模型请求、工具批、Steer 注入、压缩"]
+        loop_["loop.rs — 分层循环：turn 步循环、attempt_request 采样请求层、stream_completion 流处理"]
         message["message.rs — 会话消息/内容块数据模型"]
         compaction["compaction.rs — 触发判定、安全切点与摘要生成"]
+        prompts["prompts.rs — 人格与工作方式系统提示词"]
         subgraph session["session/ — 线性 JSONL 会话"]
             s_mod["mod.rs — 稳定 façade 与 SessionProjection"]
             s_format["format.rs — JSONL schema 与严格校验"]
@@ -152,7 +152,7 @@ flowchart TD
             t_read["read.rs — 有界流式读文件"]
             t_glob["glob.rs — 文件名模式递归匹配"]
             t_grep["grep.rs — 正则逐行搜索"]
-            t_bash["bash.rs — Shell 执行与进程树隔离"]
+            t_bash["bash/ — 执行/输出/规格三模块（mod·process·output·spec + bash_exec）"]
             t_edit["edit.rs — 唯一精确文本替换"]
             t_write["write.rs — 写入/覆盖/建目录"]
             t_truncate["truncate.rs — 输出截断算法"]
@@ -174,7 +174,7 @@ flowchart TD
         runner["runner.rs — 单个 turn 完整管线：准备、执行、事件投影、终态落盘"]
         events["events.rs — typed TurnEvent 单一事实源"]
         objects["objects.rs — Thread/Turn/usage 公开对象"]
-        store["store.rs — 会话创建/定位/修复重开入口"]
+        store["store.rs — 会话创建/定位/列表投影/修复重开入口"]
         error["error.rs — Turn 失败分类（stage/cause）"]
     end
     cli["cli"] --> runtime
@@ -195,8 +195,10 @@ flowchart TD
         jsonl_mode["jsonl_mode.rs — --json 逐行事件 + summary"]
         session_options["session_options.rs — 会话准备（默认/--session/--no-session）"]
         signal["signal.rs — Ctrl+C 计数与两级取消"]
-        subgraph tui["tui/ — 界面状态模块"]
-            app["app.rs — 应用状态：输入路由、滚动、footer、整帧渲染"]
+        subgraph tui["tui/ — 界面状态与命令模块"]
+            app["app.rs — 装配层：事件投影、状态持有、渲染编排"]
+            commands["commands.rs — SlashCommand 强类型命令模型与补全"]
+            view["view.rs — 渲染单元（draw/render_settings/render_command_menu/footer）"]
             transcript["transcript.rs — 事件流投影为可读条目"]
             editor["editor.rs — 底部多行输入编辑器"]
             scroll["scroll.rs — 会话流滚动状态机"]
@@ -218,7 +220,6 @@ flowchart TD
         state["state.rs — 运行时状态容器与协调器注册表"]
         dispatch["dispatch.rs — 请求分发与参数解析"]
         events["events.rs — 生命周期事件投影"]
-        session_index["session_index.rs — 进程内会话索引"]
         paths["paths.rs — 持久化路径投影"]
         delete["delete.rs — 会话删除"]
         subgraph lifecycle["lifecycle/ — 投影适配器"]
@@ -270,8 +271,8 @@ sequenceDiagram
 
 ## 11. 其他目录
 
-- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、本文件。
-- **plan/**：执行计划与讨论记录（`2026-08-25-simplification-execution-plan.md` 是最近一次简化执行计划的唯一事实源）。
+- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）。
+- **plan/、docs/plans/、outputs/、.worktrees/、.codex/** 等为本地工作产物，不入库。
 - **.github/**：`ci.yml` 入口 → `rust-gates.yml`（supply-chain + Linux/Windows 门禁）、`release.yml`（发布打包）、Issue 模板。
 - **根级文件**：`Cargo.toml`（workspace 成员与统一 lint）、`deny.toml`（依赖策略）、`rust-toolchain.toml`（固定工具链）、`AGENTS.md`（仓库指令）、`README.md`。
-- **outputs/**、**.worktrees/**、**.codex/** 等为本地工作产物，不入库。
+- **outputs/**、**.worktrees/**、**.codex/**、**plan/**、**docs/plans/** 等为本地工作产物，不入库。
