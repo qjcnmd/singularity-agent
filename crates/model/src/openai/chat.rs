@@ -7,25 +7,18 @@ use crate::provider::contract::{
     ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
     provider_response_validation_error, request_uses_tool_protocol, validate_model_turn_response,
 };
-use crate::provider::runtime::OpenAiProviderConfig;
+use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, ProviderReasoningReplay,
     ProviderToolReasoningMode,
 };
 
-#[allow(clippy::too_many_arguments)]
 pub fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    reasoning_enabled: bool,
-    reasoning_disabled: bool,
-    wire_reasoning_effort: Option<&str>,
-    thinking_wire_format: ThinkingWireFormat,
-    supports_developer_role: bool,
-    supports_tool_choice: bool,
-    requires_assistant_content_for_tool_calls: bool,
+    wire: &WireRequestOptions,
 ) -> Value {
     let mut payload = json!({
         "model": request
@@ -40,8 +33,8 @@ pub fn openai_request_payload(
                 openai_message_payload_with_reasoning(
                     message,
                     &request.provider_reasoning_history,
-                    supports_developer_role,
-                    requires_assistant_content_for_tool_calls,
+                    wire.supports_developer_role,
+                    wire.requires_assistant_content_for_tool_calls,
                 )
             })
             .collect::<Vec<_>>(),
@@ -55,8 +48,8 @@ pub fn openai_request_payload(
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
     }
-    if reasoning_enabled {
-        match thinking_wire_format {
+    if wire.reasoning_enabled {
+        match wire.thinking_wire_format {
             ThinkingWireFormat::ThinkingType => {
                 payload["thinking"] = json!({"type": "enabled"});
             }
@@ -64,11 +57,11 @@ pub fn openai_request_payload(
                 payload["enable_thinking"] = json!(true);
             }
         }
-        if let Some(wire_effort) = wire_reasoning_effort {
+        if let Some(wire_effort) = wire.wire_reasoning_effort.as_deref() {
             payload["reasoning_effort"] = json!(wire_effort);
         }
-    } else if reasoning_disabled {
-        match thinking_wire_format {
+    } else if wire.reasoning_disabled {
+        match wire.thinking_wire_format {
             ThinkingWireFormat::ThinkingType => {
                 payload["thinking"] = json!({"type": "disabled"});
             }
@@ -85,7 +78,7 @@ pub fn openai_request_payload(
                 .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
                 .collect::<Vec<_>>()
         );
-        if supports_tool_choice {
+        if wire.supports_tool_choice {
             payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
@@ -94,7 +87,7 @@ pub fn openai_request_payload(
     if request_uses_tool_protocol(request)
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
     {
-        match thinking_wire_format {
+        match wire.thinking_wire_format {
             ThinkingWireFormat::ThinkingType => {
                 payload["thinking"] = json!({"type": "disabled"});
             }
@@ -106,31 +99,13 @@ pub fn openai_request_payload(
     payload
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    reasoning_enabled: bool,
-    reasoning_disabled: bool,
-    wire_reasoning_effort: Option<&str>,
-    thinking_wire_format: ThinkingWireFormat,
-    supports_developer_role: bool,
-    supports_tool_choice: bool,
-    requires_assistant_content_for_tool_calls: bool,
+    wire: &WireRequestOptions,
 ) -> Value {
-    let mut payload = openai_request_payload(
-        request,
-        model_name,
-        capabilities,
-        reasoning_enabled,
-        reasoning_disabled,
-        wire_reasoning_effort,
-        thinking_wire_format,
-        supports_developer_role,
-        supports_tool_choice,
-        requires_assistant_content_for_tool_calls,
-    );
+    let mut payload = openai_request_payload(request, model_name, capabilities, wire);
     payload["stream"] = json!(true);
     // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
     // usage；不支持的 provider 仍产生合法响应（usage_present=false）。

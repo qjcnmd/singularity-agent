@@ -23,11 +23,10 @@ use crate::openai::{
 };
 use crate::provider::Provider;
 use crate::provider::contract::{
-    ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
-    provider_request_validation_error, request_uses_tool_protocol,
-    validate_model_request_with_capabilities,
+    ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
+    request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
-use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
+use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent, ProviderStreamingCapability, provider_streaming_unsupported_error,
@@ -73,66 +72,18 @@ impl ProtocolAdapter {
         capabilities: &ProviderProtocolContract,
         streaming: bool,
     ) -> Value {
-        let selection = provider.selected_model.as_ref();
-        let reasoning_enabled = selection.is_some_and(|selection| selection.reasoning_enabled);
-        let disable_reasoning = selection.is_some_and(|selection| !selection.reasoning_enabled);
-        let reasoning_effort =
-            selection.and_then(|selection| selection.wire_reasoning_effort.as_deref());
-        let supports_tool_choice = selection.is_none_or(|selection| selection.supports_tool_choice);
-        // developer 角色缺省为不支持（流式与非流式共用同一缺省值）：无
-        // SelectedModel 的 legacy/env 路径没有 per-model 声明，wire 必须用
-        // 通用的 system role——OpenAI 兼容端点普遍不接受 developer 角色。
-        // 有 SelectedModel 时以模型声明的 supports_developer_role 为准。
-        let supports_developer_role =
-            selection.is_some_and(|selection| selection.supports_developer_role);
-        let requires_assistant_content_for_tool_calls =
-            selection.is_some_and(|selection| selection.requires_assistant_content_for_tool_calls);
-        let thinking_wire_format = selection
-            .map(|selection| selection.thinking_wire_format)
-            .unwrap_or(ThinkingWireFormat::ThinkingType);
+        let wire = WireRequestOptions::from_selection(provider.selected_model.as_ref());
         match (self, streaming) {
-            (Self::Chat, true) => openai_chat_stream_request_payload(
-                request,
-                model_name,
-                capabilities,
-                reasoning_enabled,
-                disable_reasoning,
-                reasoning_effort,
-                thinking_wire_format,
-                supports_developer_role,
-                supports_tool_choice,
-                requires_assistant_content_for_tool_calls,
-            ),
-            (Self::Chat, false) => openai_request_payload(
-                request,
-                model_name,
-                capabilities,
-                reasoning_enabled,
-                disable_reasoning,
-                reasoning_effort,
-                thinking_wire_format,
-                supports_developer_role,
-                supports_tool_choice,
-                requires_assistant_content_for_tool_calls,
-            ),
-            (Self::Responses, true) => openai_responses_stream_request_payload(
-                request,
-                model_name,
-                capabilities,
-                reasoning_enabled,
-                disable_reasoning,
-                reasoning_effort,
-                supports_tool_choice,
-            ),
-            (Self::Responses, false) => openai_responses_request_payload(
-                request,
-                model_name,
-                capabilities,
-                reasoning_enabled,
-                disable_reasoning,
-                reasoning_effort,
-                supports_tool_choice,
-            ),
+            (Self::Chat, true) => {
+                openai_chat_stream_request_payload(request, model_name, capabilities, &wire)
+            }
+            (Self::Chat, false) => openai_request_payload(request, model_name, capabilities, &wire),
+            (Self::Responses, true) => {
+                openai_responses_stream_request_payload(request, model_name, capabilities, &wire)
+            }
+            (Self::Responses, false) => {
+                openai_responses_request_payload(request, model_name, capabilities, &wire)
+            }
         }
     }
 

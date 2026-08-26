@@ -8,7 +8,7 @@ use crate::provider::contract::{
     ProviderProtocolContract, message_text, provider_response_validation_error,
     request_uses_tool_protocol,
 };
-use crate::provider::runtime::OpenAiProviderConfig;
+use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     ProviderReasoningReplay, ProviderToolReasoningMode,
@@ -18,10 +18,7 @@ pub fn openai_responses_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    reasoning_enabled: bool,
-    reasoning_disabled: bool,
-    wire_reasoning_effort: Option<&str>,
-    supports_tool_choice: bool,
+    wire: &WireRequestOptions,
 ) -> Value {
     let (instructions, input) =
         openai_responses_input(&request.messages, &request.provider_reasoning_history);
@@ -57,19 +54,19 @@ pub fn openai_responses_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        if supports_tool_choice {
+        if wire.supports_tool_choice {
             payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
         }
     }
-    if reasoning_enabled {
-        let Some(wire_effort) = wire_reasoning_effort else {
+    if wire.reasoning_enabled {
+        let Some(wire_effort) = wire.wire_reasoning_effort.as_deref() else {
             return payload;
         };
         payload["reasoning"] = json!({"effort": wire_effort});
         payload["include"] = json!(["reasoning.encrypted_content"]);
-    } else if reasoning_disabled
+    } else if wire.reasoning_disabled
         || (request_uses_tool_protocol(request)
             && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls)
     {
@@ -82,20 +79,9 @@ pub fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    reasoning_enabled: bool,
-    reasoning_disabled: bool,
-    wire_reasoning_effort: Option<&str>,
-    supports_tool_choice: bool,
+    wire: &WireRequestOptions,
 ) -> Value {
-    let mut payload = openai_responses_request_payload(
-        request,
-        model_name,
-        capabilities,
-        reasoning_enabled,
-        reasoning_disabled,
-        wire_reasoning_effort,
-        supports_tool_choice,
-    );
+    let mut payload = openai_responses_request_payload(request, model_name, capabilities, wire);
     payload["stream"] = json!(true);
     payload
 }

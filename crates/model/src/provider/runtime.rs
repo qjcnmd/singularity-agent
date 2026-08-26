@@ -183,3 +183,37 @@ pub(crate) struct SelectedModel {
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
 }
+
+/// 一次请求的七个 wire 开关，由 [`SelectedModel`] 投影而来，供 openai 协议
+/// builder 统一消费，避免逐项提取散落在传输层。
+#[derive(Clone)]
+pub(crate) struct WireRequestOptions {
+    pub(crate) reasoning_enabled: bool,
+    pub(crate) reasoning_disabled: bool,
+    pub(crate) wire_reasoning_effort: Option<String>,
+    pub(crate) thinking_wire_format: ThinkingWireFormat,
+    pub(crate) supports_developer_role: bool,
+    pub(crate) supports_tool_choice: bool,
+    pub(crate) requires_assistant_content_for_tool_calls: bool,
+}
+
+impl WireRequestOptions {
+    /// 从 [`SelectedModel`] 投影七个 wire 开关。无选择（legacy/env 路径）时
+    /// 使用与历史逐项提取完全一致的缺省：developer 角色不支持（OpenAI 兼容
+    /// 端点普遍不接受 developer 角色，wire 用 system role）、tool_choice 支持、
+    /// thinking 走 `thinking: {"type": ...}`。
+    pub(crate) fn from_selection(selection: Option<&SelectedModel>) -> Self {
+        Self {
+            reasoning_enabled: selection.is_some_and(|s| s.reasoning_enabled),
+            reasoning_disabled: selection.is_some_and(|s| !s.reasoning_enabled),
+            wire_reasoning_effort: selection.and_then(|s| s.wire_reasoning_effort.clone()),
+            thinking_wire_format: selection
+                .map(|s| s.thinking_wire_format)
+                .unwrap_or(ThinkingWireFormat::ThinkingType),
+            supports_developer_role: selection.is_some_and(|s| s.supports_developer_role),
+            supports_tool_choice: selection.is_none_or(|s| s.supports_tool_choice),
+            requires_assistant_content_for_tool_calls: selection
+                .is_some_and(|s| s.requires_assistant_content_for_tool_calls),
+        }
+    }
+}
