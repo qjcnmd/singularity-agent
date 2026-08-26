@@ -37,3 +37,6 @@ evaluations/output/
 # Python bytecode caches (test runs inside task workspaces).
 __pycache__/
 *.pyc
+
+# 执行计划与摘要（过程记录，不入库）
+docs/plans/
