@@ -1166,7 +1166,6 @@ impl Agent {
         };
         let mut observed_attempt = |event: ProviderAttemptEvent| {
             on_attempt(event);
-            true
         };
         match self.provider.complete_stream_observed(
             request,

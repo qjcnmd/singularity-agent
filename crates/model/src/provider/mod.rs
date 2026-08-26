@@ -45,7 +45,7 @@ pub trait Provider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete_stream(request, cancellation, on_event)
     }
@@ -62,7 +62,7 @@ pub trait Provider {
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete(request, cancellation)
     }
@@ -95,7 +95,7 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         (**self).complete_stream_observed(request, cancellation, on_event, on_attempt)
     }
@@ -112,7 +112,7 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         (**self).complete_observed(request, cancellation, on_attempt)
     }

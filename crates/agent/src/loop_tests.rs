@@ -92,9 +92,9 @@ impl Provider for FakeProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
-        let _ = on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "fake".to_string(),
             model_name: "fake-model".to_string(),
             actual_api_protocol: ProviderApiProtocol::Declared,

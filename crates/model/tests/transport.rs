@@ -735,7 +735,6 @@ fn openai_provider_observes_one_ordered_start_end_pair() {
         &singularity_core::CancellationToken::new(),
         &mut |event| {
             events.push(event);
-            true
         },
     )
     .expect_err("one observed attempt returns its typed error");
@@ -756,40 +755,43 @@ fn openai_provider_observes_one_ordered_start_end_pair() {
 }
 
 #[test]
-fn openai_provider_rejects_observer_start_before_network_side_effect() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind observer rejection provider");
-    listener
-        .set_nonblocking(true)
-        .expect("set nonblocking observer rejection provider");
-    let address = listener.local_addr().expect("observer rejection address");
-    let provider =
-        test_provider(provider_test_config(format!("http://{address}"))).expect("provider");
+fn openai_provider_delivers_observed_attempts_without_rejecting() {
+    // 观察端尽力而为：无拒绝路径，HTTP 请求照常进行；Started 先于
+    // Finished 送达，完成不因观察端行为被丢弃。
+    let success_body = r#"{
+        "id": "resp_observed",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }]
+    }"#;
+    let (base_url, attempts) = sequence_response_server(vec![("HTTP/1.1 200 OK", success_body)]);
+    let provider = test_provider(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
-        "request_observer_rejected",
+        "request_observed_complete",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
-    let mut event_count = 0;
+    let mut events = Vec::new();
 
-    let error = Provider::complete_observed(
+    let response = Provider::complete_observed(
         &provider,
         &request,
         &singularity_core::CancellationToken::new(),
-        &mut |_event| {
-            event_count += 1;
-            false
+        &mut |event| {
+            events.push(event);
         },
     )
-    .expect_err("observer rejection must fail closed");
+    .expect("observed attempt completes");
 
-    assert_eq!(event_count, 1);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_attempt_observer_failed")
-    );
-    let accept_error = listener
-        .accept()
-        .expect_err("observer rejection must prevent the HTTP connection");
-    assert_eq!(accept_error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let [
+        ProviderAttemptEvent::Started(_),
+        ProviderAttemptEvent::Finished(_),
+    ] = events.as_slice()
+    else {
+        panic!("one ordered start/end pair expected");
+    };
 }
 
 #[test]

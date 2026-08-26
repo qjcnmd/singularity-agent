@@ -687,7 +687,7 @@ impl OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
@@ -734,7 +734,7 @@ impl OpenAiProvider {
         api_protocol: ProviderApiProtocol,
         model_name: &str,
         mut on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<OpenAiCompletion, ProviderError> {
         let streaming = on_event.is_some();
         if streaming {
@@ -806,7 +806,7 @@ impl OpenAiProvider {
         model_name: &str,
         endpoint: &str,
         request_payload: &Value,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
         read_response: &mut dyn FnMut(reqwest::Response, Instant) -> AttemptBodyOutcome,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = &self.runtime;
@@ -816,7 +816,7 @@ impl OpenAiProvider {
 
         let mut occurrence =
             ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
-        emit_provider_attempt_started(&occurrence, on_attempt)?;
+        emit_provider_attempt_started(&occurrence, on_attempt);
         let response = match block_on_provider_future(
             runtime,
             cancellation,
@@ -836,7 +836,7 @@ impl OpenAiProvider {
                 response
             }
             Err(error) => {
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt)?;
+                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 return Err(error);
             }
         };
@@ -891,7 +891,7 @@ impl OpenAiProvider {
                     })
                     .filter(|diagnostic| !diagnostic.is_empty())
             };
-            record_provider_attempt(occurrence, Some(&model_error), None, on_attempt)?;
+            record_provider_attempt(occurrence, Some(&model_error), None, on_attempt);
             let mut error =
                 ProviderError::from_model_error(model_error).with_retry_after(retry_after);
             if let Some(diagnostic) = provider_diagnostic {
@@ -912,7 +912,7 @@ impl OpenAiProvider {
                 let occurrence_error = completion.response.error.as_ref();
                 let usage = (wire_usage_present && occurrence_error.is_none())
                     .then(|| completion.response.usage.clone());
-                record_provider_attempt(occurrence, occurrence_error, usage, on_attempt)?;
+                record_provider_attempt(occurrence, occurrence_error, usage, on_attempt);
                 Ok(*completion)
             }
             AttemptBodyOutcome::Retry {
@@ -920,7 +920,7 @@ impl OpenAiProvider {
                 time_to_first_text_delta_ms,
             } => {
                 occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt)?;
+                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 Err(error)
             }
             AttemptBodyOutcome::Failed {
@@ -928,7 +928,7 @@ impl OpenAiProvider {
                 time_to_first_text_delta_ms,
             } => {
                 occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt)?;
+                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 Err(error.without_automatic_retry())
             }
         }
@@ -1002,7 +1002,7 @@ impl Provider for OpenAiProvider {
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let mut ignore_attempt = |_| true;
+        let mut ignore_attempt = |_| {};
         self.complete_stream_observed(request, cancellation, on_event, &mut ignore_attempt)
     }
 
@@ -1011,7 +1011,7 @@ impl Provider for OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete_internal(request, cancellation, Some(on_event), on_attempt)
     }
@@ -1021,7 +1021,7 @@ impl Provider for OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let mut ignore_attempt = |_| true;
+        let mut ignore_attempt = |_| {};
         self.complete_observed(request, cancellation, &mut ignore_attempt)
     }
 
@@ -1029,7 +1029,7 @@ impl Provider for OpenAiProvider {
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete_internal(request, cancellation, None, on_attempt)
     }
@@ -1038,39 +1038,19 @@ impl Provider for OpenAiProvider {
 /// 记录一次终态 attempt，不改变聚合重试语义。
 fn emit_provider_attempt_started(
     occurrence: &ProviderAttemptInProgress,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-) -> Result<(), ProviderError> {
-    if on_attempt(occurrence.started_event()) {
-        Ok(())
-    } else {
-        Err(provider_attempt_observer_error())
-    }
+    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
+) {
+    on_attempt(occurrence.started_event());
 }
 
 fn record_provider_attempt(
     occurrence: ProviderAttemptInProgress,
     error: Option<&ModelError>,
     usage: Option<ModelUsage>,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
-) -> Result<(), ProviderError> {
+    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
+) {
     let occurrence = occurrence.finish(error, usage);
-    if !on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence))) {
-        return Err(provider_attempt_observer_error());
-    }
-    Ok(())
-}
-
-fn provider_attempt_observer_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::UnknownProviderError,
-            "provider attempt observer rejected the event",
-        )
-        .with_provider_diagnostic(
-            "provider_attempt_observer_failed",
-            ProviderErrorStage::ResponseValidation,
-        ),
-    )
+    on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)));
 }
 
 #[cfg(test)]
