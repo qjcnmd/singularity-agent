@@ -1,8 +1,8 @@
 //! 协议投影适配器：把 runtime 的 [`TurnEvent`] 一一映射为 JSON-RPC 通知，
-//! 并维持「JSONL 先落盘 → 索引投影 → 客户端事件」的既有顺序。
+//! JSONL 由 runtime 先落盘；这里不维护第二份会话状态。
 //!
 //! 事件配对（item/started 与终端、turn 开始与终态）由 runtime 保证；这里
-//! 不做任何执行侧状态机，只做纯投影与索引同步。
+//! 不做任何执行侧状态机，只做纯投影。
 
 use std::sync::atomic::Ordering;
 
@@ -16,9 +16,7 @@ use singularity_runtime::events::{
     AgentDiagnosticSeverity, ProviderAttemptStatus as RuntimeProviderAttemptStatus, TurnEvent,
     TurnEventSink,
 };
-use singularity_runtime::objects::{
-    ThreadStatus as RuntimeThreadStatus, Turn as RuntimeTurn, TurnStatus as RuntimeTurnStatus,
-};
+use singularity_runtime::objects::{ThreadStatus as RuntimeThreadStatus, Turn as RuntimeTurn};
 use singularity_runtime::{
     Conversation, ProviderFailureKind, TurnFailureCause as RuntimeFailureCause,
     TurnFailureStage as RuntimeFailureStage, TurnOutcome, TurnRunError,
@@ -44,14 +42,6 @@ pub(crate) fn wire_turn(turn: &RuntimeTurn) -> Turn {
     }
 }
 
-fn session_status(status: &RuntimeTurnStatus) -> SessionStatus {
-    match status {
-        RuntimeTurnStatus::Completed => SessionStatus::Completed,
-        RuntimeTurnStatus::Interrupted => SessionStatus::Interrupted,
-        _ => SessionStatus::Failed,
-    }
-}
-
 /// 单次 run_turn 调用的协议投影。
 ///
 /// 所有投影失败都通过 [`Self::poisoned`] 暂存并在 run 返回后以错误返回，
@@ -64,12 +54,9 @@ pub(crate) struct TurnProjection<'a> {
     server: &'a AppServer,
     conversation: Arc<Conversation>,
     request_id: JsonRpcId,
-    thread_id: String,
-    title: Option<String>,
     emit: &'a mut dyn FnMut(Value),
     live_turn: Option<LiveTurnGuard>,
     response_sent: bool,
-    started_synced: bool,
     poisoned: Option<AppServerError>,
 }
 
@@ -78,20 +65,15 @@ impl<'a> TurnProjection<'a> {
         server: &'a AppServer,
         conversation: Arc<Conversation>,
         request_id: JsonRpcId,
-        thread_id: &str,
-        title: Option<String>,
         emit: &'a mut dyn FnMut(Value),
     ) -> Self {
         Self {
             server,
             conversation,
             request_id,
-            thread_id: thread_id.to_string(),
-            title,
             emit,
             live_turn: None,
             response_sent: false,
-            started_synced: false,
             poisoned: None,
         }
     }
@@ -120,40 +102,11 @@ impl<'a> TurnProjection<'a> {
         }
     }
 
-    /// turn/started 到达：JSONL 已落盘，先投影索引（Active + 首轮标题），
-    /// 随后才允许发布通知与 RPC 响应。执行停止请求在入场时立即取消，
+    /// turn/started 到达时 JSONL 已落盘。执行停止请求在入场时立即取消，
     /// 使被取消的轮快速收敛为 interrupted。
     fn on_turn_started(&mut self, turn: &RuntimeTurn) {
         if self.server.execution_stopped.load(Ordering::SeqCst) {
             self.conversation.interrupt();
-        }
-        if !self.started_synced {
-            self.started_synced = true;
-            let title = self.title.take().unwrap_or_default();
-            let record = self.server.store().get_session(&self.thread_id);
-            let metadata = match record {
-                Ok(record) => SessionMetadataUpdate {
-                    status: Some(SessionStatus::Active),
-                    title: if record.title.is_none() && !title.is_empty() {
-                        Some(Some(&title))
-                    } else {
-                        None
-                    },
-                    ..SessionMetadataUpdate::default()
-                },
-                Err(error) => {
-                    self.poison_or(AppServerError::Store(error));
-                    return;
-                }
-            };
-            if let Err(error) = self
-                .server
-                .store()
-                .update_session(&self.thread_id, metadata)
-            {
-                self.poison_or(AppServerError::Store(error));
-                return;
-            }
         }
         self.live_turn = Some(
             self.server
@@ -176,43 +129,6 @@ impl<'a> TurnProjection<'a> {
             );
         }
     }
-
-    fn sync_terminal_index(&mut self, turn: &RuntimeTurn) {
-        let usage_value = turn
-            .usage
-            .as_ref()
-            .map(|usage| {
-                usage_to_wire_with_completeness(&usage.to_model_usage(), usage.usage_complete)
-            })
-            .unwrap_or_else(|| singularity_protocol::TurnModelUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-                usage_present: false,
-                usage_complete: false,
-            });
-        let usage = match serde_json::to_value(usage_value) {
-            Ok(usage) => usage,
-            Err(error) => {
-                self.poison_or(AppServerError::InvalidJson(error));
-                return;
-            }
-        };
-        let metadata = SessionMetadataUpdate {
-            status: Some(session_status(&turn.status)),
-            token_usage: Some(&usage),
-            ..SessionMetadataUpdate::default()
-        };
-        if let Err(error) = self
-            .server
-            .store()
-            .update_session(&self.thread_id, metadata)
-        {
-            self.poison_or(AppServerError::Store(error));
-        }
-    }
 }
 
 impl TurnEventSink for TurnProjection<'_> {
@@ -220,13 +136,10 @@ impl TurnEventSink for TurnProjection<'_> {
         match event {
             TurnEvent::TurnStarted { turn } => self.on_turn_started(&turn),
             TurnEvent::TurnCompleted { turn } => {
-                // durable 终态已由 runtime 落盘；先同步索引再发布终态通知。
-                self.sync_terminal_index(&turn);
                 self.live_turn = None;
                 self.emit_notification(AppEvent::turn_completed(&wire_turn(&turn)));
             }
             TurnEvent::TurnFailed { turn, error } => {
-                self.sync_terminal_index(&turn);
                 self.live_turn = None;
                 self.emit_notification(AppEvent::turn_error(
                     &turn.turn_id,
@@ -239,21 +152,7 @@ impl TurnEventSink for TurnProjection<'_> {
             TurnEvent::ThreadStarted { thread } => {
                 self.emit_notification(AppEvent::thread_started(&protocol_thread(&thread)));
             }
-            // 待生效设置已在可信终态后持久化：JSONL 先落盘，此处同步索引
-            // model 投影，随后客户端读到的 thread/list 与 thread/read 一致。
-            TurnEvent::ThreadSettingsApplied { thread } => {
-                let metadata = SessionMetadataUpdate {
-                    model: Some(thread.model.as_deref()),
-                    ..SessionMetadataUpdate::default()
-                };
-                if let Err(error) = self
-                    .server
-                    .store()
-                    .update_session(&thread.thread_id, metadata)
-                {
-                    self.poison_or(AppServerError::Store(error));
-                }
-            }
+            TurnEvent::ThreadSettingsApplied { .. } => {}
             TurnEvent::ItemStarted {
                 thread_id,
                 turn_id,

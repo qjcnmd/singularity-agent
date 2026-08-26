@@ -22,9 +22,8 @@ pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
         .clone()
 }
 
-fn app_server(store: SessionIndex, sessions_dir: &Path) -> AppServer {
+fn app_server(sessions_dir: &Path) -> AppServer {
     AppServer::new(
-        store,
         ProviderConfigSnapshot::capture(
             |name| match name {
                 "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
@@ -50,35 +49,17 @@ fn initialize(server: &mut AppServer) {
         .expect("initialized");
 }
 
-fn insert_session(server: &AppServer, sessions_dir: &Path, session_id: &str, cwd: &Path) -> String {
-    let session =
-        SessionManager::create_with_id(cwd, sessions_dir, session_id).expect("create session file");
-    let created_at = now_iso();
-    server
-        .store()
-        .insert_session(&SessionRecord {
-            session_id: session_id.to_string(),
-            rollout_path: session.path().to_string_lossy().to_string(),
-            cwd: cwd.to_string_lossy().to_string(),
-            title: None,
-            model: Some("test-model".to_string()),
-            status: None,
-            created_at,
-            updated_at: now_iso(),
-            token_usage: json!({}),
-        })
-        .expect("insert session");
-    let _ = created_at;
+fn insert_session(sessions_dir: &Path, session_id: &str, cwd: &Path) -> String {
+    SessionManager::create_with_id(cwd, sessions_dir, session_id).expect("create session file");
     session_id.to_string()
 }
 
 #[test]
-fn jsonl_discovery_rebuilds_index_without_repairing_incomplete_turn() {
+fn jsonl_projection_does_not_repair_incomplete_turn() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "9b63cd69-94af-4e42-a53d-dac832be76f8";
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
@@ -87,35 +68,21 @@ fn jsonl_discovery_rebuilds_index_without_repairing_incomplete_turn() {
             "turn-1",
         ))
         .expect("turn metadata");
-    store
-        .insert_session(&SessionRecord {
-            session_id: session_id.to_string(),
-            rollout_path: session.path().to_string_lossy().to_string(),
-            cwd: workspace.to_string_lossy().to_string(),
-            title: None,
-            model: Some("provider/model".to_string()),
-            status: Some(SessionStatus::Active),
-            created_at: now_iso(),
-            updated_at: now_iso(),
-            token_usage: json!({}),
-        })
-        .expect("stale index");
-
-    store
-        .rebuild_from_sessions_dir(&sessions_dir)
-        .expect("discover sessions");
-    let discovered = store.get_session(session_id).expect("discovered record");
-    assert_eq!(discovered.status, Some(SessionStatus::Active));
+    let discovered = singularity_runtime::read_thread_summary(&sessions_dir, session_id)
+        .expect("project session");
+    assert_eq!(
+        discovered.status,
+        Some(singularity_runtime::ThreadStatus::Active)
+    );
     let discovered_session = SessionManager::open_existing(session.path()).expect("reopen");
     assert_eq!(discovered_session.metadata_entries().len(), 1);
 
     // 重开路径（continue 直接走 turn/start）在 turn 开始前完成一次幂等 repair：
     // 残留无终态 turn 收敛为 interrupted，不阻碍新 turn。
-    let mut server =
-        app_server(store, &sessions_dir).with_test_provider(Arc::new(StaticProvider {
-            responses: vec![completed_response("reopen")],
-            seen_requests: Arc::new(Mutex::new(Vec::new())),
-        }));
+    let mut server = app_server(&sessions_dir).with_test_provider(Arc::new(StaticProvider {
+        responses: vec![completed_response("reopen")],
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    }));
     initialize(&mut server);
     let reopened = server
         .handle_json(&format!(
@@ -160,31 +127,26 @@ fn jsonl_discovery_rebuilds_index_without_repairing_incomplete_turn() {
 }
 
 #[test]
-fn jsonl_discovery_isolates_one_corrupt_rollout() {
+fn jsonl_projection_isolates_one_corrupt_rollout() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let valid_id = "c2e0d5f5-7d50-4ef7-a6f9-0f0c1b3f44ab";
     SessionManager::create_with_id(&workspace, &sessions_dir, valid_id).expect("valid session");
     std::fs::write(sessions_dir.join("broken.jsonl"), b"not-json\n").expect("broken session");
 
-    store
-        .rebuild_from_sessions_dir(&sessions_dir)
-        .expect("discovery isolates bad file");
-    let sessions = store.list_sessions().expect("list sessions");
+    let sessions = singularity_runtime::list_threads(&sessions_dir).expect("list sessions");
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].session_id, valid_id);
+    assert_eq!(sessions[0].thread_id, valid_id);
 }
 
 #[test]
-fn jsonl_discovery_recovers_all_fields_including_title_model_usage() {
+fn jsonl_projection_recovers_all_fields_including_title_model_usage() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "d3f1e6a7-8b90-4c12-9e34-5f6a7b8c9d0e";
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
@@ -220,10 +182,8 @@ fn jsonl_discovery_recovers_all_fields_including_title_model_usage() {
         )
         .expect("usage metadata");
 
-    store
-        .rebuild_from_sessions_dir(&sessions_dir)
-        .expect("rebuild index");
-    let record = store.get_session(session_id).expect("get session");
+    let record = singularity_runtime::read_thread_summary(&sessions_dir, session_id)
+        .expect("project session");
     assert_eq!(
         record.title.as_deref(),
         Some("Implement feature X for the system")
@@ -232,7 +192,10 @@ fn jsonl_discovery_recovers_all_fields_including_title_model_usage() {
         record.model.as_deref(),
         Some("anthropic/claude-3-7-sonnet#high")
     );
-    assert_eq!(record.status, Some(SessionStatus::Completed));
+    assert_eq!(
+        record.status,
+        Some(singularity_runtime::ThreadStatus::Completed)
+    );
     assert_eq!(
         record.token_usage,
         json!({"input_tokens": 120, "output_tokens": 45})
@@ -245,8 +208,7 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
     let started = server
         .handle_json(
@@ -279,25 +241,24 @@ fn thread_settings_are_jsonl_first_and_never_store_credentials() {
         )
         .expect("settings");
     assert_eq!(settings[0]["result"]["updated"], true);
-    let record = server.store().get_session(&thread_id).expect("record");
+    let record = singularity_runtime::read_thread_summary(&sessions_dir, &thread_id)
+        .expect("project session");
     assert_eq!(
         record.model.as_deref(),
         Some("openai_compatible/test-model")
     );
-    server
-        .store()
-        .rebuild_from_sessions_dir(&sessions_dir)
-        .expect("discover settings");
     assert_eq!(
-        server
-            .store()
-            .get_session(&thread_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, &thread_id)
             .unwrap()
             .model
             .as_deref(),
         Some("openai_compatible/test-model")
     );
-    let rollout = std::fs::read_to_string(record.rollout_path).expect("rollout");
+    let rollout = std::fs::read_to_string(singularity_runtime::thread_session_path(
+        &sessions_dir,
+        &record.thread_id,
+    ))
+    .expect("rollout");
     assert!(rollout.contains("thread_settings"));
     assert!(!rollout.contains("apiKey"));
     assert!(!rollout.contains("authorization"));
@@ -324,11 +285,7 @@ fn thread_settings_null_clears_reasoning_while_missing_keeps_it() {
         .expect("append settings");
     drop(session);
 
-    let store = SessionIndex::new();
-    store
-        .rebuild_from_sessions_dir(&sessions_dir)
-        .expect("rebuild index");
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
 
     let kept = server
@@ -344,9 +301,7 @@ fn thread_settings_null_clears_reasoning_while_missing_keeps_it() {
         .expect("missing reasoning keeps current value");
     assert_eq!(kept[0]["result"]["updated"], false);
     assert_eq!(
-        server
-            .store()
-            .get_session(session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, session_id)
             .expect("record")
             .model
             .as_deref(),
@@ -367,9 +322,7 @@ fn thread_settings_null_clears_reasoning_while_missing_keeps_it() {
     assert_eq!(cleared[0]["result"]["updated"], true);
     assert_eq!(cleared[0]["result"]["reasoning"], serde_json::Value::Null);
     assert_eq!(
-        server
-            .store()
-            .get_session(session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, session_id)
             .expect("record")
             .model
             .as_deref(),
@@ -383,7 +336,6 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "7b63cd69-94af-4e42-a53d-dac832be76f8";
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
@@ -427,20 +379,7 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
             is_error: Some(true),
         })
         .expect("tool result");
-    store
-        .insert_session(&SessionRecord {
-            session_id: session_id.to_string(),
-            rollout_path: session.path().to_string_lossy().to_string(),
-            cwd: workspace.to_string_lossy().to_string(),
-            title: None,
-            model: None,
-            status: None,
-            created_at: now_iso(),
-            updated_at: now_iso(),
-            token_usage: json!({}),
-        })
-        .expect("index");
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
     let output = server
         .handle_json(
@@ -513,7 +452,6 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let provider = StaticProvider {
         responses: vec![
             completed_response("first"),
@@ -522,7 +460,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         ],
         seen_requests: Arc::new(Mutex::new(Vec::new())),
     };
-    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    let mut server = app_server(&sessions_dir).with_test_provider(Arc::new(provider));
     initialize(&mut server);
 
     let started = server
@@ -540,15 +478,13 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         .as_str()
         .expect("session id")
         .to_string();
-    // 尚无 turn：lastTurnStatus 为 null，索引行 status 也是 null，不伪装成 active。
+    // 尚无 turn：lastTurnStatus 与 JSONL 投影 status 均为 null。
     assert_eq!(
         started[1]["result"]["thread"]["lastTurnStatus"],
         serde_json::Value::Null
     );
     assert_eq!(
-        server
-            .store()
-            .get_session(&session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, &session_id)
             .expect("record")
             .status,
         None
@@ -572,12 +508,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         "completed"
     );
     assert_eq!(
-        server
-            .store()
-            .get_session(&session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, &session_id)
             .expect("record")
             .status,
-        Some(SessionStatus::Completed)
+        Some(singularity_runtime::ThreadStatus::Completed)
     );
 
     // 失败 turn 把展示状态变为 failed；随后仍可 continue。
@@ -596,12 +530,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
             .is_some_and(|text| text.contains("synthetic failure"))
     );
     assert_eq!(
-        server
-            .store()
-            .get_session(&session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, &session_id)
             .expect("record")
             .status,
-        Some(SessionStatus::Failed)
+        Some(singularity_runtime::ThreadStatus::Failed)
     );
 
     let third = server
@@ -621,18 +553,7 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         "completed"
     );
 
-    // 索引中陈旧的 interrupted 不得覆盖 JSONL 中已有的 completed 事实；
-    // 重开（turn/start）先按 JSONL 重投影，再正常完成新 turn。
-    server
-        .store()
-        .update_session(
-            &session_id,
-            SessionMetadataUpdate {
-                status: Some(SessionStatus::Interrupted),
-                ..SessionMetadataUpdate::default()
-            },
-        )
-        .expect("set interrupted");
+    // completed 会话可以继续执行下一轮。
     let reopened = server
         .handle_json(&format!(
             r#"{{"jsonrpc":"2.0","method":"turn/start","id":8,"params":{{"threadId":"{session_id}","input":[{{"type":"text","text":"reopen"}}]}}}}"#
@@ -646,8 +567,10 @@ fn session_status_sequence_tracks_turn_and_continue_ignores_terminal_status() {
         "completed"
     );
     assert_eq!(
-        server.store().get_session(&session_id).unwrap().status,
-        Some(SessionStatus::Completed)
+        singularity_runtime::read_thread_summary(&sessions_dir, &session_id)
+            .unwrap()
+            .status,
+        Some(singularity_runtime::ThreadStatus::Completed)
     );
 }
 
@@ -657,11 +580,10 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "0b0c1d2e-3f40-4152-8263-9474a5b6c7d8";
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
-    insert_session(&server, &sessions_dir, session_id, &workspace);
+    insert_session(&sessions_dir, session_id, &workspace);
 
     // 每个 Request 方法以 notification（无 id）提交 → 静默忽略且不执行任何副作用。
     for (method, params) in [
@@ -697,7 +619,7 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
     }
 
     // 副作用检查：会话仍存在、thread/start 未创建任何 thread、服务器未关闭。
-    assert!(server.store().get_session(session_id).is_ok());
+    assert!(singularity_runtime::read_thread_summary(&sessions_dir, session_id).is_ok());
     assert!(!server.shutdown_requested);
     let responses = server
         .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":10,"params":{}}"#)
@@ -715,8 +637,7 @@ fn request_methods_as_notifications_are_rejected_without_side_effects() {
 #[test]
 fn notification_only_method_with_id_returns_typed_invalid_request() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let store = SessionIndex::new();
-    let mut server = app_server(store, &temp.path().join("sessions"));
+    let mut server = app_server(&temp.path().join("sessions"));
     let response = server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","id":9,"params":{}}"#)
         .expect("notification-only request");
@@ -732,10 +653,9 @@ fn turn_start_before_initialize_is_rejected() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "5b5c6d7e-8f90-4a1b-9c2d-3e4f5a6b7c8d";
-    let mut server = app_server(store, &sessions_dir);
-    insert_session(&server, &sessions_dir, session_id, &workspace);
+    let mut server = app_server(&sessions_dir);
+    insert_session(&sessions_dir, session_id, &workspace);
 
     // initialize 之前发 turn/start：普通管线门禁拒绝，不产生任何 turn 语义。
     let responses = server
@@ -745,9 +665,7 @@ fn turn_start_before_initialize_is_rejected() {
         .expect("turn/start before initialize");
     assert_eq!(responses[0]["error"]["code"], -32002);
     assert_eq!(
-        server
-            .store()
-            .get_session(session_id)
+        singularity_runtime::read_thread_summary(&sessions_dir, session_id)
             .expect("record")
             .status,
         None,
@@ -767,11 +685,10 @@ fn session_delete_rejects_reserved_turn_and_succeeds_after_reservation_drops() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "c14e4e8b-9b4a-4c1d-8f0a-2d5e6f7a8b9c";
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
-    insert_session(&server, &sessions_dir, session_id, &workspace);
+    insert_session(&sessions_dir, session_id, &workspace);
 
     let message: JsonRpcMessage = serde_json::from_value(json!({
         "jsonrpc": "2.0",
@@ -796,7 +713,7 @@ fn session_delete_rejects_reserved_turn_and_succeeds_after_reservation_drops() {
         ))
         .expect("delete rejected");
     assert_eq!(responses[0]["error"]["code"], -32005);
-    assert!(server.store().get_session(session_id).is_ok());
+    assert!(singularity_runtime::read_thread_summary(&sessions_dir, session_id).is_ok());
     assert!(sessions_dir.join(format!("{session_id}.jsonl")).is_file());
 
     drop(claim);
@@ -807,8 +724,8 @@ fn session_delete_rejects_reserved_turn_and_succeeds_after_reservation_drops() {
         .expect("delete after turn");
     assert_eq!(responses[0]["result"]["deleted"], true);
     assert!(matches!(
-        server.store().get_session(session_id),
-        Err(SessionIndexError::NotFound(_))
+        singularity_runtime::read_thread_summary(&sessions_dir, session_id),
+        Err(singularity_runtime::ResumeError::NotFound(_))
     ));
 }
 
@@ -824,16 +741,14 @@ fn project_instructions_load_from_workspace_root_to_cwd() {
     std::fs::write(workspace.join("AGENTS.md"), "ROOT INSTRUCTION").expect("root agents");
     std::fs::write(nested.join("AGENTS.md"), "NESTED INSTRUCTION").expect("nested agents");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let provider = StaticProvider {
         responses: vec![completed_response("instructions_turn")],
         seen_requests: Arc::clone(&requests),
     };
-    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    let mut server = app_server(&sessions_dir).with_test_provider(Arc::new(provider));
     initialize(&mut server);
     insert_session(
-        &server,
         &sessions_dir,
         "9f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
         &nested,
@@ -877,16 +792,14 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
     )
     .expect("oversized agents");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let requests: Arc<Mutex<Vec<ModelTurnRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let provider = StaticProvider {
         responses: vec![completed_response("truncated_instructions_turn")],
         seen_requests: Arc::clone(&requests),
     };
-    let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+    let mut server = app_server(&sessions_dir).with_test_provider(Arc::new(provider));
     initialize(&mut server);
     insert_session(
-        &server,
         &sessions_dir,
         "3d4e5f6a-9b8c-4d1e-a2f3-b4c5d6e7f8a9",
         &workspace,
@@ -984,7 +897,6 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
             _ => unreachable!("known project instruction case"),
         }
         let sessions_dir = temp.path().join("sessions");
-        let store = SessionIndex::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let provider = StaticProvider {
             responses: vec![completed_response("must_not_run")],
@@ -996,9 +908,9 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
             "cwd_unavailable" => "6f2e1d0c-8b7a-4654-9e3d-2c1b0a9f8e7d",
             _ => unreachable!("known project instruction case"),
         };
-        let mut server = app_server(store, &sessions_dir).with_test_provider(Arc::new(provider));
+        let mut server = app_server(&sessions_dir).with_test_provider(Arc::new(provider));
         initialize(&mut server);
-        insert_session(&server, &sessions_dir, session_id, &workspace);
+        insert_session(&sessions_dir, session_id, &workspace);
         if name == "cwd_unavailable" {
             std::fs::remove_dir_all(&workspace).expect("remove workspace for read failure");
         }
@@ -1012,9 +924,7 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
         );
         assert_eq!(seen.lock().expect("seen requests").len(), 0, "{name}");
         assert_eq!(
-            server
-                .store()
-                .get_session(session_id)
+            singularity_runtime::read_thread_summary(&sessions_dir, session_id)
                 .expect("session record")
                 .status,
             None,
@@ -1027,13 +937,8 @@ fn project_instruction_errors_fail_closed_before_provider_call() {
 
 /// 建一个带 settings 前导组的多轮会话：每轮一条 user 消息，偶数索引轮
 /// 额外带一条 toolResult 消息（供条目内容断言区分轮次）。
-fn seed_turned_session(
-    server: &AppServer,
-    sessions_dir: &Path,
-    session_id: &str,
-    turn_ids: &[&str],
-) -> String {
-    let sid = insert_session(server, sessions_dir, session_id, sessions_dir);
+fn seed_turned_session(sessions_dir: &Path, session_id: &str, turn_ids: &[&str]) -> String {
+    let sid = insert_session(sessions_dir, session_id, sessions_dir);
     let path = sessions_dir.join(format!("{sid}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("reopen session");
     session
@@ -1079,17 +984,6 @@ fn seed_turned_session(
             ))
             .expect("turn completed");
     }
-    // 生产顺序是终态 metadata 先落盘、索引后更新；fixture 保持同一不变量。
-    server
-        .store()
-        .update_session(
-            &sid,
-            SessionMetadataUpdate {
-                status: Some(SessionStatus::Completed),
-                ..SessionMetadataUpdate::default()
-            },
-        )
-        .expect("mark session completed");
     sid
 }
 
@@ -1118,11 +1012,9 @@ fn turn_page(result: &serde_json::Value) -> Vec<String> {
 fn thread_read_pages_newest_first_and_before_item() {
     let temp = tempfile::tempdir().expect("temp dir");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
     let sid = seed_turned_session(
-        &server,
         &sessions_dir,
         "1f0a2b3c-4d5e-4f60-8a92-b3c4d5e6f708",
         &["t1", "t2", "t3"],
@@ -1190,11 +1082,9 @@ fn thread_read_projects_crash_leftover_turn_as_interrupted() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-    let mut server = app_server(store, &sessions_dir);
+    let mut server = app_server(&sessions_dir);
     initialize(&mut server);
     let sid = insert_session(
-        &server,
         &sessions_dir,
         "6a5b6c7d-8e9f-4a01-9b23-d4e5f6a7b8c9",
         &workspace,
@@ -1213,18 +1103,6 @@ fn thread_read_projects_crash_leftover_turn_as_interrupted() {
         ))
         .expect("user message");
     drop(session);
-    // 模拟崩溃遗留：索引行停在 active，但本进程没有存活 turn。
-    server
-        .store()
-        .update_session(
-            &sid,
-            SessionMetadataUpdate {
-                status: Some(SessionStatus::Active),
-                ..SessionMetadataUpdate::default()
-            },
-        )
-        .expect("force active row");
-
     let response = thread_read_response(&mut server, 60, &format!(r#"{{"sessionId":"{sid}"}}"#));
     let result = &response["result"];
     assert_eq!(result["status"], "interrupted");

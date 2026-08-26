@@ -2,8 +2,8 @@ use super::framing::read_bounded_line_with_limit;
 use super::supervisor::{run_server_with_io, run_turn_request};
 use super::*;
 use crate::{
-    AppServer, AppServerCancellationHandle, AppServerError, ProviderFailureKind, SessionIndex,
-    SessionIndexError, SessionRecord, TurnFailureCause, TurnFailureStage,
+    AppServer, AppServerCancellationHandle, AppServerError, ProviderFailureKind, TurnFailureCause,
+    TurnFailureStage,
 };
 use serde_json::{Value, json};
 use singularity_agent::session::{SessionManager, SessionMetadataKind};
@@ -14,7 +14,6 @@ use singularity_model::{
 };
 use singularity_protocol::{JsonRpcId, JsonRpcMessage};
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -77,9 +76,8 @@ fn test_output_channel(capacity: usize) -> (mpsc::Sender<Value>, mpsc::Receiver<
 }
 
 fn test_cancellation_handle() -> AppServerCancellationHandle {
-    let store = SessionIndex::new();
     let snapshot = ProviderConfigSnapshot::capture(|_| None, shared_provider_runtime_handle());
-    AppServer::new(store, snapshot, ".singularity/sessions").cancellation_handle()
+    AppServer::new(snapshot, ".singularity/sessions").cancellation_handle()
 }
 
 /// transport 测试共享的注入 runtime：provider 异步执行一律由上层提供。
@@ -399,9 +397,7 @@ fn transport_error_exposes_store_agent_and_workspace_text() {
     let cases: Vec<(&str, AppServerError)> = vec![
         (
             "locked by another process",
-            AppServerError::Store(SessionIndexError::InvalidState(
-                "locked by another process".to_string(),
-            )),
+            AppServerError::Store("locked by another process".to_string()),
         ),
         ("provider: unavailable", {
             AppServerError::TurnExecution {
@@ -469,7 +465,6 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(workspace.join("AGENTS.md")).expect("AGENTS.md as a directory");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
@@ -480,7 +475,7 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
         },
         shared_provider_runtime_handle(),
     );
-    let mut server = AppServer::new(store, snapshot, &sessions_dir);
+    let mut server = AppServer::new(snapshot, &sessions_dir);
     server
             .handle_json(
                 r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
@@ -539,10 +534,9 @@ fn turn_start_prepare_failure_returns_direct_error_response() {
             .is_some_and(|message| message.contains("project_instruction_unsupported_file_type")),
         "error must carry the project instruction cause: {values:?}"
     );
-    // 会话行与 JSONL 均无 turn 痕迹：直接错误响应是唯一事实（重启后由
-    // JSONL 重建索引观察同一事实）。
-    let index = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
-    let record = index.get_session(&session_id).expect("session record");
+    // JSONL 无 turn 痕迹：直接错误响应是唯一事实。
+    let record = singularity_runtime::read_thread_summary(&sessions_dir, &session_id)
+        .expect("session record");
     assert_eq!(
         record.status, None,
         "prepare failure must not activate session"
@@ -657,8 +651,6 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
-
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let (provider_started_tx, provider_started_rx) = std_mpsc::sync_channel(1);
     let (provider_release_tx, provider_release_rx) = std_mpsc::sync_channel(1);
@@ -676,19 +668,6 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     let original_session_permissions = std::fs::metadata(&session_path)
         .expect("session metadata before storage fault")
         .permissions();
-    store
-        .insert_session(&SessionRecord {
-            session_id: session_id.to_string(),
-            rollout_path: session.path().to_string_lossy().to_string(),
-            cwd: workspace.to_string_lossy().to_string(),
-            title: None,
-            model: Some("test-model".to_string()),
-            status: None,
-            created_at: "2026-08-20T00:00:00Z".to_string(),
-            updated_at: "2026-08-20T00:00:00Z".to_string(),
-            token_usage: json!({}),
-        })
-        .expect("insert session");
     drop(session);
 
     let server_sessions_dir = sessions_dir.clone();
@@ -708,7 +687,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
             handle,
         );
 
-        let server = AppServer::new(store, snapshot, &server_sessions_dir)
+        let server = AppServer::new(snapshot, &server_sessions_dir)
             .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
 
         let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
@@ -855,8 +834,7 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         "provider was called exactly once during turn"
     );
 
-    // 7. 用同一 session 文件创建新 app-server 实例（重启语义：索引由 JSONL 重建）
-    let new_store = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
+    // 7. 用同一 session 文件创建新 app-server 实例。
     let new_snapshot = ProviderConfigSnapshot::capture(
         |name| match name {
             "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
@@ -867,12 +845,11 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
         },
         shared_provider_runtime_handle(),
     );
-    let mut new_server = AppServer::new(new_store, new_snapshot, &sessions_dir).with_test_provider(
-        Arc::new(ReopenProvider {
+    let mut new_server =
+        AppServer::new(new_snapshot, &sessions_dir).with_test_provider(Arc::new(ReopenProvider {
             response: ModelTurnResponse::completed("reopen_1", "reopen_response", "done"),
             seen_requests: Arc::clone(&seen_requests),
-        }),
-    );
+        }));
 
     new_server
         .handle_json(
@@ -904,22 +881,6 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     );
 }
 
-fn insert_session_record(store: &SessionIndex, session_id: &str, rollout_path: &Path, cwd: &Path) {
-    store
-        .insert_session(&SessionRecord {
-            session_id: session_id.to_string(),
-            rollout_path: rollout_path.to_string_lossy().to_string(),
-            cwd: cwd.to_string_lossy().to_string(),
-            title: None,
-            model: Some("test-model".to_string()),
-            status: None,
-            created_at: "2026-08-20T00:00:00Z".to_string(),
-            updated_at: "2026-08-20T00:00:00Z".to_string(),
-            token_usage: json!({}),
-        })
-        .expect("insert session");
-}
-
 #[test]
 fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     // 1a 回归：就绪点前移到 initialize 请求处理完成。客户端收到 initialize
@@ -929,11 +890,9 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let sessions_dir = temp.path().join("sessions");
-    let store = SessionIndex::new();
     let session_id = "aa1b2c3d-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let session = SessionManager::create_with_id(&workspace, &sessions_dir, session_id)
         .expect("create session");
-    insert_session_record(&store, session_id, session.path(), &workspace);
     drop(session);
 
     let (provider_started_tx, provider_started_rx) = std_mpsc::sync_channel(1);
@@ -959,7 +918,7 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
             },
             handle,
         );
-        let server = AppServer::new(store, snapshot, &sessions_dir_inside)
+        let server = AppServer::new(snapshot, &sessions_dir_inside)
             .with_test_provider(server_provider as Arc<dyn Provider + Send + Sync>);
 
         let (server_stdin, mut client_stdin) = tokio::io::duplex(65536);
@@ -1052,11 +1011,12 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
         server_result.is_ok(),
         "supervisor must exit cleanly after stdin EOF: {server_result:?}"
     );
-    // 重启语义：索引由 JSONL 重建后应看到 completed 终态。
-    let reopened = SessionIndex::from_sessions_dir(&sessions_dir).expect("rebuild index");
+    // 重启后按 JSONL 投影看到 completed 终态。
+    let reopened = singularity_runtime::read_thread_summary(&sessions_dir, session_id)
+        .expect("project session");
     assert_eq!(
-        reopened.get_session(session_id).expect("record").status,
-        Some(crate::SessionStatus::Completed)
+        reopened.status,
+        Some(singularity_runtime::ThreadStatus::Completed)
     );
     let session_on_disk =
         SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))

@@ -655,7 +655,7 @@ impl TurnRunner {
     }
 
     /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘 terminal metadata
-    /// 与 usage（JSONL 是事实源）。索引更新是协议适配器的职责。
+    /// 与 usage（JSONL 是事实源）。
     fn persist_terminal_state(
         &self,
         session: &mut SessionManager,

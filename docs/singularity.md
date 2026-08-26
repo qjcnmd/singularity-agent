@@ -25,7 +25,7 @@
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config。
-- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知（索引在 JSONL 落盘后同步）；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
+- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol 与适配器；runtime 不依赖 protocol/UI。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
 - **依赖方向**：cli → runtime → {core, model, agent}；app-server → {runtime, protocol}；runtime 与 agent 不依赖 protocol/UI；protocol 类型仅服务 app-server 适配器。
 
@@ -57,7 +57,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 `thread/started · turn/started · item/started · item/agentMessage/delta · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error · thread/settingsApplied`
 
-`thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影；app-server 据此把索引行的 model 同步到已落盘值。空闲路径无此事件（提交点内已立即持久化）。
+`thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影。空闲路径无此事件（提交点内已立即持久化）。
 
 `agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 在 runtime 和协议 DTO 中均为枚举，adapter 只负责一一映射，线格式词形不变。`provider/attempt` 的方法名稳定；其字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/attemptIndex/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。错误分类词形在 runtime 单点定义（`provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`），turn/error 的 cause 字段携带同一词形；外部解析方只读 status 与分类词即可，字段集变化为加法兼容。
 
@@ -82,10 +82,11 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 ## 5. 会话持久化与恢复
 
 - 严格 JSONL v1：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started/completed/failed/interrupted、thread_settings、thread_name、usage）不进入模型上下文；runtime 与 app-server 共用同一只读投影 API。
+- 列表、存在性检查、设置基线与读取头字段均按需扫描或读取 JSONL；摘要统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。
 - **单写者**：一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束关闭写者。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
-- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）；合并待生效意图时 Keep 不覆盖已有意图、Set/Clear 覆盖。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。app-server 的 `thread/settings` 在排队时同步返回 `queued=true` 且索引行保持旧 model，终态后随 `thread/settingsApplied` 事件同步——任何时刻 thread/list 与 thread/read 都只读已落盘值。
+- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）；合并待生效意图时 Keep 不覆盖已有意图、Set/Clear 覆盖。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。app-server 的 `thread/settings` 在排队时同步返回 `queued=true`，终态后随 `thread/settingsApplied` 事件投影——任何时刻 thread/list 与 thread/read 都只读已落盘值。
 
 ## 6. Provider 与模型
 

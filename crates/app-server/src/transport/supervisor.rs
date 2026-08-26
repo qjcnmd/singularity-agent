@@ -453,24 +453,16 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     // （model 层配置校验的启动期第一道防线；违规 fail closed）。
     if std::env::var_os("SINGULARITY_HOME").is_some() {
         let home = singularity_core::user_singularity_home()
-            .ok_or_else(|| "cannot resolve SINGULARITY_HOME for session index".to_string())?;
+            .ok_or_else(|| "cannot resolve SINGULARITY_HOME for sessions".to_string())?;
         let cwd = std::env::current_dir()
             .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
         singularity_core::ensure_singularity_home_outside_workspace(&home, &cwd)?;
     }
     let paths = crate::paths::AppPaths::resolve()?;
     paths.prepare()?;
-    // 进程内会话索引：启动时从 sessions 目录的 JSONL rollout 重建（JSONL 是
-    // 唯一持久事实源，索引不落盘）。
-    let session_index = crate::SessionIndex::from_sessions_dir(&paths.sessions_dir)
-        .map_err(|error| format!("failed to scan app-server session index: {error}"))?;
     let provider_snapshot =
         ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), runtime_handle);
-    Ok(AppServer::new(
-        session_index,
-        provider_snapshot,
-        paths.sessions_dir,
-    ))
+    Ok(AppServer::new(provider_snapshot, paths.sessions_dir))
 }
 
 /// 判断单请求是否需要后台 turn worker。
@@ -483,7 +475,7 @@ fn is_turn_request(message: &JsonRpcMessage) -> bool {
 }
 
 /// 三个活动 turn 控制请求走独立 lane；它们只触碰 active-turn maps，
-/// 不读取会话索引，也不等待 ordinary owner。
+/// 不读取会话 JSONL，也不等待 ordinary owner。
 ///
 /// 控制 lane 的就绪点 = initialize 请求处理完成（`ready_for_turn`），
 /// 不等待 `initialized` 通知；与 turn lane 共用同一就绪合同。ordinary
@@ -500,7 +492,7 @@ fn is_turn_control(message: &JsonRpcMessage) -> bool {
 }
 
 /// 唯一 ordinary AppServer owner。输入 reader 只把普通请求排入有界队列；
-/// 此任务按到达顺序处理队列并持有该 owner 的会话索引。
+/// 此任务按到达顺序处理队列并持有该 owner 的协调状态。
 async fn run_ordinary_dispatch(
     mut server: AppServer,
     mut requests: mpsc::Receiver<JsonRpcMessage>,

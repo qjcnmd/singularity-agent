@@ -37,8 +37,8 @@ pub use runner::{TurnOutcome, TurnParams, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use store::{
-    ResumeError, ThreadSummary, canonical_thread_cwd, create_thread, list_threads, rename_thread,
-    resume_thread, thread_session_path,
+    ResumeError, ThreadSummary, canonical_thread_cwd, create_thread, list_threads,
+    read_thread_summary, rename_thread, resume_thread, thread_session_path,
 };
 
 #[cfg(test)]

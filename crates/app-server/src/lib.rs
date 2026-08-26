@@ -5,17 +5,15 @@
 //!
 //! 职责边界：Thread/Turn 执行语义（Agent 构造、Provider 准备、会话单写者、
 //! 事件顺序、usage 聚合、终态落盘、取消、steer/followUp、设置时序）由
-//! [`singularity_runtime`] 唯一拥有；本 crate 只做 JSON-RPC 解析、索引投影、
+//! [`singularity_runtime`] 唯一拥有；本 crate 只做 JSON-RPC 解析、只读投影、
 //! 协议对象转换，并把 [`singularity_runtime::TurnEvent`] 一一映射为协议通知。
-//! JSONL rollout 是会话正文的唯一持久事实源；进程内 `SessionIndex` 只缓存
-//! 定位与展示元数据并在启动时从 JSONL 重建。
+//! JSONL rollout 是会话正文与列表元数据的唯一持久事实源。
 
 mod delete;
 mod dispatch;
 mod events;
 mod lifecycle;
 pub mod paths;
-mod session_index;
 mod state;
 mod transport;
 
@@ -35,15 +33,10 @@ use singularity_protocol::{
 };
 use thiserror::Error;
 
-pub use session_index::{
-    SessionIndex, SessionIndexError, SessionMetadataUpdate, SessionRecord, SessionStatus, now_iso,
-};
-
 const THREAD_NOT_FOUND: &str = "Thread not found";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const SESSION_DELETE_TURN_ACTIVE: &str =
     "session/delete rejected: a turn is still active for this session";
-const MAX_SESSION_TITLE_CHARS: usize = 120;
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
 
@@ -61,7 +54,7 @@ pub enum AppServerError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
     #[error("store error: {0}")]
-    Store(#[from] SessionIndexError),
+    Store(String),
     #[error("session error: {0}")]
     Session(#[from] singularity_agent::session::SessionError),
     #[error("workspace error: {0}")]
@@ -126,7 +119,7 @@ pub type AppServerOutput = Value;
 
 pub use dispatch::{TurnClaim, TurnStartClaim};
 use events::project_turn_history;
-pub use paths::thread_from_record;
+pub use paths::thread_from_summary;
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! 唯一 AppServer 运行时状态容器与 Thread 协调器注册表。
 //!
 //! Turn 执行全部委托给 [`singularity_runtime::Conversation`]；这里只维护
-//! 会话索引、线程→协调器映射、存活 turn 注册表（供控制通道与投影判定），
+//! 线程→协调器映射、存活 turn 注册表（供控制通道与投影判定），
 //! 不复制 Agent 状态、取消或 usage。
 
 use std::collections::HashMap;
@@ -15,10 +15,9 @@ use singularity_runtime::{Conversation, TurnRunner};
 
 use super::*;
 
-/// 协调 session 索引、信任和 Thread 协调器的有状态 JSON-RPC 服务。
+/// 协调信任和 Thread 协调器的有状态 JSON-RPC 服务。
 #[derive(Clone)]
 pub struct AppServer {
-    pub(super) store: Arc<SessionIndex>,
     pub(super) sessions_dir: PathBuf,
     pub(super) initialized: bool,
     pub(super) initialized_acknowledged: bool,
@@ -223,18 +222,13 @@ impl Drop for LiveTurnGuard {
 }
 
 impl AppServer {
-    pub fn new(
-        store: SessionIndex,
-        provider_snapshot: ProviderConfigSnapshot,
-        sessions_dir: impl AsRef<Path>,
-    ) -> Self {
+    pub fn new(provider_snapshot: ProviderConfigSnapshot, sessions_dir: impl AsRef<Path>) -> Self {
         let sessions_dir = sessions_dir.as_ref().to_path_buf();
         let turn_runner = Arc::new(TurnRunner::new(
             sessions_dir.clone(),
             provider_snapshot.clone(),
         ));
         Self {
-            store: Arc::new(store),
             sessions_dir,
             initialized: false,
             initialized_acknowledged: false,
@@ -258,10 +252,6 @@ impl AppServer {
                 .with_provider_override(provider),
         );
         self
-    }
-
-    pub(crate) fn store(&self) -> &SessionIndex {
-        &self.store
     }
 
     pub fn shutdown_requested(&self) -> bool {
@@ -292,10 +282,9 @@ impl AppServer {
         }
     }
 
-    /// 为单一 turn 工作线程共享同一会话索引与协调器注册表。
+    /// 为单一 turn 工作线程共享同一协调器注册表。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
-            store: Arc::clone(&self.store),
             sessions_dir: self.sessions_dir.clone(),
             initialized: true,
             initialized_acknowledged: true,
@@ -311,8 +300,8 @@ impl AppServer {
     /// 取得（或按 JSONL 重开并修复）Thread 的长驻协调器。
     ///
     /// 进程内首次接触的线程从会话文件重投影（`resume_thread` 同时执行崩溃
-    /// 修复），并把持久化的 settings/状态带回索引行。慢路径持缓存锁完成
-    /// resume+insert，避免并发首次接触产生同一 Thread 的两个协调器。
+    /// 修复）。慢路径持缓存锁完成 resume+insert，避免并发首次接触产生同一
+    /// Thread 的两个协调器。
     pub(crate) fn conversation_for(&self, session_id: &str) -> AppServerResult<Arc<Conversation>> {
         // 快路径：缓存命中直接返回。
         if let Some(conversation) = self
@@ -336,22 +325,12 @@ impl AppServer {
             singularity_runtime::store::resume_thread(self.turn_runner.sessions_dir(), session_id)
                 .map_err(|error| match error {
                     singularity_runtime::store::ResumeError::NotFound(_) => {
-                        AppServerError::Store(SessionIndexError::NotFound(session_id.to_string()))
+                        AppServerError::Store(format!("thread {session_id} was not found"))
                     }
                     singularity_runtime::store::ResumeError::Store(message) => {
                         AppServerError::Workspace(format!("failed to resume thread: {message}"))
                     }
                 })?;
-        // 索引投影与持久化事实对齐：JSONL 是权威，索引行模型/尺寸以重投影为准。
-        self.store
-            .update_session(
-                session_id,
-                SessionMetadataUpdate {
-                    model: Some(thread.model.as_deref()),
-                    ..SessionMetadataUpdate::default()
-                },
-            )
-            .ok();
         let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
         guard.insert(session_id.to_string(), Arc::clone(&conversation));
         Ok(conversation)
@@ -394,11 +373,11 @@ impl AppServer {
 
     /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
     /// 存活 turn 时才成立；崩溃遗留的 `Active` 投影为 `interrupted`，读取
-    /// 不回写索引（终态只能由 turn 的真实结束写入）。
-    pub(crate) fn project_thread(&self, record: &SessionRecord) -> Thread {
-        let mut thread = thread_from_record(record);
+    /// 不回写 JSONL（终态只能由 turn 的真实结束写入）。
+    pub(crate) fn project_thread(&self, record: &singularity_runtime::ThreadSummary) -> Thread {
+        let mut thread = thread_from_summary(record);
         if thread.last_turn_status == Some(singularity_protocol::ThreadStatus::Active)
-            && !self.thread_has_live_turn(&record.session_id)
+            && !self.thread_has_live_turn(&record.thread_id)
         {
             thread.last_turn_status = Some(singularity_protocol::ThreadStatus::Interrupted);
         }

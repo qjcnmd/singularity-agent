@@ -755,7 +755,7 @@ pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: Option<String>,
-    /// 最近一次/当前一次 turn 的展示元数据，来自 `session_index.status`：
+    /// 最近一次/当前一次 turn 的展示元数据，来自 JSONL 会话投影：
     /// 尚无 turn 时为 `None`（wire 上为 null），运行中为 active，终态为
     /// completed/failed/interrupted。`sg continue` 不受此字段限制。
     #[serde(rename = "lastTurnStatus")]
@@ -764,7 +764,7 @@ pub struct Thread {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// `session_index.status` 的协议投影：最近一次/当前一次 turn 的状态。
+/// JSONL 会话状态的协议投影：最近一次/当前一次 turn 的状态。
 pub enum ThreadStatus {
     Active,
     Completed,

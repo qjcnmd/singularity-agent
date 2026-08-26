@@ -428,8 +428,8 @@ impl Conversation {
                 self.requeue_follow_ups(queue);
                 return step;
             }
-            // 成功应用后发布投影更新：客户端（app-server 索引同步、TUI
-            // 状态行）据此拿到下一 turn 生效的线程模型。持久化失败时
+            // 成功应用后发布投影更新：客户端据此拿到下一 turn 生效的
+            // 线程模型。持久化失败时
             // 保留该意图与剩余输入，返回可行动错误。
             let applied = match self.apply_pending_settings() {
                 Ok(applied) => applied,

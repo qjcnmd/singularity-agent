@@ -32,16 +32,6 @@ pub(super) fn input_items_to_text(
     Ok(text)
 }
 
-pub(super) fn title_from_input(input: &str) -> String {
-    input
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(MAX_SESSION_TITLE_CHARS)
-        .collect()
-}
-
 pub(super) fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
@@ -196,9 +186,8 @@ impl AppServer {
     }
 
     pub(super) fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let threads = self
-            .store
-            .list_sessions()?
+        let threads = singularity_runtime::store::list_threads(&self.sessions_dir)
+            .map_err(AppServerError::Store)?
             .iter()
             .map(|record| self.project_thread(record))
             .collect::<Vec<_>>();
@@ -216,12 +205,17 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: ThreadSettingsParams = parse_params(&message)?;
-        let record = match self.store.get_session(&params.thread_id) {
+        let record = match singularity_runtime::store::read_thread_summary(
+            &self.sessions_dir,
+            &params.thread_id,
+        ) {
             Ok(record) => record,
-            Err(SessionIndexError::NotFound(_)) => {
+            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
-            Err(error) => return Err(error.into()),
+            Err(singularity_runtime::store::ResumeError::Store(error)) => {
+                return Err(AppServerError::Store(error));
+            }
         };
         let changed =
             params.provider.is_some() || params.model.is_some() || !params.reasoning.is_keep();
@@ -240,7 +234,7 @@ impl AppServer {
                 }
             },
         };
-        // 组合与校验与协调器共用同一实现：以索引行 selector 为基线合并
+        // 组合与校验与协调器共用同一实现：以 JSONL selector 为基线合并
         // patch；空白/缺失段由协调器的提交点校验统一拒绝。
         let selector =
             singularity_runtime::compose_merged_selector(record.model.as_deref(), &patch);
@@ -254,8 +248,7 @@ impl AppServer {
         let reasoning = parts.effort.map(str::to_string);
         let mut queued = false;
         if changed {
-            // JSONL 先落盘（协调器负责校验与持久化），随后同步索引投影。
-            let conversation = self.conversation_for(&record.session_id)?;
+            let conversation = self.conversation_for(&record.thread_id)?;
             let timing = match conversation.queue_settings(patch) {
                 Ok(timing) => timing,
                 Err(error) => {
@@ -270,22 +263,7 @@ impl AppServer {
                 }
             };
             match timing {
-                // 空闲路径：内存投影已更新，直接同步索引。
-                singularity_runtime::SettingsApplyTiming::AppliedNow => {
-                    let updated_model = conversation.thread().ok().and_then(|t| t.model);
-                    if let Some(updated_model) = updated_model {
-                        self.store.update_session(
-                            &record.session_id,
-                            SessionMetadataUpdate {
-                                model: Some(Some(&updated_model)),
-                                ..SessionMetadataUpdate::default()
-                            },
-                        )?;
-                    }
-                }
-                // 活动轮路径：索引保持旧 model；终态后由 runtime 的
-                // settingsApplied 事件驱动索引同步，避免客户端读到
-                // 尚未持久化的投影。
+                singularity_runtime::SettingsApplyTiming::AppliedNow => {}
                 singularity_runtime::SettingsApplyTiming::QueuedForNextTurn => {
                     queued = true;
                 }
@@ -295,7 +273,7 @@ impl AppServer {
         json_response(
             message.required_id(),
             ThreadSettingsResult {
-                thread_id: record.session_id,
+                thread_id: record.thread_id,
                 provider: Some(provider),
                 model,
                 reasoning,
@@ -333,25 +311,12 @@ impl AppServer {
                 ));
             }
         };
-        let rollout_path =
-            singularity_runtime::store::thread_session_path(&self.sessions_dir, &thread.thread_id)
-                .to_string_lossy()
-                .to_string();
-        let created_at = now_iso();
-        let record = SessionRecord {
-            session_id: thread.thread_id.clone(),
-            rollout_path,
-            cwd: cwd.clone(),
-            title: None,
+        let protocol_thread = Thread {
+            thread_id: thread.thread_id,
             model,
-            // 尚无 turn：status 为 null，首个 turn 真正开始时才写入。
-            status: None,
-            created_at: created_at.clone(),
-            updated_at: created_at,
-            token_usage: json!({}),
+            cwd: Some(cwd),
+            last_turn_status: None,
         };
-        self.store.insert_session(&record)?;
-        let protocol_thread = self.project_thread(&record);
         let mut messages =
             vec![self.event_notification(AppEvent::thread_started(&protocol_thread))?];
         messages.push(
@@ -371,16 +336,21 @@ impl AppServer {
         if !(1..=200).contains(&params.limit) {
             return invalid_params_response(message.required_id());
         }
-        let record = match self.store.get_session(&params.session_id) {
+        let record = match singularity_runtime::store::read_thread_summary(
+            &self.sessions_dir,
+            &params.session_id,
+        ) {
             Ok(record) => record,
-            Err(SessionIndexError::NotFound(_)) => {
+            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
-            Err(error) => return Err(error.into()),
+            Err(singularity_runtime::store::ResumeError::Store(error)) => {
+                return Err(AppServerError::Store(error));
+            }
         };
         let repository = SessionRepository::new(self.sessions_dir.clone());
         let read = repository
-            .read(&record.session_id)
+            .read(&record.thread_id)
             .map_err(AppServerError::Session)?;
         // 与 thread/list 复用同一 last-turn 投影，
         // 两个读取接口不得显示互相矛盾的状态。
@@ -415,7 +385,7 @@ impl AppServer {
         json_response(
             message.required_id(),
             ThreadReadResult {
-                session_id: record.session_id,
+                session_id: record.thread_id,
                 cwd: record.cwd,
                 title: record.title,
                 model: record.model,
@@ -435,32 +405,37 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: SessionIdParams = parse_params(&message)?;
-        let record = match self.store.get_session(&params.session_id) {
+        let record = match singularity_runtime::store::read_thread_summary(
+            &self.sessions_dir,
+            &params.session_id,
+        ) {
             Ok(record) => record,
-            Err(SessionIndexError::NotFound(_)) => {
+            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
-            Err(error) => return Err(error.into()),
+            Err(singularity_runtime::store::ResumeError::Store(error)) => {
+                return Err(AppServerError::Store(error));
+            }
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
-        // 后续写入落入 unlinked inode（索引行已删，turn 终态更新打空）。
-        if self.thread_turn_active(&record.session_id) {
+        // 后续写入落入 unlinked inode。
+        if self.thread_turn_active(&record.thread_id) {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
         // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。
-        let session = SessionManager::open_existing(Path::new(&record.rollout_path))
-            .map_err(AppServerError::Session)?;
-        if session.session_id() != record.session_id {
-            return Err(AppServerError::Store(SessionIndexError::InvalidState(
-                format!(
-                    "rollout header id {} does not match index session id {}",
-                    session.session_id(),
-                    record.session_id
-                ),
+        let rollout_path =
+            singularity_runtime::store::thread_session_path(&self.sessions_dir, &record.thread_id);
+        let session =
+            SessionManager::open_existing(&rollout_path).map_err(AppServerError::Session)?;
+        if session.session_id() != record.thread_id {
+            return Err(AppServerError::Store(format!(
+                "rollout header id {} does not match requested session id {}",
+                session.session_id(),
+                record.thread_id
             )));
         }
         drop(session);
-        crate::delete::delete_session(&record, &self.store)?;
+        crate::delete::delete_session(&rollout_path)?;
         json_response(
             message.required_id(),
             SessionDeleteResult {
@@ -488,12 +463,10 @@ impl std::fmt::Debug for TurnClaim {
     }
 }
 
-/// 已预订的 turn/start：把输入、投影头与预订一起交给执行线程。
+/// 已预订的 turn/start：把输入与预订一起交给执行线程。
 pub struct TurnStartClaim {
     pub reservation: singularity_runtime::TurnReservation,
     pub request_id: JsonRpcId,
-    pub thread_id: String,
-    pub title: Option<String>,
     pub input: String,
 }
 
@@ -507,15 +480,14 @@ impl AppServer {
             ));
         }
         let params: TurnStartParams = parse_params(&message)?;
-        let record = match self.store.get_session(&params.thread_id) {
-            Ok(record) => record,
-            Err(SessionIndexError::NotFound(_)) => {
-                return Ok(TurnClaim::Responded(
-                    not_found_response(message.required_id(), THREAD_NOT_FOUND)?.remove(0),
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        };
+        if !singularity_runtime::thread_session_path(&self.sessions_dir, &params.thread_id)
+            .is_file()
+        {
+            return Ok(TurnClaim::Responded(
+                not_found_response(message.required_id(), THREAD_NOT_FOUND)?.remove(0),
+            ));
+        }
+        let conversation = self.conversation_for(&params.thread_id)?;
         let input_text = match input_items_to_text(&params.input) {
             Ok(text) => text,
             Err(_) => {
@@ -524,15 +496,10 @@ impl AppServer {
                 ));
             }
         };
-        // 协调器按 JSONL 重开（含崩溃修复）并持有全程单写者语义。
-        let conversation = self.conversation_for(&record.session_id)?;
-        let title = title_from_input(&input_text);
         match conversation.reserve_start() {
             Ok(reservation) => Ok(TurnClaim::Accepted(TurnStartClaim {
                 reservation,
                 request_id: message.required_id(),
-                thread_id: record.session_id,
-                title: Some(title),
                 input: input_text,
             })),
             Err(singularity_runtime::ConversationError::TurnAlreadyActive) => {
@@ -588,8 +555,7 @@ impl AppServer {
         }
     }
 
-    /// 以已预订的协调器执行整条 turn 链条（worker 线程入口）；终态与 usage
-    /// 索引同步在投影内完成。`#[doc(hidden)]` 暴露给 stdio transport。
+    /// 以已预订的协调器执行整条 turn 链条（worker 线程入口）。
     #[doc(hidden)]
     pub fn run_turn_started(
         &mut self,
@@ -599,16 +565,12 @@ impl AppServer {
         let TurnStartClaim {
             reservation,
             request_id,
-            thread_id,
-            title,
             input,
         } = claim;
         let mut projection = crate::lifecycle::TurnProjection::new(
             self,
             Arc::clone(reservation.conversation()),
             request_id,
-            &thread_id,
-            title,
             emit,
         );
         let run_result = reservation.run(&input, &mut projection);
