@@ -49,26 +49,12 @@ pub fn openai_request_payload(
         payload["max_tokens"] = json!(max_output_tokens);
     }
     if wire.reasoning_enabled {
-        match wire.thinking_wire_format {
-            ThinkingWireFormat::ThinkingType => {
-                payload["thinking"] = json!({"type": "enabled"});
-            }
-            ThinkingWireFormat::EnableThinking => {
-                payload["enable_thinking"] = json!(true);
-            }
-        }
+        apply_thinking_wire(&mut payload, true, wire.thinking_wire_format);
         if let Some(wire_effort) = wire.wire_reasoning_effort.as_deref() {
             payload["reasoning_effort"] = json!(wire_effort);
         }
     } else if wire.reasoning_disabled {
-        match wire.thinking_wire_format {
-            ThinkingWireFormat::ThinkingType => {
-                payload["thinking"] = json!({"type": "disabled"});
-            }
-            ThinkingWireFormat::EnableThinking => {
-                payload["enable_thinking"] = json!(false);
-            }
-        }
+        apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -87,16 +73,22 @@ pub fn openai_request_payload(
     if request_uses_tool_protocol(request)
         && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
     {
-        match wire.thinking_wire_format {
-            ThinkingWireFormat::ThinkingType => {
-                payload["thinking"] = json!({"type": "disabled"});
-            }
-            ThinkingWireFormat::EnableThinking => {
-                payload["enable_thinking"] = json!(false);
-            }
-        }
+        apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
     }
     payload
+}
+
+/// Thinking 开关的协议落点统一投影：同一个语义开关按 provider 的 wire
+/// 偏好落到 `thinking` 或 `enable_thinking` 字段。
+fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: ThinkingWireFormat) {
+    match wire_format {
+        ThinkingWireFormat::ThinkingType => {
+            payload["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+        }
+        ThinkingWireFormat::EnableThinking => {
+            payload["enable_thinking"] = json!(enabled);
+        }
+    }
 }
 
 pub fn openai_chat_stream_request_payload(
