@@ -22,10 +22,37 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
-/// 工具批次开始前执行查找与参数校验 preflight 的结果。
-#[derive(Debug, Clone, Copy)]
+/// 工具批次开始前执行查找与参数解析 preflight 的结果。
+#[derive(Clone)]
 pub struct PreparedTool {
-    execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
+    execute: std::sync::Arc<PreparedExecute>,
+}
+
+impl std::fmt::Debug for PreparedTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreparedTool")
+    }
+}
+
+/// 已解析参数与执行体的类型擦除容器。
+type PreparedExecute =
+    dyn for<'a> Fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError> + Send + Sync;
+
+impl PreparedTool {
+    /// 绑定已解析参数与执行函数：`prepare` 阶段 typed 反序列化一次，
+    /// 执行阶段直接用解析结果，不再二次反序列化。
+    pub(crate) fn from_parsed<A, F>(args: A, execute: F) -> Self
+    where
+        A: Send + Sync + 'static,
+        F: for<'a> Fn(&A, ExecuteContext<'a>) -> Result<ToolExecution, ToolError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            execute: std::sync::Arc::new(move |ctx| execute(&args, ctx)),
+        }
+    }
 }
 
 /// preflight 要么产出可执行工具，要么产出模型可见的拒绝。
@@ -57,14 +84,14 @@ pub struct ExecuteContext<'a> {
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
 }
 
-/// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实执行函数。
+/// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实的
+/// 参数解析+执行绑定（preflight 阶段 typed 解析一次）。
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
-    pub(crate) validate: fn(&Value) -> Result<(), String>,
-    pub execute: for<'a> fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError>,
+    pub(crate) prepare: fn(&Value) -> Result<PreparedTool, ToolExecution>,
 }
 
 /// 名称 → 工具规格的注册表；`new()` 注册默认工具集（read/glob/grep/bash/edit/write）。
@@ -121,22 +148,17 @@ impl ToolRegistry {
         }
     }
 
-    /// 查找并校验调用而不执行。Agent 批次在按模型给定 source order 执行
-    /// 每个调用前使用本方法。
+    /// 查找并解析调用而不执行。Agent 批次在按模型给定 source order 执行
+    /// 每个调用前使用本方法；typed 反序列化在此完成一次。
     pub fn preflight(&self, name: &str, args: &Value) -> Result<ToolPreflight, ToolError> {
         let spec = self
             .tools
             .get(name)
             .ok_or_else(|| ToolError(format!("unknown tool: {name}")))?;
-        if let Err(message) = (spec.validate)(args) {
-            return Ok(ToolPreflight::Rejected(ToolExecution {
-                content: format!("tool arguments failed validation: {message}"),
-                is_error: true,
-            }));
+        match (spec.prepare)(args) {
+            Ok(prepared) => Ok(ToolPreflight::Ready(prepared)),
+            Err(execution) => Ok(ToolPreflight::Rejected(execution)),
         }
-        Ok(ToolPreflight::Ready(PreparedTool {
-            execute: spec.execute,
-        }))
     }
 
     /// 执行一个已通过 [`Self::preflight`] 的调用。
@@ -171,6 +193,20 @@ pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, S
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))
 }
 
+/// 工具 `prepare` 的统一实现：preflight 阶段 typed 反序列化一次，把解析
+/// 结果与执行函数绑定进 [`PreparedTool`]；失败时生成模型可见的拒绝。
+pub(crate) fn prepare_typed<A, F>(raw: &Value, execute: F) -> Result<PreparedTool, ToolExecution>
+where
+    A: DeserializeOwned + Send + Sync + 'static,
+    F: for<'a> Fn(&A, ExecuteContext<'a>) -> Result<ToolExecution, ToolError>
+        + Send
+        + Sync
+        + 'static,
+{
+    let args = deserialize_args_or_error::<A>(raw)?;
+    Ok(PreparedTool::from_parsed(args, execute))
+}
+
 /// 反序列化工具参数；失败时把错误文本包装为模型可见的 `is_error` 结果。
 /// 调用方把返回的失败结果直接作为工具执行结果透传，例如：
 ///
@@ -189,36 +225,27 @@ pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     })
 }
 
-pub(crate) fn validate_args<T: DeserializeOwned>(args: &Value) -> Result<(), String> {
-    deserialize_args::<T>(args).map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::test_support::context;
     use serde_json::json;
 
-    fn ping_execute(_ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-        Ok(ToolExecution {
-            content: "pong".to_string(),
-            is_error: false,
-        })
-    }
-
     fn ping_spec() -> ToolSpec {
         ToolSpec {
             name: "ping",
             description: "custom test tool",
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
-            validate: validate_args::<EmptyArgs>,
-            execute: ping_execute,
+            prepare: |_| {
+                Ok(PreparedTool::from_parsed((), |(), _ctx| {
+                    Ok(ToolExecution {
+                        content: "pong".to_string(),
+                        is_error: false,
+                    })
+                }))
+            },
         }
     }
-
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct EmptyArgs {}
 
     #[test]
     fn default_tools_include_read_bash_edit_write() {

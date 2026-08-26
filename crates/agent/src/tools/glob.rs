@@ -5,10 +5,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
-    resolve_path, validate_args,
-};
+use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 use super::walk::{display_path, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
@@ -39,8 +36,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "glob",
         description: DESCRIPTION,
         parameters: parameters(),
-        validate: validate_args::<GlobArgs>,
-        execute,
+        prepare: |raw| super::registry::prepare_typed(raw, execute),
     }
 }
 
@@ -89,11 +85,7 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&out).map_err(|error| format!("invalid glob pattern {pattern:?}: {error}"))
 }
 
-pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args_or_error::<GlobArgs>(&ctx.args) {
-        Ok(args) => args,
-        Err(execution) => return Ok(execution),
-    };
+fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = args.path.as_deref().unwrap_or(".");
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
@@ -140,6 +132,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::registry::ToolRegistry;
     use crate::tools::test_support::context;
     use std::fs;
 
@@ -160,8 +153,9 @@ mod tests {
     #[test]
     fn glob_matches_files_recursively_and_skips_vcs_dirs() {
         let dir = layout();
-        let result =
-            execute(context(json!({ "pattern": "**/*.rs" }), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("glob", context(json!({ "pattern": "**/*.rs" }), dir.path()))
+            .expect("execute");
         assert!(!result.is_error);
         assert!(result.content.contains("src/main.rs"));
         assert!(result.content.contains("src/deep/util.rs"));
@@ -172,7 +166,9 @@ mod tests {
     #[test]
     fn glob_rejects_missing_required_parameter() {
         let dir = layout();
-        let result = execute(context(json!({}), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("glob", context(json!({}), dir.path()))
+            .expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("missing field `pattern`"));
     }

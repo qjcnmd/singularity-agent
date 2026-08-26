@@ -7,10 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
-use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
-    resolve_path, validate_args,
-};
+use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
@@ -43,16 +40,11 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "read",
         description: DESCRIPTION,
         parameters: parameters(),
-        validate: validate_args::<ReadArgs>,
-        execute,
+        prepare: |raw| super::registry::prepare_typed(raw, execute),
     }
 }
 
-pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args_or_error::<ReadArgs>(&ctx.args) {
-        Ok(args) => args,
-        Err(execution) => return Ok(execution),
-    };
+fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
         return error_result("Operation aborted");
     }

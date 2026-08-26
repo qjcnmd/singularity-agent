@@ -9,10 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::glob::glob_regex;
-use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
-    resolve_path, validate_args,
-};
+use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 use super::walk::{to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
@@ -51,8 +48,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "grep",
         description: DESCRIPTION,
         parameters: parameters(),
-        validate: validate_args::<GrepArgs>,
-        execute,
+        prepare: |raw| super::registry::prepare_typed(raw, execute),
     }
 }
 
@@ -76,11 +72,7 @@ fn truncate_for_display(line: &str) -> String {
     format!("{}...", &line[..end])
 }
 
-pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args_or_error::<GrepArgs>(&ctx.args) {
-        Ok(args) => args,
-        Err(execution) => return Ok(execution),
-    };
+fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
@@ -203,6 +195,7 @@ pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::registry::ToolRegistry;
     use crate::tools::test_support::context;
     use std::fs;
 
@@ -228,8 +221,9 @@ mod tests {
     #[test]
     fn grep_outputs_path_line_text_and_skips_binary_and_vcs() {
         let dir = layout();
-        let result =
-            execute(context(json!({ "pattern": r"main\(" }), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("grep", context(json!({ "pattern": r"main\(" }), dir.path()))
+            .expect("execute");
         assert!(!result.is_error);
         assert!(
             result.content.contains("src/main.rs:2:fn main() {"),
@@ -248,7 +242,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(dir.path().join("many.txt"), content).expect("many lines");
-        let result = execute(context(json!({ "pattern": "marker" }), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("grep", context(json!({ "pattern": "marker" }), dir.path()))
+            .expect("execute");
         assert!(!result.is_error);
         assert!(
             result.content.contains("results truncated at 500 matches"),
@@ -260,7 +256,9 @@ mod tests {
     #[test]
     fn grep_rejects_invalid_regex() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let result = execute(context(json!({ "pattern": "(" }), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("grep", context(json!({ "pattern": "(" }), dir.path()))
+            .expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("invalid regular expression"));
     }
@@ -271,7 +269,9 @@ mod tests {
         let oversized = format!("{}hit\n", "x".repeat(MAX_READ_LINE_BYTES + 1));
         fs::write(dir.path().join("huge.txt"), oversized).expect("huge file");
         fs::write(dir.path().join("ok.txt"), "hit\n").expect("ok file");
-        let result = execute(context(json!({ "pattern": "hit" }), dir.path())).expect("execute");
+        let result = ToolRegistry::new()
+            .execute("grep", context(json!({ "pattern": "hit" }), dir.path()))
+            .expect("execute");
         assert!(!result.is_error, "{}", result.content);
         assert!(
             result.content.contains("ok.txt:1:hit"),

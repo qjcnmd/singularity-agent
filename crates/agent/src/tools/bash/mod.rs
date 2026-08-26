@@ -7,7 +7,7 @@ mod pump;
 mod shell;
 mod spec;
 
-pub(crate) use exec::{DESCRIPTION, execute};
+pub(crate) use exec::DESCRIPTION;
 pub use shell::ensure_available;
 pub(crate) use spec::spec;
 

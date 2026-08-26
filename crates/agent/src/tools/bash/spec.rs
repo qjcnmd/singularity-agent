@@ -1,6 +1,5 @@
 //! bash 参数解析与工具规格。
 
-use super::super::registry::validate_args;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
@@ -45,7 +44,6 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
         name: "bash",
         description: super::DESCRIPTION,
         parameters: parameters(),
-        validate: validate_args::<BashArgs>,
-        execute: super::execute,
+        prepare: |raw| super::super::registry::prepare_typed(raw, super::exec::execute),
     }
 }

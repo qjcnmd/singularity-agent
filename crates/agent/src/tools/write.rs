@@ -5,10 +5,7 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{
-    ExecuteContext, ToolError, ToolExecution, deserialize_args_or_error, error_result,
-    resolve_path, validate_args,
-};
+use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 
@@ -36,16 +33,11 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "write",
         description: DESCRIPTION,
         parameters: parameters(),
-        validate: validate_args::<WriteArgs>,
-        execute,
+        prepare: |raw| super::registry::prepare_typed(raw, execute),
     }
 }
 
-pub(crate) fn execute(ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    let args = match deserialize_args_or_error::<WriteArgs>(&ctx.args) {
-        Ok(args) => args,
-        Err(execution) => return Ok(execution),
-    };
+fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = &args.path;
     let content = &args.content;
     if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {

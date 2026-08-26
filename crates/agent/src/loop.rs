@@ -468,7 +468,7 @@ fn execute_tool_batch(
                 continue;
             }
             Prepared::Ready(prepared) => {
-                let prepared = *prepared;
+                let prepared = prepared.clone();
                 let call = item.call.clone();
                 let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
