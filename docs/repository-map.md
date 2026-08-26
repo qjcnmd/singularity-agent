@@ -155,6 +155,7 @@ flowchart TD
             t_bash["bash/ — 执行/输出/规格三模块（mod·process·output·spec + bash_exec）"]
             t_edit["edit.rs — 唯一精确文本替换"]
             t_write["write.rs — 写入/覆盖/建目录"]
+            t_mutation["mutation.rs — 进程内文件变更队列（canonical path 键）"]
             t_truncate["truncate.rs — 输出截断算法"]
             t_walk["walk.rs — 只读目录遍历辅助"]
         end
@@ -222,6 +223,7 @@ flowchart TD
         events["events.rs — 生命周期事件投影"]
         paths["paths.rs — 持久化路径投影"]
         delete["delete.rs — 会话删除"]
+        wire["wire.rs — 结构映射收口（Thread/ThreadStatus/Usage 投影）"]
         subgraph lifecycle["lifecycle/ — 投影适配器"]
             projection["projection.rs — TurnEvent → JSON-RPC 通知"]
         end
