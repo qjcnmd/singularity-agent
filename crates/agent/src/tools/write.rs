@@ -58,9 +58,6 @@ fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, T
     if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, content.as_bytes()) {
         return error_result(format!("Could not write file: {path}. {error}"));
     }
-    if let Some(mutations) = ctx.mutations {
-        mutations.record_change(&full_path);
-    }
     Ok(ToolExecution {
         content: format!("Successfully wrote {} bytes to {path}", content.len()),
         is_error: false,

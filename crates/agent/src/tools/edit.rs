@@ -125,9 +125,6 @@ fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
     if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, &final_content) {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
-    if let Some(mutations) = ctx.mutations {
-        mutations.record_change(&full_path);
-    }
     let mut projected_text = String::with_capacity(
         normalized_str
             .len()
