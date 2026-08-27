@@ -33,6 +33,15 @@ pub(super) fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerRe
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
 
+/// 本地 app-server 的初始化结果；user-agent 取 app-server 的包版本。
+fn local_initialize_result() -> singularity_protocol::InitializeResult {
+    singularity_protocol::InitializeResult {
+        user_agent: concat!("singularity-app-server/", env!("CARGO_PKG_VERSION")).to_string(),
+        platform_family: "local".to_string(),
+        platform_os: std::env::consts::OS.to_string(),
+    }
+}
+
 pub(super) fn parse_params<T>(message: &JsonRpcMessage) -> Result<T, AppServerError>
 where
     T: serde::de::DeserializeOwned,
@@ -164,7 +173,7 @@ impl AppServer {
         Ok(vec![
             JsonRpcMessage::response(
                 message.required_id(),
-                serde_json::to_value(InitializeResult::local())?,
+                serde_json::to_value(local_initialize_result())?,
             )
             .to_wire_value(),
         ])

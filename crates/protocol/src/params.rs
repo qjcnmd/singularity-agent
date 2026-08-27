@@ -25,17 +25,6 @@ pub struct InitializeResult {
     pub platform_os: String,
 }
 
-impl InitializeResult {
-    /// 构造本地 app-server 的初始化结果。
-    pub fn local() -> Self {
-        Self {
-            user_agent: concat!("singularity-app-server/", env!("CARGO_PKG_VERSION")).to_string(),
-            platform_family: "local".to_string(),
-            platform_os: std::env::consts::OS.to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 创建 thread 的参数。
