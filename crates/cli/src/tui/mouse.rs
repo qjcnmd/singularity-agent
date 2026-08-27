@@ -65,6 +65,7 @@ impl TuiApp {
     pub fn handle_wheel(&mut self, up: bool, column: u16, row: u16) {
         let rows = self.wheel.rows_for(Instant::now());
         let editor_rect = self
+            .frame
             .click_targets
             .iter()
             .find(|(_, target)| *target == ClickTarget::Editor)
@@ -88,6 +89,7 @@ impl TuiApp {
     /// 编辑器=光标定位）。运行中点击 [stop] 与 Esc 同一中断路径。
     pub fn handle_click(&mut self, column: u16, row: u16) {
         let hit = self
+            .frame
             .click_targets
             .iter()
             .find(|(rect, _)| rect_contains(rect, column, row))
@@ -100,6 +102,7 @@ impl TuiApp {
             ClickTarget::Stop => self.request_interrupt(),
             ClickTarget::Editor => {
                 let visual_row = self
+                    .frame
                     .last_editor_scroll_top
                     .saturating_add((row - rect.y) as usize);
                 let visual_col = (column - rect.x) as usize;

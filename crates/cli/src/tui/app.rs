@@ -61,6 +61,31 @@ impl WaitingTarget {
     }
 }
 
+/// 单帧渲染缓存：会话流宽/行数/视口度量与点击命中矩形表。帧间存活，
+/// 供键位滚动、内容增长检测与鼠标命中复用。
+pub(super) struct FrameCache {
+    pub(super) last_flow_width: Option<u16>,
+    pub(super) last_total_rows: usize,
+    pub(super) last_viewport_rows: usize,
+    /// 编辑器最近一帧的可视滚动顶行（点击定位换算依赖）。
+    pub(super) last_editor_scroll_top: usize,
+    /// 帧缓存点击矩形表：本帧渲染时登记 `(Rect, ClickTarget)` 对，鼠标
+    /// 事件对缓存做包含测试（取代对状态行文本的反查）。
+    pub(super) click_targets: Vec<(Rect, ClickTarget)>,
+}
+
+impl Default for FrameCache {
+    fn default() -> Self {
+        Self {
+            last_flow_width: None,
+            last_total_rows: 0,
+            last_viewport_rows: 5,
+            last_editor_scroll_top: 0,
+            click_targets: Vec::new(),
+        }
+    }
+}
+
 /// 交互式会话的应用状态。字段以 `pub(super)` 暴露给同模块树中的
 /// `modals`/`session_actions`/`mouse`/`view`（同 `tui` 模块内部实现细节）。
 pub(crate) struct TuiApp {
@@ -84,15 +109,7 @@ pub(crate) struct TuiApp {
     /// 状态行展示用累计 token 数（最后完成 turn 的聚合或 resume 时的摘要）：
     /// 仅存在已上报 usage 时展示，故为 Option。
     pub(super) session_tokens: Option<u64>,
-    /// 最近一帧会话流宽度、总行数与视口高（键位滚动与增长检测依赖）。
-    pub(super) last_flow_width: Option<u16>,
-    pub(super) last_total_rows: usize,
-    pub(super) last_viewport_rows: usize,
-    /// 编辑器最近一帧的可视滚动顶行（点击定位换算依赖）。
-    pub(super) last_editor_scroll_top: usize,
-    /// 帧缓存点击矩形表：本帧渲染时登记 `(Rect, ClickTarget)` 对，鼠标
-    /// 事件对缓存做包含测试（取代对状态行文本的反查）。
-    pub(super) click_targets: Vec<(Rect, ClickTarget)>,
+    pub(super) frame: FrameCache,
     /// 滚轮归一化状态（滚轮/触控板加速）。
     pub(super) wheel: WheelNormalizer,
     /// /compact 后台压缩进行中；Esc 通过 `compact_cancel` 中止本次压缩。
@@ -123,11 +140,7 @@ impl TuiApp {
             waiting_since: None,
             turn_started_at: None,
             session_tokens: None,
-            last_flow_width: None,
-            last_total_rows: 0,
-            last_viewport_rows: 5,
-            last_editor_scroll_top: 0,
-            click_targets: Vec::new(),
+            frame: FrameCache::default(),
             wheel: WheelNormalizer::default(),
             compacting: false,
             compact_cancel: None,
@@ -465,10 +478,10 @@ impl TuiApp {
     // -- 渲染 ----------------------------------------------------------------
 
     pub(super) fn flow_metrics(&self) -> (usize, usize) {
-        let width = self.last_flow_width.unwrap_or(80);
+        let width = self.frame.last_flow_width.unwrap_or(80);
         let total: usize = self.transcript.row_counts(width).iter().sum::<usize>()
             + self.transcript.live_row_count(width);
-        (total, self.last_viewport_rows.max(1))
+        (total, self.frame.last_viewport_rows.max(1))
     }
 
     /// 整帧渲染。
@@ -493,15 +506,15 @@ impl TuiApp {
         .areas(area);
 
         // 滚动收敛：内容增长后按当前视口同步。
-        self.last_flow_width = Some(flow.width);
+        self.frame.last_flow_width = Some(flow.width);
         let mut counts = self.transcript.row_counts(flow.width);
         counts.push(self.transcript.live_row_count(flow.width));
         let total_rows: usize = counts.iter().sum();
         let viewport = flow.height as usize;
-        let grown = total_rows.saturating_sub(self.last_total_rows);
+        let grown = total_rows.saturating_sub(self.frame.last_total_rows);
         self.scroll.on_content_grow(grown, total_rows, viewport);
-        self.last_total_rows = total_rows;
-        self.last_viewport_rows = viewport;
+        self.frame.last_total_rows = total_rows;
+        self.frame.last_viewport_rows = viewport;
 
         // 可视窗口物化：只渲染可见行。
         let top = if self.scroll.is_following() {
@@ -569,7 +582,7 @@ impl TuiApp {
         let (visual_row, visual_col) = self.editor.cursor_visual(editor_inner_w);
         // 滚轮覆盖优先，否则跟随光标。
         let scroll_top = self.editor.effective_scroll_top(visual_row, inner_h);
-        self.last_editor_scroll_top = scroll_top;
+        self.frame.last_editor_scroll_top = scroll_top;
         let mut editor_lines: Vec<Line<'static>> = Vec::new();
         for logical in self.editor.lines() {
             for piece in wrapped_lines(logical, editor_inner_w as usize) {
@@ -593,7 +606,7 @@ impl TuiApp {
 
         // 点击命中缓存：登记本帧可点击矩形。[stop] 恒为状态行末段（按 span
         // 宽度计量，不做文本反查）；编辑器内区不含边框。
-        self.click_targets.clear();
+        self.frame.click_targets.clear();
         if self.phase != Phase::Idle {
             let stop = status_spans
                 .last()
@@ -606,7 +619,7 @@ impl TuiApp {
             let stop_x = status_area
                 .x
                 .saturating_add(status_width.saturating_sub(stop_width));
-            self.click_targets.push((
+            self.frame.click_targets.push((
                 Rect::new(stop_x, status_area.y, stop_width, 1),
                 ClickTarget::Stop,
             ));
@@ -617,7 +630,7 @@ impl TuiApp {
             width: editor_area.width.saturating_sub(2).max(1),
             height: editor_area.height.saturating_sub(2).max(1),
         };
-        self.click_targets.push((editor_inner, ClickTarget::Editor));
+        self.frame.click_targets.push((editor_inner, ClickTarget::Editor));
 
         if let Some(menu) = &self.settings {
             self.render_settings(frame, menu);

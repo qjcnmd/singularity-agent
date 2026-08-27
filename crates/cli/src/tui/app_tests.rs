@@ -412,7 +412,7 @@ fn clicking_stop_interrupts_the_running_turn() {
     let mut app = TuiApp::new(test_conversation(&sessions, Arc::new(NeverCalledProvider)));
     app.force_phase(Phase::Running);
     // 帧缓存点击矩形表：模拟 draw 注册的运行中 [stop] 命中矩形。
-    app.click_targets = vec![(Rect::new(90, 28, 7, 1), ClickTarget::Stop)];
+    app.frame.click_targets = vec![(Rect::new(90, 28, 7, 1), ClickTarget::Stop)];
     // 命中 [stop]：中断当前轮。
     app.handle_click(93, 28);
     assert_eq!(
