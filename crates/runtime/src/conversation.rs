@@ -379,22 +379,27 @@ impl Conversation {
         &self,
         patch: SettingsPatch,
     ) -> Result<SettingsApplyResult, ConversationError> {
-        if patch.is_empty() {
-            let selector =
-                compose_merged_selector(self.lock_state()?.thread.model.as_deref(), &patch);
+        // 单次拿锁事务：读当前 thread.model、合并已有待生效意图与新 patch、
+        // 校验最终组合、写回 pending、返回同一 selector。消除先校验后合并的
+        // 两次拿锁窗口，也避免合并结果只在终态持久化时才被发现非法。
+        let mut state = self.lock_state()?;
+        let merged = match state.queued_settings.as_ref() {
+            Some(pending) => pending.clone().merged_with(&patch),
+            None => patch,
+        };
+        if merged.is_empty() {
+            let selector = compose_merged_selector(state.thread.model.as_deref(), &merged);
             return Ok(SettingsApplyResult {
                 timing: SettingsApplyTiming::NothingToApply,
                 selector,
             });
         }
-        // 先用当前投影做即时校验：无效值在提交点就被拒绝，而不是等到终态后。
-        let selector = self.compose_selector(&patch)?;
-        let mut state = self.lock_state()?;
+        // 提交点校验最终组合（含已排队部分）：无效组合立即被拒绝，
+        // 而不是等到终态持久化时才失败；校验失败时原 pending 保留。
+        let selector = compose_validated_selector(&state.thread.model, &merged, &self.runner)
+            .map_err(ConversationError::Configuration)?;
+        state.queued_settings = Some(merged);
         if state.turn.is_busy() {
-            state.queued_settings = Some(match state.queued_settings.take() {
-                Some(pending) => pending.merged_with(&patch),
-                None => patch,
-            });
             return Ok(SettingsApplyResult {
                 timing: SettingsApplyTiming::QueuedForNextTurn,
                 selector,
@@ -402,7 +407,6 @@ impl Conversation {
         }
         // 空闲路径与终态后路径共用同一份待生效意图：先入队再立即消费，
         // 持久化失败时意图保留在队列中等待重试。
-        state.queued_settings = Some(patch);
         self.persist_pending_settings_locked(&mut state)?;
         Ok(SettingsApplyResult {
             timing: SettingsApplyTiming::AppliedNow,
@@ -599,12 +603,6 @@ impl Conversation {
                 "failed to persist thread settings: {message}"
             ))),
         }
-    }
-
-    fn compose_selector(&self, patch: &SettingsPatch) -> Result<String, ConversationError> {
-        let current = self.lock_state()?.thread.model.clone();
-        compose_validated_selector(&current, patch, &self.runner)
-            .map_err(ConversationError::Configuration)
     }
 
     fn active_controls(&self) -> Option<Arc<TurnControls>> {

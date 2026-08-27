@@ -647,6 +647,138 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
     );
 }
 
+/// 双 patch 第二次排队返回的 selector 反映合并结果（而非只按当前投影 + 新 patch）。
+#[test]
+fn second_queued_patch_returns_selector_of_the_merged_combination() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (release_tx, release_rx) = mpsc::channel();
+    let log = Arc::new(RequestLog::default());
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(GatedRecordingProvider {
+            release: std::sync::Mutex::new(release_rx),
+            log: Arc::clone(&log),
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+        Some("base-model"),
+    ));
+    let thread_id = shared.thread().unwrap().thread_id;
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let (_, mut sink) = collect_sink();
+            shared.run_turn("first turn", &mut sink)
+        })
+    };
+    wait_for_active(&shared);
+
+    let first = shared
+        .queue_settings(SettingsPatch {
+            model: Some("base-model".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue first patch");
+    assert_eq!(first.timing, SettingsApplyTiming::QueuedForNextTurn);
+    // 第二次排队必须返回合并后的完整 selector（当前投影 + 两份 patch），
+    // 而不是只反映「当前投影 + 新 patch」的组合。
+    let second = shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue second patch");
+    let expected = compose_merged_selector(
+        Some("base-model"),
+        &SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            model: Some("base-model".to_string()),
+            ..SettingsPatch::default()
+        },
+    );
+    assert_eq!(second.selector, expected);
+    assert_eq!(
+        second.selector, "openai_compatible/base-model",
+        "returned selector reflects the merged provider + model"
+    );
+
+    release_tx.send(()).expect("release");
+    turn_thread.join().expect("join").expect("first turn ok");
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        1,
+        "merged patches persist as exactly one thread_settings metadata"
+    );
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
+        Some("openai_compatible/base-model"),
+        "projection reflects the merged selector"
+    );
+}
+
+/// 合并后的非法组合在提交点即被拒绝（不等终态持久化），且被拒 patch 不破坏
+/// 已排队的原意图。
+#[test]
+fn merged_invalid_combination_rejected_at_commit_keeps_pending_intact() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (release_tx, release_rx) = mpsc::channel();
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(GatedRecordingProvider {
+            release: std::sync::Mutex::new(release_rx),
+            log: Arc::new(RequestLog::default()),
+            requested: Arc::clone(&requested),
+        }),
+        Some("base-model"),
+    ));
+    let thread_id = shared.thread().unwrap().thread_id;
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let (_, mut sink) = collect_sink();
+            shared.run_turn("first turn", &mut sink)
+        })
+    };
+    wait_for_active(&shared);
+
+    // 先排一份合法意图。
+    shared
+        .queue_settings(SettingsPatch {
+            provider: Some("openai_compatible".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("queue valid first patch");
+
+    // 合并后 non-parseable 的组合（legacy 快照不声明 reasoning variants）
+    // 在提交点即被拒绝，不等到终态持久化。
+    let rejected = shared.queue_settings(SettingsPatch {
+        reasoning: ReasoningPatch::Set("high".to_string()),
+        ..SettingsPatch::default()
+    });
+    assert!(
+        matches!(rejected, Err(ConversationError::Configuration(_))),
+        "merged invalid combination must be rejected at commit, got {rejected:?}"
+    );
+
+    // 被拒 patch 不得破坏已排队的原意图：终态后仍按第一份 patch 生效。
+    release_tx.send(()).expect("release");
+    turn_thread.join().expect("join").expect("first turn ok");
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        1,
+        "only the first patch persists"
+    );
+    assert_eq!(
+        shared.thread().unwrap().model.as_deref(),
+        Some("openai_compatible/base-model"),
+        "rejected second patch must not clobber the queued intent"
+    );
+}
+
 #[test]
 fn idle_settings_persist_immediately_without_any_turn() {
     let home = temp_sessions();
