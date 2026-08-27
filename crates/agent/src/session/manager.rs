@@ -300,6 +300,18 @@ impl SessionManager {
         &self.session_id
     }
 
+    /// 校验会话头部 id 与请求一致；不一致属于损坏状态。
+    pub fn verify_session_id(&self, expected: &str) -> Result<()> {
+        let actual = self.session_id();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(SessionError::InvalidHeader(format!(
+                "rollout header id {actual} does not match expected id {expected}"
+            )))
+        }
+    }
+
     /// header 时间戳是索引重建的权威创建事实。
     pub fn created_at(&self) -> &str {
         &self.header_timestamp

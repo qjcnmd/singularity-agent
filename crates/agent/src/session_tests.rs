@@ -633,3 +633,16 @@ fn append_limits_reject_without_writing_or_advancing_memory() {
     assert_eq!(std::fs::read(manager.path()).unwrap(), before_bytes);
     assert!(manager.entries().is_empty());
 }
+#[test]
+fn verify_session_id_matches_or_rejects_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let cwd = dir.path().join("project");
+    let manager = SessionManager::create(&cwd, &sessions).unwrap();
+    let id = manager.session_id().to_string();
+
+    assert!(manager.verify_session_id(&id).is_ok());
+    let error = manager.verify_session_id("other-id").expect_err("must reject mismatch");
+    assert!(matches!(error, SessionError::InvalidHeader(_)));
+    assert!(error.to_string().contains("other-id"));
+}

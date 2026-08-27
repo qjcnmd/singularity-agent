@@ -392,16 +392,10 @@ impl TurnRunner {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
         let mut session = SessionManager::open_existing_with_coordinator(&path, &self.coordinator)
             .map_err(RunnerError::Session)?;
-        if session.session_id() != thread.thread_id {
-            return Err(RunnerError::Session(
-                // 头部 id 与请求不一致属于损坏状态。
-                singularity_agent::session::SessionError::InvalidHeader(format!(
-                    "rollout header id {} does not match thread id {}",
-                    session.session_id(),
-                    thread.thread_id
-                )),
-            ));
-        }
+        // 头部 id 与请求不一致属于损坏状态。
+        session
+            .verify_session_id(&thread.thread_id)
+            .map_err(RunnerError::Session)?;
         session
             .repair_interrupted_turns()
             .map_err(RunnerError::Session)?;

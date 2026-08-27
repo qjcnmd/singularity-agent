@@ -108,12 +108,9 @@ pub fn resume_thread(
     }
     let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-    if session.session_id() != thread_id {
-        return Err(ResumeError::Store(format!(
-            "rollout header id {} does not match requested thread id {thread_id}",
-            session.session_id()
-        )));
-    }
+    session
+        .verify_session_id(thread_id)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
     session
         .repair_interrupted_turns()
         .map_err(|error| ResumeError::Store(error.to_string()))?;
@@ -177,12 +174,9 @@ pub fn read_thread_summary(
     }
     let session = SessionManager::open_existing_read_only(&path)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-    if session.session_id() != thread_id {
-        return Err(ResumeError::Store(format!(
-            "rollout header id {} does not match requested thread id {thread_id}",
-            session.session_id()
-        )));
-    }
+    session
+        .verify_session_id(thread_id)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
     Ok(thread_summary(&session))
 }
 
@@ -223,9 +217,9 @@ pub fn rename_thread(
     let path = thread_session_path(sessions_dir, thread_id);
     let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
         .map_err(|error| error.to_string())?;
-    if session.session_id() != thread_id {
-        return Err("thread id does not match session header".to_string());
-    }
+    session
+        .verify_session_id(thread_id)
+        .map_err(|error| error.to_string())?;
     session
         .append_metadata(
             singularity_agent::session::SessionMetadata::thread_name(name)
@@ -288,12 +282,9 @@ pub fn paged_read(
     }
     let session = SessionManager::open_existing_read_only(&path)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-    if session.session_id() != thread_id {
-        return Err(ResumeError::Store(format!(
-            "rollout header id {} does not match requested thread id {thread_id}",
-            session.session_id()
-        )));
-    }
+    session
+        .verify_session_id(thread_id)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
     let entries = session.entries();
     let summary = thread_summary(&session);
     let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
@@ -341,12 +332,9 @@ pub fn delete_thread(
                 other => ResumeError::Store(other.to_string()),
             }
         })?;
-    if session.session_id() != thread_id {
-        return Err(ResumeError::Store(format!(
-            "rollout header id {} does not match requested thread id {thread_id}",
-            session.session_id()
-        )));
-    }
+    session
+        .verify_session_id(thread_id)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
     drop(session);
     remove_rollout(&path)
 }
