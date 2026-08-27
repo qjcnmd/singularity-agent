@@ -65,8 +65,38 @@ fn budget(window: u64, keep_recent: u64) -> CompactionBudget {
     CompactionBudget {
         context_window: window,
         reserve_tokens: window / 10,
-        retain_ratio: keep_recent as f64 / window as f64,
+        keep_recent_tokens: keep_recent,
     }
+}
+
+#[test]
+fn default_recent_budget_is_fixed_at_twenty_thousand_tokens() {
+    let config = CompactionConfig::default();
+    assert_eq!(config.keep_recent_tokens, 20_000);
+    assert_eq!(
+        CompactionBudget::from_config(200_000, &config).retain_tokens(),
+        20_000
+    );
+}
+
+#[test]
+fn recent_budget_does_not_grow_with_the_context_window() {
+    let config = CompactionConfig::default();
+    let small = CompactionBudget::from_config(100_000, &config);
+    let large = CompactionBudget::from_config(1_000_000, &config);
+    assert_eq!(small.retain_tokens(), large.retain_tokens());
+}
+
+#[test]
+fn zero_recent_budget_is_rejected_by_configuration_validation() {
+    let config = CompactionConfig {
+        keep_recent_tokens: 0,
+        ..CompactionConfig::default()
+    };
+    assert!(matches!(
+        config.validate(100_000, 20_000),
+        Err(CompactionError::Config(message)) if message == "keep_recent_tokens must be positive"
+    ));
 }
 
 /// 记录请求并提供固定文本的 mock provider。

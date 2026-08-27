@@ -157,7 +157,7 @@ fn compaction_test_config() -> AgentConfig {
         max_output_tokens: 10,
         compaction: CompactionConfig {
             reserve_tokens: 1_000,
-            retain_ratio: 0.005,
+            keep_recent_tokens: 30,
             summary_max_tokens: 10,
         },
         ..AgentConfig::default()
@@ -999,7 +999,7 @@ fn assembled_fallback_estimate_includes_provider_reasoning_replay() {
 }
 
 #[test]
-fn manual_compaction_keeps_the_configured_recent_twenty_percent() {
+fn manual_compaction_keeps_the_configured_recent_budget() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     session
@@ -1047,7 +1047,7 @@ fn manual_compaction_keeps_the_configured_recent_twenty_percent() {
         max_output_tokens: 10,
         compaction: CompactionConfig {
             reserve_tokens: 100,
-            retain_ratio: 0.20,
+            keep_recent_tokens: 200,
             summary_max_tokens: 10,
         },
         ..AgentConfig::default()

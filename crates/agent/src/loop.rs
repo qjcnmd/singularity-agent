@@ -413,7 +413,7 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     ///
-    /// overflow 时不能保留正常近期窗口；强制路径把 retain ratio 压到 0，
+    /// overflow 时不能保留正常近期窗口；强制路径把近期保留预算压到 0，
     /// 只保留绝对必要的最近安全边界（toolResult 永不切）。
     fn force_compact(
         &mut self,
@@ -423,8 +423,8 @@ impl Agent {
         let mut budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         // 强制溢出恢复是显式模式：provider 已拒绝该请求时，不保留正常
-        // 近期内容比例。
-        budget.retain_ratio = 0.0;
+        // 近期内容。
+        budget.keep_recent_tokens = 0;
         let tokens_before = self
             .ledger
             .estimate()

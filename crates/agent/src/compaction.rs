@@ -7,7 +7,7 @@
 //! 1. **触发判定**（`should_compact`）：请求发出前优先基于上一轮 provider usage
 //!    判定，首轮或 usage 缺失时使用本轮装配估算；超过「上下文窗口 −
 //!    `reserve_tokens` 预留」即触发，预留空间供模型回答使用。
-//! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `retain_ratio` 预算内的最新消息；
+//! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。
@@ -33,8 +33,8 @@ use crate::session::{CompactionEntry, SessionEntry, SessionError, SessionManager
 /// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
 /// `context_window - reserve_tokens` 时触发压缩。
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
-/// 默认保留上下文窗口 20% 的最近内容。
-pub const DEFAULT_RETAIN_RATIO: f64 = 0.20;
+/// 默认保留的最近上下文 Token 数。
+pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20_000;
 /// 摘要请求的默认最大输出 token 数。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 /// 生成摘要时单条工具结果序列化的最大字符数截断上限。
@@ -144,7 +144,7 @@ pub struct CompactionConfig {
     /// 为模型回答预留的 Token 空间；usage 或 fallback 估算超过
     /// `context_window - reserve_tokens` 时在请求前触发压缩。
     pub reserve_tokens: u64,
-    pub retain_ratio: f64,
+    pub keep_recent_tokens: u64,
     pub summary_max_tokens: u32,
 }
 
@@ -152,7 +152,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
-            retain_ratio: DEFAULT_RETAIN_RATIO,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
         }
     }
@@ -160,11 +160,11 @@ impl Default for CompactionConfig {
 
 impl CompactionConfig {
     /// 校验压缩策略：`reserve_tokens` 必须小于 `context_window`（为上下文内容
-    /// 留出空间），`retain_ratio` 与摘要输出上限沿用既有约束；非法配置 fail closed。
+    /// 留出空间），近期保留预算与摘要输出上限必须为正；非法配置 fail closed。
     pub fn validate(&self, context_window: u64, provider_max_output_tokens: u32) -> Result<()> {
-        if !(self.retain_ratio.is_finite() && 0.0 < self.retain_ratio && self.retain_ratio < 1.0) {
+        if self.keep_recent_tokens == 0 {
             return Err(CompactionError::Config(
-                "retain_ratio must satisfy 0 < retain_ratio < 1".to_string(),
+                "keep_recent_tokens must be positive".to_string(),
             ));
         }
         if self.reserve_tokens >= context_window {
@@ -186,7 +186,7 @@ impl CompactionConfig {
 pub struct CompactionBudget {
     pub context_window: u64,
     pub reserve_tokens: u64,
-    pub retain_ratio: f64,
+    pub keep_recent_tokens: u64,
 }
 
 impl CompactionBudget {
@@ -194,7 +194,7 @@ impl CompactionBudget {
         Self {
             context_window,
             reserve_tokens: config.reserve_tokens,
-            retain_ratio: config.retain_ratio,
+            keep_recent_tokens: config.keep_recent_tokens,
         }
     }
 
@@ -203,7 +203,7 @@ impl CompactionBudget {
     }
 
     fn retain_tokens(&self) -> u64 {
-        ((self.context_window as f64) * self.retain_ratio).floor() as u64
+        self.keep_recent_tokens
     }
 }
 
