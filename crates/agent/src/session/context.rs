@@ -47,7 +47,6 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
             AgentMessageRole::Assistant => {
                 let tool_calls = message
                     .tool_calls()
-                    .into_iter()
                     .filter_map(|block| block.to_model_tool_call())
                     .collect::<Vec<_>>();
                 if tool_calls.is_empty() {

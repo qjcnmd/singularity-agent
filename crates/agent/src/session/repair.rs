@@ -74,7 +74,6 @@ impl SessionManager {
                 {
                     let tool_call_ids: Vec<String> = message
                         .tool_calls()
-                        .into_iter()
                         .filter_map(|block| match block {
                             ContentBlock::ToolCall { id, .. } => Some(id.clone()),
                             _ => None,
