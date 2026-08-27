@@ -10,9 +10,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use singularity_runtime::Conversation;
 use singularity_runtime::events::{AgentDiagnosticSeverity, ProviderAttemptStatus, TurnEvent};
 use singularity_runtime::objects::TurnStatus;
+use singularity_runtime::{Conversation, ThreadCatalog};
 use unicode_width::UnicodeWidthStr;
 
 use super::commands::Action;
@@ -89,6 +89,7 @@ impl Default for FrameCache {
 /// `modals`/`session_actions`/`mouse`/`view`（同 `tui` 模块内部实现细节）。
 pub(crate) struct TuiApp {
     pub(super) conversation: Arc<Conversation>,
+    pub(super) thread_catalog: ThreadCatalog,
     pub(super) transcript: Transcript,
     pub(super) scroll: ScrollState,
     pub(super) editor: Editor,
@@ -120,12 +121,14 @@ pub(crate) struct TuiApp {
 
 impl TuiApp {
     pub fn new(conversation: Arc<Conversation>) -> Self {
+        let thread_catalog = ThreadCatalog::new(conversation.runner_handle().as_ref());
         let thread_id = conversation
             .thread()
             .map(|thread| thread.thread_id)
             .unwrap_or_default();
         Self {
             conversation,
+            thread_catalog,
             transcript: Transcript::new(),
             scroll: ScrollState::default(),
             editor: Editor::new(),

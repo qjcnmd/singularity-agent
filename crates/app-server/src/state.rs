@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use singularity_protocol::Thread;
-use singularity_runtime::{Conversation, ProviderConfigSnapshot, TurnRunner};
+use singularity_runtime::{Conversation, ProviderConfigSnapshot, ThreadCatalog, TurnRunner};
 
 use super::*;
 
@@ -24,6 +24,7 @@ pub struct AppServer {
     pub(super) provider_snapshot: ProviderConfigSnapshot,
     /// 共享 turn 执行核心：无状态、可共享。
     pub(super) turn_runner: Arc<TurnRunner>,
+    pub(super) thread_catalog: ThreadCatalog,
     /// thread_id → 长驻协调器；首次接触时按 JSONL 重开并修复。
     pub(super) conversations: Arc<Mutex<HashMap<String, Arc<Conversation>>>>,
     pub(super) execution_stopped: Arc<AtomicBool>,
@@ -189,6 +190,7 @@ impl AppServer {
             sessions_dir.clone(),
             provider_snapshot.clone(),
         ));
+        let thread_catalog = ThreadCatalog::new(&turn_runner);
         Self {
             sessions_dir,
             initialized: false,
@@ -196,6 +198,7 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot,
             turn_runner,
+            thread_catalog,
             conversations: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
         }
@@ -237,6 +240,7 @@ impl AppServer {
             shutdown_requested: false,
             provider_snapshot: self.provider_snapshot.clone(),
             turn_runner: Arc::clone(&self.turn_runner),
+            thread_catalog: self.thread_catalog.clone(),
             conversations: Arc::clone(&self.conversations),
             execution_stopped: Arc::clone(&self.execution_stopped),
         })
@@ -267,21 +271,19 @@ impl AppServer {
         if let Some(conversation) = guard.get(session_id).cloned() {
             return Ok(conversation);
         }
-        let thread = singularity_runtime::store::resume_thread(
-            self.turn_runner.sessions_dir(),
-            session_id,
-            self.turn_runner.coordinator(),
-        )
-        .map_err(|error| match &error {
-            singularity_runtime::store::ResumeError::NotFound(_) => {
-                AppServerError::Store(format!("thread {session_id} was not found"))
-            }
-            singularity_runtime::store::ResumeError::Store(message) => {
-                AppServerError::Workspace(format!("failed to resume thread: {message}"))
-            }
-            // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
-            other => AppServerError::Workspace(format!("failed to resume thread: {other}")),
-        })?;
+        let thread =
+            self.thread_catalog
+                .resume_thread(session_id)
+                .map_err(|error| match &error {
+                    singularity_runtime::store::ResumeError::NotFound(_) => {
+                        AppServerError::Store(format!("thread {session_id} was not found"))
+                    }
+                    singularity_runtime::store::ResumeError::Store(message) => {
+                        AppServerError::Workspace(format!("failed to resume thread: {message}"))
+                    }
+                    // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
+                    other => AppServerError::Workspace(format!("failed to resume thread: {other}")),
+                })?;
         let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
         guard.insert(session_id.to_string(), Arc::clone(&conversation));
         Ok(conversation)

@@ -52,10 +52,10 @@ impl TuiApp {
     /// 换绑到已持久化的会话；失败时只记 note，状态不变。
     pub(super) fn resume_thread(&mut self, thread_id: &str) {
         let runner = self.conversation.runner_handle();
-        match self.conversation.resume_thread(thread_id) {
+        match self.thread_catalog.resume_thread(thread_id) {
             Ok(thread) => {
                 let session_tokens = self
-                    .conversation
+                    .thread_catalog
                     .list_threads()
                     .ok()
                     .and_then(|threads| {
@@ -112,7 +112,7 @@ impl TuiApp {
                     );
                     return Action::Continue;
                 }
-                match self.conversation.list_threads() {
+                match self.thread_catalog.list_threads() {
                     Ok(threads) if !threads.is_empty() => {
                         self.resume = Some(ResumeMenu {
                             threads,
@@ -140,7 +140,7 @@ impl TuiApp {
                     .map(|thread| thread.cwd.clone())
                     .unwrap_or_default();
                 let model = current.and_then(|thread| thread.model);
-                match self.conversation.create_thread(&cwd, model) {
+                match self.thread_catalog.create_thread(&cwd, model) {
                     Ok(thread) => {
                         let thread_id = thread.thread_id.clone();
                         self.rebind_conversation(runner, thread, None);
@@ -153,7 +153,7 @@ impl TuiApp {
                 }
             }
             SlashCommand::Session => {
-                let summary = self.conversation.list_threads().ok().and_then(|threads| {
+                let summary = self.thread_catalog.list_threads().ok().and_then(|threads| {
                     threads
                         .into_iter()
                         .find(|summary| summary.thread_id == self.thread_id)
@@ -197,14 +197,17 @@ impl TuiApp {
                 }
             }
             SlashCommand::Name if !argument.trim().is_empty() => {
-                match self.conversation.rename(argument.trim()) {
+                let rename = if self.conversation.has_active_turn() {
+                    Err(singularity_runtime::ConversationError::TurnAlreadyActive.to_string())
+                } else {
+                    self.thread_catalog.rename(&self.thread_id, argument.trim())
+                };
+                match rename {
                     Ok(()) => self.transcript.push_note(
                         format!("session named {}", argument.trim()),
                         NoteStyle::Accent,
                     ),
-                    Err(error) => self
-                        .transcript
-                        .push_note(error.to_string(), NoteStyle::Error),
+                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
                 }
             }
             SlashCommand::Name => self

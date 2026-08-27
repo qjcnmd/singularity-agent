@@ -204,7 +204,9 @@ impl AppServer {
     }
 
     pub(super) fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let threads = singularity_runtime::store::list_threads(&self.sessions_dir)
+        let threads = self
+            .thread_catalog
+            .list_threads()
             .map_err(AppServerError::Store)?
             .iter()
             .map(|record| self.project_thread(record))
@@ -290,12 +292,7 @@ impl AppServer {
             Some(model) => Some(model.to_string()),
             None => self.turn_runner.default_model_selector(),
         };
-        let thread = match singularity_runtime::store::create_thread(
-            &self.sessions_dir,
-            &cwd,
-            model.clone(),
-            self.turn_runner.coordinator(),
-        ) {
+        let thread = match self.thread_catalog.create_thread(&cwd, model.clone()) {
             Ok(thread) => thread,
             Err(error) => return Err(AppServerError::Store(error)),
         };
