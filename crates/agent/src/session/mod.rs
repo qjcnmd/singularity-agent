@@ -16,7 +16,7 @@ pub mod repository;
 pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind,
+    SessionMetadataKind, TurnTerminalStatus,
 };
 pub use manager::SessionManager;
 pub use repository::{SessionRepository, ThreadRead};
@@ -73,13 +73,16 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
     });
     let status = metadata.iter().rev().find_map(|entry| match entry.kind() {
         SessionMetadataKind::TurnStarted => Some(SessionProjectionStatus::Active),
-        SessionMetadataKind::TurnCompleted => Some(SessionProjectionStatus::Completed),
-        SessionMetadataKind::TurnFailed => Some(SessionProjectionStatus::Failed),
-        SessionMetadataKind::TurnInterrupted => Some(SessionProjectionStatus::Interrupted),
+        SessionMetadataKind::TurnTerminal => match entry.terminal_status() {
+            Some(TurnTerminalStatus::Completed) => Some(SessionProjectionStatus::Completed),
+            Some(TurnTerminalStatus::Failed) => Some(SessionProjectionStatus::Failed),
+            Some(TurnTerminalStatus::Interrupted) => Some(SessionProjectionStatus::Interrupted),
+            None => None,
+        },
         _ => None,
     });
     let latest_usage = metadata.iter().rev().find_map(|entry| match entry {
-        SessionMetadata::Usage { usage, .. } => Some(usage.clone()),
+        SessionMetadata::TurnTerminal { usage, .. } => Some(usage.clone()),
         _ => None,
     });
     let title = metadata
@@ -111,7 +114,7 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
     let total_tokens = metadata
         .iter()
         .filter_map(|entry| match entry {
-            SessionMetadata::Usage { usage, .. } => {
+            SessionMetadata::TurnTerminal { usage, .. } => {
                 usage.get("totalTokens").and_then(serde_json::Value::as_u64)
             }
             _ => None,

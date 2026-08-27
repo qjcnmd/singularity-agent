@@ -207,13 +207,16 @@ fn compact_full_flow_and_reopen_slicing() {
     let content = std::fs::read_to_string(session.path()).unwrap();
     let last: Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
     assert_eq!(last["type"], "compaction");
-    assert_eq!(last["firstKeptEntryId"], id_u1);
-    assert_eq!(last["tokensBefore"], 90_001);
-    let summary = last["summary"].as_str().unwrap();
+    assert_eq!(last["compaction"]["firstKeptEntryId"], id_u1);
+    assert_eq!(last["compaction"]["tokensBefore"], 90_001);
+    let summary = last["compaction"]["summary"].as_str().unwrap();
     assert!(summary.starts_with("## Goal"));
     assert!(summary.ends_with("\n\n<read-files>\nsrc/main.rs\n</read-files>"));
-    assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
-    assert_eq!(last["details"]["modifiedFiles"], json!([]));
+    assert_eq!(
+        last["compaction"]["details"]["readFiles"],
+        json!(["src/main.rs"])
+    );
+    assert_eq!(last["compaction"]["details"]["modifiedFiles"], json!([]));
 
     // 重开视角：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，
     // 旧消息被摘要取代。写者自身即最新持久事实，直接以它投影。
@@ -261,9 +264,12 @@ fn compact_full_flow_and_reopen_slicing() {
     assert!(prompt.contains("PRESERVE all existing information"));
     let content = std::fs::read_to_string(session.path()).unwrap();
     let last: Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
-    assert_eq!(last["firstKeptEntryId"], id_u2);
+    assert_eq!(last["compaction"]["firstKeptEntryId"], id_u2);
     // 文件列表从历史 details 累积。
-    assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
+    assert_eq!(
+        last["compaction"]["details"]["readFiles"],
+        json!(["src/main.rs"])
+    );
     // 二次压缩后的重开视角：写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();

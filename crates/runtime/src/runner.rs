@@ -16,7 +16,7 @@ use singularity_agent::agent::{
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
 use singularity_agent::session::{
-    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind,
+    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -656,8 +656,8 @@ impl TurnRunner {
         Err(TurnRunError::Terminalization(failure))
     }
 
-    /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘 terminal metadata
-    /// 与 usage（JSONL 是事实源）。
+    /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘单条 `turn_terminal`
+    /// metadata（status + usage + usageComplete 一次写入，JSONL 是事实源）。
     fn persist_terminal_state(
         &self,
         session: &mut SessionManager,
@@ -667,13 +667,15 @@ impl TurnRunner {
         usage_complete: bool,
     ) -> Result<(), String> {
         if let Some(turn_id) = turn_id
-            && let Some(metadata) = terminal_metadata_for_status(turn_id, status)
+            && let Some(status) = terminal_status_for_thread_status(status)
         {
-            append_terminal_metadata_if_missing(session, turn_id, metadata)?;
             let usage_value =
                 serde_json::to_value(TurnUsage::from_model_usage(usage, usage_complete))
                     .map_err(|error| error.to_string())?;
-            append_usage_metadata_if_missing(session, turn_id, usage_value)?;
+            let metadata =
+                SessionMetadata::turn_terminal(turn_id, status, usage_value, usage_complete)
+                    .map_err(|error| error.to_string())?;
+            append_terminal_metadata_if_missing(session, turn_id, metadata)?;
         }
         Ok(())
     }
@@ -783,15 +785,11 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     status
 }
 
-fn terminal_metadata_for_status(turn_id: &str, status: ThreadStatus) -> Option<SessionMetadata> {
+fn terminal_status_for_thread_status(status: ThreadStatus) -> Option<TurnTerminalStatus> {
     match status {
-        ThreadStatus::Completed => Some(SessionMetadata::turn_completed(turn_id)),
-        ThreadStatus::Failed => Some(SessionMetadata::turn_failed(turn_id, "turn failed")),
-        ThreadStatus::Interrupted => Some(SessionMetadata::turn_interrupted(
-            turn_id,
-            "turn interrupted",
-            false,
-        )),
+        ThreadStatus::Completed => Some(TurnTerminalStatus::Completed),
+        ThreadStatus::Failed => Some(TurnTerminalStatus::Failed),
+        ThreadStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
         ThreadStatus::Active => None,
     }
 }
@@ -801,31 +799,14 @@ fn append_terminal_metadata_if_missing(
     turn_id: &str,
     metadata: SessionMetadata,
 ) -> Result<(), String> {
+    // 幂等按完整终态内容判定：同一 turn 已存在相同终态即视为已写，不重复追加。
     let already_terminal = session
         .metadata_entries()
         .iter()
-        .any(|entry| entry.turn_id() == Some(turn_id) && entry.kind().matches_turn_terminal());
+        .any(|entry| entry.turn_id() == Some(turn_id) && entry == &metadata);
     if !already_terminal {
         session
             .append_metadata(metadata)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn append_usage_metadata_if_missing(
-    session: &mut SessionManager,
-    turn_id: &str,
-    usage: serde_json::Value,
-) -> Result<(), String> {
-    let already_persisted = session.metadata_entries().iter().any(|entry| {
-        entry.kind() == SessionMetadataKind::Usage && entry.turn_id() == Some(turn_id)
-    });
-    if !already_persisted {
-        session
-            .append_metadata(
-                SessionMetadata::usage(turn_id, usage).map_err(|error| error.to_string())?,
-            )
             .map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -837,9 +818,10 @@ fn persisted_usage_for_turn(session: &SessionManager, turn_id: &str) -> Option<T
         .iter()
         .rev()
         .find_map(|entry| match entry {
-            SessionMetadata::Usage {
+            SessionMetadata::TurnTerminal {
                 turn_id: entry_turn_id,
                 usage,
+                ..
             } if entry_turn_id == turn_id => Some(usage.clone()),
             _ => None,
         })?;

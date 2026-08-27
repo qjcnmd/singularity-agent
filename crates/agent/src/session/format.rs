@@ -9,8 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 唯一支持的当前会话格式版本。它是一次干净格式重置，不兼容历史 v1-v4 语义。
-pub const CURRENT_SESSION_VERSION: u32 = 1;
+/// 唯一支持的当前会话格式版本。v2：条目 payload 嵌套为子对象、全量未知字段
+/// 拒绝、终态合并为单条 `turn_terminal`（status + usage + usageComplete）。
+pub const CURRENT_SESSION_VERSION: u32 = 2;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -58,6 +59,7 @@ pub enum SessionError {
 pub type Result<T> = std::result::Result<T, SessionError>;
 /// compaction 条目 payload。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
     #[serde(
@@ -82,21 +84,24 @@ pub struct CompactionEntry {
 #[serde(rename_all = "snake_case")]
 pub enum SessionMetadataKind {
     TurnStarted,
-    TurnCompleted,
-    TurnFailed,
-    TurnInterrupted,
+    TurnTerminal,
     ThreadSettings,
     ThreadName,
-    Usage,
 }
 
 impl SessionMetadataKind {
     pub fn matches_turn_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::TurnCompleted | Self::TurnFailed | Self::TurnInterrupted
-        )
+        matches!(self, Self::TurnTerminal)
     }
+}
+
+/// `turn_terminal` 的终态词形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTerminalStatus {
+    Completed,
+    Failed,
+    Interrupted,
 }
 
 /// 一条可恢复的 session metadata；variant 直接携带其合法 payload。
@@ -107,20 +112,14 @@ pub enum SessionMetadata {
         #[serde(rename = "turnId")]
         turn_id: String,
     },
-    TurnCompleted {
+    /// turn 的原子终态：status、usage 与 usageComplete 单条落盘。
+    TurnTerminal {
         #[serde(rename = "turnId")]
         turn_id: String,
-    },
-    TurnFailed {
-        #[serde(rename = "turnId")]
-        turn_id: String,
-        error: String,
-    },
-    TurnInterrupted {
-        #[serde(rename = "turnId")]
-        turn_id: String,
-        reason: String,
-        synthetic: bool,
+        status: TurnTerminalStatus,
+        usage: Value,
+        #[serde(rename = "usageComplete")]
+        usage_complete: bool,
     },
     ThreadSettings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,45 +131,31 @@ pub enum SessionMetadata {
     ThreadName {
         name: String,
     },
-    Usage {
-        #[serde(rename = "turnId")]
-        turn_id: String,
-        usage: Value,
-    },
 }
 
 impl SessionMetadata {
     pub fn kind(&self) -> SessionMetadataKind {
         match self {
             Self::TurnStarted { .. } => SessionMetadataKind::TurnStarted,
-            Self::TurnCompleted { .. } => SessionMetadataKind::TurnCompleted,
-            Self::TurnFailed { .. } => SessionMetadataKind::TurnFailed,
-            Self::TurnInterrupted { .. } => SessionMetadataKind::TurnInterrupted,
+            Self::TurnTerminal { .. } => SessionMetadataKind::TurnTerminal,
             Self::ThreadSettings { .. } => SessionMetadataKind::ThreadSettings,
             Self::ThreadName { .. } => SessionMetadataKind::ThreadName,
-            Self::Usage { .. } => SessionMetadataKind::Usage,
         }
     }
 
     pub fn turn_id(&self) -> Option<&str> {
         match self {
-            Self::TurnStarted { turn_id }
-            | Self::TurnCompleted { turn_id }
-            | Self::TurnFailed { turn_id, .. }
-            | Self::TurnInterrupted { turn_id, .. }
-            | Self::Usage { turn_id, .. } => Some(turn_id),
+            Self::TurnStarted { turn_id } | Self::TurnTerminal { turn_id, .. } => Some(turn_id),
             Self::ThreadSettings { .. } | Self::ThreadName { .. } => None,
         }
     }
 
-    pub fn synthetic(&self) -> bool {
-        matches!(
-            self,
-            Self::TurnInterrupted {
-                synthetic: true,
-                ..
-            }
-        )
+    /// 终态词形；非终态返回 `None`。
+    pub fn terminal_status(&self) -> Option<TurnTerminalStatus> {
+        match self {
+            Self::TurnTerminal { status, .. } => Some(*status),
+            _ => None,
+        }
     }
 
     pub fn turn_started(turn_id: impl Into<String>) -> Self {
@@ -179,29 +164,23 @@ impl SessionMetadata {
         }
     }
 
-    pub fn turn_completed(turn_id: impl Into<String>) -> Self {
-        Self::TurnCompleted {
-            turn_id: turn_id.into(),
-        }
-    }
-
-    pub fn turn_failed(turn_id: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::TurnFailed {
-            turn_id: turn_id.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn turn_interrupted(
+    pub fn turn_terminal(
         turn_id: impl Into<String>,
-        reason: impl Into<String>,
-        synthetic: bool,
-    ) -> Self {
-        Self::TurnInterrupted {
-            turn_id: turn_id.into(),
-            reason: reason.into(),
-            synthetic,
+        status: TurnTerminalStatus,
+        usage: Value,
+        usage_complete: bool,
+    ) -> Result<Self> {
+        if !usage.is_object() {
+            return Err(SessionError::InvalidStructure(
+                "terminal usage must be a JSON object".to_string(),
+            ));
         }
+        Ok(Self::TurnTerminal {
+            turn_id: turn_id.into(),
+            status,
+            usage,
+            usage_complete,
+        })
     }
 
     pub fn thread_settings(
@@ -226,26 +205,14 @@ impl SessionMetadata {
         Ok(Self::ThreadName { name })
     }
 
-    pub fn usage(turn_id: impl Into<String>, usage: Value) -> Result<Self> {
-        if !usage.is_object() {
-            return Err(SessionError::InvalidStructure(
-                "usage metadata must be a JSON object".to_string(),
-            ));
-        }
-        Ok(Self::Usage {
-            turn_id: turn_id.into(),
-            usage,
-        })
-    }
-
     pub(super) fn validate(self) -> Result<Self> {
         match &self {
             Self::ThreadName { name } if name.trim().is_empty() => Err(
                 SessionError::InvalidStructure("thread name must not be empty".to_string()),
             ),
-            Self::Usage { usage, .. } if !usage.is_object() => Err(SessionError::InvalidStructure(
-                "usage metadata must be a JSON object".to_string(),
-            )),
+            Self::TurnTerminal { usage, .. } if !usage.is_object() => Err(
+                SessionError::InvalidStructure("terminal usage must be a JSON object".to_string()),
+            ),
             _ => Ok(self),
         }
     }
@@ -253,13 +220,12 @@ impl SessionMetadata {
 
 /// 会话条目：以 `type` 为标签的 tagged enum，serde 生成序列化与严格类型校验。
 ///
-/// Compaction/Metadata 的 payload 字段经 `flatten` 平铺到条目外层（与历史
-/// wire 形状一致）；`deny_unknown_fields` 与 `flatten` 在 serde 中互斥，故
-/// 外层未知字段按 serde 语义被忽略，已知字段的类型/词形校验仍严格。
-/// 会话是严格的线性序列：文件行的物理顺序即模型上下文顺序，条目按其落盘
-/// 次序推进；不再存储 parentId。
+/// v2：payload 一律嵌套为子对象（`message`/`compaction`/`metadata`），外层
+/// 与各载荷均 `deny_unknown_fields`——未知字段写入即拒绝。会话是严格的线性
+/// 序列：文件行的物理顺序即模型上下文顺序，条目按其落盘次序推进；不再存储
+/// parentId。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {
     Message {
         id: String,
@@ -271,14 +237,12 @@ pub enum SessionEntry {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<String>,
-        #[serde(flatten)]
         compaction: CompactionEntry,
     },
     Metadata {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<String>,
-        #[serde(flatten)]
         metadata: SessionMetadata,
     },
 }

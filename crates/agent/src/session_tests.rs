@@ -35,7 +35,7 @@ fn entry_ids(entries: &[SessionEntry]) -> Vec<String> {
 
 fn session_header(id: &str) -> String {
     format!(
-        r#"{{"type":"session","version":1,"id":"{id}","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
+        r#"{{"type":"session","version":2,"id":"{id}","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
     )
 }
 
@@ -70,7 +70,7 @@ fn create_append_reopen_roundtrip() {
     let content = std::fs::read_to_string(&file).unwrap();
     let first_line: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
     assert_eq!(first_line["type"], "session");
-    assert_eq!(first_line["version"], 1);
+    assert_eq!(first_line["version"], 2);
     assert_eq!(
         first_line["cwd"],
         normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
@@ -169,7 +169,15 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .append_metadata(SessionMetadata::turn_started("turn_2"))
         .unwrap();
     manager
-        .append_metadata(SessionMetadata::turn_completed("turn_1"))
+        .append_metadata(
+            SessionMetadata::turn_terminal(
+                "turn_1",
+                TurnTerminalStatus::Completed,
+                json!({"totalTokens": 42}),
+                true,
+            )
+            .unwrap(),
+        )
         .unwrap();
     let file = manager.path().to_path_buf();
     drop(manager);
@@ -182,10 +190,12 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
     let interrupted = reopened
         .metadata_entries()
         .into_iter()
-        .find(|entry| entry.kind() == SessionMetadataKind::TurnInterrupted)
-        .expect("turn_interrupted entry exists");
+        .find(|entry| {
+            entry.kind() == SessionMetadataKind::TurnTerminal
+                && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
+        })
+        .expect("interrupted terminal entry exists");
     assert_eq!(interrupted.turn_id(), Some("turn_2"));
-    assert!(interrupted.synthetic());
     drop(reopened);
 
     let mut reopened = SessionManager::open_existing(&file).unwrap();
@@ -215,13 +225,19 @@ fn thread_settings_reject_sensitive_fields() {
 fn typed_metadata_round_trips_existing_flat_wire_shape() {
     let cases = [
         json!({"metadataType": "turn_started", "turnId": "turn-1"}),
-        json!({"metadataType": "turn_completed", "turnId": "turn-1"}),
-        json!({"metadataType": "turn_failed", "turnId": "turn-1", "error": "failed"}),
         json!({
-            "metadataType": "turn_interrupted",
+            "metadataType": "turn_terminal",
             "turnId": "turn-1",
-            "reason": "cancelled",
-            "synthetic": false
+            "status": "completed",
+            "usage": {"totalTokens": 42},
+            "usageComplete": true
+        }),
+        json!({
+            "metadataType": "turn_terminal",
+            "turnId": "turn-1",
+            "status": "failed",
+            "usage": {},
+            "usageComplete": false
         }),
         json!({
             "metadataType": "thread_settings",
@@ -230,11 +246,6 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             "reasoning": "high"
         }),
         json!({"metadataType": "thread_name", "name": "Typed metadata"}),
-        json!({
-            "metadataType": "usage",
-            "turnId": "turn-1",
-            "usage": {"totalTokens": 42}
-        }),
         json!({"metadataType": "thread_settings", "model": "legacy-model"}),
     ];
     for value in cases {
@@ -260,6 +271,138 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             ref model,
             reasoning: Some(ref reasoning),
         } if provider.as_deref() == Some("openai") && model == "test-model" && reasoning == "high"
+    ));
+}
+
+/// v2 格式契约：三类条目的未知字段一律拒绝（含载荷内部与消息/内容块层级）。
+#[test]
+fn unknown_fields_are_rejected_across_all_entry_kinds() {
+    let cases = [
+        json!({
+            "type": "message",
+            "id": "m-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "unknown": 1}
+        }),
+        json!({
+            "type": "message",
+            "id": "m-1",
+            "message": {"role": "user", "content": [{"type": "text", "text": "hi", "extra": true}]}
+        }),
+        json!({
+            "type": "message",
+            "id": "m-1",
+            "unknownField": 1,
+            "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        }),
+        json!({
+            "type": "compaction",
+            "id": "c-1",
+            "compaction": {"summary": "s", "unknown": 1}
+        }),
+        json!({
+            "type": "compaction",
+            "id": "c-1",
+            "extra": true,
+            "compaction": {"summary": "s"}
+        }),
+        json!({
+            "type": "metadata",
+            "id": "md-1",
+            "metadata": {"metadataType": "turn_started", "turnId": "t-1", "unknown": 1}
+        }),
+        json!({
+            "type": "metadata",
+            "id": "md-1",
+            "metadata": {"metadataType": "turn_terminal", "turnId": "t-1", "status": "completed", "usage": {}, "usageComplete": true, "extra": false}
+        }),
+        json!({
+            "type": "metadata",
+            "id": "md-1",
+            "stray": 1,
+            "metadata": {"metadataType": "thread_name", "name": "n"}
+        }),
+    ];
+    for value in cases {
+        assert!(
+            serde_json::from_value::<SessionEntry>(value.clone()).is_err(),
+            "unknown fields must be rejected: {value}"
+        );
+    }
+}
+
+/// v2 格式契约：v1 文件在 header 校验处按版本号拒绝。
+#[test]
+fn v1_session_files_are_rejected_by_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("v1.jsonl");
+    std::fs::write(
+        &file,
+        r#"{"type":"session","version":1,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}
+{"type":"message","id":"m-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        SessionManager::open_existing(&file).unwrap_err(),
+        SessionError::InvalidHeader(_)
+    ));
+}
+
+/// v2 格式契约：新格式完整 round-trip（含嵌套载荷与终态单条）。
+#[test]
+fn v2_format_round_trips_nested_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let message_id = manager
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        })
+        .unwrap();
+    let compaction_id = manager
+        .append_compaction(CompactionEntry {
+            summary: "compacted".to_string(),
+            first_kept_entry_id: Some("m-1".to_string()),
+            tokens_before: Some(123),
+            usage: None,
+            details: None,
+        })
+        .unwrap();
+    let metadata_id = manager
+        .append_metadata(
+            SessionMetadata::turn_terminal(
+                "turn-1",
+                TurnTerminalStatus::Completed,
+                json!({"totalTokens": 7}),
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let file = manager.path().to_path_buf();
+    drop(manager);
+
+    let reopened = SessionManager::open_existing(&file).unwrap();
+    let entries = reopened.entries();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].id(), message_id);
+    assert_eq!(entries[1].id(), compaction_id);
+    assert_eq!(entries[2].id(), metadata_id);
+    assert!(matches!(
+        &entries[2],
+        SessionEntry::Metadata {
+            metadata:
+                SessionMetadata::TurnTerminal {
+                    turn_id,
+                    status: TurnTerminalStatus::Completed,
+                    usage,
+                    usage_complete: true,
+                },
+            ..
+        } if turn_id == "turn-1" && usage == &json!({"totalTokens": 7})
     ));
 }
 
@@ -408,8 +551,8 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 2. 旧版本 v2, v3, v4
-    for old_v in [2, 3, 4] {
+    // 2. 非当前版本 v1, v3, v4
+    for old_v in [1, 3, 4] {
         let old_file = dir.path().join(format!("old-v{old_v}.jsonl"));
         std::fs::write(
             &old_file,
@@ -428,7 +571,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let unknown_field = dir.path().join("unknown-field.jsonl");
     std::fs::write(
         &unknown_field,
-        r#"{"type":"session","version":1,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
+        r#"{"type":"session","version":2,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -440,7 +583,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let non_uuid = dir.path().join("non-uuid.jsonl");
     std::fs::write(
         &non_uuid,
-        r#"{"type":"session","version":1,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
+        r#"{"type":"session","version":2,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
     )
     .unwrap();
     assert!(matches!(

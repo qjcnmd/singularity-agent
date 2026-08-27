@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use serde_json::json;
-use singularity_agent::session::SessionManager;
+use singularity_agent::session::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
@@ -122,7 +122,8 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
             .metadata_entries()
             .iter()
             .filter(|entry| {
-                entry.kind() == singularity_agent::session::SessionMetadataKind::TurnInterrupted
+                entry.kind() == SessionMetadataKind::TurnTerminal
+                    && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
             })
             .count(),
         1,
@@ -140,7 +141,8 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
             .metadata_entries()
             .iter()
             .filter(|entry| {
-                entry.kind() == singularity_agent::session::SessionMetadataKind::TurnInterrupted
+                entry.kind() == SessionMetadataKind::TurnTerminal
+                    && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
             })
             .count(),
         1,
@@ -190,19 +192,16 @@ fn jsonl_projection_recovers_all_fields_including_title_model_usage() {
         )
         .expect("settings metadata");
     session
-        .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
-            "turn-1",
-        ))
-        .expect("turn completed");
-    session
         .append_metadata(
-            singularity_agent::session::SessionMetadata::usage(
+            singularity_agent::session::SessionMetadata::turn_terminal(
                 "turn-1",
+                TurnTerminalStatus::Completed,
                 json!({"input_tokens": 120, "output_tokens": 45}),
+                true,
             )
-            .expect("usage"),
+            .expect("turn terminal"),
         )
-        .expect("usage metadata");
+        .expect("turn terminal metadata");
 
     let record = singularity_runtime::read_thread_summary(&sessions_dir, session_id)
         .expect("project session");
@@ -1021,10 +1020,16 @@ fn seed_turned_session(sessions_dir: &Path, session_id: &str, turn_ids: &[&str])
                 .expect("tool result");
         }
         session
-            .append_metadata(singularity_agent::session::SessionMetadata::turn_completed(
-                *turn_id,
-            ))
-            .expect("turn completed");
+            .append_metadata(
+                singularity_agent::session::SessionMetadata::turn_terminal(
+                    *turn_id,
+                    TurnTerminalStatus::Completed,
+                    json!({}),
+                    true,
+                )
+                .expect("turn terminal"),
+            )
+            .expect("turn terminal metadata");
     }
     sid
 }

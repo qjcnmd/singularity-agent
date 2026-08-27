@@ -232,7 +232,7 @@ mod tests {
     fn write_session(sessions_dir: &Path, thread_id: &str, timestamp: &str) {
         let header = serde_json::json!({
             "type": "session",
-            "version": 1,
+            "version": 2,
             "id": thread_id,
             "timestamp": timestamp,
             "cwd": sessions_dir,

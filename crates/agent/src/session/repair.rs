@@ -5,13 +5,15 @@ use std::collections::{BTreeSet, HashSet};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
 pub use super::format::SessionError;
-use super::format::{Result, SessionEntry, SessionMetadata, SessionMetadataKind};
+use super::format::{
+    Result, SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
+};
 pub use super::manager::SessionManager;
 
 impl SessionManager {
     /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。
     pub fn repair_interrupted_turns(&mut self) -> Result<usize> {
-        // BTreeSet 保证 turn_interrupted 追加顺序确定（同输入同输出）。
+        // BTreeSet 保证 turn_terminal 追加顺序确定（同输入同输出）。
         let mut started = BTreeSet::new();
         let mut terminal = HashSet::new();
         for entry in &self.entries {
@@ -25,9 +27,7 @@ impl SessionManager {
                 SessionMetadataKind::TurnStarted => {
                     started.insert(turn_id.to_string());
                 }
-                SessionMetadataKind::TurnCompleted
-                | SessionMetadataKind::TurnFailed
-                | SessionMetadataKind::TurnInterrupted => {
+                SessionMetadataKind::TurnTerminal => {
                     terminal.insert(turn_id.to_string());
                 }
                 _ => {}
@@ -38,11 +38,12 @@ impl SessionManager {
             if terminal.contains(&turn_id) {
                 continue;
             }
-            self.append_metadata(SessionMetadata::turn_interrupted(
+            self.append_metadata(SessionMetadata::turn_terminal(
                 turn_id,
-                "session reopened with an incomplete turn",
-                true,
-            ))?;
+                TurnTerminalStatus::Interrupted,
+                serde_json::json!({}),
+                false,
+            )?)?;
             repaired += 1;
         }
         Ok(repaired)

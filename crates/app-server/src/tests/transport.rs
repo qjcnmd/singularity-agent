@@ -6,7 +6,7 @@ use crate::{
     TurnFailureStage,
 };
 use serde_json::{Value, json};
-use singularity_agent::session::{SessionManager, SessionMetadataKind};
+use singularity_agent::session::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, Provider, ProviderConfigSnapshot, ProviderError,
@@ -822,8 +822,13 @@ fn terminal_storage_fail_stop_over_stdio_supervisor() {
     );
     assert!(
         !entries.iter().any(|entry| {
-            entry.kind() == SessionMetadataKind::TurnCompleted
-                || entry.kind() == SessionMetadataKind::TurnInterrupted
+            entry.kind() == SessionMetadataKind::TurnTerminal
+                && entry.terminal_status().is_some_and(|status| {
+                    matches!(
+                        status,
+                        TurnTerminalStatus::Completed | TurnTerminalStatus::Interrupted
+                    )
+                })
         }),
         "terminal metadata must not have been persisted during double fault"
     );
@@ -1039,5 +1044,6 @@ fn turn_start_runs_on_streaming_lane_without_initialized_notification() {
     let session_on_disk =
         SessionManager::open_existing(&sessions_dir.join(format!("{session_id}.jsonl")))
             .expect("open session file");
-    assert_eq!(session_on_disk.metadata_entries().len(), 3);
+    // v2 单条原子终态：每个 turn 恰好两条 metadata（turn_started + turn_terminal）。
+    assert_eq!(session_on_disk.metadata_entries().len(), 2);
 }

@@ -30,7 +30,7 @@ pub enum AgentMessageRole {
 
 /// 消息体内的结构化内容块。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentBlock {
     /// 纯文本内容块（`{"type":"text","text":...}`）。
     Text { text: String },
@@ -80,8 +80,9 @@ impl ContentBlock {
 /// wire 形状与历史平铺格式逐字节一致（`role` 为内部 tag）：序列化输出
 /// `{"content":...,"role":"user"}` / `{"role":"assistant",...,"stopReason":...}`
 /// / `{"role":"toolResult",...,"toolCallId":...,"toolName":...,"isError":...}`。
+/// `deny_unknown_fields` 使消息内未知字段写入即拒绝。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "role", rename_all = "camelCase")]
+#[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
     #[serde(rename_all = "camelCase")]
     User { content: Vec<ContentBlock> },

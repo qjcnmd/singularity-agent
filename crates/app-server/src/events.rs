@@ -8,7 +8,7 @@
 use super::*;
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{SessionEntry, SessionMetadata, SessionMetadataKind},
+    session::{SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus},
 };
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
@@ -77,11 +77,11 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 id: turn_id.clone(),
                 status: TurnStatus::Running,
             }],
-            SessionMetadata::TurnCompleted { turn_id }
-            | SessionMetadata::TurnFailed { turn_id, .. }
-            | SessionMetadata::TurnInterrupted { turn_id, .. } => vec![HistoryItem::Turn {
+            SessionMetadata::TurnTerminal {
+                turn_id, status, ..
+            } => vec![HistoryItem::Turn {
                 id: turn_id.clone(),
-                status: terminal_turn_status(metadata.kind()),
+                status: terminal_turn_status(*status),
             }],
             SessionMetadata::ThreadSettings {
                 provider,
@@ -94,19 +94,15 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 reasoning: reasoning.clone(),
             }],
             SessionMetadata::ThreadName { .. } => Vec::new(),
-            SessionMetadata::Usage { usage, .. } => vec![HistoryItem::Usage {
-                id: id.clone(),
-                usage: usage.clone(),
-            }],
         },
     }
 }
 
-fn terminal_turn_status(kind: SessionMetadataKind) -> TurnStatus {
-    match kind {
-        SessionMetadataKind::TurnCompleted => TurnStatus::Completed,
-        SessionMetadataKind::TurnFailed => TurnStatus::Failed,
-        _ => TurnStatus::Interrupted,
+fn terminal_turn_status(status: TurnTerminalStatus) -> TurnStatus {
+    match status {
+        TurnTerminalStatus::Completed => TurnStatus::Completed,
+        TurnTerminalStatus::Failed => TurnStatus::Failed,
+        TurnTerminalStatus::Interrupted => TurnStatus::Interrupted,
     }
 }
 
@@ -148,7 +144,20 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                         && last.turn_id.is_some()
                         && last.turn_id.as_deref() == metadata.turn_id();
                     if matched {
-                        last.status = Some(terminal_turn_status(kind));
+                        let SessionMetadata::TurnTerminal { status, usage, .. } = metadata else {
+                            unreachable!("matches_turn_terminal implies TurnTerminal");
+                        };
+                        last.status = Some(terminal_turn_status(*status));
+                        // 终态携带的用量并入轮内条目，thread/read 仍暴露每次终态的用量。
+                        if !usage.as_object().is_some_and(|object| object.is_empty()) {
+                            last.items.push(HistoryItem::Usage {
+                                id: metadata
+                                    .turn_id()
+                                    .expect("TurnTerminal carries a turn id")
+                                    .to_string(),
+                                usage: usage.clone(),
+                            });
+                        }
                     } else {
                         // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。
                         let items = project_public_history(entry);
