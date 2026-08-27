@@ -173,9 +173,9 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
 
 /// 有效输出上限 = min(配置值, provider 静态能力声明)；正常请求与
 /// compaction 摘要请求共用，避免摘要派生出超过模型上限的 max_tokens。
+/// 两者都源自 u32 声明，min 结果不会溢出。
 pub(super) fn effective_max_output_tokens(provider: &dyn Provider, configured: u64) -> u32 {
-    u32::try_from(configured.min(provider.protocol_contract().max_output_tokens as u64))
-        .unwrap_or(u32::MAX)
+    configured.min(provider.protocol_contract().max_output_tokens as u64) as u32
 }
 
 /// 轮步层的溢出判定：provider 错误是否为 ContextLengthExceeded。

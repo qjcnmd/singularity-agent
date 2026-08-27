@@ -122,7 +122,6 @@ impl Provider for FakeProvider {
 fn fake_contract() -> ProviderProtocolContract {
     ProviderProtocolContract {
         supports_tools: true,
-        supports_strict_tool_schema: false,
         tool_reasoning_mode: singularity_model::ProviderToolReasoningMode::Unspecified,
         max_tools_per_request: 8,
         supports_system_message: false,

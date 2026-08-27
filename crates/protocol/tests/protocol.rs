@@ -4,7 +4,7 @@ use serde_json::json;
 use singularity_protocol::{
     AppEvent, ClientInfo, EmptyParams, ErrorCode, InitializeParams, JsonRpcId, JsonRpcInbound,
     JsonRpcMessage, Method, MethodKind, ThreadReadParams, ThreadStartParams, ThreadStatus,
-    TurnInjectionParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
+    TurnInjectionParams, TurnStartParams, parse_json_rpc_payload,
 };
 
 #[test]
@@ -280,29 +280,6 @@ fn thread_status_projects_last_turn_metadata_not_lifecycle() {
     };
     let wire = serde_json::to_value(&no_turn).expect("thread wire");
     assert_eq!(wire["lastTurnStatus"], serde_json::Value::Null);
-    for status in [
-        ThreadStatus::Active,
-        ThreadStatus::Completed,
-        ThreadStatus::Failed,
-        ThreadStatus::Interrupted,
-    ] {
-        assert_eq!(
-            ThreadStatus::from_storage_text(status.as_storage_text()),
-            Some(status)
-        );
-    }
-    assert_eq!(ThreadStatus::from_storage_text("archived"), None);
-}
-
-#[test]
-fn turn_status_has_no_paused_suspended_or_blocked_state() {
-    assert_eq!(TurnStatus::Running.as_storage_text(), "running");
-    assert_eq!(TurnStatus::Completed.as_storage_text(), "completed");
-    assert_eq!(TurnStatus::Failed.as_storage_text(), "failed");
-    assert_eq!(TurnStatus::Interrupted.as_storage_text(), "interrupted");
-    for value in ["paused", "suspended", "blocked"] {
-        assert_eq!(TurnStatus::from_storage_text(value), None);
-    }
 }
 
 #[test]

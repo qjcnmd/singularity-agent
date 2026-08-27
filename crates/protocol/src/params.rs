@@ -260,27 +260,6 @@ pub enum ThreadStatus {
     Interrupted,
 }
 
-impl ThreadStatus {
-    pub const fn as_storage_text(&self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "active" => Some(Self::Active),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "interrupted" => Some(Self::Interrupted),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// thread/start 的响应。
@@ -372,27 +351,6 @@ pub enum TurnStatus {
     Completed,
     Failed,
     Interrupted,
-}
-
-impl TurnStatus {
-    pub const fn as_storage_text(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    pub fn from_storage_text(value: &str) -> Option<Self> {
-        match value {
-            "running" => Some(Self::Running),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "interrupted" => Some(Self::Interrupted),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

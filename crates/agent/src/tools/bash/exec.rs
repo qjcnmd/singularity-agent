@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-use crate::tools::registry::{ExecuteContext, ToolError, ToolExecution, error_result};
+use crate::tools::registry::{ExecuteContext, ToolExecution, error_result};
 
 use super::capture::{CaptureState, command_slug};
 #[cfg(windows)]
@@ -39,7 +39,7 @@ pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current work
 pub(super) fn execute(
     args: &BashArgs,
     ctx: ExecuteContext<'_>,
-) -> Result<ToolExecution, ToolError> {
+) -> ToolExecution {
     let ExecuteContext {
         cwd,
         signal,
@@ -216,7 +216,7 @@ pub(super) fn execute(
     if let Some(callback) = on_update.as_mut() {
         callback(&state.current_output());
     }
-    Ok(ToolExecution { content, is_error })
+    ToolExecution { content, is_error }
 }
 
 fn ingest_chunk(

@@ -62,7 +62,7 @@ pub use config::{
     split_model_selector,
 };
 pub use error::*;
-pub use openai::{chat_completions_endpoint, provider_error_response, responses_endpoint};
+pub use openai::{chat_completions_endpoint, responses_endpoint};
 pub use provider::Provider;
 pub use provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,

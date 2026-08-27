@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelPreferences, ModelUsage,
-    ModelTurnStatus, Provider, ProviderError, ToolChoicePolicy, is_strict_tool_schema_compatible,
+    ModelTurnStatus, Provider, ProviderError, ToolChoicePolicy,
 };
 use thiserror::Error;
 
@@ -43,10 +43,8 @@ use crate::message::{
     AgentMessage, assistant_response_message, tool_result_message, user_message,
 };
 use crate::session::{SessionError, SessionManager};
-use crate::tools::batch::{
-    Prepared, PreparedToolCall, execute_tool_batch, tool_error_execution,
-};
-use crate::tools::{ToolError, ToolPreflight, ToolRegistry};
+use crate::tools::batch::{PreparedToolCall, execute_tool_batch, tool_error_execution};
+use crate::tools::ToolRegistry;
 
 /// Agent 运行配置。
 #[derive(Debug, Clone)]
@@ -102,8 +100,6 @@ impl AgentConfig {
 pub enum AgentError {
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-    #[error("tool error: {0}")]
-    Tool(#[from] ToolError),
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
     #[error("compaction error: {0}")]
@@ -275,10 +271,7 @@ impl Agent {
             // 单条 assistant 消息允许的工具调用数上限；本地按模型给定顺序
             // 串行执行全部调用，wire 侧 parallel_tool_calls 恒为 false。
             max_tool_calls: DEFAULT_MAX_TOOLS_PER_REQUEST,
-            strict_tool_schema: capabilities.supports_strict_tool_schema
-                && tools
-                    .iter()
-                    .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema)),
+            strict_tool_schema: false,
         };
         let mut spec = TurnRequestSpec {
             preferences,
@@ -372,19 +365,11 @@ impl Agent {
                     // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
                     let prepared_calls = tool_calls
                         .iter()
-                        .map(|call| {
-                            let prepared =
-                                match self.registry.preflight(&call.tool_name, &call.arguments) {
-                                    Ok(ToolPreflight::Ready(prepared)) => Prepared::Ready(prepared),
-                                    Ok(ToolPreflight::Rejected(execution)) => {
-                                        Prepared::Rejected(execution)
-                                    }
-                                    Err(error) => Prepared::Rejected(tool_error_execution(error)),
-                                };
-                            PreparedToolCall {
-                                call: call.clone(),
-                                prepared,
-                            }
+                        .map(|call| PreparedToolCall {
+                            call: call.clone(),
+                            prepared: self
+                                .registry
+                                .preflight(&call.tool_name, &call.arguments),
                         })
                         .collect::<Vec<_>>();
                     let executions = execute_tool_batch(

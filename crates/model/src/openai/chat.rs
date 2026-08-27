@@ -61,7 +61,7 @@ pub fn openai_request_payload(
             request
                 .tools
                 .iter()
-                .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
+                .map(|tool| openai_tool_payload(tool))
                 .collect::<Vec<_>>()
         );
         if wire.supports_tool_choice {
@@ -664,19 +664,15 @@ pub fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     })
 }
 
-pub fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Value {
-    let mut payload = json!({
+pub fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
+    json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
             "parameters": tool.parameters_schema,
         }
-    });
-    if strict_tool_schema {
-        payload["function"]["strict"] = json!(true);
-    }
-    payload
+    })
 }
 
 #[cfg(test)]

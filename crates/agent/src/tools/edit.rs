@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::truncate::{format_size, split_lines};
 
 const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
@@ -49,12 +49,12 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
+fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let old_string = &args.old_string;
     let new_string = &args.new_string;
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     let full_path = resolve_path(ctx.cwd, path);
     if full_path.is_dir() {
@@ -67,7 +67,7 @@ fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
         }
     };
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     let content = match std::str::from_utf8(&original) {
         Ok(content) => content,
@@ -142,10 +142,10 @@ fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
         match_start,
         match_end,
     );
-    Ok(ToolExecution {
+    ToolExecution {
         content: format!("Successfully replaced 1 block(s) in {path}.\n\n{patch}"),
         is_error: false,
-    })
+    }
 }
 
 /// 分离 UTF-8 BOM 头，返回 BOM 标志与文件文本正文。

@@ -7,18 +7,12 @@ use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
-use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, ToolRegistry};
-
-/// preflight 判定结果：可执行工具，或模型可见的拒绝执行。
-pub(crate) enum Prepared {
-    Ready(PreparedTool),
-    Rejected(ToolExecution),
-}
+use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistry};
 
 /// 一次模型工具调用及其 preflight 判定。
 pub(crate) struct PreparedToolCall {
     pub call: ModelToolCall,
-    pub prepared: Prepared,
+    pub prepared: ToolPreflight,
 }
 
 /// 工具执行失败时的通用错误 Execution。
@@ -40,7 +34,7 @@ fn execute_prepared_tool(
     mut on_update: impl FnMut(&str),
 ) -> ToolExecution {
     let mut update = |text: &str| on_update(text);
-    match registry.execute_prepared(
+    registry.execute_prepared(
         prepared,
         ExecuteContext {
             args: call.arguments.clone(),
@@ -48,10 +42,7 @@ fn execute_prepared_tool(
             signal: Some(cancellation),
             on_update: Some(&mut update),
         },
-    ) {
-        Ok(execution) => execution,
-        Err(error) => tool_error_execution(error),
-    }
+    )
 }
 
 /// 按模型给定的 source order 串行执行一批工具调用：每个工具保留
@@ -75,7 +66,7 @@ pub(crate) fn execute_tool_batch(
             },
         );
         match &item.prepared {
-            Prepared::Rejected(execution) => {
+            ToolPreflight::Rejected(execution) => {
                 emit(
                     events,
                     AgentEvent::ToolExecutionEnded {
@@ -85,9 +76,8 @@ pub(crate) fn execute_tool_batch(
                     },
                 );
                 results.push(execution.clone());
-                continue;
             }
-            Prepared::Ready(prepared) => {
+            ToolPreflight::Ready(prepared) => {
                 let prepared = prepared.clone();
                 let call = item.call.clone();
                 let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -5,7 +5,7 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 
@@ -37,11 +37,11 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
+fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let content = &args.content;
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     let full_path = resolve_path(ctx.cwd, path);
     if let Some(parent) = full_path.parent()
@@ -53,13 +53,13 @@ fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, T
         ));
     }
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, content.as_bytes()) {
         return error_result(format!("Could not write file: {path}. {error}"));
     }
-    Ok(ToolExecution {
+    ToolExecution {
         content: format!("Successfully wrote {} bytes to {path}", content.len()),
         is_error: false,
-    })
+    }
 }

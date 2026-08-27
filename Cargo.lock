@@ -2268,7 +2268,6 @@ dependencies = [
  "serde_json",
  "singularity_core",
  "tempfile",
- "thiserror 2.0.18",
  "time",
  "tokio",
  "uuid",

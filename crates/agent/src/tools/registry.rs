@@ -1,7 +1,6 @@
 //! 工具注册表：名称 → ToolSpec 的单一事实源，以及参数校验。
 
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -15,7 +14,8 @@ use super::grep;
 use super::read;
 use super::write;
 
-/// 一次工具执行的模型可见结果。
+/// 一次工具执行的模型可见结果。工具自身失败（路径不存在、参数非法、
+/// 取消等）一律以 `is_error=true` 的结果表达，不进入任何错误通道。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecution {
     pub content: String,
@@ -35,8 +35,7 @@ impl std::fmt::Debug for PreparedTool {
 }
 
 /// 已解析参数与执行体的类型擦除容器。
-type PreparedExecute =
-    dyn for<'a> Fn(ExecuteContext<'a>) -> Result<ToolExecution, ToolError> + Send + Sync;
+type PreparedExecute = dyn for<'a> Fn(ExecuteContext<'a>) -> ToolExecution + Send + Sync;
 
 impl PreparedTool {
     /// 绑定已解析参数与执行函数：`prepare` 阶段 typed 反序列化一次，
@@ -44,10 +43,7 @@ impl PreparedTool {
     pub(crate) fn from_parsed<A, F>(args: A, execute: F) -> Self
     where
         A: Send + Sync + 'static,
-        F: for<'a> Fn(&A, ExecuteContext<'a>) -> Result<ToolExecution, ToolError>
-            + Send
-            + Sync
-            + 'static,
+        F: for<'a> Fn(&A, ExecuteContext<'a>) -> ToolExecution + Send + Sync + 'static,
     {
         Self {
             execute: std::sync::Arc::new(move |ctx| execute(&args, ctx)),
@@ -55,26 +51,13 @@ impl PreparedTool {
     }
 }
 
-/// preflight 要么产出可执行工具，要么产出模型可见的拒绝。
-/// 未知名称保持为注册表错误，使调用方能保留该边界。
+/// preflight 要么产出可执行工具，要么产出模型可见的拒绝执行；
+/// 未知工具名同样以模型可见拒绝收尾，不进入任何错误通道。
 #[derive(Debug)]
 pub enum ToolPreflight {
     Ready(PreparedTool),
     Rejected(ToolExecution),
 }
-
-/// 注册表/内部层错误（如未知工具名）。工具自身的失败一律走 `ToolExecution::is_error`，
-/// 不进入该错误通道。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolError(pub String);
-
-impl Display for ToolError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ToolError {}
 
 /// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调。
 pub struct ExecuteContext<'a> {
@@ -151,29 +134,19 @@ impl ToolRegistry {
         self.tools.keys().copied().collect()
     }
 
-    /// 执行工具：先按 `parameters` JSON Schema 校验参数，校验失败返回 is_error；
-    /// 未知工具名返回 `Err(ToolError)`。
-    pub fn execute<'a>(
-        &self,
-        name: &str,
-        ctx: ExecuteContext<'a>,
-    ) -> Result<ToolExecution, ToolError> {
-        match self.preflight(name, &ctx.args)? {
-            ToolPreflight::Ready(prepared) => self.execute_prepared(prepared, ctx),
-            ToolPreflight::Rejected(execution) => Ok(execution),
-        }
-    }
-
     /// 查找并解析调用而不执行。Agent 批次在按模型给定 source order 执行
-    /// 每个调用前使用本方法；typed 反序列化在此完成一次。
-    pub fn preflight(&self, name: &str, args: &Value) -> Result<ToolPreflight, ToolError> {
-        let spec = self
-            .tools
-            .get(name)
-            .ok_or_else(|| ToolError(format!("unknown tool: {name}")))?;
+    /// 每个调用前使用本方法；typed 反序列化在此完成一次。未知工具名与
+    /// 参数解析失败都以模型可见拒绝收尾。
+    pub fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
+        let Some(spec) = self.tools.get(name) else {
+            return ToolPreflight::Rejected(ToolExecution {
+                content: format!("tool execution failed: unknown tool: {name}"),
+                is_error: true,
+            });
+        };
         match (spec.prepare)(args) {
-            Ok(prepared) => Ok(ToolPreflight::Ready(prepared)),
-            Err(execution) => Ok(ToolPreflight::Rejected(execution)),
+            Ok(prepared) => ToolPreflight::Ready(prepared),
+            Err(execution) => ToolPreflight::Rejected(execution),
         }
     }
 
@@ -182,17 +155,17 @@ impl ToolRegistry {
         &self,
         prepared: PreparedTool,
         ctx: ExecuteContext<'a>,
-    ) -> Result<ToolExecution, ToolError> {
+    ) -> ToolExecution {
         (prepared.execute)(ctx)
     }
 }
 
 /// 工具失败结果（is_error=true）的构造捷径。
-pub(crate) fn error_result(message: impl Into<String>) -> Result<ToolExecution, ToolError> {
-    Ok(ToolExecution {
+pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
+    ToolExecution {
         content: message.into(),
         is_error: true,
-    })
+    }
 }
 
 /// 相对路径解析绑定到当前工作区目录，绝对路径保持原样。
@@ -207,10 +180,7 @@ pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, S
 pub(crate) fn prepare_typed<A, F>(raw: &Value, execute: F) -> Result<PreparedTool, ToolExecution>
 where
     A: DeserializeOwned + Send + Sync + 'static,
-    F: for<'a> Fn(&A, ExecuteContext<'a>) -> Result<ToolExecution, ToolError>
-        + Send
-        + Sync
-        + 'static,
+    F: for<'a> Fn(&A, ExecuteContext<'a>) -> ToolExecution + Send + Sync + 'static,
 {
     let args = deserialize_args_or_error::<A>(raw)?;
     Ok(PreparedTool::from_parsed(args, execute))
@@ -222,7 +192,7 @@ where
 /// ```ignore
 /// let args = match deserialize_args_or_error::<MyArgs>(&raw_args) {
 ///     Ok(args) => args,
-///     Err(execution) => return Ok(execution),
+///     Err(execution) => return execution,
 /// };
 /// ```
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(

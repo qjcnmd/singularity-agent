@@ -13,7 +13,6 @@ use singularity_agent::session::{
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
 
-use crate::error::TurnFailureCause;
 use crate::history::project_turn_history;
 use crate::objects::{Thread, ThreadStatus};
 
@@ -227,13 +226,6 @@ pub fn rename_thread(
         )
         .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-/// 把 [`TurnFailureCause`] 中与存储相关的失败映射为统一文本。
-impl From<TurnFailureCause> for String {
-    fn from(cause: TurnFailureCause) -> Self {
-        cause.as_str().to_string()
-    }
 }
 
 /// Thread 定位与持久化错误。

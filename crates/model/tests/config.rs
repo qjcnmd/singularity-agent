@@ -301,10 +301,7 @@ fn model_request_validation_rejects_incompatible_strict_schema_locally() {
         parameters_schema: serde_json::json!({"type": "object"}),
     });
     request.tool_choice.strict_tool_schema = true;
-    let capabilities = ProviderProtocolContract {
-        supports_strict_tool_schema: true,
-        ..ProviderProtocolContract::default()
-    };
+    let capabilities = ProviderProtocolContract::default();
 
     for incompatible_schema in [serde_json::json!({"type": "object"}), serde_json::json!({})] {
         request.tools[0].parameters_schema = incompatible_schema;
@@ -337,13 +334,7 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
 
     let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
 
-    assert_eq!(
-        result.errors,
-        vec![
-            "provider_does_not_support_strict_tool_schema",
-            "provider_does_not_support_tools",
-        ]
-    );
+    assert_eq!(result.errors, vec!["provider_does_not_support_tools"]);
 }
 
 #[test]

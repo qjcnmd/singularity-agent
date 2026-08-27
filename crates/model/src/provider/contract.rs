@@ -43,7 +43,6 @@ pub enum ThinkingWireFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
-    pub supports_strict_tool_schema: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub max_tools_per_request: u32,
     pub supports_system_message: bool,
@@ -55,7 +54,6 @@ impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
-            supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_system_message: true,
@@ -245,12 +243,6 @@ pub fn validate_model_request_with_capabilities(
         }
         if request.tools.len() > capabilities.max_tools_per_request as usize {
             errors.push("requested_tools_exceed_provider_limit".to_string());
-        }
-        if !request.tools.is_empty()
-            && request.tool_choice.strict_tool_schema
-            && !capabilities.supports_strict_tool_schema
-        {
-            errors.push("provider_does_not_support_strict_tool_schema".to_string());
         }
     }
     validation_result(errors, Vec::new())

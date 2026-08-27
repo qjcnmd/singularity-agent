@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::glob::glob_regex;
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::walk::{to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
@@ -72,11 +72,11 @@ fn truncate_for_display(line: &str) -> String {
     format!("{}...", &line[..end])
 }
 
-fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
+fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     let root = resolve_path(ctx.cwd, path);
     if !root.is_dir() {
@@ -184,10 +184,10 @@ fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
         );
     }
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
-    Ok(ToolExecution {
+    ToolExecution {
         content: output,
         is_error: false,
-    })
+    }
 }

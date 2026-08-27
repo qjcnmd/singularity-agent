@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
-use super::registry::{ExecuteContext, ToolError, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
@@ -44,9 +44,9 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
+fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     if let Some(aborted) = ctx.abort_if_cancelled() {
-        return Ok(aborted);
+        return aborted;
     }
     let full_path = resolve_path(ctx.cwd, &args.path);
     let file = match File::open(&full_path) {
@@ -65,7 +65,7 @@ fn execute_reader(
     limit: Option<u64>,
     reader: &mut impl BufRead,
     signal: Option<&CancellationToken>,
-) -> Result<ToolExecution, ToolError> {
+) -> ToolExecution {
     if signal.is_some_and(CancellationToken::is_cancelled) {
         return error_result("Operation aborted");
     }
@@ -149,10 +149,10 @@ fn execute_reader(
                 offset.unwrap_or(0)
             ));
         }
-        return Ok(ToolExecution {
+        return ToolExecution {
             content: String::new(),
             is_error: false,
-        });
+        };
     }
 
     if start_line >= line_number {
@@ -162,10 +162,10 @@ fn execute_reader(
         ));
     }
     let output_text = render_read_output(path, start_line_display, &state);
-    Ok(ToolExecution {
+    ToolExecution {
         content: output_text,
         is_error: false,
-    })
+    }
 }
 
 struct ReadState {
