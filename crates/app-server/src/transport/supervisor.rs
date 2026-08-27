@@ -238,44 +238,29 @@ where
     let mut worker_error = None;
     if !turn_dispatcher_done {
         // dispatcher 在 turn_rx 关闭且 worker 全部收敛后退出；宽限到点 abort。
-        if let Some(error) = wait_task_graceful(
-            &mut turn_dispatcher_task,
-            shutdown_deadline,
-            "turn dispatcher",
-            true,
-        )
-        .await
+        if let Some(error) =
+            wait_task_graceful(&mut turn_dispatcher_task, shutdown_deadline, "turn dispatcher")
+                .await
         {
             worker_error.get_or_insert(error);
         }
     }
     if !ordinary_done
-        && let Some(error) = wait_task_graceful(
-            &mut ordinary_task,
-            shutdown_deadline,
-            "ordinary dispatch",
-            false,
-        )
-        .await
+        && let Some(error) =
+            wait_task_graceful(&mut ordinary_task, shutdown_deadline, "ordinary dispatch").await
     {
         worker_error.get_or_insert(error);
     }
     if !control_done
-        && let Some(error) = wait_task_graceful(
-            &mut control_task,
-            shutdown_deadline,
-            "control dispatch",
-            false,
-        )
-        .await
+        && let Some(error) =
+            wait_task_graceful(&mut control_task, shutdown_deadline, "control dispatch").await
     {
         worker_error.get_or_insert(error);
     }
     drop(output_tx);
 
     if !writer_done
-        && let Some(error) =
-            wait_task_graceful(&mut writer, shutdown_deadline, "stdout writer", true).await
+        && let Some(error) = wait_task_graceful(&mut writer, shutdown_deadline, "stdout writer").await
     {
         // 保留既有的 writer 错误措辞（内部错误带来源前缀，超时文本原样）。
         let error = if error.starts_with("timed out waiting for") {
@@ -303,22 +288,18 @@ where
     }
 }
 
-/// 在宽限期内等待后台任务收敛。超时按调用方策略 abort（有界 worker 强制
-/// 终止；普通/控制 dispatch 依赖 channel 关闭自然收敛）。返回终止错误文本。
+/// 在宽限期内等待后台任务收敛，超时一律 abort。残留的 dispatch 任务持有
+/// output_tx 克隆，不 abort 会推迟 writer 侧的通道关闭——writer 被杀在
+/// write_all 半截帧的窗口由此消除；writer 自身超时仍是最后的强制手段。
 async fn wait_task_graceful(
     task: &mut tokio::task::JoinHandle<Result<(), String>>,
     deadline: Instant,
     label: &str,
-    abort_on_timeout: bool,
 ) -> Option<String> {
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        // 宽限期已耗尽：writer 强制 abort 并报告；dispatch 任务让关闭中的
-        // channel 自然收敛（等待可能已被前面的 join 用尽）。
-        if abort_on_timeout {
-            task.abort();
-            return Some(format!("timed out waiting for {label} during shutdown"));
-        }
-        return None;
+        // 宽限期已耗尽：强制 abort 并报告。
+        task.abort();
+        return Some(format!("timed out waiting for {label} during shutdown"));
     };
     match tokio::time::timeout(remaining, &mut *task).await {
         Ok(Ok(Ok(()))) => None,
@@ -327,9 +308,7 @@ async fn wait_task_graceful(
         // join 层面失败（任务 panic）带上任务来源。
         Ok(Err(error)) => Some(format!("{label} task failed: {error}")),
         Err(_) => {
-            if abort_on_timeout {
-                task.abort();
-            }
+            task.abort();
             Some(format!("timed out waiting for {label} during shutdown"))
         }
     }

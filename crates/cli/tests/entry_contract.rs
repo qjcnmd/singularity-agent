@@ -203,6 +203,9 @@ fn all_execution_modes_fail_at_startup_without_git_bash() {
                     .and_then(Value::as_str),
                 Some("failed")
             );
+            // thread 未解析时整体省略该字段，不得写入伪造的哨兵值。
+            assert!(summary.pointer("/summary/thread").is_none());
+            assert!(!stdout.contains("unresolved"));
         } else {
             assert!(stdout.is_empty(), "args: {args:?}");
         }

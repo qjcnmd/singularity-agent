@@ -82,11 +82,15 @@ pub(crate) struct ResumeMenu {
 
 impl TuiApp {
     /// 设置菜单激活时的键盘路由。返回最终 Action（仅 `Continue`）。
-    pub(super) fn handle_settings_key(&mut self, key: KeyCode) -> Action {
+    /// 字符输入与主路径同一修饰键守卫：Ctrl/Alt 组合不落入字段。
+    pub(super) fn handle_settings_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyModifiers;
         let Some(menu) = self.settings.as_mut() else {
             return Action::Continue;
         };
-        match key {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
             KeyCode::Esc => {
                 self.settings = None;
             }
@@ -119,7 +123,7 @@ impl TuiApp {
                     Err(error) => menu.error = Some(error.to_string()),
                 }
             }
-            KeyCode::Char(ch) => menu.current_mut().push(ch),
+            KeyCode::Char(ch) if !ctrl && !alt => menu.current_mut().push(ch),
             _ => {}
         }
         Action::Continue

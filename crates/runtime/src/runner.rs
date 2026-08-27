@@ -95,9 +95,15 @@ impl TurnRunner {
     }
 
     /// 读取一个已落盘 turn 的思考块，供交互客户端按需展示。
+    ///
+    /// 展示性只读投影走无锁只读路径：TurnCompleted 投递时本轮写者可能仍
+    /// 持有会话写者锁，这里不得抢锁或触发修复重写。
     pub fn thinking_for_turn(&self, thread: &Thread, turn_id: &str) -> Result<Vec<String>, String> {
-        let session = self
-            .open_and_repair_session(thread)
+        let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
+        let session =
+            SessionManager::open_existing_read_only(&path).map_err(|error| error.to_string())?;
+        session
+            .verify_session_id(&thread.thread_id)
             .map_err(|error| error.to_string())?;
         let mut inside_turn = false;
         let mut thinking = Vec::new();

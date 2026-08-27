@@ -31,7 +31,6 @@ const MAX_EDITOR_ROWS_CAP: u16 = 10;
 pub(crate) enum Phase {
     Idle,
     Running,
-    Interrupting,
 }
 
 /// 当前正在等待的对象：驱动状态行的具名活动提示。
@@ -316,13 +315,12 @@ impl TuiApp {
     }
 
     /// 请求中断活动 turn（Esc 与点击 [stop] 同一路径）：取消 provider
-    /// 调用并转入中断收敛相位；空闲时为空操作。
+    /// 调用并等待收敛；空闲时为空操作。
     pub(super) fn request_interrupt(&mut self) {
         if self.phase == Phase::Idle {
             return;
         }
         self.conversation.interrupt();
-        self.phase = Phase::Interrupting;
         self.set_waiting(WaitingTarget::TerminalConvergence);
     }
 
@@ -342,7 +340,7 @@ impl TuiApp {
         self.reset_quit_confirm();
 
         if self.settings.is_some() {
-            return self.handle_settings_key(key.code);
+            return self.handle_settings_key(key);
         }
         if self.resume.is_some() {
             return self.handle_resume_key(key.code);
@@ -459,7 +457,7 @@ impl TuiApp {
                 self.set_waiting(WaitingTarget::Model);
                 Action::Submit(text)
             }
-            Phase::Running | Phase::Interrupting => {
+            Phase::Running => {
                 let accepted = self.conversation.steer(text.clone());
                 self.note_injection("steer", accepted, &text);
                 // steer 注入后回到最新内容（page-flip 只属于新回合）。
@@ -511,12 +509,9 @@ impl TuiApp {
         self.frame.last_total_rows = total_rows;
         self.frame.last_viewport_rows = viewport;
 
-        // 可视窗口物化：只渲染可见行。
-        let top = if self.scroll.is_following() {
-            total_rows.saturating_sub(viewport)
-        } else {
-            self.scroll.top_row()
-        };
+        // 可视窗口物化：只渲染可见行。page-flip 钉住期、跟随态与浏览态的
+        // 顶行取值收敛在 ScrollState::visible_top 单点。
+        let top = self.scroll.visible_top(total_rows, viewport);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
         if total_rows > 0 && viewport > 0 {
             let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];

@@ -19,7 +19,6 @@ mod wire;
 
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde_json::Value;
 use singularity_protocol::{

@@ -91,7 +91,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let mode = cli.mode()?;
     if let Err(error) = singularity_runtime::ensure_bash_available() {
         if mode == Some(Mode::Json) {
-            emit_failed_json_summary(&fallback_thread_id(cli.session.as_deref()));
+            emit_failed_json_summary(cli.session.as_deref());
         }
         return Err(error);
     }
@@ -119,7 +119,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             // 准备阶段失败也必须有终态形态：--json 输出 failed summary 行，
             // 保证机器解析方总能看到终态；--print 只向 stderr 报告。
             if mode == Mode::Json {
-                emit_failed_json_summary(&fallback_thread_id(cli.session.as_deref()));
+                emit_failed_json_summary(cli.session.as_deref());
             }
             return Err(error.message);
         }
@@ -128,14 +128,14 @@ fn run(cli: Cli) -> Result<i32, String> {
     run_headless(setup, &goal, mode)
 }
 
-fn fallback_thread_id(session: Option<&str>) -> String {
-    session.unwrap_or("unresolved").to_string()
-}
-
 /// `--json` 失败路径的统一终态形态：机器解析方必须总能看到 failed summary
 /// 行（评估器依赖此契约），故准备/执行/工作线程中断各路径共用这一个出口。
-fn emit_failed_json_summary(thread_id: &str) {
-    JsonlRenderer::new(thread_id).emit_summary(TurnStatus::Failed, None, false);
+/// thread 尚未解析时 summary 省略 thread 字段，不写伪造的哨兵值。
+fn emit_failed_json_summary(thread_id: Option<&str>) {
+    let renderer = thread_id
+        .map(JsonlRenderer::new)
+        .unwrap_or_else(JsonlRenderer::without_thread);
+    renderer.emit_summary(TurnStatus::Failed, None, false);
 }
 
 /// turn 执行线程向主循环投递的进度。
@@ -244,7 +244,7 @@ fn drain_json(
         }
         Err(message) => {
             // 失败也必须以终态 summary 收尾，保证机器解析总能看到终态行。
-            emit_failed_json_summary(&setup.thread_id);
+            emit_failed_json_summary(Some(&setup.thread_id));
             Err(message)
         }
     }

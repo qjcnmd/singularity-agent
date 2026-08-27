@@ -521,16 +521,13 @@ impl AppServer {
             request_id,
             input,
         } = claim;
-        let mut projection = crate::lifecycle::TurnProjection::new(
-            self,
-            Arc::clone(reservation.conversation()),
-            request_id,
-            emit,
-        );
-        let run_result = reservation.run(&input, &mut projection);
-        if let Some(poisoned) = projection.take_poisoned() {
-            return Err(poisoned);
+        // 执行停止请求在 run 前落位：TurnStarted 发布前取消本轮，使被取消的
+        // 轮快速收敛为 interrupted；投影层只做纯投影。
+        if self.cancellation_handle().execution_stop_requested() {
+            reservation.conversation().interrupt();
         }
+        let mut projection = crate::lifecycle::TurnProjection::new(self, request_id, emit);
+        let run_result = reservation.run(&input, &mut projection);
         match run_result {
             Ok(_) => Ok(()),
             Err(singularity_runtime::ConversationError::Configuration(message))

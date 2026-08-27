@@ -53,9 +53,13 @@ impl ScrollState {
     }
 
     /// 内容增长后的收敛：跟随态保持钉底；浏览态累计底部新增并钳制位置；
-    /// page-flip 保持钉顶直到新内容填满一屏。
+    /// page-flip 保持钉顶直到新内容填满一屏。零增长帧不改变任何状态——
+    /// 钉住期尤其不能被位置钳制解除。
     pub fn on_content_grow(&mut self, grown_rows: usize, total_rows: usize, viewport: usize) {
         if grown_rows == 0 {
+            if self.pin_at_total.is_some() {
+                return;
+            }
             self.clamp(total_rows, viewport);
             return;
         }
@@ -72,6 +76,19 @@ impl ScrollState {
         } else {
             self.new_below = self.new_below.saturating_add(grown_rows);
             self.clamp(total_rows, viewport);
+        }
+    }
+
+    /// 当前帧渲染应取的可视顶行：page-flip 返回钉点（新内容首行），跟随态
+    /// 返回底部，浏览态返回 top_row。draw 一律经此处取值，不自行判断状态。
+    pub fn visible_top(&self, total_rows: usize, viewport: usize) -> usize {
+        if let Some(pin) = self.pin_at_total {
+            return pin.min(total_rows);
+        }
+        if self.follow {
+            bottom_top(total_rows, viewport)
+        } else {
+            self.top_row
         }
     }
 
@@ -162,6 +179,48 @@ impl ScrollState {
         self.follow = true;
         self.new_below = 0;
         self.top_row = bottom_top(total_rows, viewport);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 钉住期的首个零增长帧不得丢失钉点：提交时刻 total 即 pin，
+    /// 钳制会立即把它判为「被视口吞没」而清钉。
+    #[test]
+    fn zero_growth_frame_keeps_the_pin() {
+        let mut state = ScrollState::default();
+        state.pin_new_content_at(10);
+        state.on_content_grow(0, 10, 5);
+        assert_eq!(state.visible_top(10, 5), 10, "pin survives a zero-growth frame");
+        assert!(state.is_following(), "pin keeps follow semantics");
+    }
+
+    /// 钉住期 visible_top 返回钉行；内容长到填满一屏时回底并解除。
+    #[test]
+    fn visible_top_returns_the_pinned_row_until_full_screen() {
+        let mut state = ScrollState::default();
+        state.pin_new_content_at(10);
+        state.on_content_grow(2, 12, 5);
+        assert_eq!(state.visible_top(12, 5), 10);
+        state.on_content_grow(3, 15, 5);
+        assert_eq!(
+            state.visible_top(15, 5),
+            15 - 5,
+            "total - pin >= viewport releases the pin back to bottom"
+        );
+    }
+
+    /// 钉住期内上滚立即解除并进入浏览态（以当前底为锚向上滚）。
+    #[test]
+    fn scrolling_up_releases_the_pin() {
+        let mut state = ScrollState::default();
+        state.pin_new_content_at(10);
+        state.on_content_grow(2, 12, 5);
+        state.scroll_up(1, 12, 5);
+        assert!(!state.is_following());
+        assert_eq!(state.visible_top(12, 5), 6);
     }
 }
 

@@ -65,12 +65,7 @@ impl TuiApp {
         let mut status = vec![];
         if self.phase != Phase::Idle {
             let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
-            let phase_word = match self.phase {
-                Phase::Running => "running",
-                Phase::Interrupting => "interrupting",
-                Phase::Idle => unreachable!("guarded above"),
-            };
-            status.push(Span::styled(format!("{spinner} {phase_word}"), warn));
+            status.push(Span::styled(format!("{spinner} running"), warn));
             let turn_elapsed = self
                 .turn_started_at
                 .map(|started| started.elapsed().as_secs())
@@ -140,7 +135,7 @@ impl TuiApp {
                 Phase::Idle => {
                     "Enter send · Ctrl+J newline · / commands · PgUp/PgDn scroll · End latest"
                 }
-                Phase::Running | Phase::Interrupting => {
+                Phase::Running => {
                     "Enter steer · Alt+Enter queue · Alt+Up withdraw · Esc stop · Ctrl+T thinking · Ctrl+O tool view"
                 }
             }

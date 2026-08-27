@@ -16,7 +16,7 @@ use singularity_runtime::events::{
 };
 use singularity_runtime::objects::Turn as RuntimeTurn;
 use singularity_runtime::{
-    Conversation, ProviderFailureKind, TurnFailureCause as RuntimeFailureCause,
+    ProviderFailureKind, TurnFailureCause as RuntimeFailureCause,
     TurnFailureStage as RuntimeFailureStage, TurnOutcome, TurnRunError,
 };
 
@@ -48,15 +48,11 @@ pub(crate) fn wire_turn(turn: &RuntimeTurn) -> Turn {
 
 /// 单次 run_turn 调用的协议投影。
 ///
-/// 所有投影失败都通过 [`Self::poisoned`] 暂存并在 run 返回后以错误返回，
-/// 不再发布后续事件；JSONL 事实已在 runtime 侧先行落盘。
-///
-/// 边界（窗口极窄，仅锁中毒等异常触发）：投影 poisoned 后 transport 向
-/// 客户端发送 error response，但 turn 继续执行并写 JSONL——客户端视角的
-/// "失败"与执行事实可能短暂背离；turn 自身的终态仍由 runtime 收敛。
+/// 纯投影：所有投影失败都通过 [`Self::poisoned`] 暂存并只让后续
+/// notification 静默，不再发布后续事件；JSONL 事实已在 runtime 侧先行落盘，
+/// turn/started 的 response 一次性无条件发出，执行事实不受投影失败影响。
 pub(crate) struct TurnProjection<'a> {
     server: &'a AppServer,
-    conversation: Arc<Conversation>,
     request_id: JsonRpcId,
     emit: &'a mut dyn FnMut(Value),
     response_sent: bool,
@@ -66,23 +62,16 @@ pub(crate) struct TurnProjection<'a> {
 impl<'a> TurnProjection<'a> {
     pub fn new(
         server: &'a AppServer,
-        conversation: Arc<Conversation>,
         request_id: JsonRpcId,
         emit: &'a mut dyn FnMut(Value),
     ) -> Self {
         Self {
             server,
-            conversation,
             request_id,
             emit,
             response_sent: false,
             poisoned: None,
         }
-    }
-
-    /// 取走暂存的投影失败（run 返回后由调用方决定错误响应形态）。
-    pub fn take_poisoned(&mut self) -> Option<AppServerError> {
-        self.poisoned.take()
     }
 
     fn emit_value(&mut self, value: Value) {
@@ -104,12 +93,9 @@ impl<'a> TurnProjection<'a> {
         }
     }
 
-    /// turn/started 到达时 JSONL 已落盘。执行停止请求在入场时立即取消，
-    /// 使被取消的轮快速收敛为 interrupted。
+    /// turn/started 到达时 JSONL 已落盘；只投影事件与一次性 response，
+    /// 不承载执行副作用。
     fn on_turn_started(&mut self, turn: &RuntimeTurn) {
-        if self.server.cancellation_handle().execution_stop_requested() {
-            self.conversation.interrupt();
-        }
         self.emit_notification(AppEvent::turn_started(&wire_turn(turn)));
         if !self.response_sent {
             self.response_sent = true;

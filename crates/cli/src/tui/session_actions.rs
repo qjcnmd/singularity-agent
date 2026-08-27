@@ -10,7 +10,7 @@ use std::sync::Arc;
 use singularity_core::CancellationToken;
 use singularity_runtime::{CompactionOutcome, Conversation, Thread, TurnRunner};
 
-use super::app::TuiApp;
+use super::app::{Phase, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::scroll::ScrollState;
@@ -18,8 +18,22 @@ use super::transcript::{NoteStyle, Transcript};
 use super::view::{short_id, truncate_label};
 
 impl TuiApp {
+    /// 会话态整体重置：换绑新会话时归位全部运行相位与临时状态，
+    /// 防新增字段在换绑后残留旧会话的事实。
+    fn reset_session_state(&mut self) {
+        self.phase = Phase::Idle;
+        self.waiting = WaitingTarget::None;
+        self.waiting_since = None;
+        self.turn_started_at = None;
+        self.compacting = false;
+        self.compact_cancel = None;
+        self.compact_queued = false;
+        self.settings = None;
+        self.resume = None;
+    }
+
     /// 会话换绑统一入口：替换 conversation、thread_id、transcript、scroll
-    /// 与 session_tokens，消除 resume/new 双份换绑逻辑。
+    /// 与 session_tokens，并整体重置会话态，消除 resume/new 双份换绑逻辑。
     fn rebind_conversation(
         &mut self,
         runner: Arc<TurnRunner>,
@@ -32,8 +46,7 @@ impl TuiApp {
         self.transcript = Transcript::new();
         self.scroll = ScrollState::default();
         self.session_tokens = session_tokens;
-        // 换绑会话丢弃待执行的排队压缩（旧会话的请求不再有效）。
-        self.compact_queued = false;
+        self.reset_session_state();
     }
 
     /// 换绑到已持久化的会话；失败时只记 note，状态不变。
@@ -89,19 +102,37 @@ impl TuiApp {
                     .and_then(|thread| thread.model);
                 self.settings = Some(SettingsMenu::open(current.as_deref()));
             }
-            SlashCommand::Resume => match self.conversation.list_threads() {
-                Ok(threads) if !threads.is_empty() => {
-                    self.resume = Some(ResumeMenu {
-                        threads,
-                        selected: 0,
-                    });
+            SlashCommand::Resume => {
+                // 换绑受相位门禁：菜单期间旧 turn 的终态事件会错乱投影进
+                // 新会话流，运行中先结束当前回合。
+                if self.phase != Phase::Idle {
+                    self.transcript.push_note(
+                        "turn in progress; press Esc to end it before switching sessions",
+                        NoteStyle::Warning,
+                    );
+                    return Action::Continue;
                 }
-                Ok(_) => self
-                    .transcript
-                    .push_note("no saved sessions", NoteStyle::Dim),
-                Err(error) => self.transcript.push_note(error, NoteStyle::Error),
-            },
+                match self.conversation.list_threads() {
+                    Ok(threads) if !threads.is_empty() => {
+                        self.resume = Some(ResumeMenu {
+                            threads,
+                            selected: 0,
+                        });
+                    }
+                    Ok(_) => self
+                        .transcript
+                        .push_note("no saved sessions", NoteStyle::Dim),
+                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
+                }
+            }
             SlashCommand::New => {
+                if self.phase != Phase::Idle {
+                    self.transcript.push_note(
+                        "turn in progress; press Esc to end it before switching sessions",
+                        NoteStyle::Warning,
+                    );
+                    return Action::Continue;
+                }
                 let runner = self.conversation.runner_handle();
                 let current = self.conversation.thread().ok();
                 let cwd = current
