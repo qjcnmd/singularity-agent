@@ -412,3 +412,70 @@ fn summarization_prompts_match_expected_structure() {
     assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT continue the conversation."));
     assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("ONLY output the structured summary."));
 }
+
+/// B1/B2：大工具结果追加后应触发主动压缩——ledger 计量把 usage 与尾部增量
+/// 合成，超过窗口预留即触发。
+#[test]
+fn ledger_large_tool_result_triggers_compaction() {
+    let mut ledger = ContextLedger::new();
+    let usage = ModelUsage {
+        total_tokens: 5_000,
+        usage_present: true,
+        ..Default::default()
+    };
+    ledger.record_usage(&usage);
+    let budget = budget(40_000, 8_000);
+    let engine = CompactionEngine::new(
+        Arc::new(MockProvider::new(vec![])) as Arc<dyn Provider + Send + Sync>
+    );
+    // 仅 usage 基线：低于阈值不触发。
+    assert!(!engine.should_compact(ledger.estimate().unwrap(), &budget));
+
+    // 上报后追加大 toolResult：估算被尾部增量推到窗口之上。
+    let big = message_entry(AgentMessage::ToolResult {
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(200_000),
+        }],
+        tool_call_id: Some("call-1".to_string()),
+        tool_name: None,
+        is_error: None,
+    });
+    ledger.record_appended(&big);
+    let estimate = ledger.estimate().expect("usage baseline present");
+    assert!(
+        estimate > 50_000,
+        "usage + trailing must exceed window: {estimate}"
+    );
+    assert!(engine.should_compact(estimate, &budget));
+}
+
+/// B2：切点估算计入工具调用参数与 thinking 块（不止 content_text）。
+#[test]
+fn entry_estimate_includes_tool_arguments_and_thinking() {
+    let tool_call = message_entry(AgentMessage::Assistant {
+        content: vec![ContentBlock::ToolCall {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            args: json!({"command": "x".repeat(4_000)}),
+        }],
+        stop_reason: None,
+        provider_reasoning_replay: None,
+    });
+    assert!(
+        entry_token_estimate(&tool_call) >= 1_000,
+        "tool call arguments must count toward the estimate"
+    );
+
+    let thinking = message_entry(AgentMessage::Assistant {
+        content: vec![ContentBlock::Thinking {
+            thinking: "t".repeat(2_000),
+            signature: None,
+        }],
+        stop_reason: None,
+        provider_reasoning_replay: None,
+    });
+    assert!(
+        entry_token_estimate(&thinking) >= 500,
+        "thinking blocks must count toward the estimate"
+    );
+}

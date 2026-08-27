@@ -685,12 +685,89 @@ fn estimate_tokens_of(text: &str) -> u64 {
     chars.div_ceil(4)
 }
 
-/// 估算单条会话条目贡献的 Token 数量。
-fn entry_token_estimate(entry: &SessionEntry) -> u64 {
+/// 估算单条会话条目贡献的 Token 数量：文本、工具调用（id/name/args）、
+/// thinking 块与 provider reasoning replay 全部计入。
+pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match entry {
-        SessionEntry::Message { message, .. } => estimate_tokens_of(&message.content_text()),
+        SessionEntry::Message { message, .. } => message_token_estimate(message),
         SessionEntry::Compaction { compaction, .. } => estimate_tokens_of(&compaction.summary),
-        _ => 0,
+        SessionEntry::Metadata { .. } => 0,
+    }
+}
+
+fn message_token_estimate(message: &AgentMessage) -> u64 {
+    let mut tokens = estimate_tokens_of(&message.content_text());
+    for block in message.content() {
+        match block {
+            ContentBlock::ToolCall { id, name, args } => {
+                tokens = tokens
+                    .saturating_add(estimate_tokens_of(id))
+                    .saturating_add(estimate_tokens_of(name))
+                    .saturating_add(estimate_tokens_of(&args.to_string()));
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                tokens = tokens.saturating_add(estimate_tokens_of(thinking));
+            }
+            ContentBlock::Text { .. } => {}
+        }
+    }
+    if let Some(replay) = message.provider_reasoning_replay() {
+        tokens = tokens.saturating_add(estimate_tokens_of(
+            &serde_json::to_string(replay).unwrap_or_default(),
+        ));
+    }
+    tokens
+}
+
+/// 请求前上下文规模的唯一计量（参照 pi `estimateContextTokens = usageTokens +
+/// trailingTokens`）：provider 最后上报的 usage 与上报之后新增条目的估算合成。
+///
+/// usage 基线缺失时（首轮、压缩重写后）返回 `None`，调用方以完整装配估算兜底；
+/// 装配固定项（tools schema、reasoning replay、输出预算与固定余量）属于估算
+/// 函数族（`estimate_assembled`/`entry_token_estimate`），ledger 只组合
+/// "usage 基线 + 尾部增量"。
+pub(crate) struct ContextLedger {
+    /// provider 最后上报的上下文 token 数（请求发出时的真实占用）。
+    last_reported_tokens: Option<u64>,
+    /// 上报之后追加到会话的条目的 token 估算（assistant 消息、toolResult 等）。
+    trailing_estimate: u64,
+}
+
+impl ContextLedger {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_reported_tokens: None,
+            trailing_estimate: 0,
+        }
+    }
+
+    /// 记录 provider 上报的 usage：尾部增量归零（本轮追加的条目从下一轮起入账）。
+    pub(crate) fn record_usage(&mut self, usage: &ModelUsage) {
+        if usage.usage_present {
+            self.last_reported_tokens = Some(usage.total_tokens);
+            self.trailing_estimate = 0;
+        }
+    }
+
+    /// 上报之后追加到会话的条目入账。
+    pub(crate) fn record_appended(&mut self, entry: &SessionEntry) {
+        self.trailing_estimate = self
+            .trailing_estimate
+            .saturating_add(entry_token_estimate(entry));
+    }
+
+    /// 压缩重写会话后 usage 基线作废：回退到装配估算兜底。
+    pub(crate) fn invalidate(&mut self) {
+        self.last_reported_tokens = None;
+        self.trailing_estimate = 0;
+    }
+
+    /// 唯一计量 = provider usage + 尾部增量；无 usage 基线时返回 `None`。
+    pub(crate) fn estimate(&self) -> Option<u64> {
+        Some(
+            self.last_reported_tokens?
+                .saturating_add(self.trailing_estimate),
+        )
     }
 }
 

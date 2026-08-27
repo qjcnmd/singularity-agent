@@ -29,7 +29,9 @@ use singularity_model::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::compaction::{CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome};
+use crate::compaction::{
+    CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, ContextLedger,
+};
 use crate::message::{
     AgentMessage, AgentMessageRole, ContentBlock, assistant_response_message, tool_result_message,
     user_message,
@@ -582,6 +584,8 @@ pub struct Agent {
     inbox: TurnInboxHandle,
     /// 进程内文件变更队列：edit/write 工具登记其修改。
     mutations: FileMutationQueue,
+    /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
+    ledger: ContextLedger,
 }
 
 impl Agent {
@@ -614,6 +618,7 @@ impl Agent {
             config,
             inbox: Arc::new(Mutex::new(TurnInbox::default())),
             mutations: FileMutationQueue::new(),
+            ledger: ContextLedger::new(),
         })
     }
 
@@ -652,9 +657,8 @@ impl Agent {
             usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        // 上一轮成功响应的 provider usage 只用于判定下一次请求前是否压缩。
-        // 首轮或 usage 缺失时由装配估算兜底。
-        let mut previous_context_tokens = None;
+        // ledger 按轮独立：每轮以空 usage 基线起步，首轮触发点由装配估算全额兜底。
+        self.ledger = ContextLedger::new();
         self.session.append_message(user_message(input))?;
 
         let mut preferences = ModelPreferences::default();
@@ -699,7 +703,6 @@ impl Agent {
                 spec.turn = outcome.turns;
                 let response = match self.run_turn(
                     &spec,
-                    previous_context_tokens,
                     &mut outcome,
                     events,
                     cancellation,
@@ -725,10 +728,7 @@ impl Agent {
                     );
                 }
                 outcome.turns += 1;
-                previous_context_tokens = response
-                    .usage
-                    .usage_present
-                    .then_some(response.usage.total_tokens);
+                self.ledger.record_usage(&response.usage);
                 record_usage(&mut outcome, &response.usage);
                 let assistant_text = response
                     .assistant_message
@@ -836,12 +836,18 @@ impl Agent {
         // 强制溢出恢复是显式模式：provider 已拒绝该请求时，不保留正常
         // 近期内容比例。
         budget.retain_ratio = 0.0;
-        let tokens_before = self.assembled_context_estimate()?;
+        let tokens_before = self
+            .ledger
+            .estimate()
+            .unwrap_or(self.assembled_context_estimate()?);
         match self
             .compaction
             .compact(&mut self.session, &budget, tokens_before, cancellation)
         {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                self.ledger.invalidate();
+                Ok(result)
+            }
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
             }
@@ -863,10 +869,16 @@ impl Agent {
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        let tokens_before = self.assembled_context_estimate()?;
-        self.compaction
+        let tokens_before = self
+            .ledger
+            .estimate()
+            .unwrap_or(self.assembled_context_estimate()?);
+        let result = self
+            .compaction
             .compact(&mut self.session, &budget, tokens_before, cancellation)
-            .map_err(AgentError::Compaction)
+            .map_err(AgentError::Compaction)?;
+        self.ledger.invalidate();
+        Ok(result)
     }
 
     /// 以正常请求同一装配 seam 重建当前上下文并估算规模：压缩前记录的
@@ -1076,7 +1088,6 @@ impl Agent {
     fn prepare_request(
         &mut self,
         spec: &TurnRequestSpec,
-        previous_context_tokens: Option<u64>,
         outcome: &mut AgentOutcome,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
@@ -1084,7 +1095,8 @@ impl Agent {
         let (mut request, assembled_estimate) = self.build_request(spec)?;
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        let compaction_tokens = previous_context_tokens.unwrap_or(assembled_estimate);
+        // 唯一计量：usage 基线 + 尾部增量；首轮或 usage 缺失时由装配估算兜底。
+        let compaction_tokens = self.ledger.estimate().unwrap_or(assembled_estimate);
         if self.compaction.should_compact(compaction_tokens, &budget) {
             match self.compaction.compact(
                 &mut self.session,
@@ -1095,6 +1107,7 @@ impl Agent {
                 Ok(result) => {
                     record_compaction(outcome, &result);
                     if matches!(result, CompactionOutcome::Compacted { .. }) {
+                        self.ledger.invalidate();
                         request = self.rebuild_request(spec)?;
                     }
                 }
@@ -1122,19 +1135,12 @@ impl Agent {
     fn run_turn(
         &mut self,
         spec: &TurnRequestSpec,
-        previous_context_tokens: Option<u64>,
         outcome: &mut AgentOutcome,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
-        let mut request = match self.prepare_request(
-            spec,
-            previous_context_tokens,
-            outcome,
-            events,
-            cancellation,
-        ) {
+        let mut request = match self.prepare_request(spec, outcome, events, cancellation) {
             Ok(request) => request,
             Err(error) => return AttemptOutcome::Failed(error),
         };
@@ -1300,6 +1306,10 @@ impl Agent {
             return Err(self
                 .fail_after_progress(AgentError::Session(error), outcome.clone())
                 .expect_err("session errors cannot abort"));
+        }
+        // 上报之后追加的条目进入 ledger 尾部增量（下一轮请求前压缩判定计入）。
+        if let Some(entry) = self.session.entries().last() {
+            self.ledger.record_appended(entry);
         }
         Ok(())
     }
