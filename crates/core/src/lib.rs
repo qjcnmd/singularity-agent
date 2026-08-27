@@ -49,7 +49,8 @@ pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("output");
-    let temporary = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+    // UUID 临时名：同一进程内并发替换同一目标（或近似名）不会互相覆盖。
+    let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let write_result = (|| -> std::io::Result<()> {
         let mut handle = create_owner_only_file(&temporary)?;
         handle.write_all(bytes)?;

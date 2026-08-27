@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52"

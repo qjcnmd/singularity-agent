@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use serde_json::Value;
@@ -256,47 +256,16 @@ fn read_bounded_session_line<R: BufRead>(
 }
 
 pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
-    let serialized: Vec<String> = entries
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<_, _>>()?;
-    let parent = file.parent().unwrap_or_else(|| Path::new("."));
-    let name = file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("session.jsonl");
-    let temporary = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4().simple()));
-    let mut handle = singularity_core::create_owner_only_file(&temporary).map_err(|error| {
-        SessionError::Repair {
-            context: "could not create temporary session file".to_string(),
-            source: error,
-        }
-    })?;
-    let write_result = (|| -> std::io::Result<()> {
-        for line in &serialized {
-            handle.write_all(line.as_bytes())?;
-            handle.write_all(b"\n")?;
-        }
-        handle.flush()?;
-        handle.sync_all()?;
-        Ok(())
-    })();
-    drop(handle);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(SessionError::Repair {
-            context: "could not write temporary session file".to_string(),
-            source: error,
-        });
+    // 序列化后委托共享原子替换原语：与工具层（edit/write）同一安全管道。
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json::to_writer(&mut bytes, entry)?;
+        bytes.push(b'\n');
     }
-    if let Err(error) = singularity_core::atomic_replace(&temporary, file) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(SessionError::Repair {
-            context: "could not atomically replace session file".to_string(),
-            source: error,
-        });
-    }
-    Ok(())
+    singularity_core::atomic_replace_bytes(file, &bytes).map_err(|error| SessionError::Repair {
+        context: "could not atomically replace session file".to_string(),
+        source: error,
+    })
 }
 
 pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {
