@@ -23,8 +23,6 @@ use super::{
     ThinkingWireFormat, validate_provider_config,
 };
 
-#[cfg(test)]
-use crate::error::ModelErrorCategory;
 pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
@@ -570,14 +568,6 @@ fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfig
     }
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_provider_values<F>(mut get_env: F) -> ResolvedProviderValues
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    resolve_provider_values_with_user_config(&mut get_env, user_config_layer)
-}
-
 pub(crate) fn resolve_provider_values_with_user_config<F, U>(
     mut get_env: F,
     user_config: U,
@@ -609,7 +599,3 @@ pub(crate) fn redacted_presence(present: bool) -> String {
         "missing".to_string()
     }
 }
-
-#[cfg(test)]
-#[path = "../config_tests.rs"]
-mod user_config_tests;

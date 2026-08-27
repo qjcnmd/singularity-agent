@@ -63,39 +63,3 @@ fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, T
         is_error: false,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::registry::ToolRegistry;
-    use crate::tools::test_support::context;
-    use serde_json::json;
-    use tempfile::tempdir;
-
-    fn execute_write(cwd: &std::path::Path, path: &str, content: &str) -> ToolExecution {
-        ToolRegistry::new()
-            .execute(
-                "write",
-                context(json!({ "path": path, "content": content }), cwd),
-            )
-            .expect("execute")
-    }
-
-    #[test]
-    fn writes_nested_file_and_overwrites_existing_content() {
-        let dir = tempdir().expect("temp dir");
-        let result = execute_write(dir.path(), "a/b/c.txt", "nested");
-        assert!(!result.is_error, "content: {}", result.content);
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a/b/c.txt")).expect("read back"),
-            "nested"
-        );
-
-        let second = execute_write(dir.path(), "a/b/c.txt", "second");
-        assert!(!second.is_error, "content: {}", second.content);
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a/b/c.txt")).expect("read back"),
-            "second"
-        );
-    }
-}

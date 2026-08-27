@@ -14,6 +14,7 @@ plan/
 .codex/
 .pi-subagents/
 .qoder/
+.serena/
 .zcode/
 .worktrees/
 
@@ -40,3 +41,4 @@ __pycache__/
 
 # 执行计划与摘要（过程记录，不入库）
 docs/plans/
+docs/research/

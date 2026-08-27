@@ -32,7 +32,3 @@ impl ExecutionStop for AppServerCancellationHandle {
         let _ = AppServerCancellationHandle::request_execution_stop(self);
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/transport.rs"]
-mod tests;

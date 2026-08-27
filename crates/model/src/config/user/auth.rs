@@ -93,12 +93,6 @@ pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, Provid
     Ok(auth)
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn ensure_private_secret_file(path: &Path) -> Result<(), ProviderError> {
-    let file = open_user_config_file(path, true)?;
-    ensure_private_secret_handle(&file)
-}
-
 pub(crate) fn open_user_config_file(
     path: &Path,
     private: bool,
@@ -181,4 +175,47 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
 pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
     ensure_no_reparse_point(directory, false)?;
     Ok(directory.join(USER_AUTH_FILE_NAME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_auth_is_rejected_before_parsing() {
+        let directory = tempfile::tempdir().expect("temporary user config directory");
+        let path = directory.path().join(USER_AUTH_FILE_NAME);
+        std::fs::write(&path, "x".repeat(crate::MAX_CONFIG_AUTH_FILE_BYTES + 1))
+            .expect("write oversized auth file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict auth file to owner");
+        }
+
+        let error = read_private_auth_file(&path).expect_err("oversized auth must fail closed");
+        assert_eq!(
+            error.error.message,
+            "user provider auth exceeds the size limit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_auth_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary user config directory");
+        let path = directory.path().join(USER_AUTH_FILE_NAME);
+        std::fs::write(&path, r#"{"schema_version":1,"providers":{}}"#).expect("write auth file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make auth file group-readable");
+
+        let error = read_private_auth_file(&path).expect_err("shared auth file must fail closed");
+        assert_eq!(
+            error.error.message,
+            "user provider auth file is not owner-only"
+        );
+    }
 }

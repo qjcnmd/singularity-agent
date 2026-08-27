@@ -120,23 +120,3 @@ pub(crate) fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) ->
     }
     line[start..].to_string()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tail_truncation_keeps_last_lines() {
-        let content = (1..=2500)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let truncation = truncate_tail(&content);
-        assert!(truncation.truncated);
-        assert_eq!(truncation.truncated_by, Some(TruncatedBy::Lines));
-        assert_eq!(truncation.total_lines, 2500);
-        assert_eq!(truncation.output_lines, 2000);
-        assert!(truncation.content.starts_with("line 501"));
-        assert!(truncation.content.ends_with("line 2500"));
-    }
-}

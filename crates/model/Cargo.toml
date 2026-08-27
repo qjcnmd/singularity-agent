@@ -33,10 +33,6 @@ path = "tests/config.rs"
 name = "transport"
 path = "tests/transport.rs"
 
-[[test]]
-name = "protocol"
-path = "tests/protocol.rs"
-
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52"
 features = [

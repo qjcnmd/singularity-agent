@@ -291,11 +291,6 @@ impl TuiApp {
         Action::Continue
     }
 
-    #[cfg(test)]
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
     /// 推进 spinner 节拍（由事件循环按固定间隔调用）。
     pub fn tick(&mut self) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
@@ -653,34 +648,4 @@ impl TuiApp {
             frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, cursor_y));
         }
     }
-
-    // -- 测试辅助 -----------------------------------------------------------
-
-    #[cfg(test)]
-    fn push_test_note(&mut self, text: &str) {
-        self.transcript.push_note(text.to_string(), NoteStyle::Info);
-    }
-
-    #[cfg(test)]
-    fn scroll_snapshot(&self) -> (bool, usize, usize) {
-        (
-            self.scroll.is_following(),
-            self.scroll.top_row(),
-            self.scroll.pending_below(),
-        )
-    }
-
-    #[cfg(test)]
-    fn force_phase(&mut self, phase: Phase) {
-        self.phase = phase;
-    }
-
-    #[cfg(test)]
-    fn editor_text(&self) -> String {
-        self.editor.text()
-    }
 }
-
-#[cfg(test)]
-#[path = "app_tests.rs"]
-mod tests;

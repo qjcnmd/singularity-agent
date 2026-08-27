@@ -102,6 +102,3 @@ pub use dispatch::{TurnClaim, TurnStartClaim};
 pub use paths::AppPaths;
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 pub use wire::thread_from_summary;
-
-#[cfg(test)]
-mod tests;

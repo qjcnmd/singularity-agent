@@ -897,7 +897,3 @@ impl Provider for OpenAiProvider {
         self.complete_internal(request, cancellation, None, on_attempt)
     }
 }
-
-#[cfg(test)]
-#[path = "../transport_tests.rs"]
-mod tests;

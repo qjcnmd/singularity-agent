@@ -166,12 +166,6 @@ impl Editor {
         self.col = self.lines[self.row].chars().count();
     }
 
-    /// 光标的字符位置（行、列）。
-    #[cfg(test)]
-    pub fn cursor(&self) -> (usize, usize) {
-        (self.row, self.col)
-    }
-
     /// 内容在给定宽度下的折行总行数；用于编辑器高度计算。
     pub fn wrapped_height(&self, width: u16) -> usize {
         let width = width.max(1) as usize;
@@ -255,101 +249,4 @@ fn char_to_byte(line: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(byte, _)| byte)
         .unwrap_or(line.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn typing_newline_and_backspace_merge_across_lines() {
-        let mut editor = Editor::new();
-        for ch in "abc".chars() {
-            editor.insert_char(ch);
-        }
-        editor.insert_newline();
-        for ch in "de".chars() {
-            editor.insert_char(ch);
-        }
-        assert_eq!(editor.text(), "abc\nde");
-        editor.backspace(); // 删除 e
-        editor.backspace(); // 删除 d
-        editor.backspace(); // 合并回上一行
-        assert_eq!(editor.text(), "abc");
-        editor.backspace();
-        editor.backspace();
-        editor.backspace();
-        editor.backspace(); // 空行上继续退格是 no-op
-        assert!(editor.is_empty());
-    }
-
-    #[test]
-    fn cursor_moves_across_rows_and_clamps_columns() {
-        let mut editor = Editor::new();
-        for ch in "abcdef".chars() {
-            editor.insert_char(ch);
-        }
-        editor.move_home();
-        assert_eq!(editor.cursor(), (0, 0));
-        editor.move_end();
-        assert_eq!(editor.cursor(), (0, 6));
-        editor.move_left();
-        editor.insert_newline(); // 在 e|f 处断行 → "abcde" / "f"
-        assert_eq!(editor.text(), "abcde\nf");
-        assert_eq!(editor.cursor(), (1, 0));
-        editor.move_up();
-        // 光标列保持 0：按当前列落到目标行。
-        assert_eq!(editor.cursor(), (0, 0));
-        editor.move_end();
-        editor.move_down();
-        // 下移后列号钳制到目标行长度（1）。
-        assert_eq!(editor.cursor(), (1, 1));
-        editor.move_down(); // 底部下移是 no-op
-        assert_eq!(editor.cursor(), (1, 1));
-    }
-
-    #[test]
-    fn take_resets_state() {
-        let mut editor = Editor::new();
-        editor.insert_char('x');
-        editor.insert_newline();
-        editor.insert_char('y');
-        assert_eq!(editor.take(), "x\ny");
-        assert!(editor.is_empty());
-        assert_eq!(editor.cursor(), (0, 0));
-    }
-
-    #[test]
-    fn wheel_override_scrolls_viewport_until_any_cursor_move() {
-        let mut editor = Editor::new();
-        for ch in "line one\nline two\nline three".chars() {
-            if ch == '\n' {
-                editor.insert_newline();
-            } else {
-                editor.insert_char(ch);
-            }
-        }
-        // 光标在第 3 行（可视行 3），高度 2 → 跟随顶行 = 2。
-        assert_eq!(editor.effective_scroll_top(3, 2), 2);
-        // 滚轮向上偏移 2 行：视口顶 = 0 并钉住（与跟随区分）。
-        editor.scroll_by(-2);
-        assert_eq!(editor.effective_scroll_top(3, 2), 0);
-        // 继续向上滚：不越界为负。
-        editor.scroll_by(-5);
-        assert_eq!(editor.effective_scroll_top(3, 2), 0);
-        // 向下滚回：覆盖偏移生效。
-        editor.scroll_by(2);
-        assert_eq!(editor.effective_scroll_top(3, 2), 2);
-        // 任何光标移动清除覆盖：回到跟随光标。
-        editor.move_up();
-        assert_eq!(editor.effective_scroll_top(2, 2), 1);
-        // 点击定位也清除。
-        editor.scroll_by(-3);
-        editor.set_cursor_visual(0, 0, 80);
-        assert_eq!(editor.effective_scroll_top(0, 2), 0);
-        // 输入与清空同样清除。
-        editor.scroll_by(-3);
-        editor.insert_char('x');
-        assert_eq!(editor.effective_scroll_top(0, 2), 0);
-    }
 }

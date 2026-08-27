@@ -201,19 +201,6 @@ impl AppServer {
         }
     }
 
-    /// 仅测试：以固定 provider 取代快照解析结果。
-    #[cfg(test)]
-    pub(crate) fn with_test_provider(
-        mut self,
-        provider: Arc<dyn singularity_runtime::Provider + Send + Sync>,
-    ) -> Self {
-        self.turn_runner = Arc::new(
-            TurnRunner::new(self.sessions_dir.clone(), self.provider_snapshot.clone())
-                .with_provider_override(provider),
-        );
-        self
-    }
-
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }

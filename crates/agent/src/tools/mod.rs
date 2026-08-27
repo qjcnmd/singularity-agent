@@ -21,19 +21,3 @@ mod walk;
 pub use registry::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry, ToolSpec,
 };
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use std::path::Path;
-
-    /// 测试用 `ExecuteContext`：无取消信号、无流式回调。
-    pub(crate) fn context<'a>(args: serde_json::Value, cwd: &'a Path) -> ExecuteContext<'a> {
-        ExecuteContext {
-            args,
-            cwd,
-            signal: None,
-            on_update: None,
-        }
-    }
-}
