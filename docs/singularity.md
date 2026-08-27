@@ -19,7 +19,7 @@
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
-  - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
+  - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
   - `session` 子系统：严格 JSONL v2（format/file/manager/context/repair）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
@@ -67,7 +67,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 ## 3. Compaction（请求前两道闸门）
 
-- **第一道（请求前主动）**：每轮成功响应后保存其真实 provider usage，下一请求发出前优先以该值对比 `context_window − reserve_tokens`；首轮或 usage 缺失时使用本轮装配估算，估算覆盖消息、工具 schema、reasoning replay 的序列化尺寸、`max_output_tokens` 预算与固定封装余量。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
+- **第一道（请求前主动）**：[`ContextLedger`] 每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时使用本轮完整装配估算，估算覆盖消息、工具 schema、reasoning replay 的序列化尺寸、`max_output_tokens` 预算与固定封装余量。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
 - **第二道（Provider 精确拒绝后）**：非 2xx body 有界读取并结构化解析，**仅当** `error.code == "context_length_exceeded"` 时分类为 `ContextLengthExceeded`（不可重试）；此时以 ContextOverflow 原因强制压缩一次并同轮重试（重试基于压缩后会话重新装配请求）；二次失败原样返回。其余错误体保持状态码分类并附有界脱敏短诊断。
 - 切点策略：从最新往回累积至保留预算（retain_ratio），取其后最近合法切点；toolResult 永不作切点且 ToolCall/ToolResult 成对保留；尾部跨预算时回退到当前轮起点——摘要更早历史，当前轮完整保留；只有当前轮即全部历史时才返回 NotNeeded。
 - 摘要调用的 usage 计入 turn 总量；强制压缩的 tokensBefore 取真实重建估算。
@@ -77,12 +77,12 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 - 固定注册 read/glob/grep/bash/edit/write 六工具；多工具批按模型给定顺序串行，`parallel_tool_calls` 恒 false。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include 按 basename 过滤；上限 500 条。
 - **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
-- **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。
-- **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂；进程内按 canonical path 登记变更（`FileMutationQueue`，canonicalize 失败回退词法规范绝对路径），作为本进程「写后读一致」与未来并发执行的单点事实；跨进程工作区协调不做（与 Codex/pi 一致，属已知限制）。
+- **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
+- **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂。跨进程工作区协调不做（与 Codex/pi 一致，属已知限制）。
 
 ## 5. 会话持久化与恢复
 
-- 严格 JSONL v1：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started/completed/failed/interrupted、thread_settings、thread_name、usage）不进入模型上下文；runtime 与 app-server 共用同一只读投影 API。
+- 严格 JSONL v2：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；runtime 与 app-server 共用同一只读投影 API。
 - 列表、存在性检查、设置基线与读取头字段均按需扫描或读取 JSONL；摘要统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
@@ -92,7 +92,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 ## 6. Provider 与模型
 
 - 运行时解析只取用户配置持久化值或进程环境层（`SINGULARITY_MODEL/SINGULARITY_BASE_URL/SINGULARITY_API_KEY/...` 任一出现即整体短路用户配置）；环境层下 api_protocol 由 base_url 是否以 `/responses` 结尾推断，用户配置层必须显式声明 api_protocol。
-- Chat SSE：仅按序 visible content delta 上抛；可见 delta 后禁止自动重试。Responses 协议独立 wire。传输层每次 complete 只执行一个 HTTP attempt，并把类型化错误与最多 60 秒的 Retry-After 交给 Agent 层；Agent 层最多重试 3 次，采用可取消的指数退避抖动并优先遵循 Retry-After。
+- Chat SSE：仅按序 visible content delta 上抛；可见 delta 后禁止自动重试。Responses 协议独立 wire。传输层每次 complete 只执行一个 HTTP attempt，并把类型化错误与最多 60 秒的 Retry-After 交给 Agent 层；Agent 层最多重试 3 次，采用可取消的指数退避、真实随机 ±10% 抖动并优先遵循 Retry-After。
 - 错误：非 2xx body 有界读取（≤8 MiB）；结构化解析仅精确识别 context_length_exceeded；普通错误附 ≤256 字符单行化短诊断，命中敏感文本或凭据形态整体替换固定文案；凭据绝不进入错误文本或任何输出。
 
 ## 7. 评估（外部黑盒评估器）
