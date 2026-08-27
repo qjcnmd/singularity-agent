@@ -466,7 +466,7 @@ impl CompactionEngine {
                     file_ops.read.insert(file);
                 }
                 for file in modified_files {
-                    file_ops.edited.insert(file);
+                    file_ops.modified.insert(file);
                 }
                 Some(compaction.summary.clone())
             }
@@ -883,12 +883,18 @@ fn format_tool_call_args(args: &Value) -> String {
 #[derive(Default)]
 struct FileOps {
     read: BTreeSet<String>,
-    written: BTreeSet<String>,
-    edited: BTreeSet<String>,
+    modified: BTreeSet<String>,
 }
 
 /// 从 Assistant 消息的 ToolCall 内容块中提取文件操作路径。
 fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps) {
+    if let Some(summary) = message.file_operations() {
+        file_ops.read.extend(summary.files_read.iter().cloned());
+        file_ops
+            .modified
+            .extend(summary.files_modified.iter().cloned());
+        return;
+    }
     if message.role() != AgentMessageRole::Assistant {
         return;
     }
@@ -896,39 +902,24 @@ fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps)
         let ContentBlock::ToolCall { name, args, .. } = block else {
             continue;
         };
-        let Some(path) = args.get("path").and_then(Value::as_str) else {
+        let Some(summary) = crate::message::file_operation_summary(name, args) else {
             continue;
         };
-        match name.as_str() {
-            "read" => {
-                file_ops.read.insert(path.to_string());
-            }
-            "write" => {
-                file_ops.written.insert(path.to_string());
-            }
-            "edit" => {
-                file_ops.edited.insert(path.to_string());
-            }
-            _ => {}
-        }
+        file_ops.read.extend(summary.files_read);
+        file_ops.modified.extend(summary.files_modified);
     }
 }
 
 /// 根据操作集合计算最终读取与修改的文件列表（修改列表为 edited ∪ written；读取列表剔除已修改文件）。
 fn compute_file_lists(file_ops: &FileOps) -> (Vec<String>, Vec<String>) {
-    let modified: BTreeSet<String> = file_ops
-        .edited
-        .iter()
-        .chain(file_ops.written.iter())
-        .cloned()
-        .collect();
+    let modified = &file_ops.modified;
     let read_files: Vec<String> = file_ops
         .read
         .iter()
         .filter(|file| !modified.contains(*file))
         .cloned()
         .collect();
-    (read_files, modified.into_iter().collect())
+    (read_files, modified.iter().cloned().collect())
 }
 
 /// 将文件列表格式化为 XML 标签块（`<read-files>` 与 `<modified-files>`）。

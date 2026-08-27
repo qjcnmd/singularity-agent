@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
+pub(crate) const NAME: &str = "write";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,7 +31,7 @@ pub(crate) fn parameters() -> Value {
 
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
-        name: "write",
+        name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
         prepare: |raw| super::registry::prepare_typed(raw, execute),

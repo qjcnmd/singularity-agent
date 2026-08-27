@@ -48,6 +48,16 @@ pub enum ContentBlock {
     },
 }
 
+/// 文件工具调用在会话中的类型化摘要，供压缩直接消费。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileOperationSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_modified: Vec<String>,
+}
+
 impl ContentBlock {
     pub(crate) fn from_model_tool_call(call: &ModelToolCall) -> Self {
         Self::ToolCall {
@@ -108,6 +118,8 @@ pub enum AgentMessage {
         /// 工具执行是否失败标志。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_operations: Option<FileOperationSummary>,
     },
 }
 
@@ -129,6 +141,7 @@ impl AgentMessage {
                 tool_call_id: None,
                 tool_name: None,
                 is_error: None,
+                file_operations: None,
             },
         }
     }
@@ -219,6 +232,16 @@ impl AgentMessage {
         }
     }
 
+    /// 文件工具调用摘要；仅新写入的相关 toolResult 消息携带。
+    pub fn file_operations(&self) -> Option<&FileOperationSummary> {
+        match self {
+            Self::ToolResult {
+                file_operations, ..
+            } => file_operations.as_ref(),
+            _ => None,
+        }
+    }
+
     /// provider 推理重放；仅 assistant 消息携带。
     pub fn provider_reasoning_replay(&self) -> Option<&ProviderReasoningReplay> {
         match self {
@@ -291,6 +314,7 @@ pub(crate) fn reasoning_text_from_replay(replay: &[ProviderReasoningReplay]) -> 
 pub(crate) fn tool_result_message(
     tool_call_id: &str,
     tool_name: &str,
+    arguments: &serde_json::Value,
     execution: &ToolExecution,
 ) -> AgentMessage {
     AgentMessage::ToolResult {
@@ -300,5 +324,24 @@ pub(crate) fn tool_result_message(
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
+        file_operations: file_operation_summary(tool_name, arguments),
+    }
+}
+
+pub(crate) fn file_operation_summary(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<FileOperationSummary> {
+    let path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    match tool_name {
+        crate::tools::read::NAME => Some(FileOperationSummary {
+            files_read: vec![path.to_string()],
+            files_modified: Vec::new(),
+        }),
+        crate::tools::write::NAME | crate::tools::edit::NAME => Some(FileOperationSummary {
+            files_read: Vec::new(),
+            files_modified: vec![path.to_string()],
+        }),
+        _ => None,
     }
 }

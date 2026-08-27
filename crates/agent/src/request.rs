@@ -22,7 +22,9 @@ use crate::session::SessionEntry;
 use crate::session::context::entry_to_llm_messages;
 use crate::tools::ToolRegistry;
 
-use super::events::{AgentDiagnostic, AgentEvent, AgentEvents, emit, emit_diagnostic};
+use super::events::{
+    AgentDiagnostic, AgentEvent, AgentEvents, diagnostic_code, emit, emit_diagnostic,
+};
 use super::{Agent, AgentError, Result};
 
 /// Agent 层重试上限：模型调用返回可重试错误时，在此层指数退避重试。
@@ -106,7 +108,7 @@ pub(crate) fn send_with_retry(
                     emit_diagnostic(
                         events,
                         AgentDiagnostic::info(
-                            "provider_retry_scheduled",
+                            diagnostic_code::PROVIDER_RETRY_SCHEDULED,
                             format!(
                                 "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
                                 error.error.message,
@@ -219,7 +221,7 @@ impl Agent {
                     emit_diagnostic(
                         events,
                         AgentDiagnostic::warning(
-                            "compaction_skipped",
+                            diagnostic_code::COMPACTION_SKIPPED,
                             "automatic context compaction skipped".to_string(),
                         ),
                     );

@@ -8,7 +8,6 @@ use crate::openai::chat::{
 };
 use crate::provider::contract::{
     ProviderProtocolContract, message_text, provider_response_validation_error,
-    request_uses_tool_protocol,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
 use crate::types::{
@@ -34,6 +33,7 @@ pub fn openai_responses_request_payload(
         "stream": false,
         "store": false,
     });
+    let reasoning = super::reasoning_wire_decision(request, capabilities, wire);
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
@@ -62,16 +62,13 @@ pub fn openai_responses_request_payload(
             payload["parallel_tool_calls"] = json!(false);
         }
     }
-    if wire.reasoning_enabled {
-        let Some(wire_effort) = wire.wire_reasoning_effort.as_deref() else {
+    if reasoning.enabled {
+        let Some(wire_effort) = reasoning.effort else {
             return payload;
         };
         payload["reasoning"] = json!({"effort": wire_effort});
         payload["include"] = json!(["reasoning.encrypted_content"]);
-    } else if wire.reasoning_disabled
-        || (request_uses_tool_protocol(request)
-            && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls)
-    {
+    } else if reasoning.disabled || reasoning.disabled_for_tool_calls {
         payload["reasoning"] = json!({"effort": "none"});
     }
     payload
@@ -358,9 +355,7 @@ pub fn openai_responses_input(
                 if let Some(ProviderReasoningReplay::Responses {
                     items: replay_items,
                     ..
-                }) = reasoning_history
-                    .iter()
-                    .find(|replay| replay.matches_tool_call_ids(&call_ids))
+                }) = super::matching_reasoning_replay(reasoning_history, &call_ids)
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {

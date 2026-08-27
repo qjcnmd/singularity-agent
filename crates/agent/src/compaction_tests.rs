@@ -29,6 +29,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
+        file_operations: None,
     }
 }
 
@@ -42,6 +43,25 @@ fn file_call(tool_name: &str, path: &str) -> AgentMessage {
         stop_reason: None,
         provider_reasoning_replay: None,
     }
+}
+
+#[test]
+fn new_tool_results_supply_typed_file_operation_summaries() {
+    let message = AgentMessage::ToolResult {
+        content: Vec::new(),
+        tool_call_id: Some("call-file".to_string()),
+        tool_name: Some(crate::tools::read::NAME.to_string()),
+        is_error: Some(false),
+        file_operations: Some(crate::message::FileOperationSummary {
+            files_read: vec!["src/lib.rs".to_string()],
+            files_modified: Vec::new(),
+        }),
+    };
+    let mut file_ops = FileOps::default();
+    extract_file_ops_from_message(&message, &mut file_ops);
+    let (read, modified) = compute_file_lists(&file_ops);
+    assert_eq!(read, ["src/lib.rs"]);
+    assert!(modified.is_empty());
 }
 
 fn message_entry(message: AgentMessage) -> SessionEntry {
@@ -469,6 +489,7 @@ fn ledger_large_tool_result_triggers_compaction() {
         tool_call_id: Some("call-1".to_string()),
         tool_name: None,
         is_error: None,
+        file_operations: None,
     });
     ledger.record_appended(&big);
     let estimate = ledger.estimate().expect("usage baseline present");

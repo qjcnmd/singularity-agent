@@ -13,6 +13,7 @@ use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
 const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
+pub(crate) const NAME: &str = "read";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +38,7 @@ pub(crate) fn parameters() -> Value {
 
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
-        name: "read",
+        name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
         prepare: |raw| super::registry::prepare_typed(raw, execute),

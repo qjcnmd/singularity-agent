@@ -5,13 +5,12 @@ use serde_json::{Value, json};
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::contract::{
     ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
-    provider_response_validation_error, request_uses_tool_protocol, validate_model_turn_response,
+    provider_response_validation_error, validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, ProviderReasoningReplay,
-    ProviderToolReasoningMode,
 };
 
 pub fn openai_request_payload(
@@ -40,6 +39,7 @@ pub fn openai_request_payload(
             .collect::<Vec<_>>(),
         "stream": false,
     });
+    let reasoning = super::reasoning_wire_decision(request, capabilities, wire);
     // 输出上限 wire 字段取舍：chat completions 走 `max_tokens`（第三方兼容
     // 端点如 DeepSeek/dashscope 接受），responses 走 `max_output_tokens`
     // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
@@ -48,12 +48,12 @@ pub fn openai_request_payload(
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
     }
-    if wire.reasoning_enabled {
+    if reasoning.enabled {
         apply_thinking_wire(&mut payload, true, wire.thinking_wire_format);
-        if let Some(wire_effort) = wire.wire_reasoning_effort.as_deref() {
+        if let Some(wire_effort) = reasoning.effort {
             payload["reasoning_effort"] = json!(wire_effort);
         }
-    } else if wire.reasoning_disabled {
+    } else if reasoning.disabled {
         apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
     }
     if !request.tools.is_empty() {
@@ -70,9 +70,7 @@ pub fn openai_request_payload(
             payload["parallel_tool_calls"] = json!(false);
         }
     }
-    if request_uses_tool_protocol(request)
-        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
-    {
+    if reasoning.disabled_for_tool_calls {
         apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
     }
     payload
@@ -634,9 +632,7 @@ fn openai_message_payload_with_reasoning(
             .collect::<Vec<_>>();
         if let Some(ProviderReasoningReplay::Chat {
             reasoning_content, ..
-        }) = reasoning_history
-            .iter()
-            .find(|replay| replay.matches_tool_call_ids(&call_ids))
+        }) = super::matching_reasoning_replay(reasoning_history, &call_ids)
         {
             payload["reasoning_content"] = json!(reasoning_content);
         }

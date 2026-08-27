@@ -24,6 +24,7 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent,
     ProviderAttemptStatus as ModelProviderAttemptStatus, ProviderConfigSnapshot,
 };
+use singularity_protocol::diagnostic_code;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
@@ -39,7 +40,6 @@ use crate::objects::{
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
-const PROJECT_INSTRUCTIONS_TRUNCATED_CODE: &str = "project_instructions_truncated";
 const PROJECT_INSTRUCTIONS_TRUNCATED_NOTE: &str = "\n\n[warning] project instructions were truncated because they exceeded the size budget; content beyond the cut was not included.";
 
 /// 一次 turn 执行的输入。
@@ -193,14 +193,15 @@ impl TurnRunner {
         cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, String> {
         workspace_path(thread)?;
+        let registry = tool_registry();
         let (provider, config, _) = self
-            .resolve_agent_runtime(thread)
+            .resolve_agent_runtime(thread, &registry)
             .map_err(|error| error.to_string())?;
         let session = self
             .open_and_repair_session(thread)
             .map_err(|error| error.to_string())?;
-        let mut agent = Agent::new(provider, ToolRegistry::new(), config, session)
-            .map_err(|error| error.to_string())?;
+        let mut agent =
+            Agent::new(provider, registry, config, session).map_err(|error| error.to_string())?;
         agent
             .compact_now(cancellation)
             .map_err(|error| error.to_string())
@@ -227,8 +228,9 @@ impl TurnRunner {
             cause: TurnFailureCause::Workspace,
             message,
         })?;
+        let registry = tool_registry();
         let (provider, config, instructions_truncated) = self
-            .resolve_agent_runtime(&thread)
+            .resolve_agent_runtime(&thread, &registry)
             .map_err(|error| TurnRunError::Preparation {
                 cause: error.cause,
                 message: error.to_string(),
@@ -246,7 +248,7 @@ impl TurnRunner {
             }
         })?;
         let mut agent = self
-            .prepare_agent(&turn_id, session, provider, config, controls)
+            .prepare_agent(&turn_id, session, provider, registry, config, controls)
             .map_err(|error| TurnRunError::Preparation {
                 cause: TurnFailureCause::Internal,
                 message: error,
@@ -264,7 +266,7 @@ impl TurnRunner {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
                 severity: AgentDiagnosticSeverity::Warning,
-                code: PROJECT_INSTRUCTIONS_TRUNCATED_CODE.to_string(),
+                code: diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED.to_string(),
                 message:
                     "project instructions were truncated because they exceeded the size budget"
                         .to_string(),
@@ -371,6 +373,7 @@ impl TurnRunner {
     fn resolve_agent_runtime(
         &self,
         thread: &Thread,
+        registry: &ToolRegistry,
     ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool), PreparationFailure> {
         let provider: Arc<dyn Provider + Send + Sync> = {
             #[cfg(any(test, feature = "test-support"))]
@@ -391,7 +394,7 @@ impl TurnRunner {
             )
         };
         let (config, instructions_truncated) =
-            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot)?;
+            agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, registry)?;
         let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
         let config = AgentConfig::prepare_for_provider_limits(config, provider_max_output_tokens)
             .map_err(|error| PreparationFailure::internal(error.to_string()))?;
@@ -420,11 +423,12 @@ impl TurnRunner {
         turn_id: &str,
         session: SessionManager,
         provider: Arc<dyn Provider + Send + Sync>,
+        registry: ToolRegistry,
         config: AgentConfig,
         controls: &crate::conversation::TurnControls,
     ) -> Result<Agent, String> {
-        let agent = Agent::new(provider, ToolRegistry::new(), config, session)
-            .map_err(|error| error.to_string())?;
+        let agent =
+            Agent::new(provider, registry, config, session).map_err(|error| error.to_string())?;
         controls.register_inbox(turn_id, agent.inbox_handle());
         Ok(agent)
     }
@@ -761,6 +765,7 @@ fn agent_config_for_thread(
     thread: &Thread,
     provider: &dyn Provider,
     snapshot: &ProviderConfigSnapshot,
+    registry: &ToolRegistry,
 ) -> Result<(AgentConfig, bool), PreparationFailure> {
     let cwd = workspace_path(thread).map_err(|message| PreparationFailure {
         cause: TurnFailureCause::Workspace,
@@ -769,7 +774,7 @@ fn agent_config_for_thread(
     let cwd_path = std::path::Path::new(&cwd).to_path_buf();
     // 工具名单从 ToolRegistry 动态生成：提示词只列出工具名，完整定义由模型
     // 通过服务端 schema 获取。
-    let tool_names = ToolRegistry::new()
+    let tool_names = registry
         .names()
         .into_iter()
         .map(str::to_string)
@@ -820,4 +825,8 @@ fn agent_config_for_thread(
         },
         instructions_truncated,
     ))
+}
+
+fn tool_registry() -> ToolRegistry {
+    ToolRegistry::new()
 }

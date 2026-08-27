@@ -107,6 +107,7 @@ impl SessionManager {
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     is_error: Some(true),
+                    file_operations: None,
                 })?;
                 repaired += 1;
             }

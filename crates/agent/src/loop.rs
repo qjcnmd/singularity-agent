@@ -26,6 +26,7 @@ use singularity_model::{
 };
 use thiserror::Error;
 
+use self::events::diagnostic_code;
 pub use self::events::{AgentDiagnostic, AgentDiagnosticSeverity, AgentEvent, AgentEvents};
 pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
@@ -350,6 +351,7 @@ impl Agent {
                             tool_result_message(
                                 &call.tool_call_id,
                                 &call.tool_name,
+                                &call.arguments,
                                 &tool_error_execution(
                                     "model output was truncated before the tool call completed",
                                 ),
@@ -387,7 +389,12 @@ impl Agent {
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
                         self.append_session_or_fail(
                             &mut outcome,
-                            tool_result_message(&call.tool_call_id, &call.tool_name, execution),
+                            tool_result_message(
+                                &call.tool_call_id,
+                                &call.tool_name,
+                                &call.arguments,
+                                execution,
+                            ),
                         )?;
                     }
                     if cancellation.is_cancelled() {
@@ -444,7 +451,7 @@ impl Agent {
                 emit_diagnostic(
                     events,
                     AgentDiagnostic::warning(
-                        "compaction_failed",
+                        diagnostic_code::COMPACTION_FAILED,
                         "forced context compaction failed".to_string(),
                     ),
                 );
@@ -519,7 +526,7 @@ impl Agent {
                                 emit_diagnostic(
                                     events,
                                     AgentDiagnostic::warning(
-                                        "context_overflow_recovery_failed",
+                                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
                                         "forced compaction failed to recover from context overflow"
                                             .to_string(),
                                     ),

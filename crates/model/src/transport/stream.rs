@@ -55,13 +55,19 @@ impl SseFrameDecoder {
         }
         self.pending.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
+        let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(frames);
+        };
+        let tail = self.pending.split_off(last_newline + 1);
+        let complete = std::mem::replace(&mut self.pending, tail);
+        for terminated_line in complete.split_inclusive(|byte| *byte == b'\n') {
+            let mut line = terminated_line
+                .strip_suffix(b"\n")
+                .unwrap_or(terminated_line);
             if line.last() == Some(&b'\r') {
-                line.pop();
+                line = &line[..line.len() - 1];
             }
-            if let Some(frame) = self.process_line(&line, malformed)? {
+            if let Some(frame) = self.process_line(line, malformed)? {
                 frames.push(frame);
             }
         }
@@ -663,4 +669,29 @@ pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
         .validation_errors
         .push("provider_response_stream_too_large".to_string());
     ProviderError::from_model_error(error)
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn one_chunk_with_many_frames_is_split_in_source_order() {
+        let mut chunk = Vec::new();
+        for index in 0..4096 {
+            chunk.extend_from_slice(format!("data: {index}\n\n").as_bytes());
+        }
+        let frames = SseFrameDecoder::default()
+            .push(&chunk, provider_chat_stream_malformed_error)
+            .expect("decode frames");
+        assert_eq!(frames.len(), 4096);
+        assert_eq!(
+            frames.first().map(|frame| frame.data.as_slice()),
+            Some(b"0".as_slice())
+        );
+        assert_eq!(
+            frames.last().map(|frame| frame.data.as_slice()),
+            Some(b"4095".as_slice())
+        );
+    }
 }

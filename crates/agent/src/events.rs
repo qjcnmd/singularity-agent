@@ -8,6 +8,13 @@ use singularity_model::ProviderAttemptEvent;
 
 use crate::tools::ToolExecution;
 
+pub(crate) mod diagnostic_code {
+    pub const COMPACTION_FAILED: &str = "compaction_failed";
+    pub const COMPACTION_SKIPPED: &str = "compaction_skipped";
+    pub const CONTEXT_OVERFLOW_RECOVERY_FAILED: &str = "context_overflow_recovery_failed";
+    pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
+}
+
 /// 非致命运行时诊断的严重级别（AgentLoop 发射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

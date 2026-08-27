@@ -6,6 +6,7 @@
 
 use singularity_agent::session::{SessionManager, SessionMetadata, TurnTerminalStatus};
 use singularity_model::ModelUsage;
+use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
 use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
@@ -75,7 +76,7 @@ pub(crate) fn fail_stop_terminalization(
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         severity: AgentDiagnosticSeverity::Error,
-        code: "storage_fatal".to_string(),
+        code: diagnostic_code::STORAGE_FATAL.to_string(),
         message,
     });
 }
@@ -212,7 +213,7 @@ mod tests {
                     code,
                     severity: AgentDiagnosticSeverity::Error,
                     ..
-                }] if code == "storage_fatal"
+                }] if code == diagnostic_code::STORAGE_FATAL
             ),
             "fail-stop must emit exactly one storage_fatal diagnostic: {events:?}"
         );

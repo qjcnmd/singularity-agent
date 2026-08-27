@@ -24,6 +24,12 @@ pub mod event_method {
     pub const THREAD_SETTINGS_APPLIED: &str = "thread/settingsApplied";
 }
 
+/// runtime 直接发射的稳定诊断代码。
+pub mod diagnostic_code {
+    pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
+    pub const STORAGE_FATAL: &str = "storage_fatal";
+}
+
 /// runtime 与客户端共同消费的线程事件投影。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
