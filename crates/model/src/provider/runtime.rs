@@ -67,10 +67,21 @@ impl OpenAiProviderConfig {
             values.source,
         )?;
         let source = values.source;
+        // 与用户配置路径同源：未显式给限时按 catalog 解析模型限额（provider
+        // 标识取 env 可用值，缺省落 DEFAULT_PROVIDER_NAME），catalog 无条目
+        // 由 resolve_model_limits 落保守默认；env 模式本就无目录保证，不报错。
+        let (catalog_context, catalog_output) = match values.model_name.as_deref() {
+            Some(model_name) => {
+                let provider_name =
+                    values.provider_name.as_deref().unwrap_or(DEFAULT_PROVIDER_NAME);
+                crate::catalog::resolve_model_limits(provider_name, model_name)
+            }
+            None => (DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS),
+        };
         let max_context_limit = parse_provider_limit(
             values.context_tokens.as_deref(),
             ENV_CONTEXT_TOKENS,
-            DEFAULT_MAX_CONTEXT_TOKENS,
+            catalog_context,
             MAX_CONFIGURED_CONTEXT_TOKENS,
             source,
         )?;
@@ -78,7 +89,7 @@ impl OpenAiProviderConfig {
         let max_output_tokens = parse_provider_limit(
             values.max_output_tokens.as_deref(),
             ENV_MAX_OUTPUT_TOKENS,
-            DEFAULT_MAX_OUTPUT_TOKENS,
+            catalog_output,
             MAX_CONFIGURED_OUTPUT_TOKENS,
             source,
         )?;

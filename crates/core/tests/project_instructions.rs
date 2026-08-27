@@ -173,7 +173,8 @@ fn truncates_hierarchy_to_total_budget_and_stops() {
         .expect("over-budget hierarchy loads via truncation")
         .expect("instructions present");
 
-    // 前两个文件全部纳入，第三个文件被截断到剩余预算，之后停止。
+    // 前两个文件全部纳入，第三个文件被截断到剩余预算（分隔符计入预算），
+    // 之后停止。
     assert_eq!(
         loaded.content().matches('a').count(),
         per_file_bytes,
@@ -186,8 +187,11 @@ fn truncates_hierarchy_to_total_budget_and_stops() {
     );
     assert_eq!(
         loaded.content().matches('c').count(),
-        per_file_bytes - 2,
-        "cwd file limited to remaining total budget"
+        PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES
+            - per_file_bytes
+            - (per_file_bytes + 2)
+            - 2,
+        "cwd file limited to remaining total budget (two separators consumed)"
     );
     assert!(loaded.truncated(), "truncation fact must be observable");
 }
@@ -199,8 +203,9 @@ fn whitespace_only_instruction_files_do_not_consume_budget() {
     let first = workspace.join("first");
     let cwd = first.join("second");
     std::fs::create_dir_all(&cwd).expect("nested cwd");
-    // 根文件与 cwd 文件各占满单文件预算；中间只有空白字符的文件若被计入
-    // 预算，cwd 文件就会被截断——空白文件必须零成本跳过。
+    // 根文件占满单文件预算；中间只有空白字符的文件若被计入预算，cwd 文件
+    // 就会被截断——空白文件必须零成本跳过。cwd 文件大小恰好使
+    // 「根文件 + 分隔符 + cwd 文件」合计等于总预算。
     std::fs::write(
         workspace.join("AGENTS.md"),
         vec![b'a'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
@@ -209,7 +214,7 @@ fn whitespace_only_instruction_files_do_not_consume_budget() {
     std::fs::write(first.join("AGENTS.md"), "\n\n  ").expect("whitespace first agents");
     std::fs::write(
         cwd.join("AGENTS.md"),
-        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2],
     )
     .expect("cwd agents");
 
@@ -223,19 +228,20 @@ fn whitespace_only_instruction_files_do_not_consume_budget() {
     );
     assert_eq!(
         loaded.content().matches('b').count(),
-        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2,
         "cwd file fully incorporated"
     );
 }
 
 #[test]
-fn budget_exhaustion_skips_remaining_files() {
+fn exactly_filling_the_total_budget_does_not_mark_truncated() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let first = workspace.join("first");
     let cwd = first.join("second");
     std::fs::create_dir_all(&cwd).expect("nested cwd");
-    // 前两个文件各占满单文件预算，合计耗尽 64KB 总预算。
+    // 前两层文件连同分隔符恰好用尽 64KB 总预算；cwd 层只有空白文件。
+    // 没有任何内容被放弃时不得误报截断。
     std::fs::write(
         workspace.join("AGENTS.md"),
         vec![b'a'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
@@ -243,23 +249,65 @@ fn budget_exhaustion_skips_remaining_files() {
     .expect("root agents");
     std::fs::write(
         first.join("AGENTS.md"),
-        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2],
     )
     .expect("first agents");
-    // 预算耗尽后不得再读取：目录形式的 AGENTS.md 一旦被读即报 UnsupportedFileType。
-    std::fs::create_dir(cwd.join("AGENTS.md")).expect("cwd agents dir");
+    std::fs::write(cwd.join("AGENTS.md"), "\n ").expect("whitespace cwd agents");
 
     let loaded = load_project_instructions(&workspace, &cwd)
-        .expect("budget-exhausted load succeeds")
+        .expect("load succeeds")
         .expect("instructions present");
 
-    assert!(loaded.truncated(), "exhausted budget marks truncated");
+    assert!(
+        !loaded.truncated(),
+        "exact budget fill without dropped content must not report truncation"
+    );
+    assert_eq!(loaded.content().matches('a').count(), PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    assert_eq!(
+        loaded.content().matches('b').count(),
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2
+    );
+}
+
+#[test]
+fn budget_exhaustion_drops_later_content_and_marks_truncated() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let first = workspace.join("first");
+    let cwd = first.join("second");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    // 前两层文件连同分隔符恰好用尽 64KB 总预算；cwd 层仍有非空内容——
+    // 被放弃的内容必须标记 truncated，已纳入的文件保持完整。
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        vec![b'a'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+    )
+    .expect("root agents");
+    std::fs::write(
+        first.join("AGENTS.md"),
+        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2],
+    )
+    .expect("first agents");
+    std::fs::write(cwd.join("AGENTS.md"), "later instructions").expect("cwd agents");
+
+    let loaded = load_project_instructions(&workspace, &cwd)
+        .expect("load succeeds")
+        .expect("instructions present");
+
+    assert!(loaded.truncated(), "dropped content must mark truncated");
     assert_eq!(
         loaded.content().matches('a').count(),
-        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+        "root file fully incorporated"
     );
     assert_eq!(
         loaded.content().matches('b').count(),
-        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2,
+        "first file fully incorporated"
+    );
+    assert_eq!(
+        loaded.content().matches('c').count(),
+        0,
+        "exhausted budget must not incorporate later content"
     );
 }

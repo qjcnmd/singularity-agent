@@ -1407,6 +1407,294 @@ fn transient_retry_then_overflow_recovers_once() {
     );
 }
 
+/// 强制压缩失败以压缩真因为主因上抛；原始 overflow 经 recovery_failed 诊断保留上下文。
+#[test]
+fn forced_compaction_failure_surfaces_the_compaction_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: "old user".to_string(),
+            }],
+        })
+        .unwrap();
+    let provider = Arc::new(OverflowProvider {
+        stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        complete_calls: std::sync::atomic::AtomicUsize::new(0),
+        overflow_times: 1,
+        fail_summary: true,
+        request_texts: std::sync::Mutex::new(Vec::new()),
+        contract: fake_contract(),
+    });
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        // 摘要失败为可重试类错误；重试预算清零使失败立即收敛。
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 0,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+    let mut diagnostics = Vec::new();
+    let mut events = AgentEvents::new();
+    let mut on_event = |event| {
+        if let AgentEvent::Diagnostic(diagnostic) = event {
+            diagnostics.push(diagnostic);
+        }
+    };
+    events.on_event = Some(&mut on_event);
+
+    let error = agent
+        .run("task", &mut events, &CancellationToken::new())
+        .expect_err("forced compaction failure must fail the turn");
+
+    match &error {
+        AgentError::Compaction(crate::compaction::CompactionError::Provider(provider_error)) => {
+            assert!(
+                provider_error.error.message.contains("summary generation failed"),
+                "the compaction cause must surface, got: {error}"
+            );
+        }
+        other => panic!("expected the compaction cause, got: {other:?}"),
+    }
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "context_overflow_recovery_failed"
+                && diagnostic.severity == AgentDiagnosticSeverity::Warning
+        }),
+        "recovery failure must be diagnosed, got: {diagnostics:?}"
+    );
+}
+
+/// 摘要请求首次 429、重试成功：摘要与正常采样共用同一重试策略。
+struct SummaryRetryProvider {
+    stream_calls: std::sync::atomic::AtomicUsize,
+    complete_calls: std::sync::atomic::AtomicUsize,
+    contract: ProviderProtocolContract,
+}
+
+impl Provider for SummaryRetryProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.contract.clone()
+    }
+
+    fn streaming_capability(
+        &self,
+        _selected_protocol: singularity_model::ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        ProviderStreamingCapability::OutputTextDelta
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        _on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let call = self
+            .stream_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            return Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::ContextLengthExceeded,
+                "context window overflow",
+            )));
+        }
+        let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+        assistant.content = "done".to_string();
+        Ok(ModelTurnResponse {
+            request_id: request.request_id.clone(),
+            response_id: "retry-ok".to_string(),
+            status: ModelTurnStatus::Success,
+            assistant_message: Some(assistant),
+            usage: ModelUsage::default(),
+            finish_reason: Some("stop".to_string()),
+            validation: None,
+            error: None,
+            provider_name: Some("fake".to_string()),
+            model_name: Some("fake-model".to_string()),
+            provider_reasoning_history: Vec::new(),
+        })
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let call = self
+            .complete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            return Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::RateLimited,
+                "rate limited summary",
+            )));
+        }
+        let mut assistant = ModelMessage::assistant_tool_calls(Vec::new());
+        assistant.content = "## Goal\ncompacted".to_string();
+        Ok(ModelTurnResponse {
+            request_id: request.request_id.clone(),
+            response_id: "compaction-ok".to_string(),
+            status: ModelTurnStatus::Success,
+            assistant_message: Some(assistant),
+            usage: ModelUsage::default(),
+            finish_reason: Some("stop".to_string()),
+            validation: None,
+            error: None,
+            provider_name: Some("fake".to_string()),
+            model_name: Some("fake-model".to_string()),
+            provider_reasoning_history: Vec::new(),
+        })
+    }
+}
+
+#[test]
+fn summary_request_retries_rate_limit_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    session
+        .append_message(AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: "old user".to_string(),
+            }],
+        })
+        .unwrap();
+    let provider = Arc::new(SummaryRetryProvider {
+        stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        complete_calls: std::sync::atomic::AtomicUsize::new(0),
+        contract: fake_contract(),
+    });
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(),
+        AgentConfig {
+            retry: TurnRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+            },
+            ..AgentConfig::default()
+        },
+        session,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &CancellationToken::new())
+        .expect("summary retry must recover the forced compaction");
+
+    assert_eq!(outcome.final_text, "done");
+    assert!(outcome.compacted, "forced compaction must succeed");
+    assert_eq!(
+        provider
+            .complete_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "first summary attempt hit 429, the retry succeeded"
+    );
+    assert_eq!(
+        provider
+            .stream_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "overflow + one resend after forced compaction"
+    );
+}
+
+/// 截断 + 工具调用响应；第二次调用时触发取消——验证截断标志保留到 aborted 出口。
+struct TruncatedToolCallProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    cancellation: CancellationToken,
+    contract: ProviderProtocolContract,
+}
+
+impl Provider for TruncatedToolCallProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.contract.clone()
+    }
+
+    fn streaming_capability(
+        &self,
+        _selected_protocol: singularity_model::ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        ProviderStreamingCapability::OutputTextDelta
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        _on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 1 {
+            self.cancellation.cancel();
+        }
+        let mut assistant = ModelMessage::assistant_tool_calls(vec![tool_call(
+            "trunc-call-1",
+            "unknown_tool",
+            json!({}),
+        )]);
+        assistant.content = "partial text".to_string();
+        Ok(ModelTurnResponse {
+            request_id: request.request_id.clone(),
+            response_id: format!("trunc-{call}"),
+            status: ModelTurnStatus::Success,
+            assistant_message: Some(assistant),
+            usage: usage(10, 2),
+            finish_reason: Some("length".to_string()),
+            validation: None,
+            error: None,
+            provider_name: Some("fake".to_string()),
+            model_name: Some("fake-model".to_string()),
+            provider_reasoning_history: Vec::new(),
+        })
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        self.complete_stream(request, _cancellation, &mut |_| {})
+    }
+}
+
+#[test]
+fn truncated_tool_call_turn_keeps_truncated_flag_through_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let cancellation = CancellationToken::new();
+    let provider = Arc::new(TruncatedToolCallProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        cancellation: cancellation.clone(),
+        contract: fake_contract(),
+    });
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        AgentConfig::default(),
+        session,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run("task", &mut AgentEvents::new(), &cancellation)
+        .unwrap();
+
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
+    assert!(
+        outcome.truncated,
+        "a truncated tool-call turn must keep the truncated flag through abort"
+    );
+}
+
 #[test]
 fn orphaned_tool_call_reopens_without_executing_tool_again() {
     let dir = tempfile::tempdir().unwrap();

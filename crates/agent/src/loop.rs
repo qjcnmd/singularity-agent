@@ -92,6 +92,59 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled()
 }
 
+/// `send_with_retry` 的结果：响应、退避等待期间被取消，或最终失败。
+pub(crate) enum SendOutcome {
+    Response(Box<ModelTurnResponse>),
+    Aborted,
+    Failed(ProviderError),
+}
+
+/// 一次纯发送的 agent 层重试包装：可重试 provider 错误按指数退避重试
+///（Retry-After 优先），重试预算按次独立；ContextOverflow 原样上抛交给
+/// 调用方处理；退避等待被取消时返回 [`SendOutcome::Aborted`]。正常采样与
+/// compaction 摘要请求经同一 helper 复用同一传输策略。
+pub(crate) fn send_with_retry(
+    mut attempt: impl FnMut(
+        &mut AgentEvents,
+    ) -> std::result::Result<ModelTurnResponse, ProviderError>,
+    retry: TurnRetryConfig,
+    events: &mut AgentEvents,
+    cancellation: &CancellationToken,
+) -> SendOutcome {
+    let mut retry_attempt = 0u32;
+    loop {
+        match attempt(events) {
+            Ok(response) => return SendOutcome::Response(Box::new(response)),
+            Err(error) if is_context_overflow_error(&error.error) => {
+                return SendOutcome::Failed(error);
+            }
+            Err(error) => {
+                if retry_attempt < retry.max_retries && is_retryable_provider_error(&error) {
+                    retry_attempt += 1;
+                    let delay_ms =
+                        retry_delay_ms(retry.base_delay_ms, retry_attempt, error.retry_after);
+                    emit_diagnostic(
+                        events,
+                        AgentDiagnostic::info(
+                            "provider_retry_scheduled",
+                            format!(
+                                "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
+                                error.error.message,
+                                max = retry.max_retries,
+                            ),
+                        ),
+                    );
+                    if !sleep_abortable(delay_ms, cancellation) {
+                        return SendOutcome::Aborted;
+                    }
+                    continue;
+                }
+                return SendOutcome::Failed(error);
+            }
+        }
+    }
+}
+
 /// 非致命运行时诊断的严重级别（AgentLoop 发射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -481,7 +534,8 @@ impl Agent {
         ));
         let compaction = CompactionEngine::new(Arc::clone(&provider))
             .with_model_preferences(compaction_preferences)
-            .with_summary_max_tokens(config.compaction.summary_max_tokens);
+            .with_summary_max_tokens(config.compaction.summary_max_tokens)
+            .with_retry(config.retry);
         Ok(Self {
             session,
             compaction,
@@ -628,6 +682,7 @@ impl Agent {
                             ),
                         )?;
                     }
+                    outcome.truncated = true;
                     outcome.final_text = assistant_text;
                     continue;
                 }
@@ -1032,7 +1087,19 @@ impl Agent {
                         overflow_retried = true;
                         let forced = match self.force_compact(cancellation, events) {
                             Ok(result) => result,
-                            Err(_) => return AttemptOutcome::Failed(error),
+                            Err(recovery_error) => {
+                                // 强制压缩失败以压缩真因为主因上抛；原始
+                                // overflow 经诊断保留上下文，不覆盖真因。
+                                emit_diagnostic(
+                                    events,
+                                    AgentDiagnostic::warning(
+                                        "context_overflow_recovery_failed",
+                                        "forced compaction failed to recover from context overflow"
+                                            .to_string(),
+                                    ),
+                                );
+                                return AttemptOutcome::Failed(recovery_error);
+                            }
                         };
                         record_compaction(outcome, &forced);
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
@@ -1049,9 +1116,9 @@ impl Agent {
         }
     }
 
-    /// 采样层：对一次纯发送做 agent 层重试包装。可重试 provider 错误指数退避
-    /// 重试，重试预算按次独立；ContextOverflow 原样上抛交给轮步层处理；退避
-    /// 等待被取消时返回 Aborted。
+    /// 采样层：对一次纯发送做 agent 层重试包装（[`send_with_retry`]）。
+    /// 可重试 provider 错误指数退避重试，重试预算按次独立；ContextOverflow
+    /// 原样上抛交给轮步层处理；退避等待被取消时返回 Aborted。
     fn sample_request(
         &self,
         request: &ModelTurnRequest,
@@ -1059,43 +1126,15 @@ impl Agent {
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
-        let mut retry_attempt = 0u32;
-        loop {
-            match self.attempt_request(request, events, cancellation, model_turn_ordinal) {
-                Ok(response) => return AttemptOutcome::Response(Box::new(response)),
-                Err(AgentError::Provider(error)) if is_context_overflow_error(&error.error) => {
-                    return AttemptOutcome::Failed(AgentError::Provider(error));
-                }
-                Err(error) => {
-                    if let AgentError::Provider(provider) = &error
-                        && retry_attempt < self.config.retry.max_retries
-                        && is_retryable_provider_error(provider)
-                    {
-                        retry_attempt += 1;
-                        let delay_ms = retry_delay_ms(
-                            self.config.retry.base_delay_ms,
-                            retry_attempt,
-                            provider.retry_after,
-                        );
-                        emit_diagnostic(
-                            events,
-                            AgentDiagnostic::info(
-                                "provider_retry_scheduled",
-                                format!(
-                                    "provider retry {retry_attempt}/{max} in {delay_ms}ms: {}",
-                                    provider.error.message,
-                                    max = self.config.retry.max_retries,
-                                ),
-                            ),
-                        );
-                        if !sleep_abortable(delay_ms, cancellation) {
-                            return AttemptOutcome::Aborted;
-                        }
-                        continue;
-                    }
-                    return AttemptOutcome::Failed(error);
-                }
-            }
+        match send_with_retry(
+            |events| self.attempt_request(request, events, cancellation, model_turn_ordinal),
+            self.config.retry,
+            events,
+            cancellation,
+        ) {
+            SendOutcome::Response(response) => AttemptOutcome::Response(response),
+            SendOutcome::Aborted => AttemptOutcome::Aborted,
+            SendOutcome::Failed(error) => AttemptOutcome::Failed(AgentError::Provider(error)),
         }
     }
 
@@ -1107,7 +1146,7 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
-    ) -> Result<ModelTurnResponse> {
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.stream_completion(request, events, cancellation, model_turn_ordinal)
     }
 
@@ -1118,7 +1157,7 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
-    ) -> Result<ModelTurnResponse> {
+    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         // provider 回调与 on_attempt 共享同一个事件出口；用本地 RefCell 承接
         // 两个异签名回调的可变借用（单线程 turn 内串行使用）。事件投影尽力
         // 而为，provider 结果不因投影失败丢弃。
@@ -1129,7 +1168,7 @@ impl Agent {
             let mut events = events_ref.borrow_mut();
             emit(&mut events, AgentEvent::MessageUpdate { delta });
         };
-        let on_attempt = |event: ProviderAttemptEvent| {
+        let mut observed_attempt = |event: ProviderAttemptEvent| {
             let mut events = events_ref.borrow_mut();
             emit(
                 &mut events,
@@ -1138,9 +1177,6 @@ impl Agent {
                     event,
                 },
             );
-        };
-        let mut observed_attempt = |event: ProviderAttemptEvent| {
-            on_attempt(event);
         };
         match self.provider.complete_stream_observed(
             request,
@@ -1154,12 +1190,11 @@ impl Agent {
             {
                 self.provider
                     .complete_observed(request, cancellation, &mut observed_attempt)
-                    .map_err(AgentError::Provider)
             }
             Err(error) => {
                 // 保留传输层给出的类型、重放安全性与 Retry-After，交由调用处
                 // 的唯一重试策略裁决。
-                Err(AgentError::Provider(error))
+                Err(error)
             }
         }
     }

@@ -335,8 +335,32 @@ pub fn delete_thread(
     session
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
+    // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
+    // NotFound，不会再 append 进即将删除的文件。
+    let pending = pending_delete_path(sessions_dir, thread_id);
+    if let Err(error) = std::fs::rename(&path, &pending) {
+        // rename 被占用/杀软拦截时按原顺序删除并上抛，不静默吞掉：
+        // 竞态窗口回归原状，删除本身仍完成；降级删除再失败时以其错误优先。
+        drop(session);
+        if let Err(remove_error) = remove_rollout(&path) {
+            return Err(remove_error);
+        }
+        return Err(ResumeError::Store(format!(
+            "failed to quarantine session rollout {}: {error}",
+            path.display()
+        )));
+    }
     drop(session);
-    remove_rollout(&path)
+    // 文件已脱离原路径，待删名尽力删除；残留不影响删除结果。
+    let _ = std::fs::remove_file(&pending);
+    Ok(())
+}
+
+fn pending_delete_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
+    sessions_dir.join(format!(
+        ".{thread_id}.deleting-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    ))
 }
 
 fn remove_rollout(rollout: &Path) -> Result<(), ResumeError> {
@@ -506,6 +530,11 @@ mod tests {
         drop(session);
         delete_thread(&sessions_dir, thread_id, &coordinator).expect("delete after writer release");
         assert!(!thread_session_path(&sessions_dir, thread_id).exists());
+        // 待删名已随删除清理，原路径对新写者立即消失（NotFound，良性）。
+        let leftovers: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .expect("list sessions dir")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
         match delete_thread(&sessions_dir, thread_id, &coordinator) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),

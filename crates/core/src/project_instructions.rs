@@ -2,8 +2,8 @@
 //!
 //! 支持从工作区根目录（Workspace Root）逐层向下检索至当前工作目录（CWD），
 //! 并按照层级顺序合并指令内容。单文件超 32KB 时按预算截断为前缀纳入；合并总
-//! 预算 64KB 用尽即停止纳入后续文件。预算导致的截断通过
-//! [`ProjectInstructions::truncated()`] 暴露而非报错；
+//! 预算 64KB（文件间分隔符计入）耗尽后不再纳入后续文件。截断只在确有内容被
+//! 预算放弃时发生，通过 [`ProjectInstructions::truncated()`] 暴露而非报错；
 //! 真正的 I/O 错误（读取失败、非法 UTF-8 等）仍 fail closed。
 
 use std::fmt::{Display, Formatter};
@@ -169,11 +169,6 @@ pub fn load_project_instructions(
     let mut truncated = false;
     let mut remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES;
     for directory in instruction_directories(&workspace_root, &cwd) {
-        // 预算耗尽后不再读取后续文件。
-        if remaining == 0 {
-            truncated = true;
-            break;
-        }
         let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let instruction_file = read_project_instruction_file(
             &directory.dir,
@@ -191,9 +186,17 @@ pub fn load_project_instructions(
             continue;
         }
         let byte_len = instruction_file.byte_len;
-        if byte_len > remaining {
+        // 分隔符与正文同样占用合并预算；截断只在预算耗尽且确有内容被
+        // 放弃时标记，恰好填满预算不误报。
+        let separator_len = if content.is_empty() {
+            0
+        } else {
+            PROJECT_INSTRUCTIONS_SEPARATOR.len()
+        };
+        if byte_len + separator_len > remaining {
             // 该文件只能纳入剩余预算内的有效 UTF-8 前缀。
-            let (take, _) = budget_prefix(&instruction_file.text, remaining);
+            let (take, _) =
+                budget_prefix(&instruction_file.text, remaining.saturating_sub(separator_len));
             if !take.trim().is_empty() {
                 if !content.is_empty() {
                     content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
@@ -204,10 +207,10 @@ pub fn load_project_instructions(
             truncated = true;
             break;
         }
-        remaining -= byte_len;
         if !content.is_empty() {
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }
+        remaining -= byte_len + separator_len;
         content.push_str(&instruction_file.text);
         found = true;
     }

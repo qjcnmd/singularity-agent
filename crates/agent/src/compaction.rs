@@ -20,12 +20,13 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnStatus, ModelUsage,
-    Provider, ProviderError,
+    ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
+    ModelTurnStatus, ModelUsage, Provider, ProviderError,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::agent::{AgentEvents, SendOutcome, TurnRetryConfig, send_with_retry};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::{CompactionEntry, SessionEntry, SessionError, SessionManager};
 
@@ -267,6 +268,8 @@ pub struct CompactionEngine {
     provider: Arc<dyn Provider + Send + Sync>,
     model_preferences: ModelPreferences,
     summary_max_tokens: u32,
+    /// 摘要请求与正常采样共用同一 agent 层重试策略。
+    retry: TurnRetryConfig,
 }
 
 impl CompactionEngine {
@@ -276,6 +279,7 @@ impl CompactionEngine {
             provider,
             model_preferences: ModelPreferences::default(),
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            retry: TurnRetryConfig::default(),
         }
     }
 
@@ -288,6 +292,12 @@ impl CompactionEngine {
     /// 绑定摘要生成的独立输出上限。
     pub fn with_summary_max_tokens(mut self, summary_max_tokens: u32) -> Self {
         self.summary_max_tokens = summary_max_tokens;
+        self
+    }
+
+    /// 绑定摘要请求的重试策略（与正常采样同源，由 `Agent::new` 注入）。
+    pub fn with_retry(mut self, retry: TurnRetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -643,7 +653,24 @@ impl CompactionEngine {
                 .collect(),
         );
         request.model_preferences = preferences;
-        let response = self.provider.complete(&request, cancellation)?;
+        // 摘要请求与正常采样经同一 helper 复用同一传输策略：可重试错误
+        // 指数退避重试；摘要请求没有事件出口，重试诊断在此路径不投影。
+        let mut summary_events = AgentEvents::new();
+        let response = match send_with_retry(
+            |_events| self.provider.complete(&request, cancellation),
+            self.retry,
+            &mut summary_events,
+            cancellation,
+        ) {
+            SendOutcome::Response(response) => *response,
+            // 退避等待被取消与 provider 取消请求同形收敛。
+            SendOutcome::Aborted => {
+                return Err(CompactionError::Provider(ProviderError::from_model_error(
+                    ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled"),
+                )));
+            }
+            SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
+        };
         if response.status != ModelTurnStatus::Success {
             let detail = response
                 .error
