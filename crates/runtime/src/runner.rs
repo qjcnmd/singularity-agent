@@ -16,8 +16,7 @@ use singularity_agent::agent::{
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
 use singularity_agent::session::{
-    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
-    WriterLockCoordinator,
+    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -27,16 +26,17 @@ use singularity_model::{
 };
 use uuid::Uuid;
 
+use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
 };
 use crate::events::{ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
+use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
 const PROJECT_INSTRUCTIONS_TRUNCATED_CODE: &str = "project_instructions_truncated";
 const PROJECT_INSTRUCTIONS_TRUNCATED_NOTE: &str = "\n\n[warning] project instructions were truncated because they exceeded the size budget; content beyond the cut was not included.";
-const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 
 /// 一次 turn 执行的输入。
 pub struct TurnParams {
@@ -583,80 +583,6 @@ impl TurnRunner {
     }
 }
 
-/// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
-///
-/// 终态化不再有"terminal 与 usage 两次独立追加"或"降级成另一个状态"的路径：
-/// 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
-/// 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
-struct TerminalCommit {
-    turn_id: String,
-    status: TurnTerminalStatus,
-    usage: TurnUsage,
-    usage_complete: bool,
-}
-
-impl TerminalCommit {
-    /// 从线程状态构造终态提交；`Active`（非终态）返回 `None`。
-    fn new(
-        turn_id: &str,
-        status: ThreadStatus,
-        usage: &ModelUsage,
-        usage_complete: bool,
-    ) -> Option<Self> {
-        let status = terminal_status_for_thread_status(status)?;
-        Some(Self {
-            turn_id: turn_id.to_string(),
-            status,
-            usage: TurnUsage::from_model_usage(usage, usage_complete),
-            usage_complete,
-        })
-    }
-
-    /// 构造终态 metadata 条目（status + usage + usageComplete 单条）。
-    fn metadata(&self) -> SessionMetadata {
-        let usage =
-            serde_json::to_value(&self.usage).expect("TurnUsage serialization is infallible");
-        SessionMetadata::turn_terminal(&self.turn_id, self.status, usage, self.usage_complete)
-            .expect("TurnUsage is always a JSON object")
-    }
-
-    /// 单条落盘终态 metadata；同内容已存在时幂等跳过。
-    fn persist(&self, session: &mut SessionManager) -> Result<(), String> {
-        append_terminal_metadata_if_missing(session, &self.turn_id, self.metadata())
-    }
-
-    /// 终态事件层 Turn 投影（携带本轮已落盘的 usage）。
-    fn turn(&self, thread_id: &str, turn_status: TurnStatus) -> Turn {
-        Turn {
-            turn_id: self.turn_id.clone(),
-            thread_id: thread_id.to_string(),
-            status: turn_status,
-            usage: Some(self.usage.clone()),
-        }
-    }
-}
-
-/// 终态无法落盘时的 fail-stop 出口：发 `storage_fatal` 诊断，不发布任何
-/// 终态事件——磁盘与客户端之间不存在矛盾窗口。
-fn fail_stop_terminalization(
-    thread_id: &str,
-    turn_id: &str,
-    failure: &TurnFailure,
-    sink: &mut dyn TurnEventSink,
-) {
-    let message = failure
-        .original
-        .clone()
-        .unwrap_or_else(|| "fatal storage error: failed to persist terminal metadata".to_string());
-    sink.emit(TurnEvent::Diagnostic {
-        thread_id: thread_id.to_string(),
-        turn_id: turn_id.to_string(),
-        severity: AgentDiagnosticSeverity::Error,
-        code: "storage_fatal".to_string(),
-        message,
-    });
-}
-
 /// 准备/执行阶段的内部错误表示，分类为 [`TurnFailure`] 时使用。
 enum RunnerError {
     Session(singularity_agent::session::SessionError),
@@ -742,33 +668,6 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
         }
     }
     status
-}
-
-fn terminal_status_for_thread_status(status: ThreadStatus) -> Option<TurnTerminalStatus> {
-    match status {
-        ThreadStatus::Completed => Some(TurnTerminalStatus::Completed),
-        ThreadStatus::Failed => Some(TurnTerminalStatus::Failed),
-        ThreadStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
-        ThreadStatus::Active => None,
-    }
-}
-
-fn append_terminal_metadata_if_missing(
-    session: &mut SessionManager,
-    turn_id: &str,
-    metadata: SessionMetadata,
-) -> Result<(), String> {
-    // 幂等按完整终态内容判定：同一 turn 已存在相同终态即视为已写，不重复追加。
-    let already_terminal = session
-        .metadata_entries()
-        .iter()
-        .any(|entry| entry.turn_id() == Some(turn_id) && entry == &metadata);
-    if !already_terminal {
-        session
-            .append_metadata(metadata)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }
 
 fn workspace_path(thread: &Thread) -> Result<String, String> {
@@ -900,239 +799,4 @@ fn agent_config_for_thread(
         },
         instructions_truncated,
     ))
-}
-
-/// 一次 AgentLoop 调用预分配的 assistant/tool item 事件状态。
-struct AssistantItemEvents {
-    thread_id: String,
-    turn_id: String,
-    item_id: String,
-    first_delta_observed: bool,
-    assistant_terminal_generated: bool,
-    tool_items: std::collections::HashMap<String, bool>,
-}
-
-impl AssistantItemEvents {
-    fn new(thread_id: String, turn_id: String, item_id: String) -> Self {
-        Self {
-            thread_id,
-            turn_id,
-            item_id,
-            first_delta_observed: false,
-            assistant_terminal_generated: false,
-            tool_items: std::collections::HashMap::new(),
-        }
-    }
-
-    fn start_tool_item(&mut self, tool_call_id: &str) {
-        self.tool_items
-            .entry(tool_call_id.to_string())
-            .or_insert(false);
-    }
-
-    fn open_tool_items(&self) -> Vec<String> {
-        self.tool_items
-            .iter()
-            .filter_map(|(id, terminal)| (!*terminal).then_some(id.clone()))
-            .collect()
-    }
-
-    fn project_assistant_delta(&mut self, sink: &mut dyn TurnEventSink, delta: &str) {
-        if !self.first_delta_observed {
-            self.first_delta_observed = true;
-            sink.emit(TurnEvent::ItemStarted {
-                thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
-                item_id: self.item_id.clone(),
-            });
-        }
-        sink.emit(TurnEvent::AssistantDelta {
-            thread_id: self.thread_id.clone(),
-            turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
-            delta: delta.to_string(),
-        });
-    }
-
-    fn emit_tool_terminal(
-        &mut self,
-        sink: &mut dyn TurnEventSink,
-        tool_call_id: &str,
-        is_error: bool,
-    ) {
-        let terminal = self.tool_items.get_mut(tool_call_id);
-        match terminal {
-            Some(already) if *already => {}
-            Some(already) => {
-                *already = true;
-                let event = if is_error {
-                    TurnEvent::ItemFailed {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        item_id: tool_call_id.to_string(),
-                        error: "tool execution failed".to_string(),
-                    }
-                } else {
-                    TurnEvent::ItemCompleted {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        item_id: tool_call_id.to_string(),
-                    }
-                };
-                sink.emit(event);
-            }
-            None => {}
-        }
-    }
-
-    fn emit_assistant_terminal_failed(&mut self, sink: &mut dyn TurnEventSink) {
-        if !self.first_delta_observed || self.assistant_terminal_generated {
-            return;
-        }
-        self.assistant_terminal_generated = true;
-        sink.emit(TurnEvent::ItemFailed {
-            thread_id: self.thread_id.clone(),
-            turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
-            error: SAFE_ASSISTANT_ITEM_FAILURE.to_string(),
-        });
-    }
-
-    fn emit_assistant_terminal_completed(&mut self, sink: &mut dyn TurnEventSink) {
-        if !self.first_delta_observed || self.assistant_terminal_generated {
-            return;
-        }
-        self.assistant_terminal_generated = true;
-        sink.emit(TurnEvent::ItemCompleted {
-            thread_id: self.thread_id.clone(),
-            turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
-        });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_appearance_does_not_create_an_assistant_terminal_item() {
-        let mut item_events =
-            AssistantItemEvents::new("thread".into(), "turn".into(), "assistant".into());
-        let mut events = Vec::new();
-
-        item_events.start_tool_item("tool");
-        item_events.emit_tool_terminal(&mut |event| events.push(event), "tool", false);
-        item_events.emit_assistant_terminal_completed(&mut |event| events.push(event));
-        item_events.emit_assistant_terminal_failed(&mut |event| events.push(event));
-
-        assert!(matches!(
-            events.as_slice(),
-            [TurnEvent::ItemCompleted { item_id, .. }] if item_id == "tool"
-        ));
-    }
-
-    /// 终态+用量单条原子写入：一次 persist 恰好一条 `turn_terminal`，内容完整；
-    /// 相同内容重复 persist 幂等跳过。
-    #[test]
-    fn terminal_commit_is_single_entry_and_idempotent() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut session =
-            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-        let usage = ModelUsage {
-            input_tokens: 100,
-            total_tokens: 150,
-            ..Default::default()
-        };
-        let commit =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
-        commit.persist(&mut session).expect("first persist");
-        commit.persist(&mut session).expect("idempotent persist");
-
-        let terminals: Vec<SessionMetadata> = session
-            .metadata_entries()
-            .into_iter()
-            .filter(|entry| entry.kind() == SessionMetadataKind::TurnTerminal)
-            .collect();
-        assert_eq!(terminals.len(), 1, "single atomic terminal entry");
-        assert_eq!(terminals[0].turn_id(), Some("turn-1"));
-        assert_eq!(
-            terminals[0].terminal_status(),
-            Some(TurnTerminalStatus::Completed)
-        );
-        let SessionMetadata::TurnTerminal {
-            usage: persisted,
-            usage_complete,
-            ..
-        } = &terminals[0]
-        else {
-            unreachable!("filtered to TurnTerminal");
-        };
-        assert!(*usage_complete, "usageComplete persisted");
-        assert_eq!(persisted["inputTokens"], 100);
-        assert_eq!(persisted["totalTokens"], 150);
-    }
-
-    /// 幂等按完整终态内容判定：同 turn 不同终态是新内容，如实追加（不跳过）。
-    #[test]
-    fn terminal_commit_distinguishes_different_terminal_content() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut session =
-            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-        let usage = ModelUsage::default();
-        let completed =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
-        completed.persist(&mut session).expect("completed persist");
-        let failed =
-            TerminalCommit::new("turn-1", ThreadStatus::Failed, &usage, true).expect("terminal");
-        failed.persist(&mut session).expect("failed persist");
-
-        let terminals: Vec<TurnTerminalStatus> = session
-            .metadata_entries()
-            .iter()
-            .filter_map(|entry| entry.terminal_status())
-            .collect();
-        assert_eq!(
-            terminals,
-            vec![TurnTerminalStatus::Completed, TurnTerminalStatus::Failed]
-        );
-    }
-
-    /// 终态无法落盘 → fail-stop：只发 `storage_fatal` 诊断，不发布任何终态事件。
-    #[test]
-    fn terminal_persist_failure_emits_no_terminal_events() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut session =
-            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-        let mut permissions = std::fs::metadata(session.path())
-            .expect("session metadata")
-            .permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(session.path(), permissions).expect("make session read-only");
-        let usage = ModelUsage::default();
-        let commit =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
-        assert!(commit.persist(&mut session).is_err(), "append must fail");
-
-        let mut events = Vec::new();
-        let failure = TurnFailure {
-            stage: TurnFailureStage::TerminalOutcome,
-            cause: TurnFailureCause::Store,
-            original: Some("injected storage failure".to_string()),
-        };
-        fail_stop_terminalization("thread-1", "turn-1", &failure, &mut |event| {
-            events.push(event)
-        });
-        assert!(
-            matches!(
-                events.as_slice(),
-                [TurnEvent::Diagnostic {
-                    code,
-                    severity: AgentDiagnosticSeverity::Error,
-                    ..
-                }] if code == "storage_fatal"
-            ),
-            "fail-stop must emit exactly one storage_fatal diagnostic: {events:?}"
-        );
-    }
 }

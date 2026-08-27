@@ -25,7 +25,9 @@ pub mod objects;
 pub mod runner;
 pub mod store;
 
+mod assistant_items;
 mod history;
+mod terminal;
 
 pub use conversation::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
