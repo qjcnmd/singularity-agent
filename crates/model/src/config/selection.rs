@@ -10,10 +10,10 @@ pub(crate) fn model_selector_error(
     super::configuration_error(message, code)
 }
 
-pub(super) struct ParsedModelSelector<'a> {
-    pub(super) provider_name: &'a str,
-    pub(super) model_name: &'a str,
-    pub(super) reasoning_effort: Option<&'a str>,
+pub(crate) struct ParsedModelSelector<'a> {
+    pub(crate) provider_name: &'a str,
+    pub(crate) model_name: &'a str,
+    pub(crate) reasoning_effort: Option<&'a str>,
 }
 
 /// 模型选择器各段：`provider/model#effort`。宽松拆分时任一段都可能缺省，
@@ -54,7 +54,7 @@ pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>)
     selector
 }
 
-pub(super) fn parse_model_selector(
+pub(crate) fn parse_model_selector(
     selector: &str,
 ) -> Result<ParsedModelSelector<'_>, ProviderError> {
     let Some((provider_name, model_and_effort)) = selector.split_once('/') else {

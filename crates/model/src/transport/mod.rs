@@ -398,35 +398,15 @@ impl OpenAiProvider {
             return Ok(normalized);
         };
         let mut normalized = request.clone();
-        let model_name = if let Some((provider_name, model_and_effort)) = selector.split_once('/') {
-            if provider_name.is_empty() || model_and_effort.is_empty() {
-                return Err(super::config::model_selector_error(
-                    "provider/model selector must contain non-empty provider and model ids",
-                    "provider_selector_invalid",
-                ));
-            }
-            if provider_name != self.config.provider_name {
-                return Err(super::config::model_selector_error(
-                    "model selector references an unknown provider",
-                    "provider_selector_unknown_provider",
-                ));
-            }
-            model_and_effort
-        } else {
-            selector
-        };
-        let (model_name, requested_effort) = match model_name.rsplit_once('#') {
-            Some((model_name, effort)) if !model_name.is_empty() && !effort.is_empty() => {
-                (model_name, Some(effort))
-            }
-            Some(_) => {
-                return Err(super::config::model_selector_error(
-                    "model selector reasoning variant is malformed",
-                    "provider_selector_invalid",
-                ));
-            }
-            None => (model_name, None),
-        };
+        let parsed = super::config::selection::parse_model_selector(selector)?;
+        if parsed.provider_name != self.config.provider_name {
+            return Err(super::config::model_selector_error(
+                "model selector references an unknown provider",
+                "provider_selector_unknown_provider",
+            ));
+        }
+        let model_name = parsed.model_name;
+        let requested_effort = parsed.reasoning_effort;
         if self.selected_model.is_some() && model_name != self.config.model_name {
             return Err(super::config::model_selector_error(
                 "model selector is not the fixed model for this provider turn",
