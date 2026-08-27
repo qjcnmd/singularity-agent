@@ -49,10 +49,16 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
         match chars[i] {
             '*' => {
                 if chars.get(i + 1) == Some(&'*') {
-                    // `**` 独占段时跨任意目录层（含零层）；段内退化普通星号。
+                    // `**` 独占段时跨任意目录层（含零层）；尾部 `**`（后无
+                    // `/`）同样跨层，如 `src/**` 匹配深层文件；段内退化普通星号。
                     if chars.get(i + 2) == Some(&'/') {
                         out.push_str("(?:.*/)?");
                         i += 3;
+                        continue;
+                    }
+                    if chars.get(i + 2).is_none() {
+                        out.push_str("(?:.*)?");
+                        i += 2;
                         continue;
                     }
                     out.push_str("[^/]*");
@@ -171,5 +177,27 @@ mod tests {
             .expect("execute");
         assert!(result.is_error);
         assert!(result.content.contains("missing field `pattern`"));
+    }
+
+    #[test]
+    fn trailing_double_star_crosses_directory_layers() {
+        let dir = layout();
+        let result = ToolRegistry::new()
+            .execute("glob", context(json!({ "pattern": "src/**" }), dir.path()))
+            .expect("execute");
+        assert!(!result.is_error);
+        assert!(result.content.contains("src/main.rs"));
+        assert!(result.content.contains("src/deep/util.rs"));
+    }
+
+    #[test]
+    fn bare_double_star_matches_recursively() {
+        let dir = layout();
+        let result = ToolRegistry::new()
+            .execute("glob", context(json!({ "pattern": "**" }), dir.path()))
+            .expect("execute");
+        assert!(!result.is_error);
+        assert!(result.content.contains("README.md"));
+        assert!(result.content.contains("src/deep/util.rs"));
     }
 }
