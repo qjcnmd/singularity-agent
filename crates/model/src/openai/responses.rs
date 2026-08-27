@@ -3,7 +3,9 @@
 use serde_json::{Value, json};
 
 use crate::error::ProviderError;
-use crate::openai::chat::{finalize_provider_response, parse_tool_call_arguments};
+use crate::openai::chat::{
+    finalize_provider_response, parse_message_content, parse_tool_call, parse_usage,
+};
 use crate::provider::contract::{
     ProviderProtocolContract, message_text, provider_response_validation_error,
     request_uses_tool_protocol,
@@ -142,7 +144,7 @@ pub fn parse_openai_responses_response(
     let mut content = String::new();
     let mut tool_calls: Vec<ModelToolCall> = Vec::new();
     let mut replay_items = Vec::new();
-    for (index, item) in output.iter().enumerate() {
+    for item in output.iter() {
         let item = item.as_object().ok_or_else(|| {
             provider_response_validation_error(
                 config,
@@ -174,7 +176,12 @@ pub fn parse_openai_responses_response(
             }
             "function_call" => {
                 let item_value = Value::Object(item.clone());
-                let call = parse_openai_responses_tool_call(index, &item_value);
+                let call = parse_tool_call(
+                    &item_value,
+                    "call_id",
+                    item_value.get("name"),
+                    item_value.get("arguments"),
+                );
                 if call.tool_call_id.is_empty() {
                     return Err(provider_response_validation_error(
                         config,
@@ -298,74 +305,24 @@ pub fn parse_openai_responses_response(
 }
 
 pub fn parse_openai_responses_message(message: &Value) -> Result<String, &'static str> {
-    match message.get("content") {
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(parts)) => {
-            let mut content = String::new();
-            for part in parts {
-                let text = match part.get("type").and_then(Value::as_str) {
-                    Some("output_text") | Some("text") => part.get("text").and_then(Value::as_str),
-                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
-                    _ => return Err("responses_message_content_part_unsupported"),
-                }
-                .ok_or("responses_message_content_text_missing")?;
-                content.push_str(text);
-            }
-            Ok(content)
-        }
-        None | Some(Value::Null) => Err("responses_message_content_missing"),
-        Some(_) => Err("responses_message_content_invalid"),
-    }
-}
-
-pub fn parse_openai_responses_tool_call(_index: usize, call: &Value) -> ModelToolCall {
-    let (arguments, raw_arguments, parse_status, validation_errors) =
-        parse_tool_call_arguments(call.get("arguments"));
-    ModelToolCall {
-        tool_call_id: call
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        tool_name: call
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        arguments,
-        raw_arguments,
-        parse_status,
-        validation_errors,
-    }
+    parse_message_content(
+        message.get("content"),
+        &["output_text"],
+        Some("responses_message_content_missing"),
+        "responses_message_content_invalid",
+        "responses_message_content_part_unsupported",
+        "responses_message_content_text_missing",
+    )
 }
 
 pub fn parse_openai_responses_usage(usage: Option<&Value>) -> ModelUsage {
-    let Some(usage) = usage else {
-        return ModelUsage::default();
-    };
-    ModelUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens: usage
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        reasoning_tokens: usage
-            .pointer("/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        usage_present: true,
-    }
+    parse_usage(
+        usage,
+        "input_tokens",
+        "output_tokens",
+        "/input_tokens_details/cached_tokens",
+        "/output_tokens_details/reasoning_tokens",
+    )
 }
 
 pub fn openai_responses_input(

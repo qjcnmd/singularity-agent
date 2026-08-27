@@ -352,8 +352,14 @@ pub fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
         .map(|calls| {
             calls
                 .iter()
-                .enumerate()
-                .map(|(index, call)| parse_openai_tool_call(index, call))
+                .map(|call| {
+                    parse_tool_call(
+                        call,
+                        "id",
+                        call.pointer("/function/name"),
+                        call.pointer("/function/arguments"),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -405,17 +411,24 @@ fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str
     Ok(())
 }
 
-pub fn parse_openai_tool_call(_index: usize, call: &Value) -> ModelToolCall {
-    let function = call.get("function").unwrap_or(&Value::Null);
+/// 按字段名参数化构建一次工具调用：`id_field` 为调用 id 字段名，
+/// `name`/`arguments` 为已定位的取值（chat 在 function 子对象内，
+/// responses 在顶层）。与 `parse_tool_arguments` 同属共享解析族。
+pub(crate) fn parse_tool_call(
+    call: &Value,
+    id_field: &str,
+    name: Option<&Value>,
+    arguments: Option<&Value>,
+) -> ModelToolCall {
     let (arguments, raw_arguments, parse_status, validation_errors) =
-        parse_tool_call_arguments(function.get("arguments"));
-    let wire_tool_name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        parse_tool_call_arguments(arguments);
+    let wire_tool_name = name.and_then(Value::as_str).unwrap_or("");
     ModelToolCall {
         tool_call_id: call
-            .get("id")
+            .get(id_field)
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .to_string(),
         tool_name: wire_tool_name.to_string(),
         arguments,
         raw_arguments,
@@ -478,45 +491,74 @@ pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus
     }
 }
 
-pub fn parse_openai_content(content: Option<&Value>) -> Result<String, &'static str> {
+/// 解析 content 为纯文本。协议差异按参数区分：`text_aliases` 是 text 类型的
+/// 额外别名（responses 的 output_text）；`missing_error` 为 None 时缺失
+/// content 视为空文本（chat），否则返回该错误（responses）。
+pub(crate) fn parse_message_content(
+    content: Option<&Value>,
+    text_aliases: &[&str],
+    missing_error: Option<&'static str>,
+    invalid_error: &'static str,
+    part_unsupported_error: &'static str,
+    part_text_missing_error: &'static str,
+) -> Result<String, &'static str> {
     match content {
-        None | Some(Value::Null) => Ok(String::new()),
+        None | Some(Value::Null) => match missing_error {
+            Some(error) => Err(error),
+            None => Ok(String::new()),
+        },
         Some(Value::String(text)) => Ok(text.clone()),
         Some(Value::Array(parts)) => {
             let mut content = String::new();
             for part in parts {
-                let part = part.as_object().ok_or("chat_content_part_type_invalid")?;
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => content.push_str(
-                        part.get("text")
-                            .and_then(Value::as_str)
-                            .ok_or("chat_content_part_type_invalid")?,
-                    ),
-                    Some("refusal") => content.push_str(
-                        part.get("refusal")
-                            .and_then(Value::as_str)
-                            .ok_or("chat_content_part_type_invalid")?,
-                    ),
-                    _ => return Err("chat_content_part_type_invalid"),
+                let part = part.as_object().ok_or(part_unsupported_error)?;
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("text") => part.get("text").and_then(Value::as_str),
+                    Some(alias) if text_aliases.contains(&alias) => {
+                        part.get("text").and_then(Value::as_str)
+                    }
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => return Err(part_unsupported_error),
                 }
+                .ok_or(part_text_missing_error)?;
+                content.push_str(text);
             }
             Ok(content)
         }
-        Some(_) => Err("chat_content_part_type_invalid"),
+        Some(_) => Err(invalid_error),
     }
 }
 
-pub fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
+pub fn parse_openai_content(content: Option<&Value>) -> Result<String, &'static str> {
+    parse_message_content(
+        content,
+        &[],
+        None,
+        "chat_content_part_type_invalid",
+        "chat_content_part_type_invalid",
+        "chat_content_part_type_invalid",
+    )
+}
+
+/// 按字段名参数化解析 usage：`input_field`/`output_field` 为计数顶层字段，
+/// `cached_path`/`reasoning_path` 为嵌套 detail 的 JSON Pointer。
+pub(crate) fn parse_usage(
+    usage: Option<&Value>,
+    input_field: &str,
+    output_field: &str,
+    cached_path: &str,
+    reasoning_path: &str,
+) -> ModelUsage {
     let Some(usage) = usage else {
         return ModelUsage::default();
     };
     ModelUsage {
         input_tokens: usage
-            .get("prompt_tokens")
+            .get(input_field)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         output_tokens: usage
-            .get("completion_tokens")
+            .get(output_field)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         total_tokens: usage
@@ -524,15 +566,25 @@ pub fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         cached_input_tokens: usage
-            .pointer("/prompt_tokens_details/cached_tokens")
+            .pointer(cached_path)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         reasoning_tokens: usage
-            .pointer("/completion_tokens_details/reasoning_tokens")
+            .pointer(reasoning_path)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         usage_present: true,
     }
+}
+
+pub fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
+    parse_usage(
+        usage,
+        "prompt_tokens",
+        "completion_tokens",
+        "/prompt_tokens_details/cached_tokens",
+        "/completion_tokens_details/reasoning_tokens",
+    )
 }
 
 fn openai_message_payload_with_reasoning(
