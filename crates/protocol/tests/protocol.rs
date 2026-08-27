@@ -265,7 +265,7 @@ fn thread_status_projects_last_turn_metadata_not_lifecycle() {
     let thread = singularity_protocol::Thread {
         thread_id: "session-1".to_string(),
         model: None,
-        cwd: Some("/tmp/work".to_string()),
+        cwd: "/tmp/work".to_string(),
         last_turn_status: Some(ThreadStatus::Completed),
     };
     let wire = serde_json::to_value(&thread).expect("thread wire");
@@ -275,7 +275,7 @@ fn thread_status_projects_last_turn_metadata_not_lifecycle() {
     let no_turn = singularity_protocol::Thread {
         thread_id: "session-2".to_string(),
         model: None,
-        cwd: None,
+        cwd: "/tmp/work".to_string(),
         last_turn_status: None,
     };
     let wire = serde_json::to_value(&no_turn).expect("thread wire");

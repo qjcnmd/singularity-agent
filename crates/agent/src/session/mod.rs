@@ -83,9 +83,7 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
             status = match entry.kind() {
                 SessionMetadataKind::TurnStarted => Some(SessionProjectionStatus::Active),
                 SessionMetadataKind::TurnTerminal => match entry.terminal_status() {
-                    Some(TurnTerminalStatus::Completed) => {
-                        Some(SessionProjectionStatus::Completed)
-                    }
+                    Some(TurnTerminalStatus::Completed) => Some(SessionProjectionStatus::Completed),
                     Some(TurnTerminalStatus::Failed) => Some(SessionProjectionStatus::Failed),
                     Some(TurnTerminalStatus::Interrupted) => {
                         Some(SessionProjectionStatus::Interrupted)

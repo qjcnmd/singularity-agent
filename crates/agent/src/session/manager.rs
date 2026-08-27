@@ -177,10 +177,7 @@ impl SessionManager {
                 }
             }
         }
-        let cwd = header_cwd
-            .map(|cwd| std::path::absolute(Path::new(&cwd)))
-            .transpose()?
-            .unwrap_or(std::env::current_dir()?);
+        let cwd = std::path::absolute(Path::new(&header_cwd))?;
         let file_state = SessionFileState::capture(&file)?;
         Ok(Self {
             file,

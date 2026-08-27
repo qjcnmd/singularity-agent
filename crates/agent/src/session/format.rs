@@ -256,7 +256,7 @@ impl SessionEntry {
         }
     }
 }
-pub(super) fn validate_header(value: &Value) -> Result<(String, u32, Option<String>, String)> {
+pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, String)> {
     let object = value
         .as_object()
         .ok_or_else(|| SessionError::InvalidHeader("header is not a JSON object".into()))?;
@@ -295,7 +295,7 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, Option<Stri
             ))
         })?;
     let cwd = match object.get("cwd") {
-        Some(Value::String(cwd)) => Some(cwd.clone()),
+        Some(Value::String(cwd)) => cwd.clone(),
         Some(_) => {
             return Err(SessionError::InvalidHeader(
                 "header cwd must be a string".into(),

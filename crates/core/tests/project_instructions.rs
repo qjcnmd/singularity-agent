@@ -217,7 +217,10 @@ fn whitespace_only_instruction_files_do_not_consume_budget() {
         .expect("load succeeds")
         .expect("instructions present");
 
-    assert!(!loaded.truncated(), "whitespace file must not push over budget");
+    assert!(
+        !loaded.truncated(),
+        "whitespace file must not push over budget"
+    );
     assert_eq!(
         loaded.content().matches('b').count(),
         PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,

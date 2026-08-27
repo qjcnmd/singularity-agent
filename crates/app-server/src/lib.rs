@@ -23,11 +23,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use singularity_protocol::{
-    AppEvent, ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method,
-    MethodKind, ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread,
-    ThreadListResult, ThreadReadParams, ThreadReadResult, ThreadSettingsParams,
-    ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus, Turn, TurnIdParams,
-    TurnInjectionParams, TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
+    AppEvent, ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind,
+    ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread, ThreadListResult,
+    ThreadReadParams, ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult,
+    ThreadStartParams, ThreadStartResult, ThreadStatus, Turn, TurnIdParams, TurnInjectionParams,
+    TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
 };
 use thiserror::Error;
 

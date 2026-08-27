@@ -233,7 +233,6 @@ impl JsonRpcMessage {
             error: JsonRpcError {
                 code: error.code,
                 message: error.message,
-                data: None,
             },
         })
     }
@@ -330,20 +329,13 @@ fn empty_params() -> Value {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// JSON-RPC 错误对象；data 仅允许调用方显式提供已脱敏内容。
+/// JSON-RPC 错误对象。
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 无参数 method 的严格空对象。
 pub struct EmptyParams {}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 无结果 notification 或永不成功 method 的占位合同。
-pub struct EmptyResult {}

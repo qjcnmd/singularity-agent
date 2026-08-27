@@ -1205,7 +1205,10 @@ fn thread_has_live_turn_reports_poisoned_registry_lock() {
         let _guard = server.conversations.lock().expect("registry lock");
         panic!("poison the registry");
     });
-    assert!(poisoned.is_err(), "test precondition: registry lock poisoned");
+    assert!(
+        poisoned.is_err(),
+        "test precondition: registry lock poisoned"
+    );
     assert!(
         server.thread_has_live_turn("some-thread").is_err(),
         "poisoned lock must surface as an error"

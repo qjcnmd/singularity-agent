@@ -630,7 +630,9 @@ impl TuiApp {
             width: editor_area.width.saturating_sub(2).max(1),
             height: editor_area.height.saturating_sub(2).max(1),
         };
-        self.frame.click_targets.push((editor_inner, ClickTarget::Editor));
+        self.frame
+            .click_targets
+            .push((editor_inner, ClickTarget::Editor));
 
         if let Some(menu) = &self.settings {
             self.render_settings(frame, menu);

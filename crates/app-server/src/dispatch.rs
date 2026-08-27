@@ -290,7 +290,7 @@ impl AppServer {
         let protocol_thread = Thread {
             thread_id: thread.thread_id,
             model,
-            cwd: Some(cwd),
+            cwd,
             last_turn_status: None,
         };
         let mut messages =

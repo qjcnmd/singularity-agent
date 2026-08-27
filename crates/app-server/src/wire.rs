@@ -12,7 +12,7 @@ pub fn thread_from_summary(record: &ThreadSummary) -> Thread {
     Thread {
         thread_id: record.thread_id.clone(),
         model: record.model.clone(),
-        cwd: Some(record.cwd.clone()),
+        cwd: record.cwd.clone(),
         last_turn_status: record.status.map(protocol_thread_status),
     }
 }
@@ -22,7 +22,7 @@ pub fn thread_from_object(thread: &RuntimeThread) -> Thread {
     Thread {
         thread_id: thread.thread_id.clone(),
         model: thread.model.clone(),
-        cwd: Some(thread.cwd.clone()),
+        cwd: thread.cwd.clone(),
         last_turn_status: thread.last_turn_status.map(protocol_thread_status),
     }
 }

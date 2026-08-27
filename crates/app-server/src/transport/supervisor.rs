@@ -63,7 +63,6 @@ where
         write_output_queue(&mut output_rx, &mut output, &writer_cancellation).await
     });
     let mut writer_done = false;
-    let mut writer_result = None;
     let ready_for_turn = Arc::new(AtomicBool::new(false));
     let ready_notify = Arc::new(tokio::sync::Notify::new());
     let (ordinary_tx, ordinary_rx) = mpsc::channel::<JsonRpcMessage>(64);
@@ -104,8 +103,7 @@ where
             biased;
             result = &mut writer, if !writer_done => {
                 writer_done = true;
-                writer_result = Some(result);
-                terminal_error = Some(match writer_result.as_ref().expect("writer result") {
+                terminal_error = Some(match result {
                     Ok(Ok(())) => "stdout writer task failed: writer stopped unexpectedly".to_string(),
                     Ok(Err(error)) => format!("stdout writer task failed: {error}"),
                     Err(error) => format!("stdout writer task failed: {error}"),

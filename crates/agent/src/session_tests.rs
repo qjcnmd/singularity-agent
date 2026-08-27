@@ -642,7 +642,9 @@ fn verify_session_id_matches_or_rejects_header() {
     let id = manager.session_id().to_string();
 
     assert!(manager.verify_session_id(&id).is_ok());
-    let error = manager.verify_session_id("other-id").expect_err("must reject mismatch");
+    let error = manager
+        .verify_session_id("other-id")
+        .expect_err("must reject mismatch");
     assert!(matches!(error, SessionError::InvalidHeader(_)));
     assert!(error.to_string().contains("other-id"));
 }
