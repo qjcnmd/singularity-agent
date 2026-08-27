@@ -9,8 +9,9 @@ use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::provider::attempt::duration_millis;
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::http::{block_on_provider_future, duration_millis};
+use crate::transport::http::block_on_provider_future;
 
 /// 流 attempt 错误 + 重试是否可能重复可见文本。
 pub(super) struct StreamAttemptFailure {

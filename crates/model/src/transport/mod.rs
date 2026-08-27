@@ -22,18 +22,19 @@ use crate::openai::{
     parse_openai_response, parse_openai_responses_response, responses_endpoint,
 };
 use crate::provider::Provider;
+use crate::provider::attempt::{
+    ProviderAttemptInProgress, emit_provider_attempt_started, record_provider_attempt,
+};
 use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
     request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
 use crate::provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent, ProviderStreamingCapability, provider_streaming_unsupported_error,
+    ProviderAttemptEvent, ProviderStreamEvent, ProviderStreamingCapability,
+    provider_streaming_unsupported_error,
 };
-use crate::types::{
-    ModelRole, ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderToolReasoningMode,
-};
+use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
 
 /// 一次 provider 补全共享的单一已验证协议选择。
 struct CompletionContext {
@@ -120,80 +121,6 @@ impl ProtocolAdapter {
                 model_name,
                 reasoning_variant,
             ),
-        }
-    }
-}
-
-/// 一次真实 provider HTTP attempt 的可变计时状态。
-struct ProviderAttemptInProgress {
-    provider_name: String,
-    model_name: String,
-    actual_api_protocol: ProviderApiProtocol,
-    started_at: Instant,
-    started_at_unix_ms: u64,
-    request_send_to_headers_ms: Option<u64>,
-    time_to_first_text_delta_ms: Option<u64>,
-}
-
-impl ProviderAttemptInProgress {
-    fn new(
-        provider_name: &str,
-        model_name: &str,
-        actual_api_protocol: ProviderApiProtocol,
-    ) -> Self {
-        Self {
-            provider_name: provider_name.to_string(),
-            model_name: model_name.to_string(),
-            actual_api_protocol,
-            started_at: Instant::now(),
-            started_at_unix_ms: unix_timestamp_ms(),
-            request_send_to_headers_ms: None,
-            time_to_first_text_delta_ms: None,
-        }
-    }
-
-    fn started_event(&self) -> ProviderAttemptEvent {
-        ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            provider_name: self.provider_name.clone(),
-            model_name: self.model_name.clone(),
-            actual_api_protocol: self.actual_api_protocol,
-            started_at_unix_ms: self.started_at_unix_ms,
-        })
-    }
-
-    fn mark_response_headers_received(&mut self) {
-        self.request_send_to_headers_ms = Some(duration_millis(self.started_at.elapsed()));
-    }
-
-    fn set_time_to_first_text_delta(&mut self, duration_ms: Option<u64>) {
-        self.time_to_first_text_delta_ms = duration_ms;
-    }
-
-    fn finish(
-        self,
-        error: Option<&ModelError>,
-        usage: Option<ModelUsage>,
-    ) -> ProviderAttemptOccurrence {
-        let terminal_status = match error.map(|error| &error.kind) {
-            None => ProviderAttemptStatus::Ok,
-            Some(ModelErrorKind::Cancelled) => ProviderAttemptStatus::Cancelled,
-            Some(_) => ProviderAttemptStatus::Error,
-        };
-        let ended_at_unix_ms = unix_timestamp_ms().max(self.started_at_unix_ms);
-        ProviderAttemptOccurrence {
-            provider_name: self.provider_name,
-            model_name: self.model_name,
-            actual_api_protocol: self.actual_api_protocol,
-            terminal_status,
-            started_at_unix_ms: self.started_at_unix_ms,
-            ended_at_unix_ms,
-            attempt_duration_ms: duration_millis(self.started_at.elapsed()),
-            request_send_to_headers_ms: self.request_send_to_headers_ms,
-            time_to_first_text_delta_ms: self.time_to_first_text_delta_ms,
-            error_category: error.map(ModelError::category),
-            error_stage: error.and_then(|error| error.stage.clone()),
-            diagnostic_code: error.and_then(|error| error.code.clone()),
-            usage,
         }
     }
 }
@@ -984,24 +911,6 @@ impl Provider for OpenAiProvider {
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete_internal(request, cancellation, None, on_attempt)
     }
-}
-
-/// 记录一次终态 attempt，不改变聚合重试语义。
-fn emit_provider_attempt_started(
-    occurrence: &ProviderAttemptInProgress,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-) {
-    on_attempt(occurrence.started_event());
-}
-
-fn record_provider_attempt(
-    occurrence: ProviderAttemptInProgress,
-    error: Option<&ModelError>,
-    usage: Option<ModelUsage>,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-) {
-    let occurrence = occurrence.finish(error, usage);
-    on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)));
 }
 
 #[cfg(test)]

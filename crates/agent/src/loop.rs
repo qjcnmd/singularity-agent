@@ -13,7 +13,6 @@
 //! `session/` facade、`compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rand::Rng;
@@ -39,9 +38,10 @@ use crate::message::{
 };
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{SessionEntry, SessionError, SessionManager};
-use crate::tools::{
-    ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
+use crate::tools::batch::{
+    Prepared, PreparedToolCall, emit, execute_tool_batch, tool_error_execution,
 };
+use crate::tools::{ToolError, ToolExecution, ToolPreflight, ToolRegistry};
 
 /// Agent 层重试上限：模型调用返回可重试错误时，在此层指数退避重试。
 const MAX_TURN_RETRIES: u32 = 3;
@@ -379,125 +379,10 @@ struct TurnRequestSpec {
     turn: u32,
 }
 
-/// preflight 判定结果：可执行工具，或模型可见的拒绝执行。
-enum Prepared {
-    Ready(PreparedTool),
-    Rejected(ToolExecution),
-}
-
-/// 一次模型工具调用及其 preflight 判定。
-struct PreparedToolCall {
-    call: singularity_model::ModelToolCall,
-    prepared: Prepared,
-}
-
 enum AttemptOutcome {
     Response(Box<ModelTurnResponse>),
     Aborted,
     Failed(AgentError),
-}
-
-/// 通过单一事件出口投递一个事件；事件投影是尽力而为的，回调不再返回
-/// 错误——投影失败由消费方（app-server/CLI）自行吸收诊断，不影响轮次结果。
-fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) {
-    if let Some(callback) = events.on_event.as_deref_mut() {
-        callback(event);
-    }
-}
-
-fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecution {
-    ToolExecution {
-        content: format!("tool execution failed: {error}"),
-        is_error: true,
-    }
-}
-
-fn execute_prepared_tool(
-    registry: &ToolRegistry,
-    prepared: PreparedTool,
-    call: &singularity_model::ModelToolCall,
-    cwd: &Path,
-    cancellation: &CancellationToken,
-    mut on_update: impl FnMut(&str),
-) -> ToolExecution {
-    let mut update = |text: &str| on_update(text);
-    match registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            args: call.arguments.clone(),
-            cwd,
-            signal: Some(cancellation),
-            on_update: Some(&mut update),
-        },
-    ) {
-        Ok(execution) => execution,
-        Err(error) => tool_error_execution(error),
-    }
-}
-
-/// 按模型给定的 source order 串行执行一批工具调用：每个工具保留
-/// `catch_unwind` panic 隔离与逐工具事件发射；preflight 拒绝项不进入执行，
-/// 直接以模型可见失败收尾。单个工具失败不影响其余调用继续执行。
-fn execute_tool_batch(
-    registry: &ToolRegistry,
-    calls: &[PreparedToolCall],
-    cwd: &Path,
-    cancellation: &CancellationToken,
-    events: &mut AgentEvents<'_>,
-) -> Result<Vec<ToolExecution>> {
-    let mut results = Vec::with_capacity(calls.len());
-    for item in calls {
-        emit(
-            events,
-            AgentEvent::ToolExecutionStarted {
-                tool_name: item.call.tool_name.clone(),
-                tool_call_id: item.call.tool_call_id.clone(),
-                arguments: item.call.arguments.clone(),
-            },
-        );
-        match &item.prepared {
-            Prepared::Rejected(execution) => {
-                emit(
-                    events,
-                    AgentEvent::ToolExecutionEnded {
-                        tool_name: item.call.tool_name.clone(),
-                        tool_call_id: item.call.tool_call_id.clone(),
-                        execution: execution.clone(),
-                    },
-                );
-                results.push(execution.clone());
-                continue;
-            }
-            Prepared::Ready(prepared) => {
-                let prepared = prepared.clone();
-                let call = item.call.clone();
-                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
-                        emit(
-                            events,
-                            AgentEvent::ToolExecutionUpdate {
-                                tool_name: call.tool_name.clone(),
-                                tool_call_id: call.tool_call_id.clone(),
-                                arguments: call.arguments.clone(),
-                                partial_result: text.to_string(),
-                            },
-                        );
-                    })
-                }))
-                .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
-                emit(
-                    events,
-                    AgentEvent::ToolExecutionEnded {
-                        tool_name: call.tool_name.clone(),
-                        tool_call_id: call.tool_call_id.clone(),
-                        execution: execution.clone(),
-                    },
-                );
-                results.push(execution);
-            }
-        }
-    }
-    Ok(results)
 }
 
 /// 把系统/开发者指令投影为请求首条消息：恒以 Developer 角色构造，
@@ -777,7 +662,7 @@ impl Agent {
                         self.session.cwd(),
                         cancellation,
                         events,
-                    )?;
+                    );
                     // 持久的 toolResult 条目始终按 assistant source order 追加，
                     // 与完成/事件顺序无关。
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {

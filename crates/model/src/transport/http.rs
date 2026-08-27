@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Response;
 use serde_json::Value;
@@ -14,17 +13,6 @@ use crate::{
     HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
     MAX_PROVIDER_RESPONSE_BODY_BYTES,
 };
-
-pub(super) fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-pub(super) fn unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
 
 pub(crate) fn model_error_from_http_status(
     status: u16,

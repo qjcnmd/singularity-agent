@@ -5,6 +5,7 @@
 //! 模型协议的 Tool Schemas，并在收到模型 ToolCall 时通过 `ToolRegistry` 完成参数校验与安全分发。
 
 pub mod bash;
+pub mod batch;
 pub mod edit;
 pub mod glob;
 pub mod grep;
