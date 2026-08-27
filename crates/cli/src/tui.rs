@@ -175,13 +175,18 @@ fn from_turn(event: TurnEvent) -> UiEvent {
     UiEvent::FromTurn(Box::new(event))
 }
 
+/// TUI worker 以完成事件作为生命周期回执；事件循环不得同步 join 而阻塞绘制。
+fn spawn_ui_worker(task: impl FnOnce() + Send + 'static) {
+    drop(std::thread::spawn(task));
+}
+
 fn spawn_turn(
     conversation: &std::sync::Arc<singularity_runtime::Conversation>,
     goal: String,
     tx: mpsc::Sender<UiEvent>,
 ) {
     let conversation = std::sync::Arc::clone(conversation);
-    std::thread::spawn(move || {
+    spawn_ui_worker(move || {
         let mut sink = EventForward::new(tx.clone(), from_turn);
         let result = conversation.run_turn(&goal, &mut sink);
         drop(sink);
@@ -201,7 +206,7 @@ fn spawn_compact(
     tx: mpsc::Sender<UiEvent>,
 ) {
     let conversation = std::sync::Arc::clone(conversation);
-    std::thread::spawn(move || {
+    spawn_ui_worker(move || {
         let result = conversation
             .compact(&cancellation)
             .map_err(|error| error.to_string());

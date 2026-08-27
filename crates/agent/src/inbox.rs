@@ -56,9 +56,7 @@ impl TurnInbox {
 /// 活动 turn 转向输入箱的线程安全句柄。
 pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
-/// 加锁活动 turn inbox；中毒时恢复，避免一次工具 panic 使输入通道永久不可用。
+/// 加锁活动 turn inbox；共享协调状态中毒时 fail-stop，不能继续使用可能损坏的队列。
 pub(super) fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
-    queue
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    queue.lock().expect("turn inbox lock poisoned")
 }

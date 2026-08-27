@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::Value;
@@ -131,12 +131,18 @@ pub(crate) fn parse_session_lines_with_limits(
     let mut lines = Vec::new();
     let mut repair = TailRepair::None;
     let mut line_number = 1usize;
-    while let Some(bounded_line) = read_bounded_session_line(&mut reader, max_line_bytes)? {
-        if bounded_line.too_long {
-            return Err(SessionError::InvalidSession(format!(
-                "session entry exceeds {max_line_bytes} bytes at line {line_number}"
-            )));
-        }
+    while let Some(bounded_line) =
+        crate::tools::line::read_bounded_line_with_termination(&mut reader, max_line_bytes, None)
+            .map_err(|error| match error {
+                crate::tools::line::LineFailure::OverLimit(_) => SessionError::InvalidSession(
+                    format!("session entry exceeds {max_line_bytes} bytes at line {line_number}"),
+                ),
+                crate::tools::line::LineFailure::Io(error) => SessionError::Io(error),
+                crate::tools::line::LineFailure::Cancelled => {
+                    unreachable!("session parsing does not provide cancellation")
+                }
+            })?
+    {
         let has_newline = bounded_line.has_newline;
         let mut line = bounded_line.bytes.as_slice();
         if line.ends_with(b"\r") {
@@ -208,51 +214,6 @@ pub(crate) fn parse_session_lines_with_limits(
         lines,
         repair,
     })
-}
-
-struct BoundedSessionLine {
-    bytes: Vec<u8>,
-    has_newline: bool,
-    too_long: bool,
-}
-
-fn read_bounded_session_line<R: BufRead>(
-    reader: &mut R,
-    limit: usize,
-) -> std::io::Result<Option<BoundedSessionLine>> {
-    let mut bytes = Vec::with_capacity(limit.min(4096) + 1);
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(BoundedSessionLine {
-                bytes,
-                has_newline: false,
-                too_long: false,
-            }));
-        }
-        let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let content_len = newline.unwrap_or(buffer.len());
-        if bytes.len().saturating_add(content_len) > limit.saturating_add(1) {
-            return Ok(Some(BoundedSessionLine {
-                bytes: Vec::new(),
-                has_newline: newline.is_some(),
-                too_long: true,
-            }));
-        }
-        bytes.extend_from_slice(&buffer[..content_len]);
-        let consumed = newline.map_or(content_len, |position| position + 1);
-        reader.consume(consumed);
-        if newline.is_some() {
-            return Ok(Some(BoundedSessionLine {
-                bytes,
-                has_newline: true,
-                too_long: false,
-            }));
-        }
-    }
 }
 
 pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {

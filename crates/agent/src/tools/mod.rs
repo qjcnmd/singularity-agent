@@ -9,7 +9,7 @@ pub mod batch;
 pub mod edit;
 pub mod glob;
 pub mod grep;
-mod line;
+pub(crate) mod line;
 mod path;
 pub mod read;
 pub mod registry;

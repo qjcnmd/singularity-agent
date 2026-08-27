@@ -9,13 +9,18 @@ use singularity_core::CancellationToken;
 
 /// 有界行读取失败。
 #[derive(Debug)]
-pub(super) enum LineFailure {
+pub(crate) enum LineFailure {
     /// 行长度超过上限。
     OverLimit(usize),
     /// 取消信号触发。
     Cancelled,
     /// 底层读取错误。
     Io(io::Error),
+}
+
+pub(crate) struct BoundedLine {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) has_newline: bool,
 }
 
 impl std::fmt::Display for LineFailure {
@@ -35,6 +40,20 @@ pub(super) fn read_bounded_line(
     max_bytes: usize,
     signal: Option<&CancellationToken>,
 ) -> Result<Option<Vec<u8>>, LineFailure> {
+    let Some(mut line) = read_bounded_line_with_termination(reader, max_bytes, signal)? else {
+        return Ok(None);
+    };
+    if line.has_newline && line.bytes.last() == Some(&b'\r') {
+        line.bytes.pop();
+    }
+    Ok(Some(line.bytes))
+}
+
+pub(crate) fn read_bounded_line_with_termination(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+    signal: Option<&CancellationToken>,
+) -> Result<Option<BoundedLine>, LineFailure> {
     let mut bytes = Vec::new();
     let newline_terminated = loop {
         if signal.is_some_and(CancellationToken::is_cancelled) {
@@ -66,9 +85,9 @@ pub(super) fn read_bounded_line(
     }
     if newline_terminated {
         bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
     }
-    Ok(Some(bytes))
+    Ok(Some(BoundedLine {
+        bytes,
+        has_newline: newline_terminated,
+    }))
 }

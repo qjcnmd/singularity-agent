@@ -17,6 +17,7 @@
 - **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn；队列是进程内存态，当前进程存活期间按 FIFO 消费已接受输入）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
+  - [`ThreadCatalog`]：线程目录操作入口，负责 create/list/resume/rename；`Conversation` 不持有线程目录 CRUD。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
@@ -25,9 +26,9 @@
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config。
-- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；事件由适配器把 typed `TurnEvent` 一一映射为协议通知；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。协议类型只存在于 crates/protocol、适配器与 runtime 的公开历史投影（`paged_read` 返回协议 `HistoryItem`/`ThreadTurn`）。
+- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心：`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到立即 invalid-state），随后在 worker 线程以预订执行为整条链；runtime 直接发出 protocol 定义的 typed `TurnEvent`，app-server 只负责 JSON-RPC 信封；`turn/steer`/`turn/followUp`/`turn/interrupt` 控制 lane 与设置、删除全部路由到共享 `Conversation`。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
-- **依赖方向**：cli → runtime → {core, model, agent, protocol}；app-server → {runtime, protocol}；agent 不依赖 protocol/UI；protocol 仅服务 app-server 适配器与 runtime 的公开历史投影。
+- **依赖方向**：cli → runtime → {core, model, agent, protocol}；app-server → {runtime, protocol}；agent 不依赖 protocol/UI；protocol 不依赖 runtime/model/agent。
 
 ## 2. 无交互主调用链
 
@@ -53,13 +54,13 @@ sg --print|--json <goal>
 
 ### 2.1 事件流（TurnEvent 单一事实源）
 
-runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来源，方法名稳定：
+protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯一事件来源，方法名稳定：
 
 `thread/started · turn/started · item/started · item/agentMessage/delta · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error · thread/settingsApplied`
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影。空闲路径无此事件（提交点内已立即持久化）。
 
-`agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 在 runtime 和协议 DTO 中均为枚举，adapter 只负责一一映射，线格式词形不变。`provider/attempt` 的方法名稳定；其字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。错误分类词形在 runtime 定义（`provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`），协议 DTO 保持同名词形；turn/error 的 cause 字段携带同一词形；外部解析方只读 status 与分类词即可，字段集变化为加法兼容。
+`agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 由 protocol 枚举单点定义，runtime 直接使用。runtime 诊断 code 由 protocol 常量定义，Agent 内部诊断 code 由 Agent 事件模块常量定义；线格式词形不变。`provider/attempt` 的字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。错误分类词形为 `provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`；turn/error 的 cause 字段携带同一词形。
 
 `--json` 行形状为 `{"method": <名>, "params": <TurnEvent 字段，snake_case>}`；终态行为
 `{"summary":{"thread":{"threadId"},"turn":{"threadId","status","usage"}}}`，
@@ -75,6 +76,8 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 ## 4. 工具执行要点
 
 - 固定注册 read/glob/grep/bash/edit/write 六工具；多工具批按模型给定顺序串行，`parallel_tool_calls` 恒 false。
+- 每次 turn 的提示词工具名单、请求 schema 与执行分发共用同一个注册表快照。read/edit/write 的 toolResult 持久化类型化文件操作摘要，压缩优先消费该摘要；历史条目仍按原 ToolCall 参数兼容读取。
+- read、grep 与 session JSONL 解析共用同一有界行读取原语；不可信超长行 fail closed。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include 按 basename 过滤；上限 500 条。
 - **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
 - **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
@@ -82,7 +85,7 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 ## 5. 会话持久化与恢复
 
-- 严格 JSONL v2：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；runtime 与 app-server 共用同一只读投影 API。
+- 严格 JSONL v2：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 app-server 共用同一只读投影 API。
 - 列表、存在性检查、设置基线与读取头字段均按需扫描或读取 JSONL；摘要统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
@@ -119,5 +122,5 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 ## 9. 当前维护边界
 
 - 本文只描述当前有效的进程边界、事件流、会话格式、AgentLoop、Compaction、工具语义、Provider 能力声明、配置、TUI 契约和评估入口。
-- app-server 的协议细节（命令/事件集、握手、控制 lane、并发 turn 裁定）作为 GUI 适配面的内部合同，由 crates/app-server 与 crates/protocol 自身的适配器测试维护（协议事件名/字段/终态/取消/会话恢复不漂移）；协议类型不进入 runtime。
+- app-server 的协议细节（命令/事件集、握手、控制 lane、并发 turn 裁定）作为 GUI 适配面的内部合同，由 crates/app-server 与 crates/protocol 的协议测试维护（协议事件名/字段/终态/取消/会话恢复不漂移）；runtime 只依赖 protocol 的稳定类型，不依赖客户端适配器。
 - 已移除机制、迁移过程和历史提交由 Git 保存；修改上述任一事实时必须同步更新对应章节并跑受影响验证。
