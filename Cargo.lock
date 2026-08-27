@@ -2180,9 +2180,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "singularity_agent",
- "singularity_core",
- "singularity_model",
  "singularity_protocol",
  "singularity_runtime",
  "tempfile",
@@ -2256,6 +2253,7 @@ dependencies = [
  "singularity_agent",
  "singularity_core",
  "singularity_model",
+ "singularity_protocol",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

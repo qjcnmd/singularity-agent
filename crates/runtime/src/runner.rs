@@ -30,7 +30,7 @@ use crate::error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
 };
 use crate::events::{ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink};
-use crate::objects::{Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
+use crate::objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
 const PROJECT_INSTRUCTIONS_TRUNCATED_CODE: &str = "project_instructions_truncated";
@@ -124,6 +124,25 @@ impl TurnRunner {
 
     pub fn provider_snapshot(&self) -> &ProviderConfigSnapshot {
         &self.provider_snapshot
+    }
+
+    /// Provider 配置快照的只读展示投影（provider/status 的 wire 映射输入）。
+    pub fn provider_status(&self) -> ProviderStatus {
+        let snapshot = &self.provider_snapshot;
+        let config = snapshot.redacted_config();
+        let configuration = snapshot.configuration();
+        ProviderStatus {
+            source: snapshot.source().map(|source| source.as_str().to_string()),
+            snapshot_id: snapshot.snapshot_id().to_string(),
+            configured: configuration.configured,
+            configuration_blocker: configuration
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code().to_string()),
+            api_key_present: config.api_key_present,
+            base_url_present: config.base_url_present,
+            model_present: config.model_name.is_some(),
+        }
     }
 
     /// 快照的默认模型 selector（未配置时为 None）。

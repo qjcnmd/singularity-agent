@@ -77,6 +77,8 @@ fn prepare_inner(
                 ResumeError::Store(message) => {
                     format!("failed to resume thread {session_id}: {message}")
                 }
+                // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
+                other => format!("failed to resume thread {session_id}: {other}"),
             })?;
         // `--model` 只覆盖本次执行：不写回 Thread 元数据。
         if model.is_some() {

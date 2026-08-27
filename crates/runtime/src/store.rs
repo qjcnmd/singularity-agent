@@ -1,14 +1,18 @@
-//! Thread 的持久化入口：创建、定位、修复重开与元数据投影。
+//! Thread 的持久化入口：创建、定位、修复重开、只读分页投影与删除。
 //!
 //! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
 //! 入口，不复制会话状态。
 
 use std::path::{Path, PathBuf};
 
-use singularity_agent::session::{SessionManager, SessionProjectionStatus, project_session};
+use singularity_agent::session::{
+    SessionEntry, SessionError, SessionManager, SessionProjectionStatus, project_session,
+};
+use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
 
 use crate::error::TurnFailureCause;
+use crate::history::project_turn_history;
 use crate::objects::{Thread, ThreadStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,13 +225,133 @@ impl From<TurnFailureCause> for String {
 pub enum ResumeError {
     #[error("thread {0} was not found")]
     NotFound(String),
+    #[error("thread has an active writer")]
+    WriterActive,
+    #[error("before item {0} was not found in the thread history")]
+    AnchorNotFound(String),
     #[error("{0}")]
     Store(String),
+}
+
+/// thread/read 的一页只读投影：摘要 + 最近一次 compaction 摘要 + 按轮分页的
+/// 公开历史。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadReadPage {
+    pub summary: ThreadSummary,
+    /// 最近一次 compaction 摘要；无 compaction 时为 None。
+    pub compaction_summary: Option<String>,
+    /// 本页轮次，按会话顺序（旧→新）排列。
+    pub turns: Vec<ThreadTurn>,
+    /// 会话中真实 turn 的总数（不含无归属 turn 的前导组）。
+    pub total_turns: usize,
+}
+
+/// 单次无锁只读解析完成 thread/read 的全部投影：摘要 + 分页条目 +
+/// 状态/用量投影。分页是单向往回读：默认返回最新 `limit` 轮；给
+/// `before_item`（上一页最旧轮内任意 item 的公开 id）则定位其所属轮，
+/// 返回该轮之前的 `limit` 轮。未知锚点返回 [`ResumeError::AnchorNotFound`]。
+///
+/// 末组未终止轮保持 running 投影；只有本进程存在该会话的存活 turn 时
+/// running 才成立，该精化由持有存活 turn 知识的调用方完成（app-server
+/// 在 thread/read 中依据整体状态投影修正为 interrupted）。
+pub fn paged_read(
+    sessions_dir: &Path,
+    thread_id: &str,
+    limit: usize,
+    before_item: Option<&str>,
+) -> Result<ThreadReadPage, ResumeError> {
+    let path = session_file(sessions_dir, thread_id);
+    if !path.exists() {
+        return Err(ResumeError::NotFound(thread_id.to_string()));
+    }
+    let session = SessionManager::open_existing_read_only(&path)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    if session.session_id() != thread_id {
+        return Err(ResumeError::Store(format!(
+            "rollout header id {} does not match requested thread id {thread_id}",
+            session.session_id()
+        )));
+    }
+    let entries = session.entries();
+    let summary = thread_summary(&session);
+    let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
+        _ => None,
+    });
+    let mut turns = project_turn_history(entries);
+    let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
+    let before_index = match before_item {
+        None => None,
+        Some(anchor) => match turns
+            .iter()
+            .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
+        {
+            Some(index) => Some(index),
+            None => return Err(ResumeError::AnchorNotFound(anchor.to_string())),
+        },
+    };
+    let page_start = before_index.unwrap_or(turns.len()).saturating_sub(limit);
+    let page_end = before_index.unwrap_or(turns.len());
+    turns = turns[page_start..page_end].to_vec();
+    Ok(ThreadReadPage {
+        summary,
+        compaction_summary,
+        turns,
+        total_turns,
+    })
+}
+
+/// 删除 Thread 的会话文件。持写者锁完成：其他写者正在 append 时拒绝
+///（[`ResumeError::WriterActive`]），避免删除后写入落入 unlinked inode。
+pub fn delete_thread(sessions_dir: &Path, thread_id: &str) -> Result<(), ResumeError> {
+    let path = session_file(sessions_dir, thread_id);
+    if !path.exists() {
+        return Err(ResumeError::NotFound(thread_id.to_string()));
+    }
+    let session = SessionManager::open_existing(&path).map_err(|error| match error {
+        SessionError::WriterConflict { .. } => ResumeError::WriterActive,
+        other => ResumeError::Store(other.to_string()),
+    })?;
+    if session.session_id() != thread_id {
+        return Err(ResumeError::Store(format!(
+            "rollout header id {} does not match requested thread id {thread_id}",
+            session.session_id()
+        )));
+    }
+    drop(session);
+    remove_rollout(&path)
+}
+
+fn remove_rollout(rollout: &Path) -> Result<(), ResumeError> {
+    let identity = std::fs::symlink_metadata(rollout).map_err(|error| {
+        ResumeError::Store(format!(
+            "failed to inspect session rollout {}: {error}",
+            rollout.display()
+        ))
+    })?;
+    if !identity.is_file() {
+        return Err(ResumeError::Store(format!(
+            "session rollout is not a regular file: {}",
+            rollout.display()
+        )));
+    }
+    std::fs::remove_file(rollout).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ResumeError::Store(format!("session rollout not found: {}", rollout.display()))
+        } else {
+            ResumeError::Store(format!(
+                "failed to remove session rollout {}: {error}",
+                rollout.display()
+            ))
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use singularity_agent::message::{AgentMessage, AgentMessageRole};
+    use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
 
     fn write_session(sessions_dir: &Path, thread_id: &str, timestamp: &str) {
         let header = serde_json::json!({
@@ -261,5 +385,109 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec![newest, first, second]);
+    }
+
+    /// 构造一轮已完成 + 一轮未终止的会话（格式 v2 真实条目），返回首轮
+    /// message 的 entry id（供锚点定位）。
+    fn session_with_two_turns(sessions_dir: &Path, thread_id: &str) -> String {
+        let mut session = SessionManager::create_with_id(Path::new("."), sessions_dir, thread_id)
+            .expect("create session");
+        session
+            .append_metadata(SessionMetadata::turn_started("turn-1"))
+            .expect("append turn start");
+        let message_id = session
+            .append_message(AgentMessage::text(
+                AgentMessageRole::User,
+                "first turn text",
+            ))
+            .expect("append message");
+        session
+            .append_metadata(
+                SessionMetadata::turn_terminal(
+                    "turn-1",
+                    TurnTerminalStatus::Completed,
+                    serde_json::json!({"input_tokens": 1}),
+                    true,
+                )
+                .expect("turn terminal metadata"),
+            )
+            .expect("append turn terminal");
+        session
+            .append_metadata(SessionMetadata::turn_started("turn-2"))
+            .expect("append second turn start");
+        message_id
+    }
+
+    #[test]
+    fn paged_read_projects_turns_summary_and_pages_by_anchor() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+        let thread_id = "01914f6b-0000-7000-8000-000000000001";
+        let message_id = session_with_two_turns(&sessions_dir, thread_id);
+
+        let page = paged_read(&sessions_dir, thread_id, 10, None).expect("read page");
+        assert_eq!(page.total_turns, 2);
+        assert_eq!(page.turns.len(), 2);
+        assert_eq!(page.turns[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            page.turns[0].status,
+            Some(singularity_protocol::TurnStatus::Completed)
+        );
+        assert_eq!(page.turns[1].turn_id.as_deref(), Some("turn-2"));
+        // 末组未终止轮保持 running；存活 turn 精化由调用方完成。
+        assert_eq!(
+            page.turns[1].status,
+            Some(singularity_protocol::TurnStatus::Running)
+        );
+        assert_eq!(page.summary.status, Some(ThreadStatus::Active));
+        assert_eq!(page.compaction_summary, None);
+        assert_eq!(page.summary.turn_count, 2);
+        // 终态 usage 并入轮内条目。
+        assert!(
+            page.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(item, singularity_protocol::HistoryItem::Usage { .. }))
+        );
+
+        // limit 1 只返回最新一轮。
+        let page = paged_read(&sessions_dir, thread_id, 1, None).expect("read one turn");
+        assert_eq!(page.turns.len(), 1);
+        assert_eq!(page.turns[0].turn_id.as_deref(), Some("turn-2"));
+
+        // 锚点定位到首轮内 item：返回该轮之前的 0 轮（空页）。
+        let anchor = format!("{message_id}:text:0");
+        let page = paged_read(&sessions_dir, thread_id, 10, Some(&anchor)).expect("read by anchor");
+        assert_eq!(page.turns.len(), 0);
+        assert_eq!(page.total_turns, 2);
+
+        // 未知锚点报 AnchorNotFound。
+        match paged_read(&sessions_dir, thread_id, 10, Some("no-such-item")) {
+            Err(ResumeError::AnchorNotFound(_)) => {}
+            other => panic!("expected AnchorNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_thread_removes_session_and_rejects_active_writer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+        let thread_id = "01914f6b-0000-7000-8000-000000000002";
+        let _ = session_with_two_turns(&sessions_dir, thread_id);
+
+        let session = SessionManager::open_existing(&thread_session_path(&sessions_dir, thread_id))
+            .expect("open session");
+        // 存活写者持有锁：删除必须拒绝，避免删除后写入落入 unlinked inode。
+        match delete_thread(&sessions_dir, thread_id) {
+            Err(ResumeError::WriterActive) => {}
+            other => panic!("expected WriterActive, got {other:?}"),
+        }
+        drop(session);
+        delete_thread(&sessions_dir, thread_id).expect("delete after writer release");
+        assert!(!thread_session_path(&sessions_dir, thread_id).exists());
+        match delete_thread(&sessions_dir, thread_id) {
+            Err(ResumeError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

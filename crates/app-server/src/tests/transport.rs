@@ -5,14 +5,15 @@ use crate::{
     AppServer, AppServerCancellationHandle, AppServerError, ProviderFailureKind, TurnFailureCause,
     TurnFailureStage,
 };
-use serde_json::{Value, json};
-use singularity_agent::session::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
-use singularity_core::CancellationToken;
-use singularity_model::{
+use s::CancellationToken;
+use s::{
     ModelTurnRequest, ModelTurnResponse, Provider, ProviderConfigSnapshot, ProviderError,
     ProviderProtocolContract,
 };
+use s::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
+use serde_json::{Value, json};
 use singularity_protocol::{JsonRpcId, JsonRpcMessage};
+use singularity_runtime::test_support as s;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,24 +119,20 @@ fn home_inside_current_repository_is_rejected_before_state_preparation() {
     std::fs::create_dir_all(&nested_cwd).expect("nested cwd");
 
     // home 位于仓库边界内（含尚不存在的尾部组件）→ 拒绝。
-    let error = singularity_core::ensure_singularity_home_outside_workspace(&inside, &nested_cwd)
+    let error = s::ensure_singularity_home_outside_workspace(&inside, &nested_cwd)
         .expect_err("inside rejected");
     assert!(error.contains("must not be inside"), "{error}");
     // 仓库外 home → 通过。
-    singularity_core::ensure_singularity_home_outside_workspace(&outside, &nested_cwd)
-        .expect("outside accepted");
+    s::ensure_singularity_home_outside_workspace(&outside, &nested_cwd).expect("outside accepted");
     // 无 `.git` 边界时以 cwd 为边界。若测试临时目录本身位于另一个
     // Git 仓库（例如本机 D:\Temp\.git）内，则该前提不成立，跳过这段。
     let plain = directory.path().join("plain");
     std::fs::create_dir_all(&plain).expect("plain cwd");
-    if singularity_core::find_workspace_root(&plain).expect("find plain root") == plain {
-        let error = singularity_core::ensure_singularity_home_outside_workspace(
-            &plain.join("home"),
-            &plain,
-        )
-        .expect_err("cwd inside");
+    if s::find_workspace_root(&plain).expect("find plain root") == plain {
+        let error = s::ensure_singularity_home_outside_workspace(&plain.join("home"), &plain)
+            .expect_err("cwd inside");
         assert!(error.contains("must not be inside"), "{error}");
-        singularity_core::ensure_singularity_home_outside_workspace(&outside, &plain)
+        s::ensure_singularity_home_outside_workspace(&outside, &plain)
             .expect("outside cwd accepted");
     }
 }

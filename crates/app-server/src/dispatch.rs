@@ -1,8 +1,5 @@
 //! JSON-RPC 注册表校验与请求分发处理器。
 
-use singularity_agent::session::{SessionError, SessionManager, SessionRepository};
-use singularity_model::ProviderConfigSnapshot;
-
 use super::*;
 
 pub(super) fn json_response<T: serde::Serialize>(
@@ -204,6 +201,11 @@ impl AppServer {
             Err(singularity_runtime::store::ResumeError::Store(error)) => {
                 return Err(AppServerError::Store(error));
             }
+            Err(_) => {
+                return Err(AppServerError::Store(
+                    "unexpected thread store error".to_string(),
+                ));
+            }
         };
         let patch = singularity_runtime::SettingsPatch {
             provider: params.provider,
@@ -236,7 +238,7 @@ impl AppServer {
                 return Err(AppServerError::InvalidParams(message));
             }
         };
-        let parts = singularity_model::split_model_selector(&result.selector);
+        let parts = singularity_runtime::split_model_selector(&result.selector);
         json_response(
             message.required_id(),
             ThreadSettingsResult {
@@ -300,28 +302,35 @@ impl AppServer {
         if !(1..=200).contains(&params.limit) {
             return invalid_params_response(message.required_id());
         }
-        let record = match singularity_runtime::store::read_thread_summary(
+        // 单次只读解析完成摘要 + 分页条目 + 状态/用量投影；分页与锚点定位
+        // 全部在 runtime store 层，这里只做 live-turn 精化与 wire 组装。
+        let page = match singularity_runtime::store::paged_read(
             &self.sessions_dir,
             &params.session_id,
+            params.limit as usize,
+            params.before_item.as_deref(),
         ) {
-            Ok(record) => record,
+            Ok(page) => page,
             Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
                 return not_found_response(message.required_id(), THREAD_NOT_FOUND);
+            }
+            Err(singularity_runtime::store::ResumeError::AnchorNotFound(_)) => {
+                return invalid_params_response(message.required_id());
             }
             Err(singularity_runtime::store::ResumeError::Store(error)) => {
                 return Err(AppServerError::Store(error));
             }
+            Err(singularity_runtime::store::ResumeError::WriterActive) => {
+                return Err(AppServerError::Store(
+                    "thread has an active writer".to_string(),
+                ));
+            }
         };
-        let repository = SessionRepository::new(self.sessions_dir.clone());
-        let read = repository
-            .read(&record.thread_id)
-            .map_err(AppServerError::Session)?;
-        // 与 thread/list 复用同一 last-turn 投影，
-        // 两个读取接口不得显示互相矛盾的状态。
-        let overall_status = self.project_thread(&record).last_turn_status;
-        let mut turns = project_turn_history(&read.entries);
-        // 整体状态一致性：末组 running 只有在整体 active（存在存活 turn）
-        // 时保留；崩溃遗留投影为 interrupted。
+        // 与 thread/list 复用同一 last-turn 投影，两个读取接口不得显示互相
+        // 矛盾的状态：末组 running 只有在整体 active（存在存活 turn）时保留；
+        // 崩溃遗留投影为 interrupted。
+        let overall_status = self.project_thread(&page.summary).last_turn_status;
+        let mut turns = page.turns;
         if overall_status != Some(ThreadStatus::Active)
             && turns
                 .last_mut()
@@ -329,23 +338,9 @@ impl AppServer {
         {
             turns.last_mut().expect("checked above").status = Some(TurnStatus::Interrupted);
         }
-        // 单向往回读分页：默认取最新 limit 轮；给 beforeItem（上一页最旧轮内
-        // 任意 item 的公开 id）则定位其所属轮，返回该轮之前的 limit 轮。
-        let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
-        let before_index = match params.before_item.as_deref() {
-            None => None,
-            Some(anchor) => match turns
-                .iter()
-                .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
-            {
-                Some(index) => Some(index),
-                None => return invalid_params_response(message.required_id()),
-            },
-        };
-        let page_start = before_index
-            .unwrap_or(turns.len())
-            .saturating_sub(params.limit as usize);
-        let page_end = before_index.unwrap_or(turns.len());
+        let record = page.summary;
+        let compaction_summary = page.compaction_summary;
+        let total_turns = page.total_turns;
         json_response(
             message.required_id(),
             ThreadReadResult {
@@ -357,8 +352,8 @@ impl AppServer {
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 token_usage: record.token_usage,
-                summary: read.summary,
-                turns: turns[page_start..page_end].to_vec(),
+                summary: compaction_summary,
+                turns,
                 total_turns,
             },
         )
@@ -380,33 +375,36 @@ impl AppServer {
             Err(singularity_runtime::store::ResumeError::Store(error)) => {
                 return Err(AppServerError::Store(error));
             }
+            Err(_) => {
+                return Err(AppServerError::Store(
+                    "unexpected thread store error".to_string(),
+                ));
+            }
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode。
         if self.thread_has_live_turn(&record.thread_id) {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
-        // 打开并校验 rollout header 后再进入删除；不能先永久删 JSONL。
-        let rollout_path =
-            singularity_runtime::store::thread_session_path(&self.sessions_dir, &record.thread_id);
-        let session = match SessionManager::open_existing(&rollout_path) {
-            Ok(session) => session,
-            Err(SessionError::WriterConflict { .. }) => {
-                return invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE);
-            }
-            Err(error) => return Err(AppServerError::Session(error)),
-        };
-        if session.session_id() != record.thread_id {
-            return Err(AppServerError::Store(format!(
-                "rollout header id {} does not match requested session id {}",
-                session.session_id(),
-                record.thread_id
-            )));
-        }
         // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在
         // 删除窗口内开始 append。
-        crate::delete::delete_session(&rollout_path)?;
-        drop(session);
+        match singularity_runtime::store::delete_thread(&self.sessions_dir, &record.thread_id) {
+            Ok(()) => {}
+            Err(singularity_runtime::store::ResumeError::WriterActive) => {
+                return invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE);
+            }
+            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
+            }
+            Err(singularity_runtime::store::ResumeError::Store(error)) => {
+                return Err(AppServerError::Store(error));
+            }
+            Err(singularity_runtime::store::ResumeError::AnchorNotFound(_)) => {
+                return Err(AppServerError::Store(
+                    "unexpected thread store error".to_string(),
+                ));
+            }
+        }
         json_response(
             message.required_id(),
             SessionDeleteResult {
@@ -543,7 +541,7 @@ impl AppServer {
     ) -> AppServerResult<Vec<Value>> {
         json_response(
             message.required_id(),
-            provider_configuration(self.turn_runner.provider_snapshot()),
+            crate::wire::provider_configuration(&self.turn_runner.provider_status()),
         )
     }
 
@@ -575,24 +573,5 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         self.control_handle().turn_follow_up(message)
-    }
-}
-
-pub(super) fn provider_configuration(
-    snapshot: &ProviderConfigSnapshot,
-) -> ProviderConfigurationStatus {
-    let config = snapshot.redacted_config();
-    let configuration = snapshot.configuration();
-    ProviderConfigurationStatus {
-        source: snapshot.source().map(|source| source.as_str().to_string()),
-        snapshot_id: snapshot.snapshot_id().to_string(),
-        configured: configuration.configured,
-        configuration_blocker: configuration
-            .blocker
-            .as_ref()
-            .map(|blocker| blocker.code().to_string()),
-        api_key_present: config.api_key_present,
-        base_url_present: config.base_url_present,
-        model_present: config.model_name.is_some(),
     }
 }

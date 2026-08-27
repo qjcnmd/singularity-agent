@@ -1,13 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use serde_json::json;
-use singularity_agent::session::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
-use singularity_core::CancellationToken;
-use singularity_model::{
+use s::CancellationToken;
+use s::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
     ProviderConfigSnapshot, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
 };
+use s::{SessionManager, SessionMetadataKind, TurnTerminalStatus};
+use serde_json::json;
+use singularity_runtime::test_support as s;
 
 /// 测试共享的注入 runtime：provider 异步执行一律由上层提供。
 pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
@@ -80,9 +81,7 @@ fn jsonl_projection_does_not_repair_incomplete_turn() {
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
     session
-        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
-            "turn-1",
-        ))
+        .append_metadata(s::SessionMetadata::turn_started("turn-1"))
         .expect("turn metadata");
     let discovered = singularity_runtime::read_thread_summary(&sessions_dir, session_id)
         .expect("project session");
@@ -176,14 +175,14 @@ fn jsonl_projection_recovers_all_fields_including_title_model_usage() {
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
 
     session
-        .append_message(singularity_agent::message::AgentMessage::text(
-            singularity_agent::message::AgentMessageRole::User,
+        .append_message(s::AgentMessage::text(
+            s::AgentMessageRole::User,
             "Implement feature X for the system",
         ))
         .expect("user message");
     session
         .append_metadata(
-            singularity_agent::session::SessionMetadata::thread_settings(
+            s::SessionMetadata::thread_settings(
                 "anthropic",
                 "claude-3-7-sonnet",
                 Some("high".to_string()),
@@ -193,7 +192,7 @@ fn jsonl_projection_recovers_all_fields_including_title_model_usage() {
         .expect("settings metadata");
     session
         .append_metadata(
-            singularity_agent::session::SessionMetadata::turn_terminal(
+            s::SessionMetadata::turn_terminal(
                 "turn-1",
                 TurnTerminalStatus::Completed,
                 json!({"input_tokens": 120, "output_tokens": 45}),
@@ -296,12 +295,8 @@ fn thread_settings_null_clears_reasoning_while_missing_keeps_it() {
         .expect("create session");
     session
         .append_metadata(
-            singularity_agent::session::SessionMetadata::thread_settings(
-                "openai_compatible",
-                "test-model",
-                None,
-            )
-            .expect("settings metadata"),
+            s::SessionMetadata::thread_settings("openai_compatible", "test-model", None)
+                .expect("settings metadata"),
         )
         .expect("append settings");
     drop(session);
@@ -361,11 +356,11 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
     let mut session =
         SessionManager::create_with_id(&workspace, &sessions_dir, session_id).expect("session");
     session
-        .append_message(singularity_agent::message::AgentMessage::Assistant {
-            content: vec![singularity_agent::message::ContentBlock::Thinking {
+        .append_message(s::AgentMessage::Assistant {
+            content: vec![s::ContentBlock::Thinking {
                 thinking: "visible reasoning".to_string(),
                 signature: None,
-            }, singularity_agent::message::ContentBlock::ToolCall {
+            }, s::ContentBlock::ToolCall {
                 id: "call-1".to_string(),
                 name: "write".to_string(),
                 args: json!({"path":"out.txt","content":"ok"}),
@@ -384,8 +379,8 @@ fn public_history_projection_omits_private_replay_and_internal_tree_fields() {
         })
         .expect("assistant");
     session
-        .append_message(singularity_agent::message::AgentMessage::ToolResult {
-            content: vec![singularity_agent::message::ContentBlock::Text {
+        .append_message(s::AgentMessage::ToolResult {
+            content: vec![s::ContentBlock::Text {
                 text: "write failed".to_string(),
             }],
             tool_call_id: Some("call-1".to_string()),
@@ -841,7 +836,7 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
         workspace.join("AGENTS.md"),
         // `#` 不会出现在 Windows 路径（含 8.3 短名）或提示词模板中，计数不受
         // runner 环境影响。
-        vec![b'#'; singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
+        vec![b'#'; s::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1],
     )
     .expect("oversized agents");
     let sessions_dir = temp.path().join("sessions");
@@ -904,7 +899,7 @@ fn oversized_project_instructions_truncate_with_warning_instead_of_failing() {
     let marker_count = joined.matches('#').count();
     assert_eq!(
         marker_count,
-        singularity_core::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+        s::PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
         "exactly the file budget prefix reaches the model (joined_len={} head={:?} tail={:?})",
         joined.len(),
         &joined[..joined.len().min(60)],
@@ -987,30 +982,24 @@ fn seed_turned_session(sessions_dir: &Path, session_id: &str, turn_ids: &[&str])
     let mut session = SessionManager::open_existing(&path).expect("reopen session");
     session
         .append_metadata(
-            singularity_agent::session::SessionMetadata::thread_settings(
-                "openai_compatible",
-                "test-model",
-                None,
-            )
-            .expect("settings"),
+            s::SessionMetadata::thread_settings("openai_compatible", "test-model", None)
+                .expect("settings"),
         )
         .expect("append settings");
     for (index, turn_id) in turn_ids.iter().enumerate() {
         session
-            .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
-                *turn_id,
-            ))
+            .append_metadata(s::SessionMetadata::turn_started(*turn_id))
             .expect("turn started");
         session
-            .append_message(singularity_agent::message::AgentMessage::text(
-                singularity_agent::message::AgentMessageRole::User,
+            .append_message(s::AgentMessage::text(
+                s::AgentMessageRole::User,
                 format!("user-{index}"),
             ))
             .expect("user message");
         if index % 2 == 0 {
             session
-                .append_message(singularity_agent::message::AgentMessage::ToolResult {
-                    content: vec![singularity_agent::message::ContentBlock::Text {
+                .append_message(s::AgentMessage::ToolResult {
+                    content: vec![s::ContentBlock::Text {
                         text: format!("tool-output-{index}"),
                     }],
                     tool_call_id: Some(format!("call-{index}")),
@@ -1021,7 +1010,7 @@ fn seed_turned_session(sessions_dir: &Path, session_id: &str, turn_ids: &[&str])
         }
         session
             .append_metadata(
-                singularity_agent::session::SessionMetadata::turn_terminal(
+                s::SessionMetadata::turn_terminal(
                     *turn_id,
                     TurnTerminalStatus::Completed,
                     json!({}),
@@ -1139,13 +1128,11 @@ fn thread_read_projects_crash_leftover_turn_as_interrupted() {
     let path = sessions_dir.join(format!("{sid}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("reopen");
     session
-        .append_metadata(singularity_agent::session::SessionMetadata::turn_started(
-            "t9",
-        ))
+        .append_metadata(s::SessionMetadata::turn_started("t9"))
         .expect("turn started");
     session
-        .append_message(singularity_agent::message::AgentMessage::text(
-            singularity_agent::message::AgentMessageRole::User,
+        .append_message(s::AgentMessage::text(
+            s::AgentMessageRole::User,
             "crashed mid-turn",
         ))
         .expect("user message");

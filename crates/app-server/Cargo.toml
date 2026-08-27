@@ -12,9 +12,6 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-singularity_agent = { path = "../agent" }
-singularity_core = { path = "../core" }
-singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
 thiserror.workspace = true

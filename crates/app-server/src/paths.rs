@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use singularity_core::{create_owner_only_dir, user_singularity_home};
+use singularity_runtime::{create_owner_only_dir, user_singularity_home};
 
 /// `~/.singularity` 下的固定路径集合（会话目录名复用 runtime 单一事实源）。
 #[derive(Debug, Clone)]

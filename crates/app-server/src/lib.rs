@@ -9,7 +9,6 @@
 //! 协议对象转换，并把 [`singularity_runtime::TurnEvent`] 一一映射为协议通知。
 //! JSONL rollout 是会话正文与列表元数据的唯一持久事实源。
 
-mod delete;
 mod dispatch;
 mod events;
 mod lifecycle;
@@ -24,12 +23,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use singularity_protocol::{
-    AppEvent, ErrorCode, HistoryItem, InitializeParams, InitializeResult, JsonRpcId,
-    JsonRpcMessage, Method, MethodKind, ProviderConfigurationStatus, ServerShutdownResult,
-    SessionDeleteResult, SessionIdParams, Thread, ThreadListResult, ThreadReadParams,
-    ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult, ThreadStartParams,
-    ThreadStartResult, ThreadStatus, ThreadTurn, Turn, TurnIdParams, TurnInjectionParams,
-    TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
+    AppEvent, ErrorCode, InitializeParams, InitializeResult, JsonRpcId, JsonRpcMessage, Method,
+    MethodKind, ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread,
+    ThreadListResult, ThreadReadParams, ThreadReadResult, ThreadSettingsParams,
+    ThreadSettingsResult, ThreadStartParams, ThreadStartResult, ThreadStatus, Turn, TurnIdParams,
+    TurnInjectionParams, TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
 };
 use thiserror::Error;
 
@@ -56,8 +54,6 @@ pub enum AppServerError {
     InvalidParams(String),
     #[error("store error: {0}")]
     Store(String),
-    #[error("session error: {0}")]
-    Session(#[from] singularity_agent::session::SessionError),
     #[error("workspace error: {0}")]
     Workspace(String),
     /// 共享核心的 turn 执行失败：分类来自 runtime 的失败 taxonomy，
@@ -103,7 +99,6 @@ impl fmt::Display for TurnTerminalizationFailure {
 pub type AppServerOutput = Value;
 
 pub use dispatch::{TurnClaim, TurnStartClaim};
-use events::project_turn_history;
 pub use paths::AppPaths;
 pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
 pub use wire::thread_from_summary;

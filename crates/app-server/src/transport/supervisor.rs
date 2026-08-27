@@ -5,8 +5,8 @@ use crate::{
     AppServer, AppServerCancellationHandle, AppServerControlHandle, AppServerError, AppServerOutput,
 };
 use serde_json::Value;
-use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{JsonRpcInbound, JsonRpcMessage, Method, parse_json_rpc_payload};
+use singularity_runtime::ProviderConfigSnapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -455,11 +455,11 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     // 显式 SINGULARITY_HOME 时，先于任何目录创建校验其不在当前仓库内
     // （model 层配置校验的启动期第一道防线；违规 fail closed）。
     if std::env::var_os("SINGULARITY_HOME").is_some() {
-        let home = singularity_core::user_singularity_home()
+        let home = singularity_runtime::user_singularity_home()
             .ok_or_else(|| "cannot resolve SINGULARITY_HOME for sessions".to_string())?;
         let cwd = std::env::current_dir()
             .map_err(|error| format!("failed to read app-server cwd: {error}"))?;
-        singularity_core::ensure_singularity_home_outside_workspace(&home, &cwd)?;
+        singularity_runtime::ensure_singularity_home_outside_workspace(&home, &cwd)?;
     }
     let paths = crate::paths::AppPaths::resolve()?;
     paths.prepare()?;

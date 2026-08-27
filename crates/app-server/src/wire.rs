@@ -1,10 +1,10 @@
 //! 结构映射的单一 wire 收口：runtime 对象 → 协议线格式。
 //!
-//! Thread/ThreadStatus 与 usage 的投影全部经此模块；runtime 词形与协议
-//! 词形的对应关系只有一份事实源。
+//! Thread/ThreadStatus、usage 与 provider 状态的投影全部经此模块；runtime
+//! 词形与协议词形的对应关系只有一份事实源。
 
-use singularity_protocol::{Thread, ThreadStatus, TurnModelUsage};
-use singularity_runtime::objects::{Thread as RuntimeThread, TurnUsage};
+use singularity_protocol::{ProviderConfigurationStatus, Thread, ThreadStatus, TurnModelUsage};
+use singularity_runtime::objects::{ProviderStatus, Thread as RuntimeThread, TurnUsage};
 use singularity_runtime::store::ThreadSummary;
 
 /// 把 JSONL 只读摘要投影为协议 Thread。
@@ -48,5 +48,18 @@ pub fn turn_model_usage(usage: &TurnUsage) -> TurnModelUsage {
         reasoning_tokens: usage.reasoning_tokens,
         usage_present: usage.usage_present,
         usage_complete: usage.usage_complete,
+    }
+}
+
+/// 把 runtime 的 provider 状态投影为协议 `provider/status` 形状。
+pub fn provider_configuration(status: &ProviderStatus) -> ProviderConfigurationStatus {
+    ProviderConfigurationStatus {
+        source: status.source.clone(),
+        snapshot_id: status.snapshot_id.clone(),
+        configured: status.configured,
+        configuration_blocker: status.configuration_blocker.clone(),
+        api_key_present: status.api_key_present,
+        base_url_present: status.base_url_present,
+        model_present: status.model_present,
     }
 }

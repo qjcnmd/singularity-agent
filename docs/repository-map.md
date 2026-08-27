@@ -27,7 +27,8 @@ flowchart TD
 ## 2. Crate 依赖方向
 
 依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core`/`protocol` 是最底层。
-`runtime` 不依赖 `protocol`/`cli`；`protocol` 只服务 app-server 适配器。
+`runtime` 依赖 `protocol` 仅为公开历史投影类型（`HistoryItem`/`ThreadTurn`）；
+`protocol` 只服务 app-server 适配器与 runtime 的历史投影。
 
 ```mermaid
 flowchart LR
@@ -35,13 +36,11 @@ flowchart LR
     CLI --> MODEL["model"]
     CLI --> CORE["core"]
     APPSERVER["app-server"] --> RUNTIME
-    APPSERVER --> MODEL
     APPSERVER --> PROTOCOL["protocol"]
-    APPSERVER --> AGENT["agent"]
-    APPSERVER --> CORE
     RUNTIME --> AGENT
     RUNTIME --> MODEL
     RUNTIME --> CORE
+    RUNTIME --> PROTOCOL
     AGENT --> MODEL
     AGENT --> CORE
     MODEL --> CORE
@@ -144,7 +143,6 @@ flowchart TD
             s_manager["manager.rs — 会话生命周期与追加"]
             s_context["context.rs — 上下文条目投影"]
             s_repair["repair.rs — 崩溃恢复与孤立工具修复"]
-            s_repository["repository.rs — 会话发现与只读投影"]
         end
         subgraph tools["tools/ — 六工具与注册表"]
             t_mod["mod.rs — 工具模块组织"]
@@ -174,8 +172,9 @@ flowchart TD
         conversation["conversation.rs — Thread 长驻协调器：单活动 turn、Steer、followUp、设置时序"]
         runner["runner.rs — 单个 turn 完整管线：准备、执行、事件投影、终态落盘"]
         events["events.rs — typed TurnEvent 单一事实源"]
-        objects["objects.rs — Thread/Turn/usage 公开对象"]
-        store["store.rs — 会话创建/定位/列表投影/修复重开入口"]
+        history["history.rs — 会话条目→公开历史投影（project_turn_history）"]
+        objects["objects.rs — Thread/Turn/usage/Provider 状态公开对象"]
+        store["store.rs — 会话创建/定位/列表/分页只读投影/删除/修复重开入口"]
         error["error.rs — Turn 失败分类（stage/cause）"]
     end
     cli["cli"] --> runtime
@@ -211,7 +210,8 @@ flowchart TD
 ## 9. crates/app-server — 桌面端后端
 
 stdio JSON-RPC 后端：只做准入、协议对象转换与事件投影，执行全部委托 runtime。
-`protocol` 类型只存在于本 crate 与适配器。
+`protocol` 类型只存在于本 crate、适配器与 runtime 的公开历史投影（D1 后
+thread/read 的分页与历史投影由 runtime store 的 `paged_read` 承担）。
 
 ```mermaid
 flowchart TD
@@ -220,10 +220,9 @@ flowchart TD
         main["main.rs — stdio 二进制入口"]
         state["state.rs — 运行时状态容器与协调器注册表"]
         dispatch["dispatch.rs — 请求分发与参数解析"]
-        events["events.rs — 生命周期事件投影"]
+        events["events.rs — 生命周期事件通知包装"]
         paths["paths.rs — 持久化路径投影"]
-        delete["delete.rs — 会话删除"]
-        wire["wire.rs — 结构映射收口（Thread/ThreadStatus/Usage 投影）"]
+        wire["wire.rs — 结构映射收口（Thread/ThreadStatus/Usage/Provider 状态投影）"]
         subgraph lifecycle["lifecycle/ — 投影适配器"]
             projection["projection.rs — TurnEvent → JSON-RPC 通知"]
         end

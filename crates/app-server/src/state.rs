@@ -9,9 +9,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::Thread;
-use singularity_runtime::{Conversation, TurnRunner};
+use singularity_runtime::{Conversation, ProviderConfigSnapshot, TurnRunner};
 
 use super::*;
 
@@ -206,7 +205,7 @@ impl AppServer {
     #[cfg(test)]
     pub(crate) fn with_test_provider(
         mut self,
-        provider: Arc<dyn singularity_model::Provider + Send + Sync>,
+        provider: Arc<dyn singularity_runtime::Provider + Send + Sync>,
     ) -> Self {
         self.turn_runner = Arc::new(
             TurnRunner::new(self.sessions_dir.clone(), self.provider_snapshot.clone())
@@ -283,13 +282,15 @@ impl AppServer {
         }
         let thread =
             singularity_runtime::store::resume_thread(self.turn_runner.sessions_dir(), session_id)
-                .map_err(|error| match error {
+                .map_err(|error| match &error {
                     singularity_runtime::store::ResumeError::NotFound(_) => {
                         AppServerError::Store(format!("thread {session_id} was not found"))
                     }
                     singularity_runtime::store::ResumeError::Store(message) => {
                         AppServerError::Workspace(format!("failed to resume thread: {message}"))
                     }
+                    // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
+                    other => AppServerError::Workspace(format!("failed to resume thread: {other}")),
                 })?;
         let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
         guard.insert(session_id.to_string(), Arc::clone(&conversation));

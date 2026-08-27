@@ -83,3 +83,15 @@ impl TurnUsage {
         }
     }
 }
+
+/// Provider 配置快照的只读展示投影；app-server 在 wire 边界映射为协议形状。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderStatus {
+    pub source: Option<String>,
+    pub snapshot_id: String,
+    pub configured: bool,
+    pub configuration_blocker: Option<String>,
+    pub api_key_present: bool,
+    pub base_url_present: bool,
+    pub model_present: bool,
+}
