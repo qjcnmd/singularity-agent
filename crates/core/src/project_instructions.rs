@@ -169,6 +169,11 @@ pub fn load_project_instructions(
     let mut truncated = false;
     let mut remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES;
     for directory in instruction_directories(&workspace_root, &cwd) {
+        // 预算耗尽后不再读取后续文件。
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
         let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let instruction_file = read_project_instruction_file(
             &directory.dir,
@@ -181,10 +186,9 @@ pub fn load_project_instructions(
         if instruction_file.truncated {
             truncated = true;
         }
-        // 预算制：剩余合并预算用尽即停止纳入后续文件。
-        if remaining == 0 {
-            truncated = true;
-            break;
+        // 空文件不消耗预算，也不标记截断。
+        if instruction_file.text.trim().is_empty() {
+            continue;
         }
         let byte_len = instruction_file.byte_len;
         if byte_len > remaining {
@@ -201,9 +205,6 @@ pub fn load_project_instructions(
             break;
         }
         remaining -= byte_len;
-        if instruction_file.text.trim().is_empty() {
-            continue;
-        }
         if !content.is_empty() {
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }

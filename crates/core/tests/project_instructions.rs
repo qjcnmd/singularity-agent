@@ -191,3 +191,72 @@ fn truncates_hierarchy_to_total_budget_and_stops() {
     );
     assert!(loaded.truncated(), "truncation fact must be observable");
 }
+
+#[test]
+fn whitespace_only_instruction_files_do_not_consume_budget() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let first = workspace.join("first");
+    let cwd = first.join("second");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    // 根文件与 cwd 文件各占满单文件预算；中间只有空白字符的文件若被计入
+    // 预算，cwd 文件就会被截断——空白文件必须零成本跳过。
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        vec![b'a'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+    )
+    .expect("root agents");
+    std::fs::write(first.join("AGENTS.md"), "\n\n  ").expect("whitespace first agents");
+    std::fs::write(
+        cwd.join("AGENTS.md"),
+        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+    )
+    .expect("cwd agents");
+
+    let loaded = load_project_instructions(&workspace, &cwd)
+        .expect("load succeeds")
+        .expect("instructions present");
+
+    assert!(!loaded.truncated(), "whitespace file must not push over budget");
+    assert_eq!(
+        loaded.content().matches('b').count(),
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+        "cwd file fully incorporated"
+    );
+}
+
+#[test]
+fn budget_exhaustion_skips_remaining_files() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let first = workspace.join("first");
+    let cwd = first.join("second");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    // 前两个文件各占满单文件预算，合计耗尽 64KB 总预算。
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        vec![b'a'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+    )
+    .expect("root agents");
+    std::fs::write(
+        first.join("AGENTS.md"),
+        vec![b'b'; PROJECT_INSTRUCTIONS_MAX_FILE_BYTES],
+    )
+    .expect("first agents");
+    // 预算耗尽后不得再读取：目录形式的 AGENTS.md 一旦被读即报 UnsupportedFileType。
+    std::fs::create_dir(cwd.join("AGENTS.md")).expect("cwd agents dir");
+
+    let loaded = load_project_instructions(&workspace, &cwd)
+        .expect("budget-exhausted load succeeds")
+        .expect("instructions present");
+
+    assert!(loaded.truncated(), "exhausted budget marks truncated");
+    assert_eq!(
+        loaded.content().matches('a').count(),
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES
+    );
+    assert_eq!(
+        loaded.content().matches('b').count(),
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES
+    );
+}
