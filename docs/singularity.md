@@ -16,7 +16,7 @@
 
 - **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
-  - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn，每条恰好一次）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
+  - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn；队列是进程内存态，当前进程存活期间按 FIFO 消费已接受输入）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
@@ -63,14 +63,14 @@ runtime 的 typed `TurnEvent` 枚举是全部客户端渲染的唯一事件来�
 
 `--json` 行形状为 `{"method": <名>, "params": <TurnEvent 字段，snake_case>}`；终态行为
 `{"summary":{"thread":{"threadId"},"turn":{"threadId","status","usage"}}}`，
-其中 `status ∈ completed|failed|interrupted`，`usage` 含 input/output/total/cached/reasoning tokens 与 `usagePresent/usageComplete`。截断终态（`turn.truncated`）的 `turn` 额外携带可选字段 `truncated: true`，普通终态省略该字段——该字段仅截断终态出现、为加法兼容的扩展，外部评估器仅依赖原有字段即可解析。
+其中 `status ∈ completed|failed|interrupted`，`usage` 含 input/output/total/cached/reasoning tokens 与 `usagePresent/usageComplete`。截断终态（`turn.truncated`）的 `turn` 额外携带可选字段 `truncated: true`，普通终态省略该字段——该字段仅截断终态出现、为加法兼容的扩展，外部评估器仅依赖原有字段即可解析。准备阶段失败的 summary 省略 `thread` 字段（turn 尚未启动，无已确定的 thread 可投影）。
 
 ## 3. Compaction（请求前两道闸门）
 
 - **第一道（请求前主动）**：[`ContextLedger`] 每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时使用本轮完整装配估算，估算覆盖消息、工具 schema、reasoning replay 的序列化尺寸、`max_output_tokens` 预算与固定封装余量。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
 - **第二道（Provider 精确拒绝后）**：非 2xx body 有界读取并结构化解析，**仅当** `error.code == "context_length_exceeded"` 时分类为 `ContextLengthExceeded`（不可重试）；此时以 ContextOverflow 原因强制压缩一次并同轮重试（重试基于压缩后会话重新装配请求）；二次失败原样返回。其余错误体保持状态码分类并附有界脱敏短诊断。
 - 切点策略：从最新往回累积至保留预算（retain_ratio），取其后最近合法切点；toolResult 永不作切点且 ToolCall/ToolResult 成对保留；尾部跨预算时回退到当前轮起点——摘要更早历史，当前轮完整保留；只有当前轮即全部历史时才返回 NotNeeded。
-- 摘要调用的 usage 计入 turn 总量；强制压缩的 tokensBefore 取真实重建估算。
+- 摘要调用的 usage 计入 turn 总量；强制压缩的 tokensBefore 取真实重建估算。摘要请求走与正常请求同一重试包装（可取消退避、尊重 Retry-After），取消时以 provider cancelled 错误收敛为压缩失败。
 
 ## 4. 工具执行要点
 

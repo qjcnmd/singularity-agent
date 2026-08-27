@@ -182,6 +182,10 @@ impl ScrollState {
     }
 }
 
+fn bottom_top(total_rows: usize, viewport: usize) -> usize {
+    total_rows.saturating_sub(viewport)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +197,11 @@ mod tests {
         let mut state = ScrollState::default();
         state.pin_new_content_at(10);
         state.on_content_grow(0, 10, 5);
-        assert_eq!(state.visible_top(10, 5), 10, "pin survives a zero-growth frame");
+        assert_eq!(
+            state.visible_top(10, 5),
+            10,
+            "pin survives a zero-growth frame"
+        );
         assert!(state.is_following(), "pin keeps follow semantics");
     }
 
@@ -222,8 +230,4 @@ mod tests {
         assert!(!state.is_following());
         assert_eq!(state.visible_top(12, 5), 6);
     }
-}
-
-fn bottom_top(total_rows: usize, viewport: usize) -> usize {
-    total_rows.saturating_sub(viewport)
 }

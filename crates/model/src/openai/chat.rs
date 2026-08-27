@@ -61,7 +61,7 @@ pub fn openai_request_payload(
             request
                 .tools
                 .iter()
-                .map(|tool| openai_tool_payload(tool))
+                .map(openai_tool_payload)
                 .collect::<Vec<_>>()
         );
         if wire.supports_tool_choice {

@@ -25,4 +25,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+singularity_agent = { path = "../agent", features = ["test-support"] }
 tempfile.workspace = true

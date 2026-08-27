@@ -238,9 +238,12 @@ where
     let mut worker_error = None;
     if !turn_dispatcher_done {
         // dispatcher 在 turn_rx 关闭且 worker 全部收敛后退出；宽限到点 abort。
-        if let Some(error) =
-            wait_task_graceful(&mut turn_dispatcher_task, shutdown_deadline, "turn dispatcher")
-                .await
+        if let Some(error) = wait_task_graceful(
+            &mut turn_dispatcher_task,
+            shutdown_deadline,
+            "turn dispatcher",
+        )
+        .await
         {
             worker_error.get_or_insert(error);
         }
@@ -260,7 +263,8 @@ where
     drop(output_tx);
 
     if !writer_done
-        && let Some(error) = wait_task_graceful(&mut writer, shutdown_deadline, "stdout writer").await
+        && let Some(error) =
+            wait_task_graceful(&mut writer, shutdown_deadline, "stdout writer").await
     {
         // 保留既有的 writer 错误措辞（内部错误带来源前缀，超时文本原样）。
         let error = if error.starts_with("timed out waiting for") {

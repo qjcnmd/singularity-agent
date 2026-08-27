@@ -37,10 +37,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use unicode_width::UnicodeWidthStr;
 
+use crate::forward::{EventForward, INTERRUPT_POLL};
 use app::TuiApp;
 use commands::Action;
 use singularity_runtime::CompactionOutcome;
-use singularity_runtime::events::{TurnEvent, TurnEventSink};
+use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
 
 pub(crate) fn char_display_width(ch: char) -> usize {
@@ -83,7 +84,6 @@ pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 const SPINNER_TICK: Duration = Duration::from_millis(120);
 
 pub struct InteractiveOutcome {
@@ -171,14 +171,8 @@ enum UiEvent {
     CompactFinished(Result<CompactionOutcome, String>),
 }
 
-struct Forward {
-    tx: mpsc::Sender<UiEvent>,
-}
-
-impl TurnEventSink for Forward {
-    fn emit(&mut self, event: TurnEvent) {
-        let _ = self.tx.send(UiEvent::FromTurn(Box::new(event)));
-    }
+fn from_turn(event: TurnEvent) -> UiEvent {
+    UiEvent::FromTurn(Box::new(event))
 }
 
 fn spawn_turn(
@@ -188,7 +182,7 @@ fn spawn_turn(
 ) {
     let conversation = std::sync::Arc::clone(conversation);
     std::thread::spawn(move || {
-        let mut sink = Forward { tx: tx.clone() };
+        let mut sink = EventForward::new(tx.clone(), from_turn);
         let result = conversation.run_turn(&goal, &mut sink);
         drop(sink);
         let finished = match result {
@@ -246,8 +240,7 @@ fn event_loop(
                 UiEvent::ChainFinished(result) => {
                     // 终态后可能带出排队中的 /compact（Action::Compact），
                     // 与键盘触发的压缩走同一 spawn 路径。
-                    if let Action::Compact = app.on_chain_finished(&result) {
-                        let cancellation = app.compact_token();
+                    if let Action::Compact(cancellation) = app.on_chain_finished(&result) {
                         spawn_compact(&app.conversation_handle(), cancellation, tx.clone());
                     }
                 }
@@ -263,8 +256,7 @@ fn event_loop(
                     Action::Submit(goal) => {
                         spawn_turn(&app.conversation_handle(), goal, tx.clone())
                     }
-                    Action::Compact => {
-                        let cancellation = app.compact_token();
+                    Action::Compact(cancellation) => {
                         spawn_compact(&app.conversation_handle(), cancellation, tx.clone())
                     }
                     Action::Exit(code) => return Ok(code),

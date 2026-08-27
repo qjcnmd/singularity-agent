@@ -43,7 +43,7 @@ impl SessionManager {
                 TurnTerminalStatus::Interrupted,
                 serde_json::json!({}),
                 false,
-            )?)?;
+            ))?;
             repaired += 1;
         }
         Ok(repaired)

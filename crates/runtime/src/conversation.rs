@@ -600,8 +600,7 @@ impl Conversation {
                     .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME),
                 parts.model.unwrap_or_default(),
                 parts.effort.map(str::to_string),
-            )
-            .map_err(|error| error.to_string())?;
+            );
             session
                 .append_metadata(metadata)
                 .map_err(|error| error.to_string())

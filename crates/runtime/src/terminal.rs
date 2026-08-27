@@ -42,7 +42,6 @@ impl TerminalCommit {
         let usage =
             serde_json::to_value(&self.usage).expect("TurnUsage serialization is infallible");
         SessionMetadata::turn_terminal(&self.turn_id, self.status, usage, self.usage_complete)
-            .expect("TurnUsage is always a JSON object")
     }
 
     /// 单条落盘终态 metadata；同内容已存在时幂等跳过。

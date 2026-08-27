@@ -10,17 +10,17 @@ use rand::Rng;
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, Provider, ProviderAttemptEvent, ProviderError,
-    ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
-    PROVIDER_STREAMING_UNSUPPORTED_CODE,
+    ModelTurnRequest, ModelTurnResponse, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider,
+    ProviderAttemptEvent, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
+    ProviderStreamEvent, ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
 };
 use uuid::Uuid;
 
 use crate::compaction::{CompactionBudget, CompactionError, CompactionOutcome};
 use crate::message::{AgentMessageRole, ContentBlock};
-use crate::session::context::entry_to_llm_messages;
 use crate::session::SessionEntry;
+use crate::session::context::entry_to_llm_messages;
+use crate::tools::ToolRegistry;
 
 use super::events::{AgentDiagnostic, AgentEvent, AgentEvents, emit, emit_diagnostic};
 use super::{Agent, AgentError, Result};
@@ -86,9 +86,7 @@ pub(crate) enum SendOutcome {
 /// 调用方处理；退避等待被取消时返回 [`SendOutcome::Aborted`]。正常采样与
 /// compaction 摘要请求经同一 helper 复用同一传输策略。
 pub(crate) fn send_with_retry(
-    mut attempt: impl FnMut(
-        &mut AgentEvents,
-    ) -> std::result::Result<ModelTurnResponse, ProviderError>,
+    mut attempt: impl FnMut(&mut AgentEvents) -> std::result::Result<ModelTurnResponse, ProviderError>,
     retry: super::TurnRetryConfig,
     events: &mut AgentEvents,
     cancellation: &CancellationToken,
@@ -311,7 +309,7 @@ impl Agent {
     pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> Result<(ModelTurnRequest, u64)> {
         let (messages, replays) = self.assemble_messages()?;
         let assembled_estimate =
-            self.estimate_assembled(&messages, &spec.tools, &replays, spec.max_output_tokens);
+            self.estimate_assembled(&messages, &replays, spec.max_output_tokens);
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
             messages,
@@ -352,12 +350,12 @@ impl Agent {
     /// 对本轮装配结果做保守 Token 估算，供首轮或 provider usage 缺失时
     /// 的请求前压缩判定使用。
     ///
-    /// 估算覆盖消息 content、工具调用标识与参数、工具 schema、provider
-    /// reasoning replay 的序列化尺寸、输出预算及固定封装余量。
+    /// 估算覆盖消息 content、工具调用标识与参数、工具 schema（构造期缓存
+    /// 的序列化串）、provider reasoning replay 的序列化尺寸、输出预算及
+    /// 固定封装余量。
     pub(super) fn estimate_assembled(
         &self,
         messages: &[ModelMessage],
-        tools: &[ModelToolSchema],
         replays: &[ProviderReasoningReplay],
         max_output_tokens: u32,
     ) -> u64 {
@@ -378,8 +376,7 @@ impl Agent {
                 tokens
             })
             .sum::<u64>();
-        let tool_tokens =
-            estimate(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string()));
+        let tool_tokens = estimate(&self.tools_json);
         let replay_tokens =
             estimate(&serde_json::to_string(replays).unwrap_or_else(|_| "[]".to_string()));
         message_tokens
@@ -480,11 +477,19 @@ impl Agent {
         &self,
         capabilities: &ProviderProtocolContract,
     ) -> Vec<ModelToolSchema> {
-        self.registry
+        Self::tool_schemas_from(&self.registry, capabilities)
+    }
+
+    /// [`Self::tool_schemas`] 的无 receiver 形式，供构造期缓存序列化复用。
+    pub(super) fn tool_schemas_from(
+        registry: &ToolRegistry,
+        capabilities: &ProviderProtocolContract,
+    ) -> Vec<ModelToolSchema> {
+        registry
             .names()
             .into_iter()
             .filter_map(|name| {
-                self.registry
+                registry
                     .get(name)
                     .map(|spec| (name, spec.description, spec.parameters.clone()))
             })

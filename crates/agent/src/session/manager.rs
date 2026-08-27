@@ -47,29 +47,41 @@ impl std::fmt::Debug for SessionManager {
 }
 
 impl SessionManager {
-    /// 新建会话：生成 UUID 并创建文件。
+    /// 测试便利构造器共用的协调器构造方式；并行测试仍各自持 per-tempdir
+    /// 协调器，共享的是构造方式而不是实例。
+    #[cfg(any(test, feature = "test-support"))]
+    fn coordinator_for_tests(sessions_dir: &Path) -> Arc<WriterLockCoordinator> {
+        Arc::new(WriterLockCoordinator::new(sessions_dir))
+    }
+
+    /// 新建会话：生成 UUID 并创建文件（测试便利入口）。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
         let session_id = Uuid::now_v7().to_string();
         let timestamp = now_iso();
-        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
         Self::create_with_file(
             cwd,
             sessions_dir,
             format!("{session_id}.jsonl"),
             session_id,
             timestamp,
-            &coordinator,
+            &Self::coordinator_for_tests(sessions_dir),
         )
     }
 
-    /// 新建会话：文件名与 header id 都是调用方指定的 UUID。
+    /// 测试便利入口：自带临时协调器 [`Self::create_with_id_with_coordinator`]。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
-        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
-        Self::create_with_id_with_coordinator(cwd, sessions_dir, session_id, &coordinator)
+        Self::create_with_id_with_coordinator(
+            cwd,
+            sessions_dir,
+            session_id,
+            &Self::coordinator_for_tests(sessions_dir),
+        )
     }
 
-    /// 与 [`create_with_id`] 相同，但使用调用方持有的长驻协调器（进程级
-    /// stale 清理只发生一次；见 [`open_existing_with_coordinator`]）。
+    /// 新建会话：文件名与 header id 都是调用方指定的 UUID，写者锁走调用方
+    /// 持有的长驻协调器（进程级 stale 清理只发生一次）。
     pub fn create_with_id_with_coordinator(
         cwd: &Path,
         sessions_dir: &Path,
@@ -92,7 +104,8 @@ impl SessionManager {
 
     /// 打开必须已存在的会话文件；缺失或损坏直接报错，不静默创建新会话。
     /// 打开时获取该会话的 OS 写者锁（文件名 stem 为锁键），解锁前其他写者
-    /// 被拒绝。修复重写与后续 append 全程持锁。
+    /// 被拒绝。修复重写与后续 append 全程持锁（测试便利入口）。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
         let sessions_dir = path.parent().ok_or_else(|| {
             SessionError::InvalidSession(format!(
@@ -100,11 +113,10 @@ impl SessionManager {
                 path.display()
             ))
         })?;
-        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
-        Self::open_existing_with_coordinator(path, &coordinator)
+        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(sessions_dir))
     }
 
-    /// 与 [`open_existing`] 相同，但使用调用方持有的长驻协调器。
+    /// 打开既有会话并使用调用方持有的长驻协调器。
     ///
     /// 协调器承担进程级的一次性 stale 清理；进程内应只存在一个实例
     /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
@@ -232,10 +244,15 @@ impl SessionManager {
         })
     }
 
+    /// 在既有条目集合内去重生成新条目 id；三个 append 入口共用。
+    fn new_entry_id(&self) -> String {
+        generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate))
+    }
+
     /// 追加消息为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
-            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            id: self.new_entry_id(),
             timestamp: Some(now_iso()),
             message,
         })
@@ -244,7 +261,7 @@ impl SessionManager {
     /// 追加 compaction 条目为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
     pub fn append_compaction(&mut self, entry: CompactionEntry) -> Result<String> {
         self.append_entry(SessionEntry::Compaction {
-            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            id: self.new_entry_id(),
             timestamp: Some(now_iso()),
             compaction: entry,
         })
@@ -254,7 +271,7 @@ impl SessionManager {
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         let metadata = metadata.validate()?;
         self.append_entry(SessionEntry::Metadata {
-            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            id: self.new_entry_id(),
             timestamp: Some(now_iso()),
             metadata,
         })

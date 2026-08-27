@@ -187,10 +187,7 @@ fn truncates_hierarchy_to_total_budget_and_stops() {
     );
     assert_eq!(
         loaded.content().matches('c').count(),
-        PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES
-            - per_file_bytes
-            - (per_file_bytes + 2)
-            - 2,
+        PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES - per_file_bytes - (per_file_bytes + 2) - 2,
         "cwd file limited to remaining total budget (two separators consumed)"
     );
     assert!(loaded.truncated(), "truncation fact must be observable");
@@ -262,7 +259,10 @@ fn exactly_filling_the_total_budget_does_not_mark_truncated() {
         !loaded.truncated(),
         "exact budget fill without dropped content must not report truncation"
     );
-    assert_eq!(loaded.content().matches('a').count(), PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    assert_eq!(
+        loaded.content().matches('a').count(),
+        PROJECT_INSTRUCTIONS_MAX_FILE_BYTES
+    );
     assert_eq!(
         loaded.content().matches('b').count(),
         PROJECT_INSTRUCTIONS_MAX_FILE_BYTES - 2

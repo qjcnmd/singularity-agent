@@ -1,5 +1,7 @@
 //! TUI 斜杠命令模型与补全。
 
+use singularity_core::CancellationToken;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
     Model,
@@ -61,13 +63,14 @@ impl SlashCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Action {
     Continue,
     Submit(String),
     Exit(i32),
-    /// 后台执行上下文压缩（/compact）；事件循环负责 spawn 线程并转发结果。
-    Compact,
+    /// 后台执行上下文压缩（/compact），携带本次压缩的外部取消令牌；
+    /// 事件循环负责 spawn 线程并转发结果。
+    Compact(CancellationToken),
 }
 
 #[cfg(test)]

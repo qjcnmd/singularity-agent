@@ -9,6 +9,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 仅供下游 crate 的测试构建启用：暴露自带临时协调器的会话便利构造器。
+test-support = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

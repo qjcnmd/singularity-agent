@@ -189,10 +189,11 @@ impl TuiApp {
                     );
                 } else {
                     self.compacting = true;
-                    self.compact_cancel = Some(CancellationToken::new());
+                    let cancellation = CancellationToken::new();
+                    self.compact_cancel = Some(cancellation.clone());
                     self.transcript
                         .push_note("compacting context…", NoteStyle::Dim);
-                    return Action::Compact;
+                    return Action::Compact(cancellation);
                 }
             }
             SlashCommand::Name if !argument.trim().is_empty() => {
@@ -237,13 +238,6 @@ impl TuiApp {
     }
 
     // -- 压缩异步编排 --------------------------------------------------------
-
-    /// 事件循环 spawn 压缩线程前取走外部取消令牌的克隆。
-    pub(super) fn compact_token(&self) -> CancellationToken {
-        self.compact_cancel
-            .clone()
-            .expect("compact token must be set before Action::Compact")
-    }
 
     /// 压缩进行中取消本次压缩：触发令牌取消；收尾文案由
     /// [`TuiApp::on_compact_finished`] 统一给出。

@@ -22,7 +22,7 @@ impl std::fmt::Display for LineFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OverLimit(limit) => write!(formatter, "line exceeds {limit} bytes"),
-            Self::Cancelled => formatter.write_str("Operation aborted"),
+            Self::Cancelled => formatter.write_str(super::registry::ABORTED_MESSAGE),
             Self::Io(error) => error.fmt(formatter),
         }
     }

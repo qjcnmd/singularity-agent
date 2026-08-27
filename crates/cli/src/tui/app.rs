@@ -21,7 +21,7 @@ use super::modals::{ResumeMenu, SettingsMenu};
 use super::mouse::{ClickTarget, WheelNormalizer};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
-use super::view::{describe_usage, truncate_label};
+use super::view::{describe_usage, short_id, truncate_label};
 use super::wrapped_lines;
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
@@ -164,7 +164,7 @@ impl TuiApp {
         match event {
             TurnEvent::TurnStarted { turn } => {
                 self.transcript.push_note(
-                    format!("── turn {} ──", &turn.turn_id[..8.min(turn.turn_id.len())]),
+                    format!("── turn {} ──", short_id(&turn.turn_id)),
                     NoteStyle::Dim,
                 );
                 self.set_waiting(WaitingTarget::Model);
@@ -282,10 +282,11 @@ impl TuiApp {
         if self.compact_queued {
             self.compact_queued = false;
             self.compacting = true;
-            self.compact_cancel = Some(singularity_core::CancellationToken::new());
+            let cancellation = singularity_core::CancellationToken::new();
+            self.compact_cancel = Some(cancellation.clone());
             self.transcript
                 .push_note("compacting context…", NoteStyle::Dim);
-            return Action::Compact;
+            return Action::Compact(cancellation);
         }
         Action::Continue
     }

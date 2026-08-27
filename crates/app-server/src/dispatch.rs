@@ -73,6 +73,30 @@ pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Valu
     json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
 }
 
+/// store 调用错误的统一映射骨架：NotFound 与 Store 的收尾在全部调用点
+/// 一致（thread 未找到响应 / 协议层存储错误）；AnchorNotFound 与
+/// WriterActive 只在部分调用点有专属语义，由 `special` 先行匹配，
+/// 未命中的按「意外 store 错误」收口，各入口不再各自拼写兜底分支。
+fn map_store_error(
+    id: JsonRpcId,
+    error: singularity_runtime::store::ResumeError,
+    special: impl FnOnce(
+        &singularity_runtime::store::ResumeError,
+    ) -> Option<AppServerResult<Vec<Value>>>,
+) -> AppServerResult<Vec<Value>> {
+    match error {
+        singularity_runtime::store::ResumeError::NotFound(_) => {
+            not_found_response(id, THREAD_NOT_FOUND)
+        }
+        singularity_runtime::store::ResumeError::Store(error) => Err(AppServerError::Store(error)),
+        ref other => special(other).unwrap_or_else(|| {
+            Err(AppServerError::Store(
+                "unexpected thread store error".to_string(),
+            ))
+        }),
+    }
+}
+
 impl AppServer {
     /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
@@ -204,17 +228,7 @@ impl AppServer {
             &params.thread_id,
         ) {
             Ok(record) => record,
-            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(singularity_runtime::store::ResumeError::Store(error)) => {
-                return Err(AppServerError::Store(error));
-            }
-            Err(_) => {
-                return Err(AppServerError::Store(
-                    "unexpected thread store error".to_string(),
-                ));
-            }
+            Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
         let patch = singularity_runtime::SettingsPatch {
             provider: params.provider,
@@ -321,19 +335,16 @@ impl AppServer {
             params.before_item.as_deref(),
         ) {
             Ok(page) => page,
-            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(singularity_runtime::store::ResumeError::AnchorNotFound(_)) => {
-                return invalid_params_response(message.required_id());
-            }
-            Err(singularity_runtime::store::ResumeError::Store(error)) => {
-                return Err(AppServerError::Store(error));
-            }
-            Err(singularity_runtime::store::ResumeError::WriterActive) => {
-                return Err(AppServerError::Store(
-                    "thread has an active writer".to_string(),
-                ));
+            Err(error) => {
+                return map_store_error(message.required_id(), error, |other| match other {
+                    singularity_runtime::store::ResumeError::AnchorNotFound(_) => {
+                        Some(invalid_params_response(message.required_id()))
+                    }
+                    singularity_runtime::store::ResumeError::WriterActive => Some(Err(
+                        AppServerError::Store("thread has an active writer".to_string()),
+                    )),
+                    _ => None,
+                });
             }
         };
         // 与 thread/list 复用同一 last-turn 投影，两个读取接口不得显示互相
@@ -379,17 +390,7 @@ impl AppServer {
             &params.session_id,
         ) {
             Ok(record) => record,
-            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(singularity_runtime::store::ResumeError::Store(error)) => {
-                return Err(AppServerError::Store(error));
-            }
-            Err(_) => {
-                return Err(AppServerError::Store(
-                    "unexpected thread store error".to_string(),
-                ));
-            }
+            Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode。
@@ -398,26 +399,17 @@ impl AppServer {
         }
         // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在
         // 删除窗口内开始 append。
-        match singularity_runtime::store::delete_thread(
+        if let Err(error) = singularity_runtime::store::delete_thread(
             &self.sessions_dir,
             &record.thread_id,
             self.turn_runner.coordinator(),
         ) {
-            Ok(()) => {}
-            Err(singularity_runtime::store::ResumeError::WriterActive) => {
-                return invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE);
-            }
-            Err(singularity_runtime::store::ResumeError::NotFound(_)) => {
-                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
-            }
-            Err(singularity_runtime::store::ResumeError::Store(error)) => {
-                return Err(AppServerError::Store(error));
-            }
-            Err(singularity_runtime::store::ResumeError::AnchorNotFound(_)) => {
-                return Err(AppServerError::Store(
-                    "unexpected thread store error".to_string(),
-                ));
-            }
+            return map_store_error(message.required_id(), error, |other| match other {
+                singularity_runtime::store::ResumeError::WriterActive => Some(
+                    invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE),
+                ),
+                _ => None,
+            });
         }
         json_response(
             message.required_id(),

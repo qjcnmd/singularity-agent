@@ -5,10 +5,10 @@ use crate::message::ContentBlock;
 use crate::session::SessionEntry;
 use serde_json::{Value, json};
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelMessage, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelUsage, Provider, ProviderApiProtocol, ProviderAttemptEvent,
-    ProviderAttemptStarted, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
-    ProviderStreamEvent, ProviderStreamingCapability, ModelRole,
+    ModelError, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderApiProtocol,
+    ProviderAttemptEvent, ProviderAttemptStarted, ProviderError, ProviderProtocolContract,
+    ProviderReasoningReplay, ProviderStreamEvent, ProviderStreamingCapability,
 };
 use uuid::Uuid;
 
@@ -992,8 +992,8 @@ fn assembled_fallback_estimate_includes_provider_reasoning_replay() {
         reasoning_content: "reasoning ".repeat(300),
     };
 
-    let without_replay = agent.estimate_assembled(&[], &[], &[], 0);
-    let with_replay = agent.estimate_assembled(&[], &[], &[replay], 0);
+    let without_replay = agent.estimate_assembled(&[], &[], 0);
+    let with_replay = agent.estimate_assembled(&[], &[replay], 0);
 
     assert!(with_replay > without_replay + 500);
 }
@@ -1463,7 +1463,10 @@ fn forced_compaction_failure_surfaces_the_compaction_cause() {
     match &error {
         AgentError::Compaction(crate::compaction::CompactionError::Provider(provider_error)) => {
             assert!(
-                provider_error.error.message.contains("summary generation failed"),
+                provider_error
+                    .error
+                    .message
+                    .contains("summary generation failed"),
                 "the compaction cause must surface, got: {error}"
             );
         }

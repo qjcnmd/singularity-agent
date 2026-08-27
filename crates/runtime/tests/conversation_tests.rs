@@ -829,14 +829,11 @@ fn persisted_selector_keeps_reasoning_effort_across_resume() {
     let mut session = SessionManager::create_with_id(Path::new("."), &sessions, thread_id)
         .expect("create session file");
     session
-        .append_metadata(
-            SessionMetadata::thread_settings(
-                "openai_compatible".to_string(),
-                "base-model".to_string(),
-                Some("high".to_string()),
-            )
-            .expect("thread settings metadata"),
-        )
+        .append_metadata(SessionMetadata::thread_settings(
+            "openai_compatible".to_string(),
+            "base-model".to_string(),
+            Some("high".to_string()),
+        ))
         .expect("append settings");
     drop(session);
 

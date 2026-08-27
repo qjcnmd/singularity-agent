@@ -21,30 +21,26 @@ use std::sync::{Arc, Mutex};
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelPreferences, ModelUsage,
-    ModelTurnStatus, Provider, ProviderError, ToolChoicePolicy,
+    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelPreferences, ModelTurnStatus,
+    ModelUsage, Provider, ProviderError, ToolChoicePolicy,
 };
 use thiserror::Error;
 
 pub use self::events::{AgentDiagnostic, AgentDiagnosticSeverity, AgentEvent, AgentEvents};
+pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
 pub use self::request::TurnRetryConfig;
-pub(crate) use self::events::{emit, emit_diagnostic};
 pub(crate) use self::request::{SendOutcome, instruction_message, send_with_retry};
 
 use self::inbox::lock_inbox;
-use self::request::{
-    AttemptOutcome, TurnRequestSpec, effective_max_output_tokens,
-};
+use self::request::{AttemptOutcome, TurnRequestSpec, effective_max_output_tokens};
 use crate::compaction::{
     CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, ContextLedger,
 };
-use crate::message::{
-    AgentMessage, assistant_response_message, tool_result_message, user_message,
-};
+use crate::message::{AgentMessage, assistant_response_message, tool_result_message, user_message};
 use crate::session::{SessionError, SessionManager};
-use crate::tools::batch::{PreparedToolCall, execute_tool_batch, tool_error_execution};
 use crate::tools::ToolRegistry;
+use crate::tools::batch::{PreparedToolCall, execute_tool_batch, tool_error_execution};
 
 /// Agent 运行配置。
 #[derive(Debug, Clone)]
@@ -179,6 +175,9 @@ pub struct Agent {
     registry: ToolRegistry,
     provider: Arc<dyn Provider + Send + Sync>,
     config: AgentConfig,
+    /// 工具 schema 的序列化串：注册表与 provider 契约在 Agent 生命周期内
+    /// 不变，构造时序列化一次供逐请求的 Token 估算复用。
+    tools_json: String,
     /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
@@ -208,12 +207,18 @@ impl Agent {
             .with_model_preferences(compaction_preferences)
             .with_summary_max_tokens(config.compaction.summary_max_tokens)
             .with_retry(config.retry);
+        let tools_json = serde_json::to_string(&Self::tool_schemas_from(
+            &registry,
+            &provider.protocol_contract(),
+        ))
+        .unwrap_or_else(|_| "[]".to_string());
         Ok(Self {
             session,
             compaction,
             registry,
             provider,
             config,
+            tools_json,
             inbox: Arc::new(Mutex::new(TurnInbox::default())),
             ledger: ContextLedger::new(),
         })
@@ -367,9 +372,7 @@ impl Agent {
                         .iter()
                         .map(|call| PreparedToolCall {
                             call: call.clone(),
-                            prepared: self
-                                .registry
-                                .preflight(&call.tool_name, &call.arguments),
+                            prepared: self.registry.preflight(&call.tool_name, &call.arguments),
                         })
                         .collect::<Vec<_>>();
                     let executions = execute_tool_batch(
@@ -471,12 +474,10 @@ impl Agent {
     /// tokens_before 必须反映完整装配（消息、工具 schema、reasoning replay、
     /// 输出预算与固定余量），而非退化占位。
     fn assembled_context_estimate(&self) -> Result<u64> {
-        let capabilities = self.provider.protocol_contract();
-        let tools = self.tool_schemas(&capabilities);
         let (messages, replays) = self.assemble_messages()?;
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        Ok(self.estimate_assembled(&messages, &tools, &replays, max_output_tokens))
+        Ok(self.estimate_assembled(&messages, &replays, max_output_tokens))
     }
 
     /// 单个轮步：先经 `prepare_request` 装配请求（含发送前主动压缩），再交给

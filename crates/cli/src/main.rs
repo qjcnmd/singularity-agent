@@ -3,18 +3,19 @@
 
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
 
 use clap::Parser;
-use singularity_runtime::events::{TurnEvent, TurnEventSink};
+use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
 
+mod forward;
 mod jsonl_mode;
 mod print_mode;
 mod session_options;
 mod signal;
 mod tui;
 
+use forward::{EventForward, INTERRUPT_POLL};
 use jsonl_mode::{JsonlRenderer, exit_code_for};
 use session_options::SessionSetup;
 
@@ -27,7 +28,6 @@ enum Mode {
 
 /// 第二次 Ctrl+C 的强制退出码（与优雅中断共用 130 语义）。
 const FORCE_EXIT_CODE: i32 = 130;
-const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg", about = "Singularity coding agent")]
@@ -151,15 +151,7 @@ fn run_headless(setup: SessionSetup, goal: &str, mode: Mode) -> Result<i32, Stri
     let event_tx = progress_tx.clone();
     let goal = goal.to_string();
     let worker = std::thread::spawn(move || {
-        struct Forward {
-            tx: mpsc::Sender<TurnProgress>,
-        }
-        impl TurnEventSink for Forward {
-            fn emit(&mut self, event: TurnEvent) {
-                let _ = self.tx.send(TurnProgress::Event(event));
-            }
-        }
-        let mut sink = Forward { tx: event_tx };
+        let mut sink = EventForward::new(event_tx, TurnProgress::Event);
         let result = conversation.run_turn(&goal, &mut sink);
         drop(sink);
         let _ = progress_tx.send(TurnProgress::Done(match result {

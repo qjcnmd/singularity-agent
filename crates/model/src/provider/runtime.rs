@@ -72,8 +72,10 @@ impl OpenAiProviderConfig {
         // 由 resolve_model_limits 落保守默认；env 模式本就无目录保证，不报错。
         let (catalog_context, catalog_output) = match values.model_name.as_deref() {
             Some(model_name) => {
-                let provider_name =
-                    values.provider_name.as_deref().unwrap_or(DEFAULT_PROVIDER_NAME);
+                let provider_name = values
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PROVIDER_NAME);
                 crate::catalog::resolve_model_limits(provider_name, model_name)
             }
             None => (DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS),

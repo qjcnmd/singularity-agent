@@ -128,10 +128,11 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 存活的写者。后续 owner 追加 metadata，再后续 owner 继续追加消息。
     let mut settings_writer = SessionManager::open_existing(&file).unwrap();
     let s1 = settings_writer
-        .append_metadata(
-            SessionMetadata::thread_settings("openai", "test-model", Some("high".to_string()))
-                .unwrap(),
-        )
+        .append_metadata(SessionMetadata::thread_settings(
+            "openai",
+            "test-model",
+            Some("high".to_string()),
+        ))
         .unwrap();
     drop(settings_writer);
     let mut turn_worker = SessionManager::open_existing(&file).unwrap();
@@ -169,15 +170,12 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .append_metadata(SessionMetadata::turn_started("turn_2"))
         .unwrap();
     manager
-        .append_metadata(
-            SessionMetadata::turn_terminal(
-                "turn_1",
-                TurnTerminalStatus::Completed,
-                json!({"totalTokens": 42}),
-                true,
-            )
-            .unwrap(),
-        )
+        .append_metadata(SessionMetadata::turn_terminal(
+            "turn_1",
+            TurnTerminalStatus::Completed,
+            json!({"totalTokens": 42}),
+            true,
+        ))
         .unwrap();
     let file = manager.path().to_path_buf();
     drop(manager);
@@ -372,15 +370,12 @@ fn v2_format_round_trips_nested_payloads() {
         })
         .unwrap();
     let metadata_id = manager
-        .append_metadata(
-            SessionMetadata::turn_terminal(
-                "turn-1",
-                TurnTerminalStatus::Completed,
-                json!({"totalTokens": 7}),
-                true,
-            )
-            .unwrap(),
-        )
+        .append_metadata(SessionMetadata::turn_terminal(
+            "turn-1",
+            TurnTerminalStatus::Completed,
+            json!({"totalTokens": 7}),
+            true,
+        ))
         .unwrap();
     let file = manager.path().to_path_buf();
     drop(manager);

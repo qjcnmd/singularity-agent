@@ -36,10 +36,7 @@ const WAIT_GRACE: Duration = Duration::from_secs(5);
 /// 命令执行超时仅在显式提供 `timeout_ms`（正整数毫秒）时生效；未提供时不主动超时。
 pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Provide timeout_ms to bound execution; without it a command runs until completion or interruption.";
 
-pub(super) fn execute(
-    args: &BashArgs,
-    ctx: ExecuteContext<'_>,
-) -> ToolExecution {
+pub(super) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let ExecuteContext {
         cwd,
         signal,

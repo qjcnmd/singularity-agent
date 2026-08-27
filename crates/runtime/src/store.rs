@@ -220,10 +220,9 @@ pub fn rename_thread(
         .verify_session_id(thread_id)
         .map_err(|error| error.to_string())?;
     session
-        .append_metadata(
-            singularity_agent::session::SessionMetadata::thread_name(name)
-                .map_err(|error| error.to_string())?,
-        )
+        .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
+            name,
+        ))
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -334,9 +333,7 @@ pub fn delete_thread(
         // rename 被占用/杀软拦截时按原顺序删除并上抛，不静默吞掉：
         // 竞态窗口回归原状，删除本身仍完成；降级删除再失败时以其错误优先。
         drop(session);
-        if let Err(remove_error) = remove_rollout(&path) {
-            return Err(remove_error);
-        }
+        remove_rollout(&path)?;
         return Err(ResumeError::Store(format!(
             "failed to quarantine session rollout {}: {error}",
             path.display()
@@ -435,15 +432,12 @@ mod tests {
             ))
             .expect("append message");
         session
-            .append_metadata(
-                SessionMetadata::turn_terminal(
-                    "turn-1",
-                    TurnTerminalStatus::Completed,
-                    serde_json::json!({"input_tokens": 1}),
-                    true,
-                )
-                .expect("turn terminal metadata"),
-            )
+            .append_metadata(SessionMetadata::turn_terminal(
+                "turn-1",
+                TurnTerminalStatus::Completed,
+                serde_json::json!({"input_tokens": 1}),
+                true,
+            ))
             .expect("append turn terminal");
         session
             .append_metadata(SessionMetadata::turn_started("turn-2"))

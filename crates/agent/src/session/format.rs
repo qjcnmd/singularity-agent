@@ -164,45 +164,36 @@ impl SessionMetadata {
         }
     }
 
+    /// 只组装载荷，不做校验；不变量统一由 [`Self::validate`] 在写入路径
+    /// （append_metadata）收敛检查。
     pub fn turn_terminal(
         turn_id: impl Into<String>,
         status: TurnTerminalStatus,
         usage: Value,
         usage_complete: bool,
-    ) -> Result<Self> {
-        if !usage.is_object() {
-            return Err(SessionError::InvalidStructure(
-                "terminal usage must be a JSON object".to_string(),
-            ));
-        }
-        Ok(Self::TurnTerminal {
+    ) -> Self {
+        Self::TurnTerminal {
             turn_id: turn_id.into(),
             status,
             usage,
             usage_complete,
-        })
+        }
     }
 
     pub fn thread_settings(
         provider: impl Into<String>,
         model: impl Into<String>,
         reasoning: Option<String>,
-    ) -> Result<Self> {
-        Ok(Self::ThreadSettings {
+    ) -> Self {
+        Self::ThreadSettings {
             provider: Some(provider.into()),
             model: model.into(),
             reasoning,
-        })
+        }
     }
 
-    pub fn thread_name(name: impl Into<String>) -> Result<Self> {
-        let name = name.into();
-        if name.trim().is_empty() {
-            return Err(SessionError::InvalidStructure(
-                "thread name must not be empty".to_string(),
-            ));
-        }
-        Ok(Self::ThreadName { name })
+    pub fn thread_name(name: impl Into<String>) -> Self {
+        Self::ThreadName { name: name.into() }
     }
 
     pub(super) fn validate(self) -> Result<Self> {

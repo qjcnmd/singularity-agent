@@ -195,8 +195,10 @@ pub fn load_project_instructions(
         };
         if byte_len + separator_len > remaining {
             // 该文件只能纳入剩余预算内的有效 UTF-8 前缀。
-            let (take, _) =
-                budget_prefix(&instruction_file.text, remaining.saturating_sub(separator_len));
+            let (take, _) = budget_prefix(
+                &instruction_file.text,
+                remaining.saturating_sub(separator_len),
+            );
             if !take.trim().is_empty() {
                 if !content.is_empty() {
                     content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
-use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size};
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
@@ -67,7 +67,7 @@ fn execute_reader(
     signal: Option<&CancellationToken>,
 ) -> ToolExecution {
     if signal.is_some_and(CancellationToken::is_cancelled) {
-        return error_result("Operation aborted");
+        return error_result(ABORTED_MESSAGE);
     }
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
@@ -86,12 +86,12 @@ fn execute_reader(
     let mut line_number = 0usize;
     loop {
         if signal.is_some_and(CancellationToken::is_cancelled) {
-            return error_result("Operation aborted");
+            return error_result(ABORTED_MESSAGE);
         }
         let Some(line) = (match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES, signal)
         {
             Ok(line) => line,
-            Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
+            Err(ReadFailure::Cancelled) => return error_result(ABORTED_MESSAGE),
             Err(error) => {
                 return error_result(format!("Could not read file: {path}. {error}"));
             }
@@ -99,7 +99,7 @@ fn execute_reader(
             break;
         };
         if signal.is_some_and(CancellationToken::is_cancelled) {
-            return error_result("Operation aborted");
+            return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;
         let selected_position = line_number.saturating_sub(start_line);
@@ -133,7 +133,7 @@ fn execute_reader(
                 match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES, signal) {
                     Ok(Some(_)) => true,
                     Ok(None) => false,
-                    Err(ReadFailure::Cancelled) => return error_result("Operation aborted"),
+                    Err(ReadFailure::Cancelled) => return error_result(ABORTED_MESSAGE),
                     Err(error) => {
                         return error_result(format!("Could not read file: {path}. {error}"));
                     }
