@@ -16,6 +16,7 @@ singularity_core = { path = "../core" }
 time.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
+rand.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 

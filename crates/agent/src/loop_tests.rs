@@ -1494,3 +1494,29 @@ fn cancelled_run_returns_aborted_outcome() {
     // 已取消时不发起任何 provider 调用。
     assert!(provider.requests.lock().unwrap().is_empty());
 }
+
+/// retry_delay_ms 保留指数退避与 Retry-After 优先，抖动改为真实随机
+/// （每次调用落在 ±10% 区间内，不依赖 attempt 确定性推导）。
+#[test]
+fn retry_delay_respects_retry_after_and_exponential_range() {
+    use std::time::Duration;
+
+    // Retry-After 优先于指数退避与抖动。
+    let delay = super::retry_delay_ms(2_000, 4, Some(Duration::from_millis(80)));
+    assert_eq!(delay, 80);
+
+    // attempt=1：base=2000，抖动 ∈ [0.90, 1.10) ⇒ [1800, 2200)。
+    // attempt=2：base=4000 ⇒ [3600, 4400)。
+    for attempt in 1..=2u32 {
+        for _ in 0..64 {
+            let delay = super::retry_delay_ms(2_000, attempt, None);
+            let expected_base = 2_000 * 2u64.saturating_pow(attempt - 1);
+            let lo = (expected_base as f64 * 0.9) as u64;
+            let hi = (expected_base as f64 * 1.1) as u64;
+            assert!(
+                (lo..hi).contains(&delay),
+                "attempt {attempt}: delay {delay} outside [{lo}, {hi})"
+            );
+        }
+    }
+}

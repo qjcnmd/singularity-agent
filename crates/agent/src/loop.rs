@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use rand::Rng;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -63,8 +64,8 @@ fn is_retryable_provider_error(error: &ProviderError) -> bool {
         )
 }
 
-/// 指数退避 + ±10% 确定性抖动（Codex `retry.rs` 同款范围；由 attempt
-/// 派生的 21 步周期伪随机，避免随机依赖并使同一 attempt 可复现）。
+/// 指数退避 + ±10% 真实随机抖动：每次重试产生独立的随机因子，
+/// 避免确定性抖动在多进程或并发重试下共振。
 fn retry_delay_ms(
     base_delay_ms: u64,
     attempt: u32,
@@ -75,7 +76,7 @@ fn retry_delay_ms(
     }
     let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
     // 抖动因子 ∈ [0.90, 1.10)。
-    let jitter = 0.9 + (u64::from(attempt) * 37 % 21) as f64 / 100.0;
+    let jitter = rand::rng().random_range(0.9..1.1);
     (base as f64 * jitter) as u64
 }
 
