@@ -348,20 +348,16 @@ fn item_rows(
                     is_error: false, ..
                 } => NoteStyle::Dim.style(),
             };
-            let mut rows: Vec<Line<'static>> = wrapped_lines(&tool.header(), width.saturating_sub(2))
-                .into_iter()
-                .map(|line| {
-                    Line::from(Span::styled(format!("{marker} {line}"), style))
-                })
-                .collect();
+            let mut rows: Vec<Line<'static>> =
+                wrapped_lines(&tool.header(), width.saturating_sub(2))
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(format!("{marker} {line}"), style)))
+                    .collect();
             match &tool.state {
                 ToolState::Running { last_output } => {
                     if !last_output.trim().is_empty() {
                         rows.extend(bounded_preview(last_output).into_iter().map(|line| {
-                            Line::from(Span::styled(
-                                format!("│ {line}"),
-                                NoteStyle::Dim.style(),
-                            ))
+                            Line::from(Span::styled(format!("│ {line}"), NoteStyle::Dim.style()))
                         }));
                     }
                 }
@@ -374,8 +370,7 @@ fn item_rows(
                     if *display == ToolDisplay::Collapsed {
                         return rows;
                     }
-                    let total_nonempty =
-                        output.lines().filter(|l| !l.trim().is_empty()).count();
+                    let total_nonempty = output.lines().filter(|l| !l.trim().is_empty()).count();
                     let visible: Vec<&str> = if *display == ToolDisplay::Full {
                         output
                             .lines()
@@ -390,9 +385,11 @@ fn item_rows(
                     } else {
                         NoteStyle::Dim.style()
                     };
-                    rows.extend(visible.iter().copied().map(|line| {
-                        Line::from(Span::styled(format!("│ {line}"), result_style))
-                    }));
+                    rows.extend(
+                        visible.iter().copied().map(|line| {
+                            Line::from(Span::styled(format!("│ {line}"), result_style))
+                        }),
+                    );
                     if total_nonempty > visible.len() {
                         let action = if *display == ToolDisplay::Full {
                             "collapse"

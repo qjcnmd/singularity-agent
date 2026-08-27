@@ -286,9 +286,9 @@ pub enum SessionEntry {
 impl SessionEntry {
     pub fn id(&self) -> &str {
         match self {
-            Self::Message { id, .. }
-            | Self::Compaction { id, .. }
-            | Self::Metadata { id, .. } => id,
+            Self::Message { id, .. } | Self::Compaction { id, .. } | Self::Metadata { id, .. } => {
+                id
+            }
         }
     }
 }
@@ -363,11 +363,12 @@ pub(super) fn validate_entries(
                 "intermediate session header at line {line}"
             )));
         }
-        let entry = serde_json::from_value::<SessionEntry>(raw.clone())
-            .map_err(|error| SessionError::InvalidEntry {
+        let entry = serde_json::from_value::<SessionEntry>(raw.clone()).map_err(|error| {
+            SessionError::InvalidEntry {
                 line,
                 cause: error.to_string(),
-            })?;
+            }
+        })?;
         if !ids.insert(entry.id().to_string()) {
             return Err(SessionError::DuplicateId(entry.id().to_string()));
         }

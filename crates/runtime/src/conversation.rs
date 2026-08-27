@@ -380,7 +380,8 @@ impl Conversation {
         patch: SettingsPatch,
     ) -> Result<SettingsApplyResult, ConversationError> {
         if patch.is_empty() {
-            let selector = compose_merged_selector(self.lock_state()?.thread.model.as_deref(), &patch);
+            let selector =
+                compose_merged_selector(self.lock_state()?.thread.model.as_deref(), &patch);
             return Ok(SettingsApplyResult {
                 timing: SettingsApplyTiming::NothingToApply,
                 selector,

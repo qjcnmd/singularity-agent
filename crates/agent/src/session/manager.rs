@@ -15,8 +15,8 @@ use super::file::{
     normalize_cwd_string, now_iso, parse_session_lines, rewrite_file, validate_append_limits,
 };
 use super::format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError,
-    SessionMetadata, validate_entries, validate_header,
+    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
+    validate_entries, validate_header,
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
 

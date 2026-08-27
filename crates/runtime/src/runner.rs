@@ -15,7 +15,9 @@ use singularity_agent::agent::{
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
-use singularity_agent::session::{SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind};
+use singularity_agent::session::{
+    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind,
+};
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{

@@ -204,8 +204,7 @@ impl Editor {
                         - char_start;
                     if target_char < consumed + row_chars || row_index + 1 == offsets.len() {
                         let within = target_char.saturating_sub(consumed);
-                        let prefix: String =
-                            line.chars().skip(char_start).take(within).collect();
+                        let prefix: String = line.chars().skip(char_start).take(within).collect();
                         return (
                             visual_row + row_index,
                             UnicodeWidthStr::width(prefix.as_str()),

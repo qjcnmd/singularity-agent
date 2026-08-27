@@ -175,10 +175,8 @@ impl TuiApp {
             // ItemFailed 是唯一定型入口，工具块不能停留在 Running。
             TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
                 if self.transcript.is_tool_item(item_id) {
-                    self.transcript.tool_terminal(
-                        item_id,
-                        matches!(event, TurnEvent::ItemFailed { .. }),
-                    );
+                    self.transcript
+                        .tool_terminal(item_id, matches!(event, TurnEvent::ItemFailed { .. }));
                     self.set_waiting(WaitingTarget::Model);
                 }
             }

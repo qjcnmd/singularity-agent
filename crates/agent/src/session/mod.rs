@@ -15,8 +15,8 @@ pub mod repository;
 
 pub use file::now_iso;
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError,
-    SessionMetadata, SessionMetadataKind,
+    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
+    SessionMetadataKind,
 };
 pub use manager::SessionManager;
 pub use repository::{SessionRepository, ThreadRead};

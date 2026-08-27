@@ -223,12 +223,7 @@ fn compact_full_flow_and_reopen_slicing() {
     assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(
         ctx_ids,
-        vec![
-            ctx[0].id(),
-            id_u1.as_str(),
-            id_a1.as_str(),
-            id_t1.as_str()
-        ]
+        vec![ctx[0].id(), id_u1.as_str(), id_a1.as_str(), id_t1.as_str()]
     );
     assert!(!ctx_ids.contains(&id_u0.as_str()));
     assert!(!ctx_ids.contains(&id_t0.as_str()));
@@ -274,12 +269,7 @@ fn compact_full_flow_and_reopen_slicing() {
     let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
     assert_eq!(
         ctx_ids,
-        vec![
-            ctx[0].id(),
-            id_u2.as_str(),
-            id_a2.as_str(),
-            id_t2.as_str()
-        ]
+        vec![ctx[0].id(), id_u2.as_str(), id_a2.as_str(), id_t2.as_str()]
     );
 }
 
@@ -364,12 +354,7 @@ fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
     assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(
         ctx_ids,
-        vec![
-            ctx[0].id(),
-            id_u1.as_str(),
-            id_a1.as_str(),
-            id_t1.as_str()
-        ]
+        vec![ctx[0].id(), id_u1.as_str(), id_a1.as_str(), id_t1.as_str()]
     );
     assert!(!ctx_ids.contains(&id_u0.as_str()));
 }

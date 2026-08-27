@@ -43,7 +43,11 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                             });
                             thinking_index += 1;
                         }
-                        ContentBlock::ToolCall { id: call_id, name, args } => {
+                        ContentBlock::ToolCall {
+                            id: call_id,
+                            name,
+                            args,
+                        } => {
                             items.push(HistoryItem::ToolCall {
                                 id: call_id.clone(),
                                 name: name.clone(),

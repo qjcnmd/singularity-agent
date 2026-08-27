@@ -244,8 +244,7 @@ impl AppServer {
                 provider: parts.provider.map(str::to_string),
                 model: parts.model.map(str::to_string),
                 reasoning: parts.effort.map(str::to_string),
-                updated: result.timing
-                    != singularity_runtime::SettingsApplyTiming::NothingToApply,
+                updated: result.timing != singularity_runtime::SettingsApplyTiming::NothingToApply,
                 queued: result.timing
                     == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn,
             },

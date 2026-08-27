@@ -776,10 +776,7 @@ fn session_file_roundtrip_after_run() {
     unique.dedup();
     assert_eq!(unique.len(), ids.len(), "session entry ids must be unique");
     assert_eq!(
-        entries
-            .iter()
-            .map(|entry| entry.id())
-            .collect::<Vec<_>>(),
+        entries.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
         reopened
             .entries()
             .iter()

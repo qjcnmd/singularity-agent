@@ -50,7 +50,9 @@ impl FileMutationQueue {
 pub(crate) fn canonical_key(path: &Path) -> PathBuf {
     match std::fs::canonicalize(path) {
         Ok(canonical) => canonical,
-        Err(_) => normalize_lexically(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())),
+        Err(_) => {
+            normalize_lexically(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+        }
     }
 }
 

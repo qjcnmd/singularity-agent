@@ -337,8 +337,10 @@ impl AppEvent {
     pub fn thread_settings_applied(thread: &Thread) -> Self {
         Self {
             method: event_method::THREAD_SETTINGS_APPLIED.to_string(),
-            params: serde_json::to_value(ThreadEventParams { thread: thread.clone() })
-                .expect("typed event params serialize"),
+            params: serde_json::to_value(ThreadEventParams {
+                thread: thread.clone(),
+            })
+            .expect("typed event params serialize"),
         }
     }
 

@@ -59,7 +59,12 @@ fn create_append_reopen_roundtrip() {
         .append_message(tool_result("call_1", "ls output"))
         .unwrap();
     let file = manager.path().to_path_buf();
-    let leaf = manager.entries().last().expect("content entry").id().to_string();
+    let leaf = manager
+        .entries()
+        .last()
+        .expect("content entry")
+        .id()
+        .to_string();
     assert_eq!(leaf, id3);
 
     let content = std::fs::read_to_string(&file).unwrap();
@@ -76,7 +81,10 @@ fn create_append_reopen_roundtrip() {
     drop(manager);
 
     let opened = SessionManager::open_existing(&file).unwrap();
-    assert_eq!(opened.entries().last().expect("content entry").id(), leaf.as_str());
+    assert_eq!(
+        opened.entries().last().expect("content entry").id(),
+        leaf.as_str()
+    );
     let entries = opened.build_context_entries().unwrap();
     assert_eq!(entry_ids(&entries), vec![id1, id2, id3]);
     for entry in &entries {

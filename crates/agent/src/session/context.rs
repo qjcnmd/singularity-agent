@@ -20,9 +20,7 @@ impl SessionManager {
             return Ok(self.entries.clone());
         };
         let first_kept = match &self.entries[compaction_index] {
-            SessionEntry::Compaction { compaction, .. } => {
-                compaction.first_kept_entry_id.clone()
-            }
+            SessionEntry::Compaction { compaction, .. } => compaction.first_kept_entry_id.clone(),
             _ => None,
         };
         let mut context = vec![self.entries[compaction_index].clone()];

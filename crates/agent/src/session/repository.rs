@@ -47,12 +47,9 @@ impl SessionRepository {
 
 impl SessionManager {
     pub fn summary(&self) -> Option<String> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
-                _ => None,
-            })
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
+            _ => None,
+        })
     }
 }
