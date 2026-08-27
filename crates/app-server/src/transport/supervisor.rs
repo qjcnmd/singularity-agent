@@ -106,8 +106,8 @@ where
                 writer_done = true;
                 writer_result = Some(result);
                 terminal_error = Some(match writer_result.as_ref().expect("writer result") {
-                    Ok(Ok(())) => "stdout writer stopped unexpectedly".to_string(),
-                    Ok(Err(error)) => error.clone(),
+                    Ok(Ok(())) => "stdout writer task failed: writer stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("stdout writer task failed: {error}"),
                     Err(error) => format!("stdout writer task failed: {error}"),
                 });
                 break;
@@ -297,9 +297,6 @@ where
     }
     if let Some(error) = terminal_error {
         errors.push(error);
-    }
-    if let Some(Err(error)) = writer_result {
-        errors.push(format!("stdout writer task failed: {error}"));
     }
     if errors.is_empty() {
         Ok(())
