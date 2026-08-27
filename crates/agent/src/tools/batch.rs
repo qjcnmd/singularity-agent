@@ -6,7 +6,7 @@ use std::path::Path;
 use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
-use crate::agent::{AgentEvent, AgentEvents};
+use crate::agent::{AgentEvent, AgentEvents, emit};
 use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, ToolRegistry};
 
 /// preflight 判定结果：可执行工具，或模型可见的拒绝执行。
@@ -19,14 +19,6 @@ pub(crate) enum Prepared {
 pub(crate) struct PreparedToolCall {
     pub call: ModelToolCall,
     pub prepared: Prepared,
-}
-
-/// 通过单一事件出口投递一个事件；事件投影是尽力而为的，回调不再返回
-/// 错误——投影失败由消费方（app-server/CLI）自行吸收诊断，不影响轮次结果。
-pub(crate) fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) {
-    if let Some(callback) = events.on_event.as_deref_mut() {
-        callback(event);
-    }
 }
 
 /// 工具执行失败时的通用错误 Execution。

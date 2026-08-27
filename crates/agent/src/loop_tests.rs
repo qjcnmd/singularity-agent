@@ -1,11 +1,18 @@
 use super::*;
 use crate::message::AgentMessage;
+use crate::message::AgentMessageRole;
+use crate::message::ContentBlock;
 use crate::session::SessionEntry;
 use serde_json::{Value, json};
 use singularity_model::{
-    ModelMessage, ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
-    ProviderAttemptStarted, ProviderReasoningReplay, ProviderStreamingCapability,
+    ModelError, ModelErrorKind, ModelMessage, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
+    ModelTurnResponse, ModelUsage, Provider, ProviderApiProtocol, ProviderAttemptEvent,
+    ProviderAttemptStarted, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
+    ProviderStreamEvent, ProviderStreamingCapability, ModelRole,
 };
+use uuid::Uuid;
+
+use super::request::retry_delay_ms;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 struct FakeProvider {
@@ -1790,14 +1797,14 @@ fn retry_delay_respects_retry_after_and_exponential_range() {
     use std::time::Duration;
 
     // Retry-After 优先于指数退避与抖动。
-    let delay = super::retry_delay_ms(2_000, 4, Some(Duration::from_millis(80)));
+    let delay = retry_delay_ms(2_000, 4, Some(Duration::from_millis(80)));
     assert_eq!(delay, 80);
 
     // attempt=1：base=2000，抖动 ∈ [0.90, 1.10) ⇒ [1800, 2200)。
     // attempt=2：base=4000 ⇒ [3600, 4400)。
     for attempt in 1..=2u32 {
         for _ in 0..64 {
-            let delay = super::retry_delay_ms(2_000, attempt, None);
+            let delay = retry_delay_ms(2_000, attempt, None);
             let expected_base = 2_000 * 2u64.saturating_pow(attempt - 1);
             let lo = (expected_base as f64 * 0.9) as u64;
             let hi = (expected_base as f64 * 1.1) as u64;
