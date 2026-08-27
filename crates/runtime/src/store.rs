@@ -330,14 +330,15 @@ pub fn delete_thread(
     // NotFound，不会再 append 进即将删除的文件。
     let pending = pending_delete_path(sessions_dir, thread_id);
     if let Err(error) = std::fs::rename(&path, &pending) {
-        // rename 被占用/杀软拦截时按原顺序删除并上抛，不静默吞掉：
-        // 竞态窗口回归原状，删除本身仍完成；降级删除再失败时以其错误优先。
+        // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后直接
+        // 删除仍满足公开删除合同；若删除也失败，再返回包含两段原因的错误。
         drop(session);
-        remove_rollout(&path)?;
-        return Err(ResumeError::Store(format!(
-            "failed to quarantine session rollout {}: {error}",
-            path.display()
-        )));
+        return remove_rollout(&path).map_err(|delete_error| {
+            ResumeError::Store(format!(
+                "failed to quarantine session rollout {}: {error}; {delete_error}",
+                path.display()
+            ))
+        });
     }
     drop(session);
     // 文件已脱离原路径，待删名尽力删除；残留不影响删除结果。

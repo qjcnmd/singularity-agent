@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use singularity_agent::agent::{
-    Agent, AgentConfig, AgentDiagnosticSeverity, AgentError, AgentEvent, AgentEvents, AgentOutcome,
-    AgentTerminalReason,
+    Agent, AgentConfig, AgentDiagnosticSeverity as LoopDiagnosticSeverity, AgentError, AgentEvent,
+    AgentEvents, AgentOutcome, AgentTerminalReason,
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
@@ -30,8 +30,12 @@ use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
 };
-use crate::events::{ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink};
-use crate::objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
+use crate::events::{
+    AgentDiagnosticSeverity, ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink,
+};
+use crate::objects::{
+    ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage,
+};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
@@ -358,7 +362,7 @@ impl TurnRunner {
             truncated: status.truncated,
             usage: final_turn
                 .usage
-                .unwrap_or_else(|| TurnUsage::from_model_usage(&ModelUsage::default(), false)),
+                .unwrap_or_else(|| turn_usage_from_model_usage(&ModelUsage::default(), false)),
         })
     }
 
@@ -497,7 +501,11 @@ impl TurnRunner {
                     sink.emit(TurnEvent::Diagnostic {
                         thread_id: thread.thread_id.clone(),
                         turn_id: turn_id.to_string(),
-                        severity: diagnostic.severity,
+                        severity: match diagnostic.severity {
+                            LoopDiagnosticSeverity::Info => AgentDiagnosticSeverity::Info,
+                            LoopDiagnosticSeverity::Warning => AgentDiagnosticSeverity::Warning,
+                            LoopDiagnosticSeverity::Error => AgentDiagnosticSeverity::Error,
+                        },
                         code: diagnostic.code,
                         message: diagnostic.message,
                     });
@@ -607,9 +615,9 @@ impl std::fmt::Display for RunnerError {
 fn turn_failure_cause(error: &RunnerError) -> TurnFailureCause {
     match error {
         RunnerError::Session(_) => TurnFailureCause::Store,
-        RunnerError::Agent(AgentError::Provider(provider_error)) => TurnFailureCause::Provider(
-            ProviderFailureKind::from_model_error_kind(&provider_error.error.kind),
-        ),
+        RunnerError::Agent(AgentError::Provider(provider_error)) => {
+            ProviderFailureKind::from_model_error_kind(&provider_error.error.kind).into()
+        }
         RunnerError::Agent(_) => TurnFailureCause::Internal,
     }
 }
@@ -696,7 +704,7 @@ fn provider_attempt_event(
             model_turn_ordinal,
             provider: started.provider_name.clone(),
             model: started.model_name.clone(),
-            protocol: started.actual_api_protocol,
+            protocol: enum_wire_word(started.actual_api_protocol),
             status: ProviderAttemptStatus::Started,
             attempt_duration_ms: None,
             error_category: None,
@@ -708,17 +716,24 @@ fn provider_attempt_event(
             model_turn_ordinal,
             provider: occurrence.provider_name.clone(),
             model: occurrence.model_name.clone(),
-            protocol: occurrence.actual_api_protocol,
+            protocol: enum_wire_word(occurrence.actual_api_protocol),
             status: match occurrence.terminal_status {
                 ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
                 ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
                 ModelProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
             },
             attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-            error_category: occurrence.error_category.clone(),
+            error_category: occurrence.error_category.clone().map(enum_wire_word),
             diagnostic_code: occurrence.diagnostic_code.clone(),
         },
     }
+}
+
+fn enum_wire_word(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// 准备阶段失败：分类 + 真实原因文本（对外前仍需敏感边界）。

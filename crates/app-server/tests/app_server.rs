@@ -140,7 +140,10 @@ fn thread_read_returns_turn_page_then_delete_removes_both() {
 
     process.send_request(6, "session/delete", json!({"sessionId": session_id}));
     let deleted = process.output.recv_id(6, Duration::from_secs(5));
-    assert_eq!(deleted["result"]["deleted"], true);
+    assert_eq!(
+        deleted["result"]["deleted"], true,
+        "session/delete response: {deleted}"
+    );
     assert!(
         !rollout.exists(),
         "session/delete must remove JSONL rollout"

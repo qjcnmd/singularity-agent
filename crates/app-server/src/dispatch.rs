@@ -234,13 +234,11 @@ impl AppServer {
             provider: params.provider,
             model: params.model,
             reasoning: match params.reasoning {
-                singularity_protocol::ReasoningPatch::Keep => {
-                    singularity_runtime::ReasoningPatch::Keep
-                }
-                singularity_protocol::ReasoningPatch::Set(value) => {
+                None => singularity_runtime::ReasoningPatch::Keep,
+                Some(singularity_protocol::ReasoningPatch::Set(value)) => {
                     singularity_runtime::ReasoningPatch::Set(value)
                 }
-                singularity_protocol::ReasoningPatch::Clear => {
+                Some(singularity_protocol::ReasoningPatch::Clear) => {
                     singularity_runtime::ReasoningPatch::Clear
                 }
             },

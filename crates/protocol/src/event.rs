@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::envelope::JsonRpcMessage;
-use crate::params::{Thread, Turn};
+use crate::params::{Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
 
 /// 对外广播的应用事件方法名（事件信封 method 字段的唯一来源）。
 pub mod event_method {
@@ -22,6 +22,154 @@ pub mod event_method {
     pub const TOOL_EXECUTION_UPDATE: &str = "tool/execution/update";
     pub const TOOL_EXECUTION_END: &str = "tool/execution/end";
     pub const THREAD_SETTINGS_APPLIED: &str = "thread/settingsApplied";
+}
+
+/// runtime 与客户端共同消费的线程事件投影。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionThread {
+    pub thread_id: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub last_turn_status: Option<ThreadStatus>,
+}
+
+/// runtime 与客户端共同消费的 turn usage 投影。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub usage_present: bool,
+    pub usage_complete: bool,
+}
+
+/// runtime 与客户端共同消费的 turn 事件投影。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTurn {
+    pub turn_id: String,
+    pub thread_id: String,
+    pub status: TurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ExecutionTurnUsage>,
+}
+
+/// 终态失败的分类信息；message 已经过脱敏边界处理。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnErrorDetail {
+    pub stage: TurnFailureStage,
+    pub cause: TurnFailureCause,
+    pub message: String,
+}
+
+/// turn 执行事件的唯一类型化出口。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum TurnEvent {
+    TurnStarted {
+        turn: ExecutionTurn,
+    },
+    ItemStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    AssistantDelta {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+    },
+    ToolExecutionStart {
+        thread_id: String,
+        turn_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    ToolExecutionUpdate {
+        thread_id: String,
+        turn_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+        partial_result: String,
+    },
+    ToolExecutionEnd {
+        thread_id: String,
+        turn_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        result: String,
+        is_error: bool,
+    },
+    ItemCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+    },
+    ItemFailed {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        error: String,
+    },
+    Diagnostic {
+        thread_id: String,
+        turn_id: String,
+        severity: DiagnosticSeverity,
+        code: String,
+        message: String,
+    },
+    ProviderAttempt {
+        thread_id: String,
+        turn_id: String,
+        model_turn_ordinal: u32,
+        provider: String,
+        model: String,
+        protocol: String,
+        status: ProviderAttemptStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic_code: Option<String>,
+    },
+    TurnCompleted {
+        turn: ExecutionTurn,
+    },
+    TurnFailed {
+        turn: ExecutionTurn,
+        error: TurnErrorDetail,
+    },
+    ThreadSettingsApplied {
+        thread: ExecutionThread,
+    },
+}
+
+impl TurnEvent {
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::TurnStarted { .. } => event_method::TURN_STARTED,
+            Self::ItemStarted { .. } => event_method::ITEM_STARTED,
+            Self::AssistantDelta { .. } => event_method::ITEM_AGENT_MESSAGE_DELTA,
+            Self::ToolExecutionStart { .. } => event_method::TOOL_EXECUTION_START,
+            Self::ToolExecutionUpdate { .. } => event_method::TOOL_EXECUTION_UPDATE,
+            Self::ToolExecutionEnd { .. } => event_method::TOOL_EXECUTION_END,
+            Self::ItemCompleted { .. } => event_method::ITEM_COMPLETED,
+            Self::ItemFailed { .. } => event_method::ITEM_FAILED,
+            Self::Diagnostic { .. } => event_method::AGENT_DIAGNOSTIC,
+            Self::ProviderAttempt { .. } => event_method::PROVIDER_ATTEMPT,
+            Self::TurnCompleted { .. } => event_method::TURN_COMPLETED,
+            Self::TurnFailed { .. } => event_method::TURN_ERROR,
+            Self::ThreadSettingsApplied { .. } => event_method::THREAD_SETTINGS_APPLIED,
+        }
+    }
 }
 
 /// `thread/started` 事件参数。
@@ -150,6 +298,22 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+impl DiagnosticSeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for DiagnosticSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// `provider/attempt` 的稳定进度与终态词形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,12 +324,44 @@ pub enum ProviderAttemptStatus {
     Cancelled,
 }
 
+impl ProviderAttemptStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderAttemptStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// `turn/error.error.stage` 的稳定管线阶段词形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureStage {
     AgentLoop,
     TerminalOutcome,
+}
+
+impl TurnFailureStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentLoop => "agent_loop",
+            Self::TerminalOutcome => "terminal_outcome",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnFailureStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// `turn/error.error.cause` 的稳定失败来源词形。
@@ -186,6 +382,75 @@ pub enum TurnFailureCause {
     ProviderUnknown,
     Serialization,
     Internal,
+}
+
+impl TurnFailureCause {
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::ProjectInstructions => "project_instructions",
+            Self::Workspace => "workspace",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderNetwork => "provider_network",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderAuth => "provider_auth",
+            Self::ProviderValidation => "provider_validation",
+            Self::ProviderOverloaded => "provider_overloaded",
+            Self::ProviderCancelled => "provider_cancelled",
+            Self::ProviderContextOverflow => "provider_context_overflow",
+            Self::ProviderUnknown => "provider_unknown",
+            Self::Serialization => "serialization",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.wire_str()
+            .strip_prefix("provider_")
+            .unwrap_or_else(|| self.wire_str())
+    }
+}
+
+impl std::fmt::Display for TurnFailureCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_str())
+    }
+}
+
+impl From<&ExecutionThread> for Thread {
+    fn from(thread: &ExecutionThread) -> Self {
+        Self {
+            thread_id: thread.thread_id.clone(),
+            model: thread.model.clone(),
+            cwd: thread.cwd.clone(),
+            last_turn_status: thread.last_turn_status,
+        }
+    }
+}
+
+impl From<&ExecutionTurn> for Turn {
+    fn from(turn: &ExecutionTurn) -> Self {
+        Self {
+            turn_id: turn.turn_id.clone(),
+            thread_id: turn.thread_id.clone(),
+            status: turn.status,
+            model_usage: turn.usage.as_ref().map(TurnModelUsage::from),
+        }
+    }
+}
+
+impl From<&ExecutionTurnUsage> for TurnModelUsage {
+    fn from(usage: &ExecutionTurnUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            usage_present: usage.usage_present,
+            usage_complete: usage.usage_complete,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +507,119 @@ impl AppEvent {
         Self {
             method: method.to_string(),
             params: serde_json::to_value(params).expect("typed event params serialize"),
+        }
+    }
+
+    /// 将共享执行事件投影为稳定的 JSON-RPC 事件参数。
+    pub fn from_turn_event(event: &TurnEvent) -> Self {
+        match event {
+            TurnEvent::TurnStarted { turn } => Self::turn_started(&Turn::from(turn)),
+            TurnEvent::TurnCompleted { turn } => Self::turn_completed(&Turn::from(turn)),
+            TurnEvent::TurnFailed { turn, error } => Self::turn_error(
+                &turn.turn_id,
+                &turn.thread_id,
+                error.stage,
+                error.cause,
+                &error.message,
+            ),
+            TurnEvent::ThreadSettingsApplied { thread } => {
+                Self::thread_settings_applied(&Thread::from(thread))
+            }
+            TurnEvent::ItemStarted {
+                thread_id,
+                turn_id,
+                item_id,
+            } => Self::item_started(thread_id, turn_id, item_id),
+            TurnEvent::AssistantDelta {
+                thread_id,
+                turn_id,
+                item_id,
+                delta,
+            } => Self::item_agent_message_delta(thread_id, turn_id, item_id, delta),
+            TurnEvent::ItemCompleted {
+                thread_id,
+                turn_id,
+                item_id,
+            } => Self::item_completed(thread_id, turn_id, item_id),
+            TurnEvent::ItemFailed {
+                thread_id,
+                turn_id,
+                item_id,
+                error,
+            } => Self::item_failed(thread_id, turn_id, item_id, error),
+            TurnEvent::ToolExecutionStart {
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                args,
+            } => Self::tool_execution_start(
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                args.clone(),
+            ),
+            TurnEvent::ToolExecutionUpdate {
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => Self::tool_execution_update(
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                args.clone(),
+                partial_result,
+            ),
+            TurnEvent::ToolExecutionEnd {
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => Self::tool_execution_end(
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                result,
+                *is_error,
+            ),
+            TurnEvent::Diagnostic {
+                thread_id,
+                turn_id,
+                severity,
+                code,
+                message,
+            } => Self::agent_diagnostic(thread_id, turn_id, *severity, code, message),
+            TurnEvent::ProviderAttempt {
+                thread_id,
+                turn_id,
+                model_turn_ordinal,
+                provider,
+                model,
+                protocol,
+                status,
+                attempt_duration_ms,
+                error_category,
+                diagnostic_code,
+            } => Self::provider_attempt(ProviderAttemptParams {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                model_turn_ordinal: *model_turn_ordinal,
+                provider: provider.clone(),
+                model: model.clone(),
+                protocol: protocol.clone(),
+                status: *status,
+                attempt_duration_ms: *attempt_duration_ms,
+                error_category: error_category.clone(),
+                diagnostic_code: diagnostic_code.clone(),
+            }),
         }
     }
 

@@ -4,13 +4,12 @@
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
 //! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
 
-use singularity_agent::agent::AgentDiagnosticSeverity;
 use singularity_agent::session::{SessionManager, SessionMetadata, TurnTerminalStatus};
 use singularity_model::ModelUsage;
 
 use crate::error::TurnFailure;
-use crate::events::{TurnEvent, TurnEventSink};
-use crate::objects::{ThreadStatus, Turn, TurnStatus, TurnUsage};
+use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
+use crate::objects::{ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage};
 
 /// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
 pub(crate) struct TerminalCommit {
@@ -32,7 +31,7 @@ impl TerminalCommit {
         Some(Self {
             turn_id: turn_id.to_string(),
             status,
-            usage: TurnUsage::from_model_usage(usage, usage_complete),
+            usage: turn_usage_from_model_usage(usage, usage_complete),
             usage_complete,
         })
     }

@@ -42,26 +42,21 @@ pub struct ThreadSettingsParams {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "ReasoningPatch::is_keep")]
-    pub reasoning: ReasoningPatch,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reasoning_patch"
+    )]
+    pub reasoning: Option<ReasoningPatch>,
 }
 
-/// `thread/settings` 中 reasoning 字段的三态 patch。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `thread/settings` 中显式出现的 reasoning patch。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReasoningPatch {
-    /// 字段缺失：保持当前值。
-    #[default]
-    Keep,
     /// 字符串：设置显式 reasoning effort。
     Set(String),
     /// `null`：清除显式值并恢复模型默认。
     Clear,
-}
-
-impl ReasoningPatch {
-    pub fn is_keep(&self) -> bool {
-        matches!(self, Self::Keep)
-    }
 }
 
 impl Serialize for ReasoningPatch {
@@ -70,7 +65,6 @@ impl Serialize for ReasoningPatch {
         S: serde::Serializer,
     {
         match self {
-            Self::Keep => serializer.serialize_unit(),
             Self::Set(value) => serializer.serialize_str(value),
             Self::Clear => serializer.serialize_none(),
         }
@@ -85,6 +79,13 @@ impl<'de> Deserialize<'de> for ReasoningPatch {
         Option::<String>::deserialize(deserializer)
             .map(|value| value.map_or(Self::Clear, Self::Set))
     }
+}
+
+fn deserialize_reasoning_patch<'de, D>(deserializer: D) -> Result<Option<ReasoningPatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ReasoningPatch::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -351,6 +352,17 @@ pub enum TurnStatus {
     Completed,
     Failed,
     Interrupted,
+}
+
+impl TurnStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
