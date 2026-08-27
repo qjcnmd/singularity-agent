@@ -175,7 +175,7 @@ impl AppServer {
             .map_err(AppServerError::Store)?
             .iter()
             .map(|record| self.project_thread(record))
-            .collect::<Vec<_>>();
+            .collect::<AppServerResult<Vec<_>>>()?;
         Ok(vec![
             JsonRpcMessage::response(
                 message.required_id(),
@@ -330,7 +330,7 @@ impl AppServer {
         // 与 thread/list 复用同一 last-turn 投影，两个读取接口不得显示互相
         // 矛盾的状态：末组 running 只有在整体 active（存在存活 turn）时保留；
         // 崩溃遗留投影为 interrupted。
-        let overall_status = self.project_thread(&page.summary).last_turn_status;
+        let overall_status = self.project_thread(&page.summary)?.last_turn_status;
         let mut turns = page.turns;
         if overall_status != Some(ThreadStatus::Active)
             && turns
@@ -384,7 +384,7 @@ impl AppServer {
         };
         // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
         // 后续写入落入 unlinked inode。
-        if self.thread_has_live_turn(&record.thread_id) {
+        if self.thread_has_live_turn(&record.thread_id)? {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
         // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在

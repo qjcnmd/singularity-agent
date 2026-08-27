@@ -1194,3 +1194,20 @@ fn failure_cause_wire_words_round_trip_across_crates() {
         assert_eq!(re_parsed, protocol_cause);
     }
 }
+
+/// 注册表锁中毒时存活 turn 判定必须显式报错，不能静默返回 false——
+/// 静默 false 会把崩溃遗留的 Active 投影成 interrupted，掩盖真实状态。
+#[test]
+fn thread_has_live_turn_reports_poisoned_registry_lock() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = app_server(temp.path());
+    let poisoned = std::panic::catch_unwind(|| {
+        let _guard = server.conversations.lock().expect("registry lock");
+        panic!("poison the registry");
+    });
+    assert!(poisoned.is_err(), "test precondition: registry lock poisoned");
+    assert!(
+        server.thread_has_live_turn("some-thread").is_err(),
+        "poisoned lock must surface as an error"
+    );
+}

@@ -301,12 +301,14 @@ impl AppServer {
     }
 
     /// 该会话当前是否存在存活 turn（执行窗口内）。
-    pub(crate) fn thread_has_live_turn(&self, session_id: &str) -> bool {
-        self.conversations
-            .lock()
-            .ok()
-            .and_then(|map| map.get(session_id).cloned())
-            .is_some_and(|conversation| conversation.has_active_turn())
+    pub(crate) fn thread_has_live_turn(&self, session_id: &str) -> AppServerResult<bool> {
+        let map = self.conversations.lock().map_err(|error| {
+            AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+        })?;
+        Ok(map
+            .get(session_id)
+            .cloned()
+            .is_some_and(|conversation| conversation.has_active_turn()))
     }
 
     pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> AppServerResult<()> {
@@ -318,13 +320,16 @@ impl AppServer {
     /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
     /// 存活 turn 时才成立；崩溃遗留的 `Active` 投影为 `interrupted`，读取
     /// 不回写 JSONL（终态只能由 turn 的真实结束写入）。
-    pub(crate) fn project_thread(&self, record: &singularity_runtime::ThreadSummary) -> Thread {
+    pub(crate) fn project_thread(
+        &self,
+        record: &singularity_runtime::ThreadSummary,
+    ) -> AppServerResult<Thread> {
         let mut thread = thread_from_summary(record);
         if thread.last_turn_status == Some(singularity_protocol::ThreadStatus::Active)
-            && !self.thread_has_live_turn(&record.thread_id)
+            && !self.thread_has_live_turn(&record.thread_id)?
         {
             thread.last_turn_status = Some(singularity_protocol::ThreadStatus::Interrupted);
         }
-        thread
+        Ok(thread)
     }
 }
