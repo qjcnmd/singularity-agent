@@ -288,44 +288,30 @@ impl TurnRunner {
             }
         };
 
-        // 终态收敛：durable JSONL metadata → 终态事件。写入失败走有界重试与
-        // fail-stop 合同，绝不发布虚假终态。
-        if let Err(storage_error) = self.persist_terminal_state(
-            &mut session,
-            Some(&turn_id),
+        // 终态收敛：单条原子落盘 `turn_terminal` → 终态事件。写入失败直接
+        // fail-stop，绝不发布虚假终态或降级成另一个状态。
+        let terminal = TerminalCommit::new(
+            &turn_id,
             status.session_status,
             &status.model_usage,
             status.usage_complete,
-        ) {
+        )
+        .expect("run() only reaches this point with a terminal thread status");
+        if let Err(storage_error) = terminal.persist(&mut session) {
             let failure = TurnFailure {
                 stage: TurnFailureStage::TerminalOutcome,
                 cause: TurnFailureCause::Store,
                 original: Some(storage_error),
             };
-            return self.converge_after_storage_failure(
-                &mut session,
-                &turn_id,
-                &mut item_events,
-                failure,
-                sink,
-            );
+            fail_stop_terminalization(&thread.thread_id, &turn_id, &failure, sink);
+            return Err(TurnRunError::Terminalization(failure));
         }
         // 取消可能打断已开始 item 的工具执行：终态事件前补齐所有未闭合 item。
         for tool_call_id in item_events.open_tool_items() {
             item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
         item_events.emit_assistant_terminal_completed(sink);
-        let final_turn = self.terminal_turn_with_usage(
-            &session,
-            Turn {
-                turn_id: turn_id.clone(),
-                thread_id: thread.thread_id.clone(),
-                status: status.turn_status,
-                usage: None,
-            },
-            &status.model_usage,
-            status.usage_complete,
-        );
+        let final_turn = terminal.turn(&thread.thread_id, status.turn_status);
         sink.emit(TurnEvent::TurnCompleted {
             turn: final_turn.clone(),
         });
@@ -525,58 +511,16 @@ impl TurnRunner {
             _ => (usage, usage_complete),
         };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
-        let (metadata_error, durable) =
-            self.persist_failure_state(session, turn_id, &usage, usage_complete);
-        if !durable {
-            let message = metadata_error
-                .as_deref()
-                .unwrap_or("failed to persist terminal failure state");
-            sink.emit(TurnEvent::Diagnostic {
-                thread_id: session.session_id().to_string(),
-                turn_id: turn_id.to_string(),
-                severity: AgentDiagnosticSeverity::Error,
-                code: "storage_fatal".to_string(),
-                message: message.to_string(),
-            });
+        let terminal = TerminalCommit::new(turn_id, ThreadStatus::Failed, &usage, usage_complete)
+            .expect("Failed always maps to a terminal status");
+        // 失败终态无法落盘同样 fail-stop：不发布任何终态事件。
+        if terminal.persist(session).is_err() {
+            fail_stop_terminalization(session.session_id(), turn_id, &failure, sink);
             return Err(TurnRunError::Terminalization(failure));
         }
         let thread_id = session.session_id().to_string();
         self.emit_failure_terminal_events(turn_id, &thread_id, item_events, &failure, sink);
         Err(TurnRunError::Execution(failure))
-    }
-
-    /// 首次失败记录后最多重试一次；返回首次 durable 写失败文本。
-    fn persist_failure_state(
-        &self,
-        session: &mut SessionManager,
-        turn_id: &str,
-        usage: &ModelUsage,
-        usage_complete: bool,
-    ) -> (Option<String>, bool) {
-        let first_error = match self.persist_terminal_state(
-            session,
-            Some(turn_id),
-            ThreadStatus::Failed,
-            usage,
-            usage_complete,
-        ) {
-            Ok(()) => return (None, true),
-            Err(error) => error,
-        };
-        if self
-            .persist_terminal_state(
-                session,
-                Some(turn_id),
-                ThreadStatus::Failed,
-                usage,
-                usage_complete,
-            )
-            .is_ok()
-        {
-            return (Some(first_error), true);
-        }
-        // 没有 JSONL 终态事实就绝不发布终态投影；下次重开由 repair 收敛。
-        (Some(first_error), false)
     }
 
     /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个。
@@ -613,89 +557,80 @@ impl TurnRunner {
             },
         });
     }
+}
 
-    fn converge_after_storage_failure(
-        &self,
-        session: &mut SessionManager,
+/// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
+///
+/// 终态化不再有"terminal 与 usage 两次独立追加"或"降级成另一个状态"的路径：
+/// 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
+/// 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
+struct TerminalCommit {
+    turn_id: String,
+    status: TurnTerminalStatus,
+    usage: TurnUsage,
+    usage_complete: bool,
+}
+
+impl TerminalCommit {
+    /// 从线程状态构造终态提交；`Active`（非终态）返回 `None`。
+    fn new(
         turn_id: &str,
-        item_events: &mut AssistantItemEvents,
-        failure: TurnFailure,
-        sink: &mut dyn TurnEventSink,
-    ) -> Result<TurnOutcome, TurnRunError> {
-        // durable 判定已在调用方完成：进入这里意味着 intended status 无法
-        // 持久化。若降级后的 interrupted/failed 状态可以持久化，则按该真实
-        // 状态发布终态；否则发 fatal 存储诊断并返回 Terminalization。
-        let degraded = self.persist_failure_state(session, turn_id, &ModelUsage::default(), false);
-        if degraded.1 {
-            let thread_id = session.session_id().to_string();
-            self.emit_failure_terminal_events(
-                turn_id,
-                &thread_id,
-                item_events,
-                &TurnFailure {
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    original: None,
-                },
-                sink,
-            );
-            return Err(TurnRunError::Execution(TurnFailure {
-                stage: failure.stage,
-                cause: failure.cause,
-                original: failure.original,
-            }));
-        }
-        let safe_message = "fatal storage error: failed to persist terminal metadata";
-        sink.emit(TurnEvent::Diagnostic {
-            thread_id: session.session_id().to_string(),
-            turn_id: turn_id.to_string(),
-            severity: AgentDiagnosticSeverity::Error,
-            code: "storage_fatal".to_string(),
-            message: safe_message.to_string(),
-        });
-        Err(TurnRunError::Terminalization(failure))
-    }
-
-    /// 终态化：复用本轮已打开的单一 `SessionManager` 落盘单条 `turn_terminal`
-    /// metadata（status + usage + usageComplete 一次写入，JSONL 是事实源）。
-    fn persist_terminal_state(
-        &self,
-        session: &mut SessionManager,
-        turn_id: Option<&str>,
         status: ThreadStatus,
         usage: &ModelUsage,
         usage_complete: bool,
-    ) -> Result<(), String> {
-        if let Some(turn_id) = turn_id
-            && let Some(status) = terminal_status_for_thread_status(status)
-        {
-            let usage_value =
-                serde_json::to_value(TurnUsage::from_model_usage(usage, usage_complete))
-                    .map_err(|error| error.to_string())?;
-            let metadata =
-                SessionMetadata::turn_terminal(turn_id, status, usage_value, usage_complete)
-                    .map_err(|error| error.to_string())?;
-            append_terminal_metadata_if_missing(session, turn_id, metadata)?;
-        }
-        Ok(())
+    ) -> Option<Self> {
+        let status = terminal_status_for_thread_status(status)?;
+        Some(Self {
+            turn_id: turn_id.to_string(),
+            status,
+            usage: TurnUsage::from_model_usage(usage, usage_complete),
+            usage_complete,
+        })
     }
 
-    /// 终态 turn 的 usage 投影：优先使用本轮已在手的 model_usage；真正缺失
-    /// 时回退到同一会话 JSONL 已持久化的 usage metadata。
-    fn terminal_turn_with_usage(
-        &self,
-        session: &SessionManager,
-        mut turn: Turn,
-        usage: &ModelUsage,
-        usage_complete: bool,
-    ) -> Turn {
-        turn.usage = if usage.usage_present {
-            Some(TurnUsage::from_model_usage(usage, usage_complete))
-        } else {
-            persisted_usage_for_turn(session, &turn.turn_id)
-        };
-        turn
+    /// 构造终态 metadata 条目（status + usage + usageComplete 单条）。
+    fn metadata(&self) -> SessionMetadata {
+        let usage =
+            serde_json::to_value(&self.usage).expect("TurnUsage serialization is infallible");
+        SessionMetadata::turn_terminal(&self.turn_id, self.status, usage, self.usage_complete)
+            .expect("TurnUsage is always a JSON object")
     }
+
+    /// 单条落盘终态 metadata；同内容已存在时幂等跳过。
+    fn persist(&self, session: &mut SessionManager) -> Result<(), String> {
+        append_terminal_metadata_if_missing(session, &self.turn_id, self.metadata())
+    }
+
+    /// 终态事件层 Turn 投影（携带本轮已落盘的 usage）。
+    fn turn(&self, thread_id: &str, turn_status: TurnStatus) -> Turn {
+        Turn {
+            turn_id: self.turn_id.clone(),
+            thread_id: thread_id.to_string(),
+            status: turn_status,
+            usage: Some(self.usage.clone()),
+        }
+    }
+}
+
+/// 终态无法落盘时的 fail-stop 出口：发 `storage_fatal` 诊断，不发布任何
+/// 终态事件——磁盘与客户端之间不存在矛盾窗口。
+fn fail_stop_terminalization(
+    thread_id: &str,
+    turn_id: &str,
+    failure: &TurnFailure,
+    sink: &mut dyn TurnEventSink,
+) {
+    let message = failure
+        .original
+        .clone()
+        .unwrap_or_else(|| "fatal storage error: failed to persist terminal metadata".to_string());
+    sink.emit(TurnEvent::Diagnostic {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        severity: AgentDiagnosticSeverity::Error,
+        code: "storage_fatal".to_string(),
+        message,
+    });
 }
 
 /// 准备/执行阶段的内部错误表示，分类为 [`TurnFailure`] 时使用。
@@ -810,22 +745,6 @@ fn append_terminal_metadata_if_missing(
             .map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-fn persisted_usage_for_turn(session: &SessionManager, turn_id: &str) -> Option<TurnUsage> {
-    let value = session
-        .metadata_entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionMetadata::TurnTerminal {
-                turn_id: entry_turn_id,
-                usage,
-                ..
-            } if entry_turn_id == turn_id => Some(usage.clone()),
-            _ => None,
-        })?;
-    serde_json::from_value(value).ok()
 }
 
 fn workspace_path(thread: &Thread) -> Result<String, String> {
@@ -1087,5 +1006,109 @@ mod tests {
             events.as_slice(),
             [TurnEvent::ItemCompleted { item_id, .. }] if item_id == "tool"
         ));
+    }
+
+    /// 终态+用量单条原子写入：一次 persist 恰好一条 `turn_terminal`，内容完整；
+    /// 相同内容重复 persist 幂等跳过。
+    #[test]
+    fn terminal_commit_is_single_entry_and_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut session =
+            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
+        let usage = ModelUsage {
+            input_tokens: 100,
+            total_tokens: 150,
+            ..Default::default()
+        };
+        let commit =
+            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+        commit.persist(&mut session).expect("first persist");
+        commit.persist(&mut session).expect("idempotent persist");
+
+        let terminals: Vec<SessionMetadata> = session
+            .metadata_entries()
+            .into_iter()
+            .filter(|entry| entry.kind() == SessionMetadataKind::TurnTerminal)
+            .collect();
+        assert_eq!(terminals.len(), 1, "single atomic terminal entry");
+        assert_eq!(terminals[0].turn_id(), Some("turn-1"));
+        assert_eq!(
+            terminals[0].terminal_status(),
+            Some(TurnTerminalStatus::Completed)
+        );
+        let SessionMetadata::TurnTerminal {
+            usage: persisted,
+            usage_complete,
+            ..
+        } = &terminals[0]
+        else {
+            unreachable!("filtered to TurnTerminal");
+        };
+        assert!(*usage_complete, "usageComplete persisted");
+        assert_eq!(persisted["inputTokens"], 100);
+        assert_eq!(persisted["totalTokens"], 150);
+    }
+
+    /// 幂等按完整终态内容判定：同 turn 不同终态是新内容，如实追加（不跳过）。
+    #[test]
+    fn terminal_commit_distinguishes_different_terminal_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut session =
+            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
+        let usage = ModelUsage::default();
+        let completed =
+            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+        completed.persist(&mut session).expect("completed persist");
+        let failed =
+            TerminalCommit::new("turn-1", ThreadStatus::Failed, &usage, true).expect("terminal");
+        failed.persist(&mut session).expect("failed persist");
+
+        let terminals: Vec<TurnTerminalStatus> = session
+            .metadata_entries()
+            .iter()
+            .filter_map(|entry| entry.terminal_status())
+            .collect();
+        assert_eq!(
+            terminals,
+            vec![TurnTerminalStatus::Completed, TurnTerminalStatus::Failed]
+        );
+    }
+
+    /// 终态无法落盘 → fail-stop：只发 `storage_fatal` 诊断，不发布任何终态事件。
+    #[test]
+    fn terminal_persist_failure_emits_no_terminal_events() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut session =
+            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
+        let mut permissions = std::fs::metadata(session.path())
+            .expect("session metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(session.path(), permissions).expect("make session read-only");
+        let usage = ModelUsage::default();
+        let commit =
+            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+        assert!(commit.persist(&mut session).is_err(), "append must fail");
+
+        let mut events = Vec::new();
+        let failure = TurnFailure {
+            stage: TurnFailureStage::TerminalOutcome,
+            cause: TurnFailureCause::Store,
+            original: Some("injected storage failure".to_string()),
+        };
+        fail_stop_terminalization("thread-1", "turn-1", &failure, &mut |event| {
+            events.push(event)
+        });
+        assert!(
+            matches!(
+                events.as_slice(),
+                [TurnEvent::Diagnostic {
+                    code,
+                    severity: AgentDiagnosticSeverity::Error,
+                    ..
+                }] if code == "storage_fatal"
+            ),
+            "fail-stop must emit exactly one storage_fatal diagnostic: {events:?}"
+        );
     }
 }
