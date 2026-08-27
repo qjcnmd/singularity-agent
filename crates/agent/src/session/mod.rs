@@ -49,80 +49,91 @@ pub const MAX_SESSION_TITLE_CHARS: usize = 120;
 pub fn project_session(session: &SessionManager) -> SessionProjection {
     use crate::message::AgentMessageRole;
 
-    let metadata = session.metadata_entries();
-    let model = metadata.iter().rev().find_map(|entry| match entry {
-        SessionMetadata::ThreadSettings {
-            provider,
-            model,
-            reasoning,
-        } => Some(
-            match provider.as_deref().filter(|value| !value.is_empty()) {
-                Some(provider) => singularity_model::compose_model_selector(
-                    provider,
-                    model,
-                    reasoning.as_deref().filter(|value| !value.is_empty()),
-                ),
-                None => match reasoning.as_deref().filter(|value| !value.is_empty()) {
-                    Some(reasoning) => format!("{model}#{reasoning}"),
-                    None => model.clone(),
+    let mut model = None;
+    let mut status = None;
+    let mut latest_usage = None;
+    let mut title = None;
+    let mut total_tokens = 0u64;
+    let mut turn_count = 0usize;
+    // 单趟反向遍历完成全部六个投影：各"最近一个"字段取首个命中，
+    // 聚合字段累加。
+    for entry in session.metadata_entries().iter().rev() {
+        if model.is_none()
+            && let SessionMetadata::ThreadSettings {
+                provider,
+                model: model_name,
+                reasoning,
+            } = entry
+        {
+            model = Some(
+                match provider.as_deref().filter(|value| !value.is_empty()) {
+                    Some(provider) => singularity_model::compose_model_selector(
+                        provider,
+                        model_name,
+                        reasoning.as_deref().filter(|value| !value.is_empty()),
+                    ),
+                    None => match reasoning.as_deref().filter(|value| !value.is_empty()) {
+                        Some(reasoning) => format!("{model_name}#{reasoning}"),
+                        None => model_name.clone(),
+                    },
                 },
-            },
-        ),
-        _ => None,
-    });
-    let status = metadata.iter().rev().find_map(|entry| match entry.kind() {
-        SessionMetadataKind::TurnStarted => Some(SessionProjectionStatus::Active),
-        SessionMetadataKind::TurnTerminal => match entry.terminal_status() {
-            Some(TurnTerminalStatus::Completed) => Some(SessionProjectionStatus::Completed),
-            Some(TurnTerminalStatus::Failed) => Some(SessionProjectionStatus::Failed),
-            Some(TurnTerminalStatus::Interrupted) => Some(SessionProjectionStatus::Interrupted),
-            None => None,
-        },
-        _ => None,
-    });
-    let latest_usage = metadata.iter().rev().find_map(|entry| match entry {
-        SessionMetadata::TurnTerminal { usage, .. } => Some(usage.clone()),
-        _ => None,
-    });
-    let title = metadata
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionMetadata::ThreadName { name } => Some(name.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            session.entries().iter().find_map(|entry| {
-                let SessionEntry::Message { message, .. } = entry else {
-                    return None;
-                };
-                if message.role() != AgentMessageRole::User {
-                    return None;
-                }
-                let title = message
-                    .content_text()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .chars()
-                    .take(MAX_SESSION_TITLE_CHARS)
-                    .collect::<String>();
-                (!title.is_empty()).then_some(title)
-            })
-        });
-    let total_tokens = metadata
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionMetadata::TurnTerminal { usage, .. } => {
-                usage.get("totalTokens").and_then(serde_json::Value::as_u64)
+            );
+        }
+        if status.is_none() {
+            status = match entry.kind() {
+                SessionMetadataKind::TurnStarted => Some(SessionProjectionStatus::Active),
+                SessionMetadataKind::TurnTerminal => match entry.terminal_status() {
+                    Some(TurnTerminalStatus::Completed) => {
+                        Some(SessionProjectionStatus::Completed)
+                    }
+                    Some(TurnTerminalStatus::Failed) => Some(SessionProjectionStatus::Failed),
+                    Some(TurnTerminalStatus::Interrupted) => {
+                        Some(SessionProjectionStatus::Interrupted)
+                    }
+                    None => None,
+                },
+                _ => None,
+            };
+        }
+        if latest_usage.is_none()
+            && let SessionMetadata::TurnTerminal { usage, .. } = entry
+        {
+            latest_usage = Some(usage.clone());
+        }
+        if title.is_none()
+            && let SessionMetadata::ThreadName { name } = entry
+        {
+            title = Some(name.clone());
+        }
+        if let SessionMetadata::TurnTerminal { usage, .. } = entry {
+            total_tokens += usage
+                .get("totalTokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+        if entry.kind() == SessionMetadataKind::TurnStarted {
+            turn_count += 1;
+        }
+    }
+    let title = title.or_else(|| {
+        session.entries().iter().find_map(|entry| {
+            let SessionEntry::Message { message, .. } = entry else {
+                return None;
+            };
+            if message.role() != AgentMessageRole::User {
+                return None;
             }
-            _ => None,
+            let title = message
+                .content_text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(MAX_SESSION_TITLE_CHARS)
+                .collect::<String>();
+            (!title.is_empty()).then_some(title)
         })
-        .sum();
-    let turn_count = metadata
-        .iter()
-        .filter(|entry| entry.kind() == SessionMetadataKind::TurnStarted)
-        .count();
+    });
     let created_at = session.created_at().to_string();
     let updated_at = session
         .entries()
