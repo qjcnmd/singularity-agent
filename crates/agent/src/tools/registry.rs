@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -84,6 +84,22 @@ pub struct ExecuteContext<'a> {
     pub signal: Option<&'a CancellationToken>,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
     pub mutations: Option<&'a super::mutation::FileMutationQueue>,
+}
+
+/// 取消时向模型可见的失败文案；全仓唯一来源，工具不得自行拼写。
+pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
+
+impl ExecuteContext<'_> {
+    /// 取消信号已触发时返回模型可见的 abort 失败结果；未触发返回 `None`。
+    /// 工具在入口与耗时段落后统一调用它检查取消，避免各工具自行判断。
+    pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
+        self.signal
+            .filter(|signal| signal.is_cancelled())
+            .map(|_| ToolExecution {
+                content: ABORTED_MESSAGE.to_string(),
+                is_error: true,
+            })
+    }
 }
 
 /// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实的
@@ -182,14 +198,7 @@ pub(crate) fn error_result(message: impl Into<String>) -> Result<ToolExecution, 
 }
 
 /// 相对路径解析绑定到当前工作区目录，绝对路径保持原样。
-pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        cwd.join(candidate)
-    }
-}
+pub(crate) use super::path::resolve_path;
 
 pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))

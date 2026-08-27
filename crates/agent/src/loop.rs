@@ -35,7 +35,7 @@ use crate::message::{
     user_message,
 };
 use crate::session::context::entry_to_llm_messages;
-use crate::session::{SessionEntry, SessionEntryType, SessionError, SessionManager};
+use crate::session::{SessionEntry, SessionError, SessionManager};
 use crate::tools::mutation::FileMutationQueue;
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolError, ToolExecution, ToolPreflight, ToolRegistry,
@@ -989,7 +989,7 @@ impl Agent {
         };
         let mut replays = Vec::new();
         for entry in entries {
-            let SessionEntryType::Message(message) = &entry.entry_type else {
+            let SessionEntry::Message { message, .. } = entry else {
                 continue;
             };
             if message.role() != AgentMessageRole::Assistant || !message.has_tool_calls() {

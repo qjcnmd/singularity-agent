@@ -4,7 +4,7 @@ use singularity_model::{ModelMessage, ModelRole};
 
 use crate::message::{AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
-use super::format::{Result, SessionEntry, SessionEntryType};
+use super::format::{Result, SessionEntry};
 use super::manager::SessionManager;
 
 impl SessionManager {
@@ -12,22 +12,23 @@ impl SessionManager {
     pub fn build_context_entries(&self) -> Result<Vec<SessionEntry>> {
         let mut compaction_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if matches!(entry.entry_type, SessionEntryType::Compaction(_)) {
+            if matches!(entry, SessionEntry::Compaction { .. }) {
                 compaction_index = Some(index);
             }
         }
         let Some(compaction_index) = compaction_index else {
             return Ok(self.entries.clone());
         };
-        let compaction = &self.entries[compaction_index];
-        let first_kept = match &compaction.entry_type {
-            SessionEntryType::Compaction(entry) => entry.first_kept_entry_id.clone(),
+        let first_kept = match &self.entries[compaction_index] {
+            SessionEntry::Compaction { compaction, .. } => {
+                compaction.first_kept_entry_id.clone()
+            }
             _ => None,
         };
-        let mut context = vec![compaction.clone()];
+        let mut context = vec![self.entries[compaction_index].clone()];
         let mut found_first_kept = false;
         for entry in &self.entries[..compaction_index] {
-            if Some(entry.id.as_str()) == first_kept.as_deref() {
+            if Some(entry.id()) == first_kept.as_deref() {
                 found_first_kept = true;
             }
             if found_first_kept {
@@ -40,8 +41,8 @@ impl SessionManager {
 }
 
 pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => match message.role() {
+    match entry {
+        SessionEntry::Message { message, .. } => match message.role() {
             AgentMessageRole::User => {
                 vec![ModelMessage::text(ModelRole::User, message.content_text())]
             }
@@ -67,13 +68,13 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
                 vec![llm]
             }
         },
-        SessionEntryType::Compaction(compaction) => vec![ModelMessage::text(
+        SessionEntry::Compaction { compaction, .. } => vec![ModelMessage::text(
             ModelRole::User,
             format!(
                 "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
                 compaction.summary
             ),
         )],
-        SessionEntryType::Metadata(_) => Vec::new(),
+        SessionEntry::Metadata { .. } => Vec::new(),
     }
 }

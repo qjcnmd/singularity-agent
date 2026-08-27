@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
 pub use super::format::SessionError;
-use super::format::{Result, SessionEntryType, SessionMetadata, SessionMetadataKind};
+use super::format::{Result, SessionEntry, SessionMetadata, SessionMetadataKind};
 pub use super::manager::SessionManager;
 
 impl SessionManager {
@@ -15,7 +15,7 @@ impl SessionManager {
         let mut started = BTreeSet::new();
         let mut terminal = HashSet::new();
         for entry in &self.entries {
-            let SessionEntryType::Metadata(metadata) = &entry.entry_type else {
+            let SessionEntry::Metadata { metadata, .. } = entry else {
                 continue;
             };
             let Some(turn_id) = metadata.turn_id() else {
@@ -52,8 +52,8 @@ impl SessionManager {
     pub fn metadata_entries(&self) -> Vec<SessionMetadata> {
         self.entries
             .iter()
-            .filter_map(|entry| match &entry.entry_type {
-                SessionEntryType::Metadata(metadata) => Some(metadata.clone()),
+            .filter_map(|entry| match entry {
+                SessionEntry::Metadata { metadata, .. } => Some(metadata.clone()),
                 _ => None,
             })
             .collect()
@@ -68,8 +68,8 @@ impl SessionManager {
         let mut paired_tool_results: HashSet<String> = HashSet::new();
         let mut assistant_tool_calls: Vec<Vec<String>> = Vec::new();
         for entry in &self.entries {
-            match &entry.entry_type {
-                SessionEntryType::Message(message)
+            match entry {
+                SessionEntry::Message { message, .. }
                     if message.role() == AgentMessageRole::Assistant =>
                 {
                     let tool_call_ids: Vec<String> = message
@@ -84,7 +84,7 @@ impl SessionManager {
                         assistant_tool_calls.push(tool_call_ids);
                     }
                 }
-                SessionEntryType::Message(message)
+                SessionEntry::Message { message, .. }
                     if message.role() == AgentMessageRole::ToolResult =>
                 {
                     if let Some(tool_call_id) = message.tool_call_id() {
@@ -100,14 +100,14 @@ impl SessionManager {
                 if paired_tool_results.contains(&tool_call_id) {
                     continue;
                 }
-                self.append_entry(SessionEntryType::Message(AgentMessage::ToolResult {
+                self.append_message(AgentMessage::ToolResult {
                     content: vec![ContentBlock::Text {
                         text: "[previous execution outcome unknown; do not retry]".to_string(),
                     }],
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     is_error: Some(true),
-                }))?;
+                })?;
                 repaired += 1;
             }
         }

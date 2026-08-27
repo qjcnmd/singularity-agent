@@ -584,14 +584,14 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
             ..SettingsPatch::default()
         })
         .expect("queue first patch");
-    assert_eq!(queued, SettingsApplyTiming::QueuedForNextTurn);
+    assert_eq!(queued.timing, SettingsApplyTiming::QueuedForNextTurn);
     let queued = shared
         .queue_settings(SettingsPatch {
             provider: Some("openai_compatible".to_string()),
             ..SettingsPatch::default()
         })
         .expect("queue second patch");
-    assert_eq!(queued, SettingsApplyTiming::QueuedForNextTurn);
+    assert_eq!(queued.timing, SettingsApplyTiming::QueuedForNextTurn);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("base-model"),
@@ -667,7 +667,7 @@ fn idle_settings_persist_immediately_without_any_turn() {
             ..SettingsPatch::default()
         })
         .expect("apply while idle");
-    assert_eq!(updated, SettingsApplyTiming::AppliedNow);
+    assert_eq!(updated.timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
         1,
@@ -803,7 +803,7 @@ fn settings_persistence_failure_keeps_intent_and_fails_run() {
             ..SettingsPatch::default()
         })
         .expect("re-apply after restore");
-    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
+    assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model")
@@ -1149,7 +1149,7 @@ fn reservation_holds_window_and_releases_on_drop() {
             ..SettingsPatch::default()
         })
         .expect("queue settings during reservation");
-    assert_eq!(timing, SettingsApplyTiming::QueuedForNextTurn);
+    assert_eq!(timing.timing, SettingsApplyTiming::QueuedForNextTurn);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("base-model"),

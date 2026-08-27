@@ -42,9 +42,6 @@ impl std::fmt::Display for ProviderAttemptStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum TurnEvent {
-    ThreadStarted {
-        thread: Thread,
-    },
     TurnStarted {
         turn: Turn,
     },
@@ -140,7 +137,6 @@ impl TurnEvent {
     /// 事件在流式输出中的稳定方法名（与协议事件名一致）。
     pub fn method(&self) -> &'static str {
         match self {
-            Self::ThreadStarted { .. } => "thread/started",
             Self::TurnStarted { .. } => "turn/started",
             Self::ItemStarted { .. } => "item/started",
             Self::AssistantDelta { .. } => "item/agentMessage/delta",

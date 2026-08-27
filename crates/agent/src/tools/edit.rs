@@ -53,8 +53,8 @@ fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
     let path = &args.path;
     let old_string = &args.old_string;
     let new_string = &args.new_string;
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let full_path = resolve_path(ctx.cwd, path);
     if full_path.is_dir() {
@@ -66,8 +66,8 @@ fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
             return error_result(format!("Could not edit file: {path}. {error}"));
         }
     };
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let content = match std::str::from_utf8(&original) {
         Ok(content) => content,

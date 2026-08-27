@@ -97,12 +97,15 @@ impl TuiApp {
             KeyCode::Enter => {
                 let patch = menu.patch();
                 match self.conversation.queue_settings(patch) {
-                    Ok(singularity_runtime::SettingsApplyTiming::NothingToApply) => {
+                    Ok(result)
+                        if result.timing
+                            == singularity_runtime::SettingsApplyTiming::NothingToApply =>
+                    {
                         menu.error = Some("nothing to change".into());
                     }
-                    Ok(timing) => {
-                        let queued_now =
-                            timing == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn;
+                    Ok(result) => {
+                        let queued_now = result.timing
+                            == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn;
                         self.transcript.push_note(
                             if queued_now {
                                 "settings queued; effective from the next turn"

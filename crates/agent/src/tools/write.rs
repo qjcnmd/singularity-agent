@@ -40,8 +40,8 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = &args.path;
     let content = &args.content;
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let full_path = resolve_path(ctx.cwd, path);
     if let Some(parent) = full_path.parent()
@@ -52,8 +52,8 @@ fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, T
             "Could not write file: {path}. Failed to create parent directories: {error}"
         ));
     }
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, content.as_bytes()) {
         return error_result(format!("Could not write file: {path}. {error}"));

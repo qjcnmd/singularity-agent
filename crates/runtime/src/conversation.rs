@@ -72,6 +72,16 @@ impl SettingsPatch {
     }
 }
 
+/// [`Conversation::queue_settings`] 的结果：本次修改的生效时点与合并后的 selector。
+///
+/// selector 由 runtime 在提交点唯一组合并校验；客户端只投影，不反推。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsApplyResult {
+    pub timing: SettingsApplyTiming,
+    /// 合并并校验后的完整 selector（`provider/model[#effort]`）。
+    pub selector: String,
+}
+
 /// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
 ///
 /// inbox 由 runner 在 Agent 构造完成后注册（先于 turn/started 事件发布），
@@ -368,25 +378,35 @@ impl Conversation {
     pub fn queue_settings(
         &self,
         patch: SettingsPatch,
-    ) -> Result<SettingsApplyTiming, ConversationError> {
+    ) -> Result<SettingsApplyResult, ConversationError> {
         if patch.is_empty() {
-            return Ok(SettingsApplyTiming::NothingToApply);
+            let selector = compose_merged_selector(self.lock_state()?.thread.model.as_deref(), &patch);
+            return Ok(SettingsApplyResult {
+                timing: SettingsApplyTiming::NothingToApply,
+                selector,
+            });
         }
         // 先用当前投影做即时校验：无效值在提交点就被拒绝，而不是等到终态后。
-        self.compose_selector(&patch)?;
+        let selector = self.compose_selector(&patch)?;
         let mut state = self.lock_state()?;
         if state.turn.is_busy() {
             state.queued_settings = Some(match state.queued_settings.take() {
                 Some(pending) => pending.merged_with(&patch),
                 None => patch,
             });
-            return Ok(SettingsApplyTiming::QueuedForNextTurn);
+            return Ok(SettingsApplyResult {
+                timing: SettingsApplyTiming::QueuedForNextTurn,
+                selector,
+            });
         }
         // 空闲路径与终态后路径共用同一份待生效意图：先入队再立即消费，
         // 持久化失败时意图保留在队列中等待重试。
         state.queued_settings = Some(patch);
         self.persist_pending_settings_locked(&mut state)?;
-        Ok(SettingsApplyTiming::AppliedNow)
+        Ok(SettingsApplyResult {
+            timing: SettingsApplyTiming::AppliedNow,
+            selector,
+        })
     }
 
     /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入与设置。

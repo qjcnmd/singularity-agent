@@ -15,9 +15,7 @@ use singularity_agent::agent::{
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
-use singularity_agent::session::{
-    SessionEntryType, SessionManager, SessionMetadata, SessionMetadataKind,
-};
+use singularity_agent::session::{SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{
@@ -92,21 +90,21 @@ impl TurnRunner {
         let mut inside_turn = false;
         let mut thinking = Vec::new();
         for entry in session.entries() {
-            match &entry.entry_type {
-                SessionEntryType::Metadata(metadata)
+            match entry {
+                SessionEntry::Metadata { metadata, .. }
                     if metadata.kind() == SessionMetadataKind::TurnStarted
                         && metadata.turn_id() == Some(turn_id) =>
                 {
                     inside_turn = true;
                 }
-                SessionEntryType::Metadata(metadata)
+                SessionEntry::Metadata { metadata, .. }
                     if inside_turn
                         && metadata.kind().matches_turn_terminal()
                         && metadata.turn_id() == Some(turn_id) =>
                 {
                     break;
                 }
-                SessionEntryType::Message(message)
+                SessionEntry::Message { message, .. }
                     if inside_turn && message.role() == AgentMessageRole::Assistant =>
                 {
                     thinking.extend(message.content().iter().filter_map(|block| match block {

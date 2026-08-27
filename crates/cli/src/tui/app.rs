@@ -150,15 +150,6 @@ impl TuiApp {
 
     pub fn on_turn_event(&mut self, event: &TurnEvent) {
         match event {
-            TurnEvent::ThreadStarted { thread } => {
-                self.transcript.push_note(
-                    format!(
-                        "thread {}",
-                        &thread.thread_id[..8.min(thread.thread_id.len())]
-                    ),
-                    NoteStyle::Dim,
-                );
-            }
             TurnEvent::TurnStarted { turn } => {
                 self.transcript.push_note(
                     format!("── turn {} ──", &turn.turn_id[..8.min(turn.turn_id.len())]),
@@ -178,10 +169,16 @@ impl TuiApp {
                     self.set_waiting(WaitingTarget::Thinking);
                 }
             }
-            // 聚合遥测不改变等待对象，也不进入会话流。
+            // 条目开始不改变等待对象，也不进入会话流。
             TurnEvent::ItemStarted { .. } => {}
+            // 条目终态是工具块的收尾信号：取消/异常中断时无 ToolExecutionEnd，
+            // ItemFailed 是唯一定型入口，工具块不能停留在 Running。
             TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
                 if self.transcript.is_tool_item(item_id) {
+                    self.transcript.tool_terminal(
+                        item_id,
+                        matches!(event, TurnEvent::ItemFailed { .. }),
+                    );
                     self.set_waiting(WaitingTarget::Model);
                 }
             }
@@ -428,6 +425,16 @@ impl TuiApp {
     }
 
     fn submit_input(&mut self) -> Action {
+        // 压缩持有一致性写窗口：完成前不接受新输入（否则误报
+        // TurnAlreadyActive 一类晦涩错误）；Esc 可取消。检查必须在
+        // editor.take() 之前，保证被拒时草稿保留在原处。
+        if self.compacting {
+            self.transcript.push_note(
+                "compaction in progress; finish or press Esc to cancel",
+                NoteStyle::Warning,
+            );
+            return Action::Continue;
+        }
         let raw = self.editor.take();
         let text = raw.trim().to_string();
         if text.is_empty() {
@@ -435,15 +442,6 @@ impl TuiApp {
         }
         if text.starts_with('/') {
             return self.execute_command(&text);
-        }
-        // 压缩持有一致性写窗口：完成前不接受新输入（否则误报
-        // TurnAlreadyActive 一类晦涩错误）；Esc 可取消。
-        if self.compacting {
-            self.transcript.push_note(
-                "compaction in progress; finish or press Esc to cancel",
-                NoteStyle::Warning,
-            );
-            return Action::Continue;
         }
         match self.phase {
             Phase::Idle => {

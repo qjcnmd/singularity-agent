@@ -1,6 +1,6 @@
 use super::*;
 use crate::message::AgentMessage;
-use crate::session::SessionEntryType;
+use crate::session::SessionEntry;
 use serde_json::{Value, json};
 use singularity_model::{
     ModelMessage, ModelToolCall, ModelToolParseStatus, ProviderApiProtocol, ProviderAttemptEvent,
@@ -696,8 +696,8 @@ fn steer_at_stop_continues_one_more_turn() {
     assert_eq!(outcome.final_text, "second answer");
     assert!(
         agent.session.entries().iter().any(|entry| matches!(
-            &entry.entry_type,
-            SessionEntryType::Message(message)
+            &entry,
+            SessionEntry::Message { message, .. }
                 if message.role() == AgentMessageRole::User
                     && message.content_text() == "please continue"
         )),
@@ -747,8 +747,8 @@ fn session_file_roundtrip_after_run() {
     let entries = reopened.build_context_entries().unwrap();
     let messages: Vec<&AgentMessage> = entries
         .iter()
-        .filter_map(|entry| match &entry.entry_type {
-            SessionEntryType::Message(message) => Some(message),
+        .filter_map(|entry| match &entry {
+            SessionEntry::Message { message, .. } => Some(message),
             _ => None,
         })
         .collect();
@@ -757,7 +757,7 @@ fn session_file_roundtrip_after_run() {
     assert_eq!(messages[0].content_text(), "task");
     assert_eq!(messages[1].role(), AgentMessageRole::Assistant);
     let ContentBlock::ToolCall { id, name, args } =
-        messages[1].tool_calls().first().expect("tool call block")
+        messages[1].tool_calls().next().expect("tool call block")
     else {
         panic!("expected tool call block");
     };
@@ -770,7 +770,7 @@ fn session_file_roundtrip_after_run() {
     assert_eq!(messages[3].role(), AgentMessageRole::Assistant);
     assert_eq!(messages[3].content_text(), "finished");
     // 线性序列：会话事实源按落盘次序推进，条目 id 必须唯一且顺序与上下文一致。
-    let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let ids: Vec<&str> = entries.iter().map(|entry| entry.id()).collect();
     let mut unique = ids.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -778,12 +778,12 @@ fn session_file_roundtrip_after_run() {
     assert_eq!(
         entries
             .iter()
-            .map(|entry| entry.id.as_str())
+            .map(|entry| entry.id())
             .collect::<Vec<_>>(),
         reopened
             .entries()
             .iter()
-            .map(|entry| entry.id.as_str())
+            .map(|entry| entry.id())
             .collect::<Vec<_>>(),
         "context entries preserve linear file order"
     );
@@ -861,7 +861,7 @@ fn previous_provider_usage_triggers_compaction_before_the_next_request() {
             .session
             .entries()
             .iter()
-            .any(|entry| matches!(entry.entry_type, SessionEntryType::Compaction(_)))
+            .any(|entry| matches!(entry, SessionEntry::Compaction { compaction: _, .. }))
     );
     assert_eq!(provider.requests.lock().unwrap().len(), 3);
 }
@@ -1299,23 +1299,23 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
             .build_context_entries()
             .unwrap()
             .iter()
-            .any(|entry| matches!(entry.entry_type, SessionEntryType::Compaction(_)))
+            .any(|entry| matches!(entry, SessionEntry::Compaction { compaction: _, .. }))
     );
     let compaction = agent
         .session
         .entries()
         .iter()
-        .find_map(|entry| match &entry.entry_type {
-            SessionEntryType::Compaction(compaction) => Some(compaction),
+        .find_map(|entry| match &entry {
+            SessionEntry::Compaction { compaction, .. } => Some(compaction),
             _ => None,
         })
         .unwrap();
     let first_kept = compaction.first_kept_entry_id.as_deref().unwrap();
     assert!(agent.session.entries().iter().any(|entry| {
-        entry.id == first_kept
+        entry.id() == first_kept
             && matches!(
-                &entry.entry_type,
-                SessionEntryType::Message(message)
+                &entry,
+                SessionEntry::Message { message, .. }
                     if message.role() == AgentMessageRole::User
                         && message.content_text() == "task"
             )
@@ -1463,8 +1463,8 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
     let entries = agent.session.build_context_entries().unwrap();
     assert!(entries.iter().any(|entry| {
         matches!(
-            &entry.entry_type,
-            SessionEntryType::Message(message)
+            &entry,
+            SessionEntry::Message { message, .. }
                 if message.role() == AgentMessageRole::ToolResult
                     && message.tool_call_id().is_some_and(|id| id == "orphan_write_1")
                     && message.content_text().contains("do not retry")

@@ -30,7 +30,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
 }
 
 fn entry_ids(entries: &[SessionEntry]) -> Vec<String> {
-    entries.iter().map(|entry| entry.id.clone()).collect()
+    entries.iter().map(|entry| entry.id().to_string()).collect()
 }
 
 fn session_header(id: &str) -> String {
@@ -59,7 +59,7 @@ fn create_append_reopen_roundtrip() {
         .append_message(tool_result("call_1", "ls output"))
         .unwrap();
     let file = manager.path().to_path_buf();
-    let leaf = manager.entries().last().expect("content entry").id.clone();
+    let leaf = manager.entries().last().expect("content entry").id().to_string();
     assert_eq!(leaf, id3);
 
     let content = std::fs::read_to_string(&file).unwrap();
@@ -76,19 +76,19 @@ fn create_append_reopen_roundtrip() {
     drop(manager);
 
     let opened = SessionManager::open_existing(&file).unwrap();
-    assert_eq!(opened.entries().last().expect("content entry").id, leaf);
+    assert_eq!(opened.entries().last().expect("content entry").id(), leaf.as_str());
     let entries = opened.build_context_entries().unwrap();
     assert_eq!(entry_ids(&entries), vec![id1, id2, id3]);
     for entry in &entries {
-        assert_eq!(entry.id.len(), 8);
-        assert!(entry.id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(entry.id().len(), 8);
+        assert!(entry.id().chars().all(|c| c.is_ascii_hexdigit()));
     }
-    assert!(matches!(&entries[0].entry_type,
-            SessionEntryType::Message(m) if m.role() == AgentMessageRole::User && m.content_text() == "hello"));
-    assert!(matches!(&entries[1].entry_type,
-            SessionEntryType::Message(m) if m.role() == AgentMessageRole::Assistant && m.content_text() == "hi there"));
-    assert!(matches!(&entries[2].entry_type,
-            SessionEntryType::Message(m) if m.role() == AgentMessageRole::ToolResult
+    assert!(matches!(&entries[0],
+            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::User && m.content_text() == "hello"));
+    assert!(matches!(&entries[1],
+            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::Assistant && m.content_text() == "hi there"));
+    assert!(matches!(&entries[2],
+            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::ToolResult
                 && m.tool_call_id().is_some_and(|id| id == "call_1")
                 && m.tool_name().is_some_and(|name| name == "bash")));
 }
@@ -145,7 +145,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     );
     let ids = entries
         .iter()
-        .map(|entry| entry.id.as_str())
+        .map(|entry| entry.id())
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), entries.len(), "entry ids must be unique");
 }
@@ -281,8 +281,8 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
     let entries = reopened.build_context_entries().unwrap();
     let tool_results = entries
         .iter()
-        .filter_map(|entry| match &entry.entry_type {
-            SessionEntryType::Message(message)
+        .filter_map(|entry| match &entry {
+            SessionEntry::Message { message, .. }
                 if message.role() == AgentMessageRole::ToolResult =>
             {
                 Some(message)
@@ -460,7 +460,11 @@ fn append_limits_reject_without_writing_or_advancing_memory() {
     let before_bytes = std::fs::read(manager.path()).unwrap();
     let error = manager
         .append_entry_with_limits(
-            SessionEntryType::Message(user("oversized")),
+            SessionEntry::Message {
+                id: "oversized".to_string(),
+                timestamp: None,
+                message: user("oversized"),
+            },
             AppendLimits {
                 line_bytes: 1,
                 file_bytes: 1024 * 1024,

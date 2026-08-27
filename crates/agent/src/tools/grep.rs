@@ -75,8 +75,8 @@ fn truncate_for_display(line: &str) -> String {
 fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let root = resolve_path(ctx.cwd, path);
     if !root.is_dir() {
@@ -183,8 +183,8 @@ fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, To
                 .unwrap_or_default()
         );
     }
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     Ok(ToolExecution {
         content: output,

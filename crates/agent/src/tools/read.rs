@@ -45,8 +45,8 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 }
 
 fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let full_path = resolve_path(ctx.cwd, &args.path);
     let file = match File::open(&full_path) {

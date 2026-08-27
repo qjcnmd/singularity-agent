@@ -45,7 +45,7 @@ fn file_call(tool_name: &str, path: &str) -> AgentMessage {
 }
 
 fn message_entry(message: AgentMessage) -> SessionEntry {
-    SessionEntry {
+    SessionEntry::Message {
         id: Uuid::new_v4()
             .simple()
             .to_string()
@@ -53,7 +53,7 @@ fn message_entry(message: AgentMessage) -> SessionEntry {
             .take(8)
             .collect(),
         timestamp: None,
-        entry_type: SessionEntryType::Message(message),
+        message,
     }
 }
 
@@ -218,13 +218,13 @@ fn compact_full_flow_and_reopen_slicing() {
     // 重开视角：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，
     // 旧消息被摘要取代。写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
+    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
     assert_eq!(ctx_ids.len(), 4);
-    assert!(matches!(ctx[0].entry_type, SessionEntryType::Compaction(_)));
+    assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(
         ctx_ids,
         vec![
-            ctx[0].id.as_str(),
+            ctx[0].id(),
             id_u1.as_str(),
             id_a1.as_str(),
             id_t1.as_str()
@@ -271,11 +271,11 @@ fn compact_full_flow_and_reopen_slicing() {
     assert_eq!(last["details"]["readFiles"], json!(["src/main.rs"]));
     // 二次压缩后的重开视角：写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
+    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
     assert_eq!(
         ctx_ids,
         vec![
-            ctx[0].id.as_str(),
+            ctx[0].id(),
             id_u2.as_str(),
             id_a2.as_str(),
             id_t2.as_str()
@@ -359,13 +359,13 @@ fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
     // 重开视角：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult
     // 成对保留。写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id.as_str()).collect();
+    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
     assert_eq!(ctx_ids.len(), 4);
-    assert!(matches!(ctx[0].entry_type, SessionEntryType::Compaction(_)));
+    assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(
         ctx_ids,
         vec![
-            ctx[0].id.as_str(),
+            ctx[0].id(),
             id_u1.as_str(),
             id_a1.as_str(),
             id_t1.as_str()

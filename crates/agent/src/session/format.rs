@@ -2,9 +2,8 @@
 
 use std::collections::HashSet;
 
-use serde::ser::Error as _;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use singularity_model::ModelUsage;
 use thiserror::Error;
 use uuid::Uuid;
@@ -252,89 +251,44 @@ impl SessionMetadata {
     }
 }
 
-fn metadata_payload(value: &Value) -> Value {
-    let mut payload = value.as_object().cloned().unwrap_or_default();
-    for key in ["id", "timestamp", "type"] {
-        payload.remove(key);
-    }
-    Value::Object(payload)
-}
-/// 会话条目类型。仅保留 Message, Compaction, Metadata。
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionEntryType {
-    Message(AgentMessage),
-    Compaction(CompactionEntry),
-    Metadata(SessionMetadata),
+/// 会话条目：以 `type` 为标签的 tagged enum，serde 生成序列化与严格类型校验。
+///
+/// Compaction/Metadata 的 payload 字段经 `flatten` 平铺到条目外层（与历史
+/// wire 形状一致）；`deny_unknown_fields` 与 `flatten` 在 serde 中互斥，故
+/// 外层未知字段按 serde 语义被忽略，已知字段的类型/词形校验仍严格。
+/// 会话是严格的线性序列：文件行的物理顺序即模型上下文顺序，条目按其落盘
+/// 次序推进；不再存储 parentId。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEntry {
+    Message {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+        message: AgentMessage,
+    },
+    Compaction {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+        #[serde(flatten)]
+        compaction: CompactionEntry,
+    },
+    Metadata {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+        #[serde(flatten)]
+        metadata: SessionMetadata,
+    },
 }
 
-impl SessionEntryType {
-    fn type_name(&self) -> &'static str {
+impl SessionEntry {
+    pub fn id(&self) -> &str {
         match self {
-            Self::Message(_) => "message",
-            Self::Compaction(_) => "compaction",
-            Self::Metadata(_) => "metadata",
-        }
-    }
-}
-
-/// 一条会话顺序条目。会话是严格的线性序列：文件行的物理顺序即模型上下文
-/// 顺序，条目按其落盘次序推进；不再存储 parentId。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionEntry {
-    pub id: String,
-    pub timestamp: Option<String>,
-    pub entry_type: SessionEntryType,
-}
-
-impl Serialize for SessionEntry {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut map = Map::new();
-        map.insert("id".to_string(), json!(self.id));
-        if let Some(timestamp) = &self.timestamp {
-            map.insert("timestamp".to_string(), json!(timestamp));
-        }
-        map.insert("type".to_string(), json!(self.entry_type.type_name()));
-        match &self.entry_type {
-            SessionEntryType::Message(message) => {
-                map.insert(
-                    "message".to_string(),
-                    serde_json::to_value(message).map_err(S::Error::custom)?,
-                );
-            }
-            SessionEntryType::Compaction(compaction) => {
-                merge_payload(
-                    &mut map,
-                    serde_json::to_value(compaction).map_err(S::Error::custom)?,
-                );
-            }
-            SessionEntryType::Metadata(metadata) => {
-                merge_payload(
-                    &mut map,
-                    serde_json::to_value(metadata).map_err(S::Error::custom)?,
-                );
-            }
-        }
-        Value::Object(map).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SessionEntry {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        strict_entry_from_value(&value).map_err(serde::de::Error::custom)
-    }
-}
-
-fn merge_payload(map: &mut Map<String, Value>, payload: Value) {
-    if let Some(object) = payload.as_object() {
-        for (key, value) in object {
-            map.insert(key.clone(), value.clone());
+            Self::Message { id, .. }
+            | Self::Compaction { id, .. }
+            | Self::Metadata { id, .. } => id,
         }
     }
 }
@@ -398,7 +352,7 @@ pub(super) fn validate_entries(
     raw_entries: &[Value],
     lines: &[usize],
 ) -> Result<Vec<SessionEntry>> {
-    // 会话是严格的线性序列：单趟相邻检查 = 逐条严格解析并保证 id 唯一、
+    // 会话是严格的线性序列：单趟相邻检查 = 逐条 serde 严格解析并保证 id 唯一、
     // 无中间 header。文件行的物理顺序就是事实源顺序。
     let mut entries = Vec::with_capacity(raw_entries.len().saturating_sub(1));
     let mut ids = HashSet::new();
@@ -409,81 +363,15 @@ pub(super) fn validate_entries(
                 "intermediate session header at line {line}"
             )));
         }
-        let entry = strict_entry_from_value(raw)
-            .map_err(|cause| SessionError::InvalidEntry { line, cause })?;
-        if !ids.insert(entry.id.clone()) {
-            return Err(SessionError::DuplicateId(entry.id));
+        let entry = serde_json::from_value::<SessionEntry>(raw.clone())
+            .map_err(|error| SessionError::InvalidEntry {
+                line,
+                cause: error.to_string(),
+            })?;
+        if !ids.insert(entry.id().to_string()) {
+            return Err(SessionError::DuplicateId(entry.id().to_string()));
         }
         entries.push(entry);
     }
     Ok(entries)
-}
-
-pub(super) fn strict_entry_from_value(value: &Value) -> std::result::Result<SessionEntry, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "session entry is not a JSON object".to_string())?;
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "id" | "timestamp"
-                | "type"
-                | "message"
-                | "summary"
-                | "firstKeptEntryId"
-                | "tokensBefore"
-                | "previousSummary"
-                | "details"
-                | "metadataType"
-                | "turnId"
-                | "error"
-                | "reason"
-                | "synthetic"
-                | "provider"
-                | "model"
-                | "reasoning"
-                | "name"
-                | "usage"
-        ) {
-            return Err(format!("unknown session entry field: {key}"));
-        }
-    }
-    let id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| "session entry id must be a non-empty string".to_string())?
-        .to_string();
-    let timestamp = object
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "session entry timestamp is required".to_string())?;
-    let entry_type = match object.get("type").and_then(Value::as_str) {
-        Some("message") => {
-            let message = value
-                .get("message")
-                .ok_or_else(|| "message entry has no message payload".to_string())?;
-            SessionEntryType::Message(
-                serde_json::from_value(message.clone())
-                    .map_err(|error| format!("invalid message payload: {error}"))?,
-            )
-        }
-        Some("compaction") => SessionEntryType::Compaction(
-            serde_json::from_value(value.clone())
-                .map_err(|error| format!("invalid compaction payload: {error}"))?,
-        ),
-        Some("metadata") => SessionEntryType::Metadata(
-            serde_json::from_value(metadata_payload(value))
-                .map_err(|error| format!("invalid metadata payload: {error}"))?,
-        ),
-        Some(other) => return Err(format!("unknown session entry type: {other}")),
-        None => return Err("session entry has no type".into()),
-    };
-    Ok(SessionEntry {
-        id,
-        timestamp: Some(timestamp),
-        entry_type,
-    })
 }

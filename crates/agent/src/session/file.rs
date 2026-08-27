@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -320,10 +320,6 @@ pub fn now_iso() -> String {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         ))
         .expect("utc timestamp always formats")
-}
-
-pub(super) fn normalize_abs_path(path: &Path) -> Result<PathBuf> {
-    Ok(std::path::absolute(path)?)
 }
 
 pub(crate) fn normalize_cwd_string(cwd: &Path) -> String {

@@ -176,28 +176,33 @@ impl Transcript {
 
     /// 工具结束：就地定型为稳定记录；首个终态生效，重复终态保持首见结果。
     pub fn tool_end(&mut self, call_id: &str, result: &str, is_error: bool) {
+        if let Some(item) = self.tool_item_mut(call_id)
+            && matches!(item.state, ToolState::Running { .. })
+        {
+            item.state = ToolState::Done {
+                output: result.to_string(),
+                is_error,
+                display: ToolDisplay::Truncated,
+                completed_at: std::time::Instant::now(),
+            };
+        }
+    }
+
+    /// 条目终态：在未收到 ToolExecutionEnd 时把运行中工具定型为稳定记录。
+    /// 取消/异常中断时 `ItemCompleted`/`ItemFailed` 是唯一收尾信号，工具块
+    /// 不能停留在 Running；输出回退到最后一次增量预览。
+    pub fn tool_terminal(&mut self, call_id: &str, is_error: bool) {
         if let Some(item) = self.tool_item_mut(call_id) {
-            if matches!(item.state, ToolState::Running { .. }) {
-                item.state = ToolState::Done {
-                    output: result.to_string(),
-                    is_error,
-                    display: ToolDisplay::Truncated,
-                    completed_at: std::time::Instant::now(),
-                };
-            }
-        } else {
-            // 终态补偿路径可能先于 start 到达（理论上不发生）：保真为完整记录。
-            self.items.push(FlowItem::Tool(ToolItem {
-                call_id: call_id.to_string(),
-                name: call_id.to_string(),
-                args_head: String::new(),
-                state: ToolState::Done {
-                    output: result.to_string(),
-                    is_error,
-                    display: ToolDisplay::Truncated,
-                    completed_at: std::time::Instant::now(),
-                },
-            }));
+            let ToolState::Running { last_output } = &mut item.state else {
+                return;
+            };
+            let output = std::mem::take(last_output);
+            item.state = ToolState::Done {
+                output,
+                is_error,
+                display: ToolDisplay::Truncated,
+                completed_at: std::time::Instant::now(),
+            };
         }
     }
 
@@ -267,7 +272,7 @@ impl Transcript {
         let width = width.max(1) as usize;
         self.items
             .iter()
-            .map(|item| item_row_count(item, width, self.thinking_collapsed))
+            .map(|item| item_rows(item, width, self.thinking_collapsed, ' ').len())
             .collect()
     }
 
@@ -282,128 +287,129 @@ impl Transcript {
     ) -> Option<Line<'static>> {
         let width = width.max(1) as usize;
         let item = self.items.get(item_index)?;
-        match item {
-            FlowItem::Text { style, text } => wrapped_lines(text, width)
-                .into_iter()
-                .nth(row_in_item)
-                .map(|line| Line::from(Span::styled(line, style.style()))),
-            FlowItem::Thinking(text) => {
-                if self.thinking_collapsed {
-                    return (row_in_item == 0)
-                        .then(|| Line::from(Span::styled("▸ thinking", NoteStyle::Dim.style())));
-                }
-                if row_in_item == 0 {
-                    return Some(Line::from(Span::styled(
-                        "▾ thinking",
-                        NoteStyle::Accent.style(),
-                    )));
-                }
+        item_rows(item, width, self.thinking_collapsed, spinner)
+            .get(row_in_item)
+            .cloned()
+    }
+}
+
+/// 物化一条会话流条目为全部可视行；行数是渲染与计数共享的单一来源，
+/// 避免行数计算与逐行渲染各自推导而失同步。
+fn item_rows(
+    item: &FlowItem,
+    width: usize,
+    thinking_collapsed: bool,
+    spinner: char,
+) -> Vec<Line<'static>> {
+    match item {
+        FlowItem::Text { style, text } => wrapped_lines(text, width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, style.style())))
+            .collect(),
+        FlowItem::Thinking(text) => {
+            if thinking_collapsed {
+                return vec![Line::from(Span::styled(
+                    "▸ thinking",
+                    NoteStyle::Dim.style(),
+                ))];
+            }
+            let mut rows = vec![Line::from(Span::styled(
+                "▾ thinking",
+                NoteStyle::Accent.style(),
+            ))];
+            rows.extend(
                 wrapped_lines(text, width.saturating_sub(2))
                     .into_iter()
-                    .nth(row_in_item - 1)
                     .map(|line| {
                         Line::from(Span::styled(format!("│ {line}"), NoteStyle::Dim.style()))
-                    })
-            }
-            FlowItem::Tool(tool) => {
-                let header_rows = wrapped_lines(&tool.header(), width.saturating_sub(2));
-                let header_len = header_rows.len().max(1);
-                if row_in_item < header_len {
-                    let marker = match &tool.state {
-                        ToolState::Running { .. } => spinner,
-                        ToolState::Done { is_error: true, .. } => '✖',
-                        ToolState::Done {
-                            is_error: false, ..
-                        } => '·',
-                    };
-                    let style = match &tool.state {
-                        ToolState::Running { .. } => NoteStyle::Accent.style(),
-                        ToolState::Done { is_error: true, .. } => NoteStyle::Error.style(),
-                        ToolState::Done {
-                            completed_at,
-                            is_error: false,
-                            ..
-                        } if completed_at.elapsed() < TOOL_COMPLETION_FLASH => {
-                            NoteStyle::Accent.style().add_modifier(Modifier::BOLD)
-                        }
-                        ToolState::Done {
-                            is_error: false, ..
-                        } => NoteStyle::Dim.style(),
-                    };
-                    return Some(Line::from(Span::styled(
-                        format!("{marker} {}", header_rows[row_in_item]),
-                        style,
-                    )));
+                    }),
+            );
+            rows
+        }
+        FlowItem::Tool(tool) => {
+            let marker = match &tool.state {
+                ToolState::Running { .. } => spinner,
+                ToolState::Done { is_error: true, .. } => '✖',
+                ToolState::Done {
+                    is_error: false, ..
+                } => '·',
+            };
+            let style = match &tool.state {
+                ToolState::Running { .. } => NoteStyle::Accent.style(),
+                ToolState::Done { is_error: true, .. } => NoteStyle::Error.style(),
+                ToolState::Done {
+                    completed_at,
+                    is_error: false,
+                    ..
+                } if completed_at.elapsed() < TOOL_COMPLETION_FLASH => {
+                    NoteStyle::Accent.style().add_modifier(Modifier::BOLD)
                 }
-                let row = row_in_item - header_len;
-                match &tool.state {
-                    ToolState::Running { last_output } => {
-                        if last_output.trim().is_empty() {
-                            return None;
-                        }
-                        let preview = bounded_preview(last_output);
-                        preview.into_iter().nth(row).map(|line| {
-                            Line::from(Span::styled(format!("│ {line}"), NoteStyle::Dim.style()))
-                        })
+                ToolState::Done {
+                    is_error: false, ..
+                } => NoteStyle::Dim.style(),
+            };
+            let mut rows: Vec<Line<'static>> = wrapped_lines(&tool.header(), width.saturating_sub(2))
+                .into_iter()
+                .map(|line| {
+                    Line::from(Span::styled(format!("{marker} {line}"), style))
+                })
+                .collect();
+            match &tool.state {
+                ToolState::Running { last_output } => {
+                    if !last_output.trim().is_empty() {
+                        rows.extend(bounded_preview(last_output).into_iter().map(|line| {
+                            Line::from(Span::styled(
+                                format!("│ {line}"),
+                                NoteStyle::Dim.style(),
+                            ))
+                        }));
                     }
-                    ToolState::Done {
-                        output,
-                        is_error,
-                        display,
-                        ..
-                    } => {
-                        if *display == ToolDisplay::Collapsed {
-                            return None;
-                        }
-                        let total_nonempty =
-                            output.lines().filter(|l| !l.trim().is_empty()).count();
-                        let visible: Vec<&str> = if *display == ToolDisplay::Full {
-                            output
-                                .lines()
-                                .filter(|line| !line.trim().is_empty())
-                                .take(TOOL_RESULT_EXPANDED_LINES)
-                                .collect()
+                }
+                ToolState::Done {
+                    output,
+                    is_error,
+                    display,
+                    ..
+                } => {
+                    if *display == ToolDisplay::Collapsed {
+                        return rows;
+                    }
+                    let total_nonempty =
+                        output.lines().filter(|l| !l.trim().is_empty()).count();
+                    let visible: Vec<&str> = if *display == ToolDisplay::Full {
+                        output
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .take(TOOL_RESULT_EXPANDED_LINES)
+                            .collect()
+                    } else {
+                        bounded_preview(output)
+                    };
+                    let result_style = if *is_error {
+                        NoteStyle::Error.style()
+                    } else {
+                        NoteStyle::Dim.style()
+                    };
+                    rows.extend(visible.iter().copied().map(|line| {
+                        Line::from(Span::styled(format!("│ {line}"), result_style))
+                    }));
+                    if total_nonempty > visible.len() {
+                        let action = if *display == ToolDisplay::Full {
+                            "collapse"
                         } else {
-                            bounded_preview(output)
+                            "expand"
                         };
-                        if row < visible.len() {
-                            let style = if *is_error {
-                                NoteStyle::Error.style()
-                            } else {
-                                NoteStyle::Dim.style()
-                            };
-                            Some(Line::from(Span::styled(
-                                format!("│ {}", visible[row]),
-                                style,
-                            )))
-                        } else if row == visible.len() {
-                            if *display == ToolDisplay::Full && total_nonempty > visible.len() {
-                                Some(Line::from(Span::styled(
-                                    format!(
-                                        "│ … {} more lines (Ctrl+O collapse)",
-                                        total_nonempty - visible.len()
-                                    ),
-                                    NoteStyle::Dim.style(),
-                                )))
-                            } else if *display == ToolDisplay::Truncated
-                                && total_nonempty > visible.len()
-                            {
-                                Some(Line::from(Span::styled(
-                                    format!(
-                                        "│ … {} more lines (Ctrl+O expand)",
-                                        total_nonempty - visible.len()
-                                    ),
-                                    NoteStyle::Dim.style(),
-                                )))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                        rows.push(Line::from(Span::styled(
+                            format!(
+                                "│ … {} more lines (Ctrl+O {action})",
+                                total_nonempty - visible.len()
+                            ),
+                            NoteStyle::Dim.style(),
+                        )));
                     }
                 }
             }
+            rows
         }
     }
 }
@@ -415,53 +421,6 @@ fn bounded_preview(output: &str) -> Vec<&str> {
         .filter(|line| !line.trim().is_empty())
         .take(TOOL_RESULT_PREVIEW_LINES)
         .collect()
-}
-
-fn item_row_count(item: &FlowItem, width: usize, thinking_collapsed: bool) -> usize {
-    match item {
-        FlowItem::Text { text, .. } => wrapped_lines(text, width).len().max(1),
-        FlowItem::Thinking(text) => {
-            if thinking_collapsed {
-                1
-            } else {
-                1 + wrapped_lines(text, width.saturating_sub(2)).len().max(1)
-            }
-        }
-        FlowItem::Tool(tool) => {
-            let mut rows = wrapped_lines(&tool.header(), width.saturating_sub(2))
-                .len()
-                .max(1);
-            match &tool.state {
-                ToolState::Running { last_output } => {
-                    if !last_output.trim().is_empty() {
-                        rows += TOOL_RESULT_PREVIEW_LINES;
-                    }
-                }
-                ToolState::Done {
-                    output, display, ..
-                } => {
-                    if *display == ToolDisplay::Collapsed {
-                        return rows;
-                    }
-                    let total_nonempty = output.lines().filter(|l| !l.trim().is_empty()).count();
-                    if *display == ToolDisplay::Full {
-                        let visible = total_nonempty.min(TOOL_RESULT_EXPANDED_LINES);
-                        rows += visible;
-                        if total_nonempty > visible {
-                            rows += 1;
-                        }
-                    } else {
-                        let preview = total_nonempty.min(TOOL_RESULT_PREVIEW_LINES);
-                        rows += preview;
-                        if total_nonempty > TOOL_RESULT_PREVIEW_LINES {
-                            rows += 1;
-                        }
-                    }
-                }
-            }
-            rows
-        }
-    }
 }
 
 /// 贪心折行：按显示宽度断行，显式 `\n` 强制换行；空文本产出一空行。

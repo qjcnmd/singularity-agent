@@ -192,16 +192,20 @@ impl Editor {
         let width = width.max(1) as usize;
         let mut visual_row = 0usize;
         for (index, line) in self.lines.iter().enumerate() {
-            let rows = wrap_with_positions(line, width);
+            let offsets = super::wrap_offsets(line, width);
             if index == self.row {
                 let target_char = self.col;
-                // 找到目标字符所在的折行与列。
                 let mut consumed = 0usize;
-                for (row_index, (_, char_start)) in rows.iter().enumerate() {
-                    let row_chars = chars_in_row(line, *char_start, width);
-                    if target_char < consumed + row_chars || row_index + 1 == rows.len() {
+                for (row_index, &char_start) in offsets.iter().enumerate() {
+                    let row_chars = offsets
+                        .get(row_index + 1)
+                        .copied()
+                        .unwrap_or(line.chars().count())
+                        - char_start;
+                    if target_char < consumed + row_chars || row_index + 1 == offsets.len() {
                         let within = target_char.saturating_sub(consumed);
-                        let prefix: String = line.chars().skip(*char_start).take(within).collect();
+                        let prefix: String =
+                            line.chars().skip(char_start).take(within).collect();
                         return (
                             visual_row + row_index,
                             UnicodeWidthStr::width(prefix.as_str()),
@@ -211,7 +215,7 @@ impl Editor {
                 }
                 return (visual_row, 0);
             }
-            visual_row += rows.len();
+            visual_row += offsets.len();
         }
         (visual_row, 0)
     }
@@ -223,7 +227,7 @@ impl Editor {
         let width = width.max(1) as usize;
         let mut visual_row = 0usize;
         for (logical_row, line) in self.lines.iter().enumerate() {
-            for (_, char_start) in wrap_with_positions(line, width) {
+            for char_start in super::wrap_offsets(line, width) {
                 if visual_row == target_row {
                     let mut used = 0usize;
                     let mut chars = 0usize;
@@ -252,41 +256,6 @@ fn char_to_byte(line: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(byte, _)| byte)
         .unwrap_or(line.len())
-}
-
-/// 折一行并记录每折行的起始字符偏移。
-fn wrap_with_positions(line: &str, width: usize) -> Vec<(String, usize)> {
-    let mut rows: Vec<(String, usize)> = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    let mut start_char = 0usize;
-    for (index, ch) in line.chars().enumerate() {
-        let w = UnicodeWidthStr::width(ch.to_string().as_str());
-        if current_width + w > width && !current.is_empty() {
-            rows.push((std::mem::take(&mut current), start_char));
-            start_char = index;
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width += w;
-    }
-    rows.push((current, start_char));
-    rows
-}
-
-/// 从 `start_char` 起最多填满一行的字符数。
-fn chars_in_row(line: &str, start_char: usize, width: usize) -> usize {
-    let mut count = 0usize;
-    let mut used = 0usize;
-    for ch in line.chars().skip(start_char) {
-        let w = UnicodeWidthStr::width(ch.to_string().as_str());
-        if used + w > width {
-            break;
-        }
-        used += w;
-        count += 1;
-    }
-    count
 }
 
 #[cfg(test)]

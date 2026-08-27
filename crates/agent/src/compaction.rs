@@ -27,9 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
-use crate::session::{
-    CompactionEntry, SessionEntry, SessionEntryType, SessionError, SessionManager,
-};
+use crate::session::{CompactionEntry, SessionEntry, SessionError, SessionManager};
 
 /// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
 /// `context_window - reserve_tokens` 时触发压缩。
@@ -397,17 +395,17 @@ impl CompactionEngine {
             return Ok(CompactionOutcome::NotNeeded);
         }
         // 若最新条目已是压缩节点，则说明尚无新的未压缩内容。
-        if session.entries().last().map(|entry| entry.id.as_str()) == Some(entries[0].id.as_str())
-            && matches!(entries[0].entry_type, SessionEntryType::Compaction(_))
+        if session.entries().last().map(|entry| entry.id()) == Some(entries[0].id())
+            && matches!(entries[0], SessionEntry::Compaction { .. })
         {
             return Ok(CompactionOutcome::NotNeeded);
         }
         // 二次压缩起点：定位前次压缩节点记录的 first_kept_entry_id。
-        let boundary_start = match &entries[0].entry_type {
-            SessionEntryType::Compaction(comp) => match &comp.first_kept_entry_id {
+        let boundary_start = match &entries[0] {
+            SessionEntry::Compaction { compaction, .. } => match &compaction.first_kept_entry_id {
                 Some(first_kept) => entries
                     .iter()
-                    .position(|entry| entry.id == *first_kept)
+                    .position(|entry| entry.id() == first_kept)
                     .unwrap_or(1),
                 None => 1,
             },
@@ -447,19 +445,20 @@ impl CompactionEngine {
         if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        let first_kept_entry_id = entries[cut.first_kept_entry_index()].id.clone();
+        let first_kept_entry_id = entries[cut.first_kept_entry_index()].id().to_string();
         // 从被压缩消息和上一代摘要的 details 中累积文件读取与修改清单。
         let mut file_ops = FileOps::default();
-        let previous_text = match &entries[0].entry_type {
-            SessionEntryType::Compaction(comp) => {
-                let (read_files, modified_files) = file_lists_from_details(comp.details.as_ref());
+        let previous_text = match &entries[0] {
+            SessionEntry::Compaction { compaction, .. } => {
+                let (read_files, modified_files) =
+                    file_lists_from_details(compaction.details.as_ref());
                 for file in read_files {
                     file_ops.read.insert(file);
                 }
                 for file in modified_files {
                     file_ops.edited.insert(file);
                 }
-                Some(comp.summary.clone())
+                Some(compaction.summary.clone())
             }
             _ => None,
         };
@@ -563,9 +562,9 @@ impl CompactionEngine {
         }
         // 向前回溯吸收不影响会话语义的相邻元数据条目。
         while cut_index > start_index {
-            let previous = &entries[cut_index - 1].entry_type;
-            if matches!(previous, SessionEntryType::Compaction(_))
-                || matches!(previous, SessionEntryType::Message(_))
+            let previous = &entries[cut_index - 1];
+            if matches!(previous, SessionEntry::Compaction { .. })
+                || matches!(previous, SessionEntry::Message { .. })
             {
                 break;
             }
@@ -688,17 +687,17 @@ fn estimate_tokens_of(text: &str) -> u64 {
 
 /// 估算单条会话条目贡献的 Token 数量。
 fn entry_token_estimate(entry: &SessionEntry) -> u64 {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => estimate_tokens_of(&message.content_text()),
-        SessionEntryType::Compaction(compaction) => estimate_tokens_of(&compaction.summary),
+    match entry {
+        SessionEntry::Message { message, .. } => estimate_tokens_of(&message.content_text()),
+        SessionEntry::Compaction { compaction, .. } => estimate_tokens_of(&compaction.summary),
         _ => 0,
     }
 }
 
 /// 判断某条目是否为合法的压缩切点（除 ToolResult 之外的消息均可作为切点）。
 fn is_cut_point_entry(entry: &SessionEntry) -> bool {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => {
+    match entry {
+        SessionEntry::Message { message, .. } => {
             !matches!(message.role(), AgentMessageRole::ToolResult)
         }
         _ => false,
@@ -707,8 +706,8 @@ fn is_cut_point_entry(entry: &SessionEntry) -> bool {
 
 /// 判断某条目是否为新轮次的起始（User 角色消息）。
 fn is_turn_start_entry(entry: &SessionEntry) -> bool {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => matches!(message.role(), AgentMessageRole::User),
+    match entry {
+        SessionEntry::Message { message, .. } => matches!(message.role(), AgentMessageRole::User),
         _ => false,
     }
 }
@@ -726,8 +725,8 @@ fn find_turn_start_index(
 
 /// 从会话条目中提取消息引用（若非消息类型则返回 None）。
 fn message_from_entry(entry: &SessionEntry) -> Option<&AgentMessage> {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => Some(message),
+    match entry {
+        SessionEntry::Message { message, .. } => Some(message),
         _ => None,
     }
 }

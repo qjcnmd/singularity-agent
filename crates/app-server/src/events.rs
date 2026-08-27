@@ -8,15 +8,15 @@
 use super::*;
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{SessionEntry, SessionEntryType, SessionMetadata, SessionMetadataKind},
+    session::{SessionEntry, SessionMetadata, SessionMetadataKind},
 };
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
 /// 或其 `provider_reasoning_replay`、parent/tree、迁移字段。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
-    match &entry.entry_type {
-        SessionEntryType::Message(message) => match message.role() {
+    match entry {
+        SessionEntry::Message { message, id, .. } => match message.role() {
             AgentMessageRole::User | AgentMessageRole::Assistant => {
                 let role = if matches!(message.role(), AgentMessageRole::User) {
                     "user"
@@ -30,7 +30,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             items.push(HistoryItem::Message {
-                                id: format!("{}:text:{text_index}", entry.id),
+                                id: format!("{id}:text:{text_index}"),
                                 role: role.to_string(),
                                 text: text.clone(),
                             });
@@ -38,14 +38,14 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                         }
                         ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                             items.push(HistoryItem::Thinking {
-                                id: format!("{}:thinking:{thinking_index}", entry.id),
+                                id: format!("{id}:thinking:{thinking_index}"),
                                 text: thinking.clone(),
                             });
                             thinking_index += 1;
                         }
-                        ContentBlock::ToolCall { id, name, args } => {
+                        ContentBlock::ToolCall { id: call_id, name, args } => {
                             items.push(HistoryItem::ToolCall {
-                                id: id.clone(),
+                                id: call_id.clone(),
                                 name: name.clone(),
                                 args: args.clone(),
                             });
@@ -59,16 +59,16 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 id: message
                     .tool_call_id()
                     .cloned()
-                    .unwrap_or_else(|| entry.id.clone()),
+                    .unwrap_or_else(|| id.clone()),
                 output: message.content_text(),
                 is_error: message.is_error().unwrap_or(false),
             }],
         },
-        SessionEntryType::Compaction(compaction) => vec![HistoryItem::Compaction {
-            id: entry.id.clone(),
+        SessionEntry::Compaction { compaction, id, .. } => vec![HistoryItem::Compaction {
+            id: id.clone(),
             summary: compaction.summary.clone(),
         }],
-        SessionEntryType::Metadata(metadata) => match metadata {
+        SessionEntry::Metadata { metadata, id, .. } => match metadata {
             SessionMetadata::TurnStarted { turn_id } => vec![HistoryItem::Turn {
                 id: turn_id.clone(),
                 status: TurnStatus::Running,
@@ -84,14 +84,14 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 model,
                 reasoning,
             } => vec![HistoryItem::Settings {
-                id: entry.id.clone(),
+                id: id.clone(),
                 provider: provider.clone(),
                 model: Some(model.clone()),
                 reasoning: reasoning.clone(),
             }],
             SessionMetadata::ThreadName { .. } => Vec::new(),
             SessionMetadata::Usage { usage, .. } => vec![HistoryItem::Usage {
-                id: entry.id.clone(),
+                id: id.clone(),
                 usage: usage.clone(),
             }],
         },
@@ -131,8 +131,8 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
 
     let mut turns: Vec<ThreadTurn> = Vec::new();
     for entry in entries {
-        match &entry.entry_type {
-            SessionEntryType::Metadata(metadata) => match metadata.kind() {
+        match entry {
+            SessionEntry::Metadata { metadata, .. } => match metadata.kind() {
                 SessionMetadataKind::TurnStarted => turns.push(ThreadTurn {
                     turn_id: metadata.turn_id().map(str::to_string),
                     status: None,

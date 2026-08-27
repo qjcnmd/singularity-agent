@@ -15,7 +15,7 @@ pub mod repository;
 
 pub use file::now_iso;
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionEntryType, SessionError,
+    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError,
     SessionMetadata, SessionMetadataKind,
 };
 pub use manager::SessionManager;
@@ -91,7 +91,7 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
         })
         .or_else(|| {
             session.entries().iter().find_map(|entry| {
-                let SessionEntryType::Message(message) = &entry.entry_type else {
+                let SessionEntry::Message { message, .. } = entry else {
                     return None;
                 };
                 if message.role() != AgentMessageRole::User {
@@ -125,7 +125,11 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
     let updated_at = session
         .entries()
         .last()
-        .and_then(|entry| entry.timestamp.clone())
+        .and_then(|entry| match entry {
+            SessionEntry::Message { timestamp, .. }
+            | SessionEntry::Compaction { timestamp, .. }
+            | SessionEntry::Metadata { timestamp, .. } => timestamp.clone(),
+        })
         .unwrap_or_else(|| created_at.clone());
     SessionProjection {
         session_id: session.session_id().to_string(),

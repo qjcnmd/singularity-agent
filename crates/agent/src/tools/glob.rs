@@ -87,8 +87,8 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
 
 fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> Result<ToolExecution, ToolError> {
     let path = args.path.as_deref().unwrap_or(".");
-    if ctx.signal.is_some_and(|signal| signal.is_cancelled()) {
-        return error_result("Operation aborted");
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return Ok(aborted);
     }
     let root = resolve_path(ctx.cwd, path);
     if !root.is_dir() {

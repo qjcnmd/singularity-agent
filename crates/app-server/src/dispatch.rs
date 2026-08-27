@@ -205,8 +205,6 @@ impl AppServer {
                 return Err(AppServerError::Store(error));
             }
         };
-        let changed =
-            params.provider.is_some() || params.model.is_some() || !params.reasoning.is_keep();
         let patch = singularity_runtime::SettingsPatch {
             provider: params.provider,
             model: params.model,
@@ -222,51 +220,34 @@ impl AppServer {
                 }
             },
         };
-        // 组合与校验与协调器共用同一实现：以 JSONL selector 为基线合并
-        // patch；空白/缺失段由协调器的提交点校验统一拒绝。
-        let selector =
-            singularity_runtime::compose_merged_selector(record.model.as_deref(), &patch);
-        self.validate_model_selector(Some(&selector))?;
-        let parts = singularity_model::split_model_selector(&selector);
-        let provider = parts
-            .provider
-            .map(str::to_string)
-            .unwrap_or_else(|| singularity_model::DEFAULT_PROVIDER_NAME.to_string());
-        let model = parts.model.map(str::to_string);
-        let reasoning = parts.effort.map(str::to_string);
-        let mut queued = false;
-        if changed {
-            let conversation = self.conversation_for(&record.thread_id)?;
-            let timing = match conversation.queue_settings(patch) {
-                Ok(timing) => timing,
-                Err(error) => {
-                    let message = match error {
-                        singularity_runtime::ConversationError::Configuration(message)
-                        | singularity_runtime::ConversationError::State(message) => {
-                            format!("invalid model selector: {message}")
-                        }
-                        other => other.to_string(),
-                    };
-                    return Err(AppServerError::InvalidParams(message));
-                }
-            };
-            match timing {
-                singularity_runtime::SettingsApplyTiming::AppliedNow => {}
-                singularity_runtime::SettingsApplyTiming::QueuedForNextTurn => {
-                    queued = true;
-                }
-                singularity_runtime::SettingsApplyTiming::NothingToApply => {}
+        // queue_settings 在提交点完成校验、组合与持久化，返回合并后的完整
+        // selector。客户端只做投影，不反推 provider/model/reasoning。
+        let conversation = self.conversation_for(&record.thread_id)?;
+        let result = match conversation.queue_settings(patch) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = match error {
+                    singularity_runtime::ConversationError::Configuration(message)
+                    | singularity_runtime::ConversationError::State(message) => {
+                        format!("invalid model selector: {message}")
+                    }
+                    other => other.to_string(),
+                };
+                return Err(AppServerError::InvalidParams(message));
             }
-        }
+        };
+        let parts = singularity_model::split_model_selector(&result.selector);
         json_response(
             message.required_id(),
             ThreadSettingsResult {
                 thread_id: record.thread_id,
-                provider: Some(provider),
-                model,
-                reasoning,
-                updated: changed,
-                queued,
+                provider: parts.provider.map(str::to_string),
+                model: parts.model.map(str::to_string),
+                reasoning: parts.effort.map(str::to_string),
+                updated: result.timing
+                    != singularity_runtime::SettingsApplyTiming::NothingToApply,
+                queued: result.timing
+                    == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn,
             },
         )
     }

@@ -47,23 +47,35 @@ pub(crate) fn char_display_width(ch: char) -> usize {
     UnicodeWidthStr::width(ch.to_string().as_str())
 }
 
+/// 单个逻辑行按显示宽度贪心折行后，每折行在其字符序列中的起始偏移。
+///
+/// transcript 行物化与 editor 光标映射共享的折行核心：偏移即折行事实，
+/// 需要行的文本时按偏移切片，需要行内字符数时取相邻偏移差。
+pub(crate) fn wrap_offsets(line: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut offsets = vec![0usize];
+    let mut current_width = 0usize;
+    for (index, ch) in line.chars().enumerate() {
+        let ch_width = char_display_width(ch);
+        if current_width + ch_width > width && index > *offsets.last().expect("non-empty") {
+            offsets.push(index);
+            current_width = 0;
+        }
+        current_width += ch_width;
+    }
+    offsets
+}
+
 /// transcript 与 editor 渲染共享的贪心显示宽度换行。
 pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
     let mut lines = Vec::new();
     for logical in text.split('\n') {
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        for ch in logical.chars() {
-            let ch_width = char_display_width(ch);
-            if current_width + ch_width > width && !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += ch_width;
+        let offsets = wrap_offsets(logical, width);
+        let char_count = logical.chars().count();
+        for (index, &start) in offsets.iter().enumerate() {
+            let end = offsets.get(index + 1).copied().unwrap_or(char_count);
+            lines.push(logical.chars().skip(start).take(end - start).collect());
         }
-        lines.push(current);
     }
     if lines.is_empty() {
         lines.push(String::new());

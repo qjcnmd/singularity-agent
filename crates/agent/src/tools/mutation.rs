@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use super::path::normalize_lexically;
+
 /// 进程内文件变更登记。`None` 表示可读工具不参与队列（只读工具无副作用）。
 #[derive(Debug, Default)]
 pub struct FileMutationQueue {
@@ -48,33 +50,8 @@ impl FileMutationQueue {
 pub(crate) fn canonical_key(path: &Path) -> PathBuf {
     match std::fs::canonicalize(path) {
         Ok(canonical) => canonical,
-        Err(_) => {
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(path))
-                    .unwrap_or_else(|_| path.to_path_buf())
-            };
-            normalize_lexically(&absolute)
-        }
+        Err(_) => normalize_lexically(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())),
     }
-}
-
-/// 词法规范化绝对路径（解析 `.`/`..`），不触碰文件系统。
-fn normalize_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
 }
 
 #[cfg(test)]

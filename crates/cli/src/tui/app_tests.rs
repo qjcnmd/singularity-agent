@@ -450,6 +450,11 @@ fn compact_command_arms_state_and_returns_the_async_action() {
         Action::Continue,
         "submission is blocked while compacting"
     );
+    assert_eq!(
+        app.editor.text(),
+        "hello",
+        "draft must be preserved when submission is blocked"
+    );
 
     // Esc 取消：令牌被取消，状态保持到 on_compact_finished 统一收尾。
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));

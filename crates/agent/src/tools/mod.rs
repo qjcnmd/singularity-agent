@@ -10,6 +10,7 @@ pub mod glob;
 pub mod grep;
 mod line;
 pub mod mutation;
+mod path;
 pub mod read;
 pub mod registry;
 pub mod write;

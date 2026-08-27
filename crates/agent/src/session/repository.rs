@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::format::{Result, SessionEntry, SessionEntryType, SessionError};
+use super::format::{Result, SessionEntry, SessionError};
 use super::manager::SessionManager;
 
 /// 一次会话读取的结果：最近一次 compaction 摘要 + 完整 leaf 条目序列。
@@ -50,8 +50,8 @@ impl SessionManager {
         self.entries
             .iter()
             .rev()
-            .find_map(|entry| match &entry.entry_type {
-                SessionEntryType::Compaction(entry) => Some(entry.summary.clone()),
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
                 _ => None,
             })
     }

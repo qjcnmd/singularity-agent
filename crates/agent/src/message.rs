@@ -165,11 +165,10 @@ impl AgentMessage {
     }
 
     /// 获取消息包含的所有工具调用块引用。
-    pub fn tool_calls(&self) -> Vec<&ContentBlock> {
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ContentBlock> {
         self.content()
             .iter()
             .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
-            .collect()
     }
 
     /// 判断消息是否包含至少一个工具调用块。

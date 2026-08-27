@@ -143,12 +143,11 @@ impl TurnEventSink for TurnProjection<'_> {
                     &error.message,
                 ));
             }
-            TurnEvent::ThreadStarted { thread } => {
-                self.emit_notification(AppEvent::thread_started(&crate::wire::thread_from_object(
-                    &thread,
-                )));
+            TurnEvent::ThreadSettingsApplied { thread } => {
+                self.emit_notification(AppEvent::thread_settings_applied(
+                    &crate::wire::thread_from_object(&thread),
+                ));
             }
-            TurnEvent::ThreadSettingsApplied { .. } => {}
             TurnEvent::ItemStarted {
                 thread_id,
                 turn_id,

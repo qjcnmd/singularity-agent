@@ -12,11 +12,10 @@ use crate::message::AgentMessage;
 
 use super::file::{
     AppendLimits, DEFAULT_APPEND_LIMITS, SessionFileState, TailRepair, generate_id,
-    normalize_abs_path, normalize_cwd_string, now_iso, parse_session_lines, rewrite_file,
-    validate_append_limits,
+    normalize_cwd_string, now_iso, parse_session_lines, rewrite_file, validate_append_limits,
 };
 use super::format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionEntryType, SessionError,
+    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError,
     SessionMetadata, validate_entries, validate_header,
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
@@ -153,7 +152,7 @@ impl SessionManager {
             }
         }
         let cwd = header_cwd
-            .map(|cwd| normalize_abs_path(Path::new(&cwd)))
+            .map(|cwd| std::path::absolute(Path::new(&cwd)))
             .transpose()?
             .unwrap_or(std::env::current_dir()?);
         let file_state = SessionFileState::capture(&file)?;
@@ -182,7 +181,7 @@ impl SessionManager {
         session_id: String,
         timestamp: String,
     ) -> Result<Self> {
-        let cwd = normalize_abs_path(cwd)?;
+        let cwd = std::path::absolute(cwd)?;
         std::fs::create_dir_all(sessions_dir)?;
         // 锁先于文件：会话文件一旦出现就受单写者保护。
         let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
@@ -212,35 +211,42 @@ impl SessionManager {
 
     /// 追加消息为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
-        self.append_entry(SessionEntryType::Message(message))
+        self.append_entry(SessionEntry::Message {
+            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            timestamp: Some(now_iso()),
+            message,
+        })
     }
 
     /// 追加 compaction 条目为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
     pub fn append_compaction(&mut self, entry: CompactionEntry) -> Result<String> {
-        self.append_entry(SessionEntryType::Compaction(entry))
+        self.append_entry(SessionEntry::Compaction {
+            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            timestamp: Some(now_iso()),
+            compaction: entry,
+        })
     }
 
     /// 追加不进入模型上下文的 metadata。
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         let metadata = metadata.validate()?;
-        self.append_entry(SessionEntryType::Metadata(metadata))
+        self.append_entry(SessionEntry::Metadata {
+            id: generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate)),
+            timestamp: Some(now_iso()),
+            metadata,
+        })
     }
 
-    pub(super) fn append_entry(&mut self, entry_type: SessionEntryType) -> Result<String> {
-        self.append_entry_with_limits(entry_type, DEFAULT_APPEND_LIMITS)
+    pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
+        self.append_entry_with_limits(entry, DEFAULT_APPEND_LIMITS)
     }
 
     pub(super) fn append_entry_with_limits(
         &mut self,
-        entry_type: SessionEntryType,
+        entry: SessionEntry,
         limits: AppendLimits,
     ) -> Result<String> {
-        let id = generate_id(|candidate| self.entries.iter().any(|entry| entry.id == candidate));
-        let entry = SessionEntry {
-            id: id.clone(),
-            timestamp: Some(now_iso()),
-            entry_type,
-        };
+        let id = entry.id().to_string();
         let serialized = serde_json::to_string(&entry)?;
         // 单写者语义：内存 entries 与 file_state 是唯一权威，append 前无需再
         // 读盘核对；limits 直接基于内存态的长度/条数判定。
