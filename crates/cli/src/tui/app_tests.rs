@@ -81,6 +81,7 @@ fn test_conversation(
         sessions,
         std::env::current_dir().unwrap().to_str().unwrap(),
         Some("openai_compatible/base-model".to_string()),
+        runner.coordinator(),
     )
     .expect("create thread");
     Conversation::new(runner, thread)

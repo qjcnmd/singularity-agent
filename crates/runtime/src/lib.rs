@@ -46,9 +46,9 @@ pub use singularity_model::{
     ModelSelectorParts, Provider, ProviderConfigSnapshot, split_model_selector,
 };
 pub use store::{
-    ResumeError, ThreadReadPage, ThreadSummary, canonical_thread_cwd, create_thread, delete_thread,
-    list_threads, paged_read, read_thread_summary, rename_thread, resume_thread,
-    thread_session_path,
+    ResumeError, ThreadLockCoordinator, ThreadReadPage, ThreadSummary, canonical_thread_cwd,
+    create_thread, delete_thread, list_threads, paged_read, read_thread_summary, rename_thread,
+    resume_thread, thread_session_path,
 };
 
 /// 测试支撑面：供依赖 crate 的集成测试构造会话、注入 provider 与复用核心

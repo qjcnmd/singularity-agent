@@ -341,8 +341,13 @@ impl Conversation {
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
-        crate::store::rename_thread(self.runner.sessions_dir(), &state.thread.thread_id, name)
-            .map_err(ConversationError::Configuration)
+        crate::store::rename_thread(
+            self.runner.sessions_dir(),
+            &state.thread.thread_id,
+            name,
+            self.runner.coordinator(),
+        )
+        .map_err(ConversationError::Configuration)
     }
 
     /// 列出可恢复的 Thread 摘要（会话列表数据源）。
@@ -352,12 +357,21 @@ impl Conversation {
 
     /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。失败时状态不变。
     pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, crate::store::ResumeError> {
-        crate::store::resume_thread(self.runner.sessions_dir(), thread_id)
+        crate::store::resume_thread(
+            self.runner.sessions_dir(),
+            thread_id,
+            self.runner.coordinator(),
+        )
     }
 
     /// 创建新 Thread（uuid v7 会话文件，属主权限）。
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, String> {
-        crate::store::create_thread(self.runner.sessions_dir(), cwd, model)
+        crate::store::create_thread(
+            self.runner.sessions_dir(),
+            cwd,
+            model,
+            self.runner.coordinator(),
+        )
     }
 
     /// 中断当前活动 turn；无活动 turn 时为 no-op。已接受的 followUp 不受
@@ -577,7 +591,8 @@ impl Conversation {
             crate::store::thread_session_path(self.runner.sessions_dir(), &state.thread.thread_id);
         let write_result = (|| -> Result<(), String> {
             let mut session =
-                SessionManager::open_existing(&path).map_err(|error| error.to_string())?;
+                SessionManager::open_existing_with_coordinator(&path, self.runner.coordinator())
+                    .map_err(|error| error.to_string())?;
             let parts = split_model_selector(&selector);
             let metadata = singularity_agent::session::SessionMetadata::thread_settings(
                 parts

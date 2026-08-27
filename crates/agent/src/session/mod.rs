@@ -18,6 +18,7 @@ pub use format::{
     SessionMetadataKind, TurnTerminalStatus,
 };
 pub use manager::SessionManager;
+pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// runtime 与 app-server 投影共享的 JSONL 派生事实。
 #[derive(Debug, Clone, PartialEq)]

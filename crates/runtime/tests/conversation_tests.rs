@@ -9,14 +9,14 @@ use std::sync::mpsc;
 use crate::events::TurnEvent;
 use crate::objects::{ThreadStatus, TurnStatus};
 use crate::runner::{TurnOutcome, TurnRunner};
-use crate::store::{create_thread, resume_thread};
+use crate::store::{ThreadLockCoordinator, create_thread, resume_thread};
 use crate::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
     TurnRunError, compose_merged_selector,
 };
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{
-    SessionManager, SessionMetadata, SessionMetadataKind, project_session,
+    SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator, project_session,
 };
 use singularity_model::{
     ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
@@ -27,6 +27,11 @@ fn temp_sessions() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("temp home");
     std::fs::create_dir_all(dir.path().join("sessions")).expect("sessions dir");
     dir
+}
+
+/// 每个测试独立临时目录，各自构造进程级协调器即可。
+fn coordinator(sessions: &Path) -> ThreadLockCoordinator {
+    Arc::new(WriterLockCoordinator::new(sessions))
 }
 
 fn snapshot() -> singularity_model::ProviderConfigSnapshot {
@@ -327,6 +332,7 @@ fn new_conversation(
         sessions,
         std::env::current_dir().unwrap().to_str().unwrap(),
         model.map(str::to_string),
+        runner.coordinator(),
     )
     .expect("create thread");
     Conversation::new(runner, thread)
@@ -386,7 +392,8 @@ fn successful_turn_emits_lifecycle_events_and_final_text() {
     assert_eq!(methods.first().copied(), Some("turn/started"));
     assert_eq!(methods.last().copied(), Some("turn/completed"));
     // 终态 metadata 已落盘：resume 投影出 completed。
-    let resumed = resume_thread(&sessions, &outcome.thread_id).expect("resume");
+    let resumed =
+        resume_thread(&sessions, &outcome.thread_id, &coordinator(&sessions)).expect("resume");
     assert_eq!(resumed.last_turn_status, Some(ThreadStatus::Completed));
 }
 
@@ -424,7 +431,7 @@ fn provider_failure_converges_to_failed_turn_with_terminal_event() {
     let methods = log.lock().unwrap().clone();
     assert_eq!(methods.last().copied(), Some("turn/error"));
     let thread_id = conversation.thread().unwrap().thread_id;
-    let resumed = resume_thread(&sessions, &thread_id).expect("resume");
+    let resumed = resume_thread(&sessions, &thread_id, &coordinator(&sessions)).expect("resume");
     assert_eq!(resumed.last_turn_status, Some(ThreadStatus::Failed));
 }
 
@@ -528,7 +535,7 @@ fn interrupt_cancels_the_running_turn() {
         .expect("join")
         .expect("interrupted outcome");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
-    let resumed = resume_thread(&sessions, &thread_id)
+    let resumed = resume_thread(&sessions, &thread_id, &coordinator(&sessions))
         .expect("resume")
         .last_turn_status;
     assert_eq!(resumed, Some(ThreadStatus::Interrupted));
@@ -833,7 +840,8 @@ fn persisted_selector_keeps_reasoning_effort_across_resume() {
         .expect("append settings");
     drop(session);
 
-    let resumed = resume_thread(&sessions, thread_id).expect("resume thread");
+    let resumed =
+        resume_thread(&sessions, thread_id, &coordinator(&sessions)).expect("resume thread");
     assert_eq!(
         resumed.model.as_deref(),
         Some("openai_compatible/base-model#high"),
@@ -1382,7 +1390,7 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         .expect("create session file");
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
-    let conflict = match resume_thread(&sessions, thread_id) {
+    let conflict = match resume_thread(&sessions, thread_id, &coordinator(&sessions)) {
         Ok(_) => panic!("resume must conflict with an active writer"),
         Err(crate::store::ResumeError::Store(message)) => message,
         Err(other) => panic!("expected store conflict, got {other:?}"),
@@ -1394,6 +1402,7 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 
     // 写者释放后 resume 恢复正常。
     drop(session);
-    let resumed = resume_thread(&sessions, thread_id).expect("resume after release");
+    let resumed =
+        resume_thread(&sessions, thread_id, &coordinator(&sessions)).expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
 }

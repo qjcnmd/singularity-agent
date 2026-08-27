@@ -280,18 +280,21 @@ impl AppServer {
         if let Some(conversation) = guard.get(session_id).cloned() {
             return Ok(conversation);
         }
-        let thread =
-            singularity_runtime::store::resume_thread(self.turn_runner.sessions_dir(), session_id)
-                .map_err(|error| match &error {
-                    singularity_runtime::store::ResumeError::NotFound(_) => {
-                        AppServerError::Store(format!("thread {session_id} was not found"))
-                    }
-                    singularity_runtime::store::ResumeError::Store(message) => {
-                        AppServerError::Workspace(format!("failed to resume thread: {message}"))
-                    }
-                    // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
-                    other => AppServerError::Workspace(format!("failed to resume thread: {other}")),
-                })?;
+        let thread = singularity_runtime::store::resume_thread(
+            self.turn_runner.sessions_dir(),
+            session_id,
+            self.turn_runner.coordinator(),
+        )
+        .map_err(|error| match &error {
+            singularity_runtime::store::ResumeError::NotFound(_) => {
+                AppServerError::Store(format!("thread {session_id} was not found"))
+            }
+            singularity_runtime::store::ResumeError::Store(message) => {
+                AppServerError::Workspace(format!("failed to resume thread: {message}"))
+            }
+            // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
+            other => AppServerError::Workspace(format!("failed to resume thread: {other}")),
+        })?;
         let conversation = Conversation::new(Arc::clone(&self.turn_runner), thread);
         guard.insert(session_id.to_string(), Arc::clone(&conversation));
         Ok(conversation)

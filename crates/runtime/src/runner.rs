@@ -17,6 +17,7 @@ use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
 use singularity_agent::session::{
     SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
+    WriterLockCoordinator,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -59,15 +60,19 @@ pub struct TurnOutcome {
 pub struct TurnRunner {
     sessions_dir: PathBuf,
     provider_snapshot: ProviderConfigSnapshot,
+    /// 进程级写者锁协调器：所有会话打开路径共用，stale 清理每进程一次。
+    coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
 impl TurnRunner {
     pub fn new(sessions_dir: PathBuf, provider_snapshot: ProviderConfigSnapshot) -> Self {
+        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
         Self {
             sessions_dir,
             provider_snapshot,
+            coordinator,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
         }
@@ -82,6 +87,11 @@ impl TurnRunner {
 
     pub fn sessions_dir(&self) -> &std::path::Path {
         &self.sessions_dir
+    }
+
+    /// 进程内共享的写者锁协调器。
+    pub fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
+        &self.coordinator
     }
 
     /// 读取一个已落盘 turn 的思考块，供交互客户端按需展示。
@@ -380,7 +390,8 @@ impl TurnRunner {
 
     fn open_and_repair_session(&self, thread: &Thread) -> Result<SessionManager, RunnerError> {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let mut session = SessionManager::open_existing(&path).map_err(RunnerError::Session)?;
+        let mut session = SessionManager::open_existing_with_coordinator(&path, &self.coordinator)
+            .map_err(RunnerError::Session)?;
         if session.session_id() != thread.thread_id {
             return Err(RunnerError::Session(
                 // 头部 id 与请求不一致属于损坏状态。

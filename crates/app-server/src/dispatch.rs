@@ -273,6 +273,7 @@ impl AppServer {
             &self.sessions_dir,
             &cwd,
             model.clone(),
+            self.turn_runner.coordinator(),
         ) {
             Ok(thread) => thread,
             Err(error) => return Err(AppServerError::Store(error)),
@@ -388,7 +389,11 @@ impl AppServer {
         }
         // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在
         // 删除窗口内开始 append。
-        match singularity_runtime::store::delete_thread(&self.sessions_dir, &record.thread_id) {
+        match singularity_runtime::store::delete_thread(
+            &self.sessions_dir,
+            &record.thread_id,
+            self.turn_runner.coordinator(),
+        ) {
             Ok(()) => {}
             Err(singularity_runtime::store::ResumeError::WriterActive) => {
                 return invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE);

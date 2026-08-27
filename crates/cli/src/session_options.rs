@@ -71,8 +71,8 @@ fn prepare_inner(
     let default_selector = runner.default_model_selector();
 
     let thread = if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
-        let mut thread =
-            resume_thread(runner.sessions_dir(), session_id).map_err(|error| match error {
+        let mut thread = resume_thread(runner.sessions_dir(), session_id, runner.coordinator())
+            .map_err(|error| match error {
                 ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
                 ResumeError::Store(message) => {
                     format!("failed to resume thread {session_id}: {message}")
@@ -91,6 +91,7 @@ fn prepare_inner(
             runner.sessions_dir(),
             &cwd,
             model.map(str::to_string).or(default_selector),
+            runner.coordinator(),
         )?
     };
 

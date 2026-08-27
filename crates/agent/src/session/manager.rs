@@ -51,17 +51,31 @@ impl SessionManager {
     pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
         let session_id = Uuid::now_v7().to_string();
         let timestamp = now_iso();
+        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
         Self::create_with_file(
             cwd,
             sessions_dir,
             format!("{session_id}.jsonl"),
             session_id,
             timestamp,
+            &coordinator,
         )
     }
 
     /// 新建会话：文件名与 header id 都是调用方指定的 UUID。
     pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
+        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
+        Self::create_with_id_with_coordinator(cwd, sessions_dir, session_id, &coordinator)
+    }
+
+    /// 与 [`create_with_id`] 相同，但使用调用方持有的长驻协调器（进程级
+    /// stale 清理只发生一次；见 [`open_existing_with_coordinator`]）。
+    pub fn create_with_id_with_coordinator(
+        cwd: &Path,
+        sessions_dir: &Path,
+        session_id: &str,
+        coordinator: &Arc<WriterLockCoordinator>,
+    ) -> Result<Self> {
         Uuid::parse_str(session_id).map_err(|_| {
             SessionError::InvalidSession(format!("session id is not a UUID: {session_id}"))
         })?;
@@ -72,6 +86,7 @@ impl SessionManager {
             format!("{session_id}.jsonl"),
             session_id.to_string(),
             timestamp,
+            coordinator,
         )
     }
 
@@ -79,6 +94,24 @@ impl SessionManager {
     /// 打开时获取该会话的 OS 写者锁（文件名 stem 为锁键），解锁前其他写者
     /// 被拒绝。修复重写与后续 append 全程持锁。
     pub fn open_existing(path: &Path) -> Result<Self> {
+        let sessions_dir = path.parent().ok_or_else(|| {
+            SessionError::InvalidSession(format!(
+                "session file has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
+        Self::open_existing_with_coordinator(path, &coordinator)
+    }
+
+    /// 与 [`open_existing`] 相同，但使用调用方持有的长驻协调器。
+    ///
+    /// 协调器承担进程级的一次性 stale 清理；进程内应只存在一个实例
+    /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
+    pub fn open_existing_with_coordinator(
+        path: &Path,
+        coordinator: &Arc<WriterLockCoordinator>,
+    ) -> Result<Self> {
         if !path.is_file() {
             return Err(SessionError::InvalidSession(format!(
                 "session file does not exist: {}",
@@ -86,19 +119,12 @@ impl SessionManager {
             )));
         }
         let file = path.to_path_buf();
-        let sessions_dir = path.parent().ok_or_else(|| {
-            SessionError::InvalidSession(format!(
-                "session file has no parent directory: {}",
-                path.display()
-            ))
-        })?;
         let lock_key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
             SessionError::InvalidSession(format!(
                 "session file name is not valid UTF-8: {}",
                 path.display()
             ))
         })?;
-        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
         let writer_lock = coordinator.acquire(lock_key)?;
         let opened = Self::open_parsed(&file, TailPolicy::RepairAndRewrite)
             .map(|opened| opened.with_lock(writer_lock))?;
@@ -180,11 +206,11 @@ impl SessionManager {
         file_name: String,
         session_id: String,
         timestamp: String,
+        coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {
         let cwd = std::path::absolute(cwd)?;
         std::fs::create_dir_all(sessions_dir)?;
         // 锁先于文件：会话文件一旦出现就受单写者保护。
-        let coordinator = Arc::new(WriterLockCoordinator::new(sessions_dir));
         let writer_lock = coordinator.acquire(&session_id)?;
         let file = sessions_dir.join(file_name);
         let header = json!({

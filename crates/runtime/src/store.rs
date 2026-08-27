@@ -4,9 +4,11 @@
 //! 入口，不复制会话状态。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use singularity_agent::session::{
-    SessionEntry, SessionError, SessionManager, SessionProjectionStatus, project_session,
+    SessionEntry, SessionError, SessionManager, SessionProjectionStatus, WriterLockCoordinator,
+    project_session,
 };
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
@@ -14,6 +16,10 @@ use uuid::Uuid;
 use crate::error::TurnFailureCause;
 use crate::history::project_turn_history;
 use crate::objects::{Thread, ThreadStatus};
+
+/// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径，stale
+/// 清理每进程只发生一次。从 store 层向下传给 `SessionManager`。
+pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadSummary {
@@ -67,10 +73,16 @@ pub fn create_thread(
     sessions_dir: &Path,
     cwd: &str,
     model: Option<String>,
+    coordinator: &ThreadLockCoordinator,
 ) -> Result<Thread, String> {
     let thread_id = Uuid::now_v7().to_string();
-    let session = SessionManager::create_with_id(Path::new(cwd), sessions_dir, &thread_id)
-        .map_err(|_| "failed to create session file".to_string())?;
+    let session = SessionManager::create_with_id_with_coordinator(
+        Path::new(cwd),
+        sessions_dir,
+        &thread_id,
+        coordinator,
+    )
+    .map_err(|_| "failed to create session file".to_string())?;
     singularity_core::ensure_owner_only_file(session.path())?;
     Ok(Thread {
         thread_id,
@@ -85,12 +97,16 @@ pub fn create_thread(
 /// 修复语义与 turn 打开路径一致：未终态 `turn_started` 补写 synthetic
 /// interrupted，孤立 tool call 补写 synthetic failed ToolResult。管理器在
 /// 投影后关闭；每个 turn 由 runner 按单写者合同重新独占打开。
-pub fn resume_thread(sessions_dir: &Path, thread_id: &str) -> Result<Thread, ResumeError> {
+pub fn resume_thread(
+    sessions_dir: &Path,
+    thread_id: &str,
+    coordinator: &ThreadLockCoordinator,
+) -> Result<Thread, ResumeError> {
     let path = session_file(sessions_dir, thread_id);
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
-    let mut session = SessionManager::open_existing(&path)
+    let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
     if session.session_id() != thread_id {
         return Err(ResumeError::Store(format!(
@@ -194,13 +210,19 @@ fn thread_summary(session: &SessionManager) -> ThreadSummary {
 }
 
 /// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
-pub fn rename_thread(sessions_dir: &Path, thread_id: &str, name: &str) -> Result<(), String> {
+pub fn rename_thread(
+    sessions_dir: &Path,
+    thread_id: &str,
+    name: &str,
+    coordinator: &ThreadLockCoordinator,
+) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("thread name must not be empty".to_string());
     }
     let path = thread_session_path(sessions_dir, thread_id);
-    let mut session = SessionManager::open_existing(&path).map_err(|error| error.to_string())?;
+    let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
+        .map_err(|error| error.to_string())?;
     if session.session_id() != thread_id {
         return Err("thread id does not match session header".to_string());
     }
@@ -303,15 +325,22 @@ pub fn paged_read(
 
 /// 删除 Thread 的会话文件。持写者锁完成：其他写者正在 append 时拒绝
 ///（[`ResumeError::WriterActive`]），避免删除后写入落入 unlinked inode。
-pub fn delete_thread(sessions_dir: &Path, thread_id: &str) -> Result<(), ResumeError> {
+pub fn delete_thread(
+    sessions_dir: &Path,
+    thread_id: &str,
+    coordinator: &ThreadLockCoordinator,
+) -> Result<(), ResumeError> {
     let path = session_file(sessions_dir, thread_id);
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
-    let session = SessionManager::open_existing(&path).map_err(|error| match error {
-        SessionError::WriterConflict { .. } => ResumeError::WriterActive,
-        other => ResumeError::Store(other.to_string()),
-    })?;
+    let session =
+        SessionManager::open_existing_with_coordinator(&path, coordinator).map_err(|error| {
+            match error {
+                SessionError::WriterConflict { .. } => ResumeError::WriterActive,
+                other => ResumeError::Store(other.to_string()),
+            }
+        })?;
     if session.session_id() != thread_id {
         return Err(ResumeError::Store(format!(
             "rollout header id {} does not match requested thread id {thread_id}",
@@ -474,18 +503,22 @@ mod tests {
         let sessions_dir = temp.path().join("sessions");
         let thread_id = "01914f6b-0000-7000-8000-000000000002";
         let _ = session_with_two_turns(&sessions_dir, thread_id);
+        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
 
-        let session = SessionManager::open_existing(&thread_session_path(&sessions_dir, thread_id))
-            .expect("open session");
+        let session = SessionManager::open_existing_with_coordinator(
+            &thread_session_path(&sessions_dir, thread_id),
+            &coordinator,
+        )
+        .expect("open session");
         // 存活写者持有锁：删除必须拒绝，避免删除后写入落入 unlinked inode。
-        match delete_thread(&sessions_dir, thread_id) {
+        match delete_thread(&sessions_dir, thread_id, &coordinator) {
             Err(ResumeError::WriterActive) => {}
             other => panic!("expected WriterActive, got {other:?}"),
         }
         drop(session);
-        delete_thread(&sessions_dir, thread_id).expect("delete after writer release");
+        delete_thread(&sessions_dir, thread_id, &coordinator).expect("delete after writer release");
         assert!(!thread_session_path(&sessions_dir, thread_id).exists());
-        match delete_thread(&sessions_dir, thread_id) {
+        match delete_thread(&sessions_dir, thread_id, &coordinator) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
