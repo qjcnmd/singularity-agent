@@ -4,6 +4,7 @@
 //! [`ToolItem`] 为单位就地刷新（运行中更新预览，结束后固化为稳定记录），
 //! 不向会话流追加重复行。可视行计算覆盖显式换行、CJK 宽字符与长行折行。
 
+use super::view::truncate_label;
 use super::wrapped_lines;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -158,7 +159,7 @@ impl Transcript {
         self.items.push(FlowItem::Tool(ToolItem {
             call_id: call_id.to_string(),
             name: name.to_string(),
-            args_head: truncate_chars(&serialized, 120),
+            args_head: truncate_label(&serialized, 120),
             state: ToolState::Running {
                 last_output: String::new(),
             },
@@ -170,7 +171,7 @@ impl Transcript {
         if let Some(item) = self.tool_item_mut(call_id)
             && let ToolState::Running { last_output } = &mut item.state
         {
-            *last_output = truncate_chars(partial_output, 200);
+            *last_output = truncate_label(partial_output, 200);
         }
     }
 
@@ -418,15 +419,6 @@ fn bounded_preview(output: &str) -> Vec<&str> {
         .filter(|line| !line.trim().is_empty())
         .take(TOOL_RESULT_PREVIEW_LINES)
         .collect()
-}
-
-/// 贪心折行：按显示宽度断行，显式 `\n` 强制换行；空文本产出一空行。
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(max_chars.saturating_sub(3)).collect();
-    format!("{cut}...")
 }
 
 #[cfg(test)]
