@@ -398,15 +398,20 @@ impl OpenAiProvider {
             return Ok(normalized);
         };
         let mut normalized = request.clone();
-        let parsed = super::config::selection::parse_model_selector(selector)?;
-        if parsed.provider_name != self.config.provider_name {
-            return Err(super::config::model_selector_error(
-                "model selector references an unknown provider",
-                "provider_selector_unknown_provider",
-            ));
-        }
-        let model_name = parsed.model_name;
-        let requested_effort = parsed.reasoning_effort;
+        // 带 `/` 的选择器走共享解析（含段合法性与拆分）；裸 model id 保持
+        // legacy 路径（整个 selector 即模型名，无 effort）。
+        let (model_name, requested_effort) = if selector.contains('/') {
+            let parsed = super::config::selection::parse_model_selector(selector)?;
+            if parsed.provider_name != self.config.provider_name {
+                return Err(super::config::model_selector_error(
+                    "model selector references an unknown provider",
+                    "provider_selector_unknown_provider",
+                ));
+            }
+            (parsed.model_name, parsed.reasoning_effort)
+        } else {
+            (selector, None)
+        };
         if self.selected_model.is_some() && model_name != self.config.model_name {
             return Err(super::config::model_selector_error(
                 "model selector is not the fixed model for this provider turn",
