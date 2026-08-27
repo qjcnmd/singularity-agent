@@ -236,33 +236,39 @@ pub struct ProviderAttemptParams {
 }
 
 impl AppEvent {
+    /// 构造一个带类型化参数的应用事件；参数结构恒可序列化，失败视为
+    /// crate 内部错误。
+    fn build(method: &str, params: impl Serialize) -> Self {
+        Self {
+            method: method.to_string(),
+            params: serde_json::to_value(params).expect("typed event params serialize"),
+        }
+    }
+
     /// 构造 thread started 事件。
     pub fn thread_started(thread: &Thread) -> Self {
-        Self {
-            method: event_method::THREAD_STARTED.to_string(),
-            params: serde_json::to_value(ThreadEventParams {
+        Self::build(
+            event_method::THREAD_STARTED,
+            ThreadEventParams {
                 thread: thread.clone(),
-            })
-            .expect("typed event params serialize"),
-        }
+            },
+        )
     }
 
     /// 构造 turn started 事件。
     pub fn turn_started(turn: &Turn) -> Self {
-        Self {
-            method: event_method::TURN_STARTED.to_string(),
-            params: serde_json::to_value(TurnEventParams { turn: turn.clone() })
-                .expect("typed event params serialize"),
-        }
+        Self::build(
+            event_method::TURN_STARTED,
+            TurnEventParams { turn: turn.clone() },
+        )
     }
 
     /// 构造 turn completed 事件。
     pub fn turn_completed(turn: &Turn) -> Self {
-        Self {
-            method: event_method::TURN_COMPLETED.to_string(),
-            params: serde_json::to_value(TurnEventParams { turn: turn.clone() })
-                .expect("typed event params serialize"),
-        }
+        Self::build(
+            event_method::TURN_COMPLETED,
+            TurnEventParams { turn: turn.clone() },
+        )
     }
 
     /// 构造 Turn 执行错误终态事件。
@@ -282,10 +288,7 @@ impl AppEvent {
                 message: message.to_string(),
             },
         };
-        Self {
-            method: event_method::TURN_ERROR.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::TURN_ERROR, params)
     }
 
     /// 构造非致命、脱敏的 Agent 诊断事件。
@@ -303,18 +306,12 @@ impl AppEvent {
             code: code.into(),
             message: message.into(),
         };
-        Self {
-            method: event_method::AGENT_DIAGNOSTIC.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::AGENT_DIAGNOSTIC, params)
     }
 
     /// 构造单次 Provider attempt 的脱敏进度/终态事件。
     pub fn provider_attempt(params: ProviderAttemptParams) -> Self {
-        Self {
-            method: event_method::PROVIDER_ATTEMPT.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::PROVIDER_ATTEMPT, params)
     }
 
     /// 构造 item started 事件。
@@ -335,13 +332,12 @@ impl AppEvent {
 
     /// 构造线程设置已应用事件（待生效设置在可信终态后持久化并更新线程投影）。
     pub fn thread_settings_applied(thread: &Thread) -> Self {
-        Self {
-            method: event_method::THREAD_SETTINGS_APPLIED.to_string(),
-            params: serde_json::to_value(ThreadEventParams {
+        Self::build(
+            event_method::THREAD_SETTINGS_APPLIED,
+            ThreadEventParams {
                 thread: thread.clone(),
-            })
-            .expect("typed event params serialize"),
-        }
+            },
+        )
     }
 
     /// 构造 agent message 增量事件。
@@ -409,10 +405,7 @@ impl AppEvent {
             tool_name: tool_name.into(),
             args,
         };
-        Self {
-            method: event_method::TOOL_EXECUTION_START.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::TOOL_EXECUTION_START, params)
     }
 
     /// 构造工具执行流式输出增量更新通知。
@@ -432,10 +425,7 @@ impl AppEvent {
             args,
             partial_result: partial_result.into(),
         };
-        Self {
-            method: event_method::TOOL_EXECUTION_UPDATE.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::TOOL_EXECUTION_UPDATE, params)
     }
 
     /// 构造工具执行完成事件通知。
@@ -460,10 +450,7 @@ impl AppEvent {
                 is_error,
             },
         };
-        Self {
-            method: event_method::TOOL_EXECUTION_END.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(event_method::TOOL_EXECUTION_END, params)
     }
 
     fn item_event(
@@ -483,10 +470,7 @@ impl AppEvent {
             delta,
             error,
         };
-        Self {
-            method: method.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
-        }
+        Self::build(method, params)
     }
 
     /// 返回事件方法名。
