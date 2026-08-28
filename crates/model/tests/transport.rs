@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 mod support;
 use support::*;
 
@@ -28,11 +29,7 @@ fn openai_responses_stream_aggregates_deltas_and_ignores_ping_after_completion()
     let body = format!(
         "event: response.output_text.delta\r\ndata: {delta_one}\r\n\r\nevent: response.output_text.delta\r\ndata: {delta_two}\r\n\r\nevent: response.completed\r\ndata: {completed}\r\n\r\nevent: ping\r\ndata: {{\"type\":\"ping\"}}\r\n\r\n"
     );
-    let chunks = body
-        .as_bytes()
-        .chunks(3)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+    let chunks = body.as_bytes().chunks(3).map(<[u8]>::to_vec).collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
     let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
@@ -109,11 +106,7 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
         ),
     ];
     for (name, body, expected_code, expected_fragment) in cases {
-        let chunks = body
-            .as_bytes()
-            .chunks(2)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let chunks = body.as_bytes().chunks(2).map(<[u8]>::to_vec).collect();
         let (base_url, requests) = responses_stream_server(chunks, None);
         let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
@@ -147,11 +140,7 @@ fn openai_responses_stream_length_preserves_partial_response() {
         "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
         "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]},{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"
     );
-    let chunks = body
-        .as_bytes()
-        .chunks(3)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+    let chunks = body.as_bytes().chunks(3).map(<[u8]>::to_vec).collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
     let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
@@ -190,7 +179,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
     let chunks = body
         .as_bytes()
         .chunks(64 * 1024)
-        .map(|chunk| chunk.to_vec())
+        .map(<[u8]>::to_vec)
         .collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
     let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
@@ -230,11 +219,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
     let tool_body = format!(
         "event: response.function_call_arguments.delta\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{{\\\"path\\\":\\\"README.md\\\"}}\"}}\n\nevent: response.completed\ndata: {completed}\n\n"
     );
-    let chunks = tool_body
-        .as_bytes()
-        .chunks(5)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+    let chunks = tool_body.as_bytes().chunks(5).map(<[u8]>::to_vec).collect();
     let (base_url, requests) = responses_stream_server(chunks, None);
     let provider = test_provider(provider_config_with_base_url(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
@@ -274,10 +259,7 @@ fn openai_chat_streaming_normalizes_visible_deltas_and_tool_fragments() {
         "data: [DONE]\n\n"
     );
     let (base_url, requests) = chat_stream_server(
-        body.as_bytes()
-            .chunks(7)
-            .map(|chunk| chunk.to_vec())
-            .collect(),
+        body.as_bytes().chunks(7).map(<[u8]>::to_vec).collect(),
         None,
     );
     let provider = test_provider(provider_test_config(base_url)).expect("provider");

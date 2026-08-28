@@ -55,7 +55,10 @@ pub(super) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("failed to spawn shell {shell}: {error}"));
         }
     };
+    // 不变量：spawn_shell 配置了 piped stdout/stderr，take 必为 Some。
+    #[allow(clippy::expect_used)]
     let stdout = managed.child.stdout.take().expect("bash stdout is piped");
+    #[allow(clippy::expect_used)]
     let stderr = managed.child.stderr.take().expect("bash stderr is piped");
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
@@ -117,7 +120,10 @@ pub(super) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             && Instant::now() >= deadline
         {
             managed.kill_tree();
-            outcome = BashOutcome::TimedOut(timeout.expect("deadline implies timeout"));
+            // 不变量：deadline 存在时 timeout 必存在。
+            #[allow(clippy::expect_used)]
+            let timed_out = BashOutcome::TimedOut(timeout.expect("deadline implies timeout"));
+            outcome = timed_out;
             exit_status = wait_for_exit(&mut managed);
             break;
         }
@@ -187,7 +193,7 @@ pub(super) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 }
             }
             Some(status) => {
-                append_status(&mut content, &describe_exit(&status));
+                append_status(&mut content, &describe_exit(status));
                 is_error = true;
             }
             // 完成路径的退出状态必然已回收；缺失时按失败报告，不伪装成功。
@@ -236,7 +242,7 @@ fn append_status(content: &mut String, status: &str) {
 
 /// 把失败退出状态投影为错误文案：Unix 上被信号终止时报告信号号，
 /// 其余情况报告退出码。
-fn describe_exit(status: &ExitStatus) -> String {
+fn describe_exit(status: ExitStatus) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;

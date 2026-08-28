@@ -232,6 +232,8 @@ impl Conversation {
             return Err(ConversationError::TurnAlreadyActive);
         }
         state.turn = TurnLifecycle::Reserved;
+        // 不变量：Conversation 由 Arc 持有并注册 self_weak 后才可 reserve_start，upgrade 必成功。
+        #[allow(clippy::expect_used)]
         let conversation = self
             .self_weak
             .upgrade()
@@ -475,6 +477,8 @@ impl Conversation {
             // 单轮执行失败不阻断其余已接受的 followUp。
             last = Some(step);
         }
+        // 不变量：run_single_turn 至少消费一轮队列，last 必为 Some。
+        #[allow(clippy::expect_used)]
         last.expect("run_turn executes at least one turn")
     }
 

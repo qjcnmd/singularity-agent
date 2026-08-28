@@ -52,7 +52,7 @@ impl WheelNormalizer {
 }
 
 /// 矩形包含测试（ratatui `Rect` 的半开区间语义：含左/上，不含右/下）。
-fn rect_contains(rect: &Rect, column: u16, row: u16) -> bool {
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
@@ -71,7 +71,7 @@ impl TuiApp {
             .find(|(_, target)| *target == ClickTarget::Editor)
             .map(|(rect, _)| *rect);
         if let Some(rect) = editor_rect
-            && rect_contains(&rect, column, row)
+            && rect_contains(rect, column, row)
         {
             self.editor
                 .scroll_by(if up { -(rows as i32) } else { rows as i32 });
@@ -92,7 +92,7 @@ impl TuiApp {
             .frame
             .click_targets
             .iter()
-            .find(|(rect, _)| rect_contains(rect, column, row))
+            .find(|(rect, _)| rect_contains(*rect, column, row))
             .copied();
         let Some((rect, target)) = hit else {
             return;

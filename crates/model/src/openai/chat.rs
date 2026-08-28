@@ -673,6 +673,7 @@ pub fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
 
 #[cfg(test)]
 mod replay_binding_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use crate::ProviderConfigSource;
     use crate::types::ProviderToolReasoningMode;

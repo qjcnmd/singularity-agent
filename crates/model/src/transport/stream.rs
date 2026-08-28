@@ -673,6 +673,7 @@ pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
 
 #[cfg(test)]
 mod frame_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
 
     #[test]

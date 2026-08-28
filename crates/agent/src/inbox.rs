@@ -57,6 +57,8 @@ impl TurnInbox {
 pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
 /// 加锁活动 turn inbox；共享协调状态中毒时 fail-stop，不能继续使用可能损坏的队列。
+#[allow(clippy::expect_used)]
 pub(super) fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
+    // 决策：Mutex 中毒 = 共享状态损坏 → fail-stop，不静默恢复。
     queue.lock().expect("turn inbox lock poisoned")
 }

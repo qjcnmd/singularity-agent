@@ -1,6 +1,7 @@
 //! stdio transport-level concurrent steer/followUp test with a deterministic
 //! fake provider. The same connection keeps a long turn in flight while the
 //! client injects turn/steer and turn/followUp.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 mod support;
 

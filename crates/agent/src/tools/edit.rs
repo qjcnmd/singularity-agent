@@ -228,6 +228,8 @@ fn normalize_with_map(text: &str) -> NormalizedText<'_> {
             normalized.push('\n');
             continue;
         }
+        // 不变量：index 恒为字符边界，chars().next() 必存在。
+        #[allow(clippy::expect_used)]
         let character = text[index..]
             .chars()
             .next()
@@ -269,6 +271,8 @@ fn map_match_region(raw: &str, match_start: usize, match_end: usize) -> (usize, 
             }
             normalized_len += 1;
         } else {
+            // 不变量：original_index 恒为字符边界，chars().next() 必存在。
+            #[allow(clippy::expect_used)]
             let character = raw[original_index..]
                 .chars()
                 .next()
@@ -317,9 +321,15 @@ impl LineEndingCounts {
             (LineEnding::CrLf, self.crlf),
             (LineEnding::Cr, self.cr),
         ];
-        let max = values.iter().map(|(_, count)| *count).max().unwrap_or(0);
-        (max > 0 && values.iter().filter(|(_, count)| *count == max).count() == 1)
-            .then(|| values.iter().find(|(_, count)| *count == max).unwrap().0)
+        // values 恒为非空数组，max_by_key 必返回一个候选。
+        let (ending, max_count) = values.iter().copied().max_by_key(|(_, count)| *count)?;
+        let is_unique = max_count > 0
+            && values
+                .iter()
+                .filter(|(_, count)| *count == max_count)
+                .count()
+                == 1;
+        is_unique.then_some(ending)
     }
 }
 

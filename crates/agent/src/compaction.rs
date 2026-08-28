@@ -405,7 +405,11 @@ impl CompactionEngine {
             return Ok(CompactionOutcome::NotNeeded);
         }
         // 若最新条目已是压缩节点，则说明尚无新的未压缩内容。
-        if session.entries().last().map(|entry| entry.id()) == Some(entries[0].id())
+        if session
+            .entries()
+            .last()
+            .map(super::session::format::SessionEntry::id)
+            == Some(entries[0].id())
             && matches!(entries[0], SessionEntry::Compaction { .. })
         {
             return Ok(CompactionOutcome::NotNeeded);

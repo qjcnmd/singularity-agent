@@ -1,6 +1,7 @@
 //! 协调器与 turn 管线的行为测试：以最小 fake Provider 驱动真实管线，
 //! 验证单活动 turn、事件顺序、失败收敛、取消、设置自动生效与
 //! followUp 后续队列合同。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::path::Path;
 use std::sync::Arc;

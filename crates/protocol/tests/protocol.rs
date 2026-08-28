@@ -1,4 +1,5 @@
 //! 收缩后协议合同测试：stdio JSON-RPC registry、wire shape 与稳定状态文本。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use serde_json::json;
 use singularity_protocol::{
@@ -62,8 +63,7 @@ fn injection_and_thread_read_params_are_bounded_by_registry() {
     })
     .expect("steer params");
     assert_eq!(steer["turnId"], "turn-id");
-    assert!(serde_json::from_value::<TurnInjectionParams>(steer.clone()).is_ok());
-    assert!(serde_json::from_value::<TurnInjectionParams>(steer.clone()).is_ok());
+    assert!(serde_json::from_value::<TurnInjectionParams>(steer).is_ok());
 
     let read = json!({"sessionId":"session-id"});
     let params: ThreadReadParams = serde_json::from_value(read).expect("session read params");
@@ -313,10 +313,9 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     assert_eq!(diagnostic.method(), "agent/diagnostic");
     assert_eq!(diagnostic.params["code"], "compaction_skipped");
     assert!(!diagnostic.params.to_string().contains("raw"));
-    let diagnostic_params = serde_json::from_value::<singularity_protocol::AgentDiagnosticParams>(
-        diagnostic.params.clone(),
-    )
-    .expect("typed diagnostic params");
+    let diagnostic_params =
+        serde_json::from_value::<singularity_protocol::AgentDiagnosticParams>(diagnostic.params)
+            .expect("typed diagnostic params");
     assert_eq!(
         diagnostic_params.severity,
         singularity_protocol::DiagnosticSeverity::Warning
@@ -338,10 +337,9 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     assert_eq!(attempt.params["modelTurnOrdinal"], 2);
     assert!(attempt.params.get("retryScheduled").is_none());
     assert!(attempt.params.get("raw").is_none());
-    let attempt_params = serde_json::from_value::<singularity_protocol::ProviderAttemptParams>(
-        attempt.params.clone(),
-    )
-    .expect("typed provider attempt params");
+    let attempt_params =
+        serde_json::from_value::<singularity_protocol::ProviderAttemptParams>(attempt.params)
+            .expect("typed provider attempt params");
     assert_eq!(
         attempt_params.status,
         singularity_protocol::ProviderAttemptStatus::Error
@@ -357,7 +355,7 @@ fn diagnostic_and_provider_attempt_events_are_safe_and_named() {
     assert_eq!(error.params["error"]["stage"], "agent_loop");
     assert_eq!(error.params["error"]["cause"], "provider_timeout");
     let error_params =
-        serde_json::from_value::<singularity_protocol::TurnErrorParams>(error.params.clone())
+        serde_json::from_value::<singularity_protocol::TurnErrorParams>(error.params)
             .expect("typed turn error params");
     assert_eq!(
         error_params.error.cause,

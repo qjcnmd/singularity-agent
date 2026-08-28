@@ -1,4 +1,5 @@
 //! 项目指令 workspace 边界、大小限制和错误归因测试。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

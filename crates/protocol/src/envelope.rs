@@ -312,13 +312,17 @@ impl JsonRpcMessage {
     }
 
     /// 返回 dispatcher 已保证存在的 request id。
+    // 不变量：仅 dispatcher 在已知 Request 消息上调用此方法，id 必存在。
+    #[allow(clippy::expect_used)]
     pub fn required_id(&self) -> JsonRpcId {
         self.id()
             .cloned()
-            .expect("dispatcher supplies a request id")
+            .expect("required_id 仅在 dispatcher 已知的 Request 消息上调用")
     }
 
     /// 生成发送到 stdio 的 JSON 值。
+    // 不变量：JsonRpcMessage 为静态类型，无 #[serde(skip)] 字段，序列化恒不失败。
+    #[allow(clippy::expect_used)]
     pub fn to_wire_value(&self) -> Value {
         serde_json::to_value(self).expect("json-rpc message serializes")
     }

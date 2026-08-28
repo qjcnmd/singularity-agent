@@ -39,6 +39,8 @@ impl TerminalCommit {
 
     /// 构造终态 metadata 条目（status + usage + usageComplete 单条）。
     fn metadata(&self) -> SessionMetadata {
+        // 不变量：TurnUsage 为本 crate 静态类型，无 #[serde(skip)] 字段，序列化恒不失败。
+        #[allow(clippy::expect_used)]
         let usage =
             serde_json::to_value(&self.usage).expect("TurnUsage serialization is infallible");
         SessionMetadata::turn_terminal(&self.turn_id, self.status, usage, self.usage_complete)
@@ -110,6 +112,7 @@ fn terminal_status_for_thread_status(status: ThreadStatus) -> Option<TurnTermina
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::session::SessionMetadataKind;
 
@@ -173,7 +176,7 @@ mod tests {
         let terminals: Vec<TurnTerminalStatus> = session
             .metadata_entries()
             .iter()
-            .filter_map(|entry| entry.terminal_status())
+            .filter_map(singularity_agent::session::SessionMetadata::terminal_status)
             .collect();
         assert_eq!(
             terminals,

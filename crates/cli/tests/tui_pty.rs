@@ -20,6 +20,7 @@
 //!   语义改由单元测试覆盖；
 //! - 收敛帧内 note 与状态行在同一 chunk 到达：顺序断言从上一个匹配的
 //!   结束偏移继续，不使用快照长度作起点（快照长度滞后于观察点）。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};

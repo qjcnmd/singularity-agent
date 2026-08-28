@@ -45,11 +45,11 @@ fn restrict(
 }
 
 pub fn ensure_owner_only_dir(path: &Path) -> Result<(), String> {
-    restrict(path, 0o700, "directory", |metadata| metadata.is_dir())
+    restrict(path, 0o700, "directory", std::fs::Metadata::is_dir)
 }
 
 pub fn ensure_owner_only_file(path: &Path) -> Result<(), String> {
-    restrict(path, 0o600, "file", |metadata| metadata.is_file())
+    restrict(path, 0o600, "file", std::fs::Metadata::is_file)
 }
 
 /// 创建目录并确保属主权限（Unix 0700）。

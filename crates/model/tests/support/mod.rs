@@ -1,4 +1,5 @@
 #![allow(dead_code, unused_imports)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 pub(crate) use serde_json::{Value, json};
 pub(crate) use singularity_model::{
@@ -56,7 +57,7 @@ impl Drop for ProcessEnvGuard {
 pub(crate) fn install_process_env(key: &str, value: &std::path::Path) -> ProcessEnvGuard {
     let _lock = PROCESS_ENV_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     unsafe { std::env::set_var(key, value) };
     ProcessEnvGuard {
         _lock,

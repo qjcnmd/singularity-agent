@@ -173,6 +173,7 @@ impl Drop for WriterLockGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use std::ffi::OsString;
     use std::fs;
     use std::sync::Arc;

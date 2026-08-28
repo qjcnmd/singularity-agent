@@ -245,9 +245,11 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<Instruction
         dir: workspace_root.to_path_buf(),
         relative_path: PathBuf::new(),
     }];
+    // 不变量：load_project_instructions 已先做 cwd.starts_with(&workspace_root) 检查，此处不可能失败。
+    #[allow(clippy::expect_used)]
     let relative_cwd = cwd
         .strip_prefix(workspace_root)
-        .expect("cwd boundary checked before traversal");
+        .expect("cwd 必在 workspace root 之下");
     let mut dir = workspace_root.to_path_buf();
     let mut relative = PathBuf::new();
     for component in relative_cwd.components() {

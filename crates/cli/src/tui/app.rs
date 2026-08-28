@@ -633,6 +633,8 @@ impl TuiApp {
         // 宽度计量，不做文本反查）；编辑器内区不含边框。
         self.frame.click_targets.clear();
         if self.phase != Phase::Idle {
+            // 不变量：非 Idle 时 status_spans 恒含 [stop] 段。
+            #[allow(clippy::expect_used)]
             let stop = status_spans
                 .last()
                 .expect("running footer always ends with [stop]");
@@ -682,6 +684,7 @@ impl TuiApp {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::CompactionState;
 
     #[test]

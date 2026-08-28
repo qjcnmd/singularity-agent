@@ -1,4 +1,5 @@
 //! stdio app-server 协议与用户级会话布局集成测试。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 mod support;
 

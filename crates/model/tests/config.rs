@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 mod support;
 use support::*;
 
@@ -498,7 +499,7 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
         provider_name: "deep".to_string(),
         model_name: "chat".to_string(),
         reasoning_effort: Some("high".to_string()),
-        tool_call_ids: vec![call.tool_call_id.clone()],
+        tool_call_ids: vec![call.tool_call_id],
         reasoning_content: "opaque-deepseek-state".to_string(),
     }];
     assert!(!format!("{request:?}").contains("opaque-deepseek-state"));
@@ -841,7 +842,7 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
         provider_name: "longcat".to_string(),
         model_name: "responses".to_string(),
         reasoning_effort: Some("high".to_string()),
-        tool_call_ids: vec![call.tool_call_id.clone()],
+        tool_call_ids: vec![call.tool_call_id],
         items: vec![
             serde_json::json!({
                 "type": "reasoning",

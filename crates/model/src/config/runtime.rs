@@ -50,7 +50,6 @@ impl ProviderConfigSnapshot {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let runtime_handle = runtime_handle.clone();
         Self::capture_with_provider(get_env, move |config| {
             OpenAiProvider::new(config, runtime_handle.clone())
         })

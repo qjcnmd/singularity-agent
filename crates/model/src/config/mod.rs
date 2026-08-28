@@ -110,14 +110,8 @@ pub(crate) fn validate_provider_value(
     let Some(value) = value else {
         return Ok(());
     };
-    let invalid_boundary_whitespace = value
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_whitespace())
-        || value
-            .chars()
-            .next_back()
-            .is_some_and(|character| character.is_whitespace());
+    let invalid_boundary_whitespace = value.chars().next().is_some_and(char::is_whitespace)
+        || value.chars().next_back().is_some_and(char::is_whitespace);
     if value
         .chars()
         .any(|character| matches!(character, '\r' | '\n' | '\0'))
@@ -501,11 +495,14 @@ where
         (_, Some(error), _) => (None, Some(error)),
         (_, _, Some(error)) => (None, Some(error)),
         (Some(api_key), None, None) => {
+            // 不变量：上方已对 models.is_empty() 早退，keys().next() 与 get() 必成功。
+            #[allow(clippy::expect_used)]
             let base_model = models
                 .keys()
                 .next()
                 .cloned()
                 .expect("models checked non-empty");
+            #[allow(clippy::expect_used)]
             let base_model_config = models.get(&base_model).expect("base model exists");
             let config = OpenAiProviderConfig {
                 provider_name: provider_name.to_string(),

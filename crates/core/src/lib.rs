@@ -103,6 +103,7 @@ pub fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::atomic_replace_bytes;
 
     #[test]
@@ -122,7 +123,7 @@ mod tests {
         // 临时文件不应残留。
         let leftovers = std::fs::read_dir(dir.path())
             .expect("list dir")
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0, "temporary files must be cleaned up");

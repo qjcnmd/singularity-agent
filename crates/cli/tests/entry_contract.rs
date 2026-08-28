@@ -8,6 +8,7 @@
 //! - `<goal>` 是无交互模式的必需位置参数；`--model` 只覆盖本次执行；
 //!   `--session <id>` 指定既有 Thread；`--no-session` 关闭本次持久化。
 //! - 旧管理型子命令（run/continue/session/threads/config）不得出现。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use assert_cmd::Command;
 use serde_json::Value;

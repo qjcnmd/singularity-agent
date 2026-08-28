@@ -272,7 +272,7 @@ fn validate_responses_replay_items(
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .ok_or("Responses reasoning item id is missing")?;
-                if id.chars().any(|character| character.is_control()) {
+                if id.chars().any(char::is_control) {
                     return Err("Responses reasoning item id is invalid");
                 }
                 reasoning_count = reasoning_count.saturating_add(1);
@@ -284,7 +284,7 @@ fn validate_responses_replay_items(
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .ok_or("Responses function_call id is missing")?;
-                if call_id.chars().any(|character| character.is_control()) {
+                if call_id.chars().any(char::is_control) {
                     return Err("Responses function_call id is invalid");
                 }
                 function_call_ids.push(call_id.to_string());

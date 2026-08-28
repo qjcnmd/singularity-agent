@@ -423,6 +423,7 @@ fn bounded_preview(output: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
 
     #[test]

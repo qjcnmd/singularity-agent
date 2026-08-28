@@ -124,7 +124,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             return Err(error.message);
         }
     };
-    signal::ensure_installed().map_err(|message| message.to_string())?;
+    signal::ensure_installed().map_err(std::string::ToString::to_string)?;
     run_headless(setup, &goal, mode)
 }
 

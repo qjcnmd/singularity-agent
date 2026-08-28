@@ -1,4 +1,5 @@
 //! core 取消合同测试。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use singularity_core::CancellationToken;
 

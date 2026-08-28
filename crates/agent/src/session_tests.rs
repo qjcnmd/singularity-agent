@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
 
 fn user(text: &str) -> AgentMessage {
@@ -143,10 +144,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
     let entries = reopened.build_context_entries().unwrap();
-    assert_eq!(
-        entry_ids(&entries),
-        vec![m1.clone(), m2.clone(), s1.clone(), m3.clone()]
-    );
+    assert_eq!(entry_ids(&entries), vec![m1, m2, s1, m3]);
     // 线性事实源：entries 依次落盘，id 无重复。
     assert_eq!(
         entries.len(),
@@ -155,7 +153,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     );
     let ids = entries
         .iter()
-        .map(|entry| entry.id())
+        .map(super::format::SessionEntry::id)
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), entries.len(), "entry ids must be unique");
 }

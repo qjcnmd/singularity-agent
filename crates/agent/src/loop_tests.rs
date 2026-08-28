@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
 use crate::message::AgentMessage;
 use crate::message::AgentMessageRole;
@@ -738,7 +739,7 @@ fn session_file_roundtrip_after_run() {
         ],
     ));
     let mut agent = Agent::new(
-        provider.clone(),
+        provider,
         ToolRegistry::new(),
         AgentConfig::default(),
         session,
@@ -776,17 +777,23 @@ fn session_file_roundtrip_after_run() {
     assert_eq!(messages[3].role(), AgentMessageRole::Assistant);
     assert_eq!(messages[3].content_text(), "finished");
     // 线性序列：会话事实源按落盘次序推进，条目 id 必须唯一且顺序与上下文一致。
-    let ids: Vec<&str> = entries.iter().map(|entry| entry.id()).collect();
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(super::super::session::format::SessionEntry::id)
+        .collect();
     let mut unique = ids.clone();
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), ids.len(), "session entry ids must be unique");
     assert_eq!(
-        entries.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(super::super::session::format::SessionEntry::id)
+            .collect::<Vec<_>>(),
         reopened
             .entries()
             .iter()
-            .map(|entry| entry.id())
+            .map(super::super::session::format::SessionEntry::id)
             .collect::<Vec<_>>(),
         "context entries preserve linear file order"
     );
@@ -1434,7 +1441,7 @@ fn forced_compaction_failure_surfaces_the_compaction_cause() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
-        provider.clone(),
+        provider,
         ToolRegistry::new(),
         // 摘要失败为可重试类错误；重试预算清零使失败立即收敛。
         AgentConfig {
@@ -1747,7 +1754,7 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
         }],
     ));
     let mut agent = Agent::new(
-        provider.clone(),
+        provider,
         ToolRegistry::new(),
         AgentConfig::default(),
         session,

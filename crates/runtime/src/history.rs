@@ -129,6 +129,8 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                 items: Vec::new(),
             });
         }
+        // 不变量：刚 push 过，last_mut 必存在。
+        #[allow(clippy::expect_used)]
         turns.last_mut().expect("group just ensured")
     }
 
@@ -152,15 +154,16 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                         };
                         last.status = Some(terminal_turn_status(*status));
                         // 终态携带的用量并入轮内条目，thread/read 仍暴露每次终态的用量。
-                        if !usage.as_object().is_some_and(|object| object.is_empty()) {
-                            last.items.push(HistoryItem::Usage {
-                                id: metadata
-                                    .turn_id()
-                                    .expect("TurnTerminal carries a turn id")
-                                    .to_string(),
-                                usage: usage.clone(),
-                            });
-                        }
+                        // 不变量：matched 条件已断言 turn_id 相等且非 None。
+                        #[allow(clippy::expect_used)]
+                        let id = metadata
+                            .turn_id()
+                            .expect("TurnTerminal carries a turn id")
+                            .to_string();
+                        last.items.push(HistoryItem::Usage {
+                            id,
+                            usage: usage.clone(),
+                        });
                     } else {
                         // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。
                         let items = project_public_history(entry);

@@ -331,6 +331,8 @@ impl TurnRunner {
 
         // 终态收敛：单条原子落盘 `turn_terminal` → 终态事件。写入失败直接
         // fail-stop，绝不发布虚假终态或降级成另一个状态。
+        // 不变量：status 为终态（completed/failed/interrupted）时 TerminalCommit 恒可构造。
+        #[allow(clippy::expect_used)]
         let terminal = TerminalCommit::new(
             &turn_id,
             status.session_status,
@@ -553,6 +555,8 @@ impl TurnRunner {
             _ => (usage, usage_complete),
         };
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
+        // 不变量：Failed 恒为终态，TerminalCommit 必可构造。
+        #[allow(clippy::expect_used)]
         let terminal = TerminalCommit::new(turn_id, ThreadStatus::Failed, &usage, usage_complete)
             .expect("Failed always maps to a terminal status");
         // 失败终态无法落盘同样 fail-stop：不发布任何终态事件。

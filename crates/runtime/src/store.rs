@@ -380,6 +380,7 @@ fn remove_rollout(rollout: &Path) -> Result<(), ResumeError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
     use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};

@@ -58,6 +58,8 @@ pub(crate) fn wrap_offsets(line: &str, width: usize) -> Vec<usize> {
     let mut current_width = 0usize;
     for (index, ch) in line.chars().enumerate() {
         let ch_width = char_display_width(ch);
+        // 不变量：offsets 初始化为 [0]，恒非空。
+        #[allow(clippy::expect_used)]
         if current_width + ch_width > width && index > *offsets.last().expect("non-empty") {
             offsets.push(index);
             current_width = 0;

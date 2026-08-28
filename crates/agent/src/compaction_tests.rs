@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
 use singularity_model::{ModelTurnResponse, ModelUsage, ProviderProtocolContract};
 use std::collections::VecDeque;
@@ -271,7 +272,10 @@ fn compact_full_flow_and_reopen_slicing() {
     // 重开视角：上下文 = [compaction, 从 firstKeptEntryId 起的保留条目]，
     // 旧消息被摘要取代。写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
+    let ctx_ids: Vec<&str> = ctx
+        .iter()
+        .map(super::super::session::format::SessionEntry::id)
+        .collect();
     assert_eq!(ctx_ids.len(), 4);
     assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(
@@ -322,7 +326,10 @@ fn compact_full_flow_and_reopen_slicing() {
     );
     // 二次压缩后的重开视角：写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
+    let ctx_ids: Vec<&str> = ctx
+        .iter()
+        .map(super::super::session::format::SessionEntry::id)
+        .collect();
     assert_eq!(
         ctx_ids,
         vec![ctx[0].id(), id_u2.as_str(), id_a2.as_str(), id_t2.as_str()]
@@ -350,8 +357,11 @@ fn compact_nothing_to_summarize() {
         .compact(&mut session, &cfg, 90_000, &CancellationToken::new())
         .unwrap();
     let content = std::fs::read_to_string(session.path()).unwrap();
-    let lines: Vec<&str> = content.lines().skip(1).collect();
-    assert_eq!(lines.len(), 1, "只有一条消息，无 compaction 条目");
+    assert_eq!(
+        content.lines().skip(1).count(),
+        1,
+        "只有一条消息，无 compaction 条目"
+    );
 }
 
 /// 5f. 有更早历史且当前轮尾部 ToolResult 跨过保留预算：切点回退到当前轮起点，
@@ -405,7 +415,10 @@ fn compact_falls_back_to_turn_start_when_tail_tool_result_crosses_budget() {
     // 重开视角：上下文 = [compaction, 当前轮全部消息]，ToolCall 与 ToolResult
     // 成对保留。写者自身即最新持久事实，直接以它投影。
     let ctx = session.build_context_entries().unwrap();
-    let ctx_ids: Vec<&str> = ctx.iter().map(|entry| entry.id()).collect();
+    let ctx_ids: Vec<&str> = ctx
+        .iter()
+        .map(super::super::session::format::SessionEntry::id)
+        .collect();
     assert_eq!(ctx_ids.len(), 4);
     assert!(matches!(ctx[0], SessionEntry::Compaction { .. }));
     assert_eq!(

@@ -510,9 +510,12 @@ impl AppEvent {
     /// 构造一个带类型化参数的应用事件；参数结构恒可序列化，失败视为
     /// crate 内部错误。
     fn build(method: &str, params: impl Serialize) -> Self {
+        // 不变量：params 均为本 crate 的静态类型，无 #[serde(skip)] 字段，序列化恒不失败。
+        #[allow(clippy::expect_used)]
+        let params = serde_json::to_value(params).expect("typed event params serialize");
         Self {
             method: method.to_string(),
-            params: serde_json::to_value(params).expect("typed event params serialize"),
+            params,
         }
     }
 
@@ -863,6 +866,8 @@ impl AppEvent {
     }
 
     /// 将应用事件包装为 JSON-RPC 通知。
+    // 不变量：params 在 build 时已成功序列化，此处再次包装恒不失败。
+    #[allow(clippy::expect_used)]
     pub fn to_notification(&self) -> JsonRpcMessage {
         JsonRpcMessage::notification(self.method.clone(), &self.params)
             .expect("application event params serialize")

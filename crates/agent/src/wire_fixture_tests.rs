@@ -6,6 +6,7 @@
 //!
 //! 键序事实：`#[serde(tag = "type")]` internally-tagged enum 先写 tag 后写字段，
 //! 字段按声明顺序序列化，round-trip 字节稳定可断言。
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use super::*;
 use singularity_model::ModelStopReason;

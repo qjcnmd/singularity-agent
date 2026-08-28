@@ -120,8 +120,7 @@ pub(crate) fn parse_session_lines_with_limits(
     let metadata = std::fs::metadata(file)?;
     if metadata.len() > max_file_bytes as u64 {
         return Err(SessionError::InvalidSession(format!(
-            "session file exceeds bounded parse limits ({} bytes / {max_content_entries} entries)",
-            max_file_bytes
+            "session file exceeds bounded parse limits ({max_file_bytes} bytes / {max_content_entries} entries)"
         )));
     }
 
@@ -197,8 +196,7 @@ pub(crate) fn parse_session_lines_with_limits(
         let content_entries = entries.len().saturating_sub(1);
         if content_entries >= max_content_entries {
             return Err(SessionError::InvalidSession(format!(
-                "session file exceeds bounded parse limits ({} bytes / {max_content_entries} entries)",
-                max_file_bytes
+                "session file exceeds bounded parse limits ({max_file_bytes} bytes / {max_content_entries} entries)"
             )));
         }
         entries.push(value);
@@ -245,6 +243,8 @@ pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {
 }
 
 pub fn now_iso() -> String {
+    // 不变量：固定格式串格式化 UTC 时间戳恒不失败。
+    #[allow(clippy::expect_used)]
     OffsetDateTime::now_utc()
         .format(&format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"

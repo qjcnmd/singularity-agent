@@ -308,7 +308,7 @@ impl AppServer {
             JsonRpcMessage::response(
                 message.required_id(),
                 serde_json::to_value(ThreadStartResult {
-                    thread: protocol_thread.clone(),
+                    thread: protocol_thread,
                 })?,
             )
             .to_wire_value(),
@@ -352,7 +352,10 @@ impl AppServer {
                 .last_mut()
                 .is_some_and(|last| last.status == Some(TurnStatus::Running))
         {
-            turns.last_mut().expect("checked above").status = Some(TurnStatus::Interrupted);
+            // 不变量：前一行 is_some_and 已确认 last_mut 存在。
+            #[allow(clippy::expect_used)]
+            let last = turns.last_mut().expect("checked above");
+            last.status = Some(TurnStatus::Interrupted);
         }
         let record = page.summary;
         let compaction_summary = page.compaction_summary;

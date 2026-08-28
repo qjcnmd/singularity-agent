@@ -179,6 +179,7 @@ pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderE
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
 
     #[test]
