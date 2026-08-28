@@ -8,7 +8,7 @@
 
 产品有三种形态，共享同一运行时语义：
 
-- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
+- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread（精确 id 优先，否则按唯一前缀匹配，歧义或无匹配直接报错）；`--continue` 续接最近更新的一条会话；`--no-session` 以临时 home 关闭持久化；默认持久化会话。无交互模式下 stdin 非终端时整体读取为管道输入（UTF-8、上限 1 MiB，超限或非法编码按准备阶段失败收敛）：与位置 goal 并存时分节合并，goal 缺席时 stdin 即输入。不向 stdin 供输入、又以管道持有它的调用方必须关闭或重定向 stdin，否则读取会等待 EOF。
 - **交互式 TUI**：`sg` 无参数进入长驻终端界面；界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照。
 - **桌面端**：参照 Codex Desktop；app-server 是桌面端连接共享 runtime 的 stdio JSON-RPC 后端，不构成独立用户入口。
 
@@ -34,10 +34,10 @@
 
 ```
 sg --print|--json <goal>
-  ├─ 解析参数（--model/--session/--no-session）
+  ├─ 解析参数（--model/--session/--continue/--no-session）并合并管道 stdin 输入
   ├─ 解析 SINGULARITY_HOME（或临时 home）并准备 sessions/backups 目录
   ├─ ProviderConfigSnapshot::capture(env)（进程层任一变量出现即整体短路用户配置）
-  ├─ Thread 来源：--session 恢复并修复 | 新建 uuid v7 会话文件
+  ├─ Thread 来源：--session（精确/唯一前缀）或 --continue（最近更新）恢复并修复 | 新建 uuid v7 会话文件
   ├─ Conversation::run_turn(goal)   # 内部 = reserve_start() 原子预订 → 执行链
   │    ├─ TurnRunner::run（每轮独立控制面；当前轮可取消/可转向）
   │    │    ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
@@ -50,7 +50,7 @@ sg --print|--json <goal>
   └─ 渲染：--print 只写最终文本；--json 逐行事件 + summary 行
 ```
 
-退出码：completed=0、interrupted=130（第一次 Ctrl+C 中断当前 turn；第二次强制退出）、failed=1。`--json` 的所有失败路径（含准备阶段失败）都输出 failed 终态 summary 行，保证机器解析总能看到终态。
+退出码：completed=0、interrupted=130（第一次 Ctrl+C 中断当前 turn；第二次强制退出）、failed=1。`--json` 的所有失败路径（含准备阶段失败）都输出 failed 终态 summary 行，保证机器解析总能看到终态。终态 summary 行或 `--print` 最终文本写 stdout 失败时，即使本轮已正常完成，进程也以失败退出码收敛——机器解析方不会看到缺失终态的成功退出；事件行写失败只置投影破损标志并跳过后续事件行，不改变执行事实。
 
 ### 2.1 事件流（TurnEvent 单一事实源）
 
@@ -90,6 +90,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
+- 归档：会话删除是归档保留（参照 codex rollout 的 `archived_sessions`）——在持写者锁与 live-turn 拒绝护栏下，把会话文件从 sessions 顶层 rename 进 `archived/` 子目录；列表、摘要与分页只扫描顶层 `.jsonl`，归档会话自动隐藏，重复归档按未找到收敛。协议方法名 `session/delete` 与其线格式字段不变，仅语义由物理删除改为归档。
 - 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）；合并待生效意图时 Keep 不覆盖已有意图、Set/Clear 覆盖。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。app-server 的 `thread/settings` 在排队时同步返回 `queued=true`，终态后随 `thread/settingsApplied` 事件投影——任何时刻 thread/list 与 thread/read 都只读已落盘值。
 
 ## 6. Provider 与模型
@@ -110,6 +111,8 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **滚动**：严格双态（钉底跟随 / 上翻脱离）。PgUp 或滚轮上滚会脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、End 或发送输入恢复跟随；恰好落底不恢复，需再次滚动才回到跟随（overscroll）。提交新消息后视口钉在新内容首行，回复填满一屏后自动回底（page-flip）。resize 不改变语义，只钳制位置。
 - **鼠标**：滚轮按事件间隔归一化加速（区分滚轮/触控板）并按指针位置路由——输入框内滚轮只滚动编辑区（任何编辑或光标移动立即回到跟随），会话流上滚轮滚动会话流；点击输入框按显示位置定位编辑光标；运行中点击状态行右侧 `[stop]` 中断当前轮（与 Esc 同一路径）。命中判定基于渲染帧登记的点击矩形表（`mouse.rs`，`(Rect, ClickTarget)` 对），取代文本列反查。
 - **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
+- **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行，字节上限按整字符截断并在提示行警告）；不提供括号粘贴的终端（典型为 Windows 控制台）按 burst 检测识别粘贴——高频无修饰字符流缓冲为一次粘贴，burst 内的 Enter 按换行处理不触发提交，静默间隙后整体落字。
+- **输入历史**：空闲相位且光标在可视首行时，↑/↓ 回溯本会话已提交的输入（含 steer 与 followUp 成功路径，相邻重复折叠）；回溯中任何编辑退出历史并保持当前文本，未编辑退出恢复原草稿；运行中 ↑/↓ 仍是编辑器光标移动。历史为会话内内存态，不持久化。
 - **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。
 - **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
 - **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环，截断档以 `… N more lines (Ctrl+O expand)` 出口提示。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
@@ -117,7 +120,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **状态行**：显示当前活动（思考中、等待模型、执行工具或终态收敛）、本轮经过时间、thread id、模型、token usage 与 followUp 队列计数；浏览态显示 `viewing history`。
 - **取消/退出**：Esc 中断当前轮；Ctrl+C 第一次在需要时清空输入并进入退出确认，第二次退出；输入为空时 Ctrl+D 退出。
 - **设置模态**：`/settings` 打开，Tab 切换字段，Enter 应用（空闲立即生效 / 运行中排队到下一轮），Esc 关闭；开关前后滚动位置与编辑器内容不变。reasoning 字段预填当前 effort，清空后应用即 Clear（恢复模型默认），非空则 Set 为该值。
-- **终端生命周期**：alternate screen + raw mode + 鼠标捕获；正常路径与 panic 钩子共用同一恢复实现；退出后无残留 raw/alt-screen。
+- **终端生命周期**：alternate screen + raw mode + 鼠标捕获 + bracketed paste；正常路径与 panic 钩子共用同一恢复实现；退出后无残留 raw/alt-screen/括号粘贴。
 
 ## 9. 当前维护边界
 
