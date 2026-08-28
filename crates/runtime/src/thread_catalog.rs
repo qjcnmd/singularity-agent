@@ -39,4 +39,11 @@ impl ThreadCatalog {
     pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), String> {
         crate::store::rename_thread(&self.sessions_dir, thread_id, name, &self.coordinator)
     }
+
+    /// 归档（删除）指定 Thread 的会话：语义见 [`crate::store::archive_thread`]
+    /// ——持写者锁移入 `archived/` 子目录而非物理删除，活动写者拒绝。
+    pub fn archive(&self, thread_id: &str) -> Result<(), String> {
+        crate::store::archive_thread(&self.sessions_dir, thread_id, &self.coordinator)
+            .map_err(|error| error.to_string())
+    }
 }

@@ -406,7 +406,7 @@ impl TuiApp {
             return self.handle_settings_key(key);
         }
         if self.resume.is_some() {
-            return self.handle_resume_key(key.code);
+            return self.handle_resume_key(key);
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

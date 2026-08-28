@@ -20,6 +20,12 @@ use super::view::{centered_rect, command_matches, short_id};
 /// 设置菜单提示：菜单内与状态行提示共用同一文案（行为与提示同源，防漂移）。
 pub(super) const SETTINGS_MENU_HINT: &str = "Enter apply · Tab next field · Esc close";
 
+/// 恢复菜单常规提示。
+pub(super) const RESUME_MENU_HINT: &str = "Enter resume · Ctrl+D archive · Esc close";
+
+/// 恢复菜单归档确认态提示（红色），确认态只接受 Enter/Esc。
+pub(super) const RESUME_ARCHIVE_HINT: &str = "Archive this session? Enter confirm · Esc cancel";
+
 /// 设置面板的临时编辑状态。
 pub(crate) struct SettingsMenu {
     pub(super) field: usize,
@@ -74,6 +80,23 @@ impl SettingsMenu {
 pub(crate) struct ResumeMenu {
     pub(super) threads: Vec<singularity_runtime::ThreadSummary>,
     pub(super) selected: usize,
+    /// 归档两阶段确认：`Some(thread_id)` 表示该行正等待 Enter 确认或 Esc 取消
+    /// （参照 pi `confirmingDeletePath`，session-selector.ts:64、:535-548）。
+    pub(super) confirming_delete: Option<String>,
+    /// 菜单内错误提示（如拒绝归档当前活动会话）。
+    pub(super) error: Option<String>,
+}
+
+impl ResumeMenu {
+    /// 以会话列表构造并复位确认/错误态。
+    pub(super) fn new(threads: Vec<singularity_runtime::ThreadSummary>) -> Self {
+        Self {
+            threads,
+            selected: 0,
+            confirming_delete: None,
+            error: None,
+        }
+    }
 }
 
 // =========================================================================
@@ -135,12 +158,50 @@ impl TuiApp {
 // =========================================================================
 
 impl TuiApp {
-    /// 恢复菜单激活时的键盘路由。Enter 执行换绑并关闭菜单。
-    pub(super) fn handle_resume_key(&mut self, key: KeyCode) -> Action {
+    /// 恢复菜单激活时的键盘路由。Enter 执行换绑并关闭菜单；Ctrl+D 触发归档
+    /// 两阶段确认，确认态只接受 Enter（归档）与 Esc（取消），其余键忽略
+    ///（参照 pi session-selector.ts:535-548）。
+    pub(super) fn handle_resume_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyModifiers;
         let Some(menu) = self.resume.as_mut() else {
             return Action::Continue;
         };
-        match key {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // 确认态优先：只接受 Enter 归档、Esc 取消（拦截其它键）。
+        if let Some(target) = menu.confirming_delete.clone() {
+            match key.code {
+                KeyCode::Enter => {
+                    // 先清确认态再执行，避免归档失败后仍停在确认帧。
+                    menu.confirming_delete = None;
+                    menu.error = None;
+                    match self.thread_catalog.archive(&target) {
+                        Ok(()) => {
+                            self.transcript.push_note(
+                                format!("archived session {}", short_id(&target)),
+                                NoteStyle::Accent,
+                            );
+                            // 重新拉取列表：归档的会话从目录消失（可能已空）。
+                            self.resume = match self.thread_catalog.list_threads() {
+                                Ok(threads) if !threads.is_empty() => {
+                                    Some(ResumeMenu::new(threads))
+                                }
+                                _ => None,
+                            };
+                        }
+                        Err(error) => {
+                            menu.error = Some(format!("archive failed: {error}"));
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    menu.confirming_delete = None;
+                    menu.error = None;
+                }
+                _ => {}
+            }
+            return Action::Continue;
+        }
+        match key.code {
             KeyCode::Esc => self.resume = None,
             KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
             KeyCode::Down => {
@@ -152,6 +213,18 @@ impl TuiApp {
                 if let Some(summary) = selected {
                     self.resume_thread(&summary.thread_id);
                 }
+            }
+            KeyCode::Char('d') if ctrl => {
+                let Some(target) = menu.threads.get(menu.selected) else {
+                    return Action::Continue;
+                };
+                // 拒绝归档当前活动会话（参照 pi :397-401）。
+                if target.thread_id == self.thread_id {
+                    menu.error = Some("cannot archive the active session".to_string());
+                    return Action::Continue;
+                }
+                menu.error = None;
+                menu.confirming_delete = Some(target.thread_id.clone());
             }
             _ => {}
         }
@@ -202,25 +275,37 @@ impl TuiApp {
         );
     }
 
-    /// 恢复会话菜单 Popup：可滚动的线程列表（最多 8 条）。
+    /// 恢复会话菜单 Popup：可滚动的线程列表（最多 8 条）。确认态把目标行标红，
+    /// 有错误时追加一行红色提示（参照 pi 确认行 error 着色，session-selector.ts:487-503）。
     pub(super) fn render_resume(&self, frame: &mut Frame<'_>, menu: &ResumeMenu) {
-        let height = (menu.threads.len().min(8) as u16).saturating_add(2).max(3);
+        let error_lines = usize::from(menu.error.is_some());
+        let height = (menu.threads.len().min(8) as u16)
+            .saturating_add(2 + error_lines as u16)
+            .max(3);
         let popup = centered_rect(frame.area(), 72, height);
         frame.render_widget(Clear, popup);
-        let lines = menu
+        let mut lines = menu
             .threads
             .iter()
             .take(8)
             .enumerate()
             .map(|(index, thread)| {
-                let style = if index == menu.selected {
+                let confirming = menu
+                    .confirming_delete
+                    .as_deref()
+                    .is_some_and(|target| target == thread.thread_id);
+                let style = if confirming {
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if index == menu.selected {
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
                     Style::new().fg(Color::DarkGray)
                 };
+                let marker = if confirming { "▸ " } else { "  " };
                 Line::from(Span::styled(
                     format!(
-                        "{} · {} turns · {} tokens · {}",
+                        "{}{} · {} turns · {} tokens · {}",
+                        marker,
                         short_id(&thread.thread_id),
                         thread.turn_count,
                         thread.total_tokens,
@@ -230,6 +315,12 @@ impl TuiApp {
                 ))
             })
             .collect::<Vec<_>>();
+        if let Some(error) = &menu.error {
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::new().fg(Color::Red),
+            )));
+        }
         frame.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("resume")),
             popup,
@@ -260,6 +351,139 @@ impl TuiApp {
         frame.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("commands")),
             popup,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::ResumeMenu;
+    use crate::tui::app::TuiApp;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use singularity_runtime::store::create_thread;
+    use singularity_runtime::{Conversation, TurnRunner};
+    use std::sync::Arc;
+
+    /// 固定三元组快照：不读磁盘、不经 HTTP，仅满足 Conversation/TurnRunner 构造。
+    fn snapshot() -> singularity_model::ProviderConfigSnapshot {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+        std::mem::forget(runtime);
+        singularity_model::ProviderConfigSnapshot::capture(
+            |name| match name {
+                "SINGULARITY_MODEL" => Some("base-model".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:9/v1".to_string()),
+                "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
+                _ => None,
+            },
+            handle,
+        )
+    }
+
+    fn key(code: KeyCode, ctrl: bool) -> KeyEvent {
+        KeyEvent::new(
+            code,
+            if ctrl {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            },
+        )
+    }
+
+    struct Fixture {
+        app: TuiApp,
+        active_id: String,
+        other_id: String,
+        _home: tempfile::TempDir,
+    }
+
+    /// 两个真实会话文件（活动 + 另一条）搭建可归档的 TuiApp。
+    fn fixture() -> Fixture {
+        let home = tempfile::TempDir::new().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let runner = Arc::new(TurnRunner::new(sessions.clone(), snapshot()));
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let active = create_thread(&sessions, &cwd, None, runner.coordinator()).unwrap();
+        let other = create_thread(&sessions, &cwd, None, runner.coordinator()).unwrap();
+        let active_id = active.thread_id.clone();
+        let other_id = other.thread_id;
+        Fixture {
+            app: TuiApp::new(Conversation::new(runner, active)),
+            active_id,
+            other_id,
+            _home: home,
+        }
+    }
+
+    fn open_and_select(app: &mut TuiApp, thread_id: &str) {
+        let threads = app.thread_catalog.list_threads().unwrap();
+        let mut menu = ResumeMenu::new(threads);
+        menu.selected = menu
+            .threads
+            .iter()
+            .position(|thread| thread.thread_id == thread_id)
+            .unwrap();
+        app.resume = Some(menu);
+    }
+
+    #[test]
+    fn ctrl_d_on_active_session_is_refused_without_confirming() {
+        let mut fixture = fixture();
+        open_and_select(&mut fixture.app, &fixture.active_id);
+        fixture.app.handle_resume_key(key(KeyCode::Char('d'), true));
+        let menu = fixture.app.resume.as_ref().unwrap();
+        assert!(menu.confirming_delete.is_none(), "活动会话不得进入归档确认");
+        assert!(menu.error.is_some(), "应给出拒绝提示");
+    }
+
+    #[test]
+    fn archive_requires_two_phase_confirm_and_hides_archived_thread() {
+        let mut fixture = fixture();
+        open_and_select(&mut fixture.app, &fixture.other_id);
+        // 第一次 Ctrl+D：进入确认态，尚未归档。
+        fixture.app.handle_resume_key(key(KeyCode::Char('d'), true));
+        assert_eq!(
+            fixture
+                .app
+                .resume
+                .as_ref()
+                .unwrap()
+                .confirming_delete
+                .as_deref(),
+            Some(fixture.other_id.as_str())
+        );
+        // Enter 确认：归档并从列表移除。
+        fixture.app.handle_resume_key(key(KeyCode::Enter, false));
+        let menu = fixture.app.resume.as_ref().unwrap();
+        assert!(
+            menu.threads.iter().all(|t| t.thread_id != fixture.other_id),
+            "归档后菜单不再显示该行"
+        );
+        let listed = fixture.app.thread_catalog.list_threads().unwrap();
+        assert!(
+            listed.iter().all(|t| t.thread_id != fixture.other_id),
+            "归档会话不再出现在目录列表"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_confirmation_without_archiving() {
+        let mut fixture = fixture();
+        open_and_select(&mut fixture.app, &fixture.other_id);
+        fixture.app.handle_resume_key(key(KeyCode::Char('d'), true));
+        fixture.app.handle_resume_key(key(KeyCode::Esc, false));
+        let menu = fixture.app.resume.as_ref().unwrap();
+        assert!(menu.confirming_delete.is_none(), "Esc 取消确认");
+        assert!(
+            menu.threads.iter().any(|t| t.thread_id == fixture.other_id),
+            "取消后不得归档"
         );
     }
 }

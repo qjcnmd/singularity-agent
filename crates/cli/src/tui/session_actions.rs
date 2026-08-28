@@ -111,10 +111,7 @@ impl TuiApp {
                 }
                 match self.thread_catalog.list_threads() {
                     Ok(threads) if !threads.is_empty() => {
-                        self.resume = Some(ResumeMenu {
-                            threads,
-                            selected: 0,
-                        });
+                        self.resume = Some(ResumeMenu::new(threads));
                     }
                     Ok(_) => self
                         .transcript

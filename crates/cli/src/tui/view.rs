@@ -6,7 +6,7 @@ use ratatui::text::Span;
 
 use super::app::{Phase, SPINNER_FRAMES, TuiApp};
 use super::commands::SlashCommand;
-use super::modals::SETTINGS_MENU_HINT;
+use super::modals::{RESUME_ARCHIVE_HINT, RESUME_MENU_HINT, SETTINGS_MENU_HINT};
 
 pub(super) fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
     let width = area.width.saturating_mul(percent_x) / 100;
@@ -128,8 +128,12 @@ impl TuiApp {
             "press Ctrl+C again to quit"
         } else if self.settings.is_some() {
             SETTINGS_MENU_HINT
-        } else if self.resume.is_some() {
-            "↑/↓ select · Enter resume · Esc close"
+        } else if let Some(menu) = self.resume.as_ref() {
+            if menu.confirming_delete.is_some() {
+                RESUME_ARCHIVE_HINT
+            } else {
+                RESUME_MENU_HINT
+            }
         } else {
             match self.phase {
                 Phase::Idle => {
@@ -140,7 +144,12 @@ impl TuiApp {
                 }
             }
         };
-        let hint_style = if self.quit_armed {
+        let hint_style = if self.quit_armed
+            || self
+                .resume
+                .as_ref()
+                .is_some_and(|menu| menu.confirming_delete.is_some())
+        {
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
             dim
