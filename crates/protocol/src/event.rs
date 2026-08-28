@@ -583,12 +583,6 @@ impl TurnFailureCause {
             Self::Internal => "internal",
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        self.wire_str()
-            .strip_prefix("provider_")
-            .unwrap_or_else(|| self.wire_str())
-    }
 }
 
 impl std::fmt::Display for TurnFailureCause {

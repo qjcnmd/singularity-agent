@@ -379,6 +379,49 @@ fn turn_event_wire_goldens() {
     }
 }
 
+/// `turn/error.error.{stage,cause}` 线格式词形的唯一权威表。runtime 的
+/// provider 分组映射与评估器解析都以此为终点：任一词条改名即协议破坏，
+/// 必须先经 docs §2.1 与客户端合同评审。
+#[test]
+fn failure_taxonomy_wire_words_are_stable() {
+    assert_eq!(TurnFailureStage::AgentLoop.as_str(), "agent_loop");
+    assert_eq!(
+        TurnFailureStage::TerminalOutcome.as_str(),
+        "terminal_outcome"
+    );
+    for (cause, word) in [
+        (TurnFailureCause::Store, "store"),
+        (
+            TurnFailureCause::ProjectInstructions,
+            "project_instructions",
+        ),
+        (TurnFailureCause::Workspace, "workspace"),
+        (
+            TurnFailureCause::ProviderRateLimited,
+            "provider_rate_limited",
+        ),
+        (TurnFailureCause::ProviderNetwork, "provider_network"),
+        (TurnFailureCause::ProviderTimeout, "provider_timeout"),
+        (TurnFailureCause::ProviderAuth, "provider_auth"),
+        (TurnFailureCause::ProviderValidation, "provider_validation"),
+        (TurnFailureCause::ProviderOverloaded, "provider_overloaded"),
+        (TurnFailureCause::ProviderCancelled, "provider_cancelled"),
+        (
+            TurnFailureCause::ProviderContextOverflow,
+            "provider_context_overflow",
+        ),
+        (TurnFailureCause::ProviderUnknown, "provider_unknown"),
+        (TurnFailureCause::Serialization, "serialization"),
+        (TurnFailureCause::Internal, "internal"),
+    ] {
+        assert_eq!(cause.wire_str(), word);
+        assert_eq!(cause.to_string(), word, "Display must equal wire_str");
+        let round_trip: TurnFailureCause =
+            serde_json::from_value(json!(word)).expect("wire word deserializes");
+        assert_eq!(round_trip, cause, "serde tag must equal wire_str");
+    }
+}
+
 #[test]
 fn json_rpc_payload_yields_single_message_or_invalid_marker() {
     let message =

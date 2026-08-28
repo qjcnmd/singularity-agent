@@ -76,9 +76,9 @@ pub enum AppServerError {
 /// `AppServer` 请求处理和生命周期操作使用的结果类型。
 pub type AppServerResult<T> = Result<T, AppServerError>;
 
-/// 已进入 Running Turn 的失败阶段与原因分类：直接复用 runtime 的类型化
-/// taxonomy（wire 词形在 runtime 单点定义），不在本边界复制第二套枚举。
-pub use singularity_runtime::{ProviderFailureKind, TurnFailureCause, TurnFailureStage};
+/// 已进入 Running Turn 的失败阶段与原因分类：直接复用 protocol 的类型化
+/// taxonomy（wire 词形在 protocol 单点定义），不在本边界复制第二套枚举。
+pub use singularity_runtime::{TurnFailureCause, TurnFailureStage};
 
 /// 终态补偿失败的稳定分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

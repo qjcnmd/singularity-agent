@@ -24,7 +24,7 @@ use singularity_protocol::diagnostic_code;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
-    ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
+    TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause,
 };
 use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{
@@ -512,7 +512,7 @@ fn turn_failure_cause(error: &RunnerError) -> TurnFailureCause {
     match error {
         RunnerError::Session(_) => TurnFailureCause::Store,
         RunnerError::Agent(AgentError::Provider(provider_error)) => {
-            ProviderFailureKind::from_model_error_kind(&provider_error.error.kind).into()
+            provider_turn_cause(&provider_error.error.kind)
         }
         RunnerError::Agent(_) => TurnFailureCause::Internal,
     }

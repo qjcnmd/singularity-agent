@@ -34,9 +34,7 @@ pub use conversation::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
     TurnControls, TurnReservation, compose_merged_selector,
 };
-pub use error::{
-    ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
-};
+pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 pub use events::{TurnEvent, TurnEventSink};
 pub use objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
 pub use runner::{TurnOutcome, TurnParams, TurnRunner};

@@ -1,79 +1,63 @@
 //! Turn 失败分类与运行错误。
 //!
-//! 分类与 app-server 协议层的失败 taxonomy 保持一一对应：stage 描述失败发生
-//! 的管线阶段，cause 描述失败来源，original 保留脱敏前的真实原因（对外输出
-//! 前必须经过敏感文本边界）。
+//! 失败 taxonomy（stage/cause 与线格式词形）由 protocol 单点定义、runtime
+//! 直接复用：stage 描述失败发生的管线阶段，cause 描述失败来源，original
+//! 保留脱敏前的真实原因（对外输出前必须经过敏感文本边界）。本模块只拥有
+//! model 具体失败类型到 provider cause 的分组映射。
 
 use singularity_model::ModelErrorKind;
 pub use singularity_protocol::{TurnFailureCause, TurnFailureStage};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderFailureKind {
-    RateLimited,
-    Network,
-    Timeout,
-    Auth,
-    Validation,
-    Overloaded,
-    Cancelled,
-    ContextOverflow,
-    Unknown,
-}
-
-impl ProviderFailureKind {
-    /// 基础词形（展示/内部文本）：由 [`Self::wire_str`] 派生，去掉 `provider_`
-    /// 前缀即得，避免第二份手写词形表。
-    pub fn as_str(self) -> &'static str {
-        self.wire_str()
-            .strip_prefix("provider_")
-            .unwrap_or_else(|| self.wire_str())
-    }
-
-    /// 协议线格式的稳定 cause 词形（`provider_` 前缀）——app-server 与
-    /// JSON-RPC 边界共用这一个定义，杜绝跨 crate 词表漂移。
-    pub const fn wire_str(self) -> &'static str {
-        match self {
-            Self::RateLimited => "provider_rate_limited",
-            Self::Network => "provider_network",
-            Self::Timeout => "provider_timeout",
-            Self::Auth => "provider_auth",
-            Self::Validation => "provider_validation",
-            Self::Overloaded => "provider_overloaded",
-            Self::Cancelled => "provider_cancelled",
-            Self::ContextOverflow => "provider_context_overflow",
-            Self::Unknown => "provider_unknown",
+/// Provider 失败的稳定分类：`ModelErrorKind`（12 个具体失败类型）到协议
+/// `TurnFailureCause`（9 个 provider 分类）的分组是本函数唯一拥有——线格式
+/// 词形只在 protocol 的 `TurnFailureCause::wire_str` 定义一次，本层不再
+/// 复制第二份词形表。
+pub(crate) fn provider_turn_cause(kind: &ModelErrorKind) -> TurnFailureCause {
+    use ModelErrorKind::*;
+    match kind {
+        RateLimited => TurnFailureCause::ProviderRateLimited,
+        NetworkError => TurnFailureCause::ProviderNetwork,
+        Timeout => TurnFailureCause::ProviderTimeout,
+        AuthError => TurnFailureCause::ProviderAuth,
+        InvalidRequest | JsonSchemaViolation | ContentFilter => {
+            TurnFailureCause::ProviderValidation
         }
-    }
-
-    pub fn from_model_error_kind(kind: &ModelErrorKind) -> Self {
-        use ModelErrorKind::*;
-        match kind {
-            RateLimited => Self::RateLimited,
-            NetworkError => Self::Network,
-            Timeout => Self::Timeout,
-            AuthError => Self::Auth,
-            InvalidRequest | JsonSchemaViolation | ContentFilter => Self::Validation,
-            ProviderOverloaded => Self::Overloaded,
-            Cancelled => Self::Cancelled,
-            ContextLengthExceeded => Self::ContextOverflow,
-            UnknownProviderError | UnsupportedCapability => Self::Unknown,
-        }
+        ProviderOverloaded => TurnFailureCause::ProviderOverloaded,
+        Cancelled => TurnFailureCause::ProviderCancelled,
+        ContextLengthExceeded => TurnFailureCause::ProviderContextOverflow,
+        UnknownProviderError | UnsupportedCapability => TurnFailureCause::ProviderUnknown,
     }
 }
 
-impl From<ProviderFailureKind> for TurnFailureCause {
-    fn from(kind: ProviderFailureKind) -> Self {
-        match kind {
-            ProviderFailureKind::RateLimited => Self::ProviderRateLimited,
-            ProviderFailureKind::Network => Self::ProviderNetwork,
-            ProviderFailureKind::Timeout => Self::ProviderTimeout,
-            ProviderFailureKind::Auth => Self::ProviderAuth,
-            ProviderFailureKind::Validation => Self::ProviderValidation,
-            ProviderFailureKind::Overloaded => Self::ProviderOverloaded,
-            ProviderFailureKind::Cancelled => Self::ProviderCancelled,
-            ProviderFailureKind::ContextOverflow => Self::ProviderContextOverflow,
-            ProviderFailureKind::Unknown => Self::ProviderUnknown,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ModelErrorKind::*;
+
+    /// 分组表逐行钉住：某个具体 kind 的归类变化必须先在这张表上显形
+    /// （失败归因的不变量，见仓库指令的归因条款）。`ModelErrorKind` 新增
+    /// 变体时 `provider_turn_cause` 的非穷尽 match 直接编译失败。
+    #[test]
+    fn provider_kind_groups_map_to_stable_causes() {
+        for (kind, expected) in [
+            (Cancelled, TurnFailureCause::ProviderCancelled),
+            (NetworkError, TurnFailureCause::ProviderNetwork),
+            (Timeout, TurnFailureCause::ProviderTimeout),
+            (RateLimited, TurnFailureCause::ProviderRateLimited),
+            (ProviderOverloaded, TurnFailureCause::ProviderOverloaded),
+            (AuthError, TurnFailureCause::ProviderAuth),
+            (InvalidRequest, TurnFailureCause::ProviderValidation),
+            (JsonSchemaViolation, TurnFailureCause::ProviderValidation),
+            (ContentFilter, TurnFailureCause::ProviderValidation),
+            (
+                ContextLengthExceeded,
+                TurnFailureCause::ProviderContextOverflow,
+            ),
+            (UnsupportedCapability, TurnFailureCause::ProviderUnknown),
+            (UnknownProviderError, TurnFailureCause::ProviderUnknown),
+        ] {
+            assert_eq!(provider_turn_cause(&kind), expected, "kind {kind:?}");
         }
     }
 }

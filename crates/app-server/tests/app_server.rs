@@ -56,16 +56,17 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
     // 的唯一合同点。
     let started_note = process
         .output
-        .recv_where(Duration::from_secs(5), |m| {
-            m["method"] == "thread/started"
-        });
+        .recv_where(Duration::from_secs(5), |m| m["method"] == "thread/started");
     assert_eq!(started_note["jsonrpc"], "2.0");
     assert!(
         started_note.get("id").is_none(),
         "notification must carry no id: {started_note}"
     );
     assert_eq!(started_note["params"]["thread"]["threadId"], thread_id);
-    assert_eq!(started_note["params"]["thread"]["lastTurnStatus"], Value::Null);
+    assert_eq!(
+        started_note["params"]["thread"]["lastTurnStatus"],
+        Value::Null
+    );
     let mut thread_keys: Vec<&str> = started_note["params"]["thread"]
         .as_object()
         .expect("thread object")
