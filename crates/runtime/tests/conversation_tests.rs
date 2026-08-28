@@ -1404,3 +1404,33 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         resume_thread(&sessions, thread_id, &coordinator(&sessions)).expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
 }
+
+/// 状态锁中毒后全部公共 API 按 fail-closed 收敛。
+#[test]
+fn state_lock_poison_fails_closed() {
+    let sessions = temp_sessions();
+    let conversation = new_conversation(sessions.path(), Arc::new(PanickingProvider), None);
+    let guard = Arc::clone(&conversation);
+
+    // 毒化 state Mutex：在线程中持锁后 panic。
+    let handle = std::thread::spawn(move || {
+        guard.poison_state_lock();
+    });
+    handle.join().unwrap_err();
+
+    // 读路径：中毒按 busy/None 收敛。
+    assert!(conversation.has_active_turn(), "poisoned → busy");
+    assert_eq!(conversation.active_turn_id(), None, "poisoned → None");
+
+    // 写路径：中毒按 false/Err 拒绝。
+    assert!(!conversation.steer("test"), "poisoned → false");
+    assert!(!conversation.submit_follow_up("test"), "poisoned → false");
+
+    // lock_state() fail-loud：直接返回中毒错误。
+    match conversation.thread() {
+        Err(crate::ConversationError::State(msg)) => {
+            assert!(msg.contains("poisoned"), "fail-loud: {msg}");
+        }
+        other => panic!("expected State poisoned, got {other:?}"),
+    }
+}

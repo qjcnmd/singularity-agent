@@ -9,6 +9,24 @@
 //!   到达可信终态后按提交顺序自动启动为一个新的 turn，每条恰好执行一次；
 //! - 设置生效时序：活动 turn 期间的变更只记录一份待生效意图，turn 终态收敛
 //!   后由本对象自动校验并持久化，调用方无需手动提取或应用。
+//!
+//! # 锁中毒策略
+//!
+//! 本模块统一采用 fail-closed：`self.state` 持有的 `Mutex` 中毒 = 状态未知，
+//! 所有写路径拒绝更改（保持原状或返回错误），所有读路径按 busy/None 收敛，
+//! 绝不静默当成功或丢失数据。具体表现在：
+//!
+//! - `lock_state()`（公开 fail-loud）直接向上传播中毒错误。
+//! - `release_reservation`（Drop 上下文，无法传播错误）保持窗口不释放，
+//!   使链窗口永久 busy，阻止后续写入。
+//! - `submit_follow_up`、`steer`、`active_controls`、`active_turn_id`：
+//!   中毒时按无活动 turn 收敛（返回 false/None），阻止后续输入接受。
+//! - `requeue_follow_ups`：中毒时向上传播错误，不静默丢弃 followUp 输入。
+//! - `register_inbox`、`close_inbox`：中毒时跳过操作，`steer` 全程 false
+//!   （fail-closed）；`close_inbox` 是 Agent 收口已关闭后的二次保险，
+//!   跳过不影响正确性。
+//! - `pending_follow_ups`、`withdraw_follow_up`：读路径按空返回，不展示
+//!   可能已损坏的数据。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -105,6 +123,8 @@ impl TurnControls {
     /// 把转向输入注入当前 turn；turn 已关闭注入窗口时返回 false。
     pub fn steer(&self, text: impl Into<String>) -> bool {
         let Ok(guard) = self.inbox.lock() else {
+            // 锁中毒（状态未知）→ 拒绝注入，fail-closed：不把输入写进
+            // 可能已损坏的收件箱，调用方按注入失败处理。
             return false;
         };
         guard.as_ref().is_some_and(|inbox| {
@@ -115,6 +135,8 @@ impl TurnControls {
     }
 
     pub(crate) fn register_inbox(&self, turn_id: &str, inbox: TurnInboxHandle) {
+        // 锁中毒（状态未知）→ 跳过注册，注入窗口保持未开，后续 steer 全程
+        // false（fail-closed）；不把句柄写进可能已损坏的字段。
         if let Ok(mut id) = self.turn_id.lock() {
             *id = turn_id.to_string();
         }
@@ -124,6 +146,8 @@ impl TurnControls {
     }
 
     pub(crate) fn close_inbox(&self) {
+        // 锁中毒（状态未知）→ 跳过关闭；此方法是 Agent 收口关闭之后的
+        // 二次保险（runner 的 abort/fail 路径已关 inbox），跳过不影响正确性。
         if let Ok(mut guard) = self.inbox.lock() {
             *guard = None;
         }
@@ -245,6 +269,8 @@ impl Conversation {
         if let Ok(mut state) = self.state.lock() {
             state.turn = TurnLifecycle::Idle;
         }
+        // 锁中毒（状态未知）时保持窗口不释放：链窗口永久 busy = fail-closed，
+        // 宁可让后续预订与提交被拒，也不在状态损坏时静默放行写入。
     }
 
     pub fn runner(&self) -> &TurnRunner {
@@ -279,6 +305,8 @@ impl Conversation {
 
     /// 当前 turn id；预订阶段与空闲阶段均无活动 turn。
     pub fn active_turn_id(&self) -> Option<String> {
+        // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
+        // 的「中毒按 busy」同向：读路径不泄露可能损坏的状态。
         self.state.lock().ok().and_then(|state| match &state.turn {
             TurnLifecycle::Running(controls) => controls.turn_id.lock().ok().map(|id| id.clone()),
             TurnLifecycle::Idle | TurnLifecycle::Reserved => None,
@@ -300,6 +328,8 @@ impl Conversation {
             return false;
         }
         let Ok(mut state) = self.state.lock() else {
+            // 锁中毒（状态未知）→ 拒绝接受，fail-closed：不把输入写进
+            // 可能已损坏的队列，调用方按未接受处理。
             return false;
         };
         if !state.turn.is_busy() {
@@ -457,7 +487,7 @@ impl Conversation {
                 ) {
                     queue.push_front(current);
                 }
-                self.requeue_follow_ups(queue);
+                self.requeue_follow_ups(queue)?;
                 return step;
             }
             // 成功应用后发布投影更新：客户端据此拿到下一 turn 生效的
@@ -466,7 +496,8 @@ impl Conversation {
             let applied = match self.apply_pending_settings() {
                 Ok(applied) => applied,
                 Err(error) => {
-                    self.requeue_follow_ups(queue);
+                    // requeue 失败（锁中毒）比 settings 持久化更根本，优先传播。
+                    self.requeue_follow_ups(queue)?;
                     return Err(error);
                 }
             };
@@ -586,6 +617,8 @@ impl Conversation {
     }
 
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
+        // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
+        // 的「中毒按 busy」同向：读路径不泄露可能损坏的控制面。
         self.state
             .lock()
             .ok()
@@ -606,15 +639,18 @@ impl Conversation {
         }
     }
 
-    fn requeue_follow_ups(&self, inputs: VecDeque<String>) {
+    /// 把未执行的 followUp 输入放回队列（与队列中已有输入合并，输入在前）。
+    /// 锁中毒时向上传播错误，不静默丢弃输入：保证「每条 followUp 恰好执行
+    /// 一次」不变量可观察（调用方在错误路径上合并该失败）。
+    fn requeue_follow_ups(&self, inputs: VecDeque<String>) -> Result<(), ConversationError> {
         if inputs.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Ok(mut state) = self.state.lock() {
-            let mut merged = inputs;
-            merged.extend(state.pending_follow_ups.drain(..));
-            state.pending_follow_ups = merged;
-        }
+        let mut state = self.lock_state()?;
+        let mut merged = inputs;
+        merged.extend(state.pending_follow_ups.drain(..));
+        state.pending_follow_ups = merged;
+        Ok(())
     }
 
     fn lock_state(
@@ -623,6 +659,15 @@ impl Conversation {
         self.state
             .lock()
             .map_err(|_| ConversationError::State("conversation state poisoned".to_string()))
+    }
+
+    /// 毒化 `self.state` 供测试验证 fail-closed 行为。
+    #[cfg(test)]
+    pub(crate) fn poison_state_lock(&self) {
+        // 测试专用：若锁已中毒则直接 panic，不掩盖测试意图。
+        #[allow(clippy::expect_used)]
+        let _guard = self.state.lock().expect("lock poisoned");
+        panic!("intentional poison for test");
     }
 }
 
