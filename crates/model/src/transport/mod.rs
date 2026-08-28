@@ -42,6 +42,12 @@ struct CompletionContext {
     api_protocol: ProviderApiProtocol,
 }
 
+struct HttpFailure {
+    model_error: ModelError,
+    retry_after: Option<Duration>,
+    provider_diagnostic: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 enum ProtocolAdapter {
     Chat,
@@ -705,59 +711,12 @@ impl OpenAiProvider {
         };
 
         let status = response.status();
-        let status_code = status.as_u16();
         if !status.is_success() {
-            let retry_after = retry_after_delay(response.headers());
-            let error_body = read_bounded_provider_response_body(
-                runtime,
-                cancellation,
-                self.request_timeout_seconds,
-                response,
-            )
-            .ok();
-            let error_fields = error_body.as_deref().map(parse_provider_error_body);
-            let context_length_exceeded = is_context_length_exceeded_code(
-                error_fields
-                    .as_ref()
-                    .and_then(|fields| fields.code.as_deref()),
-            );
-            let model_error = if context_length_exceeded {
-                let mut context_error = ModelError::new(
-                    ModelErrorKind::ContextLengthExceeded,
-                    "provider rejected the request: context length exceeded",
-                )
-                .with_provider(self.config.provider_name.clone())
-                .with_model(model_name.to_string())
-                .with_provider_diagnostic(
-                    "provider_context_length_exceeded",
-                    ProviderErrorStage::ResponseStatus,
-                );
-                context_error.http_status = Some(status_code);
-                context_error
-            } else {
-                model_error_from_http_status(status_code, &self.config.provider_name, model_name)
-            };
-            let provider_diagnostic = if context_length_exceeded {
-                None
-            } else {
-                error_fields
-                    .as_ref()
-                    .and_then(|fields| fields.message.as_deref())
-                    .map(|message| bounded_provider_error_diagnostic(message, &self.config.api_key))
-                    .or_else(|| {
-                        error_body.as_deref().map(|body| {
-                            bounded_provider_error_diagnostic(
-                                &String::from_utf8_lossy(body),
-                                &self.config.api_key,
-                            )
-                        })
-                    })
-                    .filter(|diagnostic| !diagnostic.is_empty())
-            };
-            record_provider_attempt(occurrence, Some(&model_error), None, on_attempt);
-            let mut error =
-                ProviderError::from_model_error(model_error).with_retry_after(retry_after);
-            if let Some(diagnostic) = provider_diagnostic {
+            let failure = self.classify_http_failure(response, cancellation, model_name);
+            record_provider_attempt(occurrence, Some(&failure.model_error), None, on_attempt);
+            let mut error = ProviderError::from_model_error(failure.model_error)
+                .with_retry_after(failure.retry_after);
+            if let Some(diagnostic) = failure.provider_diagnostic {
                 // 追加到内层 message：Display 与重试诊断都从单一内层文案读取。
                 error.error.message.push_str(" Provider diagnostic: ");
                 error.error.message.push_str(&diagnostic);
@@ -794,6 +753,67 @@ impl OpenAiProvider {
                 record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 Err(error.without_automatic_retry())
             }
+        }
+    }
+
+    fn classify_http_failure(
+        &self,
+        response: reqwest::Response,
+        cancellation: &CancellationToken,
+        model_name: &str,
+    ) -> HttpFailure {
+        let status_code = response.status().as_u16();
+        let retry_after = retry_after_delay(response.headers());
+        let error_body = read_bounded_provider_response_body(
+            &self.runtime,
+            cancellation,
+            self.request_timeout_seconds,
+            response,
+        )
+        .ok();
+        let error_fields = error_body.as_deref().map(parse_provider_error_body);
+        let context_length_exceeded = is_context_length_exceeded_code(
+            error_fields
+                .as_ref()
+                .and_then(|fields| fields.code.as_deref()),
+        );
+        let model_error = if context_length_exceeded {
+            let mut context_error = ModelError::new(
+                ModelErrorKind::ContextLengthExceeded,
+                "provider rejected the request: context length exceeded",
+            )
+            .with_provider(self.config.provider_name.clone())
+            .with_model(model_name.to_string())
+            .with_provider_diagnostic(
+                "provider_context_length_exceeded",
+                ProviderErrorStage::ResponseStatus,
+            );
+            context_error.http_status = Some(status_code);
+            context_error
+        } else {
+            model_error_from_http_status(status_code, &self.config.provider_name, model_name)
+        };
+        let provider_diagnostic = if context_length_exceeded {
+            None
+        } else {
+            error_fields
+                .as_ref()
+                .and_then(|fields| fields.message.as_deref())
+                .map(|message| bounded_provider_error_diagnostic(message, &self.config.api_key))
+                .or_else(|| {
+                    error_body.as_deref().map(|body| {
+                        bounded_provider_error_diagnostic(
+                            &String::from_utf8_lossy(body),
+                            &self.config.api_key,
+                        )
+                    })
+                })
+                .filter(|diagnostic| !diagnostic.is_empty())
+        };
+        HttpFailure {
+            model_error,
+            retry_after,
+            provider_diagnostic,
         }
     }
 }
