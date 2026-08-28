@@ -10,8 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use singularity_agent::agent::{
-    Agent, AgentConfig, AgentDiagnosticSeverity as LoopDiagnosticSeverity, AgentError, AgentEvent,
-    AgentEvents, AgentOutcome, AgentTerminalReason,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, AgentOutcome, AgentTerminalReason,
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::message::{AgentMessageRole, ContentBlock};
@@ -20,10 +19,7 @@ use singularity_agent::session::{
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
-use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderAttemptEvent,
-    ProviderAttemptStatus as ModelProviderAttemptStatus, ProviderConfigSnapshot,
-};
+use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::diagnostic_code;
 use uuid::Uuid;
 
@@ -31,9 +27,7 @@ use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
     ProviderFailureKind, TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError,
 };
-use crate::events::{
-    AgentDiagnosticSeverity, ProviderAttemptStatus, TurnErrorDetail, TurnEvent, TurnEventSink,
-};
+use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{
     ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage,
 };
@@ -52,8 +46,6 @@ pub struct TurnParams {
 /// 这里只运行 AgentLoop 并实时映射事件。
 struct AgentRunContext<'a> {
     agent: &'a mut Agent,
-    thread: &'a Thread,
-    turn_id: &'a str,
     input_text: &'a str,
     cancellation: &'a CancellationToken,
     item_events: &'a mut AssistantItemEvents,
@@ -303,8 +295,6 @@ impl TurnRunner {
         );
         let run_result = self.run_agent_core(AgentRunContext {
             agent: &mut agent,
-            thread: &thread,
-            turn_id: &turn_id,
             input_text: &params.input,
             cancellation: &controls.cancellation,
             item_events: &mut item_events,
@@ -463,8 +453,6 @@ impl TurnRunner {
     fn run_agent_core(&self, context: AgentRunContext<'_>) -> Result<RunStatus, RunnerError> {
         let AgentRunContext {
             agent,
-            thread,
-            turn_id,
             input_text,
             cancellation,
             item_events,
@@ -472,84 +460,7 @@ impl TurnRunner {
         } = context;
         let run_result = {
             let mut events = AgentEvents::new();
-            let mut on_event = |event: AgentEvent| match event {
-                AgentEvent::MessageUpdate { delta } => {
-                    item_events.project_assistant_delta(sink, &delta);
-                }
-                AgentEvent::ToolExecutionStarted {
-                    tool_name,
-                    tool_call_id,
-                    arguments,
-                } => {
-                    item_events.start_tool_item(&tool_call_id);
-                    sink.emit(TurnEvent::ItemStarted {
-                        thread_id: thread.thread_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        item_id: tool_call_id.clone(),
-                    });
-                    sink.emit(TurnEvent::ToolExecutionStart {
-                        thread_id: thread.thread_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        tool_call_id,
-                        tool_name,
-                        args: arguments,
-                    });
-                }
-                AgentEvent::ToolExecutionUpdate {
-                    tool_name,
-                    tool_call_id,
-                    arguments,
-                    partial_result,
-                } => {
-                    sink.emit(TurnEvent::ToolExecutionUpdate {
-                        thread_id: thread.thread_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        tool_call_id,
-                        tool_name,
-                        args: arguments,
-                        partial_result,
-                    });
-                }
-                AgentEvent::ToolExecutionEnded {
-                    tool_name,
-                    tool_call_id,
-                    execution,
-                } => {
-                    sink.emit(TurnEvent::ToolExecutionEnd {
-                        thread_id: thread.thread_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name,
-                        result: execution.content,
-                        is_error: execution.is_error,
-                    });
-                    item_events.emit_tool_terminal(sink, &tool_call_id, execution.is_error);
-                }
-                AgentEvent::Diagnostic(diagnostic) => {
-                    sink.emit(TurnEvent::Diagnostic {
-                        thread_id: thread.thread_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        severity: match diagnostic.severity {
-                            LoopDiagnosticSeverity::Info => AgentDiagnosticSeverity::Info,
-                            LoopDiagnosticSeverity::Warning => AgentDiagnosticSeverity::Warning,
-                            LoopDiagnosticSeverity::Error => AgentDiagnosticSeverity::Error,
-                        },
-                        code: diagnostic.code,
-                        message: diagnostic.message,
-                    });
-                }
-                AgentEvent::ProviderAttempt {
-                    model_turn_ordinal,
-                    event,
-                } => {
-                    sink.emit(provider_attempt_event(
-                        thread,
-                        turn_id,
-                        model_turn_ordinal,
-                        &event,
-                    ));
-                }
-            };
+            let mut on_event = |event: AgentEvent| item_events.project(sink, event);
             events.on_event = Some(&mut on_event);
             agent.run(input_text, &mut events, cancellation)
         };
@@ -721,55 +632,6 @@ fn workspace_path(thread: &Thread) -> Result<String, String> {
         return Err("thread does not have an absolute workspace".to_string());
     }
     Ok(thread.cwd.clone())
-}
-
-fn provider_attempt_event(
-    thread: &Thread,
-    turn_id: &str,
-    model_turn_ordinal: u32,
-    attempt: &ProviderAttemptEvent,
-) -> TurnEvent {
-    match attempt {
-        ProviderAttemptEvent::Started(started) => TurnEvent::ProviderAttempt {
-            thread_id: thread.thread_id.clone(),
-            turn_id: turn_id.to_string(),
-            model_turn_ordinal,
-            provider: started.provider_name.clone(),
-            model: started.model_name.clone(),
-            protocol: enum_wire_word(started.actual_api_protocol),
-            status: ProviderAttemptStatus::Started,
-            attempt_duration_ms: None,
-            error_category: None,
-            diagnostic_code: None,
-        },
-        ProviderAttemptEvent::Finished(occurrence) => TurnEvent::ProviderAttempt {
-            thread_id: thread.thread_id.clone(),
-            turn_id: turn_id.to_string(),
-            model_turn_ordinal,
-            provider: occurrence.provider_name.clone(),
-            model: occurrence.model_name.clone(),
-            protocol: enum_wire_word(occurrence.actual_api_protocol),
-            status: match occurrence.terminal_status {
-                ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
-                ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
-                ModelProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
-            },
-            attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-            error_category: occurrence.error_category.clone().map(enum_wire_word),
-            diagnostic_code: occurrence.diagnostic_code.clone(),
-        },
-    }
-}
-
-fn enum_wire_word(value: impl serde::Serialize) -> String {
-    // 不变量：调用方传入的均为本仓静态 enum（ProviderApiProtocol/ModelErrorCategory），
-    // 序列化仅在其类型定义错误时失败；失败即 panic（fail-loud），不降级为 "unknown"。
-    #[allow(clippy::expect_used)]
-    serde_json::to_value(value)
-        .expect("enum wire word serializes")
-        .as_str()
-        .map(str::to_string)
-        .expect("enum wire word is a string")
 }
 
 /// 准备阶段失败：分类 + 真实原因文本（对外前仍需敏感边界）。
