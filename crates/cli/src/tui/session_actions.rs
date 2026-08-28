@@ -7,10 +7,9 @@
 
 use std::sync::Arc;
 
-use singularity_core::CancellationToken;
 use singularity_runtime::{CompactionOutcome, Conversation, Thread, TurnRunner};
 
-use super::app::{Phase, TuiApp, WaitingTarget};
+use super::app::{CompactionState, Phase, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::scroll::ScrollState;
@@ -25,9 +24,7 @@ impl TuiApp {
         self.waiting = WaitingTarget::None;
         self.waiting_since = None;
         self.turn_started_at = None;
-        self.compacting = false;
-        self.compact_cancel = None;
-        self.compact_queued = false;
+        self.compaction = CompactionState::default();
         self.settings = None;
         self.resume = None;
     }
@@ -172,25 +169,23 @@ impl TuiApp {
                 }
             }
             SlashCommand::Compact => {
-                if self.compacting {
+                if self.compaction.is_running() {
                     self.transcript
                         .push_note("compaction already in progress", NoteStyle::Dim);
-                } else if self.compact_queued {
+                } else if self.compaction.is_queued() {
                     self.transcript
                         .push_note("compaction already queued", NoteStyle::Dim);
                 } else if self.conversation.has_active_turn() {
                     // 活动 turn 期间排队，turn 到达终态后由
                     // `on_chain_finished` 自动启动压缩（与 pi 的
                     // "waiting until idle" 语义一致）。
-                    self.compact_queued = true;
+                    self.compaction.queue();
                     self.transcript.push_note(
                         "compaction queued; will run when the turn finishes",
                         NoteStyle::Dim,
                     );
                 } else {
-                    self.compacting = true;
-                    let cancellation = CancellationToken::new();
-                    self.compact_cancel = Some(cancellation.clone());
+                    let cancellation = self.compaction.start();
                     self.transcript
                         .push_note("compacting context…", NoteStyle::Dim);
                     return Action::Compact(cancellation);
@@ -245,19 +240,14 @@ impl TuiApp {
     /// 压缩进行中取消本次压缩：触发令牌取消；收尾文案由
     /// [`TuiApp::on_compact_finished`] 统一给出。
     pub(super) fn cancel_compact(&mut self) {
-        if let Some(token) = self.compact_cancel.as_ref() {
+        if let CompactionState::Running(token) = &self.compaction {
             token.cancel();
         }
     }
 
     /// 压缩线程完成回调：复位压缩状态并把结果投影为会话流 note。
     pub(super) fn on_compact_finished(&mut self, result: Result<CompactionOutcome, String>) {
-        self.compacting = false;
-        let cancelled = self
-            .compact_cancel
-            .take()
-            .map(|token| token.is_cancelled())
-            .unwrap_or(false);
+        let cancelled = self.compaction.finish();
         match result {
             Ok(CompactionOutcome::Compacted { tokens_before, .. }) => self.transcript.push_note(
                 format!("context compacted from {tokens_before} estimated tokens"),

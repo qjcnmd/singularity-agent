@@ -113,7 +113,7 @@ impl TuiApp {
             status.push(Span::styled(" · viewing history", magenta));
         }
         // 压缩进行中显示可见指示（后台执行，界面持续渲染）。
-        if self.compacting {
+        if self.compaction.is_running() {
             status.push(Span::styled(" · compacting…", warn));
         }
         // 运行中显示可点击的 [stop]（点击 = 中断，参照 Grok 的 turn-status）。

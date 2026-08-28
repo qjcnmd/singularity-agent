@@ -33,6 +33,51 @@ pub(crate) enum Phase {
     Running,
 }
 
+/// /compact 的唯一状态源。排队与运行态互斥，运行态自带本次操作的取消令牌。
+#[derive(Debug)]
+pub(super) enum CompactionState {
+    Idle,
+    Queued,
+    Running(singularity_core::CancellationToken),
+}
+
+impl Default for CompactionState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl CompactionState {
+    pub(super) fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+
+    pub(super) fn is_queued(&self) -> bool {
+        matches!(self, Self::Queued)
+    }
+
+    pub(super) fn queue(&mut self) {
+        debug_assert!(matches!(self, Self::Idle));
+        *self = Self::Queued;
+    }
+
+    pub(super) fn start(&mut self) -> singularity_core::CancellationToken {
+        debug_assert!(!self.is_running());
+        let cancellation = singularity_core::CancellationToken::new();
+        *self = Self::Running(cancellation.clone());
+        cancellation
+    }
+
+    pub(super) fn start_if_queued(&mut self) -> Option<singularity_core::CancellationToken> {
+        self.is_queued().then(|| self.start())
+    }
+
+    pub(super) fn finish(&mut self) -> bool {
+        let previous = std::mem::take(self);
+        matches!(previous, Self::Running(token) if token.is_cancelled())
+    }
+}
+
 /// 当前正在等待的对象：驱动状态行的具名活动提示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum WaitingTarget {
@@ -112,11 +157,8 @@ pub(crate) struct TuiApp {
     pub(super) frame: FrameCache,
     /// 滚轮归一化状态（滚轮/触控板加速）。
     pub(super) wheel: WheelNormalizer,
-    /// /compact 后台压缩进行中；Esc 通过 `compact_cancel` 中止本次压缩。
-    pub(super) compacting: bool,
-    pub(super) compact_cancel: Option<singularity_core::CancellationToken>,
-    /// /compact 排队中：活动 turn 结束后自动启动压缩。
-    pub(super) compact_queued: bool,
+    /// /compact 的排队、运行和取消状态。
+    pub(super) compaction: CompactionState,
 }
 
 impl TuiApp {
@@ -144,9 +186,7 @@ impl TuiApp {
             session_tokens: None,
             frame: FrameCache::default(),
             wheel: WheelNormalizer::default(),
-            compacting: false,
-            compact_cancel: None,
-            compact_queued: false,
+            compaction: CompactionState::default(),
         }
     }
 
@@ -282,11 +322,7 @@ impl TuiApp {
             }
         }
         // 排队压缩在 turn 终态后自动启动（复用同一压缩路径与取消令牌）。
-        if self.compact_queued {
-            self.compact_queued = false;
-            self.compacting = true;
-            let cancellation = singularity_core::CancellationToken::new();
-            self.compact_cancel = Some(cancellation.clone());
+        if let Some(cancellation) = self.compaction.start_if_queued() {
             self.transcript
                 .push_note("compacting context…", NoteStyle::Dim);
             return Action::Compact(cancellation);
@@ -369,10 +405,10 @@ impl TuiApp {
                 }
                 self.request_interrupt();
                 // 压缩进行中：Esc 取消本次压缩（与中断同一按键语义）。
-                if self.compacting {
+                if self.compaction.is_running() {
                     self.cancel_compact();
-                } else if self.compact_queued {
-                    self.compact_queued = false;
+                } else if self.compaction.is_queued() {
+                    self.compaction = CompactionState::Idle;
                     self.transcript
                         .push_note("compaction cancelled", NoteStyle::Warning);
                 }
@@ -436,7 +472,7 @@ impl TuiApp {
         // 压缩持有一致性写窗口：完成前不接受新输入（否则误报
         // TurnAlreadyActive 一类晦涩错误）；Esc 可取消。检查必须在
         // editor.take() 之前，保证被拒时草稿保留在原处。
-        if self.compacting {
+        if self.compaction.is_running() {
             self.transcript.push_note(
                 "compaction in progress; finish or press Esc to cancel",
                 NoteStyle::Warning,
@@ -646,5 +682,38 @@ impl TuiApp {
         if cursor_y < editor_area.y.saturating_add(editor_area.height) {
             frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, cursor_y));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompactionState;
+
+    #[test]
+    fn compaction_state_transitions_are_exclusive() {
+        let mut state = CompactionState::default();
+        assert!(!state.is_running());
+        assert!(!state.is_queued());
+
+        state.queue();
+        assert!(!state.is_running());
+        assert!(state.is_queued());
+
+        let cancellation = state.start_if_queued().expect("queued compaction starts");
+        assert!(state.is_running());
+        assert!(!state.is_queued());
+        assert!(!cancellation.is_cancelled());
+        assert!(!state.finish());
+        assert!(matches!(state, CompactionState::Idle));
+    }
+
+    #[test]
+    fn finishing_a_cancelled_compaction_reports_cancellation() {
+        let mut state = CompactionState::default();
+        let cancellation = state.start();
+        cancellation.cancel();
+
+        assert!(state.finish());
+        assert!(matches!(state, CompactionState::Idle));
     }
 }
