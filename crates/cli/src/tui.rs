@@ -24,6 +24,7 @@ mod commands;
 mod editor;
 mod modals;
 mod mouse;
+mod paste_burst;
 mod scroll;
 mod session_actions;
 mod transcript;
@@ -122,13 +123,17 @@ pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> I
 fn enter_terminal() -> std::io::Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::event::{
-        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     };
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
+    // 括号粘贴：支持方把粘贴作为单一 Paste 事件送达，Windows 控制台等
+    // 不支持方退回 burst 检测兜底（见 paste_burst 模块）。尽力而为。
+    let _ = stdout.execute(EnableBracketedPaste);
     // 键盘增强：让 Shift+Enter / Ctrl+J 等在真实终端以带修饰符的 CSI-u 序列
     // 到达。尽力而为：Windows 控制台键记录天然携带修饰键，不受影响；不支持
     // 的主机只退回无增强模式，不阻断终端启动。
@@ -141,12 +146,15 @@ fn enter_terminal() -> std::io::Result<()> {
 
 fn restore_terminal() -> std::io::Result<()> {
     use crossterm::ExecutableCommand;
-    use crossterm::event::{DisableMouseCapture, PopKeyboardEnhancementFlags};
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+    };
     use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
     // 幂等：任一步失败继续其余步骤，保证退出路径尽量恢复。
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
     let _ = stdout.execute(PopKeyboardEnhancementFlags);
+    let _ = stdout.execute(DisableBracketedPaste);
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.flush();
@@ -268,6 +276,10 @@ fn event_loop(
                     }
                     Action::Exit(code) => return Ok(code),
                 },
+                Ok(crossterm::event::Event::Paste(text)) => {
+                    // 括号粘贴事件：CRLF/CR 归一并整段插入（burst 状态清空）。
+                    app.handle_paste(text);
+                }
                 Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
                     crossterm::event::MouseEventKind::ScrollUp => {
                         app.handle_wheel(true, mouse.column, mouse.row)
@@ -286,6 +298,9 @@ fn event_loop(
                 _ => {}
             }
         }
+
+        // 每帧推进 burst 静默超时：把已缓冲的粘贴整体落地。
+        app.flush_paste_burst_if_due(Instant::now());
 
         if last_spinner_tick.elapsed() >= SPINNER_TICK {
             app.tick();

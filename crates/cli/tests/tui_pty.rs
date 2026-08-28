@@ -104,6 +104,10 @@ impl PtySession {
             base_url.unwrap_or("http://127.0.0.1:9/v1"),
         );
         builder.env("SINGULARITY_API_KEY", "tui-pty-test-placeholder");
+        // PTY 注入整串按键在 ConPTY 上被聚合送达，等效于「粘贴」，会触发
+        // TUI 的 paste-burst 检测（真实打字有自然间隔不会触发）；测试断言
+        // 以按键为语义，故经逃生舱关闭 burst 检测（codex 同款开关）。
+        builder.env("SINGULARITY_DISABLE_PASTE_BURST", "1");
         builder.cwd(std::env::current_dir().expect("cwd"));
         builder.env("TERM", "xterm-256color");
         Self::spawn_program(builder, Some(home))

@@ -89,6 +89,75 @@ impl Editor {
         self.col = 0;
     }
 
+    /// 在光标处插入整段文本；内部 `\n` 拆成多行。粘贴与 burst flush 共用。
+    pub fn insert_str(&mut self, text: &str) {
+        self.scroll_override = None;
+        let mut parts = text.split('\n').peekable();
+        // 首段并入当前行光标处。
+        if let Some(first) = parts.next()
+            && !first.is_empty()
+        {
+            let line = &mut self.lines[self.row];
+            let byte = char_to_byte(line, self.col);
+            line.insert_str(byte, first);
+            self.col += first.chars().count();
+        }
+        // 后续每段前先拆行，再写入新行。
+        for part in parts {
+            self.insert_newline();
+            if !part.is_empty() {
+                let line = &mut self.lines[self.row];
+                line.insert_str(0, part);
+                self.col = part.chars().count();
+            }
+        }
+    }
+
+    /// 光标前的完整文本（含行间换行），供粘贴回抓判定。
+    pub fn text_before_cursor(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines[..self.row] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        let current = &self.lines[self.row];
+        let byte = char_to_byte(current, self.col);
+        out.push_str(&current[..byte]);
+        out
+    }
+
+    /// 从光标前删除 `count` 个字符（跨行），返回被删文本（正序）。
+    /// 用于粘贴 burst 回抓：把已按普通输入插入的字符移入缓冲。
+    pub fn delete_chars_before_cursor(&mut self, count: usize) -> String {
+        self.scroll_override = None;
+        let mut removed = Vec::new();
+        let mut remaining = count;
+        while remaining > 0 && (self.row > 0 || self.col > 0) {
+            if self.col > 0 {
+                let line = &mut self.lines[self.row];
+                let byte = char_to_byte(line, self.col - 1);
+                // 不变量：col 是有效字符边界，byte 处恒有字符。
+                #[allow(clippy::expect_used)]
+                let ch = line[byte..]
+                    .chars()
+                    .next()
+                    .expect("cursor char boundary is valid");
+                removed.push(ch);
+                line.remove(byte);
+                self.col -= 1;
+            } else {
+                // 行首：删除上一行行尾换行（合并行）。
+                let tail = self.lines.remove(self.row);
+                self.row -= 1;
+                self.col = self.lines[self.row].chars().count();
+                self.lines[self.row].push_str(&tail);
+                removed.push('\n');
+            }
+            remaining -= 1;
+        }
+        removed.into_iter().rev().collect()
+    }
+
     pub fn backspace(&mut self) {
         self.scroll_override = None;
         if self.col > 0 {
@@ -249,4 +318,65 @@ fn char_to_byte(line: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(byte, _)| byte)
         .unwrap_or(line.len())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::Editor;
+
+    #[test]
+    fn insert_str_at_cursor_splits_lines() {
+        let mut editor = Editor::new();
+        editor.insert_str("ab\ncd");
+        assert_eq!(editor.text(), "ab\ncd");
+        assert_eq!(editor.row, 1);
+        assert_eq!(editor.col, 2);
+    }
+
+    #[test]
+    fn insert_str_into_middle_of_existing_text() {
+        let mut editor = Editor::new();
+        editor.insert_str("hello");
+        editor.move_home();
+        editor.insert_str("X\nY");
+        assert_eq!(editor.text(), "X\nYhello");
+    }
+
+    #[test]
+    fn insert_str_handles_trailing_newline_and_wide_chars() {
+        let mut editor = Editor::new();
+        editor.insert_str("中\n文\n");
+        assert_eq!(editor.text(), "中\n文\n");
+        // 宽字符按 char 计数，与字符语义一致。
+        assert_eq!(editor.text().chars().count(), 4);
+    }
+
+    #[test]
+    fn delete_chars_before_cursor_crosses_lines() {
+        let mut editor = Editor::new();
+        editor.insert_str("ab\ncd");
+        editor.move_end();
+        let deleted = editor.delete_chars_before_cursor(3);
+        // 光标在文本末尾，向前 3 个字符依次为 'd','c','\n'。
+        assert_eq!(deleted, "\ncd");
+        assert_eq!(editor.text(), "ab");
+    }
+
+    #[test]
+    fn delete_chars_before_cursor_returns_nothing_at_start() {
+        let mut editor = Editor::new();
+        let deleted = editor.delete_chars_before_cursor(5);
+        assert_eq!(deleted, "");
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn text_before_cursor_includes_prior_lines() {
+        let mut editor = Editor::new();
+        editor.insert_str("ab\ncd");
+        editor.move_home();
+        editor.move_down();
+        assert_eq!(editor.text_before_cursor(), "ab\n");
+    }
 }

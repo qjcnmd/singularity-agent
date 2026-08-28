@@ -19,6 +19,7 @@ use super::commands::Action;
 use super::editor::Editor;
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::mouse::{ClickTarget, WheelNormalizer};
+use super::paste_burst::{CharDecision, FlushResult, PasteBurst};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{describe_usage, short_id, truncate_label};
@@ -26,6 +27,8 @@ use super::wrapped_lines;
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
+/// 单次粘贴的字节上限：防止超大粘贴拖垮折行渲染；按整字符边界截断。
+const MAX_PASTE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -154,6 +157,12 @@ pub(crate) struct TuiApp {
     pub(super) wheel: WheelNormalizer,
     /// /compact 的排队、运行和取消状态。
     pub(super) compaction: CompactionState,
+    /// 无括号粘贴终端的 burst 检测状态。
+    pub(super) paste_burst: PasteBurst,
+    /// burst 检测开关：真实终端默认启用；PTY 集成测试通过
+    /// `SINGULARITY_DISABLE_PASTE_BURST` 关闭，避免瞬时注入整串被当作
+    /// 粘贴（参照 codex 的 disable_paste_burst 逃生舱）。
+    pub(super) paste_burst_enabled: bool,
 }
 
 impl TuiApp {
@@ -182,6 +191,8 @@ impl TuiApp {
             frame: FrameCache::default(),
             wheel: WheelNormalizer::default(),
             compaction: CompactionState::default(),
+            paste_burst: PasteBurst::default(),
+            paste_burst_enabled: std::env::var_os("SINGULARITY_DISABLE_PASTE_BURST").is_none(),
         }
     }
 
@@ -332,6 +343,8 @@ impl TuiApp {
 
     /// Ctrl+C：优先清空输入；输入为空时第一次确认、第二次正常退出。
     fn handle_ctrl_c(&mut self) -> Action {
+        // 未落地的 burst 缓冲一并清空：Ctrl+C 语义是丢弃当前输入。
+        self.paste_burst.clear_after_explicit_paste();
         if !self.editor.is_empty() {
             self.editor.clear();
             self.quit_armed = true;
@@ -367,6 +380,10 @@ impl TuiApp {
             return Action::Continue;
         }
 
+        // 任何按键处理前先冲刷已到期的 burst 暂存/缓冲：暂存字符在静默
+        // 超时后作为普通输入落地，避免被后续按键顶替而丢失。
+        self.flush_paste_burst_if_due(std::time::Instant::now());
+
         // Ctrl+C 是应用级按键语义，先于 settings 模态消费，且不受 turn
         // 相位或模态影响；其余任何按键都取消已 armed 的二次确认。
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -383,6 +400,14 @@ impl TuiApp {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // 非文本输入（含修饰快捷键、方向键等）前先落地未超时的 burst 缓冲，
+        // 避免残留文本卡住或被并入后续按键。
+        if self.paste_burst_enabled
+            && !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
+            && let Some(pasted) = self.paste_burst.flush_before_modified_input()
+        {
+            self.handle_paste(pasted);
+        }
         match key.code {
             KeyCode::Char('t') if ctrl => self.transcript.toggle_thinking(),
             KeyCode::Char('j') if ctrl => self.editor.insert_newline(),
@@ -444,7 +469,22 @@ impl TuiApp {
                     self.submit_follow_up();
                 }
             }
-            KeyCode::Enter => return self.submit_input(),
+            KeyCode::Enter => {
+                let now = std::time::Instant::now();
+                // burst 抑制窗口内（含多行粘贴末尾的 Enter）按换行处理，
+                // 不触发提交。
+                if self.paste_burst_enabled
+                    && self
+                        .paste_burst
+                        .newline_should_insert_instead_of_submit(now)
+                {
+                    if !self.paste_burst.append_newline_if_active(now) {
+                        self.editor.insert_newline();
+                    }
+                    return Action::Continue;
+                }
+                return self.submit_input();
+            }
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Left => self.editor.move_left(),
@@ -457,10 +497,95 @@ impl TuiApp {
                 self.scroll.jump_to_bottom(total, viewport);
             }
             KeyCode::End => self.editor.move_end(),
-            KeyCode::Char(ch) if !ctrl && !alt => self.editor.insert_char(ch),
+            KeyCode::Char(ch) if !ctrl && !alt => {
+                let now = std::time::Instant::now();
+                self.handle_plain_char(ch, now);
+            }
             _ => {}
         }
+        // 非文本输入后清除 burst 计时窗口，避免下一按键并入上一 burst。
+        if !matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+        ) {
+            self.paste_burst.clear_window_after_non_char();
+        }
         Action::Continue
+    }
+
+    /// 单个无修饰字符：交给 burst 检测，缓冲/回抓/普通插入由决策驱动。
+    fn handle_plain_char(&mut self, ch: char, now: std::time::Instant) {
+        if !self.paste_burst_enabled {
+            self.editor.insert_char(ch);
+            return;
+        }
+        let decision = if ch.is_ascii() {
+            self.paste_burst.on_plain_char(ch, now)
+        } else {
+            match self.paste_burst.on_plain_char_no_hold(now) {
+                Some(decision) => decision,
+                None => {
+                    self.editor.insert_char(ch);
+                    return;
+                }
+            }
+        };
+        match decision {
+            CharDecision::RetainFirstChar => {
+                // 首个快速字符暂存，等待下一个字符决定是输入还是 burst。
+            }
+            CharDecision::BufferAppend => {
+                self.paste_burst.append_char_to_buffer(ch, now);
+            }
+            CharDecision::BeginBufferFromPending => {
+                self.paste_burst.append_char_to_buffer(ch, now);
+            }
+            CharDecision::BeginBuffer { retro_chars } => {
+                // 已按普通输入插入的前缀像粘贴：回抓进缓冲，避免内容重复
+                // 与中途渲染。
+                let before = self.editor.text_before_cursor();
+                if let Some((_, grabbed)) =
+                    self.paste_burst
+                        .decide_begin_buffer(now, &before, retro_chars as usize)
+                {
+                    self.editor
+                        .delete_chars_before_cursor(grabbed.chars().count());
+                    self.paste_burst.append_char_to_buffer(ch, now);
+                } else {
+                    self.editor.insert_char(ch);
+                    self.paste_burst.clear_window_after_non_char();
+                }
+            }
+        }
+    }
+
+    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一 + 字节上限整字符
+    /// 截断，然后整段插入编辑器。超限在提示行警告。
+    pub fn handle_paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let (accepted, truncated) = truncate_utf8_chars(&text, MAX_PASTE_BYTES);
+        if truncated {
+            self.transcript.push_note(
+                "paste exceeds 1 MiB; content truncated to a whole-character boundary",
+                NoteStyle::Warning,
+            );
+        }
+        self.editor.insert_str(&accepted);
+        // 显式粘贴后清空 burst 状态，防止残留窗口影响后续输入。
+        self.paste_burst.clear_after_explicit_paste();
+    }
+
+    /// 按 burst 静默超时 flush：缓冲整体作为一次粘贴，暂存字符作为普通
+    /// 输入。事件循环每帧调用。
+    pub fn flush_paste_burst_if_due(&mut self, now: std::time::Instant) {
+        if !self.paste_burst_enabled {
+            return;
+        }
+        match self.paste_burst.flush_if_due(now) {
+            FlushResult::Paste(text) => self.handle_paste(text),
+            FlushResult::Typed(ch) => self.editor.insert_char(ch),
+            FlushResult::None => {}
+        }
     }
 
     fn submit_input(&mut self) -> Action {
@@ -474,6 +599,9 @@ impl TuiApp {
             );
             return Action::Continue;
         }
+        // 提交即取走全部输入：未落地的 burst 缓冲一并清空，避免残留进入
+        // 下一次编辑会话。
+        self.paste_burst.clear_after_explicit_paste();
         let raw = self.editor.take();
         let text = raw.trim().to_string();
         if text.is_empty() {
@@ -682,10 +810,23 @@ impl TuiApp {
     }
 }
 
+/// 按字节上限截断字符串，且不把 UTF-8 字符切半：返回截断后的前缀与
+/// 是否发生截断。
+fn truncate_utf8_chars(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use super::CompactionState;
+    use super::{CompactionState, truncate_utf8_chars};
 
     #[test]
     fn compaction_state_transitions_are_exclusive() {
@@ -713,5 +854,20 @@ mod tests {
 
         assert!(state.finish());
         assert!(matches!(state, CompactionState::Idle));
+    }
+
+    #[test]
+    fn truncate_utf8_chars_keeps_whole_characters_at_boundary() {
+        let (text, truncated) = truncate_utf8_chars("中文paste", 4);
+        assert_eq!(text, "中");
+        assert!(truncated);
+
+        let (text, truncated) = truncate_utf8_chars("ascii", 4);
+        assert_eq!(text, "asci");
+        assert!(truncated);
+
+        let (text, truncated) = truncate_utf8_chars("short", 10);
+        assert_eq!(text, "short");
+        assert!(!truncated);
     }
 }
