@@ -14,22 +14,33 @@ use singularity_runtime::objects::TurnStatus;
 
 pub struct JsonlRenderer {
     thread_id: Option<String>,
+    /// stdout 已写入失败：置位后跳过后续事件行，避免每行重试；终态
+    /// summary 仍会尝试写出并把真实结果报告给调用方。
+    stdout_broken: bool,
 }
 
 impl JsonlRenderer {
     pub fn new(thread_id: impl Into<String>) -> Self {
         Self {
             thread_id: Some(thread_id.into()),
+            stdout_broken: false,
         }
     }
 
     /// thread 尚未解析的渲染器：终态 summary 省略 thread 事实。
     pub fn without_thread() -> Self {
-        Self { thread_id: None }
+        Self {
+            thread_id: None,
+            stdout_broken: false,
+        }
     }
 
-    /// 输出一行事件；序列化失败只丢弃该投影，不影响执行。
+    /// 输出一行事件；序列化失败只丢弃该投影，不影响执行。stdout 写失败
+    /// 置位 broken 标志（后续事件行跳过），终态行写失败由调用方显性处理。
     pub fn emit(&mut self, event: &TurnEvent) {
+        if self.stdout_broken {
+            return;
+        }
         let mut params = match serde_json::to_value(event) {
             Ok(Value::Object(map)) => Value::Object(map),
             _ => return,
@@ -40,13 +51,23 @@ impl JsonlRenderer {
         let line = json!({"method": event.method(), "params": params});
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        let _ = writeln!(lock, "{line}");
-        let _ = lock.flush();
+        if writeln!(lock, "{line}")
+            .and_then(|()| lock.flush())
+            .is_err()
+        {
+            self.stdout_broken = true;
+        }
     }
 
     /// 终态 summary 行。usage 仅在已知时输出；`truncated` 为 true 时额外
     /// 输出 `turn.truncated: true`（仅截断终态出现，加法兼容）。
-    pub fn emit_summary(&self, status: TurnStatus, usage: Option<Value>, truncated: bool) {
+    /// stdout 写失败以 `Err` 返回，调用方据此以非零退出码收敛。
+    pub fn emit_summary(
+        &self,
+        status: TurnStatus,
+        usage: Option<Value>,
+        truncated: bool,
+    ) -> std::io::Result<()> {
         let mut turn = json!({
             "status": status.as_str(),
             "usage": usage,
@@ -66,8 +87,8 @@ impl JsonlRenderer {
         let line = json!({ "summary": summary });
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        let _ = writeln!(lock, "{line}");
-        let _ = lock.flush();
+        writeln!(lock, "{line}")?;
+        lock.flush()
     }
 }
 

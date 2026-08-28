@@ -131,11 +131,14 @@ fn run(cli: Cli) -> Result<i32, String> {
 /// `--json` 失败路径的统一终态形态：机器解析方必须总能看到 failed summary
 /// 行（评估器依赖此契约），故准备/执行/工作线程中断各路径共用这一个出口。
 /// thread 尚未解析时 summary 省略 thread 字段，不写伪造的哨兵值。
+/// summary 自身写失败也显性报告到 stderr（调用方已处于失败路径）。
 fn emit_failed_json_summary(thread_id: Option<&str>) {
     let renderer = thread_id
         .map(JsonlRenderer::new)
         .unwrap_or_else(JsonlRenderer::without_thread);
-    renderer.emit_summary(TurnStatus::Failed, None, false);
+    if let Err(error) = renderer.emit_summary(TurnStatus::Failed, None, false) {
+        eprintln!("sg: failed to write summary to stdout: {error}");
+    }
 }
 
 /// turn 执行线程向主循环投递的进度。
@@ -208,7 +211,9 @@ fn drain_print(
     match outcome {
         Ok(view) => {
             if view.turn_status == TurnStatus::Completed {
-                renderer.write_final_text(view.final_text.trim_end());
+                renderer
+                    .write_final_text(view.final_text.trim_end())
+                    .map_err(|error| format!("failed to write final text to stdout: {error}"))?;
                 if view.truncated {
                     renderer.warn_truncated();
                 }
@@ -231,7 +236,9 @@ fn drain_json(
     match outcome {
         Ok(outcome) => {
             let usage = serde_json::to_value(outcome.usage).unwrap_or(serde_json::Value::Null);
-            renderer.emit_summary(outcome.turn_status, Some(usage), outcome.truncated);
+            renderer
+                .emit_summary(outcome.turn_status, Some(usage), outcome.truncated)
+                .map_err(|error| format!("failed to write summary to stdout: {error}"))?;
             Ok(exit_code_for(outcome.turn_status))
         }
         Err(message) => {

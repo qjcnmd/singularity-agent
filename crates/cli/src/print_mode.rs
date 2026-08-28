@@ -35,11 +35,12 @@ impl PrintRenderer {
     }
 
     /// 输出最终 assistant 文本（唯一进入 stdout 的内容）。
-    pub fn write_final_text(&self, text: &str) {
+    /// stdout 写失败以 `Err` 返回，调用方据此以非零退出码收敛。
+    pub fn write_final_text(&self, text: &str) -> std::io::Result<()> {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        let _ = writeln!(lock, "{text}");
-        let _ = lock.flush();
+        writeln!(lock, "{text}")?;
+        lock.flush()
     }
 
     pub fn warn_truncated(&self) {
