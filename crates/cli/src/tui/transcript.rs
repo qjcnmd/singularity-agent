@@ -8,6 +8,7 @@ use super::view::truncate_label;
 use super::wrapped_lines;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::cell::RefCell;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 3;
 /// 展开态下的结果行上限：防超长输出撑爆视口。
@@ -92,6 +93,50 @@ pub(crate) enum FlowItem {
     Tool(ToolItem),
 }
 
+/// 每条目物化行的缓存：宽度或 thinking 折叠态变化时全量失效，单条目
+/// 就地变更按索引失效。静态条目（文本/思考/已定型的工具）跨帧复用，
+/// 避免长会话每帧对全部条目重算折行。
+#[derive(Debug, Default)]
+struct RowCache {
+    width: u16,
+    thinking_collapsed: bool,
+    /// 与 `Transcript::items` 平行；`None` 表示该条目未缓存。
+    rows: Vec<Option<Vec<Line<'static>>>>,
+}
+
+impl RowCache {
+    /// 宽度或 thinking 折叠态与上次不一致时全量失效。
+    fn ensure_width(&mut self, width: u16, thinking_collapsed: bool) {
+        if self.width != width || self.thinking_collapsed != thinking_collapsed {
+            self.width = width;
+            self.thinking_collapsed = thinking_collapsed;
+            self.rows.iter_mut().for_each(|slot| *slot = None);
+        }
+    }
+
+    fn invalidate(&mut self, index: usize) {
+        if let Some(slot) = self.rows.get_mut(index) {
+            *slot = None;
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        self.rows.iter_mut().for_each(|slot| *slot = None);
+    }
+}
+
+/// 该条目的渲染是否随帧变化（运行中工具的光标字符、定型工具的完成
+/// 闪烁）：是则实时物化，不进入缓存。
+fn item_is_frame_variant(item: &FlowItem) -> bool {
+    match item {
+        FlowItem::Tool(tool) => match &tool.state {
+            ToolState::Running { .. } => true,
+            ToolState::Done { completed_at, .. } => completed_at.elapsed() < TOOL_COMPLETION_FLASH,
+        },
+        _ => false,
+    }
+}
+
 /// 主会话流投影状态。
 #[derive(Default)]
 pub(crate) struct Transcript {
@@ -99,6 +144,7 @@ pub(crate) struct Transcript {
     assistant_buffer: String,
     assistant_active: bool,
     thinking_collapsed: bool,
+    row_cache: RefCell<RowCache>,
 }
 
 impl Transcript {
@@ -106,10 +152,16 @@ impl Transcript {
         Self::default()
     }
 
+    /// 统一追加点：条目入列时同步扩展缓存槽位。
+    fn push_item(&mut self, item: FlowItem) {
+        self.row_cache.borrow_mut().rows.push(None);
+        self.items.push(item);
+    }
+
     /// 追加一条非流式文本（先落定进行中的 assistant 段落）。
     pub fn push_note(&mut self, text: impl Into<String>, style: NoteStyle) {
         self.flush_assistant();
-        self.items.push(FlowItem::Text {
+        self.push_item(FlowItem::Text {
             style,
             text: text.into(),
         });
@@ -126,11 +178,13 @@ impl Transcript {
 
     pub fn push_thinking(&mut self, text: impl Into<String>) {
         self.flush_assistant();
-        self.items.push(FlowItem::Thinking(text.into()));
+        self.push_item(FlowItem::Thinking(text.into()));
     }
 
     pub fn toggle_thinking(&mut self) {
         self.thinking_collapsed = !self.thinking_collapsed;
+        // 折叠态影响所有 thinking 条目的渲染。
+        self.row_cache.borrow_mut().invalidate_all();
     }
 
     pub fn thinking_collapsed(&self) -> bool {
@@ -141,7 +195,7 @@ impl Transcript {
     pub fn flush_assistant(&mut self) {
         if self.assistant_active {
             let text = std::mem::take(&mut self.assistant_buffer);
-            self.items.push(FlowItem::Text {
+            self.push_item(FlowItem::Text {
                 style: NoteStyle::Info,
                 text,
             });
@@ -156,7 +210,7 @@ impl Transcript {
             return;
         }
         let serialized = serde_json::to_string(args).unwrap_or_default();
-        self.items.push(FlowItem::Tool(ToolItem {
+        self.push_item(FlowItem::Tool(ToolItem {
             call_id: call_id.to_string(),
             name: name.to_string(),
             args_head: truncate_label(&serialized, 120),
@@ -168,24 +222,32 @@ impl Transcript {
 
     /// 工具增量：仅刷新对应运行中记录的预览，不新增条目。
     pub fn tool_update(&mut self, call_id: &str, partial_output: &str) {
-        if let Some(item) = self.tool_item_mut(call_id)
-            && let ToolState::Running { last_output } = &mut item.state
-        {
-            *last_output = truncate_label(partial_output, 200);
+        if let Some(index) = self.tool_item_index(call_id) {
+            self.row_cache.borrow_mut().invalidate(index);
+            let item = &mut self.items[index];
+            if let FlowItem::Tool(tool) = item
+                && let ToolState::Running { last_output } = &mut tool.state
+            {
+                *last_output = truncate_label(partial_output, 200);
+            }
         }
     }
 
     /// 工具结束：就地定型为稳定记录；首个终态生效，重复终态保持首见结果。
     pub fn tool_end(&mut self, call_id: &str, result: &str, is_error: bool) {
-        if let Some(item) = self.tool_item_mut(call_id)
-            && matches!(item.state, ToolState::Running { .. })
-        {
-            item.state = ToolState::Done {
-                output: result.to_string(),
-                is_error,
-                display: ToolDisplay::Truncated,
-                completed_at: std::time::Instant::now(),
-            };
+        if let Some(index) = self.tool_item_index(call_id) {
+            self.row_cache.borrow_mut().invalidate(index);
+            let item = &mut self.items[index];
+            if let FlowItem::Tool(tool) = item
+                && matches!(tool.state, ToolState::Running { .. })
+            {
+                tool.state = ToolState::Done {
+                    output: result.to_string(),
+                    is_error,
+                    display: ToolDisplay::Truncated,
+                    completed_at: std::time::Instant::now(),
+                };
+            }
         }
     }
 
@@ -193,12 +255,17 @@ impl Transcript {
     /// 取消/异常中断时 `ItemCompleted`/`ItemFailed` 是唯一收尾信号，工具块
     /// 不能停留在 Running；输出回退到最后一次增量预览。
     pub fn tool_terminal(&mut self, call_id: &str, is_error: bool) {
-        if let Some(item) = self.tool_item_mut(call_id) {
-            let ToolState::Running { last_output } = &mut item.state else {
+        if let Some(index) = self.tool_item_index(call_id) {
+            self.row_cache.borrow_mut().invalidate(index);
+            let item = &mut self.items[index];
+            let FlowItem::Tool(tool) = item else {
+                return;
+            };
+            let ToolState::Running { last_output } = &mut tool.state else {
                 return;
             };
             let output = std::mem::take(last_output);
-            item.state = ToolState::Done {
+            tool.state = ToolState::Done {
                 output,
                 is_error,
                 display: ToolDisplay::Truncated,
@@ -210,11 +277,12 @@ impl Transcript {
     /// 切换最近一个已完成工具块的展开态；返回是否发生了切换。
     /// 运行中或没有已完成工具时为 false（提示行据此不再承诺按键行为）。
     pub fn toggle_latest_tool_expansion(&mut self) -> bool {
-        for item in self.items.iter_mut().rev() {
+        for (index, item) in self.items.iter_mut().enumerate().rev() {
             if let FlowItem::Tool(tool) = item
                 && let ToolState::Done { display, .. } = &mut tool.state
             {
                 *display = display.next();
+                self.row_cache.borrow_mut().invalidate(index);
                 return true;
             }
         }
@@ -228,17 +296,17 @@ impl Transcript {
         })
     }
 
+    fn tool_item_index(&self, call_id: &str) -> Option<usize> {
+        self.items.iter().position(|item| match item {
+            FlowItem::Tool(tool) => tool.call_id == call_id,
+            _ => false,
+        })
+    }
+
     /// 该 item_id 是否为工具条目（runtime 中工具条目的 item id 即
     /// tool call id）。事件投影据此区分工具相关事件与 assistant 文本。
     pub fn is_tool_item(&self, call_id: &str) -> bool {
         self.tool_item(call_id).is_some()
-    }
-
-    fn tool_item_mut(&mut self, call_id: &str) -> Option<&mut ToolItem> {
-        self.items.iter_mut().find_map(|item| match item {
-            FlowItem::Tool(tool) if tool.call_id == call_id => Some(tool),
-            _ => None,
-        })
     }
 
     /// 条目总数。
@@ -268,12 +336,26 @@ impl Transcript {
             .map(|line| Line::from(Span::styled(line, NoteStyle::Info.style())))
     }
 
-    /// 在给定宽度下每个条目占用的可视行数。
+    /// 在给定宽度下每个条目占用的可视行数。静态条目读缓存，随帧变化
+    /// 的条目（运行中工具、完成闪烁）实时物化。
     pub fn row_counts(&self, width: u16) -> Vec<usize> {
         let width = width.max(1) as usize;
+        let mut cache = self.row_cache.borrow_mut();
+        cache.ensure_width(width as u16, self.thinking_collapsed);
         self.items
             .iter()
-            .map(|item| item_rows(item, width, self.thinking_collapsed, ' ').len())
+            .enumerate()
+            .map(|(index, item)| {
+                if item_is_frame_variant(item) {
+                    item_rows(item, width, self.thinking_collapsed, ' ').len()
+                } else {
+                    let slot = &mut cache.rows[index];
+                    let rows = slot.get_or_insert_with(|| {
+                        item_rows(item, width, self.thinking_collapsed, ' ')
+                    });
+                    rows.len()
+                }
+            })
             .collect()
     }
 
@@ -288,9 +370,16 @@ impl Transcript {
     ) -> Option<Line<'static>> {
         let width = width.max(1) as usize;
         let item = self.items.get(item_index)?;
-        item_rows(item, width, self.thinking_collapsed, spinner)
-            .get(row_in_item)
-            .cloned()
+        if item_is_frame_variant(item) {
+            return item_rows(item, width, self.thinking_collapsed, spinner)
+                .get(row_in_item)
+                .cloned();
+        }
+        let mut cache = self.row_cache.borrow_mut();
+        cache.ensure_width(width as u16, self.thinking_collapsed);
+        let slot = &mut cache.rows[item_index];
+        let rows = slot.get_or_insert_with(|| item_rows(item, width, self.thinking_collapsed, ' '));
+        rows.get(row_in_item).cloned()
     }
 }
 
@@ -488,5 +577,84 @@ mod tests {
             text.contains("more lines"),
             "overflow is advertised instead of silently dropped"
         );
+    }
+
+    #[test]
+    fn cache_consistent_across_repeated_reads() {
+        let mut transcript = Transcript::new();
+        transcript.push_note("hello world", NoteStyle::Info);
+        transcript.push_thinking("a\nb");
+        transcript.tool_start("call-1", "bash", &serde_json::json!({}));
+        transcript.tool_end("call-1", "ok", false);
+        // 连续两次读取应得到相同行数（缓存命中与未命中的对拍）。
+        let first = transcript.row_counts(80);
+        let second = transcript.row_counts(80);
+        assert_eq!(first, second);
+        // 渲染行内容也应与未缓存时的物化一致。
+        let row = transcript.render_item_row(0, 0, 80, '|').unwrap();
+        let text: String = row.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn cache_invalidated_by_append_and_width_change() {
+        let mut transcript = Transcript::new();
+        transcript.push_note("one", NoteStyle::Info);
+        assert_eq!(transcript.row_counts(80), vec![1]);
+        // 追加条目后行数向量随内容同步增长。
+        transcript.push_note("two", NoteStyle::Info);
+        assert_eq!(transcript.row_counts(80), vec![1, 1]);
+        // 宽度变化触发全量失效：窄宽度下长文本折行。
+        transcript.push_note("a very long line that must wrap", NoteStyle::Info);
+        let narrow = transcript.row_counts(10);
+        let wide = transcript.row_counts(80);
+        assert_eq!(narrow[2], 4, "10 列下长行折成 4 行");
+        assert_eq!(wide[2], 1, "80 列下不折行");
+    }
+
+    #[test]
+    fn cache_invalidated_by_in_place_tool_updates() {
+        let mut transcript = Transcript::new();
+        transcript.tool_start("call-1", "bash", &serde_json::json!({}));
+        // 运行中工具为随帧变化条目，实时物化：行数随预览增长。
+        let running_rows = transcript.row_counts(80);
+        transcript.tool_update("call-1", "one\ntwo\nthree");
+        let updated_rows = transcript.row_counts(80);
+        assert!(updated_rows[0] > running_rows[0], "预览行追加后行数应增长");
+        // 定型后走缓存，重复读取稳定。
+        transcript.tool_end("call-1", "done", false);
+        let done_rows = transcript.row_counts(80);
+        assert_eq!(done_rows, transcript.row_counts(80));
+    }
+
+    #[test]
+    fn cache_invalidated_by_toggle_thinking() {
+        let mut transcript = Transcript::new();
+        transcript.push_thinking("line one\nline two");
+        assert_eq!(transcript.row_counts(80), vec![3]);
+        transcript.toggle_thinking();
+        assert_eq!(transcript.row_counts(80), vec![1], "折叠后单行");
+        transcript.toggle_thinking();
+        assert_eq!(transcript.row_counts(80), vec![3], "展开后恢复");
+    }
+
+    #[test]
+    fn cache_invalidated_by_tool_expansion_toggle() {
+        let mut transcript = Transcript::new();
+        transcript.tool_start("call-1", "bash", &serde_json::json!({}));
+        transcript.tool_end("call-1", "a\nb\nc\nd\ne", false);
+        // 终态初始为 Truncated（header + 预览 + 溢出行）。
+        let initial = transcript.row_counts(80)[0];
+        // 展开 → Full：结果行增多。
+        transcript.toggle_latest_tool_expansion();
+        let expanded = transcript.row_counts(80)[0];
+        assert!(expanded > initial, "展开态应显示更多结果行");
+        // 折叠 → Collapsed：仅 header 一行。
+        transcript.toggle_latest_tool_expansion();
+        let collapsed = transcript.row_counts(80)[0];
+        assert!(collapsed < initial, "折叠态应只剩 header");
+        // 再切一次 → 回到 Truncated，与初始一致。
+        transcript.toggle_latest_tool_expansion();
+        assert_eq!(transcript.row_counts(80)[0], initial, "循环一圈后恢复");
     }
 }
