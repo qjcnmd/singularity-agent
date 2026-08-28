@@ -8,7 +8,7 @@
 
 产品有三种形态，共享同一运行时语义：
 
-- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread（精确 id 优先，否则按唯一前缀匹配，歧义或无匹配直接报错）；`--continue` 续接最近更新的一条会话；`--no-session` 以临时 home 关闭持久化；默认持久化会话。无交互模式下 stdin 非终端时整体读取为管道输入（UTF-8、上限 1 MiB，超限或非法编码按准备阶段失败收敛）：与位置 goal 并存时分节合并，goal 缺席时 stdin 即输入。不向 stdin 供输入、又以管道持有它的调用方必须关闭或重定向 stdin，否则读取会等待 EOF。
+- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
 - **交互式 TUI**：`sg` 无参数进入长驻终端界面；界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照。
 - **桌面端**：参照 Codex Desktop；app-server 是桌面端连接共享 runtime 的 stdio JSON-RPC 后端，不构成独立用户入口。
 
@@ -17,7 +17,7 @@
 - **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn；队列是进程内存态，当前进程存活期间按 FIFO 消费已接受输入）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
-  - [`ThreadCatalog`]：线程目录操作入口，负责 create/list/resume/rename；`Conversation` 不持有线程目录 CRUD。
+  - [`ThreadCatalog`]：线程目录操作入口，负责 create/list/resume/rename/archive；`Conversation` 不持有线程目录 CRUD。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
@@ -34,10 +34,10 @@
 
 ```
 sg --print|--json <goal>
-  ├─ 解析参数（--model/--session/--continue/--no-session）并合并管道 stdin 输入
+  ├─ 解析参数（--model/--session/--no-session）
   ├─ 解析 SINGULARITY_HOME（或临时 home）并准备 sessions/backups 目录
   ├─ ProviderConfigSnapshot::capture(env)（进程层任一变量出现即整体短路用户配置）
-  ├─ Thread 来源：--session（精确/唯一前缀）或 --continue（最近更新）恢复并修复 | 新建 uuid v7 会话文件
+  ├─ Thread 来源：--session 恢复并修复 | 新建 uuid v7 会话文件
   ├─ Conversation::run_turn(goal)   # 内部 = reserve_start() 原子预订 → 执行链
   │    ├─ TurnRunner::run（每轮独立控制面；当前轮可取消/可转向）
   │    │    ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
@@ -113,7 +113,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
 - **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行，字节上限按整字符截断并在提示行警告）；不提供括号粘贴的终端（典型为 Windows 控制台）按 burst 检测识别粘贴——高频无修饰字符流缓冲为一次粘贴，burst 内的 Enter 按换行处理不触发提交，静默间隙后整体落字。
 - **输入历史**：空闲相位且光标在可视首行时，↑/↓ 回溯本会话已提交的输入（含 steer 与 followUp 成功路径，相邻重复折叠）；回溯中任何编辑退出历史并保持当前文本，未编辑退出恢复原草稿；运行中 ↑/↓ 仍是编辑器光标移动。历史为会话内内存态，不持久化。
-- **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。
+- **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档——参照 pi session-selector 的确认与保护语义），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。
 - **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
 - **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环，截断档以 `… N more lines (Ctrl+O expand)` 出口提示。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
 - **思考块**：Ctrl+T 折叠或展开思考内容，不改变运行中输入路由。
