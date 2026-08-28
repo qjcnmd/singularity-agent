@@ -379,8 +379,11 @@ impl Agent {
             })
             .sum::<u64>();
         let tool_tokens = estimate(&self.tools_json);
+        // 不变量：replays 为本仓静态类型 Vec<ProviderReasoningReplay>，
+        // serde 序列化仅在其类型定义错误时失败。
+        #[allow(clippy::expect_used)]
         let replay_tokens =
-            estimate(&serde_json::to_string(replays).unwrap_or_else(|_| "[]".to_string()));
+            estimate(&serde_json::to_string(replays).expect("reasoning replays serialize"));
         message_tokens
             .saturating_add(tool_tokens)
             .saturating_add(replay_tokens)

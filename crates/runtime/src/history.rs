@@ -5,8 +5,6 @@
 //! `provider_reasoning_replay`、parent/tree、迁移字段。`project_turn_history`
 //! 按 turn 开始 metadata 划定轮次边界，产出协议层的公开历史类型（`ThreadTurn`/
 //! `HistoryItem`）；store 的 `paged_read` 在此基础上完成分页与整体状态精化。
-//!
-//! 这些函数原是 app-server 的 events 模块，D1 收回到 runtime 统一投影。
 
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},

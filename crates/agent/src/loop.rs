@@ -208,11 +208,14 @@ impl Agent {
             .with_model_preferences(compaction_preferences)
             .with_summary_max_tokens(config.compaction.summary_max_tokens)
             .with_retry(config.retry);
+        // 不变量：tool_schemas_from 返回本仓静态类型 Vec<ModelToolSchema>，
+        // serde 序列化仅在其类型定义错误时失败。
+        #[allow(clippy::expect_used)]
         let tools_json = serde_json::to_string(&Self::tool_schemas_from(
             &registry,
             &provider.protocol_contract(),
         ))
-        .unwrap_or_else(|_| "[]".to_string());
+        .expect("tool schemas serialize");
         Ok(Self {
             session,
             compaction,

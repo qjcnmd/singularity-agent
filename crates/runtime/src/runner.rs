@@ -738,10 +738,14 @@ fn provider_attempt_event(
 }
 
 fn enum_wire_word(value: impl serde::Serialize) -> String {
+    // 不变量：调用方传入的均为本仓静态 enum（ProviderApiProtocol/ModelErrorCategory），
+    // 序列化仅在其类型定义错误时失败；失败即 panic（fail-loud），不降级为 "unknown"。
+    #[allow(clippy::expect_used)]
     serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
+        .expect("enum wire word serializes")
+        .as_str()
+        .map(str::to_string)
+        .expect("enum wire word is a string")
 }
 
 /// 准备阶段失败：分类 + 真实原因文本（对外前仍需敏感边界）。
