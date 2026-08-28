@@ -184,7 +184,11 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     let decode_error = malformed
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("decode failure");
     assert_eq!(
         decode_error.error.code.as_deref(),
@@ -199,7 +203,11 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
     let missing_choices =
         test_provider(provider_test_config(missing_choices_url)).expect("missing choices provider");
     let envelope_error = missing_choices
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("envelope failure");
     assert_eq!(
         envelope_error.error.code.as_deref(),
@@ -510,7 +518,11 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
             .is_none()
     );
     let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("Chat reasoning completion");
     assert_eq!(response.status, ModelTurnStatus::Success);
     let payload: serde_json::Value = serde_json::from_str(
@@ -556,7 +568,11 @@ fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model(
         ],
     );
     let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("env chat request");
     assert_eq!(response.status, ModelTurnStatus::Success);
     let payload: serde_json::Value = serde_json::from_str(
@@ -612,6 +628,7 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             ),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect("DashScope Chat completion");
     let payload: serde_json::Value = serde_json::from_str(
@@ -662,6 +679,7 @@ fn missing_provider_usage_remains_unknown() {
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             ),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect("Chat completion without usage");
     request_body
@@ -693,6 +711,7 @@ fn provider_usage_above_configured_output_limit_remains_accountable() {
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             ),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect("usage above configured limit is a provider fact, not a schema failure");
 
@@ -739,6 +758,7 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             ),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect("unknown-context completion");
     let payload: serde_json::Value = serde_json::from_str(
@@ -859,7 +879,11 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
         ],
     }];
     let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("Responses reasoning completion");
     assert_eq!(response.status, ModelTurnStatus::Success);
     let captured = requests

@@ -117,6 +117,7 @@ impl Provider for ThinkingProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         let mut response = ModelTurnResponse::completed(&request.request_id, "thinking", "answer");
         response.provider_reasoning_history = vec![ProviderReasoningReplay::Chat {
@@ -139,6 +140,7 @@ impl Provider for RecordingProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.log.record(request);
         Ok(ModelTurnResponse::completed(
@@ -167,6 +169,7 @@ impl Provider for GatedRecordingProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -211,6 +214,7 @@ impl Provider for SequentialGatedProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.requests
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -252,6 +256,7 @@ impl Provider for PanickingProvider {
         &self,
         _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         panic!("compaction provider panic")
     }
@@ -266,6 +271,7 @@ impl Provider for FailingProvider {
         &self,
         _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         Err(ProviderError::from_model_error(ModelError::new(
             ModelErrorKind::AuthError,
@@ -485,6 +491,7 @@ fn interrupt_cancels_the_running_turn() {
             &self,
             _request: &ModelTurnRequest,
             cancellation: &CancellationToken,
+            _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
         ) -> Result<ModelTurnResponse, ProviderError> {
             self.cancellation_probe
                 .lock()

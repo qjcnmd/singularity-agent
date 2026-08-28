@@ -148,7 +148,8 @@ impl Provider for MockProvider {
     fn complete(
         &self,
         request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
+        _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.requests.lock().unwrap().push(request.clone());
         let text = self.texts.lock().unwrap().pop_front().unwrap_or_default();

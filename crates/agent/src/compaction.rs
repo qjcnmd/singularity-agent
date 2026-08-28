@@ -661,7 +661,11 @@ impl CompactionEngine {
         // 指数退避重试；摘要请求没有事件出口，重试诊断在此路径不投影。
         let mut summary_events = AgentEvents::new();
         let response = match send_with_retry(
-            |_events| self.provider.complete(&request, cancellation),
+            |_events| {
+                let mut ignore_attempt = |_| {};
+                self.provider
+                    .complete(&request, cancellation, &mut ignore_attempt)
+            },
             self.retry,
             &mut summary_events,
             cancellation,

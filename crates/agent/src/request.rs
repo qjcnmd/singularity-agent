@@ -9,10 +9,10 @@
 use rand::Rng;
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider,
-    ProviderAttemptEvent, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
-    ProviderStreamEvent, ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
+    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
+    ModelTurnResponse, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent,
+    ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
+    ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
 };
 use uuid::Uuid;
 
@@ -263,7 +263,7 @@ impl Agent {
                 },
             );
         };
-        match self.provider.complete_stream_observed(
+        match self.provider.complete_stream(
             request,
             cancellation,
             &mut on_stream,
@@ -274,7 +274,7 @@ impl Agent {
                 if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
             {
                 self.provider
-                    .complete_observed(request, cancellation, &mut observed_attempt)
+                    .complete(request, cancellation, &mut observed_attempt)
             }
             Err(error) => {
                 // 保留传输层给出的类型、重放安全性与 Retry-After，交由调用处

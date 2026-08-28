@@ -39,7 +39,12 @@ fn openai_responses_stream_aggregates_deltas_and_ignores_ping_after_completion()
     let cancellation = singularity_core::CancellationToken::new();
     let mut events = Vec::new();
     let response = provider
-        .complete_stream(&request, &cancellation, &mut |event| events.push(event))
+        .complete_stream(
+            &request,
+            &cancellation,
+            &mut |event| events.push(event),
+            &mut |_| {},
+        )
         .expect("Responses stream completion");
 
     assert_eq!(
@@ -118,6 +123,7 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
                 &request,
                 &singularity_core::CancellationToken::new(),
                 &mut |_| {},
+                &mut |_| {},
             )
             .expect_err("stream must fail closed");
         assert_eq!(error.error.code.as_deref(), Some(expected_code), "{name}");
@@ -157,6 +163,7 @@ fn openai_responses_stream_length_preserves_partial_response() {
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |_| {},
+            &mut |_| {},
         )
         .expect("max_output_tokens incomplete stream remains partial success");
     assert!(response.is_length_truncated());
@@ -191,6 +198,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         .complete_stream(
             &request,
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
             &mut |_| {},
         )
         .expect_err("oversized stream must fail closed");
@@ -232,6 +240,7 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |event| events.push(event),
+            &mut |_| {},
         )
         .expect("final function call envelope");
     assert!(events.is_empty());
@@ -278,6 +287,7 @@ fn openai_chat_streaming_normalizes_visible_deltas_and_tool_fragments() {
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |event| events.push(event),
+            &mut |_| {},
         )
         .expect("Chat stream completion");
     assert_eq!(
@@ -376,6 +386,7 @@ fn openai_responses_stream_marks_retry_safety_around_first_text_delta() {
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |event| events.push(event),
+            &mut |_| {},
         )
         .expect_err("the transport returns the first stream failure");
     assert!(error.automatic_retry_allowed);
@@ -416,6 +427,7 @@ fn openai_responses_stream_marks_retry_safety_around_first_text_delta() {
             &request,
             &singularity_core::CancellationToken::new(),
             &mut |event| events.push(event),
+            &mut |_| {},
         )
         .expect_err("post-delta body failure");
     assert_eq!(
@@ -464,7 +476,12 @@ fn openai_responses_stream_cancellation_reaches_inflight_body_read() {
     let (result_tx, result_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         result_tx
-            .send(provider.complete_stream(&request, &worker_cancellation, &mut |_| {}))
+            .send(provider.complete_stream(
+                &request,
+                &worker_cancellation,
+                &mut |_| {},
+                &mut |_| {},
+            ))
             .expect("send cancellation result");
     });
     started_rx
@@ -501,6 +518,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
         .complete(
             &capability_test_request(None, false, 1),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect("invalid provider response remains observable");
 
@@ -550,7 +568,11 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
     });
 
     let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("provider response");
     let serialized = serde_json::to_string(&response).expect("serialize response");
 
@@ -578,7 +600,11 @@ fn openai_chat_request_output_cap_remains_on_wire() {
     );
     request.model_preferences.max_output_tokens = Some(123);
     provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("request cap is within provider capability");
     let body = requests
         .recv_timeout(Duration::from_secs(1))
@@ -613,6 +639,7 @@ fn openai_chat_response_wire_discriminators_fail_closed_before_normalization() {
                     vec![ModelMessage::text(ModelRole::User, "hello")],
                 ),
                 &singularity_core::CancellationToken::new(),
+                &mut |_| {},
             )
             .expect_err("malformed Chat response must fail closed");
         assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
@@ -639,7 +666,11 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
     let mut request = capability_test_request(None, false, 1);
     request.request_id = "chat_length_with_tool_call".to_string();
     let response = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect("length response remains a normal partial completion");
     assert_eq!(response.status, ModelTurnStatus::Success);
     assert!(response.is_length_truncated());
@@ -657,6 +688,7 @@ fn openai_chat_length_preserves_partial_and_content_filter_is_typed() {
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             ),
             &singularity_core::CancellationToken::new(),
+            &mut |_| {},
         )
         .expect_err("content filter remains a typed error");
     assert_eq!(error.error.kind, ModelErrorKind::ContentFilter);
@@ -674,7 +706,11 @@ fn openai_provider_returns_transient_http_error_after_one_attempt() {
     );
 
     let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("transport owns exactly one HTTP attempt");
     assert_eq!(error.error.kind, ModelErrorKind::RateLimited);
     assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
@@ -694,7 +730,11 @@ fn openai_provider_carries_retry_after_to_the_caller() {
     );
 
     let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("transport returns the first transient failure");
     assert_eq!(error.retry_after, Some(Duration::from_millis(200)));
     assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1]);
@@ -711,7 +751,7 @@ fn openai_provider_observes_one_ordered_start_end_pair() {
     );
     let mut events = Vec::new();
 
-    let error = Provider::complete_observed(
+    let error = Provider::complete(
         &provider,
         &request,
         &singularity_core::CancellationToken::new(),
@@ -755,7 +795,7 @@ fn openai_provider_delivers_observed_attempts_without_rejecting() {
     );
     let mut events = Vec::new();
 
-    let response = Provider::complete_observed(
+    let response = Provider::complete(
         &provider,
         &request,
         &singularity_core::CancellationToken::new(),
@@ -804,7 +844,11 @@ fn openai_provider_uses_external_runtime_handle_for_http_body() {
     });
 
     let result = thread::spawn(move || {
-        provider.complete(&request, &singularity_core::CancellationToken::new())
+        provider.complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
     })
     .join()
     .expect("join external runtime provider");
@@ -837,7 +881,11 @@ fn openai_provider_returns_body_transport_failure_after_one_attempt() {
     );
 
     let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("transport failure");
     assert_eq!(error.error.kind, ModelErrorKind::NetworkError);
     assert_eq!(
@@ -863,7 +911,11 @@ fn openai_provider_returns_send_failure_without_sensitive_request_data() {
     );
 
     let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("closed address must fail during send");
     let serialized = serde_json::to_string(&error.error).expect("serialize error");
     assert!(!serialized.contains("sensitive prompt marker"));
@@ -887,7 +939,11 @@ fn openai_provider_rejects_multiple_choices_without_retrying_or_selecting_one() 
     );
 
     let error = provider
-        .complete(&request, &singularity_core::CancellationToken::new())
+        .complete(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
         .expect_err("multiple choices must be rejected");
     assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
     assert_eq!(
@@ -931,7 +987,7 @@ fn openai_provider_cancels_an_inflight_http_request() {
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
         result_tx
-            .send(provider.complete(&request, &worker_cancellation))
+            .send(provider.complete(&request, &worker_cancellation, &mut |_| {}))
             .expect("send provider result");
     });
 

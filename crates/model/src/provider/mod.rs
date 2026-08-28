@@ -36,19 +36,9 @@ pub trait Provider {
         _request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        Err(provider_streaming_unsupported_error())
-    }
-
-    /// 流式输出可见文本，并实时暴露每一次底层 HTTP attempt。
-    fn complete_stream_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
         _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete_stream(request, cancellation, on_event)
+        Err(provider_streaming_unsupported_error())
     }
 
     /// 完成一个已校验请求，同时保留取消和类型化模型提供方错误。
@@ -56,17 +46,8 @@ pub trait Provider {
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError>;
-
-    /// 完成一个请求，并实时暴露每一次底层 HTTP attempt。
-    fn complete_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
         _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete(request, cancellation)
-    }
+    ) -> Result<ModelTurnResponse, ProviderError>;
 }
 
 /// 允许 `Arc<dyn Provider>` 作为透明代理，使测试可以注入动态 provider。
@@ -87,34 +68,17 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        (**self).complete_stream(request, cancellation, on_event)
-    }
-
-    fn complete_stream_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        (**self).complete_stream_observed(request, cancellation, on_event, on_attempt)
+        (**self).complete_stream(request, cancellation, on_event, on_attempt)
     }
 
     fn complete(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        (**self).complete(request, cancellation)
-    }
-
-    fn complete_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        (**self).complete_observed(request, cancellation, on_attempt)
+        (**self).complete(request, cancellation, on_attempt)
     }
 }

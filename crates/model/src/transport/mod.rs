@@ -923,31 +923,12 @@ impl Provider for OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        let mut ignore_attempt = |_| {};
-        self.complete_stream_observed(request, cancellation, on_event, &mut ignore_attempt)
-    }
-
-    fn complete_stream_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.complete_internal(request, cancellation, Some(on_event), on_attempt)
     }
 
     fn complete(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        let mut ignore_attempt = |_| {};
-        self.complete_observed(request, cancellation, &mut ignore_attempt)
-    }
-
-    fn complete_observed(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,

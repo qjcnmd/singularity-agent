@@ -83,7 +83,14 @@ impl Provider for FakeProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            provider_name: "fake".to_string(),
+            model_name: "fake-model".to_string(),
+            actual_api_protocol: ProviderApiProtocol::Declared,
+            started_at_unix_ms: 1,
+        }));
         self.requests.lock().unwrap().push(request.clone());
         let step = self.pop()?;
         if !step.text.is_empty() {
@@ -94,26 +101,11 @@ impl Provider for FakeProvider {
         Ok(self.respond(request, &step))
     }
 
-    fn complete_stream_observed(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> std::result::Result<ModelTurnResponse, ProviderError> {
-        on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            provider_name: "fake".to_string(),
-            model_name: "fake-model".to_string(),
-            actual_api_protocol: ProviderApiProtocol::Declared,
-            started_at_unix_ms: 1,
-        }));
-        self.complete_stream(request, cancellation, on_event)
-    }
-
     fn complete(
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.requests.lock().unwrap().push(request.clone());
         let step = self.pop()?;
@@ -260,6 +252,7 @@ impl Provider for ErrReturningProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.try_respond(request)
     }
@@ -268,6 +261,7 @@ impl Provider for ErrReturningProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.try_respond(request)
     }
@@ -1089,6 +1083,7 @@ impl Provider for OverflowProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let call = self
             .stream_calls
@@ -1128,6 +1123,7 @@ impl Provider for OverflowProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.complete_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1172,6 +1168,7 @@ impl Provider for InterleaveProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let call = self
             .stream_calls
@@ -1219,6 +1216,7 @@ impl Provider for InterleaveProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         self.complete_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1512,6 +1510,7 @@ impl Provider for SummaryRetryProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let call = self
             .stream_calls
@@ -1543,6 +1542,7 @@ impl Provider for SummaryRetryProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let call = self
             .complete_calls
@@ -1647,6 +1647,7 @@ impl Provider for TruncatedToolCallProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == 1 {
@@ -1677,8 +1678,9 @@ impl Provider for TruncatedToolCallProvider {
         &self,
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
-        self.complete_stream(request, _cancellation, &mut |_| {})
+        self.complete_stream(request, _cancellation, &mut |_| {}, &mut |_| {})
     }
 }
 
