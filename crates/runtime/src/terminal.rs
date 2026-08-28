@@ -4,13 +4,28 @@
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
 //! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
 
-use singularity_agent::session::{SessionManager, SessionMetadata, TurnTerminalStatus};
+use singularity_agent::session::{
+    SessionManager, SessionMetadata, SessionTurnUsage, TurnTerminalStatus,
+};
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
 use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
 use crate::objects::{ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage};
+
+/// wire usage 投影 → JSONL 存储形状（字段一一对应，camelCase 落盘不变）。
+fn session_turn_usage(usage: &TurnUsage) -> SessionTurnUsage {
+    SessionTurnUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        usage_present: usage.usage_present,
+        usage_complete: usage.usage_complete,
+    }
+}
 
 /// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
 pub(crate) struct TerminalCommit {
@@ -39,11 +54,12 @@ impl TerminalCommit {
 
     /// 构造终态 metadata 条目（status + usage + usageComplete 单条）。
     fn metadata(&self) -> SessionMetadata {
-        // 不变量：TurnUsage 为本 crate 静态类型，无 #[serde(skip)] 字段，序列化恒不失败。
-        #[allow(clippy::expect_used)]
-        let usage =
-            serde_json::to_value(&self.usage).expect("TurnUsage serialization is infallible");
-        SessionMetadata::turn_terminal(&self.turn_id, self.status, usage, self.usage_complete)
+        SessionMetadata::turn_terminal(
+            &self.turn_id,
+            self.status,
+            session_turn_usage(&self.usage),
+            self.usage_complete,
+        )
     }
 
     /// 单条落盘终态 metadata；同内容已存在时幂等跳过。
@@ -155,8 +171,8 @@ mod tests {
             unreachable!("filtered to TurnTerminal");
         };
         assert!(*usage_complete, "usageComplete persisted");
-        assert_eq!(persisted["inputTokens"], 100);
-        assert_eq!(persisted["totalTokens"], 150);
+        assert_eq!(persisted.input_tokens, 100);
+        assert_eq!(persisted.total_tokens, 150);
     }
 
     /// 幂等按完整终态内容判定：同 turn 不同终态是新内容，如实追加（不跳过）。

@@ -202,9 +202,12 @@ fn thread_summary(session: &SessionManager) -> ThreadSummary {
         }),
         created_at: projection.created_at,
         updated_at: projection.updated_at,
-        token_usage: projection
-            .latest_usage
-            .unwrap_or_else(|| serde_json::json!({})),
+        // 无 usage 的会话保持空对象形状；序列化恒不失败（本仓静态类型）。
+        #[allow(clippy::expect_used)]
+        token_usage: projection.latest_usage.map_or_else(
+            || serde_json::json!({}),
+            |usage| serde_json::to_value(usage).expect("SessionTurnUsage serializes"),
+        ),
         turn_count: projection.turn_count,
         total_tokens: projection.total_tokens,
     }
@@ -367,7 +370,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
+    use singularity_agent::session::{SessionMetadata, SessionTurnUsage, TurnTerminalStatus};
 
     fn write_session(sessions_dir: &Path, thread_id: &str, timestamp: &str) {
         let header = serde_json::json!({
@@ -421,7 +424,12 @@ mod tests {
             .append_metadata(SessionMetadata::turn_terminal(
                 "turn-1",
                 TurnTerminalStatus::Completed,
-                serde_json::json!({"input_tokens": 1}),
+                SessionTurnUsage {
+                    input_tokens: 1,
+                    usage_present: true,
+                    usage_complete: true,
+                    ..SessionTurnUsage::default()
+                },
                 true,
             ))
             .expect("append turn terminal");

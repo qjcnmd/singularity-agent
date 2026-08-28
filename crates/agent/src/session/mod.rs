@@ -15,7 +15,7 @@ pub mod repair;
 pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind, TurnTerminalStatus,
+    SessionMetadataKind, SessionTurnUsage, TurnTerminalStatus,
 };
 pub use manager::SessionManager;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
@@ -30,7 +30,7 @@ pub struct SessionProjection {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<SessionProjectionStatus>,
-    pub latest_usage: Option<serde_json::Value>,
+    pub latest_usage: Option<SessionTurnUsage>,
     pub turn_count: usize,
     pub total_tokens: u64,
 }
@@ -104,10 +104,7 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
             title = Some(name.clone());
         }
         if let SessionMetadata::TurnTerminal { usage, .. } = entry {
-            total_tokens += usage
-                .get("totalTokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
+            total_tokens += usage.total_tokens;
         }
         if entry.kind() == SessionMetadataKind::TurnStarted {
             turn_count += 1;

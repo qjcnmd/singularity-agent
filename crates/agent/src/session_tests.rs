@@ -172,7 +172,12 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .append_metadata(SessionMetadata::turn_terminal(
             "turn_1",
             TurnTerminalStatus::Completed,
-            json!({"totalTokens": 42}),
+            SessionTurnUsage {
+                total_tokens: 42,
+                usage_present: true,
+                usage_complete: true,
+                ..SessionTurnUsage::default()
+            },
             true,
         ))
         .unwrap();
@@ -226,14 +231,30 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             "metadataType": "turn_terminal",
             "turnId": "turn-1",
             "status": "completed",
-            "usage": {"totalTokens": 42},
+            "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 42,
+                "cachedInputTokens": 0,
+                "reasoningTokens": 0,
+                "usagePresent": true,
+                "usageComplete": true
+            },
             "usageComplete": true
         }),
         json!({
             "metadataType": "turn_terminal",
             "turnId": "turn-1",
             "status": "failed",
-            "usage": {},
+            "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "cachedInputTokens": 0,
+                "reasoningTokens": 0,
+                "usagePresent": false,
+                "usageComplete": false
+            },
             "usageComplete": false
         }),
         json!({
@@ -253,6 +274,24 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             value
         );
     }
+
+    // 兼容读取：历史文件的部分/旧命名 usage 形状仍可反序列化。
+    let legacy: SessionMetadata = serde_json::from_value(json!({
+        "metadataType": "turn_terminal",
+        "turnId": "turn-1",
+        "status": "completed",
+        "usage": {"totalTokens": 42},
+        "usageComplete": true
+    }))
+    .expect("legacy camelCase usage reads");
+    assert!(matches!(
+        &legacy,
+        SessionMetadata::TurnTerminal { usage, .. }
+            if usage.total_tokens == 42 && usage.usage_present
+    ));
+    let snake: SessionTurnUsage =
+        serde_json::from_value(json!({"input_tokens": 3})).expect("snake usage reads");
+    assert_eq!(snake.input_tokens, 3);
 
     let metadata: SessionMetadata = serde_json::from_value(json!({
         "metadataType": "thread_settings",
@@ -372,7 +411,12 @@ fn v2_format_round_trips_nested_payloads() {
         .append_metadata(SessionMetadata::turn_terminal(
             "turn-1",
             TurnTerminalStatus::Completed,
-            json!({"totalTokens": 7}),
+            SessionTurnUsage {
+                total_tokens: 7,
+                usage_present: true,
+                usage_complete: true,
+                ..SessionTurnUsage::default()
+            },
             true,
         ))
         .unwrap();
@@ -396,7 +440,14 @@ fn v2_format_round_trips_nested_payloads() {
                     usage_complete: true,
                 },
             ..
-        } if turn_id == "turn-1" && usage == &json!({"totalTokens": 7})
+        } if turn_id == "turn-1"
+            && usage
+                == &SessionTurnUsage {
+                    total_tokens: 7,
+                    usage_present: true,
+                    usage_complete: true,
+                    ..SessionTurnUsage::default()
+                }
     ));
 }
 

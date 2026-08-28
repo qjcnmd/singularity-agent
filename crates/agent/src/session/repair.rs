@@ -6,7 +6,8 @@ use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
 pub use super::format::SessionError;
 use super::format::{
-    Result, SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
+    Result, SessionEntry, SessionMetadata, SessionMetadataKind, SessionTurnUsage,
+    TurnTerminalStatus,
 };
 pub use super::manager::SessionManager;
 
@@ -41,7 +42,7 @@ impl SessionManager {
             self.append_metadata(SessionMetadata::turn_terminal(
                 turn_id,
                 TurnTerminalStatus::Interrupted,
-                serde_json::json!({}),
+                SessionTurnUsage::default(),
                 false,
             ))?;
             repaired += 1;

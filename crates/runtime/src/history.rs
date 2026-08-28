@@ -160,7 +160,9 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                             .to_string();
                         last.items.push(HistoryItem::Usage {
                             id,
-                            usage: usage.clone(),
+                            usage: serde_json::to_value(usage)
+                                // 不变量：SessionTurnUsage 为本仓静态类型，序列化恒不失败。
+                                .expect("SessionTurnUsage serializes"),
                         });
                     } else {
                         // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。

@@ -104,6 +104,41 @@ pub enum TurnTerminalStatus {
     Interrupted,
 }
 
+/// turn 终态的持久化 usage：JSONL 存储形状的 owner 类型（camelCase 主名，
+/// 兼容早期 snake_case 写入的历史文件）。字段与 wire 投影同形，读回端
+/// 不再对裸 JSON 做鸭子解析。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurnUsage {
+    #[serde(rename = "inputTokens", alias = "input_tokens", default)]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens", alias = "output_tokens", default)]
+    pub output_tokens: u64,
+    #[serde(rename = "totalTokens", alias = "total_tokens", default)]
+    pub total_tokens: u64,
+    #[serde(rename = "cachedInputTokens", alias = "cached_input_tokens", default)]
+    pub cached_input_tokens: u64,
+    #[serde(rename = "reasoningTokens", alias = "reasoning_tokens", default)]
+    pub reasoning_tokens: u64,
+    /// 历史 usage 对象缺失该字段时视为已上报。
+    #[serde(
+        rename = "usagePresent",
+        alias = "usage_present",
+        default = "default_true"
+    )]
+    pub usage_present: bool,
+    #[serde(
+        rename = "usageComplete",
+        alias = "usage_complete",
+        default = "default_true"
+    )]
+    pub usage_complete: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// 一条可恢复的 session metadata；variant 直接携带其合法 payload。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "metadataType", rename_all = "snake_case", deny_unknown_fields)]
@@ -117,7 +152,7 @@ pub enum SessionMetadata {
         #[serde(rename = "turnId")]
         turn_id: String,
         status: TurnTerminalStatus,
-        usage: Value,
+        usage: SessionTurnUsage,
         #[serde(rename = "usageComplete")]
         usage_complete: bool,
     },
@@ -169,7 +204,7 @@ impl SessionMetadata {
     pub fn turn_terminal(
         turn_id: impl Into<String>,
         status: TurnTerminalStatus,
-        usage: Value,
+        usage: SessionTurnUsage,
         usage_complete: bool,
     ) -> Self {
         Self::TurnTerminal {
@@ -200,9 +235,6 @@ impl SessionMetadata {
         match &self {
             Self::ThreadName { name } if name.trim().is_empty() => Err(
                 SessionError::InvalidStructure("thread name must not be empty".to_string()),
-            ),
-            Self::TurnTerminal { usage, .. } if !usage.is_object() => Err(
-                SessionError::InvalidStructure("terminal usage must be a JSON object".to_string()),
             ),
             _ => Ok(self),
         }
