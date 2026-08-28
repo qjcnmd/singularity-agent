@@ -2,7 +2,6 @@
 
 > 本文是仓库的浅层导航图：先看总览与依赖，再按 crate 展开到文件。
 > 深层的架构事实、协议与行为见 [`singularity.md`](singularity.md)。
-> 目录树以 2026-08-26 `main@5bc2d7d5` 为准。
 
 ## 1. 仓库总览
 
@@ -15,8 +14,8 @@ flowchart TD
     ROOT --> GITHUB[".github/ — CI 工作流与 Issue 模板"]
     ROOT --> ROOTFILES["根级文件：Cargo.toml · README.md · AGENTS.md · deny.toml · rust-toolchain.toml"]
 
-    CRATES --> C1["core — 跨 crate 基础（取消/权限/项目指令）"]
-    CRATES --> C2["protocol — stdio JSON-RPC 协议类型"]
+    CRATES --> C1["core — 跨 crate 基础（取消/权限/项目指令/用户主目录）"]
+    CRATES --> C2["protocol — stdio JSON-RPC 协议类型、事件与公共对象"]
     CRATES --> C3["model — 模型 Provider 与 OpenAI 兼容传输"]
     CRATES --> C4["agent — AgentLoop 与工具/会话/压缩"]
     CRATES --> C5["runtime — Thread/Turn 生命周期与执行管线"]
@@ -26,9 +25,7 @@ flowchart TD
 
 ## 2. Crate 依赖方向
 
-依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core`/`protocol` 是最底层。
-`runtime` 依赖 `protocol` 仅为公开历史投影类型（`HistoryItem`/`ThreadTurn`）；
-`protocol` 只服务 app-server 适配器与 runtime 的历史投影。
+依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core` 是底层基础；`protocol` 定义公共协议对象、事件枚举与 wire 线格式，`runtime` 与 `app-server` 均依赖它。
 
 ```mermaid
 flowchart LR
@@ -37,7 +34,7 @@ flowchart LR
     CLI --> CORE["core"]
     APPSERVER["app-server"] --> RUNTIME
     APPSERVER --> PROTOCOL["protocol"]
-    RUNTIME --> AGENT
+    RUNTIME --> AGENT["agent"]
     RUNTIME --> MODEL
     RUNTIME --> CORE
     RUNTIME --> PROTOCOL
@@ -59,20 +56,24 @@ flowchart TD
         project_instructions["project_instructions.rs — AGENTS.md 加载、合并与预算截断"]
         user_home["user_home.rs — 用户主目录与 SINGULARITY_HOME 解析"]
     end
-    cli["cli / app-server / agent / runtime"] --> core
+    cli["cli / app-server / agent / runtime / model"] --> core
 ```
 
 ## 4. crates/protocol — 协议类型
 
-单一文件 crate，只依赖 serde。定义 stdio JSON-RPC 的全部方法、事件与对象形状。
+单点定义 stdio JSON-RPC 的全部方法、请求/响应 envelope、生命周期事件（`TurnEvent`）、执行对象（`Thread`/`Turn`/`TurnUsage`/`TurnStatus`）与错误分类词表。
 
 ```mermaid
 flowchart TD
     subgraph protocol["crates/protocol"]
-        lib["lib.rs — JSON-RPC 方法注册表、消息 envelope、线程设置、事件与 usage 线格式"]
+        lib["lib.rs — 模块组织与稳定导出"]
+        method["method.rs — JSON-RPC 方法名称与注册表"]
+        envelope["envelope.rs — 请求/响应/通知消息封装"]
+        event["event.rs — typed TurnEvent 与 wire/JSONL 投影"]
+        params["params.rs — 线程设置、执行对象与错误分类线格式"]
     end
     appserver["app-server"] --> protocol
-    protocol -. "runtime 不依赖它" .-> runtime["runtime"]
+    runtime["runtime"] --> protocol
 ```
 
 ## 5. crates/model — Provider 与 OpenAI 兼容传输
@@ -97,6 +98,7 @@ flowchart TD
             p_contract["contract.rs — 能力契约与本地校验"]
             p_runtime["runtime.rs — SelectedModel 解析"]
             p_telemetry["telemetry.rs — attempt 事件与流能力"]
+            p_attempt["attempt.rs — attempt 观测分类"]
         end
         subgraph openai["openai/ — 双协议适配"]
             o_mod["mod.rs — 适配器入口与 tool_choice payload"]
@@ -105,7 +107,7 @@ flowchart TD
             o_wire["wire.rs — 端点解析与 OpenAiCompletion"]
         end
         subgraph transport["transport/ — HTTP 与流解码"]
-            tr_mod["mod.rs — 完成骨架与 attempt 观测"]
+            tr_mod["mod.rs — ProtocolAdapter 薄转发表与 attempt 观测"]
             tr_http["http.rs — 有界 body 读取与错误解析"]
             tr_retry["retry.rs — Retry-After 头解析"]
             tr_stream["stream.rs — SSE 流式解码器（双协议）"]
@@ -133,6 +135,9 @@ flowchart TD
 flowchart TD
     subgraph agent["crates/agent"]
         loop_["loop.rs — 分层循环：turn 步循环、attempt_request 采样请求层、stream_completion 流处理"]
+        request["request.rs — 采样请求装配与独立重试包装"]
+        inbox["inbox.rs — TurnInbox 承载 steer 注入"]
+        events_agent["events.rs — Agent 内部事件定义"]
         message["message.rs — 会话消息/内容块数据模型"]
         compaction["compaction.rs — 触发判定、安全切点与摘要生成"]
         prompts["prompts.rs — 人格与工作方式系统提示词"]
@@ -143,6 +148,7 @@ flowchart TD
             s_manager["manager.rs — 会话生命周期与追加"]
             s_context["context.rs — 上下文条目投影"]
             s_repair["repair.rs — 崩溃恢复与孤立工具修复"]
+            s_lock["writer_lock.rs — 会话文件锁（OS 写者锁）"]
         end
         subgraph tools["tools/ — 六工具与注册表"]
             t_mod["mod.rs — 工具模块组织"]
@@ -171,10 +177,13 @@ flowchart TD
     subgraph runtime["crates/runtime"]
         conversation["conversation.rs — Thread 长驻协调器：单活动 turn、Steer、followUp、设置时序"]
         runner["runner.rs — 单个 turn 完整管线：准备、执行、事件投影、终态落盘"]
-        events["events.rs — typed TurnEvent 单一事实源"]
+        thread_catalog["thread_catalog.rs — 持久化 Thread 目录操作与只读投影的唯一入口（ThreadCatalog）"]
+        events["events.rs — typed TurnEvent 出口与 TurnEventSink"]
+        assistant_items["assistant_items.rs — Agent 内部事件到 TurnEvent 的规范化映射"]
         history["history.rs — 会话条目→公开历史投影（project_turn_history）"]
         objects["objects.rs — Thread/Turn/usage/Provider 状态公开对象"]
-        store["store.rs — 会话创建/定位/列表/分页只读投影/删除/修复重开入口"]
+        store["store.rs — 会话创建/定位/列表/分页只读投影/归档/修复重开入口"]
+        terminal["terminal.rs — Turn 终态与 usage 原子收敛落盘"]
         error["error.rs — Turn 失败分类（stage/cause）"]
     end
     cli["cli"] --> runtime
@@ -193,6 +202,7 @@ flowchart TD
         tui_["tui.rs — TUI 主循环与事件驱动渲染"]
         print_mode["print_mode.rs — --print 只输出最终文本"]
         jsonl_mode["jsonl_mode.rs — --json 逐行事件 + summary"]
+        forward["forward.rs — 事件通道投递与轮询间隔（EventForward）"]
         session_options["session_options.rs — 会话准备（默认/--session/--no-session）"]
         signal["signal.rs — Ctrl+C 计数与两级取消"]
         subgraph tui["tui/ — 界面状态与命令模块"]
@@ -210,7 +220,7 @@ flowchart TD
 ## 9. crates/app-server — 桌面端后端
 
 stdio JSON-RPC 后端：只做准入、协议对象转换与事件投影，执行全部委托 runtime。
-`protocol` 类型只存在于本 crate、适配器与 runtime 的公开历史投影（D1 后
+`protocol` 类型只存在于本 crate、适配器与 runtime 的公开历史投影（
 thread/read 的分页与历史投影由 runtime store 的 `paged_read` 承担）。
 
 ```mermaid
@@ -254,7 +264,7 @@ sequenceDiagram
     RT->>SS: 打开/修复会话（单写者）
     RT->>AG: 构造 Agent（provider/工具/配置）
     loop 每轮请求
-        AG->>MD: complete（消息+工具 schema）
+        AG->>MD: complete_stream（消息+工具 schema）
         MD-->>AG: 响应（文本/工具调用/usage）
         alt 有工具调用
             AG->>TL: 按序执行工具批（preflight→执行）
@@ -272,8 +282,7 @@ sequenceDiagram
 
 ## 11. 其他目录
 
-- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）。
-- **plan/、docs/plans/、outputs/、.worktrees/、.codex/** 等为本地工作产物，不入库。
+- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）、`decisions/`（裁决记录）、`agents/`（按需读取的项目指令）。
 - **.github/**：`ci.yml` 入口 → `rust-gates.yml`（supply-chain + Linux/Windows 门禁）、`release.yml`（发布打包）、Issue 模板。
 - **根级文件**：`Cargo.toml`（workspace 成员与统一 lint）、`deny.toml`（依赖策略）、`rust-toolchain.toml`（固定工具链）、`AGENTS.md`（仓库指令）、`README.md`。
 - **outputs/**、**.worktrees/**、**.codex/**、**plan/**、**docs/plans/** 等为本地工作产物，不入库。

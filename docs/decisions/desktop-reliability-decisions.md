@@ -222,3 +222,30 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 ### D-051：会话单写者由 OS 文件锁强制执行
 
 问题：单写者此前只由进程内约定（activate_turn 预订）保证，跨进程无法互斥；`session/delete` 的「活动 turn 检查 → 打开校验 → unlink」之间存在 TOCTOU 窗口，另一进程可在校验后开始 append，删除后写入落入 unlinked inode。参考实现：codex-rs `thread-store/src/local/writer_lock.rs`——每会话一把锁文件 + `std::fs::File::try_lock()` 快速失败 + 协调锁串行化 stale 锁清理 + Guard Drop 先关句柄再删锁文件（Windows 必须先关句柄才能删文件）。当前代码事实：SessionManager 是 JSONL 唯一可变持有者，`open_existing` 已含 repair 重写；toolchain 1.96 ≥ try_lock 稳定版 1.89，标准库直用零新依赖。选择：任何可能写 JSONL 的打开（create_with_file、open_existing 含 repair）都先获取会话写者锁，Guard 为 SessionManager 字段随实例释放；锁目录为 sessions 同级 `thread-writer-locks/`，目录创建走 `create_owner_only_dir`；`open_existing_read_only` 不加锁。`session/delete` 先 try_lock 快速失败，冲突映射为 `APP_ERROR_INVALID_STATE` + 「session is being written by an active writer」，校验与 unlink 全程持锁，TOCTOU 随之消失。影响：跨进程双开同一会话的第二写者被快速拒绝；同进程测试中原「顺序双开」按新语义改为先释放再打开；只读投影路径不受影响。验收方式：writer_lock 单元测试（竞争拒绝/释放后复用/stale 清理/跨线程快速失败）、delete vs 活动写者集成测试、resume 双开冲突测试。
+
+### D-052：Wire 分派形状与 Declared 协议降级分层
+
+问题：是否将 transport 的 ProtocolAdapter 重构为 trait 或分拆到各协议文件？未声明协议变体 Declared 如何降级？
+参考实现：Codex 单一协议适配器、Pi 多 provider 适配器。
+当前代码事实：ProtocolAdapter 薄转发表集中于 `crates/model/src/transport/mod.rs` 单文件（端点、请求载荷、reasoning 在场判定、响应解析、SSE 读取），各协议实现体分别位于 `openai/chat.rs` 与 `openai/responses.rs`。运行时协议选择下 trait 化不减少分支总数，仅拆分事实源位置。
+选择：维持当前集中薄转发表，接入第三 wire 协议时重评该形状；未声明协议变体 `Declared` 的降级按用途分层且各自单点（transport 折叠为 Chat wire，attempt 观测标记 `Unsupported`）。
+影响：双协议维持单点转发表，不引入额外 trait 间接层；协议与观测降级语义清晰独立。
+验收方式：双协议 provider 单元与集成测试全绿，wire golden 测试无漂移。
+
+### D-053：ThreadCatalog 成为 Thread 目录操作与只读投影的唯一入口
+
+问题：客户端和各调用点逐点传递 `(sessions_dir, coordinator)` 元组并直接调用 `store` 模块的底层函数，导致会话目录操作接缝发散。
+参考实现：codex-rs `core/src/thread_store.rs` 统一 Thread 目录管理。
+当前代码事实：`ThreadCatalog` 封装 `sessions_dir` 与进程级写者锁协调器 `WriterLockCoordinator`；`store` 底层函数不再对外直接暴露。
+选择：`ThreadCatalog` 成为创建、列表、恢复、重命名、归档和只读分页历史（`paged_read`、`read_thread_summary`）的唯一公开入口；`Conversation` 不持有目录 CRUD。
+影响：调用方只需持有 `ThreadCatalog` 单一实例，目录操作集中且易于测试与扩展。
+验收方式：runtime 单元与集成测试、cli 及 app-server 目录操作测试全绿。
+
+### D-054：Turn 终态与错误词表收敛为 protocol 单点定义
+
+问题：runtime 与 protocol 之间曾存在平行的终态枚举与错误原因词表，增加了跨层映射与词形同步负担。
+参考实现：项目内部收敛。
+当前代码事实：`TurnStatus`、`TurnFailureCause`、`TurnFailureStage` 以及 `ExecutionThread`/`ExecutionTurn`/`ExecutionTurnUsage` 统一在 `crates/protocol` 单点定义，runtime 直接引用并对外导出。
+选择：消除平行枚举与重复词表，protocol 成为 wire 形状、事件枚举与状态词表的单一权威事实源；runtime 负责执行语义并将具体 model 失败映射至 protocol 的 `TurnFailureCause`。
+影响：跨层类型和错误词形零冗余，golden 测试单点守护线格式。
+验收方式：protocol 与 runtime 测试全绿，错误词表一致性测试通过。
