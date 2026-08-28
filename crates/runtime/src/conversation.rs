@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::error::TurnRunError;
 use crate::events::{TurnEvent, TurnEventSink};
-use crate::objects::{Thread, ThreadStatus, TurnStatus};
+use crate::objects::{Thread, ThreadStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 
 /// 客户端可修改的当前 Thread 运行时设置。
@@ -536,12 +536,7 @@ impl Conversation {
         state.turn = TurnLifecycle::Reserved;
         match &result {
             Ok(outcome) => {
-                state.thread.last_turn_status = Some(match outcome.turn_status {
-                    TurnStatus::Running => ThreadStatus::Active,
-                    TurnStatus::Completed => ThreadStatus::Completed,
-                    TurnStatus::Failed => ThreadStatus::Failed,
-                    TurnStatus::Interrupted => ThreadStatus::Interrupted,
-                });
+                state.thread.last_turn_status = Some(ThreadStatus::from(outcome.turn_status));
             }
             // Terminalization 表示没有可信终态；保持上一投影不变。
             Err(TurnRunError::Terminalization(_)) => {}

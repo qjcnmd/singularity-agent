@@ -28,7 +28,7 @@ use crate::error::{
 };
 use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{
-    ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage,
+    ProviderStatus, Thread, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage,
 };
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
@@ -305,15 +305,16 @@ impl TurnRunner {
 
         // 终态收敛：单条原子落盘 `turn_terminal` → 终态事件。写入失败直接
         // fail-stop，绝不发布虚假终态或降级成另一个状态。
-        // 不变量：status 为终态（completed/failed/interrupted）时 TerminalCommit 恒可构造。
+        // 不变量：status.turn_status 为终态（completed/interrupted）时
+        // TerminalCommit 恒可构造（此路径排除了 Failed 与非终态）。
         #[allow(clippy::expect_used)]
         let terminal = TerminalCommit::new(
             &turn_id,
-            status.session_status,
+            status.turn_status,
             &status.model_usage,
             status.usage_complete,
         )
-        .expect("run() only reaches this point with a terminal thread status");
+        .expect("run() only reaches this point with a terminal turn status");
         if let Err(storage_error) = terminal.persist(&mut session) {
             let failure = TurnFailure {
                 stage: TurnFailureStage::TerminalOutcome,
@@ -328,7 +329,7 @@ impl TurnRunner {
             item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
         item_events.emit_assistant_terminal_completed(sink);
-        let final_turn = terminal.turn(&thread.thread_id, status.turn_status);
+        let final_turn = terminal.turn(&thread.thread_id);
         sink.emit(TurnEvent::TurnCompleted {
             turn: final_turn.clone(),
         });
@@ -445,7 +446,7 @@ impl TurnRunner {
         let failure = turn_failure_from_error(error, TurnFailureStage::AgentLoop);
         // 不变量：Failed 恒为终态，TerminalCommit 必可构造。
         #[allow(clippy::expect_used)]
-        let terminal = TerminalCommit::new(turn_id, ThreadStatus::Failed, &usage, usage_complete)
+        let terminal = TerminalCommit::new(turn_id, TurnStatus::Failed, &usage, usage_complete)
             .expect("Failed always maps to a terminal status");
         // 失败终态无法落盘同样 fail-stop：不发布任何终态事件。
         if terminal.persist(session).is_err() {
@@ -539,10 +540,10 @@ fn append_turn_started_metadata(session: &mut SessionManager, turn_id: &str) -> 
     Ok(())
 }
 
-/// AgentLoop 结束时的中间状态投影。
+/// AgentLoop 结束时的中间状态投影；turn 终态是单字段事实，
+/// ThreadStatus 与 JSONL 词形在需要处由它派生。
 struct RunStatus {
     turn_status: TurnStatus,
-    session_status: ThreadStatus,
     final_answer: Option<String>,
     truncated: bool,
     model_usage: ModelUsage,
@@ -553,7 +554,6 @@ struct RunStatus {
 fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     let mut status = RunStatus {
         turn_status: TurnStatus::Failed,
-        session_status: ThreadStatus::Failed,
         final_answer: None,
         truncated: outcome.truncated,
         model_usage: outcome.usage,
@@ -563,14 +563,12 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
     match outcome.terminal_reason {
         AgentTerminalReason::Aborted => {
             status.turn_status = TurnStatus::Interrupted;
-            status.session_status = ThreadStatus::Interrupted;
         }
         AgentTerminalReason::Completed if outcome.final_text.trim().is_empty() => {
             status.error = Some("agent loop stopped without a final assistant message".to_string());
         }
         AgentTerminalReason::Completed => {
             status.turn_status = TurnStatus::Completed;
-            status.session_status = ThreadStatus::Completed;
             status.final_answer = Some(outcome.final_text);
         }
         AgentTerminalReason::Failed => {

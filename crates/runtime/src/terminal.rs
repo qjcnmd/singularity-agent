@@ -12,7 +12,7 @@ use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
 use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
-use crate::objects::{ThreadStatus, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage};
+use crate::objects::{Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage};
 
 /// wire usage 投影 → JSONL 存储形状（字段一一对应，camelCase 落盘不变）。
 fn session_turn_usage(usage: &TurnUsage) -> SessionTurnUsage {
@@ -27,26 +27,51 @@ fn session_turn_usage(usage: &TurnUsage) -> SessionTurnUsage {
     }
 }
 
+/// turn 终态到 JSONL 存储词形的唯一派生；`Running` 非终态返回 `None`。
+fn terminal_word(status: TurnStatus) -> Option<TurnTerminalStatus> {
+    match status {
+        TurnStatus::Completed => Some(TurnTerminalStatus::Completed),
+        TurnStatus::Failed => Some(TurnTerminalStatus::Failed),
+        TurnStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
+        TurnStatus::Running => None,
+    }
+}
+
+/// JSONL 存储的终态词形回投为 `TurnStatus`（`terminal_word` 的逆映射）。
+/// 读路径（历史投影）共用此单点，不再各自手写词形表。
+pub(crate) fn turn_status_for_terminal(status: TurnTerminalStatus) -> TurnStatus {
+    match status {
+        TurnTerminalStatus::Completed => TurnStatus::Completed,
+        TurnTerminalStatus::Failed => TurnStatus::Failed,
+        TurnTerminalStatus::Interrupted => TurnStatus::Interrupted,
+    }
+}
+
 /// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
+///
+/// `TurnStatus` 是终态的唯一事实；`terminal` 与 `event_status` 两个字段都在
+/// 构造时由它派生（一致性由构造函数保证，调用方无需成对赋值）。
 pub(crate) struct TerminalCommit {
     turn_id: String,
-    status: TurnTerminalStatus,
+    terminal: TurnTerminalStatus,
+    event_status: TurnStatus,
     usage: TurnUsage,
     usage_complete: bool,
 }
 
 impl TerminalCommit {
-    /// 从线程状态构造终态提交；`Active`（非终态）返回 `None`。
+    /// 从 turn 终态构造提交；非终态（`Running`）返回 `None`。
     pub(crate) fn new(
         turn_id: &str,
-        status: ThreadStatus,
+        status: TurnStatus,
         usage: &ModelUsage,
         usage_complete: bool,
     ) -> Option<Self> {
-        let status = terminal_status_for_thread_status(status)?;
+        let terminal = terminal_word(status)?;
         Some(Self {
             turn_id: turn_id.to_string(),
-            status,
+            terminal,
+            event_status: status,
             usage: turn_usage_from_model_usage(usage, usage_complete),
             usage_complete,
         })
@@ -56,7 +81,7 @@ impl TerminalCommit {
     fn metadata(&self) -> SessionMetadata {
         SessionMetadata::turn_terminal(
             &self.turn_id,
-            self.status,
+            self.terminal,
             session_turn_usage(&self.usage),
             self.usage_complete,
         )
@@ -67,12 +92,12 @@ impl TerminalCommit {
         append_terminal_metadata_if_missing(session, &self.turn_id, self.metadata())
     }
 
-    /// 终态事件层 Turn 投影（携带本轮已落盘的 usage）。
-    pub(crate) fn turn(&self, thread_id: &str, turn_status: TurnStatus) -> Turn {
+    /// 终态事件层 Turn 投影（携带本轮已落盘的 usage 与同一终态）。
+    pub(crate) fn turn(&self, thread_id: &str) -> Turn {
         Turn {
             turn_id: self.turn_id.clone(),
             thread_id: thread_id.to_string(),
-            status: turn_status,
+            status: self.event_status,
             usage: Some(self.usage.clone()),
         }
     }
@@ -117,15 +142,6 @@ fn append_terminal_metadata_if_missing(
     Ok(())
 }
 
-fn terminal_status_for_thread_status(status: ThreadStatus) -> Option<TurnTerminalStatus> {
-    match status {
-        ThreadStatus::Completed => Some(TurnTerminalStatus::Completed),
-        ThreadStatus::Failed => Some(TurnTerminalStatus::Failed),
-        ThreadStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
-        ThreadStatus::Active => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
@@ -147,7 +163,7 @@ mod tests {
             ..Default::default()
         };
         let commit =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+            TerminalCommit::new("turn-1", TurnStatus::Completed, &usage, true).expect("terminal");
         commit.persist(&mut session).expect("first persist");
         commit.persist(&mut session).expect("idempotent persist");
 
@@ -183,10 +199,10 @@ mod tests {
             SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
         let usage = ModelUsage::default();
         let completed =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+            TerminalCommit::new("turn-1", TurnStatus::Completed, &usage, true).expect("terminal");
         completed.persist(&mut session).expect("completed persist");
         let failed =
-            TerminalCommit::new("turn-1", ThreadStatus::Failed, &usage, true).expect("terminal");
+            TerminalCommit::new("turn-1", TurnStatus::Failed, &usage, true).expect("terminal");
         failed.persist(&mut session).expect("failed persist");
 
         let terminals: Vec<TurnTerminalStatus> = session
@@ -213,7 +229,7 @@ mod tests {
         std::fs::set_permissions(session.path(), permissions).expect("make session read-only");
         let usage = ModelUsage::default();
         let commit =
-            TerminalCommit::new("turn-1", ThreadStatus::Completed, &usage, true).expect("terminal");
+            TerminalCommit::new("turn-1", TurnStatus::Completed, &usage, true).expect("terminal");
         assert!(commit.persist(&mut session).is_err(), "append must fail");
 
         let mut events = Vec::new();

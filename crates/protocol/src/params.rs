@@ -366,6 +366,20 @@ impl TurnStatus {
     }
 }
 
+/// Thread 的 `lastTurnStatus` 投影：它承载的正是最近一次 turn 的终态，
+/// 运行中的 turn 在 Thread 视角下记作 `active`。这张表是两枚举间唯一的
+/// 派生关系，客户端投影不得另行手写映射。
+impl From<TurnStatus> for ThreadStatus {
+    fn from(status: TurnStatus) -> Self {
+        match status {
+            TurnStatus::Running => Self::Active,
+            TurnStatus::Completed => Self::Completed,
+            TurnStatus::Failed => Self::Failed,
+            TurnStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// 只包含 turn id 的请求参数。

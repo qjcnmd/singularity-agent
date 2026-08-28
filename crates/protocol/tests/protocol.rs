@@ -475,6 +475,16 @@ fn json_rpc_id_is_numeric_only_and_rejects_large_u64_and_string_ids() {
 
 #[test]
 fn thread_status_projects_last_turn_metadata_not_lifecycle() {
+    // `ThreadStatus` 是 turn 终态的投影：`From<TurnStatus>` 表在 protocol 单点。
+    for (turn, expected) in [
+        (TurnStatus::Running, ThreadStatus::Active),
+        (TurnStatus::Completed, ThreadStatus::Completed),
+        (TurnStatus::Failed, ThreadStatus::Failed),
+        (TurnStatus::Interrupted, ThreadStatus::Interrupted),
+    ] {
+        assert_eq!(ThreadStatus::from(turn), expected);
+    }
+
     let thread = singularity_protocol::Thread {
         thread_id: "session-1".to_string(),
         model: None,

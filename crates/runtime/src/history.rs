@@ -8,9 +8,11 @@
 
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus},
+    session::{SessionEntry, SessionMetadata, SessionMetadataKind},
 };
 use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
+
+use crate::terminal::turn_status_for_terminal;
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
@@ -82,7 +84,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 turn_id, status, ..
             } => vec![HistoryItem::Turn {
                 id: turn_id.clone(),
-                status: terminal_turn_status(*status),
+                status: turn_status_for_terminal(*status),
             }],
             SessionMetadata::ThreadSettings {
                 provider,
@@ -96,14 +98,6 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
             }],
             SessionMetadata::ThreadName { .. } => Vec::new(),
         },
-    }
-}
-
-fn terminal_turn_status(status: TurnTerminalStatus) -> TurnStatus {
-    match status {
-        TurnTerminalStatus::Completed => TurnStatus::Completed,
-        TurnTerminalStatus::Failed => TurnStatus::Failed,
-        TurnTerminalStatus::Interrupted => TurnStatus::Interrupted,
     }
 }
 
@@ -150,7 +144,7 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                         let SessionMetadata::TurnTerminal { status, usage, .. } = metadata else {
                             unreachable!("matches_turn_terminal implies TurnTerminal");
                         };
-                        last.status = Some(terminal_turn_status(*status));
+                        last.status = Some(turn_status_for_terminal(*status));
                         // 终态携带的用量并入轮内条目，thread/read 仍暴露每次终态的用量。
                         // 不变量：matched 条件已断言 turn_id 相等且非 None。
                         #[allow(clippy::expect_used)]
