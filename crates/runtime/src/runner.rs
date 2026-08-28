@@ -15,7 +15,7 @@ use singularity_agent::agent::{
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::session::{
-    SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
+    SessionAccess, SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -379,19 +379,13 @@ impl TurnRunner {
 
     fn open_and_repair_session(&self, thread: &Thread) -> Result<SessionManager, RunnerError> {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let mut session = SessionManager::open_existing_with_coordinator(&path, &self.coordinator)
-            .map_err(RunnerError::Session)?;
-        // 头部 id 与请求不一致属于损坏状态。
-        session
-            .verify_session_id(&thread.thread_id)
-            .map_err(RunnerError::Session)?;
-        session
-            .repair_interrupted_turns()
-            .map_err(RunnerError::Session)?;
-        session
-            .repair_orphaned_tool_calls()
-            .map_err(RunnerError::Session)?;
-        Ok(session)
+        SessionManager::open_existing_with_access(
+            &path,
+            &self.coordinator,
+            &thread.thread_id,
+            SessionAccess::RepairWrite,
+        )
+        .map_err(RunnerError::Session)
     }
 
     fn prepare_agent(

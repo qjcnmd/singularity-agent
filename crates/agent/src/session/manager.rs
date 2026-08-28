@@ -20,6 +20,16 @@ use super::format::{
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
+/// 既有会话的打开意图：调用方必须声明打开后要做什么，锁语义与修复行为
+/// 由此单点决定，而不是散布在调用方的后续编排里。
+pub enum SessionAccess {
+    /// 持锁打开，校验头部 id 一致性并修复中断 turn 与孤立工具调用
+    /// （turn 执行与 resume 前的写修复路径）。
+    RepairWrite,
+    /// 持锁打开并校验头部 id 一致性，随后追加或移动，不做修复重写。
+    Append,
+}
+
 /// JSONL 会话管理器。会话是严格的线性序列，`entries` 的物理顺序即事实源顺序；
 /// 会话由单个写者在整轮 turn 内独占持有（由 OS 文件锁跨进程强制执行），因此
 /// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
@@ -116,11 +126,31 @@ impl SessionManager {
         Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(sessions_dir))
     }
 
+    /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
+    ///
+    /// 两条路径都先校验文件头部 id 与 `expected_id` 一致（不一致属于损坏
+    /// 状态）；协调器承担进程级的一次性 stale 清理，进程内应只存在一个实例
+    /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
+    pub fn open_existing_with_access(
+        path: &Path,
+        coordinator: &Arc<WriterLockCoordinator>,
+        expected_id: &str,
+        access: SessionAccess,
+    ) -> Result<Self> {
+        let mut session = Self::open_existing_with_coordinator(path, coordinator)?;
+        session.verify_session_id(expected_id)?;
+        if matches!(access, SessionAccess::RepairWrite) {
+            session.repair_interrupted_turns()?;
+            session.repair_orphaned_tool_calls()?;
+        }
+        Ok(session)
+    }
+
     /// 打开既有会话并使用调用方持有的长驻协调器。
     ///
     /// 协调器承担进程级的一次性 stale 清理；进程内应只存在一个实例
     /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
-    pub fn open_existing_with_coordinator(
+    fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {

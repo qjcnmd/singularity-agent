@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use singularity_agent::session::{
-    SessionEntry, SessionError, SessionManager, SessionProjectionStatus, WriterLockCoordinator,
-    project_session,
+    SessionAccess, SessionEntry, SessionError, SessionManager, SessionProjectionStatus,
+    WriterLockCoordinator, project_session,
 };
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
@@ -105,17 +105,13 @@ pub fn resume_thread(
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
-    let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
-    session
-        .verify_session_id(thread_id)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
-    session
-        .repair_interrupted_turns()
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
-    session
-        .repair_orphaned_tool_calls()
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let session = SessionManager::open_existing_with_access(
+        &path,
+        coordinator,
+        thread_id,
+        SessionAccess::RepairWrite,
+    )
+    .map_err(|error| ResumeError::Store(error.to_string()))?;
     let projection = project_session(&session);
     let thread = Thread {
         thread_id: thread_id.to_string(),
@@ -225,11 +221,13 @@ pub fn rename_thread(
         return Err("thread name must not be empty".to_string());
     }
     let path = thread_session_path(sessions_dir, thread_id);
-    let mut session = SessionManager::open_existing_with_coordinator(&path, coordinator)
-        .map_err(|error| error.to_string())?;
-    session
-        .verify_session_id(thread_id)
-        .map_err(|error| error.to_string())?;
+    let mut session = SessionManager::open_existing_with_access(
+        &path,
+        coordinator,
+        thread_id,
+        SessionAccess::Append,
+    )
+    .map_err(|error| error.to_string())?;
     session
         .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
             name,
@@ -338,16 +336,16 @@ pub fn archive_thread(
         // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
-    let session =
-        SessionManager::open_existing_with_coordinator(&path, coordinator).map_err(|error| {
-            match error {
-                SessionError::WriterConflict { .. } => ResumeError::WriterActive,
-                other => ResumeError::Store(other.to_string()),
-            }
-        })?;
-    session
-        .verify_session_id(thread_id)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let session = SessionManager::open_existing_with_access(
+        &path,
+        coordinator,
+        thread_id,
+        SessionAccess::Append,
+    )
+    .map_err(|error| match error {
+        SessionError::WriterConflict { .. } => ResumeError::WriterActive,
+        other => ResumeError::Store(other.to_string()),
+    })?;
     // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
     // NotFound，不会再 append 进即将归档的文件。
     if let Err(error) = std::fs::rename(&path, &archived) {
@@ -497,9 +495,11 @@ mod tests {
         let _ = session_with_two_turns(&sessions_dir, thread_id);
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
 
-        let session = SessionManager::open_existing_with_coordinator(
+        let session = SessionManager::open_existing_with_access(
             &thread_session_path(&sessions_dir, thread_id),
             &coordinator,
+            thread_id,
+            SessionAccess::Append,
         )
         .expect("open session");
         // 存活写者持有锁：归档必须拒绝，避免归档窗口内写入落入 unlinked inode。

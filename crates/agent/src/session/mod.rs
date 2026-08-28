@@ -17,7 +17,7 @@ pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
     SessionMetadataKind, SessionTurnUsage, TurnTerminalStatus,
 };
-pub use manager::SessionManager;
+pub use manager::{SessionAccess, SessionManager};
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// runtime 与 app-server 投影共享的 JSONL 派生事实。

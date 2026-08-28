@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
-use singularity_agent::session::SessionManager;
+use singularity_agent::session::{SessionAccess, SessionManager};
 use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
 use uuid::Uuid;
@@ -584,9 +584,13 @@ impl Conversation {
         let path =
             crate::store::thread_session_path(self.runner.sessions_dir(), &state.thread.thread_id);
         let write_result = (|| -> Result<(), String> {
-            let mut session =
-                SessionManager::open_existing_with_coordinator(&path, self.runner.coordinator())
-                    .map_err(|error| error.to_string())?;
+            let mut session = SessionManager::open_existing_with_access(
+                &path,
+                self.runner.coordinator(),
+                &state.thread.thread_id,
+                SessionAccess::Append,
+            )
+            .map_err(|error| error.to_string())?;
             let parts = split_model_selector(&selector);
             let metadata = singularity_agent::session::SessionMetadata::thread_settings(
                 parts
