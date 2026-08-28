@@ -161,6 +161,7 @@ fn setup(steps: Vec<FakeStep>) -> (Agent, tempfile::TempDir, Arc<FakeProvider>) 
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let provider = Arc::new(FakeProvider::new(fake_contract(), steps));
     let agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -287,6 +288,7 @@ fn retryable_provider_error_retries_then_succeeds() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -331,6 +333,7 @@ fn retryable_provider_error_exhausts_and_fails() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -380,6 +383,7 @@ fn persistent_rate_limit_makes_at_most_four_provider_calls() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -415,6 +419,7 @@ fn retry_after_controls_the_agent_retry_wait() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig {
@@ -448,6 +453,7 @@ fn replay_unsafe_provider_error_is_not_retried() {
         .without_automatic_retry())],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -480,6 +486,7 @@ fn cancellation_interrupts_retry_after_wait() {
         .with_retry_after(Some(std::time::Duration::from_secs(5))))],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -527,6 +534,7 @@ fn tool_call_executes_and_results_feed_next_turn() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -605,6 +613,7 @@ fn tool_events_pair_around_each_serial_execution_and_preflight_rejection() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -679,6 +688,7 @@ fn steer_at_stop_continues_one_more_turn() {
         })),
     );
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -733,6 +743,7 @@ fn session_file_roundtrip_after_run() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -847,6 +858,7 @@ fn previous_provider_usage_triggers_compaction_before_the_next_request() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         compaction_test_config(),
@@ -902,6 +914,7 @@ fn first_request_without_previous_usage_falls_back_to_the_assembled_estimate() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         compaction_test_config(),
@@ -964,6 +977,7 @@ fn missing_provider_usage_falls_back_to_the_next_assembled_estimate() {
         ],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         compaction_test_config(),
@@ -1053,7 +1067,14 @@ fn manual_compaction_keeps_the_configured_recent_budget() {
         },
         ..AgentConfig::default()
     };
-    let mut agent = Agent::new(provider, ToolRegistry::new(), config, session).unwrap();
+    let mut agent = Agent::new(
+        TurnInbox::default_handle(),
+        provider,
+        ToolRegistry::new(),
+        config,
+        session,
+    )
+    .unwrap();
 
     let outcome = agent.compact_now(&CancellationToken::new()).unwrap();
 
@@ -1267,6 +1288,7 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -1366,6 +1388,7 @@ fn transient_retry_then_overflow_recovers_once() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -1439,6 +1462,7 @@ fn forced_compaction_failure_surfaces_the_compaction_cause() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         // 摘要失败为可重试类错误；重试预算清零使失败立即收敛。
@@ -1588,6 +1612,7 @@ fn summary_request_retries_rate_limit_and_recovers() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
         AgentConfig {
@@ -1695,6 +1720,7 @@ fn truncated_tool_call_turn_keeps_truncated_flag_through_abort() {
         contract: fake_contract(),
     });
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig::default(),
@@ -1756,6 +1782,7 @@ fn orphaned_tool_call_reopens_without_executing_tool_again() {
         }],
     ));
     let mut agent = Agent::new(
+        TurnInbox::default_handle(),
         provider,
         ToolRegistry::new(),
         AgentConfig::default(),

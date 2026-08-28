@@ -56,6 +56,14 @@ impl TurnInbox {
 /// 活动 turn 转向输入箱的线程安全句柄。
 pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
 
+impl TurnInbox {
+    /// 新建共享注入箱句柄：由生命周期所有者（TurnControls）构造时创建，
+    /// 同一处句柄传给执行体（Agent），使注入窗口在构造时即已绑定。
+    pub fn default_handle() -> TurnInboxHandle {
+        Arc::new(Mutex::new(Self::default()))
+    }
+}
+
 /// 加锁活动 turn inbox；共享协调状态中毒时 fail-stop，不能继续使用可能损坏的队列。
 #[allow(clippy::expect_used)]
 pub(super) fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {

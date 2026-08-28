@@ -31,10 +31,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::TurnInboxHandle;
+use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
 use singularity_agent::session::SessionManager;
 use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
+use uuid::Uuid;
 
 use crate::error::TurnRunError;
 use crate::events::{TurnEvent, TurnEventSink};
@@ -102,22 +103,33 @@ pub struct SettingsApplyResult {
 
 /// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
 ///
-/// inbox 由 runner 在 Agent 构造完成后注册（先于 turn/started 事件发布），
-/// 保证 started 后立即注入必成功；终态化前由 runner 关闭注入窗口。
-#[derive(Default)]
+/// 构造即完整：turn id 与注入箱句柄在构造时一次性绑定，注入窗口在
+/// turn 开始前即已就绪；终态化前由 runner 关闭注入窗口。
 pub struct TurnControls {
-    pub(crate) turn_id: Mutex<String>,
+    pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
     pub(crate) inbox: Mutex<Option<TurnInboxHandle>>,
 }
 
 impl TurnControls {
-    pub fn new(turn_id: impl Into<String>) -> Self {
+    pub fn new(turn_id: impl Into<String>, inbox: TurnInboxHandle) -> Self {
         Self {
-            turn_id: Mutex::new(turn_id.into()),
+            turn_id: turn_id.into(),
             cancellation: CancellationToken::new(),
-            inbox: Mutex::new(None),
+            inbox: Mutex::new(Some(inbox)),
         }
+    }
+
+    /// 本轮注入箱句柄：供执行体构造时接收同一句柄。
+    pub(crate) fn inbox_handle(&self) -> TurnInboxHandle {
+        let Ok(guard) = self.inbox.lock() else {
+            // 锁中毒（状态未知）→ 返回空箱句柄，注入将被 fail-closed 拒绝。
+            return TurnInbox::default_handle();
+        };
+        guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(TurnInbox::default_handle)
     }
 
     /// 把转向输入注入当前 turn；turn 已关闭注入窗口时返回 false。
@@ -132,17 +144,6 @@ impl TurnControls {
                 .lock()
                 .is_ok_and(|mut inbox| inbox.enqueue(text.into()))
         })
-    }
-
-    pub(crate) fn register_inbox(&self, turn_id: &str, inbox: TurnInboxHandle) {
-        // 锁中毒（状态未知）→ 跳过注册，注入窗口保持未开，后续 steer 全程
-        // false（fail-closed）；不把句柄写进可能已损坏的字段。
-        if let Ok(mut id) = self.turn_id.lock() {
-            *id = turn_id.to_string();
-        }
-        if let Ok(mut guard) = self.inbox.lock() {
-            *guard = Some(inbox);
-        }
     }
 
     pub(crate) fn close_inbox(&self) {
@@ -300,7 +301,7 @@ impl Conversation {
         // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
         // 的「中毒按 busy」同向：读路径不泄露可能损坏的状态。
         self.state.lock().ok().and_then(|state| match &state.turn {
-            TurnLifecycle::Running(controls) => controls.turn_id.lock().ok().map(|id| id.clone()),
+            TurnLifecycle::Running(controls) => Some(controls.turn_id.clone()),
             TurnLifecycle::Idle | TurnLifecycle::Reserved => None,
         })
     }
@@ -517,7 +518,11 @@ impl Conversation {
             if !matches!(state.turn, TurnLifecycle::Reserved) {
                 return Err(ConversationError::TurnAlreadyActive);
             }
-            let controls = Arc::new(TurnControls::new(String::new()));
+            // 构造即完整：turn id 与注入箱在此一次性绑定，无需事后注册。
+            let controls = Arc::new(TurnControls::new(
+                Uuid::new_v4().to_string(),
+                TurnInbox::default_handle(),
+            ));
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             controls
         };

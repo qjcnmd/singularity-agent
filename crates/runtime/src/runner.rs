@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, AgentOutcome, AgentTerminalReason,
 };
@@ -20,7 +21,6 @@ use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
 use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
 use singularity_protocol::diagnostic_code;
-use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
@@ -170,8 +170,14 @@ impl TurnRunner {
         let session = self
             .open_and_repair_session(thread)
             .map_err(|error| error.to_string())?;
-        let mut agent =
-            Agent::new(provider, registry, config, session).map_err(|error| error.to_string())?;
+        let mut agent = Agent::new(
+            TurnInbox::default_handle(),
+            provider,
+            registry,
+            config,
+            session,
+        )
+        .map_err(|error| error.to_string())?;
         agent
             .compact_now(cancellation)
             .map_err(|error| error.to_string())
@@ -190,7 +196,7 @@ impl TurnRunner {
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn TurnEventSink,
     ) -> Result<TurnOutcome, TurnRunError> {
-        let turn_id = Uuid::new_v4().to_string();
+        let turn_id = controls.turn_id.clone();
         let thread = params.thread;
         // fail-fast 准备：workspace、provider/config、会话打开修复、Agent 构造
         // 全部就绪后才写任何 turn 状态；准备阶段的失败发生在状态写入之前。
@@ -218,7 +224,7 @@ impl TurnRunner {
             }
         })?;
         let mut agent = self
-            .prepare_agent(&turn_id, session, provider, registry, config, controls)
+            .prepare_agent(session, provider, registry, config, controls)
             .map_err(|error| TurnRunError::Preparation {
                 cause: TurnFailureCause::Internal,
                 message: error,
@@ -390,17 +396,15 @@ impl TurnRunner {
 
     fn prepare_agent(
         &self,
-        turn_id: &str,
         session: SessionManager,
         provider: Arc<dyn Provider + Send + Sync>,
         registry: ToolRegistry,
         config: AgentConfig,
         controls: &crate::conversation::TurnControls,
     ) -> Result<Agent, String> {
-        let agent =
-            Agent::new(provider, registry, config, session).map_err(|error| error.to_string())?;
-        controls.register_inbox(turn_id, agent.inbox_handle());
-        Ok(agent)
+        // 注入箱由控制面构造时创建并绑定，Agent 构造时接收同一句柄。
+        Agent::new(controls.inbox_handle(), provider, registry, config, session)
+            .map_err(|error| error.to_string())
     }
 
     /// 用 headless core 执行一个 turn：会话与 Agent 已在准备阶段构建，

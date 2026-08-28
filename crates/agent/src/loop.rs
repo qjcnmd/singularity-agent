@@ -17,7 +17,7 @@ mod inbox;
 #[path = "request.rs"]
 mod request;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -188,7 +188,10 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// `inbox` 是本 Agent 的实时转向输入箱句柄：由生命周期所有者构造
+    /// 控制面时创建并绑定，使注入窗口在 turn 开始前即已就绪。
     pub fn new(
+        inbox: TurnInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
         registry: ToolRegistry,
         config: AgentConfig,
@@ -225,7 +228,7 @@ impl Agent {
             provider,
             config,
             tools_json,
-            inbox: Arc::new(Mutex::new(TurnInbox::default())),
+            inbox,
             ledger: ContextLedger::new(),
         })
     }
