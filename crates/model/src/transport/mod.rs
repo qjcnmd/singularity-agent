@@ -407,85 +407,6 @@ impl OpenAiProvider {
             .map(|selection| selection.api_protocol)
     }
 
-    /// 把内部复合选择器转换为裸上游 model id；显式目录克隆还会拒绝
-    /// 在 turn 内更换所选模型。
-    fn normalize_request_model(
-        &self,
-        request: &ModelTurnRequest,
-    ) -> Result<ModelTurnRequest, ProviderError> {
-        let Some(selector) = request.model_preferences.model_name.as_deref() else {
-            // Legacy 路径：无 selector 时无法证明 replay 兼容。
-            // reasoning disabled 或未解析出 selected_model 时不再静默清空，
-            // 显式拒绝，避免旧私有状态被悄悄丢弃后继续。
-            if self
-                .selected_model
-                .as_ref()
-                .is_none_or(|selection| !selection.reasoning_enabled)
-            {
-                if !request.provider_reasoning_history.is_empty() {
-                    return Err(provider_tool_reasoning_history_error(
-                        ProviderToolReasoningMode::Unspecified,
-                    ));
-                }
-                return Ok(request.clone());
-            }
-            let normalized = request.clone();
-            self.validate_reasoning_history(&normalized)?;
-            return Ok(normalized);
-        };
-        let mut normalized = request.clone();
-        // 带 `/` 的选择器走共享解析（含段合法性与拆分）；裸 model id 保持
-        // legacy 路径（整个 selector 即模型名，无 effort）。
-        let (model_name, requested_effort) = if selector.contains('/') {
-            let parsed = super::config::selection::parse_model_selector(selector)?;
-            if parsed.provider_name != self.config.provider_name {
-                return Err(super::config::model_selector_error(
-                    "model selector references an unknown provider",
-                    "provider_selector_unknown_provider",
-                ));
-            }
-            (parsed.model_name, parsed.reasoning_effort)
-        } else {
-            (selector, None)
-        };
-        if self.selected_model.is_some() && model_name != self.config.model_name {
-            return Err(super::config::model_selector_error(
-                "model selector is not the fixed model for this provider turn",
-                "provider_selector_unknown_model",
-            ));
-        }
-        let requested_effort_matches = match requested_effort {
-            Some(effort) => {
-                self.selected_model
-                    .as_ref()
-                    .and_then(|selection| selection.reasoning_variant.as_deref())
-                    == Some(effort)
-            }
-            None => true,
-        };
-        if !requested_effort_matches {
-            return Err(super::config::model_selector_error(
-                "model selector is not the fixed reasoning variant for this provider turn",
-                "provider_selector_unknown_reasoning_variant",
-            ));
-        }
-        normalized.model_preferences.model_name = Some(model_name.to_string());
-        if self
-            .selected_model
-            .as_ref()
-            .is_none_or(|selection| !selection.reasoning_enabled)
-        {
-            if !normalized.provider_reasoning_history.is_empty() {
-                return Err(provider_tool_reasoning_history_error(
-                    ProviderToolReasoningMode::Unspecified,
-                ));
-            }
-        } else {
-            self.validate_reasoning_history(&normalized)?;
-        }
-        Ok(normalized)
-    }
-
     fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
         if request.provider_reasoning_history.is_empty() {
             return Ok(());
@@ -591,8 +512,19 @@ impl OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        let request = self.normalize_request_model(request)?;
-        let context = self.prepare_completion_context_observed(&request)?;
+        // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
+        // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
+        if self.selected_model.is_some()
+            && let Some(model_name) = request.model_preferences.model_name.as_deref()
+            && model_name != self.config.model_name
+        {
+            return Err(super::config::model_selector_error(
+                "model selector is not the fixed model for this provider turn",
+                "provider_selector_unknown_model",
+            ));
+        }
+        self.validate_reasoning_history(request)?;
+        let context = self.prepare_completion_context_observed(request)?;
         if on_event.is_some()
             && self.streaming_capability(context.api_protocol)
                 != ProviderStreamingCapability::OutputTextDelta
@@ -605,7 +537,7 @@ impl OpenAiProvider {
             .as_deref()
             .unwrap_or(&self.config.model_name);
         let completion = self.complete_protocol(
-            &request,
+            request,
             &context.capabilities,
             model_name,
             ProtocolRequestContext {
@@ -616,7 +548,7 @@ impl OpenAiProvider {
             },
         )?;
         validate_response_tool_reasoning_contract(
-            request_uses_tool_protocol(&request),
+            request_uses_tool_protocol(request),
             &completion,
             &context.capabilities,
             self.selected_model

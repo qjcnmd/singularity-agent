@@ -655,9 +655,11 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
         Some("base-model"),
         "current turn used its startup selector"
     );
+    // 请求只携带装配期物化的裸 model id（provider 段由 provider_for_selector
+    // 在每轮解析 provider 实例时消费），applied selector 的落盘投影已在上面断言。
     assert_eq!(
         log.model_of(1).as_deref(),
-        Some("openai_compatible/base-model"),
+        Some("base-model"),
         "next turn uses the applied selector"
     );
 }

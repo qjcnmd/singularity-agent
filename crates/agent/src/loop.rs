@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelPreferences, ModelTurnStatus,
-    ModelUsage, Provider, ProviderError, ToolChoicePolicy,
+    ModelUsage, Provider, ProviderError, ToolChoicePolicy, split_model_selector,
 };
 use thiserror::Error;
 
@@ -269,7 +269,10 @@ impl Agent {
 
         let mut preferences = ModelPreferences::default();
         if !self.config.model.is_empty() {
-            preferences.model_name = Some(self.config.model.clone());
+            // 装配期一次性物化：请求只携带裸 model id，发送路径不再解析选择器。
+            preferences.model_name = split_model_selector(&self.config.model)
+                .model
+                .map(str::to_string);
         }
         // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略。
         let capabilities = self.provider.protocol_contract();
