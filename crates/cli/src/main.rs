@@ -1,6 +1,7 @@
 //! `sg` 入口：无参数进入长驻交互式 TUI；`--print`/`--json` 进行单次无交互
 //! 执行。两种入口在进程内直接复用同一个 Agent/Session/Provider 运行时。
 
+use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -105,10 +106,27 @@ fn run(cli: Cli) -> Result<i32, String> {
         return Ok(tui::run(setup.conversation).exit_code);
     };
 
-    let goal = cli
-        .goal
-        .clone()
-        .ok_or_else(|| "a goal is required: sg --print <goal> | sg --json <goal>".to_string())?;
+    let piped = match read_piped_stdin() {
+        Ok(content) => content,
+        Err(error) => {
+            // 超限或编码错误按准备阶段失败路径收敛：--json 输出 failed 终态行。
+            if mode == Mode::Json {
+                emit_failed_json_summary(cli.session.as_deref());
+            }
+            return Err(error);
+        }
+    };
+    let goal = match (cli.goal.clone(), piped) {
+        (Some(goal), None) => goal,
+        (Some(goal), Some(piped)) => {
+            // goal 与管道输入并存：两者都作为任务输入，分节拼装。
+            format!("{goal}\n\n--- piped input ---\n{piped}")
+        }
+        (None, Some(piped)) => piped,
+        (None, None) => {
+            return Err("a goal is required: sg --print <goal> | sg --json <goal>".to_string());
+        }
+    };
     let setup = match session_options::prepare(
         cli.model.as_deref(),
         cli.session.as_deref(),
@@ -126,6 +144,36 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
     signal::ensure_installed().map_err(std::string::ToString::to_string)?;
     run_headless(setup, &goal, mode)
+}
+
+/// 管道 stdin 注入上限：超过按准备阶段失败路径收敛。
+const MAX_PIPED_STDIN_BYTES: usize = 1024 * 1024;
+
+/// 读取管道 stdin 全量内容（仅非 TTY 时；TTY 视为交互入口不消费输入）。
+/// 返回 `Ok(None)` 表示无管道输入（stdin 为 TTY 或内容为空）。
+/// 参照 pi 的 `readPipedStdin`：全量读取 + trim 判空。
+fn read_piped_stdin() -> Result<Option<String>, String> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((MAX_PIPED_STDIN_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|error| format!("failed to read piped stdin: {error}"))?;
+    if buf.len() > MAX_PIPED_STDIN_BYTES {
+        return Err(format!(
+            "piped stdin exceeds the {MAX_PIPED_STDIN_BYTES} byte limit",
+        ));
+    }
+    let text = String::from_utf8(buf).map_err(|_| "piped stdin is not valid UTF-8".to_string())?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
 }
 
 /// `--json` 失败路径的统一终态形态：机器解析方必须总能看到 failed summary
