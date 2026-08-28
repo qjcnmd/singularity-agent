@@ -148,81 +148,19 @@ where
                 }) else {
                     break;
                 };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let inbound = match parse_json_rpc_payload(&line) {
-                    Ok(inbound) => inbound,
-                    Err(_) => {
-                        if let Err(error) = send_output_async(
-                            output_tx.clone(),
-                            cancellation.clone(),
-                            JsonRpcMessage::parse_error().to_wire_value(),
-                        )
-                        .await
-                        {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let message = match inbound {
-                    JsonRpcInbound::Message(message) => message,
-                    JsonRpcInbound::Invalid { id } => {
-                        if let Err(error) = send_output_async(
-                            output_tx.clone(),
-                            cancellation.clone(),
-                            JsonRpcMessage::invalid_request(id).to_wire_value(),
-                        )
-                        .await
-                        {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                if is_turn_request(&message) {
-                    // 转交 turn dispatcher（未就绪的消息由 dispatcher 暂存等待）；
-                    // claim 与 worker 启动不阻塞 stdin 读取。
-                    turn_tx
-                        .send(message)
-                        .await
-                        .map_err(|_| "turn dispatcher channel closed".to_string())?;
-                    continue;
-                } else if is_turn_control(&message) && ready_for_turn.load(Ordering::SeqCst) {
-                    if let Err(error) = control_tx.try_send(message) {
-                        let Some(id) = error.into_inner().id().cloned() else {
-                            continue;
-                        };
-                        if let Err(error) = send_output_async(
-                            output_tx.clone(),
-                            cancellation.clone(),
-                            internal_error_value(Some(id), "control request queue is full"),
-                        )
-                        .await
-                        {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                    }
-                } else {
-                    if let Err(error) = ordinary_tx.try_send(message) {
-                        let Some(id) = error.into_inner().id().cloned() else {
-                            continue;
-                        };
-                        if let Err(error) = send_output_async(
-                            output_tx.clone(),
-                            cancellation.clone(),
-                            internal_error_value(Some(id), "ordinary request queue is full"),
-                        )
-                        .await
-                        {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                    }
+                if let Err(error) = route_inbound_line(
+                    line,
+                    &turn_tx,
+                    &control_tx,
+                    &ordinary_tx,
+                    &output_tx,
+                    &cancellation,
+                    &ready_for_turn,
+                )
+                .await
+                {
+                    terminal_error = Some(error);
+                    break;
                 }
             }
         }
@@ -290,6 +228,95 @@ where
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// 解析一帧 JSON-Lines 输入并转交到唯一匹配的请求 lane。
+///
+/// 解析错误和队列满错误都通过输出队列回复；只有输出队列或 turn lane
+/// 本身关闭时才把错误交回 supervisor，由 supervisor 统一进入关闭流程。
+async fn route_inbound_line(
+    line: String,
+    turn_tx: &mpsc::Sender<JsonRpcMessage>,
+    control_tx: &mpsc::Sender<JsonRpcMessage>,
+    ordinary_tx: &mpsc::Sender<JsonRpcMessage>,
+    output_tx: &mpsc::Sender<Value>,
+    cancellation: &AppServerCancellationHandle,
+    ready_for_turn: &AtomicBool,
+) -> Result<(), String> {
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let inbound = match parse_json_rpc_payload(&line) {
+        Ok(inbound) => inbound,
+        Err(_) => {
+            send_output_async(
+                output_tx.clone(),
+                cancellation.clone(),
+                JsonRpcMessage::parse_error().to_wire_value(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let message = match inbound {
+        JsonRpcInbound::Message(message) => message,
+        JsonRpcInbound::Invalid { id } => {
+            send_output_async(
+                output_tx.clone(),
+                cancellation.clone(),
+                JsonRpcMessage::invalid_request(id).to_wire_value(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if is_turn_request(&message) {
+        turn_tx
+            .send(message)
+            .await
+            .map_err(|_| "turn dispatcher channel closed".to_string())?;
+    } else if is_turn_control(&message) && ready_for_turn.load(Ordering::SeqCst) {
+        enqueue_request(
+            control_tx,
+            message,
+            output_tx,
+            cancellation,
+            "control request queue is full",
+        )
+        .await?;
+    } else {
+        enqueue_request(
+            ordinary_tx,
+            message,
+            output_tx,
+            cancellation,
+            "ordinary request queue is full",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// 非阻塞入队；队列满时仅向对应请求回复内部错误，不阻塞 stdin lane。
+async fn enqueue_request(
+    queue: &mpsc::Sender<JsonRpcMessage>,
+    message: JsonRpcMessage,
+    output_tx: &mpsc::Sender<Value>,
+    cancellation: &AppServerCancellationHandle,
+    full_message: &str,
+) -> Result<(), String> {
+    if let Err(error) = queue.try_send(message) {
+        let Some(id) = error.into_inner().id().cloned() else {
+            return Ok(());
+        };
+        send_output_async(
+            output_tx.clone(),
+            cancellation.clone(),
+            internal_error_value(Some(id), full_message),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// 在宽限期内等待后台任务收敛，超时一律 abort。残留的 dispatch 任务持有
