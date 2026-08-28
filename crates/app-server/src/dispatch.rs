@@ -390,14 +390,14 @@ impl AppServer {
             Ok(record) => record,
             Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
-        // 会话仍有存活 turn 时拒绝删除：worker 可能正持句柄 append，删除会让
+        // 会话仍有存活 turn 时拒绝归档：worker 可能正持句柄 append，归档会让
         // 后续写入落入 unlinked inode。
         if self.thread_has_live_turn(&record.thread_id)? {
             return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
         }
-        // 持锁完成 unlink：写者锁在会话删除后随实例释放，跨进程写者不会在
-        // 删除窗口内开始 append。
-        if let Err(error) = singularity_runtime::store::delete_thread(
+        // 持锁完成归档（rename 进 archived/）：写者锁在会话归档后随实例释放，
+        // 跨进程写者不会在归档窗口内开始 append。
+        if let Err(error) = singularity_runtime::store::archive_thread(
             &self.sessions_dir,
             &record.thread_id,
             self.turn_runner.coordinator(),

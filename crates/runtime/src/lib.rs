@@ -49,9 +49,9 @@ pub use singularity_model::{
     ModelSelectorParts, Provider, ProviderConfigSnapshot, split_model_selector,
 };
 pub use store::{
-    ResumeError, ThreadLockCoordinator, ThreadReadPage, ThreadSummary, canonical_thread_cwd,
-    create_thread, delete_thread, list_threads, paged_read, read_thread_summary, rename_thread,
-    resume_thread, thread_session_path,
+    ResumeError, ThreadLockCoordinator, ThreadReadPage, ThreadSummary, archive_thread,
+    canonical_thread_cwd, create_thread, list_threads, paged_read, read_thread_summary,
+    rename_thread, resume_thread, thread_session_path,
 };
 pub use thread_catalog::ThreadCatalog;
 

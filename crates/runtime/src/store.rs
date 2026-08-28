@@ -338,15 +338,34 @@ pub fn paged_read(
     })
 }
 
-/// 删除 Thread 的会话文件。持写者锁完成：其他写者正在 append 时拒绝
-///（[`ResumeError::WriterActive`]），避免删除后写入落入 unlinked inode。
-pub fn delete_thread(
+/// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要
+/// 扫描只读顶层 `.jsonl`，对 `archived/` 天然跳过——这是列表过滤的耦合
+/// 前提，改动扫描方式时必须复核（参照 codex 的 `archived_sessions` 子目录）。
+pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
+
+/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 `archived/` 子目录，
+/// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
+///（[`ResumeError::WriterActive`]），避免归档窗口内写入落入 unlinked inode。
+/// 同 id 已归档或原文件不存在时语义等同 [`ResumeError::NotFound`]。
+pub fn archive_thread(
     sessions_dir: &Path,
     thread_id: &str,
     coordinator: &ThreadLockCoordinator,
 ) -> Result<(), ResumeError> {
     let path = session_file(sessions_dir, thread_id);
     if !path.exists() {
+        return Err(ResumeError::NotFound(thread_id.to_string()));
+    }
+    let archived_dir = sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
+    if let Err(error) = std::fs::create_dir_all(&archived_dir) {
+        return Err(ResumeError::Store(format!(
+            "failed to create archive directory {}: {error}",
+            archived_dir.display()
+        )));
+    }
+    let archived = archived_dir.join(format!("{thread_id}.jsonl"));
+    if archived.exists() {
+        // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
     let session =
@@ -360,55 +379,20 @@ pub fn delete_thread(
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
     // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
-    // NotFound，不会再 append 进即将删除的文件。
-    let pending = pending_delete_path(sessions_dir, thread_id);
-    if let Err(error) = std::fs::rename(&path, &pending) {
-        // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后直接
-        // 删除仍满足公开删除合同；若删除也失败，再返回包含两段原因的错误。
+    // NotFound，不会再 append 进即将归档的文件。
+    if let Err(error) = std::fs::rename(&path, &archived) {
+        // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后重试
+        // 归档；仍失败再返回包含两段原因的错误。
         drop(session);
-        return remove_rollout(&path).map_err(|delete_error| {
+        return std::fs::rename(&path, &archived).map_err(|retry_error| {
             ResumeError::Store(format!(
-                "failed to quarantine session rollout {}: {error}; {delete_error}",
+                "failed to archive session rollout {}: {error}; {retry_error}",
                 path.display()
             ))
         });
     }
     drop(session);
-    // 文件已脱离原路径，待删名尽力删除；残留不影响删除结果。
-    let _ = std::fs::remove_file(&pending);
     Ok(())
-}
-
-fn pending_delete_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    sessions_dir.join(format!(
-        ".{thread_id}.deleting-{}",
-        &Uuid::new_v4().simple().to_string()[..8]
-    ))
-}
-
-fn remove_rollout(rollout: &Path) -> Result<(), ResumeError> {
-    let identity = std::fs::symlink_metadata(rollout).map_err(|error| {
-        ResumeError::Store(format!(
-            "failed to inspect session rollout {}: {error}",
-            rollout.display()
-        ))
-    })?;
-    if !identity.is_file() {
-        return Err(ResumeError::Store(format!(
-            "session rollout is not a regular file: {}",
-            rollout.display()
-        )));
-    }
-    std::fs::remove_file(rollout).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ResumeError::Store(format!("session rollout not found: {}", rollout.display()))
-        } else {
-            ResumeError::Store(format!(
-                "failed to remove session rollout {}: {error}",
-                rollout.display()
-            ))
-        }
-    })
 }
 
 #[cfg(test)]
@@ -531,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_thread_removes_session_and_rejects_active_writer() {
+    fn archive_thread_archives_and_rejects_active_writer() {
         let temp = tempfile::tempdir().expect("temp dir");
         let sessions_dir = temp.path().join("sessions");
         let thread_id = "01914f6b-0000-7000-8000-000000000002";
@@ -543,20 +527,34 @@ mod tests {
             &coordinator,
         )
         .expect("open session");
-        // 存活写者持有锁：删除必须拒绝，避免删除后写入落入 unlinked inode。
-        match delete_thread(&sessions_dir, thread_id, &coordinator) {
+        // 存活写者持有锁：归档必须拒绝，避免归档窗口内写入落入 unlinked inode。
+        match archive_thread(&sessions_dir, thread_id, &coordinator) {
             Err(ResumeError::WriterActive) => {}
             other => panic!("expected WriterActive, got {other:?}"),
         }
         drop(session);
-        delete_thread(&sessions_dir, thread_id, &coordinator).expect("delete after writer release");
+        archive_thread(&sessions_dir, thread_id, &coordinator)
+            .expect("archive after writer release");
+        // 原路径不再存在，列表不可见；归档目录内保留文件。
         assert!(!thread_session_path(&sessions_dir, thread_id).exists());
-        // 待删名已随删除清理，原路径对新写者立即消失（NotFound，良性）。
-        let leftovers: Vec<_> = std::fs::read_dir(&sessions_dir)
-            .expect("list sessions dir")
-            .collect();
-        assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
-        match delete_thread(&sessions_dir, thread_id, &coordinator) {
+        let archived = sessions_dir
+            .join(ARCHIVED_SESSIONS_DIR_NAME)
+            .join(format!("{thread_id}.jsonl"));
+        assert!(archived.exists(), "archived copy must be preserved");
+        // 列表/摘要扫描天然跳过 archived/ 子目录：归档后不可恢复为活动会话。
+        assert!(
+            list_threads(&sessions_dir)
+                .expect("list threads")
+                .iter()
+                .all(|thread| thread.thread_id != thread_id),
+            "archived thread must not appear in the active list"
+        );
+        match read_thread_summary(&sessions_dir, thread_id) {
+            Err(ResumeError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // 重复归档：语义等同 NotFound。
+        match archive_thread(&sessions_dir, thread_id, &coordinator) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }

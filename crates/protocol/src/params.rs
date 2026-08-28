@@ -231,7 +231,8 @@ pub struct ThreadReadResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// session/delete 的响应。
+/// session/delete 的响应。方法名与线格式保持既有语义；实际动作是归档
+/// （rename 进 `archived/` 子目录），`deleted` 字段表示归档已发生。
 pub struct SessionDeleteResult {
     pub session_id: String,
     pub deleted: bool,
