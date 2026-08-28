@@ -1,4 +1,5 @@
-//! 无交互入口的会话准备：默认持久化、`--session` 恢复、`--no-session` 临时运行。
+//! 无交互入口的会话准备：默认持久化、`--session` 恢复、`--continue` 续接、
+//! `--no-session` 临时运行。
 //!
 //! 三种形态共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
 
@@ -7,7 +8,8 @@ use std::sync::Arc;
 use singularity_core::{ensure_singularity_home_outside_workspace, user_singularity_home};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_runtime::store::{
-    ResumeError, canonical_thread_cwd, create_thread, prepare_session_dirs, resume_thread,
+    ResumeError, canonical_thread_cwd, create_thread, most_recent_session_id, prepare_session_dirs,
+    resolve_session_id, resume_thread,
 };
 use singularity_runtime::{Conversation, TurnRunner};
 
@@ -38,14 +40,17 @@ pub fn prepare(
     model: Option<&str>,
     session: Option<&str>,
     no_session: bool,
+    continue_session: bool,
 ) -> Result<SessionSetup, SetupError> {
-    prepare_inner(model, session, no_session).map_err(|message| SetupError { message })
+    prepare_inner(model, session, no_session, continue_session)
+        .map_err(|message| SetupError { message })
 }
 
 fn prepare_inner(
     model: Option<&str>,
     session: Option<&str>,
     no_session: bool,
+    continue_session: bool,
 ) -> Result<SessionSetup, String> {
     let (home, temporary_home) = if no_session {
         let temp =
@@ -70,31 +75,45 @@ fn prepare_inner(
     let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
     let default_selector = runner.default_model_selector();
 
-    let thread = if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
-        let mut thread = resume_thread(runner.sessions_dir(), session_id, runner.coordinator())
-            .map_err(|error| match error {
-                ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
-                ResumeError::Store(message) => {
-                    format!("failed to resume thread {session_id}: {message}")
-                }
-                // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
-                other => format!("failed to resume thread {session_id}: {other}"),
-            })?;
-        // `--model` 只覆盖本次执行：不写回 Thread 元数据。
-        if model.is_some() {
-            thread.model = model.map(str::to_string);
-        }
-        thread
+    let thread_id = if continue_session {
+        // `--continue`：续接最近会话；无会话时按未找到收敛。
+        most_recent_session_id(runner.sessions_dir())?
+            .ok_or_else(|| "no sessions to continue".to_string())?
+    } else if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+        // `--session`：精确优先，其次前缀唯一匹配；歧义/无匹配即报错。
+        resolve_session_id(runner.sessions_dir(), session_id)?
     } else {
         let cwd = canonical_thread_cwd(None)?;
-        create_thread(
+        let created = create_thread(
             runner.sessions_dir(),
             &cwd,
             model.map(str::to_string).or(default_selector),
             runner.coordinator(),
-        )?
+        )?;
+        let thread_id = created.thread_id.clone();
+        let thread = Conversation::new(Arc::clone(&runner), created);
+        return Ok(SessionSetup {
+            conversation: thread,
+            thread_id,
+            _runner: runner,
+            _temporary_home: temporary_home,
+            _tokio_runtime: tokio_runtime,
+        });
     };
 
+    let mut thread = resume_thread(runner.sessions_dir(), &thread_id, runner.coordinator())
+        .map_err(|error| match error {
+            ResumeError::NotFound(_) => format!("thread {thread_id} was not found"),
+            ResumeError::Store(message) => {
+                format!("failed to resume thread {thread_id}: {message}")
+            }
+            // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
+            other => format!("failed to resume thread {thread_id}: {other}"),
+        })?;
+    // `--model` 只覆盖本次执行：不写回 Thread 元数据。
+    if model.is_some() {
+        thread.model = model.map(str::to_string);
+    }
     let thread_id = thread.thread_id.clone();
     let conversation = Conversation::new(Arc::clone(&runner), thread);
     Ok(SessionSetup {

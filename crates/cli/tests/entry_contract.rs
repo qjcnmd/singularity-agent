@@ -140,17 +140,18 @@ fn help_shows_only_new_entry_contract() {
         .expect("run sg --help");
     assert!(output.status.success(), "sg --help must succeed");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    for flag in ["--print", "--json", "--session", "--no-session", "--model"] {
+    for flag in [
+        "--print",
+        "--json",
+        "--session",
+        "--continue",
+        "--no-session",
+        "--model",
+    ] {
         assert!(stdout.contains(flag), "help must document {flag}");
     }
-    for legacy in [
-        "run",
-        "continue",
-        "threads",
-        "config",
-        "doctor",
-        "import-env",
-    ] {
+    // 旧管理型子命令（已并入新 flag 的 continue 除外）不得出现。
+    for legacy in ["run", "threads", "config", "doctor", "import-env"] {
         assert!(
             !stdout.contains(legacy),
             "help must not offer legacy management command {legacy}"
@@ -485,6 +486,65 @@ fn session_resume_of_unknown_thread_fails_without_partial_output() {
     assert!(
         !stderr.is_empty() || !lines.is_empty(),
         "unknown thread resume must produce a diagnostic"
+    );
+}
+
+#[test]
+fn continue_session_resumes_the_most_recent_session() {
+    // 先用 --json 创建一次会话,再用 --continue 续接。
+    let home = isolated_home();
+    let base_url = fake_server::spawn("done");
+    let output = sg()
+        .args(["--json", "first turn"])
+        .env("SINGULARITY_HOME", &home.path)
+        .env("SINGULARITY_MODEL", "fake-model")
+        .env("SINGULARITY_BASE_URL", &base_url)
+        .env("SINGULARITY_API_KEY", "test-key-placeholder")
+        .output()
+        .expect("run sg --json to create a session");
+    assert!(output.status.success(), "--json must create a session");
+
+    // 续接该会话。
+    let output = sg()
+        .arg("--continue")
+        .arg("--json")
+        .arg("second turn")
+        .env("SINGULARITY_HOME", &home.path)
+        .env("SINGULARITY_MODEL", "fake-model")
+        .env("SINGULARITY_BASE_URL", &base_url)
+        .env("SINGULARITY_API_KEY", "test-key-placeholder")
+        .output()
+        .expect("run sg --continue");
+    assert!(
+        output.status.success(),
+        "--continue must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 验证该会话仍存在且包含两个 turn。
+    let sessions = std::fs::read_dir(sessions_dir(&home.path))
+        .expect("sessions directory")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .count();
+    assert_eq!(sessions, 1, "--continue must not create a new session file");
+}
+
+#[test]
+fn continue_session_fails_when_no_sessions_exist() {
+    let home = isolated_home();
+    let output = sg()
+        .args(["--json", "task", "--continue"])
+        .env("SINGULARITY_HOME", &home.path)
+        .output()
+        .expect("run sg --continue without sessions");
+    assert!(
+        !output.status.success(),
+        "--continue without any session must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no sessions to continue"),
+        "stderr: {stderr}"
     );
 }
 
