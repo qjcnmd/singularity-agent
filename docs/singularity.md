@@ -100,6 +100,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 ## 6. Provider 与模型
 
 - 运行时解析只取用户配置持久化值或进程环境层（`SINGULARITY_MODEL/SINGULARITY_BASE_URL/SINGULARITY_API_KEY/...` 任一出现即整体短路用户配置）；环境层下 api_protocol 由 base_url 是否以 `/responses` 结尾推断，用户配置层必须显式声明 api_protocol。
+- 两协议的 wire 分派收口在 transport 的 `ProtocolAdapter`：集中于单文件的薄转发表（端点、请求载荷、reasoning 在场判定、响应解析、SSE 读取），各协议实现体位于各自文件 `openai/chat.rs` 与 `openai/responses.rs`。协议选择是运行时事实（模型目录声明或 base_url 推断），trait 化不减少分支总数、只把分派表拆进实现文件，故不采用；接入第三 wire 协议时重评该形状。未声明协议变体 `Declared` 的降级按用途分层且各自单点：transport 折叠为 Chat wire（OpenAI 默认形状），attempt 观测（`provider/attempt`）标记 `Unsupported`。
 - Chat SSE：仅按序 visible content delta 上抛；可见 delta 后禁止自动重试。Responses 协议独立 wire。传输层每次 complete 只执行一个 HTTP attempt，并把类型化错误与最多 60 秒的 Retry-After 交给 Agent 层；Agent 层最多重试 3 次，采用可取消的指数退避、真实随机 ±10% 抖动并优先遵循 Retry-After。
 - 错误：非 2xx body 有界读取（≤8 MiB）；结构化解析仅精确识别 context_length_exceeded；普通错误附 ≤256 字符单行化短诊断，命中敏感文本或凭据形态整体替换固定文案；凭据绝不进入错误文本或任何输出。
 
