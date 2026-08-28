@@ -103,12 +103,13 @@ impl TurnRunner {
         self
     }
 
-    pub fn sessions_dir(&self) -> &std::path::Path {
+    /// 会话目录与进程内写者锁协调器：目录操作只经 [`crate::ThreadCatalog`]
+    /// 暴露给客户端，此处仅供 runtime 内部（目录接缝与会话打开路径）使用。
+    pub(crate) fn sessions_dir(&self) -> &std::path::Path {
         &self.sessions_dir
     }
 
-    /// 进程内共享的写者锁协调器。
-    pub fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
+    pub(crate) fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
         &self.coordinator
     }
 

@@ -4,8 +4,8 @@
 //! 词形与协议词形的对应关系只有一份事实源。
 
 use singularity_protocol::{ProviderConfigurationStatus, Thread};
+use singularity_runtime::ThreadSummary;
 use singularity_runtime::objects::ProviderStatus;
-use singularity_runtime::store::ThreadSummary;
 
 /// 把 JSONL 只读摘要投影为协议 Thread。
 pub fn thread_from_summary(record: &ThreadSummary) -> Thread {

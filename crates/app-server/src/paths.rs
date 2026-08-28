@@ -14,7 +14,7 @@ impl AppPaths {
         let home = user_singularity_home()
             .ok_or_else(|| "cannot resolve SINGULARITY_HOME for sessions".to_string())?;
         Ok(Self {
-            sessions_dir: home.join(singularity_runtime::store::SESSIONS_DIR_NAME),
+            sessions_dir: home.join(singularity_runtime::SESSIONS_DIR_NAME),
             home_dir: home,
         })
     }

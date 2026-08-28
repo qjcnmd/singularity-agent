@@ -17,7 +17,7 @@
 - **crates/runtime**：Thread/Turn 生命周期协调与单轮执行管线，是 Turn 执行的唯一所有者。
   - [`TurnRunner`]：一个 turn 的完整管线——会话打开/修复（单写者所有权贯穿全程）、项目指令装配、Agent 执行、typed 事件投影、终态 metadata 与 usage 落盘、fail-stop 收敛。准备阶段 fail-fast：任何失败不留 turn 痕迹。
   - [`Conversation`]：一个 Thread 的长驻协调器——单活动 turn 链窗口（`reserve_start` 原子预订，路由层可在负载线程启动前确定先到先得）、steer 注入当前轮 inbox、followUp FIFO 队列（当前轮可信终态后自动逐条执行为独立新 turn；队列是进程内存态，当前进程存活期间按 FIFO 消费已接受输入）、取消令牌按轮独立（取消只作用于当前轮）、设置时序（活动期间排队，终态后自动校验持久化，无公开手工应用接口）。
-  - [`ThreadCatalog`]：线程目录操作入口，负责 create/list/resume/rename/archive；`Conversation` 不持有线程目录 CRUD。
+  - [`ThreadCatalog`]：持久化 Thread 目录与只读投影的唯一入口（create/list/resume/rename/archive/read_thread_summary/paged_read），承载会话目录与进程级写者锁协调器；客户端不再逐调用点传递 `(sessions_dir, coordinator)`，目录操作不得绕过本接缝。`Conversation` 不持有线程目录 CRUD。归档拒绝条件分三层且各自拥有、互不合并：跨进程写者（`store::archive_thread` 持锁拒绝 `WriterActive`）、本进程存活 turn（app-server 依据协调器注册表）、当前绑定会话（TUI UI 策略）。
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;

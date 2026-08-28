@@ -1,7 +1,10 @@
-//! Thread 的持久化入口：创建、定位、修复重开、只读分页投影与删除。
+//! Thread 目录操作的实现层：创建、定位、修复重开、只读分页投影与归档。
 //!
 //! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
-//! 入口，不复制会话状态。
+//! 入口，不复制会话状态。本模块是 crate 私有实现；客户端目录入口是
+//! [`crate::ThreadCatalog`]（它吸收 `sessions_dir` + 写者锁协调器这对参数），
+//! 布局与纯函数（[`SESSIONS_DIR_NAME`]、[`thread_session_path`]、
+//! [`canonical_thread_cwd`]、[`prepare_session_dirs`]）经 crate 根导出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -79,16 +79,12 @@ pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Valu
 /// 未命中的按「意外 store 错误」收口，各入口不再各自拼写兜底分支。
 fn map_store_error(
     id: JsonRpcId,
-    error: singularity_runtime::store::ResumeError,
-    special: impl FnOnce(
-        &singularity_runtime::store::ResumeError,
-    ) -> Option<AppServerResult<Vec<Value>>>,
+    error: singularity_runtime::ResumeError,
+    special: impl FnOnce(&singularity_runtime::ResumeError) -> Option<AppServerResult<Vec<Value>>>,
 ) -> AppServerResult<Vec<Value>> {
     match error {
-        singularity_runtime::store::ResumeError::NotFound(_) => {
-            not_found_response(id, THREAD_NOT_FOUND)
-        }
-        singularity_runtime::store::ResumeError::Store(error) => Err(AppServerError::Store(error)),
+        singularity_runtime::ResumeError::NotFound(_) => not_found_response(id, THREAD_NOT_FOUND),
+        singularity_runtime::ResumeError::Store(error) => Err(AppServerError::Store(error)),
         ref other => special(other).unwrap_or_else(|| {
             Err(AppServerError::Store(
                 "unexpected thread store error".to_string(),
@@ -225,10 +221,7 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: ThreadSettingsParams = parse_params(&message)?;
-        let record = match singularity_runtime::store::read_thread_summary(
-            &self.sessions_dir,
-            &params.thread_id,
-        ) {
+        let record = match self.thread_catalog.read_thread_summary(&params.thread_id) {
             Ok(record) => record,
             Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
@@ -278,7 +271,7 @@ impl AppServer {
 
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadStartParams = parse_params(&message)?;
-        let cwd = match singularity_runtime::store::canonical_thread_cwd(params.cwd.as_deref()) {
+        let cwd = match singularity_runtime::canonical_thread_cwd(params.cwd.as_deref()) {
             Ok(cwd) => cwd,
             Err(_) => return invalid_params_response(message.required_id()),
         };
@@ -321,9 +314,8 @@ impl AppServer {
             return invalid_params_response(message.required_id());
         }
         // 单次只读解析完成摘要 + 分页条目 + 状态/用量投影；分页与锚点定位
-        // 全部在 runtime store 层，这里只做 live-turn 精化与 wire 组装。
-        let page = match singularity_runtime::store::paged_read(
-            &self.sessions_dir,
+        // 全部在 runtime 目录接缝，这里只做 live-turn 精化与 wire 组装。
+        let page = match self.thread_catalog.paged_read(
             &params.session_id,
             params.limit as usize,
             params.before_item.as_deref(),
@@ -331,10 +323,10 @@ impl AppServer {
             Ok(page) => page,
             Err(error) => {
                 return map_store_error(message.required_id(), error, |other| match other {
-                    singularity_runtime::store::ResumeError::AnchorNotFound(_) => {
+                    singularity_runtime::ResumeError::AnchorNotFound(_) => {
                         Some(invalid_params_response(message.required_id()))
                     }
-                    singularity_runtime::store::ResumeError::WriterActive => Some(Err(
+                    singularity_runtime::ResumeError::WriterActive => Some(Err(
                         AppServerError::Store("thread has an active writer".to_string()),
                     )),
                     _ => None,
@@ -382,10 +374,7 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: SessionIdParams = parse_params(&message)?;
-        let record = match singularity_runtime::store::read_thread_summary(
-            &self.sessions_dir,
-            &params.session_id,
-        ) {
+        let record = match self.thread_catalog.read_thread_summary(&params.session_id) {
             Ok(record) => record,
             Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
@@ -396,15 +385,12 @@ impl AppServer {
         }
         // 持锁完成归档（rename 进 archived/）：写者锁在会话归档后随实例释放，
         // 跨进程写者不会在归档窗口内开始 append。
-        if let Err(error) = singularity_runtime::store::archive_thread(
-            &self.sessions_dir,
-            &record.thread_id,
-            self.turn_runner.coordinator(),
-        ) {
+        if let Err(error) = self.thread_catalog.archive(&record.thread_id) {
             return map_store_error(message.required_id(), error, |other| match other {
-                singularity_runtime::store::ResumeError::WriterActive => Some(
-                    invalid_state_response(message.required_id(), SESSION_DELETE_WRITER_ACTIVE),
-                ),
+                singularity_runtime::ResumeError::WriterActive => Some(invalid_state_response(
+                    message.required_id(),
+                    SESSION_DELETE_WRITER_ACTIVE,
+                )),
                 _ => None,
             });
         }

@@ -361,8 +361,7 @@ mod tests {
     use super::ResumeMenu;
     use crate::tui::app::TuiApp;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use singularity_runtime::store::create_thread;
-    use singularity_runtime::{Conversation, TurnRunner};
+    use singularity_runtime::{Conversation, ThreadCatalog, TurnRunner};
     use std::sync::Arc;
 
     /// 固定三元组快照：不读磁盘、不经 HTTP，仅满足 Conversation/TurnRunner 构造。
@@ -404,14 +403,15 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let sessions = home.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let runner = Arc::new(TurnRunner::new(sessions.clone(), snapshot()));
+        let runner = Arc::new(TurnRunner::new(sessions, snapshot()));
+        let catalog = ThreadCatalog::new(&runner);
         let cwd = std::env::current_dir()
             .unwrap()
             .to_str()
             .unwrap()
             .to_string();
-        let active = create_thread(&sessions, &cwd, None, runner.coordinator()).unwrap();
-        let other = create_thread(&sessions, &cwd, None, runner.coordinator()).unwrap();
+        let active = catalog.create_thread(&cwd, None).unwrap();
+        let other = catalog.create_thread(&cwd, None).unwrap();
         let active_id = active.thread_id.clone();
         let other_id = other.thread_id;
         Fixture {

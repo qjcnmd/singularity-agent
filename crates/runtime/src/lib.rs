@@ -23,11 +23,11 @@ pub mod error;
 pub mod events;
 pub mod objects;
 pub mod runner;
-pub mod store;
 pub mod thread_catalog;
 
 mod assistant_items;
 mod history;
+mod store;
 mod terminal;
 
 pub use conversation::{
@@ -47,9 +47,8 @@ pub use singularity_model::{
     ModelSelectorParts, Provider, ProviderConfigSnapshot, split_model_selector,
 };
 pub use store::{
-    ResumeError, ThreadLockCoordinator, ThreadReadPage, ThreadSummary, archive_thread,
-    canonical_thread_cwd, create_thread, list_threads, paged_read, read_thread_summary,
-    rename_thread, resume_thread, thread_session_path,
+    ResumeError, SESSIONS_DIR_NAME, ThreadReadPage, ThreadSummary, canonical_thread_cwd,
+    prepare_session_dirs, thread_session_path,
 };
 pub use thread_catalog::ThreadCatalog;
 

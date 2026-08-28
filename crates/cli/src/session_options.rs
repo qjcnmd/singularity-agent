@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use singularity_core::{ensure_singularity_home_outside_workspace, user_singularity_home};
 use singularity_model::ProviderConfigSnapshot;
-use singularity_runtime::store::{
-    ResumeError, canonical_thread_cwd, create_thread, prepare_session_dirs, resume_thread,
+use singularity_runtime::{
+    Conversation, ResumeError, ThreadCatalog, TurnRunner, canonical_thread_cwd,
+    prepare_session_dirs,
 };
-use singularity_runtime::{Conversation, TurnRunner};
 
 /// 一次无交互/交互执行的全部运行时句柄。
 ///
@@ -62,16 +62,18 @@ fn prepare_inner(
     let tokio_runtime =
         Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(&home)?;
-    let sessions_dir = home.join(singularity_runtime::store::SESSIONS_DIR_NAME);
+    let sessions_dir = home.join(singularity_runtime::SESSIONS_DIR_NAME);
     let snapshot = ProviderConfigSnapshot::capture(
         |name| std::env::var(name).ok(),
         tokio_runtime.handle().clone(),
     );
     let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
+    let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();
 
     let thread = if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
-        let mut thread = resume_thread(runner.sessions_dir(), session_id, runner.coordinator())
+        let mut thread = catalog
+            .resume_thread(session_id)
             .map_err(|error| match error {
                 ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
                 ResumeError::Store(message) => {
@@ -87,12 +89,7 @@ fn prepare_inner(
         thread
     } else {
         let cwd = canonical_thread_cwd(None)?;
-        create_thread(
-            runner.sessions_dir(),
-            &cwd,
-            model.map(str::to_string).or(default_selector),
-            runner.coordinator(),
-        )?
+        catalog.create_thread(&cwd, model.map(str::to_string).or(default_selector))?
     };
 
     let thread_id = thread.thread_id.clone();

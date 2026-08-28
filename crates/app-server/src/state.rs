@@ -275,10 +275,10 @@ impl AppServer {
             self.thread_catalog
                 .resume_thread(session_id)
                 .map_err(|error| match &error {
-                    singularity_runtime::store::ResumeError::NotFound(_) => {
+                    singularity_runtime::ResumeError::NotFound(_) => {
                         AppServerError::Store(format!("thread {session_id} was not found"))
                     }
-                    singularity_runtime::store::ResumeError::Store(message) => {
+                    singularity_runtime::ResumeError::Store(message) => {
                         AppServerError::Workspace(format!("failed to resume thread: {message}"))
                     }
                     // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
