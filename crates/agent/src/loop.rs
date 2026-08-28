@@ -514,7 +514,7 @@ impl Agent {
                     if matches!(
                         &error,
                         AgentError::Provider(provider)
-                            if request::is_context_overflow_error(&provider.error)
+                            if provider.error.is_context_overflow()
                     ) {
                         outcome.usage_complete = false;
                         if overflow_retried {

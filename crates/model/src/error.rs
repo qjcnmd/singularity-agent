@@ -126,6 +126,11 @@ impl ModelError {
     pub fn category(&self) -> ModelErrorCategory {
         contract::model_error_category(self)
     }
+
+    /// provider 是否明确拒绝请求的上下文规模（不可重试，触发强制压缩路径）。
+    pub fn is_context_overflow(&self) -> bool {
+        self.kind == ModelErrorKind::ContextLengthExceeded
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +162,20 @@ impl ProviderError {
             retry_after: None,
             automatic_retry_allowed: true,
         }
+    }
+
+    /// 判断是否属于 agent 层可重试类别。
+    ///
+    /// 与 pi 的 `isRetryableAssistantError` 同向：限流、网络、超时、过载与未知
+    /// 错误可重试；认证、校验、配额、取消与上下文溢出（后者走强制压缩路径）
+    /// 不重试。
+    pub fn is_retryable(&self) -> bool {
+        use ModelErrorKind::*;
+        self.automatic_retry_allowed
+            && matches!(
+                self.error.kind,
+                RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
+            )
     }
 
     /// 为所属重试策略保留 provider 定向延迟。

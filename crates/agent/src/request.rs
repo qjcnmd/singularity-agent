@@ -9,7 +9,7 @@
 use rand::Rng;
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
+    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider,
     ProviderAttemptEvent, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
     ProviderStreamEvent, ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
@@ -33,20 +33,6 @@ const MAX_TURN_RETRIES: u32 = 3;
 const TURN_RETRY_BASE_DELAY_MS: u64 = 2_000;
 /// 退避等待的取消轮询间隔。
 const RETRY_POLL_INTERVAL_MS: u64 = 50;
-
-/// 判断 provider 错误是否属于 agent 层可重试类别。
-///
-/// 与 pi 的 `isRetryableAssistantError` 同向：限流、网络、超时、过载与未知
-/// 错误可重试；认证、校验、配额、取消与上下文溢出（后者走强制压缩路径）
-/// 不重试。
-fn is_retryable_provider_error(error: &ProviderError) -> bool {
-    use ModelErrorKind::*;
-    error.automatic_retry_allowed
-        && matches!(
-            error.error.kind,
-            RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
-        )
-}
 
 /// 指数退避 + ±10% 真实随机抖动：每次重试产生独立的随机因子，
 /// 避免确定性抖动在多进程或并发重试下共振。
@@ -97,11 +83,11 @@ pub(crate) fn send_with_retry(
     loop {
         match attempt(events) {
             Ok(response) => return SendOutcome::Response(Box::new(response)),
-            Err(error) if is_context_overflow_error(&error.error) => {
+            Err(error) if error.error.is_context_overflow() => {
                 return SendOutcome::Failed(error);
             }
             Err(error) => {
-                if retry_attempt < retry.max_retries && is_retryable_provider_error(&error) {
+                if retry_attempt < retry.max_retries && error.is_retryable() {
                     retry_attempt += 1;
                     let delay_ms =
                         retry_delay_ms(retry.base_delay_ms, retry_attempt, error.retry_after);
@@ -176,11 +162,6 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
 /// 两者都源自 u32 声明，min 结果不会溢出。
 pub(super) fn effective_max_output_tokens(provider: &dyn Provider, configured: u64) -> u32 {
     configured.min(provider.protocol_contract().max_output_tokens as u64) as u32
-}
-
-/// 轮步层的溢出判定：provider 错误是否为 ContextLengthExceeded。
-pub(super) fn is_context_overflow_error(error: &ModelError) -> bool {
-    error.kind == ModelErrorKind::ContextLengthExceeded
 }
 
 impl Agent {
