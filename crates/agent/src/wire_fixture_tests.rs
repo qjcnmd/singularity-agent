@@ -40,7 +40,7 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 {"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}}
 {"type":"message","id":"m-tr-2","timestamp":"2026-08-20T00:00:04.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"failed"}],"toolCallId":"call-2","toolName":"write","isError":true}}
 {"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","tokensBefore":1234,"usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150,"cached_input_tokens":10,"reasoning_tokens":0,"usage_present":true},"details":{"cut":"from_entry"}}}
-{"type":"metadata","id":"md-1","timestamp":"2026-08-20T00:00:06.000Z","metadata":{"metadataType":"turn_terminal","turnId":"turn-1","status":"interrupted","usage":{},"usageComplete":false}}
+{"type":"metadata","id":"md-1","timestamp":"2026-08-20T00:00:06.000Z","metadata":{"metadataType":"turn_terminal","turnId":"turn-1","status":"interrupted","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false},"usageComplete":false}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"opencode-go","model":"opencode-go/deepseek-v4-flash#max","reasoning":"high"}}
 {"type":"metadata","id":"md-3","timestamp":"2026-08-20T00:00:08.000Z","metadata":{"metadataType":"thread_name","name":"typed metadata"}}"###;
 
