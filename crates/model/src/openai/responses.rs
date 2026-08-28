@@ -138,97 +138,12 @@ pub fn parse_openai_responses_response(
                 vec!["responses_output_missing".to_string()],
             )
         })?;
-    let mut content = String::new();
-    let mut tool_calls: Vec<ModelToolCall> = Vec::new();
-    let mut replay_items = Vec::new();
-    for item in output.iter() {
-        let item = item.as_object().ok_or_else(|| {
-            provider_response_validation_error(
-                config,
-                model_name,
-                "provider Responses output item was not an object",
-                vec!["responses_output_item_invalid".to_string()],
-            )
-        })?;
-        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
-            provider_response_validation_error(
-                config,
-                model_name,
-                "provider Responses output item type was missing",
-                vec!["responses_output_item_type_missing".to_string()],
-            )
-        })?;
-        match item_type {
-            "message" => {
-                let item_value = Value::Object(item.clone());
-                let message = parse_openai_responses_message(&item_value).map_err(|evidence| {
-                    provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses message content was invalid",
-                        vec![evidence.to_string()],
-                    )
-                })?;
-                content.push_str(&message);
-            }
-            "function_call" => {
-                let item_value = Value::Object(item.clone());
-                let call = parse_tool_call(
-                    &item_value,
-                    "call_id",
-                    item_value.get("name"),
-                    item_value.get("arguments"),
-                );
-                if call.tool_call_id.is_empty() {
-                    return Err(provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses function_call id was missing",
-                        vec!["responses_function_call_id_missing".to_string()],
-                    ));
-                }
-                if tool_calls
-                    .iter()
-                    .any(|existing| existing.tool_call_id == call.tool_call_id)
-                {
-                    return Err(provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses function_call ids were duplicated",
-                        vec!["responses_function_call_id_duplicate".to_string()],
-                    ));
-                }
-                tool_calls.push(call);
-                replay_items.push(Value::Object(item.clone()));
-            }
-            "reasoning" => {
-                if item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
-                    return Err(provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses reasoning item id was missing",
-                        vec!["responses_reasoning_item_id_missing".to_string()],
-                    ));
-                }
-                replay_items.push(Value::Object(item.clone()));
-            }
-            _ => {
-                return Err(provider_response_validation_error(
-                    config,
-                    model_name,
-                    "provider Responses payload contained an unsupported output item",
-                    vec!["responses_output_item_unsupported".to_string()],
-                ));
-            }
-        }
-        if item_type == "message" {
-            replay_items.push(Value::Object(item.clone()));
-        }
-    }
+    let parsed = parse_responses_output(output, config, model_name)?;
+    let ParsedResponsesOutput {
+        content,
+        tool_calls,
+        replay_items,
+    } = parsed;
     let assistant_message = Some(ModelMessage {
         tool_calls: tool_calls.clone(),
         ..ModelMessage::text(ModelRole::Assistant, content)
@@ -298,6 +213,113 @@ pub fn parse_openai_responses_response(
     .map(|mut response| {
         response.provider_reasoning_history = provider_reasoning_history;
         response
+    })
+}
+
+struct ParsedResponsesOutput {
+    content: String,
+    tool_calls: Vec<ModelToolCall>,
+    replay_items: Vec<Value>,
+}
+
+fn parse_responses_output(
+    output: &[Value],
+    config: &OpenAiProviderConfig,
+    model_name: &str,
+) -> Result<ParsedResponsesOutput, ProviderError> {
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let mut replay_items = Vec::new();
+    for item in output {
+        let item = item.as_object().ok_or_else(|| {
+            provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses output item was not an object",
+                vec!["responses_output_item_invalid".to_string()],
+            )
+        })?;
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses output item type was missing",
+                vec!["responses_output_item_type_missing".to_string()],
+            )
+        })?;
+        match item_type {
+            "message" => {
+                let item_value = Value::Object(item.clone());
+                let message = parse_openai_responses_message(&item_value).map_err(|evidence| {
+                    provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses message content was invalid",
+                        vec![evidence.to_string()],
+                    )
+                })?;
+                content.push_str(&message);
+                replay_items.push(item_value);
+            }
+            "function_call" => {
+                let item_value = Value::Object(item.clone());
+                let call = parse_tool_call(
+                    &item_value,
+                    "call_id",
+                    item_value.get("name"),
+                    item_value.get("arguments"),
+                );
+                if call.tool_call_id.is_empty() {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses function_call id was missing",
+                        vec!["responses_function_call_id_missing".to_string()],
+                    ));
+                }
+                if tool_calls
+                    .iter()
+                    .any(|existing: &ModelToolCall| existing.tool_call_id == call.tool_call_id)
+                {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses function_call ids were duplicated",
+                        vec!["responses_function_call_id_duplicate".to_string()],
+                    ));
+                }
+                tool_calls.push(call);
+                replay_items.push(item_value);
+            }
+            "reasoning" => {
+                if item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses reasoning item id was missing",
+                        vec!["responses_reasoning_item_id_missing".to_string()],
+                    ));
+                }
+                replay_items.push(Value::Object(item.clone()));
+            }
+            _ => {
+                return Err(provider_response_validation_error(
+                    config,
+                    model_name,
+                    "provider Responses payload contained an unsupported output item",
+                    vec!["responses_output_item_unsupported".to_string()],
+                ));
+            }
+        }
+    }
+    Ok(ParsedResponsesOutput {
+        content,
+        tool_calls,
+        replay_items,
     })
 }
 
