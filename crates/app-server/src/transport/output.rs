@@ -21,18 +21,50 @@ pub(crate) async fn send_output_async(
     }
 }
 
-/// 同步上下文（spawn_blocking worker、turn worker）的入队入口：队列满时
-/// 以 `blocking_send` 阻塞当前线程形成背压，channel 关闭才触发全局停止。
-///
-/// 只能在 Tokio 运行时线程之外调用；运行时线程一律走 [`send_output_async`]。
+/// 同步上下文（spawn_blocking worker、turn worker、stream 回调）的入队入口：
+/// 优先尝试无阻塞直接入队；队列满时以背压阻塞（若在 Tokio runtime 线程内则使用 `block_in_place`），
+/// channel 关闭才触发全局停止。
 pub(crate) fn send_output(
     outputs: &mpsc::Sender<Value>,
     cancellation: &dyn ExecutionStop,
     message: Value,
 ) -> Result<(), String> {
-    match outputs.blocking_send(message) {
+    match outputs.try_send(message) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            let send_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                match handle.runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| outputs.blocking_send(message))
+                    }
+                    _ => {
+                        let mut msg = message;
+                        loop {
+                            match outputs.try_send(msg) {
+                                Ok(()) => break Ok(()),
+                                Err(mpsc::error::TrySendError::Full(m)) => {
+                                    msg = m;
+                                    std::thread::yield_now();
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    break Err(tokio::sync::mpsc::error::SendError(Value::Null));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                outputs.blocking_send(message)
+            };
+            match send_result {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    cancellation.request_execution_stop();
+                    Err("stdout transport unavailable".to_string())
+                }
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
             cancellation.request_execution_stop();
             Err("stdout transport unavailable".to_string())
         }

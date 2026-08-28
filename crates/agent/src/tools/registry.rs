@@ -22,31 +22,26 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
-/// 工具批次开始前执行查找与参数解析 preflight 的结果。
+/// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
 #[derive(Clone)]
-pub struct PreparedTool {
-    execute: std::sync::Arc<PreparedExecute>,
+pub(crate) enum PreparedTool {
+    Read(read::ReadArgs),
+    Glob(glob::GlobArgs),
+    Grep(grep::GrepArgs),
+    Bash(bash::BashArgs),
+    Edit(edit::EditArgs),
+    Write(write::WriteArgs),
 }
 
 impl std::fmt::Debug for PreparedTool {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PreparedTool")
-    }
-}
-
-/// 已解析参数与执行体的类型擦除容器。
-type PreparedExecute = dyn for<'a> Fn(ExecuteContext<'a>) -> ToolExecution + Send + Sync;
-
-impl PreparedTool {
-    /// 绑定已解析参数与执行函数：`prepare` 阶段 typed 反序列化一次，
-    /// 执行阶段直接用解析结果，不再二次反序列化。
-    pub(crate) fn from_parsed<A, F>(args: A, execute: F) -> Self
-    where
-        A: Send + Sync + 'static,
-        F: for<'a> Fn(&A, ExecuteContext<'a>) -> ToolExecution + Send + Sync + 'static,
-    {
-        Self {
-            execute: std::sync::Arc::new(move |ctx| execute(&args, ctx)),
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(args) => f.debug_tuple("Read").field(args).finish(),
+            Self::Glob(args) => f.debug_tuple("Glob").field(args).finish(),
+            Self::Grep(args) => f.debug_tuple("Grep").field(args).finish(),
+            Self::Bash(args) => f.debug_tuple("Bash").field(args).finish(),
+            Self::Edit(args) => f.debug_tuple("Edit").field(args).finish(),
+            Self::Write(args) => f.debug_tuple("Write").field(args).finish(),
         }
     }
 }
@@ -54,7 +49,7 @@ impl PreparedTool {
 /// preflight 要么产出可执行工具，要么产出模型可见的拒绝执行；
 /// 未知工具名同样以模型可见拒绝收尾，不进入任何错误通道。
 #[derive(Debug)]
-pub enum ToolPreflight {
+pub(crate) enum ToolPreflight {
     Ready(PreparedTool),
     Rejected(ToolExecution),
 }
@@ -137,7 +132,7 @@ impl ToolRegistry {
     /// 查找并解析调用而不执行。Agent 批次在按模型给定 source order 执行
     /// 每个调用前使用本方法；typed 反序列化在此完成一次。未知工具名与
     /// 参数解析失败都以模型可见拒绝收尾。
-    pub fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
+    pub(crate) fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
         let Some(spec) = self.tools.get(name) else {
             return ToolPreflight::Rejected(ToolExecution {
                 content: format!("tool execution failed: unknown tool: {name}"),
@@ -151,12 +146,19 @@ impl ToolRegistry {
     }
 
     /// 执行一个已通过 [`Self::preflight`] 的调用。
-    pub fn execute_prepared<'a>(
+    pub(crate) fn execute_prepared<'a>(
         &self,
         prepared: PreparedTool,
         ctx: ExecuteContext<'a>,
     ) -> ToolExecution {
-        (prepared.execute)(ctx)
+        match prepared {
+            PreparedTool::Read(args) => read::execute(&args, ctx),
+            PreparedTool::Glob(args) => glob::execute(&args, ctx),
+            PreparedTool::Grep(args) => grep::execute(&args, ctx),
+            PreparedTool::Bash(args) => bash::execute(&args, ctx),
+            PreparedTool::Edit(args) => edit::execute(&args, ctx),
+            PreparedTool::Write(args) => write::execute(&args, ctx),
+        }
     }
 }
 
@@ -173,17 +175,6 @@ pub(crate) use super::path::resolve_path;
 
 pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))
-}
-
-/// 工具 `prepare` 的统一实现：preflight 阶段 typed 反序列化一次，把解析
-/// 结果与执行函数绑定进 [`PreparedTool`]；失败时生成模型可见的拒绝。
-pub(crate) fn prepare_typed<A, F>(raw: &Value, execute: F) -> Result<PreparedTool, ToolExecution>
-where
-    A: DeserializeOwned + Send + Sync + 'static,
-    F: for<'a> Fn(&A, ExecuteContext<'a>) -> ToolExecution + Send + Sync + 'static,
-{
-    let args = deserialize_args_or_error::<A>(raw)?;
-    Ok(PreparedTool::from_parsed(args, execute))
 }
 
 /// 反序列化工具参数；失败时把错误文本包装为模型可见的 `is_error` 结果。

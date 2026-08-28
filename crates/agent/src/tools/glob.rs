@@ -12,11 +12,11 @@ pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob patte
 
 const MAX_MATCHES: usize = 200;
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GlobArgs {
-    pattern: String,
-    path: Option<String>,
+pub(crate) struct GlobArgs {
+    pub(crate) pattern: String,
+    pub(crate) path: Option<String>,
 }
 
 pub(crate) fn parameters() -> Value {
@@ -36,7 +36,10 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "glob",
         description: DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::registry::prepare_typed(raw, execute),
+        prepare: |raw| {
+            super::registry::deserialize_args_or_error::<GlobArgs>(raw)
+                .map(super::registry::PreparedTool::Glob)
+        },
     }
 }
 
@@ -91,7 +94,7 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&out).map_err(|error| format!("invalid glob pattern {pattern:?}: {error}"))
 }
 
-fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
+pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;

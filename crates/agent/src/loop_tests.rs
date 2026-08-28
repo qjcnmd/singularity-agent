@@ -965,11 +965,6 @@ fn missing_provider_usage_falls_back_to_the_next_assembled_estimate() {
                 usage: usage(20, 5),
             },
             FakeStep {
-                text: "prefix".to_string(),
-                tool_calls: Vec::new(),
-                usage: usage(30, 5),
-            },
-            FakeStep {
                 text: "done".to_string(),
                 tool_calls: Vec::new(),
                 usage: usage(40, 5),
@@ -991,9 +986,8 @@ fn missing_provider_usage_falls_back_to_the_next_assembled_estimate() {
 
     assert_eq!(outcome.final_text, "done");
     assert!(outcome.compacted);
-    // 大 tool_call 参数进入切点预算后落在 mid-turn 切点：主摘要 + 轮次
-    // 前缀摘要各一次调用，随后才是压缩后重建的正式请求。
-    assert_eq!(provider.requests.lock().unwrap().len(), 4);
+    // 大 tool_call 参数进入切点预算后落在 mid-turn 切点：单次滚动摘要调用，随后才是压缩后重建的正式请求。
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
 }
 
 #[test]

@@ -119,25 +119,6 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
-/// 超长单轮（Split Turn）前缀摘要的 Prompt 模板。
-const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
-
-Summarize the prefix to provide context for the retained suffix:
-
-## Original Request
-[What did the user ask for in this turn?]
-
-## Early Progress
-- [Key decisions and work done in the prefix]
-
-## Context for Suffix
-- [Information needed to understand the retained recent work]
-
-Be concise. Focus on what's needed to understand the kept suffix."#;
-
-/// 会话无历史消息时的占位摘要文本。
-const NO_PRIOR_HISTORY: &str = "No prior history.";
-
 /// 上下文压缩的用户可配置策略。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
@@ -431,35 +412,16 @@ impl CompactionEngine {
             entries.len(),
             budget.retain_tokens(),
         );
-        let (history_end, turn_prefix_range) = match &cut {
-            CutWindow::FromEntry {
-                first_kept_entry_index,
-            } => (*first_kept_entry_index, None),
-            CutWindow::SplitTurn {
-                turn_start_index,
-                first_kept_entry_index,
-            } => (
-                *turn_start_index,
-                Some((*turn_start_index, *first_kept_entry_index)),
-            ),
-        };
-        let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..history_end]
+        let first_kept_index = cut.first_kept_entry_index();
+        let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..first_kept_index]
             .iter()
             .filter_map(message_from_entry)
             .cloned()
             .collect();
-        let turn_prefix_messages: Vec<AgentMessage> = match turn_prefix_range {
-            Some((start, end)) => entries[start..end]
-                .iter()
-                .filter_map(message_from_entry)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        };
-        if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
+        if messages_to_summarize.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        let first_kept_entry_id = entries[cut.first_kept_entry_index()].id().to_string();
+        let first_kept_entry_id = entries[first_kept_index].id().to_string();
         // 从被压缩消息和上一代摘要的 details 中累积文件读取与修改清单。
         let mut file_ops = FileOps::default();
         let previous_text = match &entries[0] {
@@ -476,52 +438,25 @@ impl CompactionEngine {
             }
             _ => None,
         };
-        for message in messages_to_summarize
-            .iter()
-            .chain(turn_prefix_messages.iter())
-        {
+        for message in &messages_to_summarize {
             extract_file_ops_from_message(message, &mut file_ops);
         }
         let (read_files, modified_files) = compute_file_lists(&file_ops);
 
-        let mut summary_usage = ModelUsage::default();
-        let mut summary_usage_complete = true;
-        // 历史摘要只写一份（无历史时以占位文本表达）；split-turn 前缀摘要
-        // 是其后可选的一个追加步骤，不复制第二份摘要调用流程。
-        let summary_text = if messages_to_summarize.is_empty() {
-            NO_PRIOR_HISTORY.to_string()
-        } else {
-            let summary = self.generate_summary(
-                &self.serialize_conversation(&messages_to_summarize),
-                previous_text.as_deref(),
-                cancellation,
-            )?;
-            summary_usage.merge(&summary.usage);
-            summary_usage_complete &= summary.usage_complete;
-            summary.text
-        };
-        let mut summary_text =
-            if matches!(cut, CutWindow::SplitTurn { .. }) && !turn_prefix_messages.is_empty() {
-                let prefix = self.generate_turn_prefix_summary(
-                    &self.serialize_conversation(&turn_prefix_messages),
-                    cancellation,
-                )?;
-                summary_usage.merge(&prefix.usage);
-                summary_usage_complete &= prefix.usage_complete;
-                format!(
-                    "{summary_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
-                    prefix.text
-                )
-            } else {
-                summary_text
-            };
+        // 单次滚动摘要：被压缩消息（包含历史与截断前缀）由单次 LLM 请求处理
+        let summary = self.generate_summary(
+            &self.serialize_conversation(&messages_to_summarize),
+            previous_text.as_deref(),
+            cancellation,
+        )?;
+        let mut summary_text = summary.text;
         summary_text.push_str(&format_file_operations(&read_files, &modified_files));
 
         let entry = CompactionEntry {
             summary: summary_text,
             first_kept_entry_id: Some(first_kept_entry_id.clone()),
             tokens_before: Some(tokens_before),
-            usage: summary_usage.usage_present.then_some(summary_usage.clone()),
+            usage: summary.usage.usage_present.then_some(summary.usage.clone()),
             details: Some(json!({
                 "readFiles": read_files,
                 "modifiedFiles": modified_files,
@@ -531,8 +466,8 @@ impl CompactionEngine {
         Ok(CompactionOutcome::Compacted {
             first_kept_entry_id,
             tokens_before,
-            usage: summary_usage,
-            usage_complete: summary_usage_complete,
+            usage: summary.usage,
+            usage_complete: summary.usage_complete,
         })
     }
 
@@ -600,18 +535,6 @@ impl CompactionEngine {
                 },
             }
         }
-    }
-
-    /// 生成超长单轮（Split Turn）前缀摘要。
-    fn generate_turn_prefix_summary(
-        &self,
-        conversation: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<SummaryResponse> {
-        let prompt = format!(
-            "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
-        );
-        self.complete_summarization(&prompt, "turn prefix summarization failed", cancellation)
     }
 
     fn summary_max_output_tokens(&self) -> u32 {
@@ -785,7 +708,14 @@ impl ContextLedger {
     }
 
     /// 上报之后追加到会话的条目入账。
+    /// Assistant 消息的 token 消耗在调用完成时已包含在 `record_usage` 的 `total_tokens` 中，
+    /// 此处仅对之后新追加的 ToolResult 或后续输入累加尾部增量，防止双重计入。
     pub(crate) fn record_appended(&mut self, entry: &SessionEntry) {
+        if let SessionEntry::Message { message, .. } = entry
+            && matches!(message.role(), AgentMessageRole::Assistant)
+        {
+            return;
+        }
         self.trailing_estimate = self
             .trailing_estimate
             .saturating_add(entry_token_estimate(entry));

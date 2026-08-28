@@ -19,5 +19,6 @@ mod truncate;
 mod walk;
 
 pub use registry::{
-    ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistry, ToolSpec,
+    ExecuteContext, ToolExecution, ToolRegistry, ToolSpec,
 };
+pub(crate) use registry::{PreparedTool, ToolPreflight};

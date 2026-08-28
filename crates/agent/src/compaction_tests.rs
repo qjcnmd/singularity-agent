@@ -469,10 +469,6 @@ fn summarization_prompts_match_expected_structure() {
     assert!(UPDATE_SUMMARIZATION_PROMPT.contains("move items from \"In Progress\" to \"Done\""));
     assert!(UPDATE_SUMMARIZATION_PROMPT.contains("## Critical Context"));
 
-    assert!(TURN_PREFIX_SUMMARIZATION_PROMPT.contains("## Original Request"));
-    assert!(TURN_PREFIX_SUMMARIZATION_PROMPT.contains("## Early Progress"));
-    assert!(TURN_PREFIX_SUMMARIZATION_PROMPT.contains("## Context for Suffix"));
-
     assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT continue the conversation."));
     assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("ONLY output the structured summary."));
 }
@@ -542,5 +538,46 @@ fn entry_estimate_includes_tool_arguments_and_thinking() {
     assert!(
         entry_token_estimate(&thinking) >= 500,
         "thinking blocks must count toward the estimate"
+    );
+}
+
+#[test]
+fn ledger_assistant_message_does_not_double_count_tokens() {
+    let mut ledger = ContextLedger::new();
+    let usage = ModelUsage {
+        input_tokens: 1_000,
+        output_tokens: 500,
+        total_tokens: 1_500,
+        usage_present: true,
+        ..Default::default()
+    };
+    ledger.record_usage(&usage);
+
+    // 追加当前轮的 Assistant 消息：total_tokens 已包含，不能累加进 trailing_estimate
+    let assistant = message_entry(AgentMessage::Assistant {
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(2_000),
+        }],
+        stop_reason: None,
+        provider_reasoning_replay: None,
+    });
+    ledger.record_appended(&assistant);
+    assert_eq!(ledger.estimate(), Some(1_500));
+
+    // 追加后续的 ToolResult：必须累加进 trailing_estimate
+    let tool_result = message_entry(AgentMessage::ToolResult {
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(400),
+        }],
+        tool_call_id: Some("call-1".to_string()),
+        tool_name: None,
+        is_error: None,
+        file_operations: None,
+    });
+    ledger.record_appended(&tool_result);
+    let estimate = ledger.estimate().expect("estimate present");
+    assert!(
+        estimate > 1_500,
+        "tool result must increment estimate above usage baseline: {estimate}"
     );
 }

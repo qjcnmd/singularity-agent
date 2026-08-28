@@ -22,12 +22,12 @@ const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GrepArgs {
-    pattern: String,
-    path: Option<String>,
-    include: Option<String>,
+pub(crate) struct GrepArgs {
+    pub(crate) pattern: String,
+    pub(crate) path: Option<String>,
+    pub(crate) include: Option<String>,
 }
 
 pub(crate) fn parameters() -> Value {
@@ -48,7 +48,10 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: "grep",
         description: DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::registry::prepare_typed(raw, execute),
+        prepare: |raw| {
+            super::registry::deserialize_args_or_error::<GrepArgs>(raw)
+                .map(super::registry::PreparedTool::Grep)
+        },
     }
 }
 
@@ -72,7 +75,7 @@ fn truncate_for_display(line: &str) -> String {
     format!("{}...", &line[..end])
 }
 
-fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
+pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
     if let Some(aborted) = ctx.abort_if_cancelled() {
@@ -106,14 +109,15 @@ fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
         if matches >= MAX_MATCHES {
             return;
         }
-        // include 过滤按 basename 匹配（路径长度无关）。
+        // include 过滤：同时支持相对路径匹配与文件名匹配（与 glob 工具对齐）。
+        let rel_path = super::walk::display_path(&relative);
         let base_name = relative
             .file_name()
             .map(|name| name.to_string_lossy())
             .unwrap_or_default();
         if include_regex
             .as_ref()
-            .is_some_and(|glob| !glob.is_match(base_name.as_ref()))
+            .is_some_and(|glob| !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()))
         {
             return;
         }
@@ -189,5 +193,55 @@ fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     ToolExecution {
         content: output,
         is_error: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use singularity_core::CancellationToken;
+    use tempfile::TempDir;
+
+    #[test]
+    fn grep_include_filters_by_relative_path_and_basename() {
+        let temp = TempDir::new().unwrap();
+        let src_dir = temp.path().join("src").join("tools");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("test.rs"), "fn target_symbol() {}\n").unwrap();
+        std::fs::write(temp.path().join("root.rs"), "fn target_symbol() {}\n").unwrap();
+        std::fs::write(src_dir.join("ignore.txt"), "fn target_symbol() {}\n").unwrap();
+
+        let cancellation = CancellationToken::new();
+        let make_ctx = || ExecuteContext {
+            args: Value::Null,
+            cwd: temp.path(),
+            signal: Some(&cancellation),
+            on_update: None,
+        };
+
+        // 1. 匹配带路径的 glob: src/**/*.rs
+        let args = GrepArgs {
+            pattern: "target_symbol".to_string(),
+            path: None,
+            include: Some("src/**/*.rs".to_string()),
+        };
+        let result = execute(&args, make_ctx());
+        assert!(!result.is_error);
+        assert!(result.content.contains("src/tools/test.rs"));
+        assert!(!result.content.contains("root.rs"));
+        assert!(!result.content.contains("ignore.txt"));
+
+        // 2. 匹配纯文件名 glob: *.rs
+        let args_basename = GrepArgs {
+            pattern: "target_symbol".to_string(),
+            path: None,
+            include: Some("*.rs".to_string()),
+        };
+        let result_basename = execute(&args_basename, make_ctx());
+        assert!(!result_basename.is_error);
+        assert!(result_basename.content.contains("root.rs"));
+        assert!(result_basename.content.contains("src/tools/test.rs"));
+        assert!(!result_basename.content.contains("ignore.txt"));
     }
 }

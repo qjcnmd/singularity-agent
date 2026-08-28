@@ -10,11 +10,11 @@ use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path}
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 pub(crate) const NAME: &str = "write";
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriteArgs {
-    path: String,
-    content: String,
+pub(crate) struct WriteArgs {
+    pub(crate) path: String,
+    pub(crate) content: String,
 }
 
 pub(crate) fn parameters() -> Value {
@@ -34,11 +34,14 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::registry::prepare_typed(raw, execute),
+        prepare: |raw| {
+            super::registry::deserialize_args_or_error::<WriteArgs>(raw)
+                .map(super::registry::PreparedTool::Write)
+        },
     }
 }
 
-fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
+pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let content = &args.content;
     if let Some(aborted) = ctx.abort_if_cancelled() {

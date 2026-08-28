@@ -15,12 +15,12 @@ const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 pub(crate) const NAME: &str = "read";
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadArgs {
-    path: String,
-    offset: Option<u64>,
-    limit: Option<u64>,
+pub(crate) struct ReadArgs {
+    pub(crate) path: String,
+    pub(crate) offset: Option<u64>,
+    pub(crate) limit: Option<u64>,
 }
 
 pub(crate) fn parameters() -> Value {
@@ -41,11 +41,14 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::registry::prepare_typed(raw, execute),
+        prepare: |raw| {
+            super::registry::deserialize_args_or_error::<ReadArgs>(raw)
+                .map(super::registry::PreparedTool::Read)
+        },
     }
 }
 
-fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
+pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }

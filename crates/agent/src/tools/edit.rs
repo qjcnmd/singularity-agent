@@ -20,12 +20,12 @@ const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
 pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. oldString must match exactly once in the file (unique). If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 pub(crate) const NAME: &str = "edit";
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EditArgs {
-    path: String,
-    old_string: String,
-    new_string: String,
+pub(crate) struct EditArgs {
+    pub(crate) path: String,
+    pub(crate) old_string: String,
+    pub(crate) new_string: String,
 }
 
 pub(crate) fn parameters() -> Value {
@@ -46,11 +46,14 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::registry::prepare_typed(raw, execute),
+        prepare: |raw| {
+            super::registry::deserialize_args_or_error::<EditArgs>(raw)
+                .map(super::registry::PreparedTool::Edit)
+        },
     }
 }
 
-fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
+pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let old_string = &args.old_string;
     let new_string = &args.new_string;

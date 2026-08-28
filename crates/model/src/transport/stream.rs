@@ -11,7 +11,7 @@ use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::attempt::duration_millis;
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::http::block_on_provider_future;
+use crate::transport::http::{provider_cancelled_error, provider_transport_error};
 
 /// 流 attempt 错误 + 重试是否可能重复可见文本。
 pub(super) struct StreamAttemptFailure {
@@ -163,34 +163,42 @@ fn read_sse_stream<D: SseStreamDecoder>(
             time_to_first_text_delta_ms: None,
         });
     }
-    loop {
-        let chunk = match block_on_provider_future(
-            runtime,
-            cancellation,
-            "provider_response_body_read_failed",
-            ProviderErrorStage::ResponseBodyRead,
-            request_timeout_seconds,
-            || response.chunk(),
-        ) {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                return Err(StreamAttemptFailure {
-                    error,
-                    emitted_text_delta: decoder.emitted_text_delta(),
-                    time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
-                });
-            }
-        };
-        let Some(chunk) = chunk else { break };
-        if let Err(error) = decoder.push(&chunk) {
-            return Err(StreamAttemptFailure {
-                error,
-                emitted_text_delta: decoder.emitted_text_delta(),
-                time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
-            });
-        }
+
+    if cancellation.is_cancelled() {
+        return Err(StreamAttemptFailure {
+            error: provider_cancelled_error(),
+            emitted_text_delta: false,
+            time_to_first_text_delta_ms: None,
+        });
     }
-    match decoder.finish() {
+
+    let stream_result = runtime.block_on(async {
+        loop {
+            let chunk = tokio::select! {
+                _ = cancellation.cancelled_notified() => {
+                    return Err(provider_cancelled_error());
+                }
+                result = response.chunk() => {
+                    match result {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(error) => {
+                            return Err(provider_transport_error(
+                                error,
+                                "provider_response_body_read_failed",
+                                ProviderErrorStage::ResponseBodyRead,
+                                Some(request_timeout_seconds),
+                            ));
+                        }
+                    }
+                }
+            };
+            decoder.push(&chunk)?;
+        }
+        decoder.finish()
+    });
+
+    match stream_result {
         Ok(payload) => Ok(StreamAttemptSuccess {
             payload,
             time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),

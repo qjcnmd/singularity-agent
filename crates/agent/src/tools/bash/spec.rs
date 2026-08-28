@@ -3,12 +3,12 @@
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BashArgs {
-    pub(super) command: String,
+pub(crate) struct BashArgs {
+    pub(crate) command: String,
     #[serde(default, deserialize_with = "deserialize_timeout_ms")]
-    pub(super) timeout_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -44,6 +44,9 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
         name: "bash",
         description: super::DESCRIPTION,
         parameters: parameters(),
-        prepare: |raw| super::super::registry::prepare_typed(raw, super::exec::execute),
+        prepare: |raw| {
+            super::super::registry::deserialize_args_or_error::<BashArgs>(raw)
+                .map(super::super::registry::PreparedTool::Bash)
+        },
     }
 }
