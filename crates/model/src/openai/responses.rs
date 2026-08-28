@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::openai::chat::{
-    finalize_provider_response, parse_message_content, parse_tool_call, parse_usage,
+    ParsedResponseParts, finalize_provider_response, parse_message_content, parse_tool_call,
+    parse_usage,
 };
 use crate::provider::contract::{
     ProviderProtocolContract, message_text, provider_response_validation_error,
@@ -201,14 +202,16 @@ pub fn parse_openai_responses_response(
         config,
         model_name,
         capabilities,
-        payload
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("response")
-            .to_string(),
-        assistant_message,
-        parse_openai_responses_usage(payload.get("usage")),
-        Some(response_finish_reason.to_string()),
+        ParsedResponseParts {
+            response_id: payload
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("response")
+                .to_string(),
+            assistant_message,
+            usage: parse_openai_responses_usage(payload.get("usage")),
+            finish_reason: Some(response_finish_reason.to_string()),
+        },
     )
     .map(|mut response| {
         response.provider_reasoning_history = provider_reasoning_history;

@@ -217,10 +217,12 @@ pub fn parse_openai_response(
         config,
         model_name,
         capabilities,
-        response_id,
-        assistant_message,
-        parse_openai_usage(payload.get("usage")),
-        finish_reason,
+        ParsedResponseParts {
+            response_id,
+            assistant_message,
+            usage: parse_openai_usage(payload.get("usage")),
+            finish_reason,
+        },
     )
     .map(|mut response| {
         response.provider_reasoning_history = provider_reasoning_history;
@@ -228,17 +230,30 @@ pub fn parse_openai_response(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一次 provider 响应的解析产物：完成消息、用量与终止原因。
+///
+/// 由各协议适配器的 payload 解析组装，供 [`finalize_provider_response`]
+/// 合成最终 [`ModelTurnResponse`]。
+pub struct ParsedResponseParts {
+    pub response_id: String,
+    pub assistant_message: Option<ModelMessage>,
+    pub usage: ModelUsage,
+    pub finish_reason: Option<String>,
+}
+
 pub fn finalize_provider_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    response_id: String,
-    assistant_message: Option<ModelMessage>,
-    usage: ModelUsage,
-    finish_reason: Option<String>,
+    parsed: ParsedResponseParts,
 ) -> Result<ModelTurnResponse, ProviderError> {
+    let ParsedResponseParts {
+        response_id,
+        assistant_message,
+        usage,
+        finish_reason,
+    } = parsed;
     let mut response = ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id,

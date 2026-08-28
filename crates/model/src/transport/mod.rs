@@ -247,16 +247,46 @@ fn parse_protocol_payload(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_protocol_sse(
+/// 流式读取一次 provider 响应的上下文：协议适配、HTTP 响应与事件回调。
+struct SseReadContext<'a> {
     adapter: ProtocolAdapter,
-    runtime: &tokio::runtime::Handle,
-    cancellation: &CancellationToken,
+    runtime: &'a tokio::runtime::Handle,
+    cancellation: &'a CancellationToken,
     request_timeout_seconds: u64,
     response: reqwest::Response,
-    on_event: &mut dyn FnMut(ProviderStreamEvent),
+    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
     attempt_started_at: Instant,
+}
+
+/// 一次协议完成请求的上下文：协议契约、选择器与事件回调。
+struct ProtocolRequestContext<'a> {
+    cancellation: &'a CancellationToken,
+    api_protocol: ProviderApiProtocol,
+    on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
+    on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
+}
+
+/// 一次 HTTP attempt 的上下文：协议、选择器、端点与载荷。
+struct AttemptContext<'a> {
+    cancellation: &'a CancellationToken,
+    api_protocol: ProviderApiProtocol,
+    model_name: &'a str,
+    endpoint: &'a str,
+    request_payload: &'a Value,
+}
+
+fn read_protocol_sse(
+    context: SseReadContext<'_>,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
+    let SseReadContext {
+        adapter,
+        runtime,
+        cancellation,
+        request_timeout_seconds,
+        response,
+        on_event,
+        attempt_started_at,
+    } = context;
     match adapter {
         ProtocolAdapter::Chat => read_openai_chat_sse(
             runtime,
@@ -551,12 +581,12 @@ impl OpenAiProvider {
     /// 协议流能力声明，为 `None` 时走有界 body 读取。请求归一、能力校验、
     /// wire 协议选择与 tool-reasoning 契约校验只在这一个入口实现，杜绝
     /// 流式/非流式双轨各自维护导致的静默漂移。
-    fn complete_internal(
+    fn complete_internal<'a>(
         &self,
         request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
+        cancellation: &'a CancellationToken,
+        on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
+        on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
@@ -576,12 +606,14 @@ impl OpenAiProvider {
             .unwrap_or(&self.config.model_name);
         let completion = self.complete_protocol(
             &request,
-            cancellation,
             &context.capabilities,
-            context.api_protocol,
             model_name,
-            on_event,
-            on_attempt,
+            ProtocolRequestContext {
+                cancellation,
+                api_protocol: context.api_protocol,
+                on_event,
+                on_attempt,
+            },
         )?;
         validate_response_tool_reasoning_contract(
             request_uses_tool_protocol(&request),
@@ -594,17 +626,20 @@ impl OpenAiProvider {
         Ok(completion.response)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// 单协议完成请求的执行：适配 payload、流式/非流式读取并合成完成。
     fn complete_protocol(
         &self,
         request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
         capabilities: &ProviderProtocolContract,
-        api_protocol: ProviderApiProtocol,
         model_name: &str,
-        mut on_event: Option<&mut dyn FnMut(ProviderStreamEvent)>,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
+        context: ProtocolRequestContext<'_>,
     ) -> Result<OpenAiCompletion, ProviderError> {
+        let ProtocolRequestContext {
+            cancellation,
+            api_protocol,
+            mut on_event,
+            on_attempt,
+        } = context;
         let streaming = on_event.is_some();
         if streaming {
             self.validate_reasoning_history(request)?;
@@ -618,11 +653,13 @@ impl OpenAiProvider {
             .as_ref()
             .and_then(|selection| selection.reasoning_variant.as_deref());
         self.complete_attempt(
-            cancellation,
-            api_protocol,
-            model_name,
-            &endpoint,
-            &request_payload,
+            AttemptContext {
+                cancellation,
+                api_protocol,
+                model_name,
+                endpoint: &endpoint,
+                request_payload: &request_payload,
+            },
             on_attempt,
             &mut |response, attempt_started_at| {
                 let parse_payload = |payload| {
@@ -638,15 +675,15 @@ impl OpenAiProvider {
                 };
                 if let Some(on_event) = on_event.as_deref_mut() {
                     streaming_outcome(
-                        read_protocol_sse(
+                        read_protocol_sse(SseReadContext {
                             adapter,
-                            &self.runtime,
+                            runtime: &self.runtime,
                             cancellation,
-                            self.request_timeout_seconds,
+                            request_timeout_seconds: self.request_timeout_seconds,
                             response,
                             on_event,
                             attempt_started_at,
-                        ),
+                        }),
                         parse_payload,
                     )
                 } else {
@@ -667,17 +704,19 @@ impl OpenAiProvider {
     /// 两种 wire 协议、流式与非流式响应的共享完成骨架：执行一次 HTTP
     /// attempt，返回解析后的完成或携带重放安全性与 provider 定向延时的
     /// 类型化失败。
-    #[allow(clippy::too_many_arguments)]
     fn complete_attempt(
         &self,
-        cancellation: &CancellationToken,
-        api_protocol: ProviderApiProtocol,
-        model_name: &str,
-        endpoint: &str,
-        request_payload: &Value,
+        context: AttemptContext<'_>,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
         read_response: &mut dyn FnMut(reqwest::Response, Instant) -> AttemptBodyOutcome,
     ) -> Result<OpenAiCompletion, ProviderError> {
+        let AttemptContext {
+            cancellation,
+            api_protocol,
+            model_name,
+            endpoint,
+            request_payload,
+        } = context;
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());

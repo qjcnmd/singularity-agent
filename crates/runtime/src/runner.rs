@@ -48,6 +48,29 @@ pub struct TurnParams {
     pub input: String,
 }
 
+/// 用 headless core 执行一个 turn 的上下文：会话与 Agent 已在准备阶段构建，
+/// 这里只运行 AgentLoop 并实时映射事件。
+struct AgentRunContext<'a> {
+    agent: &'a mut Agent,
+    thread: &'a Thread,
+    turn_id: &'a str,
+    input_text: &'a str,
+    cancellation: &'a CancellationToken,
+    item_events: &'a mut AssistantItemEvents,
+    sink: &'a mut dyn TurnEventSink,
+}
+
+/// 失败 turn 的终态提交上下文：落盘 Failed 终态并发布失败事件。
+struct FailureCommitContext<'a> {
+    session: &'a mut SessionManager,
+    turn_id: &'a str,
+    item_events: &'a mut AssistantItemEvents,
+    error: &'a RunnerError,
+    usage: ModelUsage,
+    usage_complete: bool,
+    sink: &'a mut dyn TurnEventSink,
+}
+
 /// 一次成功收敛到终态的 turn 结果。
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
@@ -278,15 +301,15 @@ impl TurnRunner {
             turn_id.clone(),
             format!("{turn_id}_assistant"),
         );
-        let run_result = self.run_agent_core(
-            &mut agent,
-            &thread,
-            &turn_id,
-            &params.input,
-            &controls.cancellation,
-            &mut item_events,
+        let run_result = self.run_agent_core(AgentRunContext {
+            agent: &mut agent,
+            thread: &thread,
+            turn_id: &turn_id,
+            input_text: &params.input,
+            cancellation: &controls.cancellation,
+            item_events: &mut item_events,
             sink,
-        );
+        });
         // AgentLoop 已停止后立即关闭实时注入窗口；终态后的输入必须通过新的
         // turn 发起，不能在内存中静默排队。
         controls.close_inbox();
@@ -306,26 +329,26 @@ impl TurnRunner {
                     RunnerError::Agent(AgentError::Loop(status.error.unwrap_or_else(|| {
                         "agent loop did not reach a terminal result".to_string()
                     })));
-                return self.finish_failure(
-                    &mut session,
-                    &turn_id,
-                    &mut item_events,
-                    &error,
-                    status.model_usage,
-                    status.usage_complete,
+                return self.finish_failure(FailureCommitContext {
+                    session: &mut session,
+                    turn_id: &turn_id,
+                    item_events: &mut item_events,
+                    error: &error,
+                    usage: status.model_usage,
+                    usage_complete: status.usage_complete,
                     sink,
-                );
+                });
             }
             Err(error) => {
-                return self.finish_failure(
-                    &mut session,
-                    &turn_id,
-                    &mut item_events,
-                    &error,
-                    ModelUsage::default(),
-                    false,
+                return self.finish_failure(FailureCommitContext {
+                    session: &mut session,
+                    turn_id: &turn_id,
+                    item_events: &mut item_events,
+                    error: &error,
+                    usage: ModelUsage::default(),
+                    usage_complete: false,
                     sink,
-                );
+                });
             }
         };
 
@@ -437,17 +460,16 @@ impl TurnRunner {
 
     /// 用 headless core 执行一个 turn：会话与 Agent 已在准备阶段构建，
     /// 这里只运行 AgentLoop 并实时映射事件。
-    #[allow(clippy::too_many_arguments)]
-    fn run_agent_core(
-        &self,
-        agent: &mut Agent,
-        thread: &Thread,
-        turn_id: &str,
-        input_text: &str,
-        cancellation: &CancellationToken,
-        item_events: &mut AssistantItemEvents,
-        sink: &mut dyn TurnEventSink,
-    ) -> Result<RunStatus, RunnerError> {
+    fn run_agent_core(&self, context: AgentRunContext<'_>) -> Result<RunStatus, RunnerError> {
+        let AgentRunContext {
+            agent,
+            thread,
+            turn_id,
+            input_text,
+            cancellation,
+            item_events,
+            sink,
+        } = context;
         let run_result = {
             let mut events = AgentEvents::new();
             let mut on_event = |event: AgentEvent| match event {
@@ -537,17 +559,19 @@ impl TurnRunner {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_failure(
         &self,
-        session: &mut SessionManager,
-        turn_id: &str,
-        item_events: &mut AssistantItemEvents,
-        error: &RunnerError,
-        usage: ModelUsage,
-        usage_complete: bool,
-        sink: &mut dyn TurnEventSink,
+        context: FailureCommitContext<'_>,
     ) -> Result<TurnOutcome, TurnRunError> {
+        let FailureCommitContext {
+            session,
+            turn_id,
+            item_events,
+            error,
+            usage,
+            usage_complete,
+            sink,
+        } = context;
         let (usage, usage_complete) = match error {
             RunnerError::Agent(AgentError::RunFailed { outcome, .. }) => {
                 (outcome.usage.clone(), outcome.usage_complete)
