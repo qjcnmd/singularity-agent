@@ -1,29 +1,21 @@
-//! 应用事件：事件方法名、事件参数与构造器。
+//! 执行事件唯一事实源与两面 wire 投影。
+//!
+//! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态；
+//! 两个对外表面各有一个显式投影函数，方法名由 [`TurnEvent::method`] 单点定义：
+//!
+//! - [`turn_event_notification`]：桌面端 JSON-RPC 通知（camelCase wire，
+//!   嵌套形状在本文件唯一一处组装）；
+//! - [`turn_event_jsonl_params`]：`sg --json` 事件行的 `params`（snake_case）。
+//!
+//! `thread/started` 不是执行事件，由 app-server 作为桌面端局部生命周期通知
+//! 自行发出。Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
+//! [`diagnostic_code`] 定义。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::envelope::JsonRpcMessage;
 use crate::params::{Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
-
-/// 对外广播的应用事件方法名（事件信封 method 字段的唯一来源）。
-pub mod event_method {
-    pub const THREAD_STARTED: &str = "thread/started";
-    pub const TURN_STARTED: &str = "turn/started";
-    pub const TURN_COMPLETED: &str = "turn/completed";
-    pub const TURN_ERROR: &str = "turn/error";
-    pub const AGENT_DIAGNOSTIC: &str = "agent/diagnostic";
-    pub const PROVIDER_ATTEMPT: &str = "provider/attempt";
-    pub const ITEM_STARTED: &str = "item/started";
-    pub const ITEM_AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
-    pub const ITEM_AGENT_THINKING: &str = "item/agentThinking";
-    pub const ITEM_COMPLETED: &str = "item/completed";
-    pub const ITEM_FAILED: &str = "item/failed";
-    pub const TOOL_EXECUTION_START: &str = "tool/execution/start";
-    pub const TOOL_EXECUTION_UPDATE: &str = "tool/execution/update";
-    pub const TOOL_EXECUTION_END: &str = "tool/execution/end";
-    pub const THREAD_SETTINGS_APPLIED: &str = "thread/settingsApplied";
-}
 
 /// runtime 直接发射的稳定诊断代码。
 pub mod diagnostic_code {
@@ -73,9 +65,9 @@ pub struct TurnErrorDetail {
     pub message: String,
 }
 
-/// turn 执行事件的唯一类型化出口。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+/// turn 执行事件的唯一类型化出口。纯数据载体：不携带任何 serde derive，
+/// 两面 wire 形状只存在于本文件的投影函数中。
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     TurnStarted {
         turn: ExecutionTurn,
@@ -146,11 +138,8 @@ pub enum TurnEvent {
         model: String,
         protocol: String,
         status: ProviderAttemptStatus,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_duration_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         error_category: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostic_code: Option<String>,
     },
     TurnCompleted {
@@ -166,150 +155,318 @@ pub enum TurnEvent {
 }
 
 impl TurnEvent {
+    /// 事件方法名的唯一词表：两面投影与 `--json` 行都从这里取方法名。
     pub const fn method(&self) -> &'static str {
         match self {
-            Self::TurnStarted { .. } => event_method::TURN_STARTED,
-            Self::ItemStarted { .. } => event_method::ITEM_STARTED,
-            Self::AssistantDelta { .. } => event_method::ITEM_AGENT_MESSAGE_DELTA,
-            Self::AssistantThinking { .. } => event_method::ITEM_AGENT_THINKING,
-            Self::ToolExecutionStart { .. } => event_method::TOOL_EXECUTION_START,
-            Self::ToolExecutionUpdate { .. } => event_method::TOOL_EXECUTION_UPDATE,
-            Self::ToolExecutionEnd { .. } => event_method::TOOL_EXECUTION_END,
-            Self::ItemCompleted { .. } => event_method::ITEM_COMPLETED,
-            Self::ItemFailed { .. } => event_method::ITEM_FAILED,
-            Self::Diagnostic { .. } => event_method::AGENT_DIAGNOSTIC,
-            Self::ProviderAttempt { .. } => event_method::PROVIDER_ATTEMPT,
-            Self::TurnCompleted { .. } => event_method::TURN_COMPLETED,
-            Self::TurnFailed { .. } => event_method::TURN_ERROR,
-            Self::ThreadSettingsApplied { .. } => event_method::THREAD_SETTINGS_APPLIED,
+            Self::TurnStarted { .. } => "turn/started",
+            Self::ItemStarted { .. } => "item/started",
+            Self::AssistantDelta { .. } => "item/agentMessage/delta",
+            Self::AssistantThinking { .. } => "item/agentThinking",
+            Self::ToolExecutionStart { .. } => "tool/execution/start",
+            Self::ToolExecutionUpdate { .. } => "tool/execution/update",
+            Self::ToolExecutionEnd { .. } => "tool/execution/end",
+            Self::ItemCompleted { .. } => "item/completed",
+            Self::ItemFailed { .. } => "item/failed",
+            Self::Diagnostic { .. } => "agent/diagnostic",
+            Self::ProviderAttempt { .. } => "provider/attempt",
+            Self::TurnCompleted { .. } => "turn/completed",
+            Self::TurnFailed { .. } => "turn/error",
+            Self::ThreadSettingsApplied { .. } => "thread/settingsApplied",
         }
     }
 }
 
-/// `item/agentThinking` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentThinkingParams {
-    pub thread_id: String,
-    pub turn_id: String,
-    pub text: String,
+/// 桌面端 JSON-RPC 通知：`turn/started` 等方法的信封消息。
+// 不变量：params 为刚组装完成的 Value，不存在序列化失败路径。
+#[allow(clippy::expect_used)]
+pub fn turn_event_notification(event: &TurnEvent) -> JsonRpcMessage {
+    JsonRpcMessage::notification(event.method(), turn_event_wire_params(event))
+        .expect("notification with json value params serializes")
 }
 
-/// `thread/started` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadEventParams {
-    pub thread: Thread,
+/// 桌面端 wire 的 `params` 形状（camelCase，item/result 嵌套形态在此唯一一处
+/// 定义）。与 `--json` 面的差异（`modelUsage` 键名、`turn/error` 平铺、可选
+/// 字段以 null 出现）都是桌面端协议的既有合同，由 golden 测试逐字钉住。
+fn turn_event_wire_params(event: &TurnEvent) -> Value {
+    match event {
+        TurnEvent::TurnStarted { turn } => json!({"turn": Turn::from(turn)}),
+        TurnEvent::TurnCompleted { turn } => json!({"turn": Turn::from(turn)}),
+        TurnEvent::TurnFailed { turn, error } => json!({
+            "turnId": turn.turn_id,
+            "threadId": turn.thread_id,
+            "error": {
+                "stage": error.stage.as_str(),
+                "cause": error.cause.wire_str(),
+                "message": error.message,
+            },
+        }),
+        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": Thread::from(thread)}),
+        TurnEvent::ItemStarted {
+            thread_id,
+            turn_id,
+            item_id,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"itemId": item_id},
+        }),
+        TurnEvent::AssistantDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"itemId": item_id},
+            "delta": delta,
+        }),
+        TurnEvent::AssistantThinking {
+            thread_id,
+            turn_id,
+            text,
+        } => json!({"threadId": thread_id, "turnId": turn_id, "text": text}),
+        TurnEvent::ItemCompleted {
+            thread_id,
+            turn_id,
+            item_id,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"itemId": item_id},
+        }),
+        TurnEvent::ItemFailed {
+            thread_id,
+            turn_id,
+            item_id,
+            error,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"itemId": item_id},
+            "error": error,
+        }),
+        TurnEvent::ToolExecutionStart {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            args,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "args": args,
+        }),
+        TurnEvent::ToolExecutionUpdate {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "args": args,
+            "partialResult": partial_result,
+        }),
+        TurnEvent::ToolExecutionEnd {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "result": {
+                "content": [{"type": "text", "text": result}],
+                "isError": is_error,
+            },
+        }),
+        TurnEvent::Diagnostic {
+            thread_id,
+            turn_id,
+            severity,
+            code,
+            message,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "severity": severity.as_str(),
+            "code": code,
+            "message": message,
+        }),
+        TurnEvent::ProviderAttempt {
+            thread_id,
+            turn_id,
+            model_turn_ordinal,
+            provider,
+            model,
+            protocol,
+            status,
+            attempt_duration_ms,
+            error_category,
+            diagnostic_code,
+        } => json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "modelTurnOrdinal": model_turn_ordinal,
+            "provider": provider,
+            "model": model,
+            "protocol": protocol,
+            "status": status.as_str(),
+            // 可选字段在桌面端 wire 上恒出现：无值时为 null。
+            "attemptDurationMs": attempt_duration_ms,
+            "errorCategory": error_category,
+            "diagnosticCode": diagnostic_code,
+        }),
+    }
 }
 
-/// `turn/started` 与 `turn/completed` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnEventParams {
-    pub turn: Turn,
-}
-
-/// item 事件的条目引用。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ItemRef {
-    #[serde(rename = "itemId")]
-    pub item_id: String,
-}
-
-/// item 生命周期事件参数（started/completed/delta/failed 共用）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ItemEventParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    pub item: ItemRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delta: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// `tool/execution/start` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExecutionStartParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    #[serde(rename = "toolCallId")]
-    pub tool_call_id: String,
-    #[serde(rename = "toolName")]
-    pub tool_name: String,
-    pub args: Value,
-}
-
-/// `tool/execution/update` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExecutionUpdateParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    #[serde(rename = "toolCallId")]
-    pub tool_call_id: String,
-    #[serde(rename = "toolName")]
-    pub tool_name: String,
-    pub args: Value,
-    #[serde(rename = "partialResult")]
-    pub partial_result: String,
-}
-
-/// `tool/execution/end` 事件参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExecutionEndParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    #[serde(rename = "toolCallId")]
-    pub tool_call_id: String,
-    #[serde(rename = "toolName")]
-    pub tool_name: String,
-    pub result: ToolExecutionResult,
-}
-
-/// 工具执行结果的类型化载体。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExecutionResult {
-    pub content: Vec<ToolExecutionTextPart>,
-    #[serde(rename = "isError")]
-    pub is_error: bool,
-}
-
-/// 工具执行结果中的一段纯文本。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExecutionTextPart {
-    #[serde(rename = "type")]
-    pub kind: ToolResultPartType,
-    pub text: String,
-}
-
-/// 工具执行结果片段类型词形。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolResultPartType {
-    Text,
-}
-
-/// 对外广播的应用事件。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppEvent {
-    pub method: String,
-    pub params: Value,
+/// `sg --json` 事件行的 `params` 形状（snake_case；缺值的可选字段整体省略，
+/// 与桌面端 wire 的 null 语义刻意不同，两面的合同由 protocol golden 测试分别
+/// 钉住）。
+pub fn turn_event_jsonl_params(event: &TurnEvent) -> Value {
+    match event {
+        TurnEvent::TurnStarted { turn } | TurnEvent::TurnCompleted { turn } => {
+            json!({"turn": turn})
+        }
+        TurnEvent::TurnFailed { turn, error } => json!({"turn": turn, "error": error}),
+        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": thread}),
+        TurnEvent::ItemStarted {
+            thread_id,
+            turn_id,
+            item_id,
+        } => json!({"thread_id": thread_id, "turn_id": turn_id, "item_id": item_id}),
+        TurnEvent::AssistantDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "item_id": item_id,
+            "delta": delta,
+        }),
+        TurnEvent::AssistantThinking {
+            thread_id,
+            turn_id,
+            text,
+        } => json!({"thread_id": thread_id, "turn_id": turn_id, "text": text}),
+        TurnEvent::ItemCompleted {
+            thread_id,
+            turn_id,
+            item_id,
+        } => json!({"thread_id": thread_id, "turn_id": turn_id, "item_id": item_id}),
+        TurnEvent::ItemFailed {
+            thread_id,
+            turn_id,
+            item_id,
+            error,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "item_id": item_id,
+            "error": error,
+        }),
+        TurnEvent::ToolExecutionStart {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            args,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "args": args,
+        }),
+        TurnEvent::ToolExecutionUpdate {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "args": args,
+            "partial_result": partial_result,
+        }),
+        TurnEvent::ToolExecutionEnd {
+            thread_id,
+            turn_id,
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "result": result,
+            "is_error": is_error,
+        }),
+        TurnEvent::Diagnostic {
+            thread_id,
+            turn_id,
+            severity,
+            code,
+            message,
+        } => json!({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "severity": severity.as_str(),
+            "code": code,
+            "message": message,
+        }),
+        TurnEvent::ProviderAttempt {
+            thread_id,
+            turn_id,
+            model_turn_ordinal,
+            provider,
+            model,
+            protocol,
+            status,
+            attempt_duration_ms,
+            error_category,
+            diagnostic_code,
+        } => {
+            let mut object = serde_json::Map::new();
+            object.insert("thread_id".to_string(), json!(thread_id));
+            object.insert("turn_id".to_string(), json!(turn_id));
+            object.insert("model_turn_ordinal".to_string(), json!(model_turn_ordinal));
+            object.insert("provider".to_string(), json!(provider));
+            object.insert("model".to_string(), json!(model));
+            object.insert("protocol".to_string(), json!(protocol));
+            object.insert("status".to_string(), json!(status.as_str()));
+            // --json 面的可选字段仅在已知时出现（省略即未知，不写 null）。
+            if let Some(duration) = attempt_duration_ms {
+                object.insert("attempt_duration_ms".to_string(), json!(duration));
+            }
+            if let Some(category) = error_category {
+                object.insert("error_category".to_string(), json!(category));
+            }
+            if let Some(code) = diagnostic_code {
+                object.insert("diagnostic_code".to_string(), json!(code));
+            }
+            Value::Object(object)
+        }
+    }
 }
 
 /// `agent/diagnostic` 的稳定严重级别词形。
@@ -473,439 +630,5 @@ impl From<&ExecutionTurnUsage> for TurnModelUsage {
             usage_present: usage.usage_present,
             usage_complete: usage.usage_complete,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnErrorParams {
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    pub error: TurnError,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnError {
-    pub stage: TurnFailureStage,
-    pub cause: TurnFailureCause,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentDiagnosticParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    pub severity: DiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderAttemptParams {
-    #[serde(rename = "threadId")]
-    pub thread_id: String,
-    #[serde(rename = "turnId")]
-    pub turn_id: String,
-    pub model_turn_ordinal: u32,
-    pub provider: String,
-    pub model: String,
-    pub protocol: String,
-    pub status: ProviderAttemptStatus,
-    pub attempt_duration_ms: Option<u64>,
-    pub error_category: Option<String>,
-    pub diagnostic_code: Option<String>,
-}
-
-impl AppEvent {
-    /// 构造一个带类型化参数的应用事件；参数结构恒可序列化，失败视为
-    /// crate 内部错误。
-    fn build(method: &str, params: impl Serialize) -> Self {
-        // 不变量：params 均为本 crate 的静态类型，无 #[serde(skip)] 字段，序列化恒不失败。
-        #[allow(clippy::expect_used)]
-        let params = serde_json::to_value(params).expect("typed event params serialize");
-        Self {
-            method: method.to_string(),
-            params,
-        }
-    }
-
-    /// 将共享执行事件投影为稳定的 JSON-RPC 事件参数。
-    pub fn from_turn_event(event: &TurnEvent) -> Self {
-        match event {
-            TurnEvent::TurnStarted { turn } => Self::turn_started(&Turn::from(turn)),
-            TurnEvent::TurnCompleted { turn } => Self::turn_completed(&Turn::from(turn)),
-            TurnEvent::TurnFailed { turn, error } => Self::turn_error(
-                &turn.turn_id,
-                &turn.thread_id,
-                error.stage,
-                error.cause,
-                &error.message,
-            ),
-            TurnEvent::ThreadSettingsApplied { thread } => {
-                Self::thread_settings_applied(&Thread::from(thread))
-            }
-            TurnEvent::ItemStarted {
-                thread_id,
-                turn_id,
-                item_id,
-            } => Self::item_started(thread_id, turn_id, item_id),
-            TurnEvent::AssistantDelta {
-                thread_id,
-                turn_id,
-                item_id,
-                delta,
-            } => Self::item_agent_message_delta(thread_id, turn_id, item_id, delta),
-            TurnEvent::AssistantThinking {
-                thread_id,
-                turn_id,
-                text,
-            } => Self::item_agent_thinking(thread_id, turn_id, text),
-            TurnEvent::ItemCompleted {
-                thread_id,
-                turn_id,
-                item_id,
-            } => Self::item_completed(thread_id, turn_id, item_id),
-            TurnEvent::ItemFailed {
-                thread_id,
-                turn_id,
-                item_id,
-                error,
-            } => Self::item_failed(thread_id, turn_id, item_id, error),
-            TurnEvent::ToolExecutionStart {
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                args,
-            } => Self::tool_execution_start(
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                args.clone(),
-            ),
-            TurnEvent::ToolExecutionUpdate {
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                args,
-                partial_result,
-            } => Self::tool_execution_update(
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                args.clone(),
-                partial_result,
-            ),
-            TurnEvent::ToolExecutionEnd {
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                result,
-                is_error,
-            } => Self::tool_execution_end(
-                thread_id,
-                turn_id,
-                tool_call_id,
-                tool_name,
-                result,
-                *is_error,
-            ),
-            TurnEvent::Diagnostic {
-                thread_id,
-                turn_id,
-                severity,
-                code,
-                message,
-            } => Self::agent_diagnostic(thread_id, turn_id, *severity, code, message),
-            TurnEvent::ProviderAttempt {
-                thread_id,
-                turn_id,
-                model_turn_ordinal,
-                provider,
-                model,
-                protocol,
-                status,
-                attempt_duration_ms,
-                error_category,
-                diagnostic_code,
-            } => Self::provider_attempt(ProviderAttemptParams {
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                model_turn_ordinal: *model_turn_ordinal,
-                provider: provider.clone(),
-                model: model.clone(),
-                protocol: protocol.clone(),
-                status: *status,
-                attempt_duration_ms: *attempt_duration_ms,
-                error_category: error_category.clone(),
-                diagnostic_code: diagnostic_code.clone(),
-            }),
-        }
-    }
-
-    /// 构造 thread started 事件。
-    pub fn thread_started(thread: &Thread) -> Self {
-        Self::build(
-            event_method::THREAD_STARTED,
-            ThreadEventParams {
-                thread: thread.clone(),
-            },
-        )
-    }
-
-    /// 构造 turn started 事件。
-    pub fn turn_started(turn: &Turn) -> Self {
-        Self::build(
-            event_method::TURN_STARTED,
-            TurnEventParams { turn: turn.clone() },
-        )
-    }
-
-    /// 构造 turn completed 事件。
-    pub fn turn_completed(turn: &Turn) -> Self {
-        Self::build(
-            event_method::TURN_COMPLETED,
-            TurnEventParams { turn: turn.clone() },
-        )
-    }
-
-    /// 构造 Turn 执行错误终态事件。
-    pub fn turn_error(
-        turn_id: &str,
-        thread_id: &str,
-        stage: TurnFailureStage,
-        cause: TurnFailureCause,
-        message: &str,
-    ) -> Self {
-        let params = TurnErrorParams {
-            turn_id: turn_id.to_string(),
-            thread_id: thread_id.to_string(),
-            error: TurnError {
-                stage,
-                cause,
-                message: message.to_string(),
-            },
-        };
-        Self::build(event_method::TURN_ERROR, params)
-    }
-
-    /// 构造非致命、脱敏的 Agent 诊断事件。
-    pub fn agent_diagnostic(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        severity: DiagnosticSeverity,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        let params = AgentDiagnosticParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            severity,
-            code: code.into(),
-            message: message.into(),
-        };
-        Self::build(event_method::AGENT_DIAGNOSTIC, params)
-    }
-
-    /// 构造单次 Provider attempt 的脱敏进度/终态事件。
-    pub fn provider_attempt(params: ProviderAttemptParams) -> Self {
-        Self::build(event_method::PROVIDER_ATTEMPT, params)
-    }
-
-    /// 构造 item started 事件。
-    pub fn item_started(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        item_id: impl Into<String>,
-    ) -> Self {
-        Self::item_event(
-            event_method::ITEM_STARTED,
-            thread_id,
-            turn_id,
-            item_id,
-            None,
-            None,
-        )
-    }
-
-    /// 构造线程设置已应用事件（待生效设置在可信终态后持久化并更新线程投影）。
-    pub fn thread_settings_applied(thread: &Thread) -> Self {
-        Self::build(
-            event_method::THREAD_SETTINGS_APPLIED,
-            ThreadEventParams {
-                thread: thread.clone(),
-            },
-        )
-    }
-
-    /// 构造 assistant 思考块事件。
-    pub fn item_agent_thinking(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        text: impl Into<String>,
-    ) -> Self {
-        let params = AgentThinkingParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            text: text.into(),
-        };
-        Self::build(event_method::ITEM_AGENT_THINKING, params)
-    }
-
-    /// 构造 agent message 增量事件。
-    pub fn item_agent_message_delta(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        item_id: impl Into<String>,
-        delta: impl Into<String>,
-    ) -> Self {
-        Self::item_event(
-            event_method::ITEM_AGENT_MESSAGE_DELTA,
-            thread_id,
-            turn_id,
-            item_id,
-            Some(delta.into()),
-            None,
-        )
-    }
-
-    /// 构造 item completed 事件。
-    pub fn item_completed(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        item_id: impl Into<String>,
-    ) -> Self {
-        Self::item_event(
-            event_method::ITEM_COMPLETED,
-            thread_id,
-            turn_id,
-            item_id,
-            None,
-            None,
-        )
-    }
-
-    /// 构造 item failed 事件。
-    pub fn item_failed(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        item_id: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
-        Self::item_event(
-            event_method::ITEM_FAILED,
-            thread_id,
-            turn_id,
-            item_id,
-            None,
-            Some(error.into()),
-        )
-    }
-
-    /// 构造工具开始执行事件通知。
-    pub fn tool_execution_start(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        tool_call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        args: Value,
-    ) -> Self {
-        let params = ToolExecutionStartParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            tool_call_id: tool_call_id.into(),
-            tool_name: tool_name.into(),
-            args,
-        };
-        Self::build(event_method::TOOL_EXECUTION_START, params)
-    }
-
-    /// 构造工具执行流式输出增量更新通知。
-    pub fn tool_execution_update(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        tool_call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        args: Value,
-        partial_result: impl Into<String>,
-    ) -> Self {
-        let params = ToolExecutionUpdateParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            tool_call_id: tool_call_id.into(),
-            tool_name: tool_name.into(),
-            args,
-            partial_result: partial_result.into(),
-        };
-        Self::build(event_method::TOOL_EXECUTION_UPDATE, params)
-    }
-
-    /// 构造工具执行完成事件通知。
-    pub fn tool_execution_end(
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        tool_call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        result: impl Into<String>,
-        is_error: bool,
-    ) -> Self {
-        let params = ToolExecutionEndParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            tool_call_id: tool_call_id.into(),
-            tool_name: tool_name.into(),
-            result: ToolExecutionResult {
-                content: vec![ToolExecutionTextPart {
-                    kind: ToolResultPartType::Text,
-                    text: result.into(),
-                }],
-                is_error,
-            },
-        };
-        Self::build(event_method::TOOL_EXECUTION_END, params)
-    }
-
-    fn item_event(
-        method: &'static str,
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        item_id: impl Into<String>,
-        delta: Option<String>,
-        error: Option<String>,
-    ) -> Self {
-        let params = ItemEventParams {
-            thread_id: thread_id.into(),
-            turn_id: turn_id.into(),
-            item: ItemRef {
-                item_id: item_id.into(),
-            },
-            delta,
-            error,
-        };
-        Self::build(method, params)
-    }
-
-    /// 返回事件方法名。
-    pub fn method(&self) -> &str {
-        &self.method
-    }
-
-    /// 将应用事件包装为 JSON-RPC 通知。
-    // 不变量：params 在 build 时已成功序列化，此处再次包装恒不失败。
-    #[allow(clippy::expect_used)]
-    pub fn to_notification(&self) -> JsonRpcMessage {
-        JsonRpcMessage::notification(self.method.clone(), &self.params)
-            .expect("application event params serialize")
     }
 }

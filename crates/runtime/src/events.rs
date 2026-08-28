@@ -2,7 +2,7 @@
 
 pub use singularity_protocol::{
     DiagnosticSeverity as AgentDiagnosticSeverity, ProviderAttemptStatus, TurnErrorDetail,
-    TurnEvent,
+    TurnEvent, turn_event_jsonl_params,
 };
 
 /// 事件观察端。投影失败不得影响 Agent 执行：实现方自行吞掉并记录自身的

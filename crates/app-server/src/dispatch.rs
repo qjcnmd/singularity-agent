@@ -302,8 +302,7 @@ impl AppServer {
             cwd,
             last_turn_status: None,
         };
-        let mut messages =
-            vec![self.event_notification(AppEvent::thread_started(&protocol_thread))?];
+        let mut messages = vec![self.thread_started_notification(&protocol_thread)?];
         messages.push(
             JsonRpcMessage::response(
                 message.required_id(),
@@ -516,7 +515,7 @@ impl AppServer {
         if self.cancellation_handle().execution_stop_requested() {
             reservation.conversation().interrupt();
         }
-        let mut projection = crate::lifecycle::TurnProjection::new(self, request_id, emit);
+        let mut projection = crate::lifecycle::TurnProjection::new(request_id, emit);
         let run_result = reservation.run(&input, &mut projection);
         match run_result {
             Ok(_) => Ok(()),

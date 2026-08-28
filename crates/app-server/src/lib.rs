@@ -22,7 +22,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use singularity_protocol::{
-    AppEvent, ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind,
+    ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind,
     ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult,
     ThreadStartParams, ThreadStartResult, ThreadStatus, Turn, TurnIdParams, TurnInjectionParams,

@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use serde_json::{Value, json};
-use singularity_runtime::events::TurnEvent;
+use singularity_runtime::events::{TurnEvent, turn_event_jsonl_params};
 use singularity_runtime::objects::TurnStatus;
 
 pub struct JsonlRenderer {
@@ -35,20 +35,13 @@ impl JsonlRenderer {
         }
     }
 
-    /// 输出一行事件；序列化失败只丢弃该投影，不影响执行。stdout 写失败
-    /// 置位 broken 标志（后续事件行跳过），终态行写失败由调用方显性处理。
+    /// 输出一行事件；投影是恒不失败的纯构造，stdout 写失败置位 broken
+    /// 标志（后续事件行跳过），终态行写失败由调用方显性处理。
     pub fn emit(&mut self, event: &TurnEvent) {
         if self.stdout_broken {
             return;
         }
-        let mut params = match serde_json::to_value(event) {
-            Ok(Value::Object(map)) => Value::Object(map),
-            _ => return,
-        };
-        if let Some(object) = params.as_object_mut() {
-            object.remove("event");
-        }
-        let line = json!({"method": event.method(), "params": params});
+        let line = json!({"method": event.method(), "params": turn_event_jsonl_params(event)});
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
         if writeln!(lock, "{line}")

@@ -51,6 +51,30 @@ fn stdio_handshake_thread_start_lists_user_level_session() {
         serde_json::from_str(&std::fs::read_to_string(&rollout).expect("rollout")).expect("header");
     assert_eq!(header["id"], thread_id);
 
+    // thread/started 是桌面端局部生命周期通知（非 TurnEvent）：wire 形状
+    // {jsonrpc,method,params:{thread:{threadId,model,cwd,lastTurnStatus}}}
+    // 的唯一合同点。
+    let started_note = process
+        .output
+        .recv_where(Duration::from_secs(5), |m| {
+            m["method"] == "thread/started"
+        });
+    assert_eq!(started_note["jsonrpc"], "2.0");
+    assert!(
+        started_note.get("id").is_none(),
+        "notification must carry no id: {started_note}"
+    );
+    assert_eq!(started_note["params"]["thread"]["threadId"], thread_id);
+    assert_eq!(started_note["params"]["thread"]["lastTurnStatus"], Value::Null);
+    let mut thread_keys: Vec<&str> = started_note["params"]["thread"]
+        .as_object()
+        .expect("thread object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    thread_keys.sort_unstable();
+    assert_eq!(thread_keys, ["cwd", "lastTurnStatus", "model", "threadId"]);
+
     process.send_request(4, "thread/list", json!({}));
     let listed = process.output.recv_id(4, Duration::from_secs(5));
     let threads = listed["result"]["threads"].as_array().expect("threads");

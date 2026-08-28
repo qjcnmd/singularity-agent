@@ -1,7 +1,7 @@
 //! runtime 事件的 JSON-RPC 投影。
 
 use singularity_protocol::{
-    AppEvent, ExecutionTurn, JsonRpcId, JsonRpcMessage, Turn, TurnStartResult,
+    ExecutionTurn, JsonRpcId, JsonRpcMessage, Turn, TurnStartResult, turn_event_notification,
 };
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 use singularity_runtime::{TurnFailureStage, TurnOutcome, TurnRunError};
@@ -14,7 +14,6 @@ pub(crate) fn wire_turn(turn: &ExecutionTurn) -> Turn {
 
 /// 单次 run_turn 调用的协议投影。
 pub(crate) struct TurnProjection<'a> {
-    server: &'a AppServer,
     request_id: JsonRpcId,
     emit: &'a mut dyn FnMut(Value),
     response_sent: bool,
@@ -22,13 +21,8 @@ pub(crate) struct TurnProjection<'a> {
 }
 
 impl<'a> TurnProjection<'a> {
-    pub fn new(
-        server: &'a AppServer,
-        request_id: JsonRpcId,
-        emit: &'a mut dyn FnMut(Value),
-    ) -> Self {
+    pub fn new(request_id: JsonRpcId, emit: &'a mut dyn FnMut(Value)) -> Self {
         Self {
-            server,
             request_id,
             emit,
             response_sent: false,
@@ -42,45 +36,38 @@ impl<'a> TurnProjection<'a> {
         }
     }
 
-    fn emit_notification(&mut self, event: AppEvent) {
-        match self.server.event_notification(event) {
-            Ok(value) => self.emit_value(value),
-            Err(error) => self.poison_or(error),
-        }
-    }
-
     fn poison_or(&mut self, error: AppServerError) {
         if self.poisoned.is_none() {
             self.poisoned = Some(error);
         }
     }
 
-    fn on_turn_started(&mut self, turn: &ExecutionTurn) {
-        self.emit_notification(AppEvent::from_turn_event(&TurnEvent::TurnStarted {
-            turn: turn.clone(),
-        }));
-        if !self.response_sent {
-            self.response_sent = true;
-            let value = match serde_json::to_value(TurnStartResult {
-                turn: wire_turn(turn),
-            }) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.poison_or(AppServerError::InvalidJson(error));
-                    return;
-                }
-            };
-            self.emit_value(JsonRpcMessage::response(self.request_id, value).to_wire_value());
+    /// `turn/started` 之后紧随回写 turn/start 的响应：stdio 单连接下客户端
+    /// 把该 response 之前的 notification 关联到本次请求（每个投影只回一次，
+    /// 链式 followUp 的后续 turn 不再产生响应）。
+    fn send_start_response(&mut self, turn: &ExecutionTurn) {
+        if self.response_sent {
+            return;
         }
+        self.response_sent = true;
+        let value = match serde_json::to_value(TurnStartResult {
+            turn: wire_turn(turn),
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                self.poison_or(AppServerError::InvalidJson(error));
+                return;
+            }
+        };
+        self.emit_value(JsonRpcMessage::response(self.request_id, value).to_wire_value());
     }
 }
 
 impl TurnEventSink for TurnProjection<'_> {
     fn emit(&mut self, event: TurnEvent) {
+        self.emit_value(turn_event_notification(&event).to_wire_value());
         if let TurnEvent::TurnStarted { turn } = &event {
-            self.on_turn_started(turn);
-        } else {
-            self.emit_notification(AppEvent::from_turn_event(&event));
+            self.send_start_response(turn);
         }
     }
 }
