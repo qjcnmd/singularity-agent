@@ -34,17 +34,12 @@ pub(crate) enum Phase {
 }
 
 /// /compact 的唯一状态源。排队与运行态互斥，运行态自带本次操作的取消令牌。
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) enum CompactionState {
+    #[default]
     Idle,
     Queued,
     Running(singularity_core::CancellationToken),
-}
-
-impl Default for CompactionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl CompactionState {
