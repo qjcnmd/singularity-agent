@@ -39,8 +39,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use unicode_width::UnicodeWidthStr;
 
-use crate::forward::{EventForward, INTERRUPT_POLL};
-use app::TuiApp;
+use crate::forward::EventForward;
+use app::{Phase, TuiApp};
 use commands::Action;
 use singularity_runtime::CompactionOutcome;
 use singularity_runtime::events::TurnEvent;
@@ -89,6 +89,9 @@ pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
 }
 
 const SPINNER_TICK: Duration = Duration::from_millis(120);
+/// 空闲（无运行中 turn）时事件泵单次阻塞等待的上限：无 spinner 节拍驱动，
+/// 放宽唤醒频率以省 CPU；运行中由下一次 spinner 节拍约束。
+const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct InteractiveOutcome {
     pub exit_code: i32,
@@ -249,6 +252,27 @@ fn event_loop(
     let mut last_spinner_tick = Instant::now();
 
     loop {
+        // 阻塞等待键盘事件：键事件即时唤醒，避免固定轮询间隔引入的按键
+        // 延迟（参照 grok 的 poll_timeout 有界阻塞 poll）。运行中 deadline
+        // 取下一次 spinner 节拍，空闲放宽到 IDLE_POLL_TIMEOUT；turn 事件
+        // 经通道送达，最迟等一个 deadline 后处理，与现状轮询节奏持平。
+        let now = Instant::now();
+        let poll_timeout = if app.phase == Phase::Idle {
+            if app.paste_burst.is_active() {
+                // 有未落地的 burst 缓冲时缩短等待，确保静默超时及时 flush。
+                Duration::from_millis(50)
+            } else {
+                IDLE_POLL_TIMEOUT
+            }
+        } else {
+            // 距下一次 spinner 节拍的时间；若已过点则立即返回。
+            last_spinner_tick
+                .checked_add(SPINNER_TICK)
+                .unwrap_or_else(|| now + SPINNER_TICK)
+                .saturating_duration_since(now)
+        };
+        let key_ready = crossterm::event::poll(poll_timeout).unwrap_or(false);
+
         // 排空本轮 turn 事件。
         while let Ok(event) = rx.try_recv() {
             match event {
@@ -264,39 +288,41 @@ fn event_loop(
             }
         }
 
-        // 键盘、鼠标与 resize 事件（排空至无事件为止）。
-        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-            match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key)) => match app.handle_key(key) {
-                    Action::Continue => {}
-                    Action::Submit(goal) => {
-                        spawn_turn(&app.conversation_handle(), goal, tx.clone())
+        // 键盘、鼠标与 resize 事件（有就绪时才排空，否则保持阻塞等待）。
+        if key_ready {
+            while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+                match crossterm::event::read() {
+                    Ok(crossterm::event::Event::Key(key)) => match app.handle_key(key) {
+                        Action::Continue => {}
+                        Action::Submit(goal) => {
+                            spawn_turn(&app.conversation_handle(), goal, tx.clone())
+                        }
+                        Action::Compact(cancellation) => {
+                            spawn_compact(&app.conversation_handle(), cancellation, tx.clone())
+                        }
+                        Action::Exit(code) => return Ok(code),
+                    },
+                    Ok(crossterm::event::Event::Paste(text)) => {
+                        // 括号粘贴事件：CRLF/CR 归一并整段插入（burst 状态清空）。
+                        app.handle_paste(text);
                     }
-                    Action::Compact(cancellation) => {
-                        spawn_compact(&app.conversation_handle(), cancellation, tx.clone())
-                    }
-                    Action::Exit(code) => return Ok(code),
-                },
-                Ok(crossterm::event::Event::Paste(text)) => {
-                    // 括号粘贴事件：CRLF/CR 归一并整段插入（burst 状态清空）。
-                    app.handle_paste(text);
-                }
-                Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
-                    crossterm::event::MouseEventKind::ScrollUp => {
-                        app.handle_wheel(true, mouse.column, mouse.row)
-                    }
-                    crossterm::event::MouseEventKind::ScrollDown => {
-                        app.handle_wheel(false, mouse.column, mouse.row)
-                    }
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        app.handle_click(mouse.column, mouse.row)
+                    Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => {
+                            app.handle_wheel(true, mouse.column, mouse.row)
+                        }
+                        crossterm::event::MouseEventKind::ScrollDown => {
+                            app.handle_wheel(false, mouse.column, mouse.row)
+                        }
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ) => app.handle_click(mouse.column, mouse.row),
+                        _ => {}
+                    },
+                    Ok(crossterm::event::Event::Resize(_, _)) => {
+                        // 布局按帧重算；滚动位置由 ScrollState 钳制。
                     }
                     _ => {}
-                },
-                Ok(crossterm::event::Event::Resize(_, _)) => {
-                    // 布局按帧重算；滚动位置由 ScrollState 钳制。
                 }
-                _ => {}
             }
         }
 
@@ -311,6 +337,5 @@ fn event_loop(
         terminal
             .draw(|frame| app.draw(frame))
             .map_err(|error| format!("draw failed: {error}"))?;
-        std::thread::sleep(INTERRUPT_POLL.min(SPINNER_TICK));
     }
 }

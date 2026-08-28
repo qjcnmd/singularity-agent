@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 
-/// 入口主循环无阻塞等待 turn 事件的轮询间隔。
+/// 无交互入口（--print/--json）主循环无阻塞等待 turn 事件的轮询间隔；
+/// TUI 事件泵改用 crossterm 有界阻塞 poll，不再使用此常量。
 pub(crate) const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 
 /// 把 turn 事件按入口自己的消息形状映射后投递进通道的 sink；执行线程
