@@ -405,7 +405,7 @@ fn successful_turn_emits_lifecycle_events_and_final_text() {
 }
 
 #[test]
-fn completed_turn_exposes_its_persisted_thinking_blocks() {
+fn completed_turn_publishes_thinking_blocks_on_the_event_stream() {
     let home = temp_sessions();
     let conversation = new_conversation(
         &home.path().join("sessions"),
@@ -413,16 +413,18 @@ fn completed_turn_exposes_its_persisted_thinking_blocks() {
         None,
     );
     let mut events = Vec::new();
-    let outcome = conversation
+    conversation
         .run_turn("reason", &mut |event| events.push(event))
         .expect("turn completes");
 
-    assert_eq!(
-        conversation
-            .thinking_for_turn(&outcome.turn_id)
-            .expect("thinking loads"),
-        vec!["considered the evidence"]
-    );
+    let thinking: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::AssistantThinking { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, ["considered the evidence"]);
 }
 
 #[test]

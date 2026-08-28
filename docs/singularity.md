@@ -56,7 +56,7 @@ sg --print|--json <goal>
 
 protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯一事件来源，方法名稳定：
 
-`thread/started · turn/started · item/started · item/agentMessage/delta · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error · thread/settingsApplied`
+`thread/started · turn/started · item/started · item/agentMessage/delta · item/agentThinking · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error · thread/settingsApplied`
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影。空闲路径无此事件（提交点内已立即持久化）。
 
@@ -116,7 +116,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档——参照 pi session-selector 的确认与保护语义），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。
 - **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
 - **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环，截断档以 `… N more lines (Ctrl+O expand)` 出口提示。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
-- **思考块**：Ctrl+T 折叠或展开思考内容，不改变运行中输入路由。
+- **思考块**：思考内容经 `item/agentThinking` 事件流实时到达客户端（assistant 消息持久化后逐块发布），不回查持久层；Ctrl+T 折叠或展开思考内容，不改变运行中输入路由。
 - **状态行**：显示当前活动（思考中、等待模型、执行工具或终态收敛）、本轮经过时间、thread id、模型、token usage 与 followUp 队列计数；浏览态显示 `viewing history`。
 - **取消/退出**：Esc 中断当前轮；Ctrl+C 第一次在需要时清空输入并进入退出确认，第二次退出；输入为空时 Ctrl+D 退出。
 - **设置模态**：`/settings` 打开，Tab 切换字段，Enter 应用（空闲立即生效 / 运行中排队到下一轮），Esc 关闭；开关前后滚动位置与编辑器内容不变。reasoning 字段预填当前 effort，清空后应用即 Clear（恢复模型默认），非空则 Set 为该值。

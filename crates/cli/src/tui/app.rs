@@ -292,14 +292,12 @@ impl TuiApp {
                 self.transcript
                     .push_note(format!("⚠ [{severity}] {code}: {message}"), style);
             }
+            TurnEvent::AssistantThinking { text, .. } => {
+                self.transcript.push_thinking(text);
+            }
             TurnEvent::TurnCompleted { turn } => {
                 if turn.usage.as_ref().is_some_and(|usage| usage.usage_present) {
                     self.session_tokens = turn.usage.as_ref().map(|usage| usage.total_tokens);
-                }
-                if let Ok(blocks) = self.conversation.thinking_for_turn(&turn.turn_id) {
-                    for block in blocks {
-                        self.transcript.push_thinking(block);
-                    }
                 }
                 self.transcript.push_note(
                     format!("✔ completed ({})", describe_usage(turn)),

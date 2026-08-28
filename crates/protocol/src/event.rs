@@ -16,6 +16,7 @@ pub mod event_method {
     pub const PROVIDER_ATTEMPT: &str = "provider/attempt";
     pub const ITEM_STARTED: &str = "item/started";
     pub const ITEM_AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
+    pub const ITEM_AGENT_THINKING: &str = "item/agentThinking";
     pub const ITEM_COMPLETED: &str = "item/completed";
     pub const ITEM_FAILED: &str = "item/failed";
     pub const TOOL_EXECUTION_START: &str = "tool/execution/start";
@@ -89,6 +90,12 @@ pub enum TurnEvent {
         turn_id: String,
         item_id: String,
         delta: String,
+    },
+    /// assistant 消息内的思考块事实；持久化后实时逐块发布。
+    AssistantThinking {
+        thread_id: String,
+        turn_id: String,
+        text: String,
     },
     ToolExecutionStart {
         thread_id: String,
@@ -164,6 +171,7 @@ impl TurnEvent {
             Self::TurnStarted { .. } => event_method::TURN_STARTED,
             Self::ItemStarted { .. } => event_method::ITEM_STARTED,
             Self::AssistantDelta { .. } => event_method::ITEM_AGENT_MESSAGE_DELTA,
+            Self::AssistantThinking { .. } => event_method::ITEM_AGENT_THINKING,
             Self::ToolExecutionStart { .. } => event_method::TOOL_EXECUTION_START,
             Self::ToolExecutionUpdate { .. } => event_method::TOOL_EXECUTION_UPDATE,
             Self::ToolExecutionEnd { .. } => event_method::TOOL_EXECUTION_END,
@@ -176,6 +184,15 @@ impl TurnEvent {
             Self::ThreadSettingsApplied { .. } => event_method::THREAD_SETTINGS_APPLIED,
         }
     }
+}
+
+/// `item/agentThinking` 事件参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentThinkingParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub text: String,
 }
 
 /// `thread/started` 事件参数。
@@ -545,6 +562,11 @@ impl AppEvent {
                 item_id,
                 delta,
             } => Self::item_agent_message_delta(thread_id, turn_id, item_id, delta),
+            TurnEvent::AssistantThinking {
+                thread_id,
+                turn_id,
+                text,
+            } => Self::item_agent_thinking(thread_id, turn_id, text),
             TurnEvent::ItemCompleted {
                 thread_id,
                 turn_id,
@@ -725,6 +747,20 @@ impl AppEvent {
                 thread: thread.clone(),
             },
         )
+    }
+
+    /// 构造 assistant 思考块事件。
+    pub fn item_agent_thinking(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        let params = AgentThinkingParams {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            text: text.into(),
+        };
+        Self::build(event_method::ITEM_AGENT_THINKING, params)
     }
 
     /// 构造 agent message 增量事件。

@@ -13,9 +13,8 @@ use singularity_agent::agent::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, AgentOutcome, AgentTerminalReason,
 };
 use singularity_agent::compaction::CompactionConfig;
-use singularity_agent::message::{AgentMessageRole, ContentBlock};
 use singularity_agent::session::{
-    SessionEntry, SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
+    SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -111,50 +110,6 @@ impl TurnRunner {
     /// 进程内共享的写者锁协调器。
     pub fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
         &self.coordinator
-    }
-
-    /// 读取一个已落盘 turn 的思考块，供交互客户端按需展示。
-    ///
-    /// 展示性只读投影走无锁只读路径：TurnCompleted 投递时本轮写者可能仍
-    /// 持有会话写者锁，这里不得抢锁或触发修复重写。
-    pub fn thinking_for_turn(&self, thread: &Thread, turn_id: &str) -> Result<Vec<String>, String> {
-        let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let session =
-            SessionManager::open_existing_read_only(&path).map_err(|error| error.to_string())?;
-        session
-            .verify_session_id(&thread.thread_id)
-            .map_err(|error| error.to_string())?;
-        let mut inside_turn = false;
-        let mut thinking = Vec::new();
-        for entry in session.entries() {
-            match entry {
-                SessionEntry::Metadata { metadata, .. }
-                    if metadata.kind() == SessionMetadataKind::TurnStarted
-                        && metadata.turn_id() == Some(turn_id) =>
-                {
-                    inside_turn = true;
-                }
-                SessionEntry::Metadata { metadata, .. }
-                    if inside_turn
-                        && metadata.kind().matches_turn_terminal()
-                        && metadata.turn_id() == Some(turn_id) =>
-                {
-                    break;
-                }
-                SessionEntry::Message { message, .. }
-                    if inside_turn && message.role() == AgentMessageRole::Assistant =>
-                {
-                    thinking.extend(message.content().iter().filter_map(|block| match block {
-                        ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                            Some(thinking.clone())
-                        }
-                        _ => None,
-                    }));
-                }
-                _ => {}
-            }
-        }
-        Ok(thinking)
     }
 
     pub fn provider_snapshot(&self) -> &ProviderConfigSnapshot {

@@ -74,6 +74,8 @@ impl AgentDiagnostic {
 pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
     MessageUpdate { delta: String },
+    /// assistant 消息中的思考块事实；持久化该消息后逐块上报。
+    Thinking { text: String },
     /// 工具开始执行事件。
     ToolExecutionStarted {
         tool_name: String,

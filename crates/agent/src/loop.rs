@@ -38,7 +38,9 @@ use self::request::{AttemptOutcome, TurnRequestSpec, effective_max_output_tokens
 use crate::compaction::{
     CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, ContextLedger,
 };
-use crate::message::{AgentMessage, assistant_response_message, tool_result_message, user_message};
+use crate::message::{
+    AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
+};
 use crate::session::{SessionError, SessionManager};
 use crate::tools::ToolRegistry;
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch, tool_error_execution};
@@ -347,10 +349,9 @@ impl Agent {
                     // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant
                     // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
                     // 它们显示为成功的工具事件。
-                    self.append_session_or_fail(
-                        &mut outcome,
-                        assistant_response_message(&response),
-                    )?;
+                    let assistant = assistant_response_message(&response);
+                    self.append_session_or_fail(&mut outcome, assistant.clone())?;
+                    Self::emit_thinking(&assistant, events);
                     for call in &tool_calls {
                         self.append_session_or_fail(
                             &mut outcome,
@@ -370,10 +371,9 @@ impl Agent {
                 }
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
-                    self.append_session_or_fail(
-                        &mut outcome,
-                        assistant_response_message(&response),
-                    )?;
+                    let assistant = assistant_response_message(&response);
+                    self.append_session_or_fail(&mut outcome, assistant.clone())?;
+                    Self::emit_thinking(&assistant, events);
                     // 查找、参数校验和执行模式判定先按 source order 完成；
                     // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
                     let prepared_calls = tool_calls
@@ -409,7 +409,9 @@ impl Agent {
                     continue;
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
-                self.append_session_or_fail(&mut outcome, assistant_response_message(&response))?;
+                let assistant = assistant_response_message(&response);
+                self.append_session_or_fail(&mut outcome, assistant.clone())?;
+                Self::emit_thinking(&assistant, events);
                 outcome.final_text = assistant_text;
                 outcome.truncated = length_truncated;
                 break;
@@ -570,6 +572,23 @@ impl Agent {
             self.ledger.record_appended(entry);
         }
         Ok(())
+    }
+
+    /// 持久化后的 assistant 消息内的思考块作为事实上报：每块一条事件，
+    /// 供客户端实时展示，替代持久层回查。
+    fn emit_thinking(message: &AgentMessage, events: &mut AgentEvents) {
+        for block in message.thinking_blocks() {
+            if let ContentBlock::Thinking { thinking, .. } = block
+                && !thinking.trim().is_empty()
+            {
+                emit(
+                    events,
+                    AgentEvent::Thinking {
+                        text: thinking.clone(),
+                    },
+                );
+            }
+        }
     }
 
     /// 取消/中止的收敛出口：标记中止原因并关闭 inbox（消费者因此退出），

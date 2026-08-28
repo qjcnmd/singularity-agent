@@ -58,6 +58,13 @@ impl AssistantItemEvents {
             AgentEvent::MessageUpdate { delta } => {
                 self.project_assistant_delta(sink, &delta);
             }
+            AgentEvent::Thinking { text } => {
+                sink.emit(TurnEvent::AssistantThinking {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    text,
+                });
+            }
             AgentEvent::ToolExecutionStarted {
                 tool_name,
                 tool_call_id,
