@@ -218,8 +218,12 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
+        self.exit_history_after_edit();
         let accepted = self.conversation.submit_follow_up(text.clone());
         self.note_injection("followUp", accepted, &text);
+        if accepted {
+            self.record_history(&text);
+        }
     }
 
     /// 向会话流注入一条「已注入/被拒」提示，文案与内容截断保持一致。

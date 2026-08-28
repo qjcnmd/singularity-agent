@@ -22,6 +22,7 @@
 mod app;
 mod commands;
 mod editor;
+mod history;
 mod modals;
 mod mouse;
 mod paste_burst;

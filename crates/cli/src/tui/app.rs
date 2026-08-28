@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::commands::Action;
 use super::editor::Editor;
+use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::mouse::{ClickTarget, WheelNormalizer};
 use super::paste_burst::{CharDecision, FlushResult, PasteBurst};
@@ -163,6 +164,13 @@ pub(crate) struct TuiApp {
     /// `SINGULARITY_DISABLE_PASTE_BURST` 关闭，避免瞬时注入整串被当作
     /// 粘贴（参照 codex 的 disable_paste_burst 逃生舱）。
     pub(super) paste_burst_enabled: bool,
+    /// 会话内历史（不持久化）：逐条记录提交文本，供 ↑/↓ 回溯。
+    history: InputHistory,
+    /// 进入回溯前暂存的草稿，退出回溯且未编辑时恢复。
+    history_draft: Option<String>,
+    /// 回溯期间是否发生过编辑（字符插入/删除/粘贴/Enter 等），用于决定
+    /// 退出时是否恢复草稿。
+    history_edited: bool,
 }
 
 impl TuiApp {
@@ -193,6 +201,9 @@ impl TuiApp {
             compaction: CompactionState::default(),
             paste_burst: PasteBurst::default(),
             paste_burst_enabled: std::env::var_os("SINGULARITY_DISABLE_PASTE_BURST").is_none(),
+            history: InputHistory::new(),
+            history_draft: None,
+            history_edited: false,
         }
     }
 
@@ -485,12 +496,32 @@ impl TuiApp {
                 }
                 return self.submit_input();
             }
-            KeyCode::Backspace => self.editor.backspace(),
-            KeyCode::Delete => self.editor.delete(),
+            KeyCode::Backspace => {
+                self.exit_history_after_edit();
+                self.editor.backspace();
+            }
+            KeyCode::Delete => {
+                self.exit_history_after_edit();
+                self.editor.delete();
+            }
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right => self.editor.move_right(),
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => {
+                // 历史回溯消歧：Idle 且光标在可视首行起始时 ↑ 进入回溯，
+                // 否则 move_up（多行编辑不受影响）；回溯中 ↑ 上一条。
+                if self.handle_history_up() {
+                    return Action::Continue;
+                }
+                self.editor.move_up();
+            }
+            KeyCode::Down => {
+                // 回溯中 ↓ 下一条；已到最新时退出回溯并恢复草稿，否则
+                // 交还普通 move_down。
+                if self.handle_history_down() {
+                    return Action::Continue;
+                }
+                self.editor.move_down();
+            }
             KeyCode::Home => self.editor.move_home(),
             KeyCode::End if !self.scroll.is_following() => {
                 let (total, viewport) = self.flow_metrics();
@@ -498,6 +529,7 @@ impl TuiApp {
             }
             KeyCode::End => self.editor.move_end(),
             KeyCode::Char(ch) if !ctrl && !alt => {
+                self.exit_history_after_edit();
                 let now = std::time::Instant::now();
                 self.handle_plain_char(ch, now);
             }
@@ -562,6 +594,7 @@ impl TuiApp {
     /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一 + 字节上限整字符
     /// 截断，然后整段插入编辑器。超限在提示行警告。
     pub fn handle_paste(&mut self, text: String) {
+        self.exit_history_after_edit();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let (accepted, truncated) = truncate_utf8_chars(&text, MAX_PASTE_BYTES);
         if truncated {
@@ -588,6 +621,70 @@ impl TuiApp {
         }
     }
 
+    // -- 输入历史回溯 ---------------------------------------------------------
+
+    /// ↑ 处理：回溯中上一条；Idle 且光标在首行起始时进入回溯；否则
+    /// 返回 false 由调用方执行 move_up。
+    fn handle_history_up(&mut self) -> bool {
+        if self.history.is_navigating() {
+            if let Some(text) = self.history.up() {
+                self.editor.set_text(text);
+            }
+            return true;
+        }
+        // 消歧：仅 Idle 且光标在可视首行起始时 ↑ 进入回溯。
+        if self.phase == Phase::Idle
+            && self.editor.row() == 0
+            && self.editor.col() == 0
+            && !self.history.is_empty()
+        {
+            self.history_draft = Some(self.editor.text());
+            self.history_edited = false;
+            if let Some(text) = self.history.enter(self.editor.text()) {
+                self.editor.set_text(text);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// ↓ 处理：回溯中下一条，到最新后退出回溯并恢复草稿；否则返回
+    /// false 由调用方执行 move_down。
+    fn handle_history_down(&mut self) -> bool {
+        if !self.history.is_navigating() {
+            return false;
+        }
+        if let Some(text) = self.history.down() {
+            self.editor.set_text(text);
+            return true;
+        }
+        // 已到最新并退出回溯。
+        if !self.history_edited
+            && let Some(draft) = self.history.take_draft()
+        {
+            self.editor.set_text(&draft);
+        }
+        self.history_draft = None;
+        true
+    }
+
+    /// 回溯中发生编辑（插入/删除/粘贴/Enter 提交）：退出回溯，保留
+    /// 当前内容（草稿丢弃）。
+    pub(super) fn exit_history_after_edit(&mut self) {
+        if self.history.is_navigating() {
+            self.history.exit_keeping();
+            self.history_draft = None;
+            self.history_edited = true;
+        }
+    }
+
+    /// 记录一条提交到历史，复位回溯指针与草稿。
+    pub(super) fn record_history(&mut self, text: &str) {
+        self.history.record(text);
+        self.history_draft = None;
+        self.history_edited = false;
+    }
+
     fn submit_input(&mut self) -> Action {
         // 压缩持有一致性写窗口：完成前不接受新输入（否则误报
         // TurnAlreadyActive 一类晦涩错误）；Esc 可取消。检查必须在
@@ -602,11 +699,14 @@ impl TuiApp {
         // 提交即取走全部输入：未落地的 burst 缓冲一并清空，避免残留进入
         // 下一次编辑会话。
         self.paste_burst.clear_after_explicit_paste();
+        self.exit_history_after_edit();
         let raw = self.editor.take();
         let text = raw.trim().to_string();
         if text.is_empty() {
             return Action::Continue;
         }
+        // 提交即进入历史（含命令与 steer/followUp 路径），指针复位。
+        self.record_history(&text);
         if text.starts_with('/') {
             return self.execute_command(&text);
         }

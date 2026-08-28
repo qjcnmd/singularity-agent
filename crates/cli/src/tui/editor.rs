@@ -36,6 +36,24 @@ impl Editor {
         self.lines.join("\n")
     }
 
+    /// 当前光标行（0 起）。
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// 当前光标列（0 起，字符单位）。
+    pub fn col(&self) -> usize {
+        self.col
+    }
+
+    /// 整体替换编辑器内容，光标置于末尾。
+    pub fn set_text(&mut self, text: &str) {
+        self.clear();
+        if !text.is_empty() {
+            self.insert_str(text);
+        }
+    }
+
     /// 逐行只读访问（渲染用）。
     pub fn lines(&self) -> impl Iterator<Item = &str> {
         self.lines.iter().map(String::as_str)
