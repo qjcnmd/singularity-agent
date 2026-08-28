@@ -43,6 +43,11 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 
 ### 代码导航
 
+- **符号优先**：查定义、调用方、实现、影响面时，第一个动作是 Serena 符号工具；`grep` 与整文件 `read` 用于确认它定位到的目标。
+  - 文件里有哪些对象 → `get_symbols_overview`；定义在哪 / 需要符号正文 → `find_symbol`（`include_body=True` 才拉实现）
+  - 谁调用它 / 改动波及哪些调用点 → `find_referencing_symbols`（影响面结论以它的引用集合为准，不是关键词命中数）
+  - trait 或接口有哪些实现 → `find_implementations`；还不知道符号名、或要查字符串字面量 → `search_for_pattern`
+  - 重命名 / 删除符号 → `rename_symbol` / `safe_delete_symbol`（跨文件引用由工具更新或返回引用清单）
 - 理解仓库结构、查找定义、引用、实现和影响面时，优先使用已配置的 Serena LSP 符号工具（如 `get_symbols_overview`、`find_symbol`、`find_referencing_symbols`）缩小范围；关键事实仍必须以当前源码、`rg`、Git 和可复现运行验证。
 - Serena 的符号缓存只用于导航，不是事实源。首次使用、缓存缺失或大规模结构变更后运行 `serena project index` 刷新缓存；活动会话中的语言服务器直接跟踪当前文件变化，无需在每次提交后重复建立完整索引。
 
