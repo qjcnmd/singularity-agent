@@ -693,3 +693,82 @@ fn verify_session_id_matches_or_rejects_header() {
     assert!(matches!(error, SessionError::InvalidHeader(_)));
     assert!(error.to_string().contains("other-id"));
 }
+#[test]
+fn access_open_repair_write_repairs_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let session_id = manager.session_id().to_string();
+    manager
+        .append_metadata(SessionMetadata::turn_started("turn_1"))
+        .unwrap();
+    let file = manager.path().to_path_buf();
+    drop(manager);
+
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
+    let opened = SessionManager::open_existing_with_access(
+        &file,
+        &coordinator,
+        &session_id,
+        SessionAccess::RepairWrite,
+    )
+    .unwrap();
+    drop(opened);
+
+    let reopened = SessionManager::open_existing_read_only(&file).unwrap();
+    let interrupted = reopened
+        .metadata_entries()
+        .into_iter()
+        .find(|entry| {
+            entry.kind() == SessionMetadataKind::TurnTerminal
+                && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
+        })
+        .expect("RepairWrite open appended synthetic interrupted terminal");
+    assert_eq!(interrupted.turn_id(), Some("turn_1"));
+}
+
+#[test]
+fn access_open_append_keeps_interrupted_turn_and_appends_under_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let session_id = manager.session_id().to_string();
+    manager
+        .append_metadata(SessionMetadata::turn_started("turn_1"))
+        .unwrap();
+    let file = manager.path().to_path_buf();
+    drop(manager);
+
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
+    let mut opened = SessionManager::open_existing_with_access(
+        &file,
+        &coordinator,
+        &session_id,
+        SessionAccess::Append,
+    )
+    .unwrap();
+    assert!(
+        opened
+            .metadata_entries()
+            .into_iter()
+            .all(|entry| entry.terminal_status() != Some(TurnTerminalStatus::Interrupted)),
+        "Append intent must not repair interrupted turns"
+    );
+    opened
+        .append_metadata(SessionMetadata::thread_name("renamed"))
+        .unwrap();
+}
+
+#[test]
+fn access_open_verifies_header_id_for_both_intents() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let file = manager.path().to_path_buf();
+    drop(manager);
+
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
+    for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
+        let error =
+            SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
+                .expect_err("header id mismatch must fail closed for both intents");
+        assert!(matches!(error, SessionError::InvalidHeader(_)));
+    }
+}

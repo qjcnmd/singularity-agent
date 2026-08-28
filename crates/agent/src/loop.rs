@@ -238,8 +238,9 @@ impl Agent {
         Arc::clone(&self.inbox)
     }
 
-    /// 回收本轮持有的会话写者；一轮 turn 只打开一次会话文件，终态落盘必须
-    /// 复用这里返回的同一 `SessionManager`，而不是再次全量打开。
+    /// 移交本轮持有的会话写者。一轮 turn 只打开一次会话文件，终态落盘
+    /// 必须复用这里返回的同一 `SessionManager`：再次全量打开会被写者锁
+    /// 拒绝（WriterConflict）。
     pub fn into_session(self) -> SessionManager {
         self.session
     }
