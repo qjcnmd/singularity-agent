@@ -162,11 +162,10 @@ pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
     Ok(threads)
 }
 
-/// 只读投影一个 Thread；不执行崩溃修复或写入。
-pub fn read_thread_summary(
+fn open_thread_read_only(
     sessions_dir: &Path,
     thread_id: &str,
-) -> Result<ThreadSummary, ResumeError> {
+) -> Result<SessionManager, ResumeError> {
     let path = session_file(sessions_dir, thread_id);
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
@@ -176,6 +175,15 @@ pub fn read_thread_summary(
     session
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
+    Ok(session)
+}
+
+/// 只读投影一个 Thread；不执行崩溃修复或写入。
+pub fn read_thread_summary(
+    sessions_dir: &Path,
+    thread_id: &str,
+) -> Result<ThreadSummary, ResumeError> {
+    let session = open_thread_read_only(sessions_dir, thread_id)?;
     Ok(thread_summary(&session))
 }
 
@@ -267,15 +275,7 @@ pub fn paged_read(
     limit: usize,
     before_item: Option<&str>,
 ) -> Result<ThreadReadPage, ResumeError> {
-    let path = session_file(sessions_dir, thread_id);
-    if !path.exists() {
-        return Err(ResumeError::NotFound(thread_id.to_string()));
-    }
-    let session = SessionManager::open_existing_read_only(&path)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
-    session
-        .verify_session_id(thread_id)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let session = open_thread_read_only(sessions_dir, thread_id)?;
     let entries = session.entries();
     let summary = thread_summary(&session);
     let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
