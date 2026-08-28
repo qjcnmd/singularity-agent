@@ -52,10 +52,6 @@ struct Cli {
     #[arg(long)]
     session: Option<String>,
 
-    /// 续接最近一次会话（与 --session/--no-session 互斥）。
-    #[arg(long = "continue", conflicts_with_all = ["session", "no_session"])]
-    continue_session: bool,
-
     /// 本次执行禁用持久化。
     #[arg(long, conflicts_with = "session")]
     no_session: bool,
@@ -105,12 +101,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             eprintln!("sg: {message}");
             return Ok(2);
         }
-        let setup = session_options::prepare(
-            cli.model.as_deref(),
-            cli.session.as_deref(),
-            cli.no_session,
-            cli.continue_session,
-        )?;
+        let setup =
+            session_options::prepare(cli.model.as_deref(), cli.session.as_deref(), cli.no_session)?;
         return Ok(tui::run(setup.conversation).exit_code);
     };
 
@@ -139,7 +131,6 @@ fn run(cli: Cli) -> Result<i32, String> {
         cli.model.as_deref(),
         cli.session.as_deref(),
         cli.no_session,
-        cli.continue_session,
     ) {
         Ok(setup) => setup,
         Err(error) => {

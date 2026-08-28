@@ -131,39 +131,6 @@ pub fn resume_thread(
     Ok(thread)
 }
 
-/// 按 `--session <arg>` 解析 thread_id：精确匹配优先，其次前缀唯一匹配。
-/// 歧义或未找到返回描述性错误。在既有 `list_threads` 扫描上工作，不建
-/// 平行扫描逻辑（参照 pi 的 `findLocalSessionByExactId` 精确 → 前缀模式）。
-pub fn resolve_session_id(sessions_dir: &Path, session_arg: &str) -> Result<String, String> {
-    // 精确匹配：文件存在即确认。
-    if session_file(sessions_dir, session_arg).exists() {
-        return Ok(session_arg.to_string());
-    }
-    // 前缀匹配：扫描列表（已按 updated_at 降序 + thread_id 升序稳定）。
-    let threads = list_threads(sessions_dir)?;
-    let matches: Vec<&ThreadSummary> = threads
-        .iter()
-        .filter(|t| t.thread_id.starts_with(session_arg))
-        .collect();
-    match matches.len() {
-        0 => Err(format!("thread {session_arg} was not found")),
-        1 => Ok(matches[0].thread_id.clone()),
-        _ => {
-            let candidates: Vec<&str> = matches.iter().map(|t| t.thread_id.as_str()).collect();
-            Err(format!(
-                "session id '{session_arg}' is ambiguous; candidates:\n  {}",
-                candidates.join("\n  ")
-            ))
-        }
-    }
-}
-
-/// 取最近会话（`--continue`）：`list_threads` 首条，已按 updated_at 降序。
-pub fn most_recent_session_id(sessions_dir: &Path) -> Result<Option<String>, String> {
-    let threads = list_threads(sessions_dir)?;
-    Ok(threads.into_iter().next().map(|t| t.thread_id))
-}
-
 /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
 pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
     if !sessions_dir.exists() {
@@ -558,81 +525,5 @@ mod tests {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn resolve_session_id_prefers_exact_then_unique_prefix() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().to_path_buf();
-        let exact = "01914f6b-0000-7000-8000-000000000aaa";
-        let prefixed = "01914f6b-0000-7000-8000-000000000bbb";
-        write_session(&sessions_dir, exact, "2026-08-20T00:00:00.000Z");
-        write_session(&sessions_dir, prefixed, "2026-08-21T00:00:00.000Z");
-        // 精确 id 优先。
-        assert_eq!(
-            resolve_session_id(&sessions_dir, exact).expect("exact match"),
-            exact
-        );
-        // 前缀唯一匹配：aa 只匹配 aaa。
-        assert_eq!(
-            resolve_session_id(&sessions_dir, "01914f6b-0000-7000-8000-000000000aa")
-                .expect("unique prefix"),
-            exact,
-            "前缀应解析到唯一候选"
-        );
-    }
-
-    #[test]
-    fn resolve_session_id_ambiguous_lists_candidates() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().to_path_buf();
-        let a = "01914f6b-0000-7000-8000-000000000aaa";
-        let b = "01914f6b-0000-7000-8000-000000000bbb";
-        write_session(&sessions_dir, a, "2026-08-20T00:00:00.000Z");
-        write_session(&sessions_dir, b, "2026-08-21T00:00:00.000Z");
-        let error = resolve_session_id(&sessions_dir, "01914f6b-0000-7000-8000-0")
-            .expect_err("ambiguous prefix");
-        assert!(error.contains("ambiguous"), "error: {error}");
-        assert!(
-            error.contains(a),
-            "error must name first candidate: {error}"
-        );
-        assert!(
-            error.contains(b),
-            "error must name second candidate: {error}"
-        );
-    }
-
-    #[test]
-    fn resolve_session_id_no_match_reports_not_found() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().to_path_buf();
-        write_session(
-            &sessions_dir,
-            "01914f6b-0000-7000-8000-000000000001",
-            "2026-08-20T00:00:00.000Z",
-        );
-        let error = resolve_session_id(&sessions_dir, "01914f6b-dead").expect_err("no match");
-        assert!(error.contains("was not found"), "error: {error}");
-    }
-
-    #[test]
-    fn most_recent_session_id_picks_newest_or_none_when_empty() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().to_path_buf();
-        // 空目录：无会话可续。
-        assert_eq!(
-            most_recent_session_id(&sessions_dir).expect("empty list"),
-            None
-        );
-        let older = "01914f6b-0000-7000-8000-000000000001";
-        let newer = "01914f6b-0000-7000-8000-000000000002";
-        write_session(&sessions_dir, older, "2026-08-20T00:00:00.000Z");
-        write_session(&sessions_dir, newer, "2026-08-21T00:00:00.000Z");
-        assert_eq!(
-            most_recent_session_id(&sessions_dir).expect("recent session"),
-            Some(newer.to_string()),
-            "--continue 应取 updated_at 最新的会话"
-        );
     }
 }
