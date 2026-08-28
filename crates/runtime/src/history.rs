@@ -160,8 +160,9 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                             .to_string();
                         last.items.push(HistoryItem::Usage {
                             id,
+                            // 不变量：SessionTurnUsage 为本仓静态类型，序列化恒不失败。
+                            #[allow(clippy::expect_used)]
                             usage: serde_json::to_value(usage)
-                                // 不变量：SessionTurnUsage 为本仓静态类型，序列化恒不失败。
                                 .expect("SessionTurnUsage serializes"),
                         });
                     } else {
