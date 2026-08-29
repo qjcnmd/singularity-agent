@@ -5,7 +5,6 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = ["RUSTSEC-2017-0008"]
 unused-ignored-advisory = "deny"
 
 [bans]
