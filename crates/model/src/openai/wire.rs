@@ -31,3 +31,30 @@ pub(crate) struct OpenAiCompletion {
     pub(crate) response: ModelTurnResponse,
     pub(crate) reasoning_content_present: bool,
 }
+
+/// replay 与请求绑定的公共包络：provider/model 归属、请求时实际 selection
+/// 的 reasoning 变体（provider 不回显 effort 时保持 None，不伪造禁用变体），
+/// 以及全部工具调用 id（replay 的归属键）。
+pub(crate) struct ReplayBinding {
+    pub(crate) provider_name: String,
+    pub(crate) model_name: String,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tool_call_ids: Vec<String>,
+}
+
+pub(crate) fn replay_binding(
+    config: &crate::OpenAiProviderConfig,
+    model_name: &str,
+    reasoning_effort: Option<&str>,
+    tool_calls: &[crate::ModelToolCall],
+) -> ReplayBinding {
+    ReplayBinding {
+        provider_name: config.provider_name.clone(),
+        model_name: model_name.to_string(),
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        tool_call_ids: tool_calls
+            .iter()
+            .map(|call| call.tool_call_id.clone())
+            .collect(),
+    }
+}

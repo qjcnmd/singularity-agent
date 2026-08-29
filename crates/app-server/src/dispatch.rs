@@ -1,6 +1,7 @@
 //! JSON-RPC 注册表校验与请求分发处理器。
 
 use super::*;
+use crate::state::registry_lock_poisoned;
 
 pub(super) fn json_response<T: serde::Serialize>(
     id: JsonRpcId,
@@ -156,7 +157,7 @@ impl AppServer {
             Method::SessionDelete => self.session_delete(message),
             Method::ThreadSettings => self.thread_settings(message),
             Method::TurnStart => Err(AppServerError::InvalidParams(
-                "turn/start must be claimed via the turn lane".to_string(),
+                "turn/start must be claimed by the dispatch loop".to_string(),
             )),
             Method::TurnSteer => self.turn_steer(message),
             Method::TurnFollowUp => self.turn_follow_up(message),
@@ -195,6 +196,7 @@ impl AppServer {
 
     pub(super) fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let threads = self
+            .core
             .thread_catalog
             .list_threads()
             .map_err(AppServerError::Store)?
@@ -215,7 +217,11 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: ThreadSettingsParams = parse_params(&message)?;
-        let record = match self.thread_catalog.read_thread_summary(&params.thread_id) {
+        let record = match self
+            .core
+            .thread_catalog
+            .read_thread_summary(&params.thread_id)
+        {
             Ok(record) => record,
             Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
@@ -232,10 +238,11 @@ impl AppServer {
                 }
             },
         };
-        // queue_settings 在提交点完成校验、组合与持久化，返回合并后的完整
-        // selector。客户端只做投影，不反推 provider/model/reasoning。
+        // update_settings 在提交点完成校验、组合与内存投影更新，返回合并后的
+        // 完整 selector；落盘由下一 turn 开始时记录。客户端只做投影，不反推
+        // provider/model/reasoning。
         let conversation = self.conversation_for(&record.thread_id)?;
-        let result = match conversation.queue_settings(patch) {
+        let result = match conversation.update_settings(patch) {
             Ok(result) => result,
             Err(error) => {
                 let message = match error {
@@ -257,8 +264,6 @@ impl AppServer {
                 model: parts.model.map(str::to_string),
                 reasoning: parts.effort.map(str::to_string),
                 updated: result.timing != singularity_runtime::SettingsApplyTiming::NothingToApply,
-                queued: result.timing
-                    == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn,
             },
         )
     }
@@ -277,9 +282,9 @@ impl AppServer {
         }
         let model = match params.model.as_deref() {
             Some(model) => Some(model.to_string()),
-            None => self.turn_runner.default_model_selector(),
+            None => self.core.turn_runner.default_model_selector(),
         };
-        let thread = match self.thread_catalog.create_thread(&cwd, model.clone()) {
+        let thread = match self.core.thread_catalog.create_thread(&cwd, model.clone()) {
             Ok(thread) => thread,
             Err(error) => return Err(AppServerError::Store(error)),
         };
@@ -309,7 +314,7 @@ impl AppServer {
         }
         // 单次只读解析完成摘要 + 分页条目 + 状态/用量投影；分页与锚点定位
         // 全部在 runtime 目录接缝，这里只做 live-turn 精化与 wire 组装。
-        let page = match self.thread_catalog.paged_read(
+        let page = match self.core.thread_catalog.paged_read(
             &params.session_id,
             params.limit as usize,
             params.before_item.as_deref(),
@@ -367,7 +372,11 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let params: SessionIdParams = parse_params(&message)?;
-        let record = match self.thread_catalog.read_thread_summary(&params.session_id) {
+        let record = match self
+            .core
+            .thread_catalog
+            .read_thread_summary(&params.session_id)
+        {
             Ok(record) => record,
             Err(error) => return map_store_error(message.required_id(), error, |_| None),
         };
@@ -378,7 +387,7 @@ impl AppServer {
         }
         // 持锁完成归档（rename 进 archived/）：写者锁在会话归档后随实例释放，
         // 跨进程写者不会在归档窗口内开始 append。
-        if let Err(error) = self.thread_catalog.archive(&record.thread_id) {
+        if let Err(error) = self.core.thread_catalog.archive(&record.thread_id) {
             return map_store_error(message.required_id(), error, |other| match other {
                 singularity_runtime::ResumeError::WriterActive => Some(invalid_state_response(
                     message.required_id(),
@@ -431,13 +440,6 @@ impl AppServer {
             ));
         }
         let params: TurnStartParams = parse_params(&message)?;
-        if !singularity_runtime::thread_session_path(&self.sessions_dir, &params.thread_id)
-            .is_file()
-        {
-            return Ok(TurnClaim::Responded(
-                not_found_response(message.required_id(), THREAD_NOT_FOUND)?.remove(0),
-            ));
-        }
         let conversation = self.conversation_for(&params.thread_id)?;
         let input_text = match input_items_to_text(&params.input) {
             Ok(text) => text,
@@ -535,7 +537,10 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
-        json_response(message.required_id(), self.turn_runner.provider_status())
+        json_response(
+            message.required_id(),
+            self.core.turn_runner.provider_status(),
+        )
     }
 
     pub(crate) fn server_shutdown(
@@ -550,21 +555,96 @@ impl AppServer {
         )
     }
 
-    pub(crate) fn turn_interrupt(
-        &mut self,
-        message: JsonRpcMessage,
-    ) -> AppServerResult<Vec<Value>> {
-        self.control_handle().turn_interrupt(message)
+    pub(crate) fn turn_interrupt(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = parse_params(&message)?;
+        if !self.interrupt_turn(&params.turn_id)? {
+            return not_found_response(message.required_id(), TURN_NOT_FOUND);
+        }
+        Ok(vec![
+            JsonRpcMessage::response(
+                message.required_id(),
+                serde_json::to_value(TurnInterruptResult {
+                    turn_id: params.turn_id,
+                    status: TurnStatus::Interrupted,
+                })?,
+            )
+            .to_wire_value(),
+        ])
     }
 
-    pub(crate) fn turn_steer(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        self.control_handle().turn_steer(message)
+    pub(crate) fn turn_steer(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, false)
     }
 
-    pub(crate) fn turn_follow_up(
-        &mut self,
+    pub(crate) fn turn_follow_up(&self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        self.inject_turn_input(message, true)
+    }
+
+    /// 把 steer/followUp 注入按 turn id 定位到的活动协调器；turn 已关闭
+    /// 注入窗口时拒绝。
+    fn inject_turn_input(
+        &self,
         message: JsonRpcMessage,
+        follow_up: bool,
     ) -> AppServerResult<Vec<Value>> {
-        self.control_handle().turn_follow_up(message)
+        let params: TurnInjectionParams = parse_params(&message)?;
+        let text = input_items_to_text(&params.input)?;
+        let conversation = self
+            .core
+            .conversations
+            .lock()
+            .map_err(registry_lock_poisoned)?
+            .values()
+            .find(|conversation| {
+                conversation.active_turn_id().as_deref() == Some(params.turn_id.as_str())
+            })
+            .cloned();
+        let Some(conversation) = conversation else {
+            return not_found_response(message.required_id(), TURN_NOT_FOUND);
+        };
+        let thread_id = conversation
+            .thread()
+            .map_err(|error| {
+                AppServerError::Workspace(format!("conversation thread unavailable: {error}"))
+            })?
+            .thread_id;
+        let accepted = if follow_up {
+            conversation.submit_follow_up(text)
+        } else {
+            conversation.steer(text)
+        };
+        if !accepted {
+            return invalid_state_response(
+                message.required_id(),
+                "turn is no longer accepting input",
+            );
+        }
+        json_response(
+            message.required_id(),
+            TurnInjectionResult {
+                turn: Turn {
+                    turn_id: params.turn_id,
+                    thread_id,
+                    status: TurnStatus::Running,
+                    usage: None,
+                },
+            },
+        )
+    }
+
+    fn interrupt_turn(&self, turn_id: &str) -> AppServerResult<bool> {
+        let conversation = self
+            .core
+            .conversations
+            .lock()
+            .map_err(registry_lock_poisoned)?
+            .values()
+            .find(|conversation| conversation.active_turn_id().as_deref() == Some(turn_id))
+            .cloned();
+        let Some(conversation) = conversation else {
+            return Ok(false);
+        };
+        conversation.interrupt();
+        Ok(true)
     }
 }

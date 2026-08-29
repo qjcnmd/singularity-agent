@@ -145,19 +145,7 @@ fn configured_model_from_user_file(
     });
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
-    let reasoning_variants = model_file
-        .reasoning_variants
-        .iter()
-        .map(|(variant, descriptor)| {
-            (
-                variant.clone(),
-                ReasoningVariant {
-                    enabled: descriptor.enabled,
-                    wire_effort: descriptor.wire_effort.clone(),
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let reasoning_variants = model_file.reasoning_variants.clone();
     validate_reasoning_variants(
         protocol,
         &reasoning_variants,

@@ -21,7 +21,6 @@ pub enum ModelStopReason {
 #[serde(rename_all = "snake_case")]
 pub enum ModelTurnStatus {
     Success,
-    Failed,
     Invalid,
 }
 

@@ -74,22 +74,11 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
-    /// 按 provider 声明的输出上限钳制并校验 compaction 配置：默认 summary
-    /// 预算可被更小的 provider 上限安全下调，显式非默认预算保持 fail-closed。
-    /// turn 启动前的准备阶段与 `Agent::new` 必须共用这一个入口，使「准备阶段
-    /// 已校验」与「Agent 构造不再失败」成为同一事实而不是两份手工同步的逻辑。
-    pub fn prepare_for_provider_limits(
-        mut config: Self,
-        provider_max_output_tokens: u32,
-    ) -> Result<Self> {
-        if config.compaction == CompactionConfig::default()
-            && provider_max_output_tokens < config.compaction.summary_max_tokens
-        {
-            config.compaction.summary_max_tokens = provider_max_output_tokens;
-        }
-        config
-            .compaction
-            .validate(config.context_window, provider_max_output_tokens)?;
+    /// 按 provider 声明的输出上限校验 compaction 配置；turn 启动前的准备阶段
+    /// 与 `Agent::new` 必须共用这一个入口，使「准备阶段已校验」与「Agent 构造
+    /// 不再失败」成为同一事实而不是两份手工同步的逻辑。
+    pub fn prepare_for_provider_limits(config: Self) -> Result<Self> {
+        config.compaction.validate(config.context_window)?;
         Ok(config)
     }
 }
@@ -181,9 +170,6 @@ pub struct Agent {
     registry: ToolRegistry,
     provider: Arc<dyn Provider + Send + Sync>,
     config: AgentConfig,
-    /// 工具 schema 的序列化串：注册表与 provider 契约在 Agent 生命周期内
-    /// 不变，构造时序列化一次供逐请求的 Token 估算复用。
-    tools_json: String,
     /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
@@ -200,37 +186,22 @@ impl Agent {
         config: AgentConfig,
         session: SessionManager,
     ) -> Result<Self> {
-        let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
-        let config = AgentConfig::prepare_for_provider_limits(config, provider_max_output_tokens)?;
-        // 摘要请求复用 provider/model 选择，但使用独立的摘要输出上限；
-        // 正常 turn 的 max_output_tokens 不应把 8192-token 摘要压缩成 1 token。
+        let config = AgentConfig::prepare_for_provider_limits(config)?;
+        // 摘要请求复用 provider/model 选择；输出上限由引擎按默认摘要预算与
+        // provider 上限自行收敛，不与正常 turn 的输出预算共用通道。
         let mut compaction_preferences = ModelPreferences::default();
         if !config.model.is_empty() {
             compaction_preferences.model_name = Some(config.model.clone());
         }
-        compaction_preferences.max_output_tokens = Some(effective_max_output_tokens(
-            provider.as_ref(),
-            config.compaction.summary_max_tokens as u64,
-        ));
         let compaction = CompactionEngine::new(Arc::clone(&provider))
             .with_model_preferences(compaction_preferences)
-            .with_summary_max_tokens(config.compaction.summary_max_tokens)
             .with_retry(config.retry);
-        // 不变量：tool_schemas_from 返回本仓静态类型 Vec<ModelToolSchema>，
-        // serde 序列化仅在其类型定义错误时失败。
-        #[allow(clippy::expect_used)]
-        let tools_json = serde_json::to_string(&Self::tool_schemas_from(
-            &registry,
-            &provider.protocol_contract(),
-        ))
-        .expect("tool schemas serialize");
         Ok(Self {
             session,
             compaction,
             registry,
             provider,
             config,
-            tools_json,
             inbox,
             ledger: ContextLedger::new(),
         })
@@ -292,7 +263,6 @@ impl Agent {
             // 单条 assistant 消息允许的工具调用数上限；本地按模型给定顺序
             // 串行执行全部调用，wire 侧 parallel_tool_calls 恒为 false。
             max_tool_calls: DEFAULT_MAX_TOOLS_PER_REQUEST,
-            strict_tool_schema: false,
         };
         let mut spec = TurnRequestSpec {
             preferences,
@@ -436,12 +406,9 @@ impl Agent {
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     ///
     /// 与自动压缩共用同一固定保留预算；溢出恢复只保证安全切点（toolResult
-    /// 永不切），保留预算内的最近上下文照常保留。
-    fn force_compact(
-        &mut self,
-        cancellation: &CancellationToken,
-        events: &mut AgentEvents,
-    ) -> Result<CompactionOutcome> {
+    /// 永不切），保留预算内的最近上下文照常保留。失败经溢出恢复路径以
+    /// `context_overflow_recovery_failed` 诊断收敛，此处不重复发诊断。
+    fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
         let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let tokens_before = self
@@ -459,19 +426,7 @@ impl Agent {
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
             }
-            Err(crate::compaction::CompactionError::Aborted) => Err(AgentError::Compaction(
-                crate::compaction::CompactionError::Aborted,
-            )),
-            Err(error) => {
-                emit_diagnostic(
-                    events,
-                    AgentDiagnostic::warning(
-                        diagnostic_code::COMPACTION_FAILED,
-                        "forced context compaction failed".to_string(),
-                    ),
-                );
-                Err(AgentError::Compaction(error))
-            }
+            Err(error) => Err(AgentError::Compaction(error)),
         }
     }
 
@@ -492,14 +447,10 @@ impl Agent {
         Ok(result)
     }
 
-    /// 以正常请求同一装配 seam 重建当前上下文并估算规模：压缩前记录的
-    /// tokens_before 必须反映完整装配（消息、工具 schema、reasoning replay、
-    /// 输出预算与固定余量），而非退化占位。
+    /// 以正常请求同一装配 seam 重建当前上下文的内容计量：压缩前记录的
+    /// tokens_before 反映上下文条目的估算规模（对齐 pi，只合计消息）。
     fn assembled_context_estimate(&self) -> Result<u64> {
-        let (messages, replays) = self.assemble_messages()?;
-        let max_output_tokens =
-            effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
-        Ok(self.estimate_assembled(&messages, &replays, max_output_tokens))
+        Ok(self.assemble_messages()?.token_estimate)
     }
 
     /// 单个轮步：先经 `prepare_request` 装配请求（含发送前主动压缩），再交给
@@ -533,7 +484,7 @@ impl Agent {
                             return AttemptOutcome::Failed(error);
                         }
                         overflow_retried = true;
-                        let forced = match self.force_compact(cancellation, events) {
+                        let forced = match self.force_compact(cancellation) {
                             Ok(result) => result,
                             Err(AgentError::Compaction(
                                 crate::compaction::CompactionError::Aborted,

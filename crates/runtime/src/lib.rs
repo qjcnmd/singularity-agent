@@ -32,7 +32,7 @@ mod terminal;
 
 pub use conversation::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
-    TurnControls, TurnReservation, compose_merged_selector,
+    TurnControls, TurnReservation,
 };
 pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 pub use events::{TurnEvent, TurnEventSink};
@@ -46,6 +46,7 @@ pub use singularity_core::{
 pub use singularity_model::{
     ModelSelectorParts, Provider, ProviderConfigSnapshot, split_model_selector,
 };
+pub use singularity_protocol::{HistoryItem, ThreadTurn};
 pub use store::{
     ResumeError, SESSIONS_DIR_NAME, ThreadReadPage, ThreadSummary, canonical_thread_cwd,
     prepare_session_dirs, thread_session_path,

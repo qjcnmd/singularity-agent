@@ -1,6 +1,6 @@
 //! 协调器的并发安全护栏：panic 与锁中毒路径的窗口释放、单写者锁冲突、
-//! 预订窗口的回收。turn 链行为（lifecycle 事件、steer/followUp、设置生效
-//! 时序）的行为回归由评估器与真实使用兜底，不在此重复。
+//! 预订窗口的回收、写者锁占用下设置提交仍被接受。turn 链行为（lifecycle
+//! 事件、steer/followUp）的行为回归由评估器与真实使用兜底，不在此重复。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::path::Path;
@@ -12,7 +12,9 @@ use crate::runner::TurnRunner;
 use crate::store::{ThreadLockCoordinator, create_thread, resume_thread};
 use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
-use singularity_agent::session::{SessionManager, SessionMetadataKind, WriterLockCoordinator};
+use singularity_agent::session::{
+    SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
+};
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, Provider, ProviderError, ProviderProtocolContract,
 };
@@ -29,8 +31,9 @@ fn coordinator(sessions: &Path) -> ThreadLockCoordinator {
 }
 
 fn snapshot() -> singularity_model::ProviderConfigSnapshot {
-    // 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible/base-model，
-    // auth.json 提供测试 key。fake provider 经 provider_override 注入，不经 HTTP；
+    // 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible 的
+    // base-model 与 base-model-2，auth.json 提供测试 key。fake provider 经
+    // provider_override 注入，不经 HTTP；
     // Handle 背后的 runtime 无需存活。
     static FIXTURE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let home = FIXTURE.get_or_init(|| {
@@ -45,6 +48,11 @@ fn snapshot() -> singularity_model::ProviderConfigSnapshot {
                     "base_url": "http://127.0.0.1:9/v1",
                     "models": {
                         "base-model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 128_000,
+                            "max_output_tokens": 4_096
+                        },
+                        "base-model-2": {
                             "api_protocol": "chat",
                             "max_context_tokens": 128_000,
                             "max_output_tokens": 4_096
@@ -136,6 +144,37 @@ impl Provider for RecordingProvider {
     }
 }
 
+/// 首次请求时发出 started 信号并阻塞，直到测试放行：把断言精确锚定在
+/// 「turn 已在执行、写者锁已被占用」的时刻。后续请求直接放行（测试的
+/// 第二轮在主线程断言完成后运行）。
+struct GateProvider {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Provider for GateProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.started.send(()).expect("test is still waiting");
+        if let Some(release) = self.release.lock().expect("gate").take() {
+            release.recv().expect("test releases the gate");
+        }
+        Ok(ModelTurnResponse::completed(
+            request.request_id.clone(),
+            "resp-gate",
+            "done".to_string(),
+        ))
+    }
+}
+
 struct PanickingProvider;
 
 impl Provider for PanickingProvider {
@@ -153,12 +192,11 @@ impl Provider for PanickingProvider {
     }
 }
 
-/// 收集 turn/started 事件的完整 turn id 序列与 settingsApplied 投影。
+/// 收集 turn/started 事件的完整 turn id 序列。
 #[derive(Clone, Default)]
 struct EventCollector {
     methods: Arc<std::sync::Mutex<Vec<&'static str>>>,
     started_turn_ids: Arc<std::sync::Mutex<Vec<String>>>,
-    applied_threads: Arc<std::sync::Mutex<Vec<crate::Thread>>>,
 }
 
 impl EventCollector {
@@ -169,13 +207,6 @@ impl EventCollector {
                     .lock()
                     .expect("ids")
                     .push(turn.turn_id.clone());
-                self.methods.lock().expect("methods").push(event.method());
-            }
-            TurnEvent::ThreadSettingsApplied { thread } => {
-                self.applied_threads
-                    .lock()
-                    .expect("applied threads")
-                    .push(thread.clone());
                 self.methods.lock().expect("methods").push(event.method());
             }
             _ => self.methods.lock().expect("methods").push(event.method()),
@@ -208,6 +239,31 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
         .iter()
         .filter(|entry| entry.kind() == SessionMetadataKind::ThreadSettings)
         .count()
+}
+
+/// 最后一条 `thread_settings` 记录反推的 selector（与 resume 投影的
+/// last-wins 组合规则一致）。
+fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
+    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen")
+        .metadata_entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            SessionMetadata::ThreadSettings {
+                provider,
+                model,
+                reasoning,
+            } => Some(singularity_model::compose_model_selector(
+                provider
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME),
+                model,
+                reasoning.as_deref().filter(|value| !value.is_empty()),
+            )),
+            _ => None,
+        })
 }
 
 #[test]
@@ -276,24 +332,24 @@ fn reservation_holds_window_and_releases_on_drop() {
         "followUp is protected by the reserved chain window"
     );
     let timing = shared
-        .queue_settings(SettingsPatch {
+        .update_settings(SettingsPatch {
             provider: Some("openai_compatible".to_string()),
             ..SettingsPatch::default()
         })
-        .expect("queue settings during reservation");
-    assert_eq!(timing.timing, SettingsApplyTiming::QueuedForNextTurn);
+        .expect("apply settings during reservation");
+    assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
         Some("openai_compatible/base-model"),
-        "reserved settings must not change the current projection"
+        "commit point only updates the in-memory projection"
     );
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
         0,
-        "reserved settings must not persist before a trusted terminal"
+        "commit point writes nothing: recording happens at the next turn start"
     );
 
-    // 未消费的预订 drop 后窗口释放；已接受的 followUp 与设置意图保留，
+    // 未消费的预订 drop 后窗口释放；已接受的 followUp 保留，
     // 随后由下一条执行链按合同消费。
     drop(reservation);
     assert!(!shared.has_active_turn());
@@ -307,10 +363,75 @@ fn reservation_holds_window_and_releases_on_drop() {
             "now it runs".to_string()
         ]
     );
-    assert_eq!(thread_settings_count(&sessions, &thread_id), 1);
     assert_eq!(
-        shared.thread().unwrap().model.as_deref(),
-        Some("openai_compatible/base-model")
+        thread_settings_count(&sessions, &thread_id),
+        1,
+        "the turn recorded the effective selector at its start"
+    );
+}
+
+/// 运行中改设置走与空闲时同一条提交路径：写者锁被活动 turn 占用时提交点
+/// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录——
+/// 对齐 codex 的 turn 边界记录编排。
+#[test]
+fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(GateProvider {
+            started: started_tx,
+            release: std::sync::Mutex::new(Some(release_rx)),
+        }),
+        Some("openai_compatible/base-model"),
+    );
+    let thread_id = conversation.thread().unwrap().thread_id;
+
+    let mut sink = EventCollector::default().sink();
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || conversation.run_turn("first", &mut sink))
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("turn reaches the provider");
+
+    let timing = conversation
+        .update_settings(SettingsPatch {
+            model: Some("base-model-2".to_string()),
+            ..SettingsPatch::default()
+        })
+        .expect("mid-turn settings update is accepted");
+    assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
+    assert_eq!(
+        conversation.thread().unwrap().model.as_deref(),
+        Some("openai_compatible/base-model-2"),
+        "in-memory projection is updated while the turn holds the writer lock"
+    );
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        1,
+        "turn 1 start recorded the original selector; the commit point writes nothing"
+    );
+
+    release_tx.send(()).expect("gate release");
+    let outcome = worker.join().expect("turn thread").expect("turn ok");
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+
+    let mut sink = EventCollector::default().sink();
+    let outcome = conversation.run_turn("second", &mut sink).expect("runs");
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    assert_eq!(
+        thread_settings_count(&sessions, &thread_id),
+        2,
+        "turn 2 start recorded the changed selector"
+    );
+    assert_eq!(
+        last_recorded_selector(&sessions, &thread_id).as_deref(),
+        Some("openai_compatible/base-model-2"),
+        "resume projection (last-wins) shows the mid-turn change"
     );
 }
 

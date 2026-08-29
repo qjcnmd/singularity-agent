@@ -16,7 +16,9 @@ use singularity_model::{
 };
 use uuid::Uuid;
 
-use crate::compaction::{CompactionBudget, CompactionError, CompactionOutcome};
+use crate::compaction::{
+    CompactionBudget, CompactionError, CompactionOutcome, entry_token_estimate,
+};
 use crate::message::{AgentMessageRole, ContentBlock};
 use crate::session::SessionEntry;
 use crate::session::context::entry_to_llm_messages;
@@ -164,6 +166,17 @@ pub(super) fn effective_max_output_tokens(provider: &dyn Provider, configured: u
     configured.min(provider.protocol_contract().max_output_tokens as u64) as u32
 }
 
+/// 会话装配成品：消息、reasoning replay 与上下文内容计量同源于一次
+/// `build_context_entries` 遍历。
+pub(super) struct AssembledContext {
+    pub(super) messages: Vec<ModelMessage>,
+    pub(super) replays: Vec<ProviderReasoningReplay>,
+    /// 上下文条目的 token 估算求和——请求前上下文规模的唯一内容计量
+    /// （对齐 pi `estimateContextTokens`：只合计消息，不附加工具 schema、
+    /// 输出预算或固定余量）。
+    pub(super) token_estimate: u64,
+}
+
 impl Agent {
     /// 装配单轮请求一次，并在发送前按上一轮真实 usage（缺失时用装配估算）
     /// 判定是否主动压缩；实际压缩后基于压缩后的会话重建请求。非 session
@@ -292,24 +305,22 @@ impl Agent {
     /// 按 `TurnRequestSpec` 组装单轮 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     ///
-    /// 上下文条目只装配一次：messages、reasoning replay 与预算估算全部在
+    /// 上下文条目只装配一次：消息、reasoning replay 与内容计量全部在
     /// 同一份装配成品上完成；返回 (请求, 装配成品估算)。
     pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> Result<(ModelTurnRequest, u64)> {
-        let (messages, replays) = self.assemble_messages()?;
-        let assembled_estimate =
-            self.estimate_assembled(&messages, &replays, spec.max_output_tokens);
+        let assembled = self.assemble_messages()?;
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
-            messages,
+            assembled.messages,
         );
         request.tools = spec.tools.clone();
         request.tool_choice = spec.tool_choice.clone();
-        request.provider_reasoning_history = replays;
+        request.provider_reasoning_history = assembled.replays;
         request.model_preferences = ModelPreferences {
             model_name: spec.preferences.model_name.clone(),
             max_output_tokens: Some(spec.max_output_tokens),
         };
-        Ok((request, assembled_estimate))
+        Ok((request, assembled.token_estimate))
     }
 
     /// 基于当前会话按同一装配 seam 重建请求；只返回请求本身（丢弃装配估算）。
@@ -320,61 +331,21 @@ impl Agent {
     }
 
     /// 上下文装配的单一 seam：指令消息 + compaction 感知会话历史 + reasoning
-    /// replay 只在此一次完成。`build_request` 与 `assembled_context_estimate`
-    /// 共用同一份装配成品，防止请求与估算各拼一遍产生不一致。
-    pub(super) fn assemble_messages(
-        &self,
-    ) -> Result<(Vec<ModelMessage>, Vec<ProviderReasoningReplay>)> {
-        let entries = self.session.build_context_entries()?;
+    /// replay 只在此一次完成，`build_request` 与压缩前估算共用同一份装配成品。
+    pub(super) fn assemble_messages(&self) -> Result<AssembledContext> {
+        let entries = self.session.build_context_entries();
+        let token_estimate = entries.iter().map(entry_token_estimate).sum();
         let replays = self.reasoning_replays_from_entries(&entries);
         let mut messages = Vec::with_capacity(entries.len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
         }
         messages.extend(entries.iter().flat_map(entry_to_llm_messages));
-        Ok((messages, replays))
-    }
-
-    /// 对本轮装配结果做保守 Token 估算，供首轮或 provider usage 缺失时
-    /// 的请求前压缩判定使用。
-    ///
-    /// 估算覆盖消息 content、工具调用标识与参数、工具 schema（构造期缓存
-    /// 的序列化串）、provider reasoning replay 的序列化尺寸、输出预算及
-    /// 固定封装余量。
-    pub(super) fn estimate_assembled(
-        &self,
-        messages: &[ModelMessage],
-        replays: &[ProviderReasoningReplay],
-        max_output_tokens: u32,
-    ) -> u64 {
-        let estimate = |text: &str| self.compaction.estimate_tokens(text);
-        let message_tokens = messages
-            .iter()
-            .map(|message| {
-                let mut tokens = estimate(&message.content);
-                if let Some(tool_call_id) = &message.tool_call_id {
-                    tokens = tokens.saturating_add(estimate(tool_call_id));
-                }
-                for call in &message.tool_calls {
-                    tokens = tokens
-                        .saturating_add(estimate(&call.tool_call_id))
-                        .saturating_add(estimate(&call.tool_name))
-                        .saturating_add(estimate(&call.raw_arguments));
-                }
-                tokens
-            })
-            .sum::<u64>();
-        let tool_tokens = estimate(&self.tools_json);
-        // 不变量：replays 为本仓静态类型 Vec<ProviderReasoningReplay>，
-        // serde 序列化仅在其类型定义错误时失败。
-        #[allow(clippy::expect_used)]
-        let replay_tokens =
-            estimate(&serde_json::to_string(replays).expect("reasoning replays serialize"));
-        message_tokens
-            .saturating_add(tool_tokens)
-            .saturating_add(replay_tokens)
-            .saturating_add(max_output_tokens as u64)
-            .saturating_add(32)
+        Ok(AssembledContext {
+            messages,
+            replays,
+            token_estimate,
+        })
     }
 
     /// 从 durable assistant entries 恢复 provider-private continuation。

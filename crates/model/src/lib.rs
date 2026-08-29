@@ -61,9 +61,8 @@ pub use openai::{chat_completions_endpoint, responses_endpoint};
 pub use provider::Provider;
 pub use provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
-    is_strict_tool_schema_compatible, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
-    validate_model_turn_response, validate_provider_config,
+    validate_model_request_with_capabilities, validate_model_turn_response,
+    validate_provider_config,
 };
 pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;

@@ -40,9 +40,9 @@ impl ProviderStreamingCapability {
     /// 从实际所选协议解析规范化流能力。
     pub const fn for_protocol(protocol: ProviderApiProtocol) -> Self {
         match protocol {
-            ProviderApiProtocol::OpenAiResponses => Self::OutputTextDelta,
-            ProviderApiProtocol::OpenAiChatCompletions => Self::OutputTextDelta,
-            ProviderApiProtocol::Declared => Self::Unsupported,
+            ProviderApiProtocol::OpenAiResponses | ProviderApiProtocol::OpenAiChatCompletions => {
+                Self::OutputTextDelta
+            }
         }
     }
 }

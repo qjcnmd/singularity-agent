@@ -9,7 +9,6 @@ use crate::envelope::ClientInfo;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 初始化请求参数。
 pub struct InitializeParams {
-    #[serde(rename = "clientInfo")]
     pub client_info: ClientInfo,
 }
 
@@ -17,11 +16,8 @@ pub struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 /// 初始化响应及平台摘要。
 pub struct InitializeResult {
-    #[serde(rename = "userAgent")]
     pub user_agent: String,
-    #[serde(rename = "platformFamily")]
     pub platform_family: String,
-    #[serde(rename = "platformOs")]
     pub platform_os: String,
 }
 
@@ -91,17 +87,12 @@ where
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// thread/settings 的脱敏结果；不包含 key、header 或其他认证材料。
-///
-/// `queued` 表示修改发生在活动轮期间：已接受但尚未持久化，
-/// turn 到达可信终态后由 runtime 自动落盘并在下一 turn 生效。
 pub struct ThreadSettingsResult {
     pub thread_id: String,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub updated: bool,
-    #[serde(default)]
-    pub queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

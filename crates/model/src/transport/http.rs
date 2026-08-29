@@ -37,9 +37,6 @@ pub(crate) fn model_error_from_http_status(
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// 附加到非 2xx 错误的 provider 诊断文本上界（字符数）。
 const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
-/// 诊断文本包含当前请求凭据时的固定替代文案。
-const REDACTED_PROVIDER_ERROR_DIAGNOSTIC: &str =
-    "provider error diagnostic withheld: it may contain credentials";
 
 /// 非 2xx 响应体解析出的结构化错误字段。
 pub(crate) struct ProviderErrorBodyFields {
@@ -83,11 +80,7 @@ pub(crate) fn is_context_length_exceeded_code(code: Option<&str>) -> bool {
 }
 
 /// 有界单行 provider 诊断：控制字符与空白合并为单个空格后截断到上限。
-/// 截断前精确匹配调用方凭据值；命中时整体替换，凭据绝不进入错误文本。
-pub(crate) fn bounded_provider_error_diagnostic(text: &str, credential: &str) -> String {
-    if !credential.is_empty() && text.contains(credential) {
-        return REDACTED_PROVIDER_ERROR_DIAGNOSTIC.to_string();
-    }
+pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     let flattened: String = text
         .chars()
         .map(|character| {
@@ -233,26 +226,22 @@ pub(crate) fn read_bounded_provider_response_body(
 }
 
 pub(super) fn provider_response_body_too_large_error() -> ProviderError {
-    let mut error = ModelError::new(
+    ProviderError::from_model_error(ModelError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         "provider response body exceeded the fixed safety limit",
-    )
-    .with_provider_diagnostic(
         "provider_response_body_too_large",
         ProviderErrorStage::ResponseBodyRead,
-    );
-    error.validation_errors = vec!["provider_response_body_too_large".to_string()];
-    ProviderError::from_model_error(error)
+        vec!["provider_response_body_too_large".to_string()],
+    ))
 }
 
 pub(super) fn provider_response_json_error() -> ModelError {
-    ModelError::new(
+    ModelError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         "provider response was not valid JSON",
-    )
-    .with_provider_diagnostic(
         "provider_response_json_decode_failed",
         ProviderErrorStage::ResponseJsonDecode,
+        Vec::new(),
     )
 }
 

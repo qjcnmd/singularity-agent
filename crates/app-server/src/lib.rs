@@ -51,6 +51,10 @@ pub enum AppServerError {
     InvalidJson(#[from] serde_json::Error),
     #[error("invalid params: {0}")]
     InvalidParams(String),
+    /// 请求的 thread 不存在；transport 投影为 JSON-RPC not_found（-32004），
+    /// 不落入 internal 错误。
+    #[error("thread not found: {0}")]
+    NotFound(String),
     #[error("store error: {0}")]
     Store(String),
     #[error("workspace error: {0}")]
@@ -99,5 +103,5 @@ pub type AppServerOutput = Value;
 
 pub use dispatch::{TurnClaim, TurnStartClaim};
 pub use paths::AppPaths;
-pub use state::{AppServer, AppServerCancellationHandle, AppServerControlHandle};
+pub use state::{AppServer, AppServerCancellationHandle};
 pub use wire::thread_from_summary;

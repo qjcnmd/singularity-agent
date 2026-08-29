@@ -26,9 +26,8 @@ use crate::provider::attempt::{
     ProviderAttemptInProgress, emit_provider_attempt_started, record_provider_attempt,
 };
 use crate::provider::contract::{
-    ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
-    provider_request_validation_error, request_uses_tool_protocol,
-    validate_model_request_with_capabilities,
+    ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
+    request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
 use crate::provider::telemetry::{
@@ -59,9 +58,7 @@ impl ProtocolAdapter {
     fn for_api_protocol(api_protocol: ProviderApiProtocol) -> Self {
         match api_protocol {
             ProviderApiProtocol::OpenAiResponses => Self::Responses,
-            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
-                Self::Chat
-            }
+            ProviderApiProtocol::OpenAiChatCompletions => Self::Chat,
         }
     }
 
@@ -296,36 +293,6 @@ impl OpenAiProvider {
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
         Self::new_with_request_timeout(config, crate::PROVIDER_TIMEOUT_SECONDS, runtime_handle)
-    }
-
-    /// 绑定单一显式协议构造 provider：与目录无 reasoning 变体条目的选择同形
-    /// （reasoning 关闭、wire 开关取目录默认）。生产路径经
-    /// [`ProviderConfigSnapshot`] 解析目录后按需克隆；本入口供已知模型与协议
-    /// 的直连场景使用。
-    pub fn with_single_model(
-        config: OpenAiProviderConfig,
-        api_protocol: ProviderApiProtocol,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Result<Self, ProviderError> {
-        let model_name = config.model_name.clone();
-        let max_context_tokens = config.max_context_tokens;
-        let max_output_tokens = config.max_output_tokens;
-        let provider = Self::new(config, runtime_handle)?;
-        Ok(provider.with_selected_model(SelectedModel {
-            model_name,
-            api_protocol,
-            max_context_tokens,
-            max_output_tokens,
-            reasoning_variant: None,
-            reasoning_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: ThinkingWireFormat::ThinkingType,
-            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            supports_developer_role: true,
-            supports_tool_choice: true,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: false,
-        }))
     }
 
     pub(crate) fn new_with_request_timeout(
@@ -699,13 +666,10 @@ impl OpenAiProvider {
             error_fields
                 .as_ref()
                 .and_then(|fields| fields.message.as_deref())
-                .map(|message| bounded_provider_error_diagnostic(message, &self.config.api_key))
+                .map(bounded_provider_error_diagnostic)
                 .or_else(|| {
                     error_body.as_deref().map(|body| {
-                        bounded_provider_error_diagnostic(
-                            &String::from_utf8_lossy(body),
-                            &self.config.api_key,
-                        )
+                        bounded_provider_error_diagnostic(&String::from_utf8_lossy(body))
                     })
                 })
                 .filter(|diagnostic| !diagnostic.is_empty())

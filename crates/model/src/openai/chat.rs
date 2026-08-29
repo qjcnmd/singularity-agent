@@ -119,6 +119,14 @@ pub fn parse_openai_response(
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
+    if payload.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(provider_response_validation_error(
+            config,
+            model_name,
+            "provider Chat payload contained an error",
+            vec!["chat_error_present".to_string()],
+        ));
+    }
     let response_id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -198,16 +206,12 @@ pub fn parse_openai_response(
         .filter(|value| !value.is_empty())
         .filter(|_| !tool_calls.is_empty())
         .map(|reasoning_content| {
+            let binding = super::replay_binding(config, model_name, reasoning_effort, &tool_calls);
             vec![ProviderReasoningReplay::Chat {
-                provider_name: config.provider_name.clone(),
-                model_name: model_name.to_string(),
-                // 绑定请求时实际 selection 的 reasoning 变体；provider 不回显
-                // effort 时保持 None，不伪造禁用变体。
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                tool_call_ids: tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-                    .collect(),
+                provider_name: binding.provider_name,
+                model_name: binding.model_name,
+                reasoning_effort: binding.reasoning_effort,
+                tool_call_ids: binding.tool_call_ids,
                 reasoning_content: reasoning_content.to_string(),
             }]
         })
@@ -271,8 +275,7 @@ pub fn finalize_provider_response(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let validation = validate_model_turn_response(request, &response, Some(capabilities));
-    let mut validation = validation;
+    let mut validation = validate_model_turn_response(request, &response, Some(capabilities));
     // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
     // 能进入 AgentLoop 的参数修复路径。

@@ -312,8 +312,6 @@ impl TuiApp {
                 );
                 self.set_waiting(WaitingTarget::TerminalConvergence);
             }
-            // 待生效设置已在可信终态后应用，无需额外文案（提交点已提示过）。
-            TurnEvent::ThreadSettingsApplied { .. } => {}
         }
     }
 
@@ -437,7 +435,10 @@ impl TuiApp {
         }
         match key.code {
             KeyCode::Char('t') if ctrl => self.transcript.toggle_thinking(),
-            KeyCode::Char('j') if ctrl => self.editor.insert_newline(),
+            KeyCode::Char('j') if ctrl => {
+                self.exit_history_after_edit();
+                self.editor.insert_newline();
+            }
             KeyCode::Char('o') if ctrl || alt => {
                 self.transcript.toggle_latest_tool_expansion();
             }
@@ -489,6 +490,7 @@ impl TuiApp {
                 self.scroll.scroll_down(1, total, viewport);
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.exit_history_after_edit();
                 self.editor.insert_newline();
             }
             KeyCode::Enter if alt => {
@@ -734,6 +736,7 @@ impl TuiApp {
                 self.phase = Phase::Running;
                 self.set_waiting(WaitingTarget::Model);
                 self.record_history(&text);
+                self.transcript.push_user(text.clone());
                 Action::Submit(text)
             }
             Phase::Running => {
@@ -750,6 +753,7 @@ impl TuiApp {
                     // 空闲竞态：直接开新回合。
                     self.phase = Phase::Running;
                     self.set_waiting(WaitingTarget::Model);
+                    self.transcript.push_user(text.clone());
                     return Action::Submit(text);
                 }
                 Action::Continue

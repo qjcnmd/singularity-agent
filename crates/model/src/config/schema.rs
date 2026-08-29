@@ -94,7 +94,7 @@ pub(crate) struct ConfiguredModel {
     pub(crate) protocol: ProviderApiProtocol,
     pub(crate) max_context_tokens: Option<u32>,
     pub(crate) max_output_tokens: u32,
-    pub(crate) reasoning_variants: BTreeMap<String, ReasoningVariant>,
+    pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     pub(crate) default_variant: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
     pub(crate) tool_reasoning_mode: ProviderToolReasoningMode,
@@ -110,12 +110,6 @@ pub struct ModelsFileReasoningVariant {
     pub enabled: bool,
     #[serde(default)]
     pub wire_effort: Option<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ReasoningVariant {
-    pub(crate) enabled: bool,
-    pub(crate) wire_effort: Option<String>,
 }
 
 pub(crate) fn deserialize_unique_map<'de, D, K, V>(
@@ -251,7 +245,7 @@ pub(crate) fn parse_tool_reasoning_history(
 
 pub(crate) fn validate_reasoning_variants(
     protocol: ProviderApiProtocol,
-    variants: &BTreeMap<String, ReasoningVariant>,
+    variants: &BTreeMap<String, ModelsFileReasoningVariant>,
     default_variant: Option<&str>,
 ) -> Result<(), ProviderError> {
     if variants.is_empty() {

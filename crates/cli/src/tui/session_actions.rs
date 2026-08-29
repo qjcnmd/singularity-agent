@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use singularity_runtime::{CompactionOutcome, Conversation, Thread, TurnRunner};
+use singularity_runtime::{CompactionOutcome, Conversation, HistoryItem, Thread, TurnRunner};
 
 use super::app::{CompactionState, Phase, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};
@@ -15,6 +15,9 @@ use super::modals::{ResumeMenu, SettingsMenu};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{short_id, truncate_label};
+
+/// /resume 重放的轮次上限；与 thread/read 协议单页上限一致。
+const REPLAY_TURN_LIMIT: usize = 200;
 
 impl TuiApp {
     /// 会话态整体重置：换绑新会话时归位全部运行相位与临时状态，
@@ -53,16 +56,12 @@ impl TuiApp {
             Ok(thread) => {
                 let session_tokens = self
                     .thread_catalog
-                    .list_threads()
+                    .read_thread_summary(&thread.thread_id)
                     .ok()
-                    .and_then(|threads| {
-                        threads
-                            .into_iter()
-                            .find(|summary| summary.thread_id == thread.thread_id)
-                    })
                     .and_then(|summary| (summary.total_tokens > 0).then_some(summary.total_tokens));
                 let thread_id = thread.thread_id.clone();
                 self.rebind_conversation(runner, thread, session_tokens);
+                self.replay_history(&thread_id);
                 self.transcript.push_note(
                     format!("resumed thread {}", short_id(&thread_id)),
                     NoteStyle::Accent,
@@ -71,6 +70,50 @@ impl TuiApp {
             Err(error) => self
                 .transcript
                 .push_note(format!("resume failed: {error}"), NoteStyle::Error),
+        }
+    }
+
+    /// /resume 后按 `paged_read` 重放历史：物化 user/assistant/thinking/tool
+    /// 条目为会话流（pi 的会话重放语义）。重放只发生在 resume 换绑路径，
+    /// /new 与首启保持空流；读取失败时静默跳过（note 仍提示 resume 成功）。
+    fn replay_history(&mut self, thread_id: &str) {
+        let Ok(page) = self
+            .thread_catalog
+            .paged_read(thread_id, REPLAY_TURN_LIMIT, None)
+        else {
+            return;
+        };
+        let mut unresulted_calls: Vec<String> = Vec::new();
+        for turn in &page.turns {
+            for item in &turn.items {
+                match item {
+                    HistoryItem::Message { role, text, .. } => match role.as_str() {
+                        "user" => self.transcript.push_user(text.clone()),
+                        _ => self.transcript.push_note(text.clone(), NoteStyle::Info),
+                    },
+                    HistoryItem::Thinking { text, .. } => {
+                        self.transcript.push_thinking(text.clone());
+                    }
+                    HistoryItem::ToolCall { id, name, args } => {
+                        unresulted_calls.push(id.clone());
+                        self.transcript.tool_start(id, name, args);
+                    }
+                    HistoryItem::ToolResult {
+                        id,
+                        output,
+                        is_error,
+                    } => {
+                        unresulted_calls.retain(|call| call != id);
+                        self.transcript.tool_end(id, output, *is_error);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // 崩溃遗留的孤立工具调用（无 ToolResult 收尾）定型为稳定记录，
+        // 不停留在运行中渲染。
+        for call_id in &unresulted_calls {
+            self.transcript.tool_terminal(call_id, false);
         }
     }
 
@@ -143,20 +186,15 @@ impl TuiApp {
                 }
             }
             SlashCommand::Session => {
-                let summary = self.thread_catalog.list_threads().ok().and_then(|threads| {
-                    threads
-                        .into_iter()
-                        .find(|summary| summary.thread_id == self.thread_id)
-                });
-                match summary {
-                    Some(summary) => self.transcript.push_note(
+                match self.thread_catalog.read_thread_summary(&self.thread_id) {
+                    Ok(summary) => self.transcript.push_note(
                         format!(
                             "session {} · {} turns · {} tokens",
                             summary.thread_id, summary.turn_count, summary.total_tokens
                         ),
                         NoteStyle::Accent,
                     ),
-                    None => self
+                    Err(_) => self
                         .transcript
                         .push_note("session facts unavailable", NoteStyle::Warning),
                 }
@@ -188,13 +226,8 @@ impl TuiApp {
                 // 打开单行命名输入弹窗（复用 SettingsMenu 的字段编辑模式）。
                 let current_name = self
                     .thread_catalog
-                    .list_threads()
+                    .read_thread_summary(&self.thread_id)
                     .ok()
-                    .and_then(|threads| {
-                        threads
-                            .into_iter()
-                            .find(|summary| summary.thread_id == self.thread_id)
-                    })
                     .and_then(|summary| summary.title)
                     .unwrap_or_default();
                 self.settings = Some(SettingsMenu::open_name(Some(&current_name)));
@@ -217,15 +250,16 @@ impl TuiApp {
         }
     }
 
-    /// 向会话流注入一条「已注入/被拒」提示，文案与内容截断保持一致。
+    /// 注入结果回显：接受时以用户消息样式本地回显全文；被拒时保留
+    /// 「已注入/被拒」提示（文案与内容截断保持一致）。
     pub(super) fn note_injection(&mut self, kind: &str, accepted: bool, text: &str) {
+        if accepted {
+            self.transcript.push_user(text.to_string());
+            return;
+        }
         let label = truncate_label(text, 40);
         self.transcript.push_note(
-            if accepted {
-                format!("↳ {kind}: {label}")
-            } else {
-                format!("↳ {kind} rejected (turn closed): {label}")
-            },
+            format!("↳ {kind} rejected (turn closed): {label}"),
             NoteStyle::Accent,
         );
     }

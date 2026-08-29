@@ -70,6 +70,11 @@ impl TerminalCommit {
             usage: Some(self.usage.clone()),
         }
     }
+
+    /// 终态 usage 投影：终态事件与 `TurnOutcome` 共享同一份已落盘 usage。
+    pub(crate) fn usage(&self) -> &TurnModelUsage {
+        &self.usage
+    }
 }
 
 /// 终态无法落盘时的 fail-stop 出口：发 `storage_fatal` 诊断，不发布任何

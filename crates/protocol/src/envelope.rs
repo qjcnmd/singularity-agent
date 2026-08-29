@@ -30,21 +30,6 @@ pub struct ClientInfo {
     pub version: String,
 }
 
-impl ClientInfo {
-    /// 创建客户端身份信息。
-    pub fn new(
-        name: impl Into<String>,
-        title: impl Into<String>,
-        version: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            title: title.into(),
-            version: version.into(),
-        }
-    }
-}
-
 /// JSON-RPC 错误码和错误消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCode {
@@ -84,11 +69,6 @@ impl ErrorCode {
     /// 构造资源不存在错误。
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(APP_ERROR_NOT_FOUND, message)
-    }
-
-    /// 返回错误消息。
-    pub fn message(&self) -> &str {
-        &self.message
     }
 }
 
@@ -338,8 +318,3 @@ pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
 }
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// 无参数 method 的严格空对象。
-pub struct EmptyParams {}

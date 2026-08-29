@@ -52,7 +52,6 @@ pub fn openai_responses_request_payload(
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.parameters_schema,
-                        "strict": request.tool_choice.strict_tool_schema,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -153,17 +152,12 @@ pub fn parse_openai_responses_response(
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
     let provider_reasoning_history = if has_reasoning_item && !tool_calls.is_empty() {
-        let tool_call_ids: Vec<String> = tool_calls
-            .iter()
-            .map(|call| call.tool_call_id.clone())
-            .collect();
+        let binding = super::replay_binding(config, model_name, reasoning_effort, &tool_calls);
         vec![ProviderReasoningReplay::Responses {
-            provider_name: config.provider_name.clone(),
-            model_name: model_name.to_string(),
-            // 绑定请求时实际 selection 的 reasoning 变体；provider 不回显
-            // effort 时保持 None，不伪造禁用变体。
-            reasoning_effort: reasoning_effort.map(str::to_string),
-            tool_call_ids,
+            provider_name: binding.provider_name,
+            model_name: binding.model_name,
+            reasoning_effort: binding.reasoning_effort,
+            tool_call_ids: binding.tool_call_ids,
             items: replay_items,
         }]
     } else {

@@ -7,8 +7,9 @@
 //! - steer 注入窗口（活动 turn 的 Agent 收件箱）与取消令牌；
 //! - followUp 后续输入队列：活动 turn 期间接受的每条 followUp 在当前 turn
 //!   到达可信终态后按提交顺序自动启动为一个新的 turn，每条恰好执行一次；
-//! - 设置生效时序：活动 turn 期间的变更只记录一份待生效意图，turn 终态收敛
-//!   后由本对象自动校验并持久化，调用方无需手动提取或应用。
+//! - 设置生效时序：变更提交点只做校验与内存投影更新（运行中同样接受），
+//!   落盘发生在 turn 开始时由 turn 在自己的会话写者上记录（对齐 codex 的
+//!   turn 边界记录），本对象不持有设置持久化状态。
 //!
 //! # 锁中毒策略
 //!
@@ -32,13 +33,12 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
-use singularity_agent::session::{SessionAccess, SessionManager};
 use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
 use uuid::Uuid;
 
 use crate::error::TurnRunError;
-use crate::events::{TurnEvent, TurnEventSink};
+use crate::events::TurnEventSink;
 use crate::objects::{Thread, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 
@@ -59,16 +59,13 @@ pub enum ReasoningPatch {
     Clear,
 }
 
-/// [`Conversation::queue_settings`] 的结果：本次修改的生效时点。
+/// [`Conversation::update_settings`] 的结果：本次修改的生效时点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsApplyTiming {
     /// 没有可应用的内容（空 patch）。
     NothingToApply,
-    /// 已立即校验并持久化，内存投影同步更新。
+    /// 已校验并更新内存投影；落盘由下一 turn 开始时记录。
     AppliedNow,
-    /// 活动 turn 期间只记录了意图；turn 到达可信终态后自动持久化并在
-    /// 下一 turn 生效（持久化结果以 `thread/settingsApplied` 事件发布）。
-    QueuedForNextTurn,
 }
 
 impl SettingsPatch {
@@ -77,21 +74,9 @@ impl SettingsPatch {
             && self.model.is_none()
             && matches!(self.reasoning, ReasoningPatch::Keep)
     }
-
-    /// 字段级合并：`patch` 中给出的字段覆盖 `self`，未给出的保持不变。
-    fn merged_with(self, patch: &SettingsPatch) -> Self {
-        Self {
-            provider: patch.provider.clone().or(self.provider),
-            model: patch.model.clone().or(self.model),
-            reasoning: match patch.reasoning {
-                ReasoningPatch::Keep => self.reasoning,
-                _ => patch.reasoning.clone(),
-            },
-        }
-    }
 }
 
-/// [`Conversation::queue_settings`] 的结果：本次修改的生效时点与合并后的 selector。
+/// [`Conversation::update_settings`] 的结果：本次修改的生效时点与合并后的 selector。
 ///
 /// selector 由 runtime 在提交点唯一组合并校验；客户端只投影，不反推。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,8 +160,6 @@ impl TurnControls {
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
-    /// 活动 turn 期间接受、待终态后生效的设置意图；至多一份。
-    queued_settings: Option<SettingsPatch>,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行。
     pending_follow_ups: VecDeque<String>,
 }
@@ -259,7 +242,6 @@ impl Conversation {
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
-                queued_settings: None,
                 pending_follow_ups: VecDeque::new(),
             }),
         })
@@ -378,75 +360,56 @@ impl Conversation {
         result.map_err(ConversationError::Configuration)
     }
 
-    /// 中断当前活动 turn；无活动 turn 时为 no-op。已接受的 followUp 不受
-    /// 影响，仍按合同在该 turn 终态后继续执行。
+    /// 中断当前活动 turn；无活动 turn 时为 no-op。已接受的 followUp 保留
+    /// 在待处理队列中，不在中断当轮自动执行，由下一次 `run_turn` 按 FIFO
+    /// 继续消费。
     pub fn interrupt(&self) {
         if let Some(controls) = self.active_controls() {
             controls.cancellation.cancel();
         }
     }
 
-    /// 修改当前 Thread 的 provider/model/reasoning。
+    /// 修改当前 Thread 的 provider/model/reasoning（对齐 codex：变更即生效）。
     ///
-    /// 空闲时立即校验并持久化为 `thread_settings` metadata（不改写全局配置）；
-    /// 活动 turn 期间只记录一份待生效意图（新 patch 按字段合并覆盖），当前
-    /// turn 继续使用启动时的 selector，turn 到达可信终态后由 [`Self::run_turn`]
-    /// 自动持久化并以 `thread/settingsApplied` 事件发布，下一 turn 生效。
-    /// 校验失败立即报错，不进入队列。返回本次修改的生效时点。
-    pub fn queue_settings(
+    /// 提交点只做校验与内存投影更新，不写会话文件：turn 执行期间写者锁被
+    /// 本轮占用，提交点写文件会使「运行中改设置」报错。持久化由下一 turn
+    /// 开始时执行体在自己的会话写者上记录（去重后追加 `thread_settings`
+    /// metadata），因此运行中与空闲时同路径，提交点不会因落盘失败。
+    pub fn update_settings(
         &self,
         patch: SettingsPatch,
     ) -> Result<SettingsApplyResult, ConversationError> {
-        // 单次拿锁事务：读当前 thread.model、合并已有待生效意图与新 patch、
-        // 校验最终组合、写回 pending、返回同一 selector。消除先校验后合并的
-        // 两次拿锁窗口，也避免合并结果只在终态持久化时才被发现非法。
         let mut state = self.lock_state()?;
-        let merged = match state.queued_settings.as_ref() {
-            Some(pending) => pending.clone().merged_with(&patch),
-            None => patch,
-        };
-        if merged.is_empty() {
-            let selector = compose_merged_selector(state.thread.model.as_deref(), &merged);
+        if patch.is_empty() {
+            let selector = compose_merged_selector(state.thread.model.as_deref(), &patch);
             return Ok(SettingsApplyResult {
                 timing: SettingsApplyTiming::NothingToApply,
                 selector,
             });
         }
-        // 提交点校验最终组合（含已排队部分）：无效组合立即被拒绝，
-        // 而不是等到终态持久化时才失败；校验失败时原 pending 保留。
-        let selector = compose_validated_selector(&state.thread.model, &merged, &self.runner)
+        let selector = compose_validated_selector(&state.thread.model, &patch, &self.runner)
             .map_err(ConversationError::Configuration)?;
-        state.queued_settings = Some(merged);
-        if state.turn.is_busy() {
-            return Ok(SettingsApplyResult {
-                timing: SettingsApplyTiming::QueuedForNextTurn,
-                selector,
-            });
-        }
-        // 空闲路径与终态后路径共用同一份待生效意图：先入队再立即消费，
-        // 持久化失败时意图保留在队列中等待重试。
-        self.persist_pending_settings_locked(&mut state)?;
+        state.thread.model = Some(selector.clone());
         Ok(SettingsApplyResult {
             timing: SettingsApplyTiming::AppliedNow,
             selector,
         })
     }
 
-    /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入与设置。
+    /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入。
     ///
     /// 同一时刻只允许一个活动 turn；执行期间通过共享的 [`TurnControls`]
     /// （TUI 从其他线程）进行 steer 与取消。整个调用内完成：
     ///
     /// 1. 本轮显式输入的 turn（若此前有残留的已接受 followUp，则按 FIFO 先行）；
-    /// 2. turn 到达可信终态（completed/failed/interrupted）后，自动持久化
-    ///    待生效设置并更新 Thread 投影——下一 turn 使用新 selector；
+    /// 2. turn 到达可信终态（completed/failed/interrupted）后更新 Thread 投影；
+    ///    设置变更由每个 turn 开始时在会话中记录（见 [`TurnRunner::run`]）；
     /// 3. 按 FIFO 启动已接受的 followUp 为新的 turn（各自独立 turn id），
     ///    直到队列清空；执行期间新提交的 followUp 同样被消费。
     ///
     /// 失败语义：单轮执行失败（`Execution`）不阻断队列中其余 followUp；
-    /// 终态化失败（无可信终态）、准备阶段失败或设置持久化失败会中止链条，
-    /// 未执行的 followUp 与未生效的设置原样保留，并返回可行动错误。
-    /// 返回值为最后一个到达终态的 turn 结果。
+    /// 终态化失败（无可信终态）或准备阶段失败会中止链条，未执行的 followUp
+    /// 原样保留，并返回可行动错误。返回值为最后一个到达终态的 turn 结果。
     pub fn run_turn(
         &self,
         input: &str,
@@ -481,7 +444,7 @@ impl Conversation {
             };
             let (step, turn_undelivered) = self.run_single_turn(current.clone(), sink);
             // 无可信终态的轮次（终态化失败、准备失败、并发占用）中止链条：
-            // 剩余输入与待生效设置原样保留，返回可行动错误。
+            // 剩余输入原样保留，返回可行动错误。
             let untrusted = matches!(
                 step,
                 Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
@@ -513,20 +476,6 @@ impl Conversation {
             ) {
                 self.requeue_follow_ups(queue)?;
                 return step;
-            }
-            // 成功应用后发布投影更新：客户端据此拿到下一 turn 生效的
-            // 线程模型。持久化失败时
-            // 保留该意图与剩余输入，返回可行动错误。
-            let applied = match self.apply_pending_settings() {
-                Ok(applied) => applied,
-                Err(error) => {
-                    // requeue 失败（锁中毒）比 settings 持久化更根本，优先传播。
-                    self.requeue_follow_ups(queue)?;
-                    return Err(error);
-                }
-            };
-            if let Some(updated) = applied {
-                sink.emit(TurnEvent::ThreadSettingsApplied { thread: updated });
             }
             // completed/failed 终态（含以 Err 收敛但终态可信的执行失败）后，
             // 未交付转向输入排到链队列队首，先于已排队的 followUp 执行（pi
@@ -603,70 +552,6 @@ impl Conversation {
         (result, undelivered)
     }
 
-    /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回
-    /// `None`（不产生事件）。持久化失败时意图保留在队列中等待重试；若与
-    /// 存活写者并发，写者锁显式拒绝（WriterConflict），同样进队列重试。
-    fn apply_pending_settings(&self) -> Result<Option<Thread>, ConversationError> {
-        let mut state = self.lock_state()?;
-        if state.queued_settings.is_none() {
-            return Ok(None);
-        }
-        self.persist_pending_settings_locked(&mut state)?;
-        Ok(Some(state.thread.clone()))
-    }
-
-    /// 校验并把当前待生效意图持久化为 `thread_settings` metadata，
-    /// 同步更新内存 Thread 投影。持久化失败时意图保留在队列中等待重试。
-    fn persist_pending_settings_locked(
-        &self,
-        state: &mut ConversationState,
-    ) -> Result<(), ConversationError> {
-        let Some(pending) = state.queued_settings.clone() else {
-            return Ok(());
-        };
-        if pending.is_empty() {
-            state.queued_settings = None;
-            return Ok(());
-        }
-        // 调用方已持有 state 锁：selector 组合必须走无锁纯函数。
-        let selector = compose_validated_selector(&state.thread.model, &pending, &self.runner)
-            .map_err(ConversationError::Configuration)?;
-        let path =
-            crate::store::thread_session_path(self.runner.sessions_dir(), &state.thread.thread_id);
-        let write_result = (|| -> Result<(), String> {
-            let mut session = SessionManager::open_existing_with_access(
-                &path,
-                self.runner.coordinator(),
-                &state.thread.thread_id,
-                SessionAccess::Append,
-            )
-            .map_err(|error| error.to_string())?;
-            let parts = split_model_selector(&selector);
-            let metadata = singularity_agent::session::SessionMetadata::thread_settings(
-                parts
-                    .provider
-                    .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME),
-                parts.model.unwrap_or_default(),
-                parts.effort.map(str::to_string),
-            );
-            session
-                .append_metadata(metadata)
-                .map_err(|error| error.to_string())
-                .map(|_| ())
-        })();
-        match write_result {
-            Ok(()) => {
-                state.queued_settings = None;
-                state.thread.model = Some(selector);
-                Ok(())
-            }
-            // JSONL 未写入：意图原样保留，避免静默丢失。
-            Err(message) => Err(ConversationError::Configuration(format!(
-                "failed to persist thread settings: {message}"
-            ))),
-        }
-    }
-
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
         // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
         // 的「中毒按 busy」同向：读路径不泄露可能损坏的控制面。
@@ -725,7 +610,7 @@ impl Conversation {
 /// 把 patch 合并到当前 selector 上（`provider/model[#effort]`），返回完整
 /// 选择器；不做合法性校验。提交点校验、终态自动生效与 app-server 回显
 /// 共用同一组合语义。
-pub fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
+fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
     let parts = split_model_selector(current.unwrap_or(""));
     let provider = patch
         .provider

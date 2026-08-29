@@ -4,12 +4,12 @@ use singularity_model::{ModelMessage, ModelRole};
 
 use crate::message::{AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
-use super::format::{Result, SessionEntry};
+use super::format::SessionEntry;
 use super::manager::SessionManager;
 
 impl SessionManager {
     /// 构建活跃的、compaction 感知的条目列表。
-    pub fn build_context_entries(&self) -> Result<Vec<SessionEntry>> {
+    pub fn build_context_entries(&self) -> Vec<SessionEntry> {
         let mut compaction_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
             if matches!(entry, SessionEntry::Compaction { .. }) {
@@ -17,7 +17,7 @@ impl SessionManager {
             }
         }
         let Some(compaction_index) = compaction_index else {
-            return Ok(self.entries.clone());
+            return self.entries.clone();
         };
         let first_kept = match &self.entries[compaction_index] {
             SessionEntry::Compaction { compaction, .. } => compaction.first_kept_entry_id.clone(),
@@ -34,7 +34,7 @@ impl SessionManager {
             }
         }
         context.extend_from_slice(&self.entries[compaction_index + 1..]);
-        Ok(context)
+        context
     }
 }
 

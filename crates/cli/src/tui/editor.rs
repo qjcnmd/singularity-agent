@@ -73,11 +73,11 @@ impl Editor {
         self.scroll_override = None;
     }
 
-    /// 鼠标滚轮滚动视口：`delta` 为行偏移（负=向上）。滚动后任何光标
+    /// 鼠标滚轮滚动视口：`delta` 为行偏移（负=向上），`base` 为上一帧实际
+    /// 视口顶行（跟随态与覆盖态统一以此为锚，滚动不跳变）。滚动后任何光标
     /// 移动都会清除覆盖；顶到 0 用 `Some(0)` 钉住（与 `None`=跟随区分）。
-    pub fn scroll_by(&mut self, delta: i32) {
-        let base = self.scroll_override.unwrap_or(0) as i32;
-        let next = base + delta;
+    pub fn scroll_by(&mut self, delta: i32, base: usize) {
+        let next = base as i32 + delta;
         self.scroll_override = Some(next.max(0) as usize);
     }
 

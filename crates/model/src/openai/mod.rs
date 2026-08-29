@@ -6,7 +6,7 @@ pub(crate) mod wire;
 
 pub(crate) use chat::*;
 pub(crate) use responses::*;
-pub(crate) use wire::OpenAiCompletion;
+pub(crate) use wire::{OpenAiCompletion, replay_binding};
 pub use wire::{chat_completions_endpoint, responses_endpoint};
 
 use crate::provider::contract::{ProviderProtocolContract, request_uses_tool_protocol};

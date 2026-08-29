@@ -1,7 +1,6 @@
 //! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 
 use super::runtime::OpenAiProviderConfig;
@@ -18,11 +17,9 @@ use crate::{
 };
 
 /// 为模型提供方完成请求选定的线路协议。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
-    #[default]
-    Declared,
     OpenAiResponses,
     OpenAiChatCompletions,
 }
@@ -99,18 +96,20 @@ pub(crate) fn provider_request_validation_error(
     } else {
         ModelErrorKind::InvalidRequest
     };
-    let mut error = ModelError::new(
-        kind,
-        format!(
-            "model request validation failed: {}",
-            validation.errors.join(", ")
-        ),
+    ProviderError::from_model_error(
+        ModelError::diagnostic(
+            kind,
+            format!(
+                "model request validation failed: {}",
+                validation.errors.join(", ")
+            ),
+            "provider_request_invalid",
+            ProviderErrorStage::RequestSend,
+            validation.errors,
+        )
+        .with_provider(config.provider_name.clone())
+        .with_model(config.model_name.clone()),
     )
-    .with_provider(config.provider_name.clone())
-    .with_model(config.model_name.clone())
-    .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
-    error.validation_errors = validation.errors;
-    ProviderError::from_model_error(error)
 }
 
 pub(crate) fn provider_response_validation_error(
@@ -119,15 +118,17 @@ pub(crate) fn provider_response_validation_error(
     message: &str,
     validation_errors: Vec<String>,
 ) -> ProviderError {
-    let mut error = ModelError::new(ModelErrorKind::JsonSchemaViolation, message)
-        .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string())
-        .with_provider_diagnostic(
+    ProviderError::from_model_error(
+        ModelError::diagnostic(
+            ModelErrorKind::JsonSchemaViolation,
+            message,
             "provider_response_invalid",
             ProviderErrorStage::ResponseValidation,
-        );
-    error.validation_errors = validation_errors;
-    ProviderError::from_model_error(error)
+            validation_errors,
+        )
+        .with_provider(config.provider_name.clone())
+        .with_model(model_name.to_string()),
+    )
 }
 
 pub(crate) fn provider_content_filter_error(
@@ -135,22 +136,25 @@ pub(crate) fn provider_content_filter_error(
     model_name: &str,
     message: &str,
 ) -> ProviderError {
-    let mut error = ModelError::new(ModelErrorKind::ContentFilter, message)
+    ProviderError::from_model_error(
+        ModelError::diagnostic(
+            ModelErrorKind::ContentFilter,
+            message,
+            "content_filter",
+            ProviderErrorStage::ResponseValidation,
+            vec!["content_filter".to_string()],
+        )
         .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string())
-        .with_provider_diagnostic("content_filter", ProviderErrorStage::ResponseValidation);
-    error.validation_errors.push("content_filter".to_string());
-    ProviderError::from_model_error(error)
+        .with_model(model_name.to_string()),
+    )
 }
 
 fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> bool {
     !validation.errors.is_empty()
-        && validation.errors.iter().all(|error| {
-            matches!(
-                error.as_str(),
-                "provider_does_not_support_tools" | "provider_does_not_support_strict_tool_schema"
-            )
-        })
+        && validation
+            .errors
+            .iter()
+            .all(|error| error.as_str() == "provider_does_not_support_tools")
 }
 
 /// 检查脱敏模型提供方配置是否包含全部必需值。
@@ -171,11 +175,7 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
     validation_result(errors)
 }
 
-/// 在应用模型提供方专属能力检查前校验模型请求。
-pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResult {
-    validate_model_request_with_capabilities(request, None)
-}
-
+/// 校验带可选 provider 能力约束的模型请求。
 pub fn validate_model_request_with_capabilities(
     request: &ModelTurnRequest,
     capabilities: Option<&ProviderProtocolContract>,
@@ -213,14 +213,6 @@ pub fn validate_model_request_with_capabilities(
     {
         errors.push("tool_names_must_be_unique".to_string());
     }
-    if request.tool_choice.strict_tool_schema
-        && request
-            .tools
-            .iter()
-            .any(|tool| !is_strict_tool_schema_compatible(&tool.parameters_schema))
-    {
-        errors.push("strict_tool_schema_incompatible".to_string());
-    }
     if let Some(capabilities) = capabilities {
         if !request.tools.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
@@ -253,63 +245,6 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// 报告 `JSON Schema` 是否能够在模型提供方的严格 tool 模式契约下发送。
-pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
-    if schema.get("const").is_some() {
-        return true;
-    }
-    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
-        return !branches.is_empty() && branches.iter().all(is_strict_tool_schema_compatible);
-    }
-    if schema.get("type").and_then(Value::as_str) == Some("object") {
-        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-            return false;
-        };
-        let Some(required) = schema.get("required").and_then(Value::as_array) else {
-            return false;
-        };
-        if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
-            || required.iter().any(|name| {
-                name.as_str()
-                    .is_none_or(|name| !properties.contains_key(name))
-            })
-            || properties.keys().any(|name| {
-                !required
-                    .iter()
-                    .any(|required| required.as_str() == Some(name.as_str()))
-            })
-        {
-            return false;
-        }
-        return properties.values().all(is_strict_tool_schema_compatible);
-    }
-    if schema.get("type").and_then(Value::as_str) == Some("array") {
-        return schema
-            .get("items")
-            .is_some_and(is_strict_tool_schema_compatible);
-    }
-    match schema.get("type") {
-        Some(Value::String(value_type)) => {
-            matches!(
-                value_type.as_str(),
-                "string" | "number" | "integer" | "boolean" | "null"
-            )
-        }
-        Some(Value::Array(value_types)) => {
-            !value_types.is_empty()
-                && value_types.iter().all(|value_type| {
-                    value_type.as_str().is_some_and(|value_type| {
-                        matches!(
-                            value_type,
-                            "string" | "number" | "integer" | "boolean" | "null"
-                        )
-                    })
-                })
-        }
-        _ => false,
-    }
-}
-
 /// 根据对应请求和协商能力校验完整的模型提供方 turn。
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
@@ -339,21 +274,6 @@ pub fn validate_model_turn_response(
     result.errors.dedup();
     result.valid = result.errors.is_empty();
     result
-}
-
-/// 在 `AgentLoop` 处理前校验已解析的模型提供方内容和 tool call。
-pub fn validate_model_response(
-    assistant_message: Option<&ModelMessage>,
-    tool_calls: &[ModelToolCall],
-    available_tool_names: &[String],
-    capabilities: Option<&ProviderProtocolContract>,
-) -> ModelValidationResult {
-    validate_model_response_with_protocol_context(
-        assistant_message,
-        tool_calls,
-        capabilities,
-        !available_tool_names.is_empty(),
-    )
 }
 
 fn validate_model_response_with_protocol_context(

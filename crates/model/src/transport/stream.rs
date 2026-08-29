@@ -132,11 +132,38 @@ impl SseFrameDecoder {
 }
 
 /// 流式解码器的统一读取契约：`read_sse_stream` 以该 trait 泛型驱动 chunk
-/// 循环；协议差异只保留在 `push`/`finish` 与各自的 malformed 构造器里。
-trait SseStreamDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError>;
-    fn finish(&mut self) -> Result<Value, ProviderError>;
+/// 循环。chunk→帧的泵（`push`）与终态前的帧边界校验（`finish`）由默认实现
+/// 收敛；协议差异只保留在 malformed 构造器、单帧分派与终态物化里。
+/// 只作泛型约束使用（无 trait 对象），`Sized` 供默认方法调用关联构造器。
+trait SseStreamDecoder: Sized {
+    /// 该协议的 malformed 构造器（帧边界失败的稳定词形）。
+    fn frame_malformed() -> fn(&'static str) -> ProviderError
+    where
+        Self: Sized;
+
+    /// 单帧协议分派。
+    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
+
+    /// 终态物化：帧边界已校验后由默认 `finish` 调用。
+    fn materialize_terminal(&mut self) -> Result<Value, ProviderError>;
+
+    /// 是否已发射可见文本增量（失败路径的边界快照）。
     fn emitted_text_delta(&self) -> bool;
+
+    /// 解码器持有的帧边界解码器（默认 `push`/`finish` 的共享输入）。
+    fn sse_frames(&mut self) -> &mut SseFrameDecoder;
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        for frame in self.sse_frames().push(chunk, Self::frame_malformed())? {
+            self.dispatch_event(frame)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Value, ProviderError> {
+        self.sse_frames().finish(Self::frame_malformed())?;
+        self.materialize_terminal()
+    }
 }
 
 /// 字节泵与解码消费之间的通道容量：有界背压同时防解码侧失控内存。
@@ -266,40 +293,8 @@ pub(super) struct ChatSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ChatSseDecoder<'_> {
-    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        for frame in self
-            .frames
-            .push(chunk, provider_chat_stream_malformed_error)?
-        {
-            self.dispatch_event(frame)?;
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<Value, ProviderError> {
-        ChatSseDecoder::finish(self)
-    }
-
-    fn emitted_text_delta(&self) -> bool {
-        self.emitted_text_delta
-    }
-}
-
-impl<'a> ChatSseDecoder<'a> {
-    pub(super) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
-        Self {
-            frames: SseFrameDecoder::default(),
-            response_id: None,
-            content: String::new(),
-            reasoning_content: String::new(),
-            tool_calls: BTreeMap::new(),
-            finish_reason: None,
-            usage: None,
-            saw_choice: false,
-            done: false,
-            emitted_text_delta: false,
-            on_event,
-        }
+    fn frame_malformed() -> fn(&'static str) -> ProviderError {
+        provider_chat_stream_malformed_error
     }
 
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
@@ -395,8 +390,7 @@ impl<'a> ChatSseDecoder<'a> {
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<Value, ProviderError> {
-        self.frames.finish(provider_chat_stream_malformed_error)?;
+    fn materialize_terminal(&mut self) -> Result<Value, ProviderError> {
         if !self.done {
             return Err(provider_chat_stream_malformed_error(
                 "terminal_done_missing",
@@ -447,6 +441,32 @@ impl<'a> ChatSseDecoder<'a> {
         }
         Ok(payload)
     }
+
+    fn emitted_text_delta(&self) -> bool {
+        self.emitted_text_delta
+    }
+
+    fn sse_frames(&mut self) -> &mut SseFrameDecoder {
+        &mut self.frames
+    }
+}
+
+impl<'a> ChatSseDecoder<'a> {
+    pub(super) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+        Self {
+            frames: SseFrameDecoder::default(),
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: None,
+            usage: None,
+            saw_choice: false,
+            done: false,
+            emitted_text_delta: false,
+            on_event,
+        }
+    }
 }
 
 /// 解码一个 Responses body，保留任意 HTTP chunk 与 SSE 帧边界。
@@ -473,33 +493,8 @@ pub struct ResponsesSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ResponsesSseDecoder<'_> {
-    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        for frame in self
-            .frames
-            .push(chunk, provider_responses_stream_malformed_error)?
-        {
-            self.dispatch_event(frame)?;
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<Value, ProviderError> {
-        ResponsesSseDecoder::finish(self)
-    }
-
-    fn emitted_text_delta(&self) -> bool {
-        self.emitted_text_delta
-    }
-}
-
-impl<'a> ResponsesSseDecoder<'a> {
-    pub fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
-        Self {
-            frames: SseFrameDecoder::default(),
-            terminal_response: None,
-            emitted_text_delta: false,
-            on_event,
-        }
+    fn frame_malformed() -> fn(&'static str) -> ProviderError {
+        provider_responses_stream_malformed_error
     }
 
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
@@ -583,12 +578,29 @@ impl<'a> ResponsesSseDecoder<'a> {
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<Value, ProviderError> {
-        self.frames
-            .finish(provider_responses_stream_malformed_error)?;
+    fn materialize_terminal(&mut self) -> Result<Value, ProviderError> {
         self.terminal_response
             .clone()
             .ok_or_else(provider_responses_stream_terminal_missing_error)
+    }
+
+    fn emitted_text_delta(&self) -> bool {
+        self.emitted_text_delta
+    }
+
+    fn sse_frames(&mut self) -> &mut SseFrameDecoder {
+        &mut self.frames
+    }
+}
+
+impl<'a> ResponsesSseDecoder<'a> {
+    pub fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+        Self {
+            frames: SseFrameDecoder::default(),
+            terminal_response: None,
+            emitted_text_delta: false,
+            on_event,
+        }
     }
 }
 
@@ -598,10 +610,13 @@ fn provider_stream_malformed_error(
     code: &'static str,
     reason: &'static str,
 ) -> ProviderError {
-    let mut error = ModelError::new(ModelErrorKind::JsonSchemaViolation, message)
-        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
-    error.validation_errors.push(reason.to_string());
-    ProviderError::from_model_error(error)
+    ProviderError::from_model_error(ModelError::diagnostic(
+        ModelErrorKind::JsonSchemaViolation,
+        message,
+        code,
+        ProviderErrorStage::ResponseValidation,
+        vec![reason.to_string()],
+    ))
 }
 
 pub fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
@@ -624,40 +639,33 @@ pub(super) fn provider_stream_terminal_error(
     code: &'static str,
     message: &'static str,
 ) -> ProviderError {
-    let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
-        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
-    error.validation_errors.push(code.to_string());
-    ProviderError::from_model_error(error)
+    ProviderError::from_model_error(ModelError::diagnostic(
+        ModelErrorKind::UnknownProviderError,
+        message,
+        code,
+        ProviderErrorStage::ResponseValidation,
+        vec![code.to_string()],
+    ))
 }
 
 pub(super) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
-    let mut error = ModelError::new(
+    ProviderError::from_model_error(ModelError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream did not contain a completed terminal",
-    )
-    .with_provider_diagnostic(
         "responses_stream_terminal_missing",
         ProviderErrorStage::ResponseValidation,
-    );
-    error
-        .validation_errors
-        .push("responses_stream_terminal_missing".to_string());
-    ProviderError::from_model_error(error)
+        vec!["responses_stream_terminal_missing".to_string()],
+    ))
 }
 
 pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
-    let mut error = ModelError::new(
+    ProviderError::from_model_error(ModelError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         "provider stream exceeded the fixed safety limit",
-    )
-    .with_provider_diagnostic(
         "provider_response_stream_too_large",
         ProviderErrorStage::ResponseBodyRead,
-    );
-    error
-        .validation_errors
-        .push("provider_response_stream_too_large".to_string());
-    ProviderError::from_model_error(error)
+        vec!["provider_response_stream_too_large".to_string()],
+    ))
 }
 
 #[cfg(test)]

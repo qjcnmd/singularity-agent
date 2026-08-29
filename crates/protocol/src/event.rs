@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::envelope::JsonRpcMessage;
-use crate::params::{Thread, Turn};
+use crate::params::Turn;
 
 /// `agent/diagnostic` 事件携带的稳定诊断代码词表。
 pub mod diagnostic_code {
@@ -118,9 +118,6 @@ pub enum TurnEvent {
         turn: Turn,
         error: TurnErrorDetail,
     },
-    ThreadSettingsApplied {
-        thread: Thread,
-    },
 }
 
 impl TurnEvent {
@@ -140,7 +137,6 @@ impl TurnEvent {
             Self::ProviderAttempt { .. } => "provider/attempt",
             Self::TurnCompleted { .. } => "turn/completed",
             Self::TurnFailed { .. } => "turn/error",
-            Self::ThreadSettingsApplied { .. } => "thread/settingsApplied",
         }
     }
 }
@@ -169,7 +165,6 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
                 "message": error.message,
             },
         }),
-        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": thread}),
         TurnEvent::ItemStarted {
             thread_id,
             turn_id,
@@ -611,19 +606,6 @@ mod tests {
                 },
                 r#"{"jsonrpc":"2.0","method":"turn/error","params":{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
-            ),
-            (
-                "thread/settingsApplied",
-                TurnEvent::ThreadSettingsApplied {
-                    thread: Thread {
-                        thread_id: "thread-1".to_string(),
-                        cwd: "C:\\work".to_string(),
-                        model: Some("opencode-go/deepseek-v4-flash#max".to_string()),
-                        last_turn_status: Some(TurnStatus::Completed),
-                    },
-                },
-                r#"{"jsonrpc":"2.0","method":"thread/settingsApplied","params":{"thread":{"cwd":"C:\\work","lastTurnStatus":"completed","model":"opencode-go/deepseek-v4-flash#max","threadId":"thread-1"}}}"#,
-                r#"{"thread":{"cwd":"C:\\work","lastTurnStatus":"completed","model":"opencode-go/deepseek-v4-flash#max","threadId":"thread-1"}}"#,
             ),
         ];
         for (method, event, notification, jsonl_params) in cases {

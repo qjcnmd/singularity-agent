@@ -151,12 +151,10 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 Err(_) => break,
             };
             line_number += 1;
-            // 正则始终对完整原始行匹配；行尾 \n 与 CRLF 的 \r 先剥除，
-            // 展示截断只作用于命中行的输出文本。
+            // 正则对剥除行尾后的整行匹配；read_bounded_line 已剥除换行，
+            // 无终态换行的 CRLF 末行残留的 \r 在此剥除，展示截断只作用于
+            // 命中行的输出文本。
             let mut line_end = bytes.len();
-            if line_end > 0 && bytes[line_end - 1] == b'\n' {
-                line_end -= 1;
-            }
             if line_end > 0 && bytes[line_end - 1] == b'\r' {
                 line_end -= 1;
             }

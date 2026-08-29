@@ -88,7 +88,7 @@ fn create_append_reopen_roundtrip() {
         opened.entries().last().expect("content entry").id(),
         leaf.as_str()
     );
-    let entries = opened.build_context_entries().unwrap();
+    let entries = opened.build_context_entries();
     assert_eq!(entry_ids(&entries), vec![id1, id2, id3]);
     for entry in &entries {
         assert_eq!(entry.id().len(), 8);
@@ -144,7 +144,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
 
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
-    let entries = reopened.build_context_entries().unwrap();
+    let entries = reopened.build_context_entries();
     assert_eq!(entry_ids(&entries), vec![m1, m2, s1, m3]);
     // 线性事实源：entries 依次落盘，id 无重复。
     assert_eq!(
@@ -503,7 +503,7 @@ fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
     drop(reopened);
 
     let reopened = SessionManager::open_existing(&file).unwrap();
-    let entries = reopened.build_context_entries().unwrap();
+    let entries = reopened.build_context_entries();
     let tool_results = entries
         .iter()
         .filter_map(|entry| match &entry {
@@ -545,15 +545,15 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     );
     std::fs::write(&file, format!("{prefix}{{\"type\":\"message\",\"id\":\"")).unwrap();
     let opened = SessionManager::open_existing(&file).unwrap();
-    assert_eq!(opened.build_context_entries().unwrap().len(), 1);
+    assert_eq!(opened.build_context_entries().len(), 1);
     assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
     drop(opened);
     let mut reopened = SessionManager::open_existing(&file).unwrap();
-    assert_eq!(reopened.build_context_entries().unwrap().len(), 1);
+    assert_eq!(reopened.build_context_entries().len(), 1);
     reopened.append_message(user("after repair")).unwrap();
     drop(reopened);
     let reopened_again = SessionManager::open_existing(&file).unwrap();
-    assert_eq!(reopened_again.build_context_entries().unwrap().len(), 2);
+    assert_eq!(reopened_again.build_context_entries().len(), 2);
 
     let missing_newline = dir
         .path()
@@ -568,7 +568,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     )
     .unwrap();
     let opened = SessionManager::open_existing(&missing_newline).unwrap();
-    assert_eq!(opened.build_context_entries().unwrap().len(), 1);
+    assert_eq!(opened.build_context_entries().len(), 1);
     assert!(std::fs::read(&missing_newline).unwrap().ends_with(b"\n"));
 }
 
@@ -670,10 +670,10 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
 fn append_io_failure_does_not_advance_memory() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let before = manager.build_context_entries().unwrap();
+    let before = manager.build_context_entries();
     manager.file = dir.path().to_path_buf();
     assert!(manager.append_message(user("must fail")).is_err());
-    assert_eq!(manager.build_context_entries().unwrap(), before);
+    assert_eq!(manager.build_context_entries(), before);
     assert!(manager.entries().is_empty());
 }
 

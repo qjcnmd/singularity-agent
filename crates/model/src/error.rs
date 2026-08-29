@@ -102,6 +102,22 @@ impl ModelError {
         self
     }
 
+    /// Provider 诊断型错误的单一构造核心：kind/message、diagnostic（code +
+    /// stage）与 validation errors 在此一次写全；各协议字面词构造器只保留
+    /// 自己的词形与归属链（provider/model 名经 `with_provider`/`with_model`
+    /// 续链）。
+    pub(crate) fn diagnostic(
+        kind: ModelErrorKind,
+        message: impl Into<String>,
+        diagnostic_code: impl Into<String>,
+        stage: ProviderErrorStage,
+        validation_errors: Vec<String>,
+    ) -> Self {
+        let mut error = Self::new(kind, message).with_provider_diagnostic(diagnostic_code, stage);
+        error.validation_errors = validation_errors;
+        error
+    }
+
     /// 归类为公共模型错误类别。
     pub fn category(&self) -> ModelErrorCategory {
         contract::model_error_category(self)

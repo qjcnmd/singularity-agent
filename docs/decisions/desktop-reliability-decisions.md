@@ -249,3 +249,21 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 选择：消除平行枚举与重复词表，protocol 成为 wire 形状、事件枚举与状态词表的单一权威事实源；runtime 负责执行语义并将具体 model 失败映射至 protocol 的 `TurnFailureCause`。
 影响：跨层类型和错误词形零冗余，golden 测试单点守护线格式。
 验收方式：protocol 与 runtime 测试全绿，错误词表一致性测试通过。
+
+### D-055：Thread 设置立即生效（取代 D-048）
+
+问题：D-048 的排队机制（待生效意图合并、终态自动应用、`thread/settingsApplied` 事件、协议 `queued` 字段）是为「活动轮期间可改设置且当前轮不变」这一自设需求引入的全链机制；对照 pi 与 codex 均无排队设计，属过度实现。
+参考实现：codex 设置更新立即生效（`core/session/mod.rs` 会话配置就地更新）；pi `setModel` 立即应用（`agent-session.ts`）。
+当前代码事实：`Conversation::queue_settings` 在提交点一次完成校验、内存投影更新与 `thread_settings` metadata 持久化；`SettingsApplyTiming` 只剩 `AppliedNow`/`NothingToApply`；`thread/settingsApplied` 事件与协议 `queued` 字段已删除。
+选择：设置修改立即校验、立即持久化、立即生效（当前 turn 保持启动时 selector，下一 turn 读取生效）；turn 执行期间写者锁被占用，持久化失败回滚内存投影并报错，设置修改在 turn 间隙提交。空 patch 返回 `NothingToApply`。
+影响：删除排队意图、字段合并、终态应用与事件发布全链；任何时刻 thread/list 与 thread/read 只读已落盘值的不变量由「提交点持久化」直接保证。
+验收方式：runtime 预订窗口测试断言提交点立即持久化；protocol golden 事件表无 `thread/settingsApplied`；workspace 测试全绿。
+
+### D-056：设置落盘移到 turn 边界记录（修订 D-055）
+
+问题：D-055 的「提交点持久化」要求变更提交点获取会话写者锁；turn 执行期间锁被活动 turn 占用，「运行中改设置」因此成为报错场景，而参考实现在该场景下正常接受——提交点写文件是把持久化放在了错误的层。
+参考实现：codex `core/src/session/mod.rs` 的 `update_settings` 只做内存就地更新、不落盘（thread_settings 更新仅发不物化的通知事件），持久化由 turn 自身开始时写入的 TurnContext 记录承载；协议语义为「for subsequent turns」（`app-server-protocol/src/protocol/v2/thread.rs`）。
+当前代码事实：`Conversation::update_settings` 在提交点只做校验与内存投影更新；`thread_settings` 的落盘由 `TurnRunner::run` 在 turn 开始时、于本轮已打开的同一会话写者上执行（`record_thread_settings_metadata`，与最后一条已记录值相同则跳过，位于 `turn_started` 之前），失败映射为 `Preparation { cause: Store }`。
+选择：对齐 codex 的 turn 边界记录编排——变更提交点只更新内存投影（运行中与空闲同路径，提交点不会因写者锁冲突失败）；持久化发生在下一 turn 开始时由 turn 记录；空 patch 返回 `NothingToApply`。
+影响：删除提交点持久化与回滚分支；thread/list、thread/read 在下一 turn 运行前显示旧值（只读已落盘值的不变量由定义保持）；进程在下一次 turn 开始前崩溃会丢失未记录的变更，与 codex 一致。
+验收方式：runtime 预订窗口测试断言提交点零写入；新增写者锁占用下的 mid-turn 提交测试（提交被接受、下一 turn 开始记录新 selector）；workspace 测试全绿。

@@ -39,6 +39,8 @@ pub(crate) enum NoteStyle {
     Warning,
     Error,
     Accent,
+    /// 本地回显的用户消息；与 assistant 文本（默认前景色）区分。
+    User,
 }
 
 impl NoteStyle {
@@ -49,6 +51,7 @@ impl NoteStyle {
             Self::Warning => Style::new().fg(Color::Yellow),
             Self::Error => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             Self::Accent => Style::new().fg(Color::Cyan),
+            Self::User => Style::new().fg(Color::Blue),
         }
     }
 }
@@ -149,7 +152,11 @@ pub(crate) struct Transcript {
 
 impl Transcript {
     pub fn new() -> Self {
-        Self::default()
+        // 思考默认折叠（Ctrl+T 展开）：实时思考与历史重放都不刷屏。
+        Self {
+            thinking_collapsed: true,
+            ..Self::default()
+        }
     }
 
     /// 统一追加点：条目入列时同步扩展缓存槽位。
@@ -163,6 +170,15 @@ impl Transcript {
         self.flush_assistant();
         self.push_item(FlowItem::Text {
             style,
+            text: text.into(),
+        });
+    }
+
+    /// 本地回显一条已提交的用户消息（独立样式，区别于 assistant 文本）。
+    pub fn push_user(&mut self, text: impl Into<String>) {
+        self.flush_assistant();
+        self.push_item(FlowItem::Text {
+            style: NoteStyle::User,
             text: text.into(),
         });
     }

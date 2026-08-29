@@ -8,7 +8,7 @@
 //!    判定，首轮或 usage 缺失时使用本轮装配估算；超过「上下文窗口 −
 //!    `reserve_tokens` 预留」即触发，预留空间供模型回答使用。
 //! 2. **切点查找**（`find_cut_point_in_range`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
-//!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
+//!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。
 //! 4. **持久化落盘**（`SessionManager::append_compaction`）：将生成的 `CompactionEntry` 写入会话文件，
@@ -128,7 +128,6 @@ pub struct CompactionConfig {
     /// `context_window - reserve_tokens` 时在请求前触发压缩。
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
-    pub summary_max_tokens: u32,
 }
 
 impl Default for CompactionConfig {
@@ -136,15 +135,14 @@ impl Default for CompactionConfig {
         Self {
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
-            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
         }
     }
 }
 
 impl CompactionConfig {
     /// 校验压缩策略：`reserve_tokens` 必须小于 `context_window`（为上下文内容
-    /// 留出空间），近期保留预算与摘要输出上限必须为正；非法配置 fail closed。
-    pub fn validate(&self, context_window: u64, provider_max_output_tokens: u32) -> Result<()> {
+    /// 留出空间），近期保留预算必须为正；非法配置 fail closed。
+    pub fn validate(&self, context_window: u64) -> Result<()> {
         if self.keep_recent_tokens == 0 {
             return Err(CompactionError::Config(
                 "keep_recent_tokens must be positive".to_string(),
@@ -153,11 +151,6 @@ impl CompactionConfig {
         if self.reserve_tokens >= context_window {
             return Err(CompactionError::Config(format!(
                 "reserve_tokens must be smaller than the model context window ({context_window})"
-            )));
-        }
-        if self.summary_max_tokens == 0 || self.summary_max_tokens > provider_max_output_tokens {
-            return Err(CompactionError::Config(format!(
-                "summary_max_tokens must be positive and no greater than provider output limit ({provider_max_output_tokens})"
             )));
         }
         Ok(())
@@ -222,38 +215,10 @@ pub enum CompactionError {
 /// `compact` 结果别名。
 pub type Result<T> = std::result::Result<T, CompactionError>;
 
-/// 切点查找的内部计算结果（穷尽两态：切点落在条目上，或超长单轮被切开）。
-#[derive(Debug, Clone, PartialEq)]
-enum CutWindow {
-    /// 保留区自该条目起（条目不保证是轮边界；轮起点定位失败时也回落此态）。
-    FromEntry { first_kept_entry_index: usize },
-    /// 超长单轮被切开：保留区自 `first_kept_entry_index` 起，其所属轮起始于
-    /// `turn_start_index`，轮内被切掉的前缀另出摘要。
-    SplitTurn {
-        turn_start_index: usize,
-        first_kept_entry_index: usize,
-    },
-}
-
-impl CutWindow {
-    fn first_kept_entry_index(&self) -> usize {
-        match self {
-            CutWindow::FromEntry {
-                first_kept_entry_index,
-            }
-            | CutWindow::SplitTurn {
-                first_kept_entry_index,
-                ..
-            } => *first_kept_entry_index,
-        }
-    }
-}
-
 /// 上下文压缩引擎：负责判定触发时机、查找安全切点并调用模型生成结构化摘要。
 pub struct CompactionEngine {
     provider: Arc<dyn Provider + Send + Sync>,
     model_preferences: ModelPreferences,
-    summary_max_tokens: u32,
     /// 摘要请求与正常采样共用同一 agent 层重试策略。
     retry: TurnRetryConfig,
 }
@@ -264,7 +229,6 @@ impl CompactionEngine {
         Self {
             provider,
             model_preferences: ModelPreferences::default(),
-            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
             retry: TurnRetryConfig::default(),
         }
     }
@@ -272,12 +236,6 @@ impl CompactionEngine {
     /// 绑定摘要请求的模型偏好配置（如模型名称、温度等）。
     pub fn with_model_preferences(mut self, preferences: ModelPreferences) -> Self {
         self.model_preferences = preferences;
-        self
-    }
-
-    /// 绑定摘要生成的独立输出上限。
-    pub fn with_summary_max_tokens(mut self, summary_max_tokens: u32) -> Self {
-        self.summary_max_tokens = summary_max_tokens;
         self
     }
 
@@ -291,11 +249,6 @@ impl CompactionEngine {
     /// 恰好等于阈值不触发。
     pub fn should_compact(&self, context_tokens: u64, budget: &CompactionBudget) -> bool {
         context_tokens > budget.threshold_tokens()
-    }
-
-    /// 估算文本的 Token 消耗：按字符编码启发式估算（`ceil(UTF-16 字符数 / 4)`）。
-    pub fn estimate_tokens(&self, text: &str) -> u64 {
-        estimate_tokens_of(text)
     }
 
     /// 将消息列表序列化为适合输入给摘要模型的纯文本对话格式。
@@ -373,7 +326,7 @@ impl CompactionEngine {
         tokens_before: u64,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let entries = session.build_context_entries()?;
+        let entries = session.build_context_entries();
         if entries.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
@@ -398,13 +351,12 @@ impl CompactionEngine {
             },
             _ => 0,
         };
-        let cut = self.find_cut_point_in_range(
+        let first_kept_index = self.find_cut_point_in_range(
             &entries,
             boundary_start,
             entries.len(),
             budget.retain_tokens(),
         );
-        let first_kept_index = cut.first_kept_entry_index();
         let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..first_kept_index]
             .iter()
             .filter_map(message_from_entry)
@@ -467,21 +419,20 @@ impl CompactionEngine {
         })
     }
 
-    /// 在指定范围内查找安全切点。
+    /// 在指定范围内查找安全切点，返回保留区首个条目下标（条目不保证是
+    /// 轮边界；轮起点定位失败时回落到范围起点）。
     fn find_cut_point_in_range(
         &self,
         entries: &[SessionEntry],
         start_index: usize,
         end_index: usize,
         keep_recent_tokens: u64,
-    ) -> CutWindow {
+    ) -> usize {
         let cut_points: Vec<usize> = (start_index..end_index)
             .filter(|&index| is_cut_point_entry(&entries[index]))
             .collect();
         if cut_points.is_empty() {
-            return CutWindow::FromEntry {
-                first_kept_entry_index: start_index,
-            };
+            return start_index;
         }
         // 从最新条目向后回溯累加 Token 估算值，达到保留预算时选择 >= 当前条目的最近合法切点。
         // 切点绝不切在 ToolResult 上（ToolResult 必须紧随其 ToolCall 保持在同一侧）；
@@ -515,32 +466,16 @@ impl CompactionEngine {
             }
             cut_index -= 1;
         }
-        let starts_turn = is_turn_start_entry(&entries[cut_index]);
-        if starts_turn {
-            CutWindow::FromEntry {
-                first_kept_entry_index: cut_index,
-            }
-        } else {
-            match find_turn_start_index(entries, cut_index, start_index) {
-                Some(turn_start_index) => CutWindow::SplitTurn {
-                    turn_start_index,
-                    first_kept_entry_index: cut_index,
-                },
-                None => CutWindow::FromEntry {
-                    first_kept_entry_index: cut_index,
-                },
-            }
-        }
+        cut_index
     }
 
+    /// 摘要输出上限：显式偏好优先，否则用默认摘要预算；始终不超过 provider
+    /// 声明的输出上限。
     fn summary_max_output_tokens(&self) -> u32 {
-        self.summary_max_tokens
+        self.model_preferences
+            .max_output_tokens
+            .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS)
             .min(self.provider.protocol_contract().max_output_tokens)
-            .min(
-                self.model_preferences
-                    .max_output_tokens
-                    .unwrap_or(self.summary_max_tokens),
-            )
     }
 
     /// 执行摘要模型的具体补全调用，处理安全预算与错误映射。
@@ -672,9 +607,8 @@ fn message_token_estimate(message: &AgentMessage) -> u64 {
 /// 请求前上下文规模的唯一计量（参照 pi `estimateContextTokens = usageTokens +
 /// trailingTokens`）：provider 最后上报的 usage 与上报之后新增条目的估算合成。
 ///
-/// usage 基线缺失时（首轮、压缩重写后）返回 `None`，调用方以完整装配估算兜底；
-/// 装配固定项（tools schema、reasoning replay、输出预算与固定余量）属于估算
-/// 函数族（`estimate_assembled`/`entry_token_estimate`），ledger 只组合
+/// 内容计量由 [`entry_token_estimate`] 单点拥有；usage 基线缺失时（首轮、
+/// 压缩重写后）返回 `None`，调用方以「上下文条目估算求和」兜底，ledger 只组合
 /// "usage 基线 + 尾部增量"。
 pub(crate) struct ContextLedger {
     /// provider 最后上报的上下文 token 数（请求发出时的真实占用）。

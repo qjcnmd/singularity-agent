@@ -73,8 +73,10 @@ impl TuiApp {
         if let Some(rect) = editor_rect
             && rect_contains(rect, column, row)
         {
+            // 锚定上一帧实际视口顶行：跟随态滚动不跳到内容头。
+            let base = self.frame.last_editor_scroll_top;
             self.editor
-                .scroll_by(if up { -(rows as i32) } else { rows as i32 });
+                .scroll_by(if up { -(rows as i32) } else { rows as i32 }, base);
             return;
         }
         let (total, viewport) = self.flow_metrics();

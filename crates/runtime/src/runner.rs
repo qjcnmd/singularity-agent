@@ -2,7 +2,8 @@
 //!
 //! 从 app-server 生命周期层提取的协调事实：
 //! - 准备阶段 fail-fast：任何失败都不留下 turn 痕迹；
-//! - `turn_started` 先于一切事件落盘；terminal/usage metadata 先于终态事件；
+//! - 设置记录与本轮 `turn_started` 先于一切事件落盘；terminal/usage
+//!   metadata 先于终态事件；
 //! - 一个 turn 只打开一次会话文件，同一 [`SessionManager`] 贯穿全程；
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
@@ -19,7 +20,10 @@ use singularity_agent::session::{
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
-use singularity_model::{DEFAULT_MAX_CONTEXT_TOKENS, ModelUsage, Provider, ProviderConfigSnapshot};
+use singularity_model::{
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_PROVIDER_NAME, ModelUsage, Provider,
+    ProviderConfigSnapshot, split_model_selector,
+};
 use singularity_protocol::diagnostic_code;
 
 use crate::assistant_items::AssistantItemEvents;
@@ -27,10 +31,7 @@ use crate::error::{
     TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause,
 };
 use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
-use crate::objects::{
-    ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus,
-    turn_usage_from_model_usage,
-};
+use crate::objects::{ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
@@ -217,6 +218,12 @@ impl TurnRunner {
                     cause: TurnFailureCause::Store,
                     message: error.to_string(),
                 })?;
+        record_thread_settings_metadata(&mut session, &thread).map_err(|error| {
+            TurnRunError::Preparation {
+                cause: TurnFailureCause::Store,
+                message: error,
+            }
+        })?;
         append_turn_started_metadata(&mut session, &turn_id).map_err(|error| {
             TurnRunError::Preparation {
                 cause: TurnFailureCause::Store,
@@ -339,9 +346,7 @@ impl TurnRunner {
             turn_status: final_turn.status,
             final_text: status.final_answer.unwrap_or_default(),
             truncated: status.truncated,
-            usage: final_turn
-                .usage
-                .unwrap_or_else(|| turn_usage_from_model_usage(&ModelUsage::default(), false)),
+            usage: terminal.usage().clone(),
             undelivered_inputs: Vec::new(),
         })
     }
@@ -373,8 +378,7 @@ impl TurnRunner {
         };
         let (config, instructions_truncated) =
             agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, registry)?;
-        let provider_max_output_tokens = provider.protocol_contract().max_output_tokens;
-        let config = AgentConfig::prepare_for_provider_limits(config, provider_max_output_tokens)
+        let config = AgentConfig::prepare_for_provider_limits(config)
             .map_err(|error| PreparationFailure::internal(error.to_string()))?;
         Ok((provider, config, instructions_truncated))
     }
@@ -513,10 +517,19 @@ impl std::fmt::Display for RunnerError {
 fn turn_failure_cause(error: &RunnerError) -> TurnFailureCause {
     match error {
         RunnerError::Session(_) => TurnFailureCause::Store,
-        RunnerError::Agent(AgentError::Provider(provider_error)) => {
-            provider_turn_cause(&provider_error.error.kind)
+        RunnerError::Agent(agent_error) => agent_turn_failure_cause(agent_error),
+    }
+}
+
+/// RunFailed 是「已积累持久事实后的失败」包装：分类必须穿透包装还原权威
+/// 根因，否则带进度的 provider 失败会被误报为 internal。
+fn agent_turn_failure_cause(error: &AgentError) -> TurnFailureCause {
+    match error {
+        AgentError::Provider(provider_error) => provider_turn_cause(&provider_error.error.kind),
+        AgentError::RunFailed { error, .. } => agent_turn_failure_cause(error),
+        AgentError::Session(_) | AgentError::Compaction(_) | AgentError::Loop(_) => {
+            TurnFailureCause::Internal
         }
-        RunnerError::Agent(_) => TurnFailureCause::Internal,
     }
 }
 
@@ -539,6 +552,49 @@ fn append_turn_started_metadata(session: &mut SessionManager, turn_id: &str) -> 
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// 设置持久化点：变更提交点只更新内存投影（运行中同样接受），本函数在
+/// turn 开始时于本轮已打开的同一会话写者上记录当前 selector（对齐 codex
+/// 的 turn 边界记录）。与最后一条已记录值相同则跳过，不产生重复行；
+/// Thread 无模型覆盖时不记录。
+fn record_thread_settings_metadata(
+    session: &mut SessionManager,
+    thread: &Thread,
+) -> Result<(), String> {
+    let Some(selector) = thread.model.as_deref() else {
+        return Ok(());
+    };
+    let parts = split_model_selector(selector);
+    let already_recorded = session
+        .metadata_entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            SessionMetadata::ThreadSettings {
+                provider,
+                model,
+                reasoning,
+            } => Some((provider.as_deref(), model.as_str(), reasoning.as_deref())),
+            _ => None,
+        })
+        .is_some_and(|(provider, model, reasoning)| {
+            provider.filter(|value| !value.is_empty())
+                == Some(parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME))
+                && Some(model) == parts.model
+                && reasoning.filter(|value| !value.is_empty()) == parts.effort
+        });
+    if already_recorded {
+        return Ok(());
+    }
+    session
+        .append_metadata(SessionMetadata::thread_settings(
+            parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME),
+            parts.model.unwrap_or_default(),
+            parts.effort.map(str::to_string),
+        ))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// AgentLoop 结束时的中间状态投影；turn 终态是单字段事实，
@@ -675,4 +731,47 @@ fn agent_config_for_thread(
 
 fn tool_registry() -> ToolRegistry {
     ToolRegistry::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use singularity_model::{ModelError, ModelErrorKind, ProviderError};
+
+    fn run_failed(error: AgentError) -> RunnerError {
+        RunnerError::Agent(AgentError::RunFailed {
+            error: Box::new(error),
+            outcome: Box::new(singularity_agent::agent::AgentOutcome {
+                final_text: String::new(),
+                truncated: false,
+                turns: 1,
+                usage: singularity_model::ModelUsage::default(),
+                compacted: false,
+                usage_complete: false,
+                terminal_reason: singularity_agent::agent::AgentTerminalReason::Failed,
+            }),
+        })
+    }
+
+    /// 失败归因穿透 RunFailed 包装：带进度的 provider 失败不得退化为
+    /// internal（回归：turn_failure_cause 的递归分支）。
+    #[test]
+    fn run_failed_wrapped_provider_error_keeps_provider_cause() {
+        let provider = AgentError::Provider(ProviderError::from_model_error(ModelError::new(
+            ModelErrorKind::RateLimited,
+            "rate limited",
+        )));
+        assert_eq!(
+            turn_failure_cause(&run_failed(provider)),
+            TurnFailureCause::ProviderRateLimited
+        );
+    }
+
+    #[test]
+    fn run_failed_wrapped_loop_error_is_internal() {
+        assert_eq!(
+            turn_failure_cause(&run_failed(AgentError::Loop("invariant".to_string()))),
+            TurnFailureCause::Internal
+        );
+    }
 }

@@ -161,24 +161,16 @@ impl TuiApp {
             }
             KeyCode::Enter => {
                 let patch = menu.patch();
-                match self.conversation.queue_settings(patch) {
+                match self.conversation.update_settings(patch) {
                     Ok(result)
                         if result.timing
                             == singularity_runtime::SettingsApplyTiming::NothingToApply =>
                     {
                         menu.error = Some("nothing to change".into());
                     }
-                    Ok(result) => {
-                        let queued_now = result.timing
-                            == singularity_runtime::SettingsApplyTiming::QueuedForNextTurn;
-                        self.transcript.push_note(
-                            if queued_now {
-                                "settings queued; effective from the next turn"
-                            } else {
-                                "settings updated for this thread"
-                            },
-                            NoteStyle::Accent,
-                        );
+                    Ok(_) => {
+                        self.transcript
+                            .push_note("settings updated for this thread", NoteStyle::Accent);
                         self.settings = None;
                     }
                     Err(error) => menu.error = Some(error.to_string()),
