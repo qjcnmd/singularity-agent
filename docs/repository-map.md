@@ -232,7 +232,7 @@ flowchart TD
         dispatch["dispatch.rs — 请求分发与参数解析"]
         events["events.rs — 生命周期事件通知包装"]
         paths["paths.rs — 持久化路径投影"]
-        wire["wire.rs — 结构映射收口（Thread/ThreadStatus/Usage/Provider 状态投影）"]
+        wire["wire.rs — 结构映射收口（Thread 摘要投影）"]
         subgraph lifecycle["lifecycle/ — 投影适配器"]
             projection["projection.rs — TurnEvent → JSON-RPC 通知"]
         end

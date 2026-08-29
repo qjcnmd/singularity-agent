@@ -190,7 +190,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 ### D-046：会话索引进程内化（取代 D-011/D-016/D-031/D-035/D-037 的 SQLite 面）
 
-问题：既有裁决（D-011 持久事实与发布顺序、D-016 thread 设置存储、D-031 usage 持久化、D-035 thread 模型投影、D-037 索引修复）以 SQLite 会话索引为前提；该 store 层独立于 JSONL 唯一权威之外形成第二落盘事实，增加崩溃恢复与修复路径。参考实现：无（项目内部收敛）。当前代码事实：会话正文 JSONL 是唯一权威，进程内 `SessionIndex` 启动时从 JSONL 重建；SQLite store 层已删除。选择：会话索引只存在于进程内（定位与展示元数据缓存，启动重建、退出不落盘），不再有第二持久化索引；D-011/D-016/D-031/D-035/D-037 中「先写 JSONL 再更新 SQLite 索引」的时序语义由「先写 JSONL 再更新进程内索引」承接，其余不变。影响：无索引修复路径、无 SQLite 依赖；`session/delete` 只删 JSONL 与备份。验收方式：删除 SQLite store 层与依赖；JSONL 唯一权威链路（终态事件通知前完成写盘 + 索引更新）测试全绿。
+问题：既有裁决（D-011 持久事实与发布顺序、D-016 thread 设置存储、D-031 usage 持久化、D-035 thread 模型投影、D-037 索引修复）以 SQLite 会话索引为前提；该 store 层独立于 JSONL 唯一权威之外形成第二落盘事实，增加崩溃恢复与修复路径。参考实现：无（项目内部收敛）。当前代码事实：会话正文 JSONL 是唯一权威；进程内无常驻索引对象，列表、摘要与分页按需扫描顶层 JSONL 产生定位与展示元数据，退出不落盘。选择：不再有第二持久化索引；D-011/D-016/D-031/D-035/D-037 中「先写 JSONL 再更新 SQLite 索引」的时序语义由「先写 JSONL 再发布事件」（durable 先于发布）承接，其余不变。影响：无索引修复路径、无 SQLite 依赖；`session/delete` 把会话文件 rename 进 `archived/` 子目录归档保留（见架构文档归档条目）。验收方式：JSONL 唯一权威链路（终态事件发布前完成写盘）测试全绿。
 
 ### D-048：活动轮设置时序与索引一致性（D-030/D-035 的落地形态）
 
@@ -245,7 +245,7 @@ JSONL 追加成功而 SQLite 更新失败时保留 JSONL；下次打开从 JSONL
 
 问题：runtime 与 protocol 之间曾存在平行的终态枚举与错误原因词表，增加了跨层映射与词形同步负担。
 参考实现：项目内部收敛。
-当前代码事实：`TurnStatus`、`TurnFailureCause`、`TurnFailureStage` 以及 `ExecutionThread`/`ExecutionTurn`/`ExecutionTurnUsage` 统一在 `crates/protocol` 单点定义，runtime 直接引用并对外导出。
+当前代码事实：`Thread`、`Turn`、`TurnStatus`、`TurnModelUsage`、`TurnFailureCause`、`TurnFailureStage` 统一在 `crates/protocol` 单点定义，runtime 经 `objects.rs`/`error.rs` 原样再导出。
 选择：消除平行枚举与重复词表，protocol 成为 wire 形状、事件枚举与状态词表的单一权威事实源；runtime 负责执行语义并将具体 model 失败映射至 protocol 的 `TurnFailureCause`。
 影响：跨层类型和错误词形零冗余，golden 测试单点守护线格式。
 验收方式：protocol 与 runtime 测试全绿，错误词表一致性测试通过。

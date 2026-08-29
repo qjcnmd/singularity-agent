@@ -56,7 +56,6 @@ pub(crate) enum ToolPreflight {
 
 /// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调。
 pub struct ExecuteContext<'a> {
-    pub args: Value,
     pub cwd: &'a Path,
     pub signal: Option<&'a CancellationToken>,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,

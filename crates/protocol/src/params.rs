@@ -215,9 +215,9 @@ pub struct ThreadReadResult {
     pub title: Option<String>,
     pub model: Option<String>,
     /// 最近一次 turn 状态的投影，与 thread/list 的 `lastTurnStatus` 来自
-    /// 同一投影：尚无 turn 为 None，运行中 active，
+    /// 同一投影：尚无 turn 为 None，运行中 running，
     /// 终态 completed/failed/interrupted。
-    pub status: Option<ThreadStatus>,
+    pub status: Option<TurnStatus>,
     pub created_at: String,
     pub updated_at: String,
     pub token_usage: Value,
@@ -246,20 +246,10 @@ pub struct Thread {
     pub model: Option<String>,
     pub cwd: String,
     /// 最近一次/当前一次 turn 的展示元数据，来自 JSONL 会话投影：
-    /// 尚无 turn 时为 `None`（wire 上为 null），运行中为 active，终态为
-    /// completed/failed/interrupted。`sg continue` 不受此字段限制。
+    /// 尚无 turn 时为 `None`（wire 上为 null），运行中为 running，终态为
+    /// completed/failed/interrupted。
     #[serde(rename = "lastTurnStatus")]
-    pub last_turn_status: Option<ThreadStatus>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-/// JSONL 会话状态的协议投影：最近一次/当前一次 turn 的状态。
-pub enum ThreadStatus {
-    Active,
-    Completed,
-    Failed,
-    Interrupted,
+    pub last_turn_status: Option<TurnStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,20 +344,6 @@ impl TurnStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
-        }
-    }
-}
-
-/// Thread 的 `lastTurnStatus` 投影：它承载的正是最近一次 turn 的终态，
-/// 运行中的 turn 在 Thread 视角下记作 `active`。这张表是两枚举间唯一的
-/// 派生关系，客户端投影不得另行手写映射。
-impl From<TurnStatus> for ThreadStatus {
-    fn from(status: TurnStatus) -> Self {
-        match status {
-            TurnStatus::Running => Self::Active,
-            TurnStatus::Completed => Self::Completed,
-            TurnStatus::Failed => Self::Failed,
-            TurnStatus::Interrupted => Self::Interrupted,
         }
     }
 }

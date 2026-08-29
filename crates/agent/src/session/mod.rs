@@ -15,10 +15,10 @@ pub mod repair;
 pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind, TurnTerminalStatus,
+    SessionMetadataKind, TurnTerminalStatus, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionManager};
-pub use singularity_protocol::TurnModelUsage;
+pub use singularity_protocol::{TurnModelUsage, TurnStatus};
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// runtime 与 app-server 投影共享的 JSONL 派生事实。
@@ -30,18 +30,10 @@ pub struct SessionProjection {
     pub updated_at: String,
     pub title: Option<String>,
     pub model: Option<String>,
-    pub status: Option<SessionProjectionStatus>,
+    pub status: Option<TurnStatus>,
     pub latest_usage: Option<TurnModelUsage>,
     pub turn_count: usize,
     pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionProjectionStatus {
-    Active,
-    Completed,
-    Failed,
-    Interrupted,
 }
 
 pub const MAX_SESSION_TITLE_CHARS: usize = 120;
@@ -82,15 +74,10 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
         }
         if status.is_none() {
             status = match entry.kind() {
-                SessionMetadataKind::TurnStarted => Some(SessionProjectionStatus::Active),
-                SessionMetadataKind::TurnTerminal => match entry.terminal_status() {
-                    Some(TurnTerminalStatus::Completed) => Some(SessionProjectionStatus::Completed),
-                    Some(TurnTerminalStatus::Failed) => Some(SessionProjectionStatus::Failed),
-                    Some(TurnTerminalStatus::Interrupted) => {
-                        Some(SessionProjectionStatus::Interrupted)
-                    }
-                    None => None,
-                },
+                SessionMetadataKind::TurnStarted => Some(TurnStatus::Running),
+                SessionMetadataKind::TurnTerminal => {
+                    entry.terminal_status().map(TurnTerminalStatus::turn_status)
+                }
                 _ => None,
             };
         }

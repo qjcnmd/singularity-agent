@@ -36,7 +36,7 @@ pub use conversation::{
 };
 pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 pub use events::{TurnEvent, TurnEventSink};
-pub use objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
+pub use objects::{ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus};
 pub use runner::{TurnOutcome, TurnParams, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
@@ -51,24 +51,6 @@ pub use store::{
     prepare_session_dirs, thread_session_path,
 };
 pub use thread_catalog::ThreadCatalog;
-
-/// 测试支撑面：供依赖 crate 的集成测试构造会话、注入 provider 与复用核心
-/// 常量，不进入生产依赖图（`test-support` feature）。
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    pub use singularity_agent::message::{AgentMessage, AgentMessageRole, ContentBlock};
-    pub use singularity_agent::session::{
-        SessionManager, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
-    };
-    pub use singularity_core::{
-        CancellationToken, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
-        ensure_singularity_home_outside_workspace, find_workspace_root,
-    };
-    pub use singularity_model::{
-        ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
-        ProviderConfigSnapshot, ProviderError, ProviderProtocolContract, ProviderReasoningReplay,
-    };
-}
 
 #[cfg(test)]
 #[path = "../tests/conversation_tests.rs"]

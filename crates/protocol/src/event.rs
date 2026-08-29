@@ -387,7 +387,6 @@ pub enum TurnFailureCause {
     ProviderCancelled,
     ProviderContextOverflow,
     ProviderUnknown,
-    Serialization,
     Internal,
 }
 
@@ -406,7 +405,6 @@ impl TurnFailureCause {
             Self::ProviderCancelled => "provider_cancelled",
             Self::ProviderContextOverflow => "provider_context_overflow",
             Self::ProviderUnknown => "provider_unknown",
-            Self::Serialization => "serialization",
             Self::Internal => "internal",
         }
     }

@@ -30,6 +30,10 @@ pub(crate) struct BoundedLine {
     pub(crate) has_newline: bool,
 }
 
+/// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入；read 与 grep 经
+/// [`read_bounded_line`] 逐行读取不可信文件内容时共用这一个数值。
+pub(super) const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 /// 有界读取一行：单行超过 `max_bytes` 时返回 [`LineFailure::OverLimit`]，
 /// 携带截断到上限内的前缀并把该行剩余消费到换行。返回行剥除末尾换行与 CR。
 pub(super) fn read_bounded_line(

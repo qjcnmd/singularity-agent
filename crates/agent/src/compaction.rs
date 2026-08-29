@@ -28,7 +28,9 @@ use uuid::Uuid;
 
 use crate::agent::{AgentEvents, SendOutcome, TurnRetryConfig, send_with_retry};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
-use crate::session::{CompactionEntry, SessionEntry, SessionError, SessionManager};
+use crate::session::{
+    CompactionEntry, SessionEntry, SessionError, SessionManager, turn_usage_from_model_usage,
+};
 
 /// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
 /// `context_window - reserve_tokens` 时触发压缩。
@@ -459,7 +461,11 @@ impl CompactionEngine {
             summary: summary_text,
             first_kept_entry_id: Some(first_kept_entry_id.clone()),
             tokens_before: Some(tokens_before),
-            usage: summary.usage.usage_present.then_some(summary.usage.clone()),
+            // 摘要器是单次请求：报告了 usage 即完整。
+            usage: summary
+                .usage
+                .usage_present
+                .then(|| turn_usage_from_model_usage(&summary.usage, true)),
             details: Some(json!({
                 "readFiles": read_files,
                 "modifiedFiles": modified_files,

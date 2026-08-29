@@ -25,7 +25,7 @@ use singularity_protocol::{
     ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind,
     ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult,
-    ThreadStartParams, ThreadStartResult, ThreadStatus, Turn, TurnIdParams, TurnInjectionParams,
+    ThreadStartParams, ThreadStartResult, Turn, TurnIdParams, TurnInjectionParams,
     TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
 };
 use thiserror::Error;

@@ -13,22 +13,13 @@ use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus, turn_usage_from_model_usage};
 
 /// turn 终态到 JSONL 存储词形的唯一派生；`Running` 非终态返回 `None`。
+/// 反向回投是 `TurnTerminalStatus::turn_status`（agent 落盘形状自带）。
 fn terminal_word(status: TurnStatus) -> Option<TurnTerminalStatus> {
     match status {
         TurnStatus::Completed => Some(TurnTerminalStatus::Completed),
         TurnStatus::Failed => Some(TurnTerminalStatus::Failed),
         TurnStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
         TurnStatus::Running => None,
-    }
-}
-
-/// JSONL 存储的终态词形回投为 `TurnStatus`（`terminal_word` 的逆映射）。
-/// 读路径（历史投影）共用此单点，不再各自手写词形表。
-pub(crate) fn turn_status_for_terminal(status: TurnTerminalStatus) -> TurnStatus {
-    match status {
-        TurnTerminalStatus::Completed => TurnStatus::Completed,
-        TurnTerminalStatus::Failed => TurnStatus::Failed,
-        TurnTerminalStatus::Interrupted => TurnStatus::Interrupted,
     }
 }
 

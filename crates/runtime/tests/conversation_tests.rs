@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use crate::events::TurnEvent;
-use crate::objects::{ThreadStatus, TurnStatus};
+use crate::objects::TurnStatus;
 use crate::runner::{TurnOutcome, TurnRunner};
 use crate::store::{ThreadLockCoordinator, create_thread, resume_thread};
 use crate::{
@@ -476,7 +476,7 @@ fn successful_turn_emits_lifecycle_events_and_final_text() {
     // 终态 metadata 已落盘：resume 投影出 completed。
     let resumed =
         resume_thread(&sessions, &outcome.thread_id, &coordinator(&sessions)).expect("resume");
-    assert_eq!(resumed.last_turn_status, Some(ThreadStatus::Completed));
+    assert_eq!(resumed.last_turn_status, Some(TurnStatus::Completed));
 }
 
 #[test]
@@ -516,7 +516,7 @@ fn provider_failure_converges_to_failed_turn_with_terminal_event() {
     assert_eq!(methods.last().copied(), Some("turn/error"));
     let thread_id = conversation.thread().unwrap().thread_id;
     let resumed = resume_thread(&sessions, &thread_id, &coordinator(&sessions)).expect("resume");
-    assert_eq!(resumed.last_turn_status, Some(ThreadStatus::Failed));
+    assert_eq!(resumed.last_turn_status, Some(TurnStatus::Failed));
 }
 
 #[test]
@@ -623,7 +623,7 @@ fn interrupt_cancels_the_running_turn() {
     let resumed = resume_thread(&sessions, &thread_id, &coordinator(&sessions))
         .expect("resume")
         .last_turn_status;
-    assert_eq!(resumed, Some(ThreadStatus::Interrupted));
+    assert_eq!(resumed, Some(TurnStatus::Interrupted));
 }
 
 // ---------------------------------------------------------------------------

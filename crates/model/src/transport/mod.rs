@@ -545,9 +545,6 @@ impl OpenAiProvider {
             on_attempt,
         } = context;
         let streaming = on_event.is_some();
-        if streaming {
-            self.validate_reasoning_history(request, selection)?;
-        }
         let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
         let endpoint = adapter.endpoint(&self.config);
         let wire = WireRequestOptions::from_selection(selection);

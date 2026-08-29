@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use singularity_agent::session::{
-    SessionAccess, SessionEntry, SessionError, SessionManager, SessionProjectionStatus,
-    WriterLockCoordinator, project_session,
+    SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
+    project_session,
 };
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
 
 use crate::history::project_turn_history;
-use crate::objects::{Thread, ThreadStatus};
+use crate::objects::{Thread, TurnStatus};
 
 /// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径，stale
 /// 清理每进程只发生一次。从 store 层向下传给 `SessionManager`。
@@ -29,7 +29,7 @@ pub struct ThreadSummary {
     pub cwd: String,
     pub title: Option<String>,
     pub model: Option<String>,
-    pub status: Option<ThreadStatus>,
+    pub status: Option<TurnStatus>,
     pub created_at: String,
     pub updated_at: String,
     pub token_usage: serde_json::Value,
@@ -120,12 +120,10 @@ pub fn resume_thread(
         thread_id: thread_id.to_string(),
         cwd: session.cwd().to_string_lossy().to_string(),
         model: projection.model,
-        last_turn_status: projection.status.and_then(|status| match status {
-            SessionProjectionStatus::Completed => Some(ThreadStatus::Completed),
-            SessionProjectionStatus::Failed => Some(ThreadStatus::Failed),
-            SessionProjectionStatus::Interrupted => Some(ThreadStatus::Interrupted),
-            SessionProjectionStatus::Active => None,
-        }),
+        // resume 视图只投影已终结的 turn；未终态的活跃事实由重开修复收敛。
+        last_turn_status: projection
+            .status
+            .filter(|status| *status != TurnStatus::Running),
     };
     Ok(thread)
 }
@@ -193,12 +191,7 @@ fn thread_summary(session: &SessionManager) -> ThreadSummary {
         cwd: projection.cwd,
         title: projection.title,
         model: projection.model,
-        status: projection.status.map(|status| match status {
-            SessionProjectionStatus::Active => ThreadStatus::Active,
-            SessionProjectionStatus::Completed => ThreadStatus::Completed,
-            SessionProjectionStatus::Failed => ThreadStatus::Failed,
-            SessionProjectionStatus::Interrupted => ThreadStatus::Interrupted,
-        }),
+        status: projection.status,
         created_at: projection.created_at,
         updated_at: projection.updated_at,
         // 无 usage 的会话保持空对象形状；序列化恒不失败（本仓静态类型）。
@@ -463,7 +456,7 @@ mod tests {
             page.turns[1].status,
             Some(singularity_protocol::TurnStatus::Running)
         );
-        assert_eq!(page.summary.status, Some(ThreadStatus::Active));
+        assert_eq!(page.summary.status, Some(TurnStatus::Running));
         assert_eq!(page.compaction_summary, None);
         assert_eq!(page.summary.turn_count, 2);
         // 终态 usage 并入轮内条目。

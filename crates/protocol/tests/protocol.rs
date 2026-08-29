@@ -5,9 +5,9 @@ use serde_json::json;
 use singularity_protocol::{
     ClientInfo, DiagnosticSeverity, EmptyParams, ErrorCode, InitializeParams, JsonRpcId,
     JsonRpcInbound, JsonRpcMessage, Method, MethodKind, ProviderAttemptStatus, Thread,
-    ThreadReadParams, ThreadStartParams, ThreadStatus, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnInjectionParams, TurnModelUsage, TurnStartParams,
-    TurnStatus, parse_json_rpc_payload, turn_event_notification, turn_event_params,
+    ThreadReadParams, ThreadStartParams, Turn, TurnErrorDetail, TurnEvent, TurnFailureCause,
+    TurnFailureStage, TurnInjectionParams, TurnModelUsage, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload, turn_event_notification, turn_event_params,
 };
 #[test]
 fn json_rpc_requires_the_2_0_version_member() {
@@ -351,7 +351,7 @@ fn turn_event_wire_goldens() {
                     thread_id: "thread-1".to_string(),
                     cwd: "C:\\work".to_string(),
                     model: Some("opencode-go/deepseek-v4-flash#max".to_string()),
-                    last_turn_status: Some(ThreadStatus::Completed),
+                    last_turn_status: Some(TurnStatus::Completed),
                 },
             },
             r#"{"jsonrpc":"2.0","method":"thread/settingsApplied","params":{"thread":{"cwd":"C:\\work","lastTurnStatus":"completed","model":"opencode-go/deepseek-v4-flash#max","threadId":"thread-1"}}}"#,
@@ -409,7 +409,6 @@ fn failure_taxonomy_wire_words_are_stable() {
             "provider_context_overflow",
         ),
         (TurnFailureCause::ProviderUnknown, "provider_unknown"),
-        (TurnFailureCause::Serialization, "serialization"),
         (TurnFailureCause::Internal, "internal"),
     ] {
         assert_eq!(cause.wire_str(), word);
@@ -472,22 +471,12 @@ fn json_rpc_id_is_numeric_only_and_rejects_large_u64_and_string_ids() {
 }
 
 #[test]
-fn thread_status_projects_last_turn_metadata_not_lifecycle() {
-    // `ThreadStatus` 是 turn 终态的投影：`From<TurnStatus>` 表在 protocol 单点。
-    for (turn, expected) in [
-        (TurnStatus::Running, ThreadStatus::Active),
-        (TurnStatus::Completed, ThreadStatus::Completed),
-        (TurnStatus::Failed, ThreadStatus::Failed),
-        (TurnStatus::Interrupted, ThreadStatus::Interrupted),
-    ] {
-        assert_eq!(ThreadStatus::from(turn), expected);
-    }
-
+fn thread_wire_projects_last_turn_metadata() {
     let thread = singularity_protocol::Thread {
         thread_id: "session-1".to_string(),
         model: None,
         cwd: "/tmp/work".to_string(),
-        last_turn_status: Some(ThreadStatus::Completed),
+        last_turn_status: Some(TurnStatus::Completed),
     };
     let wire = serde_json::to_value(&thread).expect("thread wire");
     assert_eq!(wire["threadId"], "session-1");

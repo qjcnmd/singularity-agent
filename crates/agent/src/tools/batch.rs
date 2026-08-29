@@ -28,7 +28,6 @@ pub(crate) fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecuti
 fn execute_prepared_tool(
     registry: &ToolRegistry,
     prepared: PreparedTool,
-    call: &ModelToolCall,
     cwd: &Path,
     cancellation: &CancellationToken,
     mut on_update: impl FnMut(&str),
@@ -37,7 +36,6 @@ fn execute_prepared_tool(
     registry.execute_prepared(
         prepared,
         ExecuteContext {
-            args: call.arguments.clone(),
             cwd,
             signal: Some(cancellation),
             on_update: Some(&mut update),
@@ -81,7 +79,7 @@ pub(crate) fn execute_tool_batch(
                 let prepared = prepared.clone();
                 let call = item.call.clone();
                 let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_prepared_tool(registry, prepared, &call, cwd, cancellation, |text| {
+                    execute_prepared_tool(registry, prepared, cwd, cancellation, |text| {
                         emit(
                             events,
                             AgentEvent::ToolExecutionUpdate {

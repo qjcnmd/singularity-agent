@@ -43,7 +43,7 @@ sg --print|--json <goal>
   │    │    ├─ fail-fast 准备（workspace/provider/config/项目指令/会话修复）
   │    │    ├─ turn_started metadata 落盘 → 发布 turn/started
   │    │    ├─ AgentLoop 执行(三层分层:轮步/采样请求/纯发送,工具批、steer 注入)
-  │    │    ├─ 终态 metadata + usage 落盘（有界重试一次，失败即 fail-stop）
+  │    │    ├─ 终态 metadata + usage 单条落盘（幂等跳过；失败即 fail-stop）
   │    │    └─ 发布 item/turn 终态事件
   │    ├─ 终态后自动持久化待生效设置（若有）→ 下一轮用新 selector
   │    └─ 按 FIFO 启动已接受的 followUp 为独立新 turn，直到队列清空
@@ -92,7 +92,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - 严格 JSONL v3：首行 header（id/version/cwd/timestamp），header version 必须等于当前版本，非当前版本直接拒绝打开；metadata 载荷的 usage 七个键全部必填、只认 camelCase，终态条目的完整性标志由 `usage.usageComplete` 单点承载；未知字段写入即拒绝。metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 app-server 共用同一只读投影 API。
 - 列表、存在性检查、设置基线与读取头字段均按需扫描或读取 JSONL；摘要统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
-- 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
+- 发布次序：durable JSONL 先于事件发布；terminal metadata 单条落盘失败时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
 - 归档：会话删除是归档保留（参照 codex rollout 的 `archived_sessions`）——在持写者锁与 live-turn 拒绝护栏下，把会话文件从 sessions 顶层 rename 进 `archived/` 子目录；列表、摘要与分页只扫描顶层 `.jsonl`，归档会话自动隐藏，重复归档按未找到收敛。协议方法名 `session/delete` 与其线格式字段不变，仅语义由物理删除改为归档。
 - 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::queue_settings` 是唯一入口——空闲时立即校验并持久化（`AppliedNow`），活动 turn 期间合并为单份待生效意图（`QueuedForNextTurn`）并在轮终态收敛后自动应用（下一轮读取生效，当前轮保持启动时 selector），空 patch 返回 `NothingToApply`；设置持久化失败保留意图并中止链条返回可行动错误。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）；合并待生效意图时 Keep 不覆盖已有意图、Set/Clear 覆盖。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。app-server 的 `thread/settings` 在排队时同步返回 `queued=true`，终态后随 `thread/settingsApplied` 事件投影——任何时刻 thread/list 与 thread/read 都只读已落盘值。

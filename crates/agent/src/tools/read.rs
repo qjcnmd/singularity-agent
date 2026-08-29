@@ -7,11 +7,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
+use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
-/// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入。
-const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 pub(crate) const NAME: &str = "read";
 
@@ -208,5 +207,5 @@ fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
     selected_content
 }
 
-/// 有界读取一行：单行超过 MAX_READ_LINE_BYTES 时 fail closed，不分配无界内存。
+/// 行读取失败类型：与 grep 共用 `super::line` 的有界读取原语。
 type ReadFailure = super::line::LineFailure;

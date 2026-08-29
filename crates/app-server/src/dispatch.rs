@@ -94,12 +94,6 @@ fn map_store_error(
 }
 
 impl AppServer {
-    /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
-    pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
-        let message: JsonRpcMessage = serde_json::from_str(line)?;
-        self.handle_with_output(message)
-    }
-
     /// 处理请求并返回生成的协议消息；传输 writer 负责全局输出顺序，dispatch 不假设 turn 执行顺序。
     pub fn handle_with_output(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let notification = message.is_notification();
@@ -334,11 +328,11 @@ impl AppServer {
             }
         };
         // 与 thread/list 复用同一 last-turn 投影，两个读取接口不得显示互相
-        // 矛盾的状态：末组 running 只有在整体 active（存在存活 turn）时保留；
-        // 崩溃遗留投影为 interrupted。
+        // 矛盾的状态：末组 running 只有在 `lastTurnStatus` 为 running（存在
+        // 存活 turn）时保留；崩溃遗留投影为 interrupted。
         let overall_status = self.project_thread(&page.summary)?.last_turn_status;
         let mut turns = page.turns;
-        if overall_status != Some(ThreadStatus::Active)
+        if overall_status != Some(TurnStatus::Running)
             && turns
                 .last_mut()
                 .is_some_and(|last| last.status == Some(TurnStatus::Running))
@@ -542,10 +536,7 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
-        json_response(
-            message.required_id(),
-            crate::wire::provider_configuration(&self.turn_runner.provider_status()),
-        )
+        json_response(message.required_id(), self.turn_runner.provider_status())
     }
 
     pub(crate) fn server_shutdown(

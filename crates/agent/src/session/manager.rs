@@ -173,10 +173,10 @@ impl SessionManager {
         Ok(opened)
     }
 
-    /// 为有界 discovery/index 重建打开既有 rollout。
+    /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
-    /// 此接缝在持有正常追加锁时校验完整文件，但绝不截断 torn tail 或
-    /// 补末尾换行；需要正常重开修复路径的文件被拒绝。
+    /// 此接缝不获取写者锁、不做任何写入：仅校验完整文件，需要正常
+    /// 重开修复路径的文件被拒绝。
     pub fn open_existing_read_only(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(SessionError::InvalidSession(format!(

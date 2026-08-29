@@ -312,7 +312,7 @@ impl Editor {
                     let mut used = 0usize;
                     let mut chars = 0usize;
                     for ch in line.chars().skip(char_start) {
-                        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+                        let ch_width = super::char_display_width(ch);
                         if used + ch_width > target_col || used + ch_width > width {
                             break;
                         }

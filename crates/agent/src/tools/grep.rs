@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
 use super::glob::glob_regex;
+use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
 use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
@@ -18,8 +19,6 @@ pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expres
 const MAX_MATCHES: usize = 500;
 /// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
-/// 单行硬上限：超过即跳过整个文件（与 read 工具的有界读取一致）。
-const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
@@ -221,7 +220,6 @@ mod tests {
 
         let cancellation = CancellationToken::new();
         let make_ctx = || ExecuteContext {
-            args: Value::Null,
             cwd: temp.path(),
             signal: Some(&cancellation),
             on_update: None,

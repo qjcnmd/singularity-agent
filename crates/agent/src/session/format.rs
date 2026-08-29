@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_model::ModelUsage;
-use singularity_protocol::TurnModelUsage;
+use singularity_protocol::{TurnModelUsage, TurnStatus};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -76,7 +76,7 @@ pub struct CompactionEntry {
     )]
     pub tokens_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<ModelUsage>,
+    pub usage: Option<TurnModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
@@ -103,6 +103,32 @@ pub enum TurnTerminalStatus {
     Completed,
     Failed,
     Interrupted,
+}
+
+impl TurnTerminalStatus {
+    /// 落盘终态到事件层 `TurnStatus` 的同词回投：持久化词形与事件词形的
+    /// 终态子集一一对应，此单点是唯一的回投形状。
+    pub const fn turn_status(self) -> TurnStatus {
+        match self {
+            Self::Completed => TurnStatus::Completed,
+            Self::Failed => TurnStatus::Failed,
+            Self::Interrupted => TurnStatus::Interrupted,
+        }
+    }
+}
+
+/// 领域 usage → 会话统一落盘形状 `TurnModelUsage`；`complete` 由调用方的
+/// 聚合语义给出（终态：每个 provider 请求是否都报告了精确 usage）。
+pub fn turn_usage_from_model_usage(usage: &ModelUsage, complete: bool) -> TurnModelUsage {
+    TurnModelUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        usage_present: usage.usage_present,
+        usage_complete: complete,
+    }
 }
 
 /// 一条可恢复的 session metadata；variant 直接携带其合法 payload。

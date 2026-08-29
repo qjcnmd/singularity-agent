@@ -28,7 +28,8 @@ use crate::error::{
 };
 use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{
-    ProviderStatus, Thread, Turn, TurnModelUsage, TurnStatus, turn_usage_from_model_usage,
+    ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus,
+    turn_usage_from_model_usage,
 };
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
@@ -119,12 +120,12 @@ impl TurnRunner {
         &self.provider_snapshot
     }
 
-    /// Provider 配置快照的只读展示投影（provider/status 的 wire 映射输入）。
-    pub fn provider_status(&self) -> ProviderStatus {
+    /// Provider 配置快照的只读展示投影（provider/status 的 wire 输入）。
+    pub fn provider_status(&self) -> ProviderConfigurationStatus {
         let snapshot = &self.provider_snapshot;
         let config = snapshot.redacted_config();
         let configuration = snapshot.configuration();
-        ProviderStatus {
+        ProviderConfigurationStatus {
             source: snapshot.source().map(|source| source.as_str().to_string()),
             snapshot_id: snapshot.snapshot_id().to_string(),
             configured: configuration.configured,
@@ -541,7 +542,7 @@ fn append_turn_started_metadata(session: &mut SessionManager, turn_id: &str) -> 
 }
 
 /// AgentLoop 结束时的中间状态投影；turn 终态是单字段事实，
-/// ThreadStatus 与 JSONL 词形在需要处由它派生。
+/// JSONL 终态词形在需要处由它派生。
 struct RunStatus {
     turn_status: TurnStatus,
     final_answer: Option<String>,

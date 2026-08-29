@@ -14,6 +14,11 @@ use singularity_runtime::{Conversation, ProviderConfigSnapshot, ThreadCatalog, T
 
 use super::*;
 
+/// 注册表锁中毒的统一错误投影。
+fn registry_lock_poisoned<E: std::fmt::Display>(error: E) -> AppServerError {
+    AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
+}
+
 /// 协调信任和 Thread 协调器的有状态 JSON-RPC 服务。
 #[derive(Clone)]
 pub struct AppServer {
@@ -99,9 +104,7 @@ impl AppServerControlHandle {
         let conversation = self
             .conversations
             .lock()
-            .map_err(|error| {
-                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-            })?
+            .map_err(registry_lock_poisoned)?
             .values()
             .find(|conversation| {
                 conversation.active_turn_id().as_deref() == Some(params.turn_id.as_str())
@@ -144,9 +147,7 @@ impl AppServerControlHandle {
         let conversation = self
             .conversations
             .lock()
-            .map_err(|error| {
-                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-            })?
+            .map_err(registry_lock_poisoned)?
             .values()
             .find(|conversation| conversation.active_turn_id().as_deref() == Some(turn_id))
             .cloned();
@@ -165,9 +166,7 @@ impl AppServerCancellationHandle {
         let conversations: Vec<Arc<Conversation>> = self
             .conversations
             .lock()
-            .map_err(|error| {
-                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-            })?
+            .map_err(registry_lock_poisoned)?
             .values()
             .cloned()
             .collect();
@@ -256,18 +255,14 @@ impl AppServer {
         if let Some(conversation) = self
             .conversations
             .lock()
-            .map_err(|error| {
-                AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-            })?
+            .map_err(registry_lock_poisoned)?
             .get(session_id)
             .cloned()
         {
             return Ok(conversation);
         }
         // 慢路径：持锁完成重投影与回插；锁内二次检查挡住并发未命中。
-        let mut guard = self.conversations.lock().map_err(|error| {
-            AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-        })?;
+        let mut guard = self.conversations.lock().map_err(registry_lock_poisoned)?;
         if let Some(conversation) = guard.get(session_id).cloned() {
             return Ok(conversation);
         }
@@ -291,9 +286,7 @@ impl AppServer {
 
     /// 该会话当前是否存在存活 turn（执行窗口内）。
     pub(crate) fn thread_has_live_turn(&self, session_id: &str) -> AppServerResult<bool> {
-        let map = self.conversations.lock().map_err(|error| {
-            AppServerError::Workspace(format!("conversation registry lock poisoned: {error}"))
-        })?;
+        let map = self.conversations.lock().map_err(registry_lock_poisoned)?;
         Ok(map
             .get(session_id)
             .cloned()
@@ -306,18 +299,19 @@ impl AppServer {
             .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))
     }
 
-    /// wire 可见的 thread 摘要：持久化 `Active` 只有在本进程存在该会话的
-    /// 存活 turn 时才成立；崩溃遗留的 `Active` 投影为 `interrupted`，读取
-    /// 不回写 JSONL（终态只能由 turn 的真实结束写入）。
+    /// wire 可见的 thread 摘要：持久化 `running`（无终态的悬挂 turn_started）
+    /// 只有在本进程存在该会话的存活 turn 时才成立；崩溃遗留的 `running`
+    /// 投影为 `interrupted`，读取不回写 JSONL（终态只能由 turn 的真实结束
+    /// 写入）。
     pub(crate) fn project_thread(
         &self,
         record: &singularity_runtime::ThreadSummary,
     ) -> AppServerResult<Thread> {
         let mut thread = thread_from_summary(record);
-        if thread.last_turn_status == Some(singularity_protocol::ThreadStatus::Active)
+        if thread.last_turn_status == Some(singularity_protocol::TurnStatus::Running)
             && !self.thread_has_live_turn(&record.thread_id)?
         {
-            thread.last_turn_status = Some(singularity_protocol::ThreadStatus::Interrupted);
+            thread.last_turn_status = Some(singularity_protocol::TurnStatus::Interrupted);
         }
         Ok(thread)
     }
