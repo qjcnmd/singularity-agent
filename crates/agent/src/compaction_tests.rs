@@ -1,6 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
-use singularity_model::{ModelTurnResponse, ModelUsage, ProviderProtocolContract};
+use singularity_model::{
+    ModelError, ModelErrorKind, ModelTurnResponse, ModelUsage, ProviderError,
+    ProviderProtocolContract,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -124,6 +127,7 @@ fn zero_recent_budget_is_rejected_by_configuration_validation() {
 #[derive(Clone)]
 struct MockProvider {
     texts: Arc<Mutex<VecDeque<String>>>,
+    errors: Arc<Mutex<VecDeque<ProviderError>>>,
     requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 }
 
@@ -131,8 +135,13 @@ impl MockProvider {
     fn new(texts: Vec<String>) -> Self {
         Self {
             texts: Arc::new(Mutex::new(texts.into())),
+            errors: Arc::new(Mutex::new(VecDeque::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn queue_error(&self, error: ProviderError) {
+        self.errors.lock().unwrap().push_back(error);
     }
 
     fn requests(&self) -> Vec<ModelTurnRequest> {
@@ -151,6 +160,9 @@ impl Provider for MockProvider {
         _cancellation: &singularity_core::CancellationToken,
         _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+        if let Some(error) = self.errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         self.requests.lock().unwrap().push(request.clone());
         let text = self.texts.lock().unwrap().pop_front().unwrap_or_default();
         Ok(ModelTurnResponse::completed(
@@ -196,6 +208,42 @@ fn find_cut_point_full_history_and_tool_result_following() {
 
     // 空条目无切点。
     assert_eq!(engine.find_cut_point(&[], &budget(100_000, 10)), None);
+}
+
+/// 6. 取消下的摘要发送收敛为 `Aborted`：取消不是压缩故障，与采样取消同形。
+#[test]
+fn cancelled_summary_send_is_aborted_not_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), dir.path()).unwrap();
+    session.append_message(user(&"u".repeat(7000))).unwrap();
+    session
+        .append_message(file_call("read", "src/main.rs"))
+        .unwrap();
+    session
+        .append_message(tool_result("c1", &"t".repeat(7000)))
+        .unwrap();
+    session.append_message(user(&"d".repeat(7000))).unwrap();
+    session
+        .append_message(assistant(&"e".repeat(7000)))
+        .unwrap();
+    session
+        .append_message(tool_result("c2", &"f".repeat(7000)))
+        .unwrap();
+    let (mut engine, mock) = mock_engine(vec!["## Goal\nsummary of history".to_string()]);
+    // 可重试错误让发送路径进入可中止退避；预取消令牌在退避中立即命中。
+    mock.queue_error(ProviderError::from_model_error(ModelError::new(
+        ModelErrorKind::RateLimited,
+        "Provider returned HTTP 429.",
+    )));
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let result = engine.compact(&mut session, &budget(100_000, 4_000), 90_001, &cancellation);
+
+    assert!(
+        matches!(result, Err(CompactionError::Aborted)),
+        "cancelled compaction must be Aborted, got {result:?}"
+    );
 }
 
 /// 5. compact 全流程（mock provider）：触发、摘要、append_compaction 落盘、

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::envelope::JsonRpcMessage;
 use crate::params::{Thread, Turn};
 
-/// runtime 直接发射的稳定诊断代码。
+/// `agent/diagnostic` 事件携带的稳定诊断代码词表。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
     pub const STEER_UNDELIVERED: &str = "steer_undelivered";

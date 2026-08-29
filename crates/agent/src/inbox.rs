@@ -49,7 +49,9 @@ impl TurnInbox {
         }
     }
 
-    pub(super) fn close(&mut self) {
+    /// 关闭注入箱：之后的输入被拒绝；已接受而未交付的条目保留在箱内，
+    /// 由终态排水（`drain`）取走并给出归宿。
+    pub fn close(&mut self) {
         self.state = TurnInboxState::Closed;
     }
 }

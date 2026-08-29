@@ -187,6 +187,51 @@ impl Provider for GatedRecordingProvider {
     }
 }
 
+/// 首个请求在闸门上挂起、放行后返回不可重试错误；后续请求记录并成功。
+/// 用于构造"转向已被接受、当轮以可信失败终态收敛"的确定性窗口。
+struct GateFailThenOkProvider {
+    release: std::sync::Mutex<mpsc::Receiver<()>>,
+    log: Arc<RequestLog>,
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    first_request_failed: std::sync::atomic::AtomicBool,
+}
+
+impl Provider for GateFailThenOkProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10));
+        self.log.record(request);
+        if self
+            .first_request_failed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::AuthError,
+                "Provider returned HTTP 401.",
+            )));
+        }
+        Ok(ModelTurnResponse::completed(
+            request.request_id.clone(),
+            "r",
+            "ok",
+        ))
+    }
+}
+
 fn wait_for_requested(requested: &std::sync::atomic::AtomicBool) {
     for _ in 0..400 {
         if requested.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1075,6 +1120,46 @@ fn steer_affects_only_the_current_turn() {
         log.input_sequence(),
         vec!["original task".to_string(), "course correction".to_string()],
         "steer joins the current turn's context without spawning a turn"
+    );
+}
+
+#[test]
+fn steered_input_survives_a_failed_turn_and_runs_next() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (release_tx, release_rx) = mpsc::channel();
+    let log = Arc::new(RequestLog::default());
+    let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = Arc::new(new_conversation(
+        &sessions,
+        Arc::new(GateFailThenOkProvider {
+            release: std::sync::Mutex::new(release_rx),
+            log: Arc::clone(&log),
+            requested: Arc::clone(&requested),
+            first_request_failed: std::sync::atomic::AtomicBool::new(true),
+        }),
+        Some("openai_compatible/base-model"),
+    ));
+
+    let turn_thread = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let (_, mut sink) = collect_sink();
+            shared.run_turn("original task", &mut sink)
+        })
+    };
+    wait_for_active(&shared);
+    wait_for_requested(&requested);
+    wait_steer_accepted(&shared, "course correction");
+    release_tx.send(()).expect("release");
+
+    // 失败轮（可信失败终态）不阻断链条，也不吞掉已接受的转向输入。
+    let outcome = turn_thread.join().expect("join").expect("chain completes");
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    assert_eq!(
+        log.input_sequence(),
+        vec!["original task".to_string(), "course correction".to_string()],
+        "steered input must run as the next turn after a failed turn"
     );
 }
 

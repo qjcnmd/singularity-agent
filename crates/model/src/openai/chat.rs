@@ -271,12 +271,7 @@ pub fn finalize_provider_response(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let validation = validate_model_turn_response(
-        request,
-        &response,
-        &available_tool_names,
-        Some(capabilities),
-    );
+    let validation = validate_model_turn_response(request, &response, Some(capabilities));
     let mut validation = validation;
     // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不

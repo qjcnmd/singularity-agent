@@ -161,9 +161,13 @@ impl TurnControls {
 
     pub(crate) fn close_inbox(&self) {
         // 锁中毒（状态未知）→ 跳过关闭；此方法是 Agent 收口关闭之后的
-        // 二次保险（runner 的 abort/fail 路径已关 inbox），跳过不影响正确性。
-        if let Ok(mut guard) = self.inbox.lock() {
-            *guard = None;
+        // 二次保险。关闭后新输入仍被拒绝，但已接受而未交付的文本保留在
+        // 箱内，由终态排水取走并给出归宿——不随句柄丢弃。
+        if let Ok(guard) = self.inbox.lock()
+            && let Some(inbox) = guard.as_ref()
+            && let Ok(mut inbox) = inbox.lock()
+        {
+            inbox.close();
         }
     }
 }
@@ -475,7 +479,7 @@ impl Conversation {
                     None => break,
                 },
             };
-            let step = self.run_single_turn(current.clone(), sink);
+            let (step, turn_undelivered) = self.run_single_turn(current.clone(), sink);
             // 无可信终态的轮次（终态化失败、准备失败、并发占用）中止链条：
             // 剩余输入与待生效设置原样保留，返回可行动错误。
             let untrusted = matches!(
@@ -485,6 +489,11 @@ impl Conversation {
                     | Err(ConversationError::TurnAlreadyActive)
             );
             if untrusted {
+                // 本轮已接受的转向输入与剩余输入一样保留在队列中，不存在
+                // 无归宿的丢弃路径。
+                for text in turn_undelivered.iter().rev() {
+                    queue.push_front(text.clone());
+                }
                 // 准备失败时本轮输入必然未执行过：放回队首继续可用；
                 // 终态化失败时本轮可能已部分执行，不重放。
                 if !matches!(
@@ -519,13 +528,12 @@ impl Conversation {
             if let Some(updated) = applied {
                 sink.emit(TurnEvent::ThreadSettingsApplied { thread: updated });
             }
-            // completed/failed 终态后，未交付转向输入排到链队列队首，先于
-            // 已排队的 followUp 执行（pi continue 的排水顺序）；随后继续
-            // 消费队列。单轮执行失败不阻断其余已接受的 followUp。
-            if let Ok(outcome) = &step {
-                for text in outcome.undelivered_inputs.iter().rev() {
-                    queue.push_front(text.clone());
-                }
+            // completed/failed 终态（含以 Err 收敛但终态可信的执行失败）后，
+            // 未交付转向输入排到链队列队首，先于已排队的 followUp 执行（pi
+            // continue 的排水顺序）；随后继续消费队列。单轮执行失败不阻断
+            // 其余已接受的 followUp。
+            for text in turn_undelivered.iter().rev() {
+                queue.push_front(text.clone());
             }
             last = Some(step);
         }
@@ -535,16 +543,21 @@ impl Conversation {
     }
 
     /// 单个 turn 的执行与投影收敛；每轮使用独立控制面，取消与注入只影响
-    /// 当前轮，后续队列中的轮次不受本轮取消影响。
+    /// 当前轮，后续队列中的轮次不受本轮取消影响。第二元素是终态后注入箱
+    /// 的排水结果：Ok 时已并入 `TurnOutcome::undelivered_inputs`，Err 时
+    /// 交由链条保留归宿。
     fn run_single_turn(
         &self,
         input: String,
         sink: &mut dyn TurnEventSink,
-    ) -> Result<TurnOutcome, ConversationError> {
+    ) -> (Result<TurnOutcome, ConversationError>, Vec<String>) {
         let controls = {
-            let mut state = self.lock_state()?;
+            let mut state = match self.lock_state() {
+                Ok(state) => state,
+                Err(error) => return (Err(error), Vec::new()),
+            };
             if !matches!(state.turn, TurnLifecycle::Reserved) {
-                return Err(ConversationError::TurnAlreadyActive);
+                return (Err(ConversationError::TurnAlreadyActive), Vec::new());
             }
             // 构造即完整：turn id 与注入箱在此一次性绑定，无需事后注册。
             let controls = Arc::new(TurnControls::new(
@@ -554,16 +567,22 @@ impl Conversation {
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             controls
         };
-        let thread_snapshot = self.lock_state()?.thread.clone();
+        let thread_snapshot = match self.lock_state() {
+            Ok(state) => state.thread.clone(),
+            Err(error) => return (Err(error), Vec::new()),
+        };
         let params = TurnParams {
             thread: thread_snapshot,
             input,
         };
         let result = self.runner.run(params, &controls, sink);
-        // 终态后排水：注入箱中仍未交付的转向输入随 outcome 返回，由链条
-        // 决定重排到下一轮或退还调用方。
+        // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定
+        // 重排到下一轮或退还调用方。
         let undelivered = controls.drain_inbox();
-        let mut state = self.lock_state()?;
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => return (Err(error), undelivered),
+        };
         state.turn = TurnLifecycle::Reserved;
         match &result {
             Ok(outcome) => {
@@ -573,14 +592,15 @@ impl Conversation {
             Err(TurnRunError::Terminalization(_)) => {}
             Err(_) => state.thread.last_turn_status = Some(ThreadStatus::Failed),
         }
-        match result {
+        let result = match result {
             Ok(mut outcome) => {
-                outcome.undelivered_inputs = undelivered;
+                outcome.undelivered_inputs = undelivered.clone();
                 Ok(outcome)
             }
             Err(error) => Err(error),
         }
-        .map_err(ConversationError::Turn)
+        .map_err(ConversationError::Turn);
+        (result, undelivered)
     }
 
     /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回

@@ -11,7 +11,6 @@ use crate::error::{
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelValidationResult, ProviderToolReasoningMode,
-    ToolChoicePolicy,
 };
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
@@ -66,12 +65,11 @@ impl Default for ProviderProtocolContract {
 use crate::config::schema::ModelProviderConfig;
 
 impl ModelValidationResult {
-    /// 构造通过校验且无警告的结果。
+    /// 构造通过校验的结果。
     pub fn valid() -> Self {
         Self {
             valid: true,
             errors: Vec::new(),
-            warnings: Vec::new(),
         }
     }
 
@@ -80,7 +78,6 @@ impl ModelValidationResult {
         Self {
             valid: false,
             errors,
-            warnings: Vec::new(),
         }
     }
 }
@@ -171,7 +168,7 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
     if !config.api_key_present {
         errors.push("api_key_required".to_string());
     }
-    validation_result(errors, Vec::new())
+    validation_result(errors)
 }
 
 /// 在应用模型提供方专属能力检查前校验模型请求。
@@ -245,7 +242,7 @@ pub fn validate_model_request_with_capabilities(
             errors.push("requested_tools_exceed_provider_limit".to_string());
         }
     }
-    validation_result(errors, Vec::new())
+    validation_result(errors)
 }
 
 fn is_portable_tool_name(name: &str) -> bool {
@@ -317,14 +314,11 @@ pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
-    available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut result = validate_model_response_with_protocol_context(
         response.assistant_message.as_ref(),
         response.tool_calls(),
-        &request.tool_choice,
-        available_tool_names,
         capabilities,
         request_uses_tool_protocol(request),
     );
@@ -351,15 +345,12 @@ pub fn validate_model_turn_response(
 pub fn validate_model_response(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],
-    tool_choice: &ToolChoicePolicy,
     available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     validate_model_response_with_protocol_context(
         assistant_message,
         tool_calls,
-        tool_choice,
-        available_tool_names,
         capabilities,
         !available_tool_names.is_empty(),
     )
@@ -368,13 +359,10 @@ pub fn validate_model_response(
 fn validate_model_response_with_protocol_context(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],
-    tool_choice: &ToolChoicePolicy,
-    available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
     tool_protocol_active: bool,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
 
     match assistant_message {
         Some(message) if message.role != ModelRole::Assistant => {
@@ -407,12 +395,6 @@ fn validate_model_response_with_protocol_context(
         errors.push("tool_name_not_provider_portable".to_string());
     }
 
-    if tool_calls.len() > tool_choice.max_tool_calls as usize {
-        // 响应超限降级为 warning：请求上限表达的是单条 assistant 消息允许的
-        // 工具调用数上限；Agent loop 会按模型给定顺序串行执行全部工具调用，
-        // 作为致命校验会杀死本可正常完成的 turn。
-        warnings.push("max_tool_calls_exceeded".to_string());
-    }
     if let Some(capabilities) = capabilities
         && !tool_calls.is_empty()
         && !capabilities.supports_tools
@@ -433,23 +415,15 @@ fn validate_model_response_with_protocol_context(
         if !call.arguments.is_object() {
             errors.push("tool_call_arguments_must_be_object".to_string());
         }
-        let unknown_tool = !available_tool_names
-            .iter()
-            .any(|name| name == &call.tool_name)
-            || call.parse_status == ModelToolParseStatus::UnknownTool;
         match call.parse_status {
             ModelToolParseStatus::InvalidJson => errors.push("invalid_json".to_string()),
             ModelToolParseStatus::SchemaMismatch => errors.push("schema_mismatch".to_string()),
             ModelToolParseStatus::UnknownTool => {}
             ModelToolParseStatus::Valid => {}
         }
-        if unknown_tool {
-            warnings.push("unknown_tool".to_string());
-        }
-        warnings.extend(call.validation_errors.iter().cloned());
     }
 
-    validation_result(errors, warnings)
+    validation_result(errors)
 }
 
 pub(crate) fn model_error_category(error: &ModelError) -> ModelErrorCategory {
@@ -478,19 +452,13 @@ pub(crate) fn model_error_category(error: &ModelError) -> ModelErrorCategory {
     }
 }
 
-fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelValidationResult {
+fn validation_result(mut errors: Vec<String>) -> ModelValidationResult {
     errors.sort();
     errors.dedup();
     if errors.is_empty() {
-        ModelValidationResult {
-            warnings,
-            ..ModelValidationResult::valid()
-        }
+        ModelValidationResult::valid()
     } else {
-        ModelValidationResult {
-            warnings,
-            ..ModelValidationResult::invalid(errors)
-        }
+        ModelValidationResult::invalid(errors)
     }
 }
 

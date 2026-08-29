@@ -944,13 +944,7 @@ fn model_response_validation_rejects_nonportable_tool_names() {
     let call = tool_call("call_1", "builtin.read");
     let assistant = ModelMessage::assistant_tool_calls(vec![call.clone()]);
 
-    let result = validate_model_response(
-        Some(&assistant),
-        &[call],
-        &ToolChoicePolicy::default(),
-        &["read".to_string()],
-        None,
-    );
+    let result = validate_model_response(Some(&assistant), &[call], &["read".to_string()], None);
 
     assert_eq!(result.errors, vec!["tool_name_not_provider_portable"]);
 }
@@ -963,7 +957,6 @@ fn model_response_validation_requires_tool_call_arguments_object() {
     let result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call],
-        &ToolChoicePolicy::default(),
         &["read_file".to_string()],
         None,
     );

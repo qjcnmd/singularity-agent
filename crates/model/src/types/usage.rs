@@ -34,10 +34,9 @@ impl ModelUsage {
     }
 }
 
-/// 模型侧请求或响应的校验错误和非致命警告。
+/// 模型侧请求或响应的校验错误。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelValidationResult {
     pub valid: bool,
     pub errors: Vec<String>,
-    pub warnings: Vec<String>,
 }
