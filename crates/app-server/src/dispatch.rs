@@ -355,7 +355,6 @@ impl AppServer {
                 status: overall_status,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
-                token_usage: record.token_usage,
                 summary: compaction_summary,
                 turns,
                 total_turns,

@@ -220,7 +220,6 @@ pub struct ThreadReadResult {
     pub status: Option<TurnStatus>,
     pub created_at: String,
     pub updated_at: String,
-    pub token_usage: Value,
     /// 最近一次 compaction 摘要；无 compaction 时为 None。
     pub summary: Option<String>,
     /// 本页轮次，按会话顺序（旧→新）排列。

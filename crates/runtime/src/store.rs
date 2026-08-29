@@ -32,7 +32,6 @@ pub struct ThreadSummary {
     pub status: Option<TurnStatus>,
     pub created_at: String,
     pub updated_at: String,
-    pub token_usage: serde_json::Value,
     pub turn_count: usize,
     pub total_tokens: u64,
 }
@@ -194,12 +193,6 @@ fn thread_summary(session: &SessionManager) -> ThreadSummary {
         status: projection.status,
         created_at: projection.created_at,
         updated_at: projection.updated_at,
-        // 无 usage 的会话保持空对象形状；序列化恒不失败（本仓静态类型）。
-        #[allow(clippy::expect_used)]
-        token_usage: projection.latest_usage.map_or_else(
-            || serde_json::json!({}),
-            |usage| serde_json::to_value(usage).expect("TurnModelUsage serializes"),
-        ),
         turn_count: projection.turn_count,
         total_tokens: projection.total_tokens,
     }

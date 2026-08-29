@@ -31,7 +31,6 @@ pub struct SessionProjection {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<TurnStatus>,
-    pub latest_usage: Option<TurnModelUsage>,
     pub turn_count: usize,
     pub total_tokens: u64,
 }
@@ -44,11 +43,10 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
 
     let mut model = None;
     let mut status = None;
-    let mut latest_usage = None;
     let mut title = None;
     let mut total_tokens = 0u64;
     let mut turn_count = 0usize;
-    // 单趟反向遍历完成全部六个投影：各"最近一个"字段取首个命中，
+    // 单趟反向遍历完成全部五个投影：各"最近一个"字段取首个命中，
     // 聚合字段累加。
     for entry in session.metadata_entries().iter().rev() {
         if model.is_none()
@@ -80,11 +78,6 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
                 }
                 _ => None,
             };
-        }
-        if latest_usage.is_none()
-            && let SessionMetadata::TurnTerminal { usage, .. } = entry
-        {
-            latest_usage = Some(usage.clone());
         }
         if title.is_none()
             && let SessionMetadata::ThreadName { name } = entry
@@ -135,7 +128,6 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
         title,
         model,
         status,
-        latest_usage,
         turn_count,
         total_tokens,
     }
