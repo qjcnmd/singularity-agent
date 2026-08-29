@@ -2,8 +2,10 @@
 use super::ExecutionStop;
 use crate::{AppServerCancellationHandle, AppServerOutput};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// Async 上下文的入队入口：队列满时在 `send().await` 上背压等待，
 /// 真实发送失败（writer 已消失）才触发全局停止。
@@ -22,51 +24,25 @@ pub(crate) async fn send_output_async(
 }
 
 /// 同步上下文（spawn_blocking worker、turn worker、stream 回调）的入队入口：
-/// 优先尝试无阻塞直接入队；队列满时以背压阻塞（若在 Tokio runtime 线程内则使用 `block_in_place`），
-/// channel 关闭才触发全局停止。
+/// 队列满时以 `try_send` + 短暂休眠轮询形成背压，channel 关闭才触发全局
+/// 停止。不能在 Tokio 异步任务中直接 await，但可以在 spawn_blocking 或
+/// 非运行时线程使用。
 pub(crate) fn send_output(
     outputs: &mpsc::Sender<Value>,
     cancellation: &dyn ExecutionStop,
     message: Value,
 ) -> Result<(), String> {
-    match outputs.try_send(message) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(message)) => {
-            let send_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                match handle.runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        tokio::task::block_in_place(|| outputs.blocking_send(message))
-                    }
-                    _ => {
-                        let mut msg = message;
-                        loop {
-                            match outputs.try_send(msg) {
-                                Ok(()) => break Ok(()),
-                                Err(mpsc::error::TrySendError::Full(m)) => {
-                                    msg = m;
-                                    std::thread::yield_now();
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    break Err(tokio::sync::mpsc::error::SendError(Value::Null));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                outputs.blocking_send(message)
-            };
-            match send_result {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    cancellation.request_execution_stop();
-                    Err("stdout transport unavailable".to_string())
-                }
+    loop {
+        match outputs.try_send(message.clone()) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(_)) => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            cancellation.request_execution_stop();
-            Err("stdout transport unavailable".to_string())
+            Err(TrySendError::Closed(_)) => {
+                cancellation.request_execution_stop();
+                return Err("stdout transport unavailable".to_string());
+            }
         }
     }
 }

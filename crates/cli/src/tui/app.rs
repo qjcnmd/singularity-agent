@@ -15,7 +15,7 @@ use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ThreadCatalog};
 use unicode_width::UnicodeWidthStr;
 
-use super::commands::Action;
+use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
@@ -343,6 +343,26 @@ impl TuiApp {
             return Action::Compact(cancellation);
         }
         Action::Continue
+    }
+
+    /// 中断时未交付的转向输入退还编辑器（pi clearQueue 语义）：合并进
+    /// 当前编辑器文本，便于用户编辑后重新提交。
+    pub fn return_undelivered(&mut self, inputs: Vec<String>) {
+        if inputs.is_empty() {
+            return;
+        }
+        let mut draft = self.editor.take();
+        for text in inputs {
+            if !draft.is_empty() {
+                draft.push('\n');
+            }
+            draft.push_str(&text);
+        }
+        self.editor.set_text(&draft);
+        self.transcript.push_note(
+            "interrupted input returned to the editor",
+            NoteStyle::Dim,
+        );
     }
 
     /// 推进 spinner 节拍（由事件循环按固定间隔调用）。
@@ -703,10 +723,9 @@ impl TuiApp {
         if text.is_empty() {
             return Action::Continue;
         }
-        // 提交即进入历史（含命令与 steer/followUp 路径），指针复位。
-        self.record_history(&text);
-        if text.starts_with('/') {
-            return self.execute_command(&text);
+        // 斜杠命令精确匹配：命中的执行命令，其余一切（含 / 开头）走消息路径。
+        if let Some(command) = SlashCommand::parse(&text) {
+            return self.execute_command(command);
         }
         match self.phase {
             Phase::Idle => {
@@ -716,14 +735,25 @@ impl TuiApp {
                 self.scroll.pin_new_content_at(total);
                 self.phase = Phase::Running;
                 self.set_waiting(WaitingTarget::Model);
+                self.record_history(&text);
                 Action::Submit(text)
             }
             Phase::Running => {
                 let accepted = self.conversation.steer(text.clone());
+                if accepted {
+                    // 接受才记历史，与 followUp 路径统一。
+                    self.record_history(&text);
+                }
                 self.note_injection("steer", accepted, &text);
                 // steer 注入后回到最新内容（page-flip 只属于新回合）。
                 let (total, viewport) = self.flow_metrics();
                 self.scroll.jump_to_bottom(total, viewport);
+                if !accepted {
+                    // 空闲竞态：直接开新回合。
+                    self.phase = Phase::Running;
+                    self.set_waiting(WaitingTarget::Model);
+                    return Action::Submit(text);
+                }
                 Action::Continue
             }
         }
@@ -848,30 +878,24 @@ impl TuiApp {
         );
 
         // 状态行 + 提示行。
-        let (status_spans, hint_spans) = self.footer_spans(total_rows, viewport);
+        let (status_spans, hint_spans) = self.footer_spans(total_rows, viewport, status_area.width);
         frame.render_widget(
             Paragraph::new(vec![Line::from(status_spans.clone())]),
             status_area,
         );
         frame.render_widget(Paragraph::new(vec![Line::from(hint_spans)]), hint_area);
 
-        // 点击命中缓存：登记本帧可点击矩形。[stop] 恒为状态行末段（按 span
-        // 宽度计量，不做文本反查）；编辑器内区不含边框。
+        // 点击命中缓存：登记本帧可点击矩形。[stop] 恒为状态行末段（按布局
+        // 右对齐，矩形位置由布局保证可见）；编辑器内区不含边框。
         self.frame.click_targets.clear();
         if self.phase != Phase::Idle {
-            // 不变量：非 Idle 时 status_spans 恒含 [stop] 段。
+            // 不变量：非 Idle 时状态行恒以 [stop] 收尾。
             #[allow(clippy::expect_used)]
             let stop = status_spans
                 .last()
                 .expect("running footer always ends with [stop]");
             let stop_width = UnicodeWidthStr::width(stop.content.as_ref()) as u16;
-            let status_width: u16 = status_spans
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
-                .sum();
-            let stop_x = status_area
-                .x
-                .saturating_add(status_width.saturating_sub(stop_width));
+            let stop_x = status_area.right().saturating_sub(stop_width);
             self.frame.click_targets.push((
                 Rect::new(stop_x, status_area.y, stop_width, 1),
                 ClickTarget::Stop,

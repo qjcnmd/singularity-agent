@@ -1,7 +1,7 @@
 use super::message::{ModelMessage, ModelRole};
 use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolCall;
-use super::usage::{ModelUsage, ModelValidationResult};
+use super::usage::ModelUsage;
 use crate::error::ModelError;
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +34,6 @@ pub struct ModelTurnResponse {
     pub assistant_message: Option<ModelMessage>,
     pub usage: ModelUsage,
     pub finish_reason: Option<String>,
-    pub validation: Option<ModelValidationResult>,
     pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
@@ -58,7 +57,6 @@ impl ModelTurnResponse {
             assistant_message: Some(ModelMessage::text(ModelRole::Assistant, content)),
             usage: ModelUsage::default(),
             finish_reason: None,
-            validation: None,
             error: None,
             provider_name: None,
             model_name: None,

@@ -1,15 +1,12 @@
 //! runtime 公开对象。
 
-pub use singularity_protocol::{
-    ExecutionThread as Thread, ExecutionTurn as Turn, ExecutionTurnUsage as TurnUsage,
-    ThreadStatus, TurnStatus,
-};
+pub use singularity_protocol::{Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
 
 pub(crate) fn turn_usage_from_model_usage(
     usage: &singularity_model::ModelUsage,
     complete: bool,
-) -> TurnUsage {
-    TurnUsage {
+) -> TurnModelUsage {
+    TurnModelUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,

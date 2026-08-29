@@ -58,7 +58,6 @@ impl FakeProvider {
             } else {
                 "tool_calls".to_string()
             }),
-            validation: None,
             error: None,
             provider_name: Some("fake".to_string()),
             model_name: Some("fake-model".to_string()),
@@ -89,7 +88,6 @@ impl Provider for FakeProvider {
             provider_name: "fake".to_string(),
             model_name: "fake-model".to_string(),
             actual_api_protocol: ProviderApiProtocol::Declared,
-            started_at_unix_ms: 1,
         }));
         self.requests.lock().unwrap().push(request.clone());
         let step = self.pop()?;
@@ -1126,7 +1124,6 @@ impl Provider for OverflowProvider {
             assistant_message: Some(assistant),
             usage: ModelUsage::default(),
             finish_reason: Some("stop".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("overflow".to_string()),
             model_name: Some("overflow-model".to_string()),
@@ -1157,7 +1154,6 @@ impl Provider for OverflowProvider {
             assistant_message: Some(assistant),
             usage: ModelUsage::default(),
             finish_reason: Some("stop".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("overflow".to_string()),
             model_name: Some("overflow-model".to_string()),
@@ -1217,7 +1213,6 @@ impl Provider for InterleaveProvider {
                     assistant_message: Some(assistant),
                     usage: ModelUsage::default(),
                     finish_reason: Some("stop".to_string()),
-                    validation: None,
                     error: None,
                     provider_name: Some("interleave".to_string()),
                     model_name: Some("interleave-model".to_string()),
@@ -1244,7 +1239,6 @@ impl Provider for InterleaveProvider {
             assistant_message: Some(assistant),
             usage: ModelUsage::default(),
             finish_reason: Some("stop".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("interleave".to_string()),
             model_name: Some("interleave-model".to_string()),
@@ -1285,7 +1279,14 @@ fn context_overflow_forces_one_compaction_retry_then_succeeds() {
         TurnInbox::default_handle(),
         provider.clone(),
         ToolRegistry::new(),
-        AgentConfig::default(),
+        AgentConfig {
+            compaction: CompactionConfig {
+                keep_recent_tokens: 1,
+                summary_max_tokens: 10,
+                ..CompactionConfig::default()
+            },
+            ..AgentConfig::default()
+        },
         session,
     )
     .unwrap();
@@ -1391,6 +1392,11 @@ fn transient_retry_then_overflow_recovers_once() {
                 max_retries: 1,
                 base_delay_ms: 1,
             },
+            compaction: CompactionConfig {
+                keep_recent_tokens: 1,
+                summary_max_tokens: 10,
+                ..CompactionConfig::default()
+            },
             ..AgentConfig::default()
         },
         session,
@@ -1464,6 +1470,11 @@ fn forced_compaction_failure_surfaces_the_compaction_cause() {
             retry: TurnRetryConfig {
                 max_retries: 0,
                 base_delay_ms: 1,
+            },
+            compaction: CompactionConfig {
+                keep_recent_tokens: 1,
+                summary_max_tokens: 10,
+                ..CompactionConfig::default()
             },
             ..AgentConfig::default()
         },
@@ -1548,7 +1559,6 @@ impl Provider for SummaryRetryProvider {
             assistant_message: Some(assistant),
             usage: ModelUsage::default(),
             finish_reason: Some("stop".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("fake".to_string()),
             model_name: Some("fake-model".to_string()),
@@ -1580,7 +1590,6 @@ impl Provider for SummaryRetryProvider {
             assistant_message: Some(assistant),
             usage: ModelUsage::default(),
             finish_reason: Some("stop".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("fake".to_string()),
             model_name: Some("fake-model".to_string()),
@@ -1613,6 +1622,11 @@ fn summary_request_retries_rate_limit_and_recovers() {
             retry: TurnRetryConfig {
                 max_retries: 3,
                 base_delay_ms: 1,
+            },
+            compaction: CompactionConfig {
+                keep_recent_tokens: 1,
+                summary_max_tokens: 10,
+                ..CompactionConfig::default()
             },
             ..AgentConfig::default()
         },
@@ -1685,7 +1699,6 @@ impl Provider for TruncatedToolCallProvider {
             assistant_message: Some(assistant),
             usage: usage(10, 2),
             finish_reason: Some("length".to_string()),
-            validation: None,
             error: None,
             provider_name: Some("fake".to_string()),
             model_name: Some("fake-model".to_string()),

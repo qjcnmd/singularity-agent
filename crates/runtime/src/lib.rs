@@ -36,7 +36,7 @@ pub use conversation::{
 };
 pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 pub use events::{TurnEvent, TurnEventSink};
-pub use objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnStatus, TurnUsage};
+pub use objects::{ProviderStatus, Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
 pub use runner::{TurnOutcome, TurnParams, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;

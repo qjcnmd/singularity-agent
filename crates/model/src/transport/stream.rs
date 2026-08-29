@@ -1,7 +1,6 @@
 //! SSE 流式解码器（Chat Completions 与 Responses 格式）。
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 use reqwest::Response;
 use serde_json::Value;
@@ -9,7 +8,6 @@ use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
-use crate::provider::attempt::duration_millis;
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::http::{provider_cancelled_error, provider_transport_error};
 
@@ -17,13 +15,11 @@ use crate::transport::http::{provider_cancelled_error, provider_transport_error}
 pub(super) struct StreamAttemptFailure {
     pub(super) error: ProviderError,
     pub(super) emitted_text_delta: bool,
-    pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
-/// 一次完成的流解码 + 解码器边界捕获的计时。
+/// 一次完成的流解码。
 pub(super) struct StreamAttemptSuccess {
     pub(super) payload: Value,
-    pub(super) time_to_first_text_delta_ms: Option<u64>,
 }
 
 struct SseFrame {
@@ -141,15 +137,13 @@ trait SseStreamDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError>;
     fn finish(&mut self) -> Result<Value, ProviderError>;
     fn emitted_text_delta(&self) -> bool;
-    fn time_to_first_text_delta_ms(&self) -> Option<u64>;
 }
 
-/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，任一失败路径都带
-/// 解码器边界快照（是否已发射文本增量、首增量耗时）。
+/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，失败路径携带
+/// 解码器边界快照（是否已发射文本增量）。
 fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
-    request_timeout_seconds: u64,
     mut response: Response,
     mut decoder: D,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
@@ -160,7 +154,6 @@ fn read_sse_stream<D: SseStreamDecoder>(
         return Err(StreamAttemptFailure {
             error: provider_response_stream_too_large_error(),
             emitted_text_delta: false,
-            time_to_first_text_delta_ms: None,
         });
     }
 
@@ -168,7 +161,6 @@ fn read_sse_stream<D: SseStreamDecoder>(
         return Err(StreamAttemptFailure {
             error: provider_cancelled_error(),
             emitted_text_delta: false,
-            time_to_first_text_delta_ms: None,
         });
     }
 
@@ -187,7 +179,6 @@ fn read_sse_stream<D: SseStreamDecoder>(
                                 error,
                                 "provider_response_body_read_failed",
                                 ProviderErrorStage::ResponseBodyRead,
-                                Some(request_timeout_seconds),
                             ));
                         }
                     }
@@ -199,14 +190,10 @@ fn read_sse_stream<D: SseStreamDecoder>(
     });
 
     match stream_result {
-        Ok(payload) => Ok(StreamAttemptSuccess {
-            payload,
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
-        }),
+        Ok(payload) => Ok(StreamAttemptSuccess { payload }),
         Err(error) => Err(StreamAttemptFailure {
             error,
             emitted_text_delta: decoder.emitted_text_delta(),
-            time_to_first_text_delta_ms: decoder.time_to_first_text_delta_ms(),
         }),
     }
 }
@@ -215,17 +202,14 @@ fn read_sse_stream<D: SseStreamDecoder>(
 pub(super) fn read_openai_chat_sse(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
-    request_timeout_seconds: u64,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-    attempt_started_at: Instant,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
     read_sse_stream(
         runtime,
         cancellation,
-        request_timeout_seconds,
         response,
-        ChatSseDecoder::new(on_event, attempt_started_at),
+        ChatSseDecoder::new(on_event),
     )
 }
 
@@ -248,8 +232,6 @@ pub(super) struct ChatSseDecoder<'a> {
     saw_choice: bool,
     done: bool,
     pub(super) emitted_text_delta: bool,
-    attempt_started_at: Instant,
-    pub(super) time_to_first_text_delta_ms: Option<u64>,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
@@ -271,16 +253,11 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     fn emitted_text_delta(&self) -> bool {
         self.emitted_text_delta
     }
-
-    fn time_to_first_text_delta_ms(&self) -> Option<u64> {
-        self.time_to_first_text_delta_ms
-    }
 }
 
 impl<'a> ChatSseDecoder<'a> {
     pub(super) fn new(
         on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-        attempt_started_at: Instant,
     ) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
@@ -293,8 +270,6 @@ impl<'a> ChatSseDecoder<'a> {
             saw_choice: false,
             done: false,
             emitted_text_delta: false,
-            attempt_started_at,
-            time_to_first_text_delta_ms: None,
             on_event,
         }
     }
@@ -351,10 +326,6 @@ impl<'a> ChatSseDecoder<'a> {
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
-                if self.time_to_first_text_delta_ms.is_none() {
-                    self.time_to_first_text_delta_ms =
-                        Some(duration_millis(self.attempt_started_at.elapsed()));
-                }
                 self.emitted_text_delta = true;
                 self.content.push_str(text);
                 (self.on_event)(ProviderStreamEvent::OutputTextDelta {
@@ -454,17 +425,14 @@ impl<'a> ChatSseDecoder<'a> {
 pub(super) fn read_openai_responses_sse(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
-    request_timeout_seconds: u64,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-    attempt_started_at: Instant,
 ) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
     read_sse_stream(
         runtime,
         cancellation,
-        request_timeout_seconds,
         response,
-        ResponsesSseDecoder::new(on_event, attempt_started_at),
+        ResponsesSseDecoder::new(on_event),
     )
 }
 
@@ -473,8 +441,6 @@ pub struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
     pub emitted_text_delta: bool,
-    attempt_started_at: Instant,
-    pub time_to_first_text_delta_ms: Option<u64>,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
@@ -496,23 +462,14 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     fn emitted_text_delta(&self) -> bool {
         self.emitted_text_delta
     }
-
-    fn time_to_first_text_delta_ms(&self) -> Option<u64> {
-        self.time_to_first_text_delta_ms
-    }
 }
 
 impl<'a> ResponsesSseDecoder<'a> {
-    pub fn new(
-        on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-        attempt_started_at: Instant,
-    ) -> Self {
+    pub fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
             terminal_response: None,
             emitted_text_delta: false,
-            attempt_started_at,
-            time_to_first_text_delta_ms: None,
             on_event,
         }
     }
@@ -550,10 +507,6 @@ impl<'a> ResponsesSseDecoder<'a> {
                         provider_responses_stream_malformed_error("output_text_delta_missing")
                     })?;
                 if !delta.is_empty() {
-                    if self.time_to_first_text_delta_ms.is_none() {
-                        self.time_to_first_text_delta_ms =
-                            Some(duration_millis(self.attempt_started_at.elapsed()));
-                    }
                     self.emitted_text_delta = true;
                     (self.on_event)(ProviderStreamEvent::OutputTextDelta {
                         delta: delta.to_string(),

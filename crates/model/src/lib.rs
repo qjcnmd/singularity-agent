@@ -44,6 +44,7 @@ pub(crate) const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_
 pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
+pub(crate) const HTTP_STATUS_CONFLICT: u16 = 409;
 pub(crate) const HTTP_STATUS_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;

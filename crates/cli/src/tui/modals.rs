@@ -33,6 +33,9 @@ pub(crate) struct SettingsMenu {
     pub(super) model: String,
     pub(super) reasoning: String,
     pub(super) error: Option<String>,
+    /// 命名模式：`Some(当前名)` 时面板退化为单行命名输入，Enter 走
+    /// `thread_catalog.rename` 路径。
+    pub(super) name: Option<String>,
 }
 
 impl SettingsMenu {
@@ -48,7 +51,24 @@ impl SettingsMenu {
             model: parts.model.unwrap_or_default().to_string(),
             reasoning: parts.effort.unwrap_or_default().to_string(),
             error: None,
+            name: None,
         }
+    }
+
+    /// 命名模式：单行编辑当前会话名。
+    pub(super) fn open_name(current_name: Option<&str>) -> Self {
+        Self {
+            field: 0,
+            provider: String::new(),
+            model: String::new(),
+            reasoning: String::new(),
+            error: None,
+            name: Some(current_name.unwrap_or_default().to_string()),
+        }
+    }
+
+    pub(super) fn is_name_mode(&self) -> bool {
+        self.name.is_some()
     }
 
     pub(super) fn fields(&self) -> [&String; 3] {
@@ -56,6 +76,9 @@ impl SettingsMenu {
     }
 
     pub(super) fn current_mut(&mut self) -> &mut String {
+        if let Some(name) = &mut self.name {
+            return name;
+        }
         match self.field {
             0 => &mut self.provider,
             1 => &mut self.model,
@@ -104,7 +127,7 @@ impl ResumeMenu {
 // =========================================================================
 
 impl TuiApp {
-    /// 设置菜单激活时的键盘路由。返回最终 Action（仅 `Continue`）。
+    /// 设置/命名菜单激活时的键盘路由。返回最终 Action（仅 `Continue`）。
     /// 字符输入与主路径同一修饰键守卫：Ctrl/Alt 组合不落入字段。
     pub(super) fn handle_settings_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
         use crossterm::event::KeyModifiers;
@@ -117,9 +140,25 @@ impl TuiApp {
             KeyCode::Esc => {
                 self.settings = None;
             }
-            KeyCode::Tab => menu.field = (menu.field + 1) % 3,
+            KeyCode::Tab if !menu.is_name_mode() => menu.field = (menu.field + 1) % 3,
             KeyCode::Backspace => {
                 menu.current_mut().pop();
+            }
+            KeyCode::Enter if menu.is_name_mode() => {
+                let name = menu.current_mut().trim().to_string();
+                let rename = if self.conversation.has_active_turn() {
+                    Err(singularity_runtime::ConversationError::TurnAlreadyActive.to_string())
+                } else {
+                    self.thread_catalog.rename(&self.thread_id, &name)
+                };
+                match rename {
+                    Ok(()) => self.transcript.push_note(
+                        format!("session named {name}"),
+                        NoteStyle::Accent,
+                    ),
+                    Err(error) => menu.error = Some(error),
+                }
+                self.settings = None;
             }
             KeyCode::Enter => {
                 let patch = menu.patch();
@@ -238,12 +277,38 @@ impl TuiApp {
 
 impl TuiApp {
     /// 设置菜单 Popup：三个可编辑字段 + 错误提示 + 操作提示。
+    /// 命名模式退化为单行名称字段。
     pub(super) fn render_settings(&self, frame: &mut Frame<'_>, menu: &SettingsMenu) {
         let popup = centered_rect(frame.area(), 60, 9);
         frame.render_widget(Clear, popup);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(name) = &menu.name {
+            lines.push(Line::from(Span::styled(
+                format!("name: {name}"),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            if let Some(error) = &menu.error {
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "Enter apply · Esc close",
+                Style::new().fg(Color::DarkGray),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("session name"),
+                ),
+                popup,
+            );
+            return;
+        }
         let names = ["provider", "model", "reasoning"];
         let values = menu.fields();
-        let mut lines: Vec<Line<'static>> = Vec::new();
         for (index, name) in names.iter().enumerate() {
             let style = if index == menu.field {
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)

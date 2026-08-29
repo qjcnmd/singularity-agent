@@ -5,13 +5,13 @@ use serde_json::Value;
 use singularity_core::CancellationToken;
 
 use crate::error::{
-    ModelError, ModelErrorKind, ProviderError, ProviderErrorStage, ProviderTransportCategory,
+    ModelError, ModelErrorKind, ProviderError, ProviderErrorStage,
 };
 use crate::types::ProviderToolReasoningMode;
 use crate::{
-    HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR, HTTP_STATUS_NOT_FOUND,
-    HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT, HTTP_STATUS_UNAUTHORIZED,
-    MAX_PROVIDER_RESPONSE_BODY_BYTES,
+    HTTP_STATUS_CONFLICT, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
+    HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
+    HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_RESPONSE_BODY_BYTES,
 };
 
 pub(crate) fn model_error_from_http_status(
@@ -22,18 +22,17 @@ pub(crate) fn model_error_from_http_status(
     let kind = match status {
         HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
         HTTP_STATUS_REQUEST_TIMEOUT => ModelErrorKind::Timeout,
+        HTTP_STATUS_CONFLICT | HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
         HTTP_STATUS_NOT_FOUND => ModelErrorKind::InvalidRequest,
-        HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
         status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
+        status if (400..=499).contains(&status) => ModelErrorKind::InvalidRequest,
         _ => ModelErrorKind::UnknownProviderError,
     };
     let message = format!("Provider returned HTTP {status}.");
-    let mut error = ModelError::new(kind, message)
+    ModelError::new(kind, message)
         .with_provider(provider_name.to_string())
         .with_model(model_name.to_string())
-        .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus);
-    error.http_status = Some(status);
-    error
+        .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus)
 }
 
 /// Provider 错误响应体中精确表示上下文超限的 wire 错误码；匹配必须是全等，不做模糊推断。
@@ -115,31 +114,14 @@ pub(super) fn provider_transport_error(
     error: reqwest::Error,
     code: &'static str,
     stage: ProviderErrorStage,
-    request_timeout_seconds: Option<u64>,
 ) -> ProviderError {
     let kind = if error.is_timeout() {
         ModelErrorKind::Timeout
     } else {
         ModelErrorKind::NetworkError
     };
-    let timeout = error.is_timeout();
-    let category = if error.is_timeout() {
-        ProviderTransportCategory::Timeout
-    } else if error.is_connect() {
-        ProviderTransportCategory::Connect
-    } else if error.is_request() {
-        ProviderTransportCategory::Request
-    } else if error.is_body() {
-        ProviderTransportCategory::BodyRead
-    } else {
-        ProviderTransportCategory::Unknown
-    };
     let message = format!("provider transport failed: {}", error.without_url());
-    let mut model_error = ModelError::new(kind, message).with_provider_diagnostic(code, stage);
-    model_error.transport_category = Some(category);
-    if timeout {
-        model_error.timeout_seconds = request_timeout_seconds;
-    }
+    let model_error = ModelError::new(kind, message).with_provider_diagnostic(code, stage);
     ProviderError::from_model_error(model_error)
 }
 
@@ -148,7 +130,6 @@ pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> Pro
         error,
         "provider_client_initialization_failed",
         ProviderErrorStage::ClientInitialization,
-        None,
     )
 }
 
@@ -187,7 +168,6 @@ pub(crate) fn block_on_provider_future<C, F, T>(
     cancellation: &CancellationToken,
     error_code: &'static str,
     error_stage: ProviderErrorStage,
-    request_timeout_seconds: u64,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -208,12 +188,7 @@ where
     match outcome {
         ProviderWaitOutcome::Cancelled => Err(provider_cancelled_error()),
         ProviderWaitOutcome::Done(result) => result.map_err(|error| {
-            provider_transport_error(
-                error,
-                error_code,
-                error_stage.clone(),
-                Some(request_timeout_seconds),
-            )
+            provider_transport_error(error, error_code, error_stage.clone())
         }),
     }
 }
@@ -227,7 +202,6 @@ enum ProviderWaitOutcome<T> {
 pub(crate) fn read_bounded_provider_response_body(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
-    request_timeout_seconds: u64,
     mut response: Response,
 ) -> Result<Vec<u8>, ProviderError> {
     if response
@@ -248,7 +222,6 @@ pub(crate) fn read_bounded_provider_response_body(
             cancellation,
             "provider_response_body_read_failed",
             ProviderErrorStage::ResponseBodyRead,
-            request_timeout_seconds,
             || response.chunk(),
         )?;
         let Some(chunk) = chunk else {
@@ -283,4 +256,49 @@ pub(super) fn provider_response_json_error() -> ModelError {
         "provider_response_json_decode_failed",
         ProviderErrorStage::ResponseJsonDecode,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(status: u16) -> ModelError {
+        model_error_from_http_status(status, "test-provider", "test-model")
+    }
+
+    #[test]
+    fn retryable_status_codes_map_to_retryable_kinds() {
+        // 与 pi provider-retry 对齐：仅 408/409/429 与 ≥500 可重试。
+        for status in [408, 409, 429, 500, 503, 599] {
+            let error = classify(status);
+            let provider_error = ProviderError::from_model_error(error.clone());
+            assert!(
+                provider_error.is_retryable(),
+                "status {status} mapped to {:?} should be retryable",
+                error.kind
+            );
+        }
+    }
+
+    #[test]
+    fn client_error_status_codes_are_not_retryable() {
+        for status in [400, 401, 403, 404, 413, 422, 499] {
+            let error = classify(status);
+            let provider_error = ProviderError::from_model_error(error.clone());
+            assert!(
+                !provider_error.is_retryable(),
+                "status {status} mapped to {:?} should not be retryable",
+                error.kind
+            );
+        }
+    }
+
+    #[test]
+    fn context_length_exceeded_code_stays_precise() {
+        assert!(is_context_length_exceeded_code(Some(
+            PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE
+        )));
+        assert!(!is_context_length_exceeded_code(Some("context_length_exceededx")));
+        assert!(!is_context_length_exceeded_code(None));
+    }
 }

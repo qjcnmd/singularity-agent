@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
-use super::walk::{display_path, to_cwd_relative, walk_files};
+use super::walk::{WalkControl, display_path, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
 
@@ -108,25 +108,24 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         Err(message) => return error_result(message),
     };
     let mut matches = Vec::new();
-    let mut total_matches = 0usize;
+    let mut truncated = false;
     if let Err(error) = walk_files(&root, &mut |relative| {
-        if regex.is_match(&display_path(&relative)) {
-            total_matches += 1;
-            if matches.len() < MAX_MATCHES {
-                matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
-            }
+        if matches.len() >= MAX_MATCHES {
+            truncated = true;
+            return WalkControl::Stop;
         }
+        if regex.is_match(&display_path(&relative)) {
+            matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
+        }
+        WalkControl::Continue
     }) {
         return error_result(format!("failed to walk {path}: {error}"));
     }
     matches.sort();
     let mut content = matches.join("\n");
-    let truncated = total_matches > MAX_MATCHES;
     if truncated {
         content.push_str("\n[glob] results truncated: showing first ");
         content.push_str(&MAX_MATCHES.to_string());
-        content.push_str(" of ");
-        content.push_str(&total_matches.to_string());
         content.push_str(" matching files; narrow the pattern to see the rest.");
     }
     if content.is_empty() {

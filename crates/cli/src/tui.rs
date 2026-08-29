@@ -181,6 +181,8 @@ fn install_panic_hook() {
 enum UiEvent {
     FromTurn(Box<TurnEvent>),
     ChainFinished(Result<TurnStatus, String>),
+    /// 中断/失败时未交付的转向输入，退还编辑器（pi clearQueue 语义）。
+    UndeliveredInputs(Vec<String>),
     /// /compact 后台压缩线程的结果。
     CompactFinished(Result<CompactionOutcome, String>),
 }
@@ -204,11 +206,14 @@ fn spawn_turn(
         let mut sink = EventForward::new(tx.clone(), from_turn);
         let result = conversation.run_turn(&goal, &mut sink);
         drop(sink);
-        let finished = match result {
-            Ok(outcome) => Ok(outcome.turn_status),
-            Err(error) => Err(error.to_string()),
+        let (finished, undelivered) = match result {
+            Ok(outcome) => (Ok(outcome.turn_status), outcome.undelivered_inputs),
+            Err(error) => (Err(error.to_string()), Vec::new()),
         };
         let _ = tx.send(UiEvent::ChainFinished(finished));
+        if !undelivered.is_empty() {
+            let _ = tx.send(UiEvent::UndeliveredInputs(undelivered));
+        }
     });
 }
 
@@ -284,6 +289,7 @@ fn event_loop(
                         spawn_compact(&app.conversation_handle(), cancellation, tx.clone());
                     }
                 }
+                UiEvent::UndeliveredInputs(inputs) => app.return_undelivered(inputs),
                 UiEvent::CompactFinished(result) => app.on_compact_finished(result),
             }
         }

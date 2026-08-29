@@ -28,7 +28,7 @@ use crate::error::{
 };
 use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
 use crate::objects::{
-    ProviderStatus, Thread, Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage,
+    ProviderStatus, Thread, Turn, TurnModelUsage, TurnStatus, turn_usage_from_model_usage,
 };
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
@@ -71,7 +71,9 @@ pub struct TurnOutcome {
     /// 最终 assistant 文本；中断/失败时可能为空。
     pub final_text: String,
     pub truncated: bool,
-    pub usage: TurnUsage,
+    pub usage: TurnModelUsage,
+    /// 终态后仍留在注入箱、未在本次 turn 交付的转向输入（中断时退还调用方）。
+    pub undelivered_inputs: Vec<String>,
 }
 
 /// 进程内 turn 执行器：无状态、可共享，按需构造。
@@ -343,6 +345,7 @@ impl TurnRunner {
             usage: final_turn
                 .usage
                 .unwrap_or_else(|| turn_usage_from_model_usage(&ModelUsage::default(), false)),
+            undelivered_inputs: Vec::new(),
         })
     }
 

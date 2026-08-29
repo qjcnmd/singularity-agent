@@ -1,16 +1,12 @@
 //! runtime 事件的 JSON-RPC 投影。
 
 use singularity_protocol::{
-    ExecutionTurn, JsonRpcId, JsonRpcMessage, Turn, TurnStartResult, turn_event_notification,
+    JsonRpcId, JsonRpcMessage, Turn, TurnStartResult, turn_event_notification,
 };
 use singularity_runtime::events::{TurnEvent, TurnEventSink};
 use singularity_runtime::{TurnFailureStage, TurnOutcome, TurnRunError};
 
 use super::*;
-
-pub(crate) fn wire_turn(turn: &ExecutionTurn) -> Turn {
-    Turn::from(turn)
-}
 
 /// 单次 run_turn 调用的协议投影。
 pub(crate) struct TurnProjection<'a> {
@@ -45,13 +41,13 @@ impl<'a> TurnProjection<'a> {
     /// `turn/started` 之后紧随回写 turn/start 的响应：stdio 单连接下客户端
     /// 把该 response 之前的 notification 关联到本次请求（每个投影只回一次，
     /// 链式 followUp 的后续 turn 不再产生响应）。
-    fn send_start_response(&mut self, turn: &ExecutionTurn) {
+    fn send_start_response(&mut self, turn: &Turn) {
         if self.response_sent {
             return;
         }
         self.response_sent = true;
         let value = match serde_json::to_value(TurnStartResult {
-            turn: wire_turn(turn),
+            turn: turn.clone(),
         }) {
             Ok(value) => value,
             Err(error) => {

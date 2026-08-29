@@ -131,15 +131,14 @@ pub(crate) fn parse_session_lines_with_limits(
     let mut repair = TailRepair::None;
     let mut line_number = 1usize;
     while let Some(bounded_line) =
-        crate::tools::line::read_bounded_line_with_termination(&mut reader, max_line_bytes, None)
+        crate::tools::line::read_bounded_line_with_termination(&mut reader, max_line_bytes)
             .map_err(|error| match error {
-                crate::tools::line::LineFailure::OverLimit(_) => SessionError::InvalidSession(
-                    format!("session entry exceeds {max_line_bytes} bytes at line {line_number}"),
-                ),
-                crate::tools::line::LineFailure::Io(error) => SessionError::Io(error),
-                crate::tools::line::LineFailure::Cancelled => {
-                    unreachable!("session parsing does not provide cancellation")
+                crate::tools::line::LineFailure::OverLimit { .. } => {
+                    SessionError::InvalidSession(format!(
+                        "session entry exceeds {max_line_bytes} bytes at line {line_number}"
+                    ))
                 }
+                crate::tools::line::LineFailure::Io(error) => SessionError::Io(error),
             })?
     {
         let has_newline = bounded_line.has_newline;

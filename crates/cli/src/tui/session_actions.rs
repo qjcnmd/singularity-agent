@@ -76,12 +76,8 @@ impl TuiApp {
 
     /// 斜杠命令分发。`/compact` 不在此处阻塞执行：置位压缩状态并返回
     /// [`Action::Compact`]，由事件循环 spawn 后台线程真正执行。
-    pub(super) fn execute_command(&mut self, text: &str) -> Action {
-        let Some((command, argument)) = SlashCommand::parse(text) else {
-            self.transcript
-                .push_note(format!("unknown command: {text}"), NoteStyle::Warning);
-            return Action::Continue;
-        };
+    /// `/name` 打开单行命名输入弹窗，确认后走 `thread_catalog.rename` 路径。
+    pub(super) fn execute_command(&mut self, command: SlashCommand) -> Action {
         match command {
             SlashCommand::Model => {
                 let current = self
@@ -188,23 +184,21 @@ impl TuiApp {
                     return Action::Compact(cancellation);
                 }
             }
-            SlashCommand::Name if !argument.trim().is_empty() => {
-                let rename = if self.conversation.has_active_turn() {
-                    Err(singularity_runtime::ConversationError::TurnAlreadyActive.to_string())
-                } else {
-                    self.thread_catalog.rename(&self.thread_id, argument.trim())
-                };
-                match rename {
-                    Ok(()) => self.transcript.push_note(
-                        format!("session named {}", argument.trim()),
-                        NoteStyle::Accent,
-                    ),
-                    Err(error) => self.transcript.push_note(error, NoteStyle::Error),
-                }
+            SlashCommand::Name => {
+                // 打开单行命名输入弹窗（复用 SettingsMenu 的字段编辑模式）。
+                let current_name = self
+                    .thread_catalog
+                    .list_threads()
+                    .ok()
+                    .and_then(|threads| {
+                        threads
+                            .into_iter()
+                            .find(|summary| summary.thread_id == self.thread_id)
+                    })
+                    .and_then(|summary| summary.title)
+                    .unwrap_or_default();
+                self.settings = Some(SettingsMenu::open_name(Some(&current_name)));
             }
-            SlashCommand::Name => self
-                .transcript
-                .push_note("usage: /name <session name>", NoteStyle::Warning),
         }
         Action::Continue
     }

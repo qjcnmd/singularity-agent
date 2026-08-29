@@ -111,15 +111,6 @@ impl ToolRegistry {
         self.tools.insert(spec.name, spec);
     }
 
-    /// 注册工具。重复名称是编程错误，直接 panic（调用方必须使用唯一名称）。
-    #[cfg(test)]
-    pub fn register(&mut self, spec: ToolSpec) {
-        if self.tools.contains_key(spec.name) {
-            panic!("tool already registered: {}", spec.name);
-        }
-        self.tools.insert(spec.name, spec);
-    }
-
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
     }

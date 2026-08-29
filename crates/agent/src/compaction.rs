@@ -20,8 +20,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
-    ModelTurnStatus, ModelUsage, Provider, ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnStatus, ModelUsage,
+    Provider, ProviderError,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -204,6 +204,9 @@ pub enum CompactionOutcome {
 /// Compaction 错误。
 #[derive(Debug, Error)]
 pub enum CompactionError {
+    /// 压缩请求被取消（与采样取消同一语义；不视为压缩故障）。
+    #[error("compaction aborted")]
+    Aborted,
     #[error("summarization provider error: {0}")]
     Provider(#[from] ProviderError),
     #[error("session error: {0}")]
@@ -594,12 +597,8 @@ impl CompactionEngine {
             cancellation,
         ) {
             SendOutcome::Response(response) => *response,
-            // 退避等待被取消与 provider 取消请求同形收敛。
-            SendOutcome::Aborted => {
-                return Err(CompactionError::Provider(ProviderError::from_model_error(
-                    ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled"),
-                )));
-            }
+            // 退避等待被取消：压缩取消与采样取消同形收敛，不伪装成故障。
+            SendOutcome::Aborted => return Err(CompactionError::Aborted),
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
         };
         if response.status != ModelTurnStatus::Success {

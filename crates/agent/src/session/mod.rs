@@ -15,9 +15,10 @@ pub mod repair;
 pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind, SessionTurnUsage, TurnTerminalStatus,
+    SessionMetadataKind, TurnTerminalStatus,
 };
 pub use manager::{SessionAccess, SessionManager};
+pub use singularity_protocol::TurnModelUsage;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// runtime 与 app-server 投影共享的 JSONL 派生事实。
@@ -30,7 +31,7 @@ pub struct SessionProjection {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<SessionProjectionStatus>,
-    pub latest_usage: Option<SessionTurnUsage>,
+    pub latest_usage: Option<TurnModelUsage>,
     pub turn_count: usize,
     pub total_tokens: u64,
 }

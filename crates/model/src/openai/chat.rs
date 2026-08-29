@@ -261,7 +261,6 @@ pub fn finalize_provider_response(
         assistant_message,
         usage,
         finish_reason,
-        validation: None,
         error: None,
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(model_name.to_string()),
@@ -325,7 +324,6 @@ pub fn finalize_provider_response(
             error.validation_errors = validation.errors.clone();
         }
     }
-    response.validation = Some(validation);
     Ok(response)
 }
 

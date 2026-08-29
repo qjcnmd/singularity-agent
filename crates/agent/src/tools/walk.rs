@@ -9,13 +9,28 @@ pub(crate) fn skipped_dir(name: &str) -> bool {
     matches!(name, ".git" | "target" | "node_modules")
 }
 
+/// 遍历回调的控制信号：返回 [`WalkControl::Stop`] 时遍历器立即收尾。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkControl {
+    Continue,
+    Stop,
+}
+
 /// 深度优先遍历 `root` 之下的普通文件；对每个文件以相对 `root` 的路径调用
-/// `on_file`。子目录条目确定性排序后再进入，保证输出顺序稳定。
-pub(crate) fn walk_files(root: &Path, on_file: &mut dyn FnMut(PathBuf)) -> io::Result<()> {
-    fn walk(dir: &Path, root: &Path, on_file: &mut dyn FnMut(PathBuf)) -> io::Result<()> {
+/// `on_file`。子目录条目确定性排序后再进入，保证输出顺序稳定。回调返回
+/// [`WalkControl::Stop`] 时立即停止整棵遍历。
+pub(crate) fn walk_files(
+    root: &Path,
+    on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
+) -> io::Result<()> {
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
+    ) -> io::Result<bool> {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
             Err(error) => return Err(error),
         };
         let mut paths = Vec::new();
@@ -40,15 +55,20 @@ pub(crate) fn walk_files(root: &Path, on_file: &mut dyn FnMut(PathBuf)) -> io::R
                 if metadata.file_type().is_symlink() {
                     continue;
                 }
-                walk(&path, root, on_file)?;
+                if !walk(&path, root, on_file)? {
+                    return Ok(false);
+                }
             } else if metadata.is_file() {
                 let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                on_file(relative);
+                if on_file(relative) == WalkControl::Stop {
+                    return Ok(false);
+                }
             }
         }
-        Ok(())
+        Ok(true)
     }
-    walk(root, root, on_file)
+    let _ = walk(root, root, on_file)?;
+    Ok(())
 }
 
 /// 把相对路径渲染成 `/` 分隔的字符串（跨平台输出稳定）。

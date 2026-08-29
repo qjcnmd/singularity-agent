@@ -6,9 +6,9 @@ use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
 pub use super::format::SessionError;
 use super::format::{
-    Result, SessionEntry, SessionMetadata, SessionMetadataKind, SessionTurnUsage,
-    TurnTerminalStatus,
+    Result, SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
 };
+use singularity_protocol::TurnModelUsage;
 pub use super::manager::SessionManager;
 
 impl SessionManager {
@@ -42,7 +42,7 @@ impl SessionManager {
             self.append_metadata(SessionMetadata::turn_terminal(
                 turn_id,
                 TurnTerminalStatus::Interrupted,
-                SessionTurnUsage::default(),
+                TurnModelUsage::default(),
                 false,
             ))?;
             repaired += 1;

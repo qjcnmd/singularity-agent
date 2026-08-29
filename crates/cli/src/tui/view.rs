@@ -3,6 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 use super::app::{Phase, SPINNER_FRAMES, TuiApp};
 use super::commands::SlashCommand;
@@ -53,11 +54,23 @@ impl TuiApp {
     /// footer 合同：状态行＝相位+spinner·具名等待对象·thread·模型·
     /// token/队列数·浏览指示（含新增计数）·压缩进行指示。提示行按上下文
     /// 给出关键操作。
+    ///
+    /// 右端预留 [stop] 宽度（running 相位）右对齐；左侧内容按 unicode 宽度
+    /// 逐 span 裁剪到剩余预算，截断补 `…`（继承被截 span 样式）。
     pub(super) fn footer_spans(
         &self,
         total_rows: usize,
         viewport: usize,
+        width: u16,
     ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        const STOP_STR: &str = "[stop]";
+        let stop_width = UnicodeWidthStr::width(STOP_STR) as u16;
+        let available = if self.phase != Phase::Idle {
+            width.saturating_sub(stop_width + 1)
+        } else {
+            width
+        };
+
         let dim = Style::new().fg(Color::DarkGray);
         let warn = Style::new().fg(Color::Yellow);
         let magenta = Style::new().fg(Color::Magenta);
@@ -116,10 +129,44 @@ impl TuiApp {
         if self.compaction.is_running() {
             status.push(Span::styled(" · compacting…", warn));
         }
-        // 运行中显示可点击的 [stop]（点击 = 中断，参照 Grok 的 turn-status）。
+
+        // 按可用宽度逐 span 裁剪，截断补 …（继承被截 span 样式）。
+        let mut trimmed = Vec::new();
+        let mut used = 0u16;
+        for span in status {
+            let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+            let remaining = available.saturating_sub(used);
+            if span_width <= remaining {
+                trimmed.push(span);
+                used += span_width;
+            } else if remaining > 0 {
+                let style = span.style.clone();
+                let text = span.content.as_ref();
+                let mut cut = remaining as usize;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let mut truncated = text[..cut].to_string();
+                truncated.push('…');
+                trimmed.push(Span::styled(truncated, style));
+                used += remaining;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        // 运行中右对齐显示 [stop]：左侧内容不足时以空白填充到右缘。
         if self.phase != Phase::Idle {
-            status.push(Span::styled(
-                "[stop]",
+            if used < available {
+                trimmed.push(Span::raw(" ".repeat((available - used) as usize)));
+            }
+            trimmed.push(Span::styled(
+                " ".to_string(),
+                Style::new(),
+            ));
+            trimmed.push(Span::styled(
+                STOP_STR.to_string(),
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
         }
@@ -155,6 +202,6 @@ impl TuiApp {
             dim
         };
         let hint = vec![Span::styled(hint_text, hint_style)];
-        (status, hint)
+        (trimmed, hint)
     }
 }

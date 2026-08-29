@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use serde_json::{Value, json};
-use singularity_runtime::events::{TurnEvent, turn_event_jsonl_params};
+use singularity_runtime::events::{TurnEvent, turn_event_params};
 use singularity_runtime::objects::TurnStatus;
 
 pub struct JsonlRenderer {
@@ -41,7 +41,7 @@ impl JsonlRenderer {
         if self.stdout_broken {
             return;
         }
-        let line = json!({"method": event.method(), "params": turn_event_jsonl_params(event)});
+        let line = json!({"method": event.method(), "params": turn_event_params(event)});
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
         if writeln!(lock, "{line}")

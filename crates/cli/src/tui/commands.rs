@@ -48,12 +48,11 @@ impl SlashCommand {
         }
     }
 
-    pub(crate) fn parse(text: &str) -> Option<(Self, &str)> {
-        let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
+    /// 整行精确匹配：返回命中的命令（无参数）；非精确命令返回 None。
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .find(|item| item.as_str() == command)
-            .map(|item| (item, argument.trim()))
+            .find(|item| item.as_str() == text)
     }
 
     pub(crate) fn completions(prefix: &str) -> impl Iterator<Item = Self> {
@@ -78,11 +77,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_commands_and_arguments() {
-        assert_eq!(
-            SlashCommand::parse("/name hello world"),
-            Some((SlashCommand::Name, "hello world"))
-        );
+    fn parses_commands_by_exact_match() {
+        assert_eq!(SlashCommand::parse("/name"), Some(SlashCommand::Name));
+        assert_eq!(SlashCommand::parse("/name hello world"), None);
         assert_eq!(SlashCommand::parse("/unknown"), None);
     }
 

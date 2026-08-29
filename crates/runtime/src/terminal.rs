@@ -5,27 +5,14 @@
 //! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
 
 use singularity_agent::session::{
-    SessionManager, SessionMetadata, SessionTurnUsage, TurnTerminalStatus,
+    SessionManager, SessionMetadata, TurnTerminalStatus,
 };
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
 use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
-use crate::objects::{Turn, TurnStatus, TurnUsage, turn_usage_from_model_usage};
-
-/// wire usage 投影 → JSONL 存储形状（字段一一对应，camelCase 落盘不变）。
-fn session_turn_usage(usage: &TurnUsage) -> SessionTurnUsage {
-    SessionTurnUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
-        usage_present: usage.usage_present,
-        usage_complete: usage.usage_complete,
-    }
-}
+use crate::objects::{Turn, TurnModelUsage, TurnStatus, turn_usage_from_model_usage};
 
 /// turn 终态到 JSONL 存储词形的唯一派生；`Running` 非终态返回 `None`。
 fn terminal_word(status: TurnStatus) -> Option<TurnTerminalStatus> {
@@ -55,7 +42,7 @@ pub(crate) struct TerminalCommit {
     turn_id: String,
     terminal: TurnTerminalStatus,
     event_status: TurnStatus,
-    usage: TurnUsage,
+    usage: TurnModelUsage,
     usage_complete: bool,
 }
 
@@ -82,7 +69,7 @@ impl TerminalCommit {
         SessionMetadata::turn_terminal(
             &self.turn_id,
             self.terminal,
-            session_turn_usage(&self.usage),
+            self.usage.clone(),
             self.usage_complete,
         )
     }

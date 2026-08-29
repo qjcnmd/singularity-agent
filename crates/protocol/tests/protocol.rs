@@ -3,14 +3,12 @@
 
 use serde_json::json;
 use singularity_protocol::{
-    ClientInfo, DiagnosticSeverity, EmptyParams, ErrorCode, ExecutionThread, ExecutionTurn,
-    ExecutionTurnUsage, InitializeParams, JsonRpcId, JsonRpcInbound, JsonRpcMessage, Method,
-    MethodKind, ProviderAttemptStatus, ThreadReadParams, ThreadStartParams, ThreadStatus,
-    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnInjectionParams,
-    TurnStartParams, TurnStatus, parse_json_rpc_payload, turn_event_jsonl_params,
-    turn_event_notification,
+    ClientInfo, DiagnosticSeverity, EmptyParams, ErrorCode, InitializeParams, JsonRpcId,
+    JsonRpcInbound, JsonRpcMessage, Method, MethodKind, ProviderAttemptStatus, Thread,
+    ThreadReadParams, ThreadStartParams, ThreadStatus, Turn, TurnErrorDetail, TurnEvent,
+    TurnFailureCause, TurnFailureStage, TurnInjectionParams, TurnModelUsage, TurnStartParams,
+    TurnStatus, parse_json_rpc_payload, turn_event_notification, turn_event_params,
 };
-
 #[test]
 fn json_rpc_requires_the_2_0_version_member() {
     let error =
@@ -156,12 +154,12 @@ fn thread_settings_reasoning_wire_distinguishes_missing_string_and_null() {
     }
 }
 
-fn execution_turn(status: TurnStatus, usage: bool) -> ExecutionTurn {
-    ExecutionTurn {
+fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
+    Turn {
         turn_id: "turn-1".to_string(),
         thread_id: "thread-1".to_string(),
         status,
-        usage: usage.then_some(ExecutionTurnUsage {
+        usage: usage.then_some(TurnModelUsage {
             input_tokens: 101,
             output_tokens: 202,
             total_tokens: 303,
@@ -197,7 +195,7 @@ fn turn_event_wire_goldens() {
                 item_id: "item-1".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"item_id":"item-1","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/agentMessage/delta",
@@ -208,7 +206,7 @@ fn turn_event_wire_goldens() {
                 delta: "hel".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"delta":"hel","item_id":"item-1","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/agentThinking",
@@ -218,7 +216,7 @@ fn turn_event_wire_goldens() {
                 text: "think".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"item/agentThinking","params":{"text":"think","threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"text":"think","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"text":"think","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/start",
@@ -230,7 +228,7 @@ fn turn_event_wire_goldens() {
                 args: args.clone(),
             },
             r#"{"jsonrpc":"2.0","method":"tool/execution/start","params":{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"thread_id":"thread-1","tool_call_id":"call-1","tool_name":"edit","turn_id":"turn-1"}"#,
+            r#"{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/update",
@@ -243,7 +241,7 @@ fn turn_event_wire_goldens() {
                 partial_result: "chunk".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"tool/execution/update","params":{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"partial_result":"chunk","thread_id":"thread-1","tool_call_id":"call-1","tool_name":"edit","turn_id":"turn-1"}"#,
+            r#"{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/end",
@@ -256,7 +254,7 @@ fn turn_event_wire_goldens() {
                 is_error: false,
             },
             r#"{"jsonrpc":"2.0","method":"tool/execution/end","params":{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
-            r#"{"is_error":false,"result":"done","thread_id":"thread-1","tool_call_id":"call-1","tool_name":"edit","turn_id":"turn-1"}"#,
+            r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
         (
             "item/completed",
@@ -266,7 +264,7 @@ fn turn_event_wire_goldens() {
                 item_id: "item-1".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"item_id":"item-1","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/failed",
@@ -277,7 +275,7 @@ fn turn_event_wire_goldens() {
                 error: "boom".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"item/failed","params":{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"error":"boom","item_id":"item-1","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "agent/diagnostic",
@@ -289,7 +287,7 @@ fn turn_event_wire_goldens() {
                 message: "truncated".to_string(),
             },
             r#"{"jsonrpc":"2.0","method":"agent/diagnostic","params":{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"code":"project_instructions_truncated","message":"truncated","severity":"warning","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "provider/attempt",
@@ -306,7 +304,7 @@ fn turn_event_wire_goldens() {
                 diagnostic_code: None,
             },
             r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"model":"deepseek-v4-flash","model_turn_ordinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "provider/attempt",
@@ -323,14 +321,14 @@ fn turn_event_wire_goldens() {
                 diagnostic_code: Some("provider_retry_scheduled".to_string()),
             },
             r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"attempt_duration_ms":421,"diagnostic_code":"provider_retry_scheduled","error_category":"rate_limited","model":"deepseek-v4-flash","model_turn_ordinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","thread_id":"thread-1","turn_id":"turn-1"}"#,
+            r#"{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/completed",
             TurnEvent::TurnCompleted {
                 turn: execution_turn(TurnStatus::Completed, true),
             },
-            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"modelUsage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true},"status":"completed","threadId":"thread-1","turnId":"turn-1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true},"status":"completed","threadId":"thread-1","turnId":"turn-1"}}}"#,
             r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true}}}"#,
         ),
         (
@@ -344,12 +342,12 @@ fn turn_event_wire_goldens() {
                 },
             },
             r#"{"jsonrpc":"2.0","method":"turn/error","params":{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}}"#,
-            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"turn":{"status":"failed","threadId":"thread-1","turnId":"turn-1"}}"#,
+            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "thread/settingsApplied",
             TurnEvent::ThreadSettingsApplied {
-                thread: ExecutionThread {
+                thread: Thread {
                     thread_id: "thread-1".to_string(),
                     cwd: "C:\\work".to_string(),
                     model: Some("opencode-go/deepseek-v4-flash#max".to_string()),
@@ -372,7 +370,7 @@ fn turn_event_wire_goldens() {
         let expected_jsonl: serde_json::Value =
             serde_json::from_str(jsonl_params).expect("jsonl golden parses");
         assert_eq!(
-            turn_event_jsonl_params(&event),
+            turn_event_params(&event),
             expected_jsonl,
             "{method}: --json params drift"
         );

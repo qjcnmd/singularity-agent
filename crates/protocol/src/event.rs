@@ -1,11 +1,13 @@
 //! 执行事件唯一事实源与两面 wire 投影。
 //!
-//! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态；
-//! 两个对外表面各有一个显式投影函数，方法名由 [`TurnEvent::method`] 单点定义：
+//! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态，
+//! 各变体直接携带 [`params`](crate::params) 的协议对象类型，不存在第二份
+//! 同构镜像；方法名由 [`TurnEvent::method`] 单点定义，params 由
+//! [`turn_event_params`] 单一投影：
 //!
 //! - [`turn_event_notification`]：桌面端 JSON-RPC 通知（camelCase wire，
 //!   嵌套形状在本文件唯一一处组装）；
-//! - [`turn_event_jsonl_params`]：`sg --json` 事件行的 `params`（snake_case）。
+//! - `--json` 事件行 = `{"method", "params"}`，与桌面端共用同一 params 投影。
 //!
 //! `thread/started` 不是执行事件，由 app-server 作为桌面端局部生命周期通知
 //! 自行发出。Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
@@ -15,46 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::envelope::JsonRpcMessage;
-use crate::params::{Thread, ThreadStatus, Turn, TurnModelUsage, TurnStatus};
+use crate::params::{Thread, Turn};
 
 /// runtime 直接发射的稳定诊断代码。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
     pub const STORAGE_FATAL: &str = "storage_fatal";
-}
-
-/// runtime 与客户端共同消费的线程事件投影。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionThread {
-    pub thread_id: String,
-    pub cwd: String,
-    pub model: Option<String>,
-    pub last_turn_status: Option<ThreadStatus>,
-}
-
-/// runtime 与客户端共同消费的 turn usage 投影。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionTurnUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub usage_present: bool,
-    pub usage_complete: bool,
-}
-
-/// runtime 与客户端共同消费的 turn 事件投影。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionTurn {
-    pub turn_id: String,
-    pub thread_id: String,
-    pub status: TurnStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<ExecutionTurnUsage>,
 }
 
 /// 终态失败的分类信息；message 已经过脱敏边界处理。
@@ -70,7 +38,7 @@ pub struct TurnErrorDetail {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     TurnStarted {
-        turn: ExecutionTurn,
+        turn: Turn,
     },
     ItemStarted {
         thread_id: String,
@@ -143,14 +111,14 @@ pub enum TurnEvent {
         diagnostic_code: Option<String>,
     },
     TurnCompleted {
-        turn: ExecutionTurn,
+        turn: Turn,
     },
     TurnFailed {
-        turn: ExecutionTurn,
+        turn: Turn,
         error: TurnErrorDetail,
     },
     ThreadSettingsApplied {
-        thread: ExecutionThread,
+        thread: Thread,
     },
 }
 
@@ -180,17 +148,17 @@ impl TurnEvent {
 // 不变量：params 为刚组装完成的 Value，不存在序列化失败路径。
 #[allow(clippy::expect_used)]
 pub fn turn_event_notification(event: &TurnEvent) -> JsonRpcMessage {
-    JsonRpcMessage::notification(event.method(), turn_event_wire_params(event))
+    JsonRpcMessage::notification(event.method(), turn_event_params(event))
         .expect("notification with json value params serializes")
 }
 
-/// 桌面端 wire 的 `params` 形状（camelCase，item/result 嵌套形态在此唯一一处
-/// 定义）。与 `--json` 面的差异（`modelUsage` 键名、`turn/error` 平铺、可选
-/// 字段以 null 出现）都是桌面端协议的既有合同，由 golden 测试逐字钉住。
-fn turn_event_wire_params(event: &TurnEvent) -> Value {
+/// 事件 `params` 的唯一投影（camelCase，item/result 嵌套形态在此唯一一处
+/// 定义）。桌面端 JSON-RPC 通知与 `--json` 事件行共用此形状；可选字段恒以
+/// null 出现（省略即未知），由 golden 测试逐字钉住。
+pub fn turn_event_params(event: &TurnEvent) -> Value {
     match event {
-        TurnEvent::TurnStarted { turn } => json!({"turn": Turn::from(turn)}),
-        TurnEvent::TurnCompleted { turn } => json!({"turn": Turn::from(turn)}),
+        TurnEvent::TurnStarted { turn } => json!({"turn": turn}),
+        TurnEvent::TurnCompleted { turn } => json!({"turn": turn}),
         TurnEvent::TurnFailed { turn, error } => json!({
             "turnId": turn.turn_id,
             "threadId": turn.thread_id,
@@ -200,7 +168,7 @@ fn turn_event_wire_params(event: &TurnEvent) -> Value {
                 "message": error.message,
             },
         }),
-        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": Thread::from(thread)}),
+        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": thread}),
         TurnEvent::ItemStarted {
             thread_id,
             turn_id,
@@ -331,144 +299,6 @@ fn turn_event_wire_params(event: &TurnEvent) -> Value {
     }
 }
 
-/// `sg --json` 事件行的 `params` 形状（snake_case；缺值的可选字段整体省略，
-/// 与桌面端 wire 的 null 语义刻意不同，两面的合同由 protocol golden 测试分别
-/// 钉住）。
-pub fn turn_event_jsonl_params(event: &TurnEvent) -> Value {
-    match event {
-        TurnEvent::TurnStarted { turn } | TurnEvent::TurnCompleted { turn } => {
-            json!({"turn": turn})
-        }
-        TurnEvent::TurnFailed { turn, error } => json!({"turn": turn, "error": error}),
-        TurnEvent::ThreadSettingsApplied { thread } => json!({"thread": thread}),
-        TurnEvent::ItemStarted {
-            thread_id,
-            turn_id,
-            item_id,
-        } => json!({"thread_id": thread_id, "turn_id": turn_id, "item_id": item_id}),
-        TurnEvent::AssistantDelta {
-            thread_id,
-            turn_id,
-            item_id,
-            delta,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "item_id": item_id,
-            "delta": delta,
-        }),
-        TurnEvent::AssistantThinking {
-            thread_id,
-            turn_id,
-            text,
-        } => json!({"thread_id": thread_id, "turn_id": turn_id, "text": text}),
-        TurnEvent::ItemCompleted {
-            thread_id,
-            turn_id,
-            item_id,
-        } => json!({"thread_id": thread_id, "turn_id": turn_id, "item_id": item_id}),
-        TurnEvent::ItemFailed {
-            thread_id,
-            turn_id,
-            item_id,
-            error,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "item_id": item_id,
-            "error": error,
-        }),
-        TurnEvent::ToolExecutionStart {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            args,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "args": args,
-        }),
-        TurnEvent::ToolExecutionUpdate {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            args,
-            partial_result,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "args": args,
-            "partial_result": partial_result,
-        }),
-        TurnEvent::ToolExecutionEnd {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "result": result,
-            "is_error": is_error,
-        }),
-        TurnEvent::Diagnostic {
-            thread_id,
-            turn_id,
-            severity,
-            code,
-            message,
-        } => json!({
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "severity": severity.as_str(),
-            "code": code,
-            "message": message,
-        }),
-        TurnEvent::ProviderAttempt {
-            thread_id,
-            turn_id,
-            model_turn_ordinal,
-            provider,
-            model,
-            protocol,
-            status,
-            attempt_duration_ms,
-            error_category,
-            diagnostic_code,
-        } => {
-            let mut object = serde_json::Map::new();
-            object.insert("thread_id".to_string(), json!(thread_id));
-            object.insert("turn_id".to_string(), json!(turn_id));
-            object.insert("model_turn_ordinal".to_string(), json!(model_turn_ordinal));
-            object.insert("provider".to_string(), json!(provider));
-            object.insert("model".to_string(), json!(model));
-            object.insert("protocol".to_string(), json!(protocol));
-            object.insert("status".to_string(), json!(status.as_str()));
-            // --json 面的可选字段仅在已知时出现（省略即未知，不写 null）。
-            if let Some(duration) = attempt_duration_ms {
-                object.insert("attempt_duration_ms".to_string(), json!(duration));
-            }
-            if let Some(category) = error_category {
-                object.insert("error_category".to_string(), json!(category));
-            }
-            if let Some(code) = diagnostic_code {
-                object.insert("diagnostic_code".to_string(), json!(code));
-            }
-            Value::Object(object)
-        }
-    }
-}
-
 /// `agent/diagnostic` 的稳定严重级别词形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,6 +318,7 @@ impl DiagnosticSeverity {
     }
 }
 
+/// 经 runtime 重导出后被 CLI 诊断行以 Display 使用。
 impl std::fmt::Display for DiagnosticSeverity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -515,12 +346,6 @@ impl ProviderAttemptStatus {
     }
 }
 
-impl std::fmt::Display for ProviderAttemptStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// `turn/error.error.stage` 的稳定管线阶段词形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -538,6 +363,7 @@ impl TurnFailureStage {
     }
 }
 
+/// app-server 错误消息使用 Display 呈现阶段词形。
 impl std::fmt::Display for TurnFailureStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -585,44 +411,13 @@ impl TurnFailureCause {
     }
 }
 
+/// app-server 错误消息使用 Display 呈现原因词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.wire_str())
     }
 }
 
-impl From<&ExecutionThread> for Thread {
-    fn from(thread: &ExecutionThread) -> Self {
-        Self {
-            thread_id: thread.thread_id.clone(),
-            model: thread.model.clone(),
-            cwd: thread.cwd.clone(),
-            last_turn_status: thread.last_turn_status,
-        }
-    }
-}
 
-impl From<&ExecutionTurn> for Turn {
-    fn from(turn: &ExecutionTurn) -> Self {
-        Self {
-            turn_id: turn.turn_id.clone(),
-            thread_id: turn.thread_id.clone(),
-            status: turn.status,
-            model_usage: turn.usage.as_ref().map(TurnModelUsage::from),
-        }
-    }
-}
 
-impl From<&ExecutionTurnUsage> for TurnModelUsage {
-    fn from(usage: &ExecutionTurnUsage) -> Self {
-        Self {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            usage_present: usage.usage_present,
-            usage_complete: usage.usage_complete,
-        }
-    }
-}
+

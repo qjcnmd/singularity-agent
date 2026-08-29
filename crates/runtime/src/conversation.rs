@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::error::TurnRunError;
 use crate::events::{TurnEvent, TurnEventSink};
-use crate::objects::{Thread, ThreadStatus};
+use crate::objects::{Thread, ThreadStatus, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 
 /// 客户端可修改的当前 Thread 运行时设置。
@@ -143,6 +143,17 @@ impl TurnControls {
             inbox
                 .lock()
                 .is_ok_and(|mut inbox| inbox.enqueue(text.into()))
+        })
+    }
+
+    /// 取走本轮尚未交付的转向输入（终态后由链条排水到下一轮）。
+    pub(crate) fn drain_inbox(&self) -> Vec<String> {
+        let Ok(guard) = self.inbox.lock() else {
+            // 锁中毒（状态未知）→ 按无残留输入收敛，不泄露可能损坏的状态。
+            return Vec::new();
+        };
+        guard.as_ref().map_or_else(Vec::new, |inbox| {
+            inbox.lock().map_or_else(|_| Vec::new(), |mut inbox| inbox.drain())
         })
     }
 
@@ -483,6 +494,15 @@ impl Conversation {
                 self.requeue_follow_ups(queue)?;
                 return step;
             }
+            // 中断终态停止链条：剩余 followUp 原样保留，未交付转向输入
+            // 随本轮 outcome 退还调用方（pi 的 interrupted 排水语义）。
+            if matches!(
+                &step,
+                Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted
+            ) {
+                self.requeue_follow_ups(queue)?;
+                return step;
+            }
             // 成功应用后发布投影更新：客户端据此拿到下一 turn 生效的
             // 线程模型。持久化失败时
             // 保留该意图与剩余输入，返回可行动错误。
@@ -497,8 +517,14 @@ impl Conversation {
             if let Some(updated) = applied {
                 sink.emit(TurnEvent::ThreadSettingsApplied { thread: updated });
             }
-            // 可信终态（completed/failed/interrupted）后继续消费队列；
-            // 单轮执行失败不阻断其余已接受的 followUp。
+            // completed/failed 终态后，未交付转向输入排到链队列队首，先于
+            // 已排队的 followUp 执行（pi continue 的排水顺序）；随后继续
+            // 消费队列。单轮执行失败不阻断其余已接受的 followUp。
+            if let Ok(outcome) = &step {
+                for text in outcome.undelivered_inputs.iter().rev() {
+                    queue.push_front(text.clone());
+                }
+            }
             last = Some(step);
         }
         // 不变量：run_single_turn 至少消费一轮队列，last 必为 Some。
@@ -532,6 +558,9 @@ impl Conversation {
             input,
         };
         let result = self.runner.run(params, &controls, sink);
+        // 终态后排水：注入箱中仍未交付的转向输入随 outcome 返回，由链条
+        // 决定重排到下一轮或退还调用方。
+        let undelivered = controls.drain_inbox();
         let mut state = self.lock_state()?;
         state.turn = TurnLifecycle::Reserved;
         match &result {
@@ -542,7 +571,14 @@ impl Conversation {
             Err(TurnRunError::Terminalization(_)) => {}
             Err(_) => state.thread.last_turn_status = Some(ThreadStatus::Failed),
         }
-        result.map_err(ConversationError::Turn)
+        match result {
+            Ok(mut outcome) => {
+                outcome.undelivered_inputs = undelivered;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(ConversationError::Turn)
     }
 
     /// 终态后应用待生效设置并返回更新后的线程投影；无待生效意图时返回

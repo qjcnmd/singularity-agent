@@ -134,7 +134,7 @@ impl AppServerControlHandle {
                     turn_id: params.turn_id,
                     thread_id,
                     status: TurnStatus::Running,
-                    model_usage: None,
+                    usage: None,
                 },
             },
         )

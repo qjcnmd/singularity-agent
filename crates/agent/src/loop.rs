@@ -146,7 +146,7 @@ fn is_cancelled_agent_error(error: &AgentError) -> bool {
     matches!(
         error,
         AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
-    )
+    ) || matches!(error, AgentError::Compaction(crate::compaction::CompactionError::Aborted))
 }
 
 /// 逐轮聚合 provider 返回的真实 token/cache usage。
@@ -432,18 +432,15 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     ///
-    /// overflow 时不能保留正常近期窗口；强制路径把近期保留预算压到 0，
-    /// 只保留绝对必要的最近安全边界（toolResult 永不切）。
+    /// 与自动压缩共用同一固定保留预算；溢出恢复只保证安全切点（toolResult
+    /// 永不切），保留预算内的最近上下文照常保留。
     fn force_compact(
         &mut self,
         cancellation: &CancellationToken,
         events: &mut AgentEvents,
     ) -> Result<CompactionOutcome> {
-        let mut budget =
+        let budget =
             CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
-        // 强制溢出恢复是显式模式：provider 已拒绝该请求时，不保留正常
-        // 近期内容。
-        budget.keep_recent_tokens = 0;
         let tokens_before = self
             .ledger
             .estimate()
@@ -458,6 +455,9 @@ impl Agent {
             }
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
+            }
+            Err(crate::compaction::CompactionError::Aborted) => {
+                Err(AgentError::Compaction(crate::compaction::CompactionError::Aborted))
             }
             Err(error) => {
                 emit_diagnostic(
@@ -532,6 +532,11 @@ impl Agent {
                         overflow_retried = true;
                         let forced = match self.force_compact(cancellation, events) {
                             Ok(result) => result,
+                            Err(AgentError::Compaction(
+                                crate::compaction::CompactionError::Aborted,
+                            )) => {
+                                return AttemptOutcome::Aborted;
+                            }
                             Err(recovery_error) => {
                                 // 强制压缩失败以压缩真因为主因上抛；原始
                                 // overflow 经诊断保留上下文，不覆盖真因。

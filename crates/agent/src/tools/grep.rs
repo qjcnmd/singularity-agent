@@ -7,10 +7,11 @@ use std::io::{BufReader, Seek, SeekFrom};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use singularity_core::CancellationToken;
 
 use super::glob::glob_regex;
 use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
-use super::walk::{to_cwd_relative, walk_files};
+use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
 
@@ -106,8 +107,11 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
     if let Err(error) = walk_files(&root, &mut |relative| {
+        if ctx.signal.is_some_and(CancellationToken::is_cancelled) {
+            return WalkControl::Stop;
+        }
         if matches >= MAX_MATCHES {
-            return;
+            return WalkControl::Stop;
         }
         // include 过滤：同时支持相对路径匹配与文件名匹配（与 glob 工具对齐）。
         let rel_path = super::walk::display_path(&relative);
@@ -119,27 +123,29 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             .as_ref()
             .is_some_and(|glob| !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()))
         {
-            return;
+            return WalkControl::Continue;
         }
         scanned_files += 1;
         let Ok(mut file) = File::open(root.join(&relative)) else {
-            return;
+            return WalkControl::Continue;
         };
         if looks_binary(&mut file) {
-            return;
+            return WalkControl::Continue;
         }
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut line_number = 0u64;
         loop {
+            if ctx.signal.is_some_and(CancellationToken::is_cancelled) {
+                return WalkControl::Stop;
+            }
             if matches >= MAX_MATCHES {
                 break;
             }
-            let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES, None)
-            {
+            let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
                 // 畸形超长行：跳过整个文件并计数，不中止整个搜索。
-                Err(super::line::LineFailure::OverLimit(_)) => {
+                Err(super::line::LineFailure::OverLimit { .. }) => {
                     skipped_files += 1;
                     break;
                 }
@@ -165,6 +171,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 ));
             }
         }
+        WalkControl::Continue
     }) {
         return error_result(format!("failed to walk {path}: {error}"));
     }

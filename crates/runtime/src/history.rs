@@ -154,10 +154,10 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                             .to_string();
                         last.items.push(HistoryItem::Usage {
                             id,
-                            // 不变量：SessionTurnUsage 为本仓静态类型，序列化恒不失败。
+                            // 不变量：TurnModelUsage 为本仓静态类型，序列化恒不失败。
                             #[allow(clippy::expect_used)]
                             usage: serde_json::to_value(usage)
-                                .expect("SessionTurnUsage serializes"),
+                                .expect("TurnModelUsage serializes"),
                         });
                     } else {
                         // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。

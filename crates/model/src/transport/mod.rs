@@ -9,7 +9,7 @@ pub(crate) use retry::*;
 pub(crate) use stream::*;
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use singularity_core::CancellationToken;
@@ -136,16 +136,12 @@ impl ProtocolAdapter {
 enum AttemptBodyOutcome {
     Completed {
         completion: Box<OpenAiCompletion>,
-        wire_usage_present: bool,
-        time_to_first_text_delta_ms: Option<u64>,
     },
     Retry {
         error: ProviderError,
-        time_to_first_text_delta_ms: Option<u64>,
     },
     Failed {
         error: ProviderError,
-        time_to_first_text_delta_ms: Option<u64>,
     },
 }
 
@@ -153,45 +149,30 @@ enum AttemptBodyOutcome {
 /// 可见 delta 之前可重试：之后重发会重复已输出的内容。
 fn streaming_outcome(
     attempt: Result<StreamAttemptSuccess, StreamAttemptFailure>,
-    parse_payload: impl FnOnce(Value) -> Result<(OpenAiCompletion, bool), ProviderError>,
+    parse_payload: impl FnOnce(Value) -> Result<OpenAiCompletion, ProviderError>,
 ) -> AttemptBodyOutcome {
     match attempt {
-        Ok(success) => {
-            let time_to_first_text_delta_ms = success.time_to_first_text_delta_ms;
-            match parse_payload(success.payload) {
-                Ok((completion, wire_usage_present)) => AttemptBodyOutcome::Completed {
-                    completion: Box::new(completion),
-                    wire_usage_present,
-                    time_to_first_text_delta_ms,
-                },
-                Err(error) => AttemptBodyOutcome::Failed {
-                    error,
-                    time_to_first_text_delta_ms,
-                },
-            }
-        }
+        Ok(success) => match parse_payload(success.payload) {
+            Ok(completion) => AttemptBodyOutcome::Completed {
+                completion: Box::new(completion),
+            },
+            Err(error) => AttemptBodyOutcome::Failed { error },
+        },
         Err(failure) if !failure.emitted_text_delta => AttemptBodyOutcome::Retry {
             error: failure.error,
-            time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
         },
-        Err(failure) => AttemptBodyOutcome::Failed {
-            error: failure.error,
-            time_to_first_text_delta_ms: failure.time_to_first_text_delta_ms,
-        },
+        Err(failure) => AttemptBodyOutcome::Failed { error: failure.error },
     }
 }
 
 fn non_streaming_outcome(
     body: Result<Vec<u8>, ProviderError>,
-    parse_payload: impl FnOnce(Value) -> Result<(OpenAiCompletion, bool), ProviderError>,
+    parse_payload: impl FnOnce(Value) -> Result<OpenAiCompletion, ProviderError>,
 ) -> AttemptBodyOutcome {
     let body = match body {
         Ok(body) => body,
         Err(error) => {
-            return AttemptBodyOutcome::Retry {
-                error,
-                time_to_first_text_delta_ms: None,
-            };
+            return AttemptBodyOutcome::Retry { error };
         }
     };
     let payload = match serde_json::from_slice::<Value>(&body) {
@@ -199,20 +180,14 @@ fn non_streaming_outcome(
         Err(_) => {
             return AttemptBodyOutcome::Failed {
                 error: ProviderError::from_model_error(provider_response_json_error()),
-                time_to_first_text_delta_ms: None,
             };
         }
     };
     match parse_payload(payload) {
-        Ok((completion, wire_usage_present)) => AttemptBodyOutcome::Completed {
+        Ok(completion) => AttemptBodyOutcome::Completed {
             completion: Box::new(completion),
-            wire_usage_present,
-            time_to_first_text_delta_ms: None,
         },
-        Err(error) => AttemptBodyOutcome::Failed {
-            error,
-            time_to_first_text_delta_ms: None,
-        },
+        Err(error) => AttemptBodyOutcome::Failed { error },
     }
 }
 
@@ -224,8 +199,7 @@ fn parse_protocol_payload(
     capabilities: &ProviderProtocolContract,
     model_name: &str,
     reasoning_variant: Option<&str>,
-) -> Result<(OpenAiCompletion, bool), ProviderError> {
-    let wire_usage_present = payload.get("usage").is_some_and(Value::is_object);
+) -> Result<OpenAiCompletion, ProviderError> {
     let reasoning_content_present = adapter.reasoning_present(&payload);
     adapter
         .parse_response(
@@ -236,14 +210,9 @@ fn parse_protocol_payload(
             model_name,
             reasoning_variant,
         )
-        .map(|response| {
-            (
-                OpenAiCompletion {
-                    response,
-                    reasoning_content_present,
-                },
-                wire_usage_present,
-            )
+        .map(|response| OpenAiCompletion {
+            response,
+            reasoning_content_present,
         })
 }
 
@@ -252,10 +221,8 @@ struct SseReadContext<'a> {
     adapter: ProtocolAdapter,
     runtime: &'a tokio::runtime::Handle,
     cancellation: &'a CancellationToken,
-    request_timeout_seconds: u64,
     response: reqwest::Response,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-    attempt_started_at: Instant,
 }
 
 /// 一次协议完成请求的上下文：协议契约、选择器与事件回调。
@@ -282,28 +249,16 @@ fn read_protocol_sse(
         adapter,
         runtime,
         cancellation,
-        request_timeout_seconds,
         response,
         on_event,
-        attempt_started_at,
     } = context;
     match adapter {
-        ProtocolAdapter::Chat => read_openai_chat_sse(
-            runtime,
-            cancellation,
-            request_timeout_seconds,
-            response,
-            on_event,
-            attempt_started_at,
-        ),
-        ProtocolAdapter::Responses => read_openai_responses_sse(
-            runtime,
-            cancellation,
-            request_timeout_seconds,
-            response,
-            on_event,
-            attempt_started_at,
-        ),
+        ProtocolAdapter::Chat => {
+            read_openai_chat_sse(runtime, cancellation, response, on_event)
+        }
+        ProtocolAdapter::Responses => {
+            read_openai_responses_sse(runtime, cancellation, response, on_event)
+        }
     }
 }
 
@@ -593,7 +548,7 @@ impl OpenAiProvider {
                 request_payload: &request_payload,
             },
             on_attempt,
-            &mut |response, attempt_started_at| {
+            &mut |response| {
                 let parse_payload = |payload| {
                     parse_protocol_payload(
                         adapter,
@@ -611,21 +566,14 @@ impl OpenAiProvider {
                             adapter,
                             runtime: &self.runtime,
                             cancellation,
-                            request_timeout_seconds: self.request_timeout_seconds,
                             response,
                             on_event,
-                            attempt_started_at,
                         }),
                         parse_payload,
                     )
                 } else {
                     non_streaming_outcome(
-                        read_bounded_provider_response_body(
-                            &self.runtime,
-                            cancellation,
-                            self.request_timeout_seconds,
-                            response,
-                        ),
+                        read_bounded_provider_response_body(&self.runtime, cancellation, response),
                         parse_payload,
                     )
                 }
@@ -640,7 +588,7 @@ impl OpenAiProvider {
         &self,
         context: AttemptContext<'_>,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-        read_response: &mut dyn FnMut(reqwest::Response, Instant) -> AttemptBodyOutcome,
+        read_response: &mut dyn FnMut(reqwest::Response) -> AttemptBodyOutcome,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let AttemptContext {
             cancellation,
@@ -654,7 +602,7 @@ impl OpenAiProvider {
             return Err(provider_cancelled_error());
         }
 
-        let mut occurrence =
+        let occurrence =
             ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
         emit_provider_attempt_started(&occurrence, on_attempt);
         let response = match block_on_provider_future(
@@ -662,7 +610,6 @@ impl OpenAiProvider {
             cancellation,
             "provider_request_send_failed",
             ProviderErrorStage::RequestSend,
-            self.request_timeout_seconds,
             || {
                 self.client
                     .post(endpoint)
@@ -671,10 +618,7 @@ impl OpenAiProvider {
                     .send()
             },
         ) {
-            Ok(response) => {
-                occurrence.mark_response_headers_received();
-                response
-            }
+            Ok(response) => response,
             Err(error) => {
                 record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 return Err(error);
@@ -695,32 +639,19 @@ impl OpenAiProvider {
             return Err(error);
         }
 
-        match read_response(response, occurrence.started_at) {
-            AttemptBodyOutcome::Completed {
-                completion,
-                wire_usage_present,
-                time_to_first_text_delta_ms,
-            } => {
-                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+        match read_response(response) {
+            AttemptBodyOutcome::Completed { completion } => {
                 let occurrence_error = completion.response.error.as_ref();
-                let usage = (wire_usage_present && occurrence_error.is_none())
+                let usage = (completion.response.usage.usage_present && occurrence_error.is_none())
                     .then(|| completion.response.usage.clone());
                 record_provider_attempt(occurrence, occurrence_error, usage, on_attempt);
                 Ok(*completion)
             }
-            AttemptBodyOutcome::Retry {
-                error,
-                time_to_first_text_delta_ms,
-            } => {
-                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+            AttemptBodyOutcome::Retry { error } => {
                 record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 Err(error)
             }
-            AttemptBodyOutcome::Failed {
-                error,
-                time_to_first_text_delta_ms,
-            } => {
-                occurrence.set_time_to_first_text_delta(time_to_first_text_delta_ms);
+            AttemptBodyOutcome::Failed { error } => {
                 record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
                 Err(error.without_automatic_retry())
             }
@@ -735,13 +666,8 @@ impl OpenAiProvider {
     ) -> HttpFailure {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
-        let error_body = read_bounded_provider_response_body(
-            &self.runtime,
-            cancellation,
-            self.request_timeout_seconds,
-            response,
-        )
-        .ok();
+        let error_body = read_bounded_provider_response_body(&self.runtime, cancellation, response)
+            .ok();
         let error_fields = error_body.as_deref().map(parse_provider_error_body);
         let context_length_exceeded = is_context_length_exceeded_code(
             error_fields
@@ -749,7 +675,7 @@ impl OpenAiProvider {
                 .and_then(|fields| fields.code.as_deref()),
         );
         let model_error = if context_length_exceeded {
-            let mut context_error = ModelError::new(
+            ModelError::new(
                 ModelErrorKind::ContextLengthExceeded,
                 "provider rejected the request: context length exceeded",
             )
@@ -758,9 +684,7 @@ impl OpenAiProvider {
             .with_provider_diagnostic(
                 "provider_context_length_exceeded",
                 ProviderErrorStage::ResponseStatus,
-            );
-            context_error.http_status = Some(status_code);
-            context_error
+            )
         } else {
             model_error_from_http_status(status_code, &self.config.provider_name, model_name)
         };

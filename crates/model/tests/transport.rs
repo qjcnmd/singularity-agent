@@ -524,9 +524,12 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
 
     assert_eq!(response.status, ModelTurnStatus::Invalid);
     assert!(response.tool_calls().is_empty());
-    assert_eq!(
-        response.validation.expect("response validation").errors,
-        vec!["text_tool_call_envelope_not_supported"]
+    let error = response.error.expect("invalid response carries its error");
+    assert!(
+        error
+            .message
+            .contains("text_tool_call_envelope_not_supported"),
+        "error message must surface the validation cause"
     );
     assert_eq!(
         requests
@@ -773,7 +776,6 @@ fn openai_provider_observes_one_ordered_start_end_pair() {
     assert_eq!(started.provider_name, finished.provider_name);
     assert_eq!(started.model_name, finished.model_name);
     assert_eq!(started.actual_api_protocol, finished.actual_api_protocol);
-    assert_eq!(started.started_at_unix_ms, finished.started_at_unix_ms);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol, ProviderErrorStage};
+use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol};
 use serde::{Deserialize, Serialize};
 
 /// 面向 `AgentLoop` 边界的规范化、安全的 provider 流数据。
@@ -23,7 +23,6 @@ pub struct ProviderAttemptStarted {
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
-    pub started_at_unix_ms: u64,
 }
 
 /// 某个所选 provider 协议的类型化规范化文本流能力。
@@ -67,18 +66,9 @@ pub struct ProviderAttemptOccurrence {
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
     pub terminal_status: ProviderAttemptStatus,
-    /// 创建该 transport attempt 时的墙钟时间戳。
-    pub started_at_unix_ms: u64,
-    /// 该 transport attempt 被终态化时的墙钟时间戳。
-    pub ended_at_unix_ms: u64,
     /// 从 attempt 创建到响应解析或失败终结的墙钟时长。
     pub attempt_duration_ms: u64,
-    /// 从发送请求到收到响应 headers；未收到 headers 时不可用。
-    pub request_send_to_headers_ms: Option<u64>,
-    /// 仅流式 Responses 首个非空 output_text delta 的真实到达时长。
-    pub time_to_first_text_delta_ms: Option<u64>,
     pub error_category: Option<ModelErrorCategory>,
-    pub error_stage: Option<ProviderErrorStage>,
     pub diagnostic_code: Option<String>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,

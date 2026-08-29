@@ -60,13 +60,13 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 `thread/started` 是 app-server 桌面端接口的局部生命周期通知（`thread/start` 成功后由 app-server 发出），不描述 turn 执行事实，因此不是 `TurnEvent` 变体。
 
-两面 wire 形状都是 protocol 内对 `TurnEvent` 的显式投影，`TurnEvent` 本身不携带 serde derive：桌面端 JSON-RPC 通知由 `turn_event_notification` 构造（camelCase；`tool/execution/end` 的 result 包成 `content:[{type:text,text}]`；`provider/attempt` 的可选字段恒出现、无值为 null；`turn/error` 平铺 `threadId/turnId/error`）；`--json` 事件行的 params 由 `turn_event_jsonl_params` 构造（snake_case；可选字段无值时整体省略）。两面差异是既有协议合同，由 protocol golden 测试表逐字钉住。
+两面 wire 形状共享 protocol 内对 `TurnEvent` 的唯一 params 投影 `turn_event_params`（camelCase；`tool/execution/end` 的 result 包成 `content:[{type:text,text}]`；`provider/attempt` 的可选字段恒出现、无值为 null；`turn/error` 平铺 `threadId/turnId/error`），差异只在信封：桌面端 JSON-RPC 通知由 `turn_event_notification` 构造，`--json` 事件行为 `{"method","params"}` 行；协议 golden 测试表逐字钉住。
 
 `thread/settingsApplied` 在活动 turn 期间排队的设置于可信终态后成功持久化时发布（位于该轮终态事件之后），payload 为应用后的完整 Thread 投影。空闲路径无此事件（提交点内已立即持久化）。
 
 `agent/diagnostic.severity`、`provider/attempt.status` 与 `turn/error.error.{stage,cause}` 由 protocol 枚举单点定义，runtime 直接使用。runtime 诊断 code 由 protocol 常量定义，Agent 内部诊断 code 由 Agent 事件模块常量定义；线格式词形不变。`provider/attempt` 的字段集为「threadId/turnId/modelTurnOrdinal/provider/model/protocol/status/attemptDurationMs + 按分类可选的 errorCategory/diagnosticCode」。两张错误词表各自独立：`turn/error.error.cause` 用 protocol `TurnFailureCause` 的 14 词（provider 来源带 `provider_` 前缀：`provider_rate_limited`、`provider_network`、`provider_timeout`、`provider_auth`、`provider_validation`、`provider_overloaded`、`provider_cancelled`、`provider_context_overflow`、`provider_unknown`，另有 `store`、`project_instructions`、`workspace`、`serialization`、`internal`），model 具体失败类型（`ModelErrorKind` 12 类）到 provider cause 的分组映射由 runtime 单点拥有；`provider/attempt.errorCategory` 用 model `ModelErrorCategory` 的 snake_case 词形（`cancelled`、`authentication`、`network`、`model_configuration`、`invalid_request`、`context_length_exceeded`、`json_schema`、`content_filter`、`unsupported_capability`、`provider_unavailable`、`unknown_provider_error`，无 `provider_` 前缀），是 attempt 观测分类而非 turn 失败原因。两面 wire 与 serde 词形的一致性由 protocol 测试钉住。
 
-`--json` 行形状为 `{"method": <名>, "params": <turn_event_jsonl_params 投影>}`；终态行为
+`--json` 行形状为 `{"method": <名>, "params": <turn_event_params 投影>}`；终态行为
 `{"summary":{"thread":{"threadId"},"turn":{"threadId","status","usage"}}}`，
 其中 `status ∈ completed|failed|interrupted`，`usage` 含 input/output/total/cached/reasoning tokens 与 `usagePresent/usageComplete`。截断终态（`turn.truncated`）的 `turn` 额外携带可选字段 `truncated: true`，普通终态省略该字段——该字段仅截断终态出现、为加法兼容的扩展，外部评估器仅依赖原有字段即可解析。准备阶段失败的 summary 省略 `thread` 字段（turn 尚未启动，无已确定的 thread 可投影）。
 

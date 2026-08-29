@@ -33,7 +33,8 @@ impl TurnInbox {
         true
     }
 
-    pub(super) fn drain(&mut self) -> Vec<String> {
+    /// 取走全部未交付条目（终态排水与下一轮注入共用）。
+    pub fn drain(&mut self) -> Vec<String> {
         self.entries.drain(..).collect()
     }
 

@@ -197,6 +197,11 @@ impl Agent {
                 Err(CompactionError::Session(error)) => {
                     return Err(AgentError::Session(error));
                 }
+                // 压缩被取消：与采样取消同形收敛，跳过压缩且不发故障诊断，
+                // 由上层取消路径统一收敛。
+                Err(CompactionError::Aborted) => {
+                    return Err(AgentError::Compaction(CompactionError::Aborted));
+                }
                 Err(_error) => {
                     outcome.usage_complete = false;
                     emit_diagnostic(

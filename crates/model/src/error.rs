@@ -50,17 +50,6 @@ pub enum ProviderErrorStage {
     Cancelled,
 }
 
-/// 与模型或策略语义分开保留的传输层原因。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderTransportCategory {
-    Timeout,
-    Connect,
-    Request,
-    BodyRead,
-    Unknown,
-}
-
 /// 带类型分类和清理后模型提供方诊断信息的模型错误。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelError {
@@ -72,12 +61,6 @@ pub struct ModelError {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<ProviderErrorStage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport_category: Option<ProviderTransportCategory>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validation_errors: Vec<String>,
 }
@@ -92,9 +75,6 @@ impl ModelError {
             model_name: None,
             code: None,
             stage: None,
-            transport_category: None,
-            timeout_seconds: None,
-            http_status: None,
             validation_errors: Vec::new(),
         }
     }

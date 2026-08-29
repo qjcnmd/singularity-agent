@@ -687,13 +687,10 @@ fn missing_provider_usage_remains_unknown() {
         .expect("captured provider request");
     let usage = response.usage;
     assert!(!usage.usage_present, "missing usage must be marked absent");
-    let validation = response.validation.expect("validation present");
+    assert_eq!(response.status, ModelTurnStatus::Success);
     assert!(
-        !validation
-            .errors
-            .iter()
-            .any(|error| error == "response_output_tokens_exceed_provider_limit"),
-        "upper-limit check must not fire on absent usage"
+        response.error.is_none(),
+        "absent usage must not fail the response"
     );
 }
 
@@ -717,7 +714,11 @@ fn provider_usage_above_configured_output_limit_remains_accountable() {
 
     assert_eq!(response.usage.output_tokens, 9999);
     assert_eq!(response.usage.total_tokens, 10002);
-    assert!(response.validation.expect("validation present").valid);
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert!(
+        response.error.is_none(),
+        "usage above the configured limit is a provider fact, not a schema failure"
+    );
 }
 
 #[test]

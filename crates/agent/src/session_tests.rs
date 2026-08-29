@@ -172,11 +172,11 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .append_metadata(SessionMetadata::turn_terminal(
             "turn_1",
             TurnTerminalStatus::Completed,
-            SessionTurnUsage {
+            TurnModelUsage {
                 total_tokens: 42,
                 usage_present: true,
                 usage_complete: true,
-                ..SessionTurnUsage::default()
+                ..TurnModelUsage::default()
             },
             true,
         ))
@@ -289,7 +289,7 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
         SessionMetadata::TurnTerminal { usage, .. }
             if usage.total_tokens == 42 && usage.usage_present
     ));
-    let snake: SessionTurnUsage =
+    let snake: TurnModelUsage =
         serde_json::from_value(json!({"input_tokens": 3})).expect("snake usage reads");
     assert_eq!(snake.input_tokens, 3);
 
@@ -411,11 +411,11 @@ fn v2_format_round_trips_nested_payloads() {
         .append_metadata(SessionMetadata::turn_terminal(
             "turn-1",
             TurnTerminalStatus::Completed,
-            SessionTurnUsage {
+            TurnModelUsage {
                 total_tokens: 7,
                 usage_present: true,
                 usage_complete: true,
-                ..SessionTurnUsage::default()
+                ..TurnModelUsage::default()
             },
             true,
         ))
@@ -442,11 +442,11 @@ fn v2_format_round_trips_nested_payloads() {
             ..
         } if turn_id == "turn-1"
             && usage
-                == &SessionTurnUsage {
+                == &TurnModelUsage {
                     total_tokens: 7,
                     usage_present: true,
                     usage_complete: true,
-                    ..SessionTurnUsage::default()
+                    ..TurnModelUsage::default()
                 }
     ));
 }
