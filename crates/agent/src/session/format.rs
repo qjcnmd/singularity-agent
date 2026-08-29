@@ -44,8 +44,6 @@ pub enum SessionError {
     },
     #[error("{0}")]
     InvalidSession(String),
-    #[error("entry {0} not found")]
-    EntryNotFound(String),
     #[error("session is being written by an active writer: {thread_id}")]
     WriterConflict { thread_id: String },
     #[error("session writer lock error: {context}")]

@@ -370,13 +370,6 @@ impl OpenAiProvider {
         Some(selector)
     }
 
-    /// 返回目录选择的不可变 catalog 协议（若非目录选择则为 `None`）。
-    pub fn selected_api_protocol(&self) -> Option<ProviderApiProtocol> {
-        self.selected_model
-            .as_ref()
-            .map(|selection| selection.api_protocol)
-    }
-
     fn validate_reasoning_history(
         &self,
         request: &ModelTurnRequest,
