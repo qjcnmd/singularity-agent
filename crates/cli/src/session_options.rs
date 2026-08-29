@@ -63,10 +63,7 @@ fn prepare_inner(
         Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(&home)?;
     let sessions_dir = home.join(singularity_runtime::SESSIONS_DIR_NAME);
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| std::env::var(name).ok(),
-        tokio_runtime.handle().clone(),
-    );
+    let snapshot = ProviderConfigSnapshot::capture(tokio_runtime.handle().clone());
     let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
     let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();

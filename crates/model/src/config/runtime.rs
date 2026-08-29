@@ -20,7 +20,8 @@ pub(crate) struct ModelSelectionSnapshot {
 
 /// 服务级模型提供方配置快照，包含脱敏状态和已初始化的模型提供方。
 ///
-/// 只捕获一次，使 `AppServer` 报告和使用同一份配置，同时不暴露 API 密钥或其他原始环境值。
+/// 只捕获一次，使 `AppServer` 报告和使用同一份配置，同时不暴露 API 密钥
+/// 或其他原始配置值。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     snapshot_id: String,
@@ -45,63 +46,53 @@ impl fmt::Debug for ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
-    /// 从环境读取并固定一份 provider 配置快照；异步执行使用调用方注入的 runtime。
-    pub fn capture<F>(get_env: F, runtime_handle: tokio::runtime::Handle) -> Self
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        Self::capture_with_provider(get_env, move |config| {
-            OpenAiProvider::new(config, runtime_handle.clone())
-        })
+    /// 读取用户配置目录（`config.json` + `auth.json`）并固定一份 provider
+    /// 配置快照；异步执行使用调用方注入的 runtime。
+    pub fn capture(runtime_handle: tokio::runtime::Handle) -> Self {
+        Self::from_user_config(read_user_config_data(), runtime_handle)
     }
 
-    fn capture_with_provider<F, P>(get_env: F, provider_factory: P) -> Self
-    where
-        F: FnMut(&str) -> Option<String>,
-        P: Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
-    {
-        Self::capture_with_provider_and_sources(get_env, provider_factory, user_config_layer)
-    }
-
-    pub(crate) fn capture_with_provider_and_sources<F, P, U>(
-        get_env: F,
-        provider_factory: P,
-        user_config: U,
-    ) -> Self
-    where
-        F: FnMut(&str) -> Option<String>,
-        P: Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
-        U: FnOnce() -> Option<ProviderConfigLayer>,
-    {
-        let mut get_env = get_env;
-        let mut captured_env = std::collections::HashMap::<String, Option<String>>::new();
-        let mut get_env_once = |name: &str| {
-            if let Some(value) = captured_env.get(name) {
-                return value.clone();
-            }
-            let value = get_env(name);
-            captured_env.insert(name.to_string(), value.clone());
-            value
-        };
-        let values = resolve_provider_values_with_user_config(&mut get_env_once, user_config);
-        let source = values.source;
-        let (redacted_config, provider, model_selection) =
-            if let Some(error) = values.user_config_error.clone() {
-                (redacted_models_config(), Err(error), None)
-            } else if let Some(user_config) = values.user_config.as_ref() {
-                match capture_user_model_selection(user_config, source, &provider_factory) {
+    fn from_user_config(
+        user_config: Result<Option<UserConfigData>, ProviderError>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        let user_config_source = Some(ProviderConfigSource::UserConfigFile);
+        let (source, redacted_config, provider, model_selection) = match user_config {
+            Err(error) => (
+                user_config_source,
+                redacted_models_config(),
+                Err(error),
+                None,
+            ),
+            Ok(Some(user_config)) => {
+                match capture_user_model_selection(&user_config, &runtime_handle) {
                     Ok((catalog, redacted)) => {
                         let provider = provider_for_selection(&catalog, None);
-                        (redacted, provider, Some(std::sync::Arc::new(catalog)))
+                        (
+                            user_config_source,
+                            redacted,
+                            provider,
+                            Some(std::sync::Arc::new(catalog)),
+                        )
                     }
-                    Err(error) => (redacted_models_config(), Err(error), None),
+                    Err(error) => (
+                        user_config_source,
+                        redacted_models_config(),
+                        Err(error),
+                        None,
+                    ),
                 }
-            } else {
-                let redacted_config = provider_config_resolution(&values).config;
-                let provider =
-                    OpenAiProviderConfig::from_resolved_values(values).and_then(provider_factory);
-                (redacted_config, provider, None)
-            };
+            }
+            Ok(None) => (
+                None,
+                redacted_models_config(),
+                Err(missing_provider_config_error(
+                    crate::USER_CONFIG_FILE_NAME,
+                    None,
+                )),
+                None,
+            ),
+        };
         let mut configuration = ProviderConfigurationStatus::from_config(&redacted_config);
         if configuration.configured
             && let Err(error) = &provider
@@ -117,6 +108,19 @@ impl ProviderConfigSnapshot {
             provider,
             model_selection,
         }
+    }
+
+    /// 测试接缝：从指定用户配置目录捕获快照，不读进程环境。生产路径一律经
+    /// [`Self::capture`] 解析 `SINGULARITY_HOME`。
+    #[cfg(feature = "test-support")]
+    pub fn capture_from_directory(
+        directory: &std::path::Path,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self::from_user_config(
+            read_user_config_data_from_directory(directory.to_path_buf()),
+            runtime_handle,
+        )
     }
 
     /// 返回配置来源。
@@ -139,13 +143,7 @@ impl ProviderConfigSnapshot {
         &self.snapshot_id
     }
 
-    /// 返回本次快照是否来自显式多-provider 模型配置。
-    pub fn has_explicit_model_selection(&self) -> bool {
-        self.model_selection.is_some()
-    }
-
-    /// 若当前配置能无歧义解析默认 selector，返回其完整字符串
-    /// （catalog 为 `provider/model#effort`，legacy 为裸 model id）；
+    /// 返回用户配置目录解析出的默认 selector（`provider/model#effort`）；
     /// provider 未配置或无法解析时返回 `None`（调用方保留 `Thread.model` 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
         self.provider().ok()?.resolved_selector()
@@ -156,8 +154,8 @@ impl ProviderConfigSnapshot {
         self.provider_for_selector(None)
     }
 
-    /// 对照此不可变快照解析持久化的 `provider_id/model_id` 引用；返回的
-    /// provider 克隆带裸 model id 与恰好一个配置协议。
+    /// 对照此不可变快照解析持久化的 `provider/model[#variant]` 引用；返回的
+    /// provider 克隆带裸 model id 与恰好一个目录声明的协议。
     pub fn provider_for_selector(
         &self,
         selector: Option<&str>,
@@ -165,42 +163,11 @@ impl ProviderConfigSnapshot {
         if let Some(selection) = &self.model_selection {
             return provider_for_selection(selection, selector);
         }
-        let provider = self.provider.clone()?;
-        if let Some(selector) = selector {
-            if selector.contains('#') || selector.contains('/') {
-                let parsed = parse_model_selector(selector)?;
-                if parsed.provider_name != provider.configured_provider_name() {
-                    return Err(model_selector_error(
-                        "model selector references an unknown provider",
-                        "provider_selector_unknown_provider",
-                    ));
-                }
-                if parsed.model_name != provider.config_snapshot().model_name {
-                    return Err(model_selector_error(
-                        "model selector references an unknown or disallowed model",
-                        "provider_selector_unknown_model",
-                    ));
-                }
-                if parsed.reasoning_effort.is_some() {
-                    return Err(model_selector_error(
-                        "legacy provider configuration does not declare reasoning variants",
-                        "provider_selector_reasoning_unsupported",
-                    ));
-                }
-            } else if selector != provider.config_snapshot().model_name {
-                return Err(model_selector_error(
-                    "model selector references an unknown or disallowed model",
-                    "provider_selector_unknown_model",
-                ));
-            }
-            if selector.ends_with('/') {
-                return Err(model_selector_error(
-                    "provider/model selector must contain a model id",
-                    "provider_selector_invalid",
-                ));
-            }
-        }
-        Ok(provider)
+        // 不变量：构造成功的 provider 必带模型选择；走到这里说明快照未配置，
+        // 原样返回捕获期记录的配置错误。
+        Err(self.provider.clone().err().unwrap_or_else(|| {
+            missing_provider_config_error(crate::USER_CONFIG_FILE_NAME, self.source)
+        }))
     }
 }
 
@@ -250,7 +217,7 @@ impl ProviderConfigurationStatus {
             blocker: if validation.valid {
                 None
             } else {
-                Some(ModelBlockerKind::RequiredEnvMissing)
+                Some(ModelBlockerKind::RequiredConfigMissing)
             },
         }
     }

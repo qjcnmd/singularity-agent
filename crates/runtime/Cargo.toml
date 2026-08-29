@@ -26,4 +26,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 singularity_agent = { path = "../agent", features = ["test-support"] }
+singularity_model = { path = "../model", features = ["test-support"] }
 tempfile.workspace = true

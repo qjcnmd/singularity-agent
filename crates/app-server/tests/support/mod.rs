@@ -166,42 +166,52 @@ pub struct AppServerProcess {
 }
 
 impl AppServerProcess {
+    /// 以用户配置目录（`{home}/config.json` + `{home}/auth.json`）提供单一
+    /// Responses provider（`openai_compatible/test-model`）指向 `base_url`，
+    /// 启动 app-server。
     pub fn spawn(cwd: &Path, home: &Path, base_url: &str) -> Self {
-        let provider_env: Vec<(&str, &str)> = vec![
-            ("SINGULARITY_MODEL_PROVIDER", "openai_compatible"),
-            ("SINGULARITY_MODEL", "test-model"),
-            ("SINGULARITY_BASE_URL", base_url),
-            ("SINGULARITY_API_KEY", "test-secret"),
-        ];
-        Self::spawn_with_provider_env(cwd, home, &provider_env)
+        let config = serde_json::json!({
+            "version": 1,
+            "default_provider": "openai_compatible",
+            "default_model": "openai_compatible/test-model",
+            "providers": {
+                "openai_compatible": {
+                    "base_url": base_url,
+                    "models": {
+                        "test-model": {
+                            "api_protocol": "responses",
+                            "max_context_tokens": 128_000,
+                            "max_output_tokens": 4_096
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(home.join("config.json"), config.to_string()).expect("write config.json");
+        let auth = serde_json::json!({
+            "schema_version": 1,
+            "providers": { "openai_compatible": { "api_key": "test-secret" } }
+        });
+        let auth_path = home.join("auth.json");
+        std::fs::write(&auth_path, auth.to_string()).expect("write auth.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict auth.json to owner");
+        }
+        Self::spawn_with_home(cwd, home)
     }
 
-    /// 变体：通过用户配置目录（`{home}/config.json` + `{home}/auth.json`）
-    /// 提供 provider 选择，不注入 SINGULARITY_MODEL/BASE_URL/API_KEY——
-    /// 环境层会覆盖用户配置层，注入这些变量会把快照打回单模型 legacy 形态。
-    /// 仅 steer_transport 测试目标使用，app_server 目标不引用。
-    #[allow(dead_code)]
-    pub fn spawn_with_user_config(cwd: &Path, home: &Path) -> Self {
-        Self::spawn_with_provider_env(cwd, home, &[])
-    }
-
-    fn spawn_with_provider_env(cwd: &Path, home: &Path, provider_env: &[(&str, &str)]) -> Self {
+    fn spawn_with_home(cwd: &Path, home: &Path) -> Self {
         let binary = app_server_bin();
         let mut command = Command::new(&binary);
         command
             .current_dir(cwd)
             .env("SINGULARITY_HOME", home)
-            // 防止宿主环境泄漏覆盖用户配置层。
-            .env_remove("SINGULARITY_MODEL_PROVIDER")
-            .env_remove("SINGULARITY_MODEL")
-            .env_remove("SINGULARITY_BASE_URL")
-            .env_remove("SINGULARITY_API_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (name, value) in provider_env {
-            command.env(name, value);
-        }
         let mut child = command.spawn().unwrap_or_else(|error| {
             panic!(
                 "spawn app-server failed: binary={} cwd={} SINGULARITY_HOME={} error={error}",

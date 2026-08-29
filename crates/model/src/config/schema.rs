@@ -27,7 +27,6 @@ pub struct ModelProviderConfig {
 /// 解析出有效模型提供方配置值的配置层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderConfigSource {
-    ProcessEnvironment,
     UserConfigFile,
 }
 
@@ -35,24 +34,16 @@ impl ProviderConfigSource {
     /// 返回配置来源的稳定字符串。
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ProcessEnvironment => "process_env",
             Self::UserConfigFile => "user_config",
         }
     }
-}
-
-/// 构建模型提供方前解析得到的来源和脱敏配置状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProviderConfigResolution {
-    pub(crate) source: Option<ProviderConfigSource>,
-    pub(crate) config: ModelProviderConfig,
 }
 
 /// 模型提供方初始化无法继续时报告的稳定阻塞类别。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBlockerKind {
-    RequiredEnvMissing,
+    RequiredConfigMissing,
     AuthenticationProviderError,
     BaseUrlNetworkError,
     ModelNameConfigError,
@@ -62,7 +53,7 @@ impl ModelBlockerKind {
     /// 返回阻塞类别代码。
     pub fn code(&self) -> &'static str {
         match self {
-            Self::RequiredEnvMissing => "required_env_missing",
+            Self::RequiredConfigMissing => "required_config_missing",
             Self::AuthenticationProviderError => "authentication_provider_error",
             Self::BaseUrlNetworkError => "base_url_network_error",
             Self::ModelNameConfigError => "model_name_config_error",
@@ -72,7 +63,7 @@ impl ModelBlockerKind {
     /// 返回阻塞类别说明。
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::RequiredEnvMissing => "required env missing",
+            Self::RequiredConfigMissing => "required configuration missing",
             Self::AuthenticationProviderError => "authentication/provider error",
             Self::BaseUrlNetworkError => "base_url/network error",
             Self::ModelNameConfigError => "model name/config error",

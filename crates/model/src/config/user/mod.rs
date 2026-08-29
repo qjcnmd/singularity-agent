@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::ProviderConfigLayer;
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::error::ProviderError;
@@ -239,20 +238,5 @@ pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool,
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(user_config_error(message)),
-    }
-}
-
-pub(crate) fn user_config_layer() -> Option<ProviderConfigLayer> {
-    match read_user_config_data() {
-        Ok(Some(user_config)) => Some(ProviderConfigLayer {
-            user_config: Some(user_config),
-            user_config_error: None,
-            ..ProviderConfigLayer::default()
-        }),
-        Ok(None) => None,
-        Err(error) => Some(ProviderConfigLayer {
-            user_config_error: Some(error),
-            ..ProviderConfigLayer::default()
-        }),
     }
 }

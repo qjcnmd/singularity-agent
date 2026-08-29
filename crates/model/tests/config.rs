@@ -70,112 +70,6 @@ fn provider_config_validation_reports_missing_boundary_fields() {
 }
 
 #[test]
-fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
-    let mut reads = std::collections::HashMap::<String, usize>::new();
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| {
-            let count = reads.entry(name.to_string()).or_default();
-            *count += 1;
-            assert_eq!(*count, 1, "provider setting {name} was read more than once");
-            match name {
-                "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-                "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
-                "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
-                "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
-                _ => None,
-            }
-        },
-        test_runtime_handle(),
-    );
-
-    assert_eq!(
-        snapshot.source(),
-        Some(ProviderConfigSource::ProcessEnvironment)
-    );
-    assert_eq!(
-        snapshot.redacted_config().model_name.as_deref(),
-        Some("snapshot-model")
-    );
-    assert!(
-        snapshot.configuration().configured,
-        "configuration={:?} provider_err={:?}",
-        snapshot.configuration(),
-        snapshot.provider()
-    );
-    assert!(snapshot.provider().is_ok());
-    assert!(snapshot.snapshot_id().starts_with("provider_snapshot_"));
-    let debug = format!("{snapshot:?}");
-    for secret in ["snapshot-secret", "snapshot-provider.example"] {
-        assert!(!debug.contains(secret));
-        assert!(!snapshot.snapshot_id().contains(secret));
-    }
-
-    let same_config = ProviderConfigSnapshot::capture(
-        |name| match name {
-            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-            "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
-            "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
-    );
-    assert_ne!(snapshot.snapshot_id(), same_config.snapshot_id());
-}
-
-#[test]
-fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
-    for (name, malformed) in [
-        ("SINGULARITY_MODEL", "test-model\r"),
-        ("SINGULARITY_BASE_URL", "https://provider.example/v1\r"),
-        ("SINGULARITY_API_KEY", "test-key-placeholder\r"),
-        ("SINGULARITY_MODEL", "test-model\n"),
-        ("SINGULARITY_BASE_URL", "https://provider.example/v1\0"),
-    ] {
-        let snapshot = ProviderConfigSnapshot::capture(
-            |candidate| match candidate {
-                "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
-                    malformed.to_string()
-                } else {
-                    "test-model".to_string()
-                }),
-                "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
-                    malformed.to_string()
-                } else {
-                    "https://provider.example/v1".to_string()
-                }),
-                "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
-                    malformed.to_string()
-                } else {
-                    "test-key-placeholder".to_string()
-                }),
-                _ => None,
-            },
-            test_runtime_handle(),
-        );
-
-        assert!(!snapshot.configuration().configured);
-        let error = snapshot
-            .provider()
-            .expect_err("malformed process environment must fail before provider creation");
-        assert_eq!(
-            error.error.code.as_deref(),
-            Some("provider_configuration_invalid")
-        );
-        assert_eq!(
-            error.error.stage,
-            Some(ProviderErrorStage::ClientInitialization)
-        );
-        assert!(!error.error.message.contains(malformed));
-        assert!(
-            !serde_json::to_string(&error.error)
-                .expect("serialize configuration error")
-                .contains(malformed)
-        );
-    }
-}
-
-#[test]
 fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics() {
     let malformed_url = single_response_server("HTTP/1.1 200 OK", "not-json");
     let malformed = test_provider(provider_test_config(malformed_url)).expect("malformed provider");
@@ -361,7 +255,7 @@ fn openai_provider_debug_redacts_secret_configuration() {
 }
 
 #[test]
-fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
+fn model_catalog_resolves_fixed_protocols_and_limits() {
     let fixture = UserConfigFixture::new();
     let _env = fixture.install_env();
     fixture.set_api_key("first", "first-secret");
@@ -391,17 +285,7 @@ fn model_catalog_captures_once_and_resolves_fixed_protocols_and_limits() {
             }
         }),
     );
-    let mut reads = std::collections::HashMap::<String, usize>::new();
-    let fixture_inside = &fixture;
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| {
-            let count = reads.entry(name.to_string()).or_default();
-            *count += 1;
-            assert_eq!(*count, 1, "configuration value {name} was captured twice");
-            fixture_inside.env(name)
-        },
-        test_runtime_handle(),
-    );
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
 
     assert!(
         snapshot.configuration().configured,
@@ -491,7 +375,7 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("deep/chat#high"))
         .expect("selected Chat provider");
@@ -545,50 +429,6 @@ fn catalog_chat_reasoning_variant_projects_wire_and_replays_opaque_content() {
 }
 
 #[test]
-fn env_provider_chat_projects_developer_role_to_system_without_a_selected_model() {
-    let (base_url, request_body) = captured_request_server(
-        "HTTP/1.1 200 OK",
-        r#"{"id":"env_chat_done","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
-    );
-    let snapshot = ProviderConfigSnapshot::capture(
-        |name| match name {
-            "SINGULARITY_MODEL" => Some("test-model".to_string()),
-            "SINGULARITY_BASE_URL" => Some(base_url.clone()),
-            "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        test_runtime_handle(),
-    );
-    let provider = snapshot.provider().expect("env provider");
-    let request = ModelTurnRequest::new(
-        "env_developer_role_request",
-        vec![
-            ModelMessage::text(ModelRole::Developer, "instruction"),
-            ModelMessage::text(ModelRole::User, "hello"),
-        ],
-    );
-    let response = provider
-        .complete(
-            &request,
-            &singularity_core::CancellationToken::new(),
-            &mut |_| {},
-        )
-        .expect("env chat request");
-    assert_eq!(response.status, ModelTurnStatus::Success);
-    let payload: serde_json::Value = serde_json::from_str(
-        &request_body
-            .recv_timeout(Duration::from_secs(1))
-            .expect("captured env chat request"),
-    )
-    .expect("env chat payload JSON");
-    let messages = payload["messages"].as_array().expect("env chat messages");
-    // env 路径没有 per-model 声明：chat wire 必须用通用的 system role，
-    // 不得发送 OpenAI 兼容端点普遍不接受的 developer（dashscope 实测 400）。
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[1]["role"], "user");
-}
-
-#[test]
 fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinking_object() {
     let (base_url, request_body) = captured_request_server(
         "HTTP/1.1 200 OK",
@@ -617,7 +457,7 @@ fn catalog_enable_thinking_projects_dashscope_chat_fields_without_openai_thinkin
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("dashscope/deepseek-v4-flash-0731#max"))
         .expect("selected DashScope provider");
@@ -668,7 +508,7 @@ fn missing_provider_usage_remains_unknown() {
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("opencode-go/deepseek-v4-flash"))
         .expect("selected builtin provider");
@@ -748,7 +588,7 @@ fn catalog_unknown_context_remains_selectable_without_inventing_a_window() {
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("unknown/model#max"))
         .expect("selected unknown-context provider");
@@ -800,7 +640,7 @@ fn catalog_rejects_explicit_output_limit_equal_to_context_window() {
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let error = snapshot
         .provider()
         .expect_err("invalid explicit limits must fail closed");
@@ -843,7 +683,7 @@ fn catalog_responses_reasoning_variant_replays_standard_item_without_chat_field(
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let provider = snapshot
         .provider_for_selector(Some("longcat/responses#high"))
         .expect("selected Responses provider");
@@ -929,7 +769,7 @@ fn catalog_responses_reasoning_requires_explicit_wire_mapping() {
             }
         }),
     );
-    let snapshot = ProviderConfigSnapshot::capture(|name| fixture.env(name), test_runtime_handle());
+    let snapshot = ProviderConfigSnapshot::capture(test_runtime_handle());
     let error = snapshot
         .provider()
         .expect_err("Responses reasoning without a wire map must fail closed");

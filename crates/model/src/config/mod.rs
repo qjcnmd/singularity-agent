@@ -1,4 +1,4 @@
-//! provider 配置分层解析、脱敏状态和服务级配置快照。
+//! provider 配置解析、脱敏状态和服务级配置快照。
 use std::collections::BTreeMap;
 
 pub(crate) mod filesystem;
@@ -16,11 +16,10 @@ pub use schema::{
 pub(crate) use user::*;
 
 use super::{
-    DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL, ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS,
-    ENV_MODEL, ENV_PROVIDER, MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
-    ModelError, ModelErrorKind, OpenAiProvider, OpenAiProviderConfig, PROVIDER_SNAPSHOT_ID_PREFIX,
-    ProviderApiProtocol, ProviderError, ProviderErrorStage, ProviderToolReasoningMode,
-    ThinkingWireFormat, validate_provider_config,
+    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
+    OpenAiProvider, OpenAiProviderConfig, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
+    ProviderError, ProviderErrorStage, ProviderToolReasoningMode, ThinkingWireFormat,
+    validate_provider_config,
 };
 
 pub(super) use selection::model_selector_error;
@@ -44,12 +43,14 @@ pub(crate) fn missing_provider_config_error(
     )
 }
 
-pub(crate) fn missing_provider_auth_error(source: Option<ProviderConfigSource>) -> ProviderError {
-    let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+pub(crate) fn missing_provider_auth_error() -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
             ModelErrorKind::AuthError,
-            format!("required provider authentication is missing (source={source})"),
+            format!(
+                "required provider authentication is missing (source={})",
+                ProviderConfigSource::UserConfigFile.as_str()
+            ),
         )
         .with_provider_diagnostic(
             "provider_auth_missing",
@@ -58,54 +59,9 @@ pub(crate) fn missing_provider_auth_error(source: Option<ProviderConfigSource>) 
     )
 }
 
-pub(crate) fn provider_source_missing_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::InvalidRequest,
-            "provider configuration source is missing",
-        )
-        .with_provider_diagnostic(
-            "provider_configuration_missing",
-            ProviderErrorStage::ClientInitialization,
-        ),
-    )
-}
-
-pub(crate) fn parse_provider_limit(
-    value: Option<&str>,
-    name: &str,
-    fallback: u32,
-    upper_bound: u32,
-    source: Option<ProviderConfigSource>,
-) -> Result<u32, ProviderError> {
-    let Some(value) = value else {
-        return Ok(fallback);
-    };
-    let parsed = value.parse::<u32>().ok().filter(|value| *value > 0);
-    match parsed {
-        Some(value) if value <= upper_bound => Ok(value),
-        _ => {
-            let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
-            Err(ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::InvalidRequest,
-                    format!(
-                        "invalid model configuration: {name} must be between 1 and {upper_bound} (source={source})"
-                    ),
-                )
-                .with_provider_diagnostic(
-                    "provider_configuration_invalid",
-                    ProviderErrorStage::ClientInitialization,
-                ),
-            ))
-        }
-    }
-}
-
 pub(crate) fn validate_provider_value(
     value: Option<&str>,
     name: &str,
-    source: Option<ProviderConfigSource>,
 ) -> Result<(), ProviderError> {
     let Some(value) = value else {
         return Ok(());
@@ -117,12 +73,12 @@ pub(crate) fn validate_provider_value(
         .any(|character| matches!(character, '\r' | '\n' | '\0'))
         || invalid_boundary_whitespace
     {
-        let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
         return Err(ProviderError::from_model_error(
             ModelError::new(
                 ModelErrorKind::InvalidRequest,
                 format!(
-                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace (source={source})"
+                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace (source={})",
+                    ProviderConfigSource::UserConfigFile.as_str()
                 ),
             )
             .with_provider_diagnostic(
@@ -134,23 +90,20 @@ pub(crate) fn validate_provider_value(
     Ok(())
 }
 
-pub(crate) fn validate_base_url(
-    value: Option<&str>,
-    source: Option<ProviderConfigSource>,
-) -> Result<(), ProviderError> {
+pub(crate) fn validate_base_url(value: Option<&str>) -> Result<(), ProviderError> {
     let Some(value) = value else {
         return Ok(());
     };
-    validate_provider_value(Some(value), ENV_BASE_URL, source)?;
+    validate_provider_value(Some(value), "base_url")?;
     if value.is_empty() {
         return Err(configuration_error(
-            "invalid model configuration: SINGULARITY_BASE_URL must not be empty",
+            "invalid model configuration: base_url must not be empty",
             "provider_configuration_invalid",
         ));
     }
     let url = reqwest::Url::parse(value).map_err(|_| {
         configuration_error(
-            "invalid model configuration: SINGULARITY_BASE_URL must be an absolute URL",
+            "invalid model configuration: base_url must be an absolute URL",
             "provider_configuration_invalid",
         )
     })?;
@@ -162,79 +115,11 @@ pub(crate) fn validate_base_url(
         || url.fragment().is_some()
     {
         return Err(configuration_error(
-            "invalid model configuration: SINGULARITY_BASE_URL must be an http/https URL with a host, path only, and no credentials, query, or fragment",
+            "invalid model configuration: base_url must be an http/https URL with a host, path only, and no credentials, query, or fragment",
             "provider_configuration_invalid",
         ));
     }
     Ok(())
-}
-
-#[derive(Default)]
-pub(crate) struct ProviderConfigLayer {
-    provider_name: Option<String>,
-    model_name: Option<String>,
-    context_tokens: Option<String>,
-    max_output_tokens: Option<String>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    user_config: Option<UserConfigData>,
-    user_config_error: Option<ProviderError>,
-}
-
-impl ProviderConfigLayer {
-    fn from_process_env<F>(get_env: &mut F) -> Self
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        Self {
-            provider_name: get_env(ENV_PROVIDER),
-            model_name: get_env(ENV_MODEL),
-            context_tokens: get_env(ENV_CONTEXT_TOKENS),
-            max_output_tokens: get_env(ENV_MAX_OUTPUT_TOKENS),
-            base_url: get_env(ENV_BASE_URL),
-            api_key: get_env(ENV_API_KEY),
-            user_config: None,
-            user_config_error: None,
-        }
-    }
-
-    fn any_present(&self) -> bool {
-        self.provider_name.is_some()
-            || self.model_name.is_some()
-            || self.context_tokens.is_some()
-            || self.max_output_tokens.is_some()
-            || self.base_url.is_some()
-            || self.api_key.is_some()
-            || self.user_config.is_some()
-            || self.user_config_error.is_some()
-    }
-
-    fn into_values(self, source: ProviderConfigSource) -> ResolvedProviderValues {
-        ResolvedProviderValues {
-            source: Some(source),
-            provider_name: normalized_provider_value(self.provider_name),
-            model_name: normalized_provider_value(self.model_name),
-            context_tokens: normalized_provider_value(self.context_tokens),
-            max_output_tokens: normalized_provider_value(self.max_output_tokens),
-            base_url: normalized_provider_value(self.base_url),
-            api_key: normalized_provider_value(self.api_key),
-            user_config: self.user_config,
-            user_config_error: self.user_config_error,
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct ResolvedProviderValues {
-    pub(crate) source: Option<ProviderConfigSource>,
-    pub(crate) provider_name: Option<String>,
-    pub(crate) model_name: Option<String>,
-    pub(crate) context_tokens: Option<String>,
-    pub(crate) max_output_tokens: Option<String>,
-    pub(crate) base_url: Option<String>,
-    pub(crate) api_key: Option<String>,
-    pub(crate) user_config: Option<UserConfigData>,
-    pub(crate) user_config_error: Option<ProviderError>,
 }
 
 fn configured_model_from_user_file(
@@ -341,14 +226,10 @@ fn configured_model_from_user_file(
     })
 }
 
-fn capture_user_model_selection<P>(
+fn capture_user_model_selection(
     user_config: &UserConfigData,
-    source: Option<ProviderConfigSource>,
-    provider_factory: &P,
-) -> Result<(ModelSelectionSnapshot, ModelProviderConfig), ProviderError>
-where
-    P: Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
-{
+    runtime_handle: &tokio::runtime::Handle,
+) -> Result<(ModelSelectionSnapshot, ModelProviderConfig), ProviderError> {
     let default_model = user_config.config.default_model.clone().ok_or_else(|| {
         model_selector_error(
             "user provider config must declare default_model",
@@ -377,10 +258,9 @@ where
             provider_name,
             provider_file,
             &user_config.auth,
-            source,
             provider_name == &default_provider_name,
             parsed_default.model_name,
-            provider_factory,
+            runtime_handle,
         )?
         else {
             continue;
@@ -413,7 +293,7 @@ where
         return Err(default_provider
             .provider_error
             .clone()
-            .unwrap_or_else(|| missing_provider_auth_error(source)));
+            .unwrap_or_else(missing_provider_auth_error));
     }
     Ok((
         ModelSelectionSnapshot {
@@ -433,18 +313,14 @@ where
 /// provider 配置（含按需的 adapter 实例）。阻断错误只作用于默认提供者
 /// （`is_default`）；非默认条目的同类错误以 `provider_error` 记录、无效模型
 /// 跳过、无有效模型时整体跳过（返回 `None`），不阻断启动。
-fn normalize_provider_entry<P>(
+fn normalize_provider_entry(
     provider_name: &str,
     provider_file: &UserConfigProvider,
     auth: &UserAuthFile,
-    source: Option<ProviderConfigSource>,
     is_default: bool,
     default_model_name: &str,
-    provider_factory: &P,
-) -> Result<Option<ConfiguredProvider>, ProviderError>
-where
-    P: Fn(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
-{
+    runtime_handle: &tokio::runtime::Handle,
+) -> Result<Option<ConfiguredProvider>, ProviderError> {
     let is_default_model = |model_name: &str| is_default && model_name == default_model_name;
 
     if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
@@ -453,7 +329,7 @@ where
         }
         return Ok(None);
     }
-    let endpoint_error = validate_base_url(Some(&provider_file.base_url), source).err();
+    let endpoint_error = validate_base_url(Some(&provider_file.base_url)).err();
     if is_default && let Some(error) = endpoint_error.clone() {
         return Err(error);
     }
@@ -463,11 +339,11 @@ where
         .map(|provider| provider.api_key.clone())
         .filter(|value| !value.is_empty());
     if is_default && api_key.is_none() {
-        return Err(missing_provider_auth_error(source));
+        return Err(missing_provider_auth_error());
     }
     let auth_error = api_key
         .as_deref()
-        .and_then(|api_key| validate_provider_value(Some(api_key), ENV_API_KEY, source).err());
+        .and_then(|api_key| validate_provider_value(Some(api_key), "api_key").err());
     if is_default && let Some(error) = auth_error.clone() {
         return Err(error);
     }
@@ -491,7 +367,7 @@ where
         return Ok(None);
     }
     let (provider, provider_error) = match (api_key, endpoint_error, auth_error) {
-        (None, _, _) => (None, Some(missing_provider_auth_error(source))),
+        (None, _, _) => (None, Some(missing_provider_auth_error())),
         (_, Some(error), _) => (None, Some(error)),
         (_, _, Some(error)) => (None, Some(error)),
         (Some(api_key), None, None) => {
@@ -509,11 +385,11 @@ where
                 model_name: base_model,
                 base_url: provider_file.base_url.clone(),
                 api_key,
-                source: source.ok_or_else(provider_source_missing_error)?,
+                source: ProviderConfigSource::UserConfigFile,
                 max_context_tokens: base_model_config.max_context_tokens,
                 max_output_tokens: base_model_config.max_output_tokens,
             };
-            match provider_factory(config) {
+            match OpenAiProvider::new(config, runtime_handle.clone()) {
                 Ok(provider) => (Some(provider), None),
                 Err(error) if is_default => return Err(error),
                 Err(error) => (None, Some(error)),
@@ -525,68 +401,6 @@ where
         provider_error,
         models,
     }))
-}
-
-fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfigResolution {
-    if let Some(user_config) = values.user_config.as_ref() {
-        let default_selector = user_config.config.default_model.clone();
-        let parsed = default_selector
-            .as_deref()
-            .and_then(|selector| parse_model_selector(selector).ok());
-        let provider_name = parsed
-            .as_ref()
-            .map(|selector| selector.provider_name.to_string())
-            .or_else(|| user_config.config.default_provider.clone());
-        let model_name = default_selector;
-        return ProviderConfigResolution {
-            source: values.source,
-            config: ModelProviderConfig {
-                provider_name,
-                model_name,
-                base_url_present: values.base_url.is_some(),
-                api_key_present: values.api_key.is_some(),
-            },
-        };
-    }
-    let provider_name = values.source.map(|_| {
-        values
-            .provider_name
-            .clone()
-            .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string())
-    });
-    ProviderConfigResolution {
-        source: values.source,
-        config: ModelProviderConfig {
-            provider_name,
-            model_name: values.model_name.clone(),
-            base_url_present: values.base_url.is_some(),
-            api_key_present: values.api_key.is_some(),
-        },
-    }
-}
-
-pub(crate) fn resolve_provider_values_with_user_config<F, U>(
-    mut get_env: F,
-    user_config: U,
-) -> ResolvedProviderValues
-where
-    F: FnMut(&str) -> Option<String>,
-    U: FnOnce() -> Option<ProviderConfigLayer>,
-{
-    // 来源原子选择：任何进程环境 provider 字段使该完整层具有权威性。
-    // 绝不从用户配置合并缺失的进程字段——否则快照会依赖两个可变来源，
-    // 隐藏不完整的进程设置。
-    let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
-    if process_layer.any_present() {
-        return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);
-    }
-    user_config()
-        .map(|layer| layer.into_values(ProviderConfigSource::UserConfigFile))
-        .unwrap_or_default()
-}
-
-pub(crate) fn normalized_provider_value(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty())
 }
 
 pub(crate) fn redacted_presence(present: bool) -> String {

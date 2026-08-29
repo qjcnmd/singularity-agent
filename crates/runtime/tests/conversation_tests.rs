@@ -36,21 +36,51 @@ fn coordinator(sessions: &Path) -> ThreadLockCoordinator {
 }
 
 fn snapshot() -> singularity_model::ProviderConfigSnapshot {
-    // 进程层注入固定三元组：快照完全不读磁盘与真实环境；
-    // selector 校验按 legacy 规则解析 openai_compatible/base-model。
-    // fake provider 不经 HTTP；Handle 背后的 runtime 无需存活。
+    // 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible/base-model，
+    // auth.json 提供测试 key。fake provider 经 provider_override 注入，不经 HTTP；
+    // Handle 背后的 runtime 无需存活。
+    static FIXTURE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let home = FIXTURE.get_or_init(|| {
+        let directory = tempfile::tempdir().expect("snapshot fixture home");
+        let path = directory.path().to_path_buf();
+        let config = serde_json::json!({
+            "version": 1,
+            "default_provider": "openai_compatible",
+            "default_model": "openai_compatible/base-model",
+            "providers": {
+                "openai_compatible": {
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "models": {
+                        "base-model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 128_000,
+                            "max_output_tokens": 4_096
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(path.join("config.json"), config.to_string()).expect("write fixture config");
+        let auth = serde_json::json!({
+            "schema_version": 1,
+            "providers": { "openai_compatible": { "api_key": "test-key-placeholder" } }
+        });
+        let auth_path = path.join("auth.json");
+        std::fs::write(&auth_path, auth.to_string()).expect("write fixture auth");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict fixture auth");
+        }
+        // fixture 目录随进程存活：capture 按目录读取两文件。
+        std::mem::forget(directory);
+        path
+    });
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let handle = runtime.handle().clone();
     std::mem::forget(runtime);
-    singularity_model::ProviderConfigSnapshot::capture(
-        |name| match name {
-            "SINGULARITY_MODEL" => Some("base-model".to_string()),
-            "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:9/v1".to_string()),
-            "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
-            _ => None,
-        },
-        handle,
-    )
+    singularity_model::ProviderConfigSnapshot::capture_from_directory(home, handle)
 }
 
 /// 记录每次模型请求，用于断言各 turn 实际看到的输入与 selector。
@@ -613,7 +643,7 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
             log: Arc::clone(&log),
             requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
     ));
     let thread_id = shared.thread().unwrap().thread_id;
 
@@ -656,7 +686,7 @@ fn settings_accepted_during_turn_apply_automatically_before_next_turn() {
     assert_eq!(queued.timing, SettingsApplyTiming::QueuedForNextTurn);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
         "current turn keeps its startup selector"
     );
     assert_eq!(
@@ -725,7 +755,7 @@ fn second_queued_patch_returns_selector_of_the_merged_combination() {
             log: Arc::clone(&log),
             requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
     ));
     let thread_id = shared.thread().unwrap().thread_id;
 
@@ -754,7 +784,7 @@ fn second_queued_patch_returns_selector_of_the_merged_combination() {
         })
         .expect("queue second patch");
     let expected = compose_merged_selector(
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
         &SettingsPatch {
             provider: Some("openai_compatible".to_string()),
             model: Some("base-model".to_string()),
@@ -796,7 +826,7 @@ fn merged_invalid_combination_rejected_at_commit_keeps_pending_intact() {
             log: Arc::new(RequestLog::default()),
             requested: Arc::clone(&requested),
         }),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
     ));
     let thread_id = shared.thread().unwrap().thread_id;
 
@@ -817,8 +847,8 @@ fn merged_invalid_combination_rejected_at_commit_keeps_pending_intact() {
         })
         .expect("queue valid first patch");
 
-    // 合并后 non-parseable 的组合（legacy 快照不声明 reasoning variants）
-    // 在提交点即被拒绝，不等到终态持久化。
+    // 合并后无法解析的组合（base-model 未声明该 reasoning 变体）在提交点即被
+    // 拒绝，不等到终态持久化。
     let rejected = shared.queue_settings(SettingsPatch {
         reasoning: ReasoningPatch::Set("high".to_string()),
         ..SettingsPatch::default()
@@ -923,7 +953,7 @@ fn settings_persistence_failure_keeps_intent_and_fails_run() {
             log: Arc::new(RequestLog::default()),
             requested: Arc::clone(&requested),
         }),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
     ));
     let thread_id = shared.thread().unwrap().thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
@@ -974,7 +1004,7 @@ fn settings_persistence_failure_keeps_intent_and_fails_run() {
     // 意图保留：线程投影未更新，JSONL 没有 thread_settings 记录。
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
         "intent stays queued; projection keeps the old selector"
     );
     assert_eq!(
@@ -1354,7 +1384,7 @@ fn reservation_holds_window_and_releases_on_drop() {
             text: "ok".into(),
             log: Arc::clone(&log),
         }),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
     );
     let thread_id = shared.thread().unwrap().thread_id;
 
@@ -1386,7 +1416,7 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert_eq!(timing.timing, SettingsApplyTiming::QueuedForNextTurn);
     assert_eq!(
         shared.thread().unwrap().model.as_deref(),
-        Some("base-model"),
+        Some("openai_compatible/base-model"),
         "reserved settings must not change the current projection"
     );
     assert_eq!(

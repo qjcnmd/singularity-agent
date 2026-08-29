@@ -692,7 +692,7 @@ mod replay_binding_tests {
             model_name: "test-model".to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
             api_key: "test-key-placeholder".to_string(),
-            source: ProviderConfigSource::ProcessEnvironment,
+            source: ProviderConfigSource::UserConfigFile,
             max_context_tokens: Some(crate::DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
         }

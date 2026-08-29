@@ -425,20 +425,21 @@ mod tests {
     use singularity_runtime::{Conversation, ThreadCatalog, TurnRunner};
     use std::sync::Arc;
 
-    /// 固定三元组快照：不读磁盘、不经 HTTP，仅满足 Conversation/TurnRunner 构造。
+    /// 固定快照：空用户配置目录（未配置）即可满足 Conversation/TurnRunner
+    /// 构造，不经 HTTP、不读真实 home。
     fn snapshot() -> singularity_model::ProviderConfigSnapshot {
+        static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let home = HOME.get_or_init(|| {
+            let directory = tempfile::tempdir().expect("snapshot fixture home");
+            let path = directory.path().to_path_buf();
+            // fixture 目录随进程存活：capture 按目录读取。
+            std::mem::forget(directory);
+            path
+        });
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
         std::mem::forget(runtime);
-        singularity_model::ProviderConfigSnapshot::capture(
-            |name| match name {
-                "SINGULARITY_MODEL" => Some("base-model".to_string()),
-                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:9/v1".to_string()),
-                "SINGULARITY_API_KEY" => Some("test-key-placeholder".to_string()),
-                _ => None,
-            },
-            handle,
-        )
+        singularity_model::ProviderConfigSnapshot::capture_from_directory(home, handle)
     }
 
     fn key(code: KeyCode, ctrl: bool) -> KeyEvent {

@@ -131,6 +131,40 @@ fn stdout_lines(stdout: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 在隔离 home 写入指向本地假 Chat 服务器的用户配置（config.json + auth.json）。
+fn install_fake_provider(home: &Path, base_url: &str) {
+    let config = serde_json::json!({
+        "version": 1,
+        "default_provider": "openai_compatible",
+        "default_model": "openai_compatible/fake-model",
+        "providers": {
+            "openai_compatible": {
+                "base_url": base_url,
+                "models": {
+                    "fake-model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 128000,
+                        "max_output_tokens": 4096
+                    }
+                }
+            }
+        }
+    });
+    std::fs::write(home.join("config.json"), config.to_string()).expect("write config.json");
+    let auth = serde_json::json!({
+        "schema_version": 1,
+        "providers": { "openai_compatible": { "api_key": "test-key-placeholder" } }
+    });
+    let auth_path = home.join("auth.json");
+    std::fs::write(&auth_path, auth.to_string()).expect("write auth.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict auth.json to owner");
+    }
+}
+
 #[test]
 fn help_shows_only_new_entry_contract() {
     let output = sg()
@@ -175,10 +209,6 @@ fn all_execution_modes_fail_at_startup_without_git_bash() {
             .env_remove("ProgramFiles")
             .env_remove("ProgramFiles(x86)")
             .env_remove("ProgramW6432")
-            .env_remove("SINGULARITY_MODEL")
-            .env_remove("SINGULARITY_BASE_URL")
-            .env_remove("SINGULARITY_API_KEY")
-            .env_remove("SINGULARITY_MODEL_PROVIDER")
             .output()
             .expect("run sg without Git Bash");
 
@@ -217,13 +247,10 @@ fn all_execution_modes_fail_at_startup_without_git_bash() {
 fn print_writes_only_final_assistant_text() {
     let home = isolated_home();
     let base_url = fake_server::spawn("done");
+    install_fake_provider(&home.path, &base_url);
     let output = sg()
         .args(["--print", "Reply with exactly: done"])
         .env("SINGULARITY_HOME", &home.path)
-        .env("SINGULARITY_MODEL", "fake-model")
-        .env("SINGULARITY_BASE_URL", &base_url)
-        .env("SINGULARITY_API_KEY", "test-key-placeholder")
-        .env_remove("SINGULARITY_MODEL_PROVIDER")
         .output()
         .expect("run sg --print");
     assert!(
@@ -239,12 +266,10 @@ fn print_writes_only_final_assistant_text() {
 fn length_truncation_is_persisted_and_projected_by_headless_modes() {
     let print_home = isolated_home();
     let base_url = fake_server::spawn_with_finish_reason("partial", "length");
+    install_fake_provider(&print_home.path, &base_url);
     let output = sg()
         .args(["--print", "produce a long response"])
         .env("SINGULARITY_HOME", &print_home.path)
-        .env("SINGULARITY_MODEL", "fake-model")
-        .env("SINGULARITY_BASE_URL", &base_url)
-        .env("SINGULARITY_API_KEY", "test-key-placeholder")
         .output()
         .expect("run truncated sg --print");
     assert!(
@@ -277,12 +302,10 @@ fn length_truncation_is_persisted_and_projected_by_headless_modes() {
     );
 
     let json_home = isolated_home();
+    install_fake_provider(&json_home.path, &base_url);
     let output = sg()
         .args(["--json", "produce a long response"])
         .env("SINGULARITY_HOME", &json_home.path)
-        .env("SINGULARITY_MODEL", "fake-model")
-        .env("SINGULARITY_BASE_URL", &base_url)
-        .env("SINGULARITY_API_KEY", "test-key-placeholder")
         .output()
         .expect("run truncated sg --json");
     assert!(
@@ -305,12 +328,10 @@ fn length_truncation_is_persisted_and_projected_by_headless_modes() {
 fn json_emits_event_lines_and_terminal_summary() {
     let home = isolated_home();
     let base_url = fake_server::spawn("done");
+    install_fake_provider(&home.path, &base_url);
     let output = sg()
         .args(["--json", "Reply with exactly: done"])
         .env("SINGULARITY_HOME", &home.path)
-        .env("SINGULARITY_MODEL", "fake-model")
-        .env("SINGULARITY_BASE_URL", &base_url)
-        .env("SINGULARITY_API_KEY", "test-key-placeholder")
         .output()
         .expect("run sg --json");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
@@ -425,12 +446,10 @@ fn home_inside_repository_is_rejected_before_directory_creation() {
 fn no_session_persists_nothing() {
     let home = isolated_home();
     let base_url = fake_server::spawn("done");
+    install_fake_provider(&home.path, &base_url);
     let output = sg()
         .args(["--json", "Reply with exactly: done", "--no-session"])
         .env("SINGULARITY_HOME", &home.path)
-        .env("SINGULARITY_MODEL", "fake-model")
-        .env("SINGULARITY_BASE_URL", &base_url)
-        .env("SINGULARITY_API_KEY", "test-key-placeholder")
         .output()
         .expect("run sg --no-session");
     assert!(

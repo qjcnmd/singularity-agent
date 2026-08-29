@@ -67,8 +67,8 @@ pub(crate) fn install_process_env(key: &str, value: &std::path::Path) -> Process
 
 /// config.json 用户配置 fixture：以 `SINGULARITY_HOME` 指向隔离目录，
 /// 一次性写入 config.json 与 auth.json（ProviderConfigSnapshot::capture
-/// 的 user-config 层读取两文件；该层直接读进程环境，因此必须经
-/// `install_env` 把 SINGULARITY_HOME 安装到进程环境）。
+/// 读取这两个文件；读取层直接读进程环境里的 SINGULARITY_HOME，因此必须经
+/// `install_env` 把它安装到进程环境）。
 pub(crate) struct UserConfigFixture {
     pub(crate) directory: tempfile::TempDir,
 }
@@ -126,14 +126,6 @@ impl UserConfigFixture {
                 .expect("restrict user auth to owner");
         }
     }
-
-    /// ProviderConfigSnapshot 的 env getter：只回答 SINGULARITY_HOME。
-    pub(crate) fn env(&self, name: &str) -> Option<String> {
-        if name == "SINGULARITY_HOME" {
-            return Some(self.directory.path().to_string_lossy().into_owned());
-        }
-        None
-    }
 }
 
 pub(crate) fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
@@ -155,8 +147,28 @@ pub(crate) fn test_runtime_handle() -> tokio::runtime::Handle {
 }
 
 /// 构造注入共享测试 runtime 的 provider；返回 Result 以保持调用点 `.expect` 形状。
+/// 协议按 base_url 端点后缀选择（`/responses` 结尾为 Responses，否则 Chat），
+/// 与目录无 reasoning 变体条目的选择同形。
 pub(crate) fn test_provider(config: OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError> {
-    OpenAiProvider::new(config, test_runtime_handle())
+    test_provider_with_runtime(config, test_runtime_handle())
+}
+
+/// [`test_provider`] 的显式 runtime 变体：验证 provider 使用调用方注入的 runtime。
+pub(crate) fn test_provider_with_runtime(
+    config: OpenAiProviderConfig,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<OpenAiProvider, ProviderError> {
+    let api_protocol = if config
+        .base_url
+        .trim()
+        .trim_end_matches('/')
+        .ends_with("/responses")
+    {
+        ProviderApiProtocol::OpenAiResponses
+    } else {
+        ProviderApiProtocol::OpenAiChatCompletions
+    };
+    OpenAiProvider::with_single_model(config, api_protocol, runtime_handle)
 }
 
 pub(crate) fn provider_auto_test_config(base_url: String) -> OpenAiProviderConfig {
@@ -169,7 +181,7 @@ pub(crate) fn provider_config_with_base_url(base_url: String) -> OpenAiProviderC
         model_name: "test-model".to_string(),
         base_url,
         api_key: "test-key-placeholder".to_string(),
-        source: ProviderConfigSource::ProcessEnvironment,
+        source: ProviderConfigSource::UserConfigFile,
         max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
     }
@@ -252,7 +264,7 @@ pub(crate) fn responses_provider_server(
         tx.send(vec![(first_line, request_body)])
             .expect("send Responses requests");
     });
-    // 静态协议选择：legacy provider 按 endpoint 后缀决定协议，显式 /v1/responses。
+    // Responses 端点显式 /v1/responses；目录条目按 api_protocol: responses 声明协议。
     (format!("http://{addr}/v1/responses"), rx)
 }
 

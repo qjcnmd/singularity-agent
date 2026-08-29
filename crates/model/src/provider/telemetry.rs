@@ -74,7 +74,7 @@ pub struct ProviderAttemptOccurrence {
     pub usage: Option<ModelUsage>,
 }
 
-/// 构建 Chat、Declared 与 legacy provider 使用的稳定 unsupported 结果。
+/// 构建无规范化文本流协议使用的稳定 unsupported 结果。
 pub(crate) fn provider_streaming_unsupported_error() -> crate::error::ProviderError {
     crate::error::ProviderError::from_model_error(
         crate::error::ModelError::new(

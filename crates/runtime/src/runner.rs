@@ -145,11 +145,7 @@ impl TurnRunner {
 
     /// 校验模型 selector 能被快照解析为具体 provider 配置。
     pub fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
-        if let Some(selector) = selector
-            && (self.provider_snapshot.has_explicit_model_selection()
-                || selector.contains('/')
-                || selector.contains('#'))
-        {
+        if let Some(selector) = selector {
             self.provider_snapshot
                 .provider_for_selector(Some(selector))
                 .map(|_| ())

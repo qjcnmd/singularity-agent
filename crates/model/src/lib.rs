@@ -14,12 +14,6 @@ pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
 pub(crate) const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 1_000_000;
-pub(crate) const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
-pub(crate) const ENV_MODEL: &str = "SINGULARITY_MODEL";
-pub(crate) const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
-pub(crate) const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
-pub(crate) const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
-pub(crate) const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
 /// 默认 provider 名称；适配器回显、selector 组合与元数据落盘共用这一个事实源。
 pub const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";

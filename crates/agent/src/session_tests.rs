@@ -261,7 +261,7 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             "reasoning": "high"
         }),
         json!({"metadataType": "thread_name", "name": "Typed metadata"}),
-        json!({"metadataType": "thread_settings", "model": "legacy-model"}),
+        json!({"metadataType": "thread_settings", "model": "settings-model"}),
     ];
     for value in cases {
         let metadata: SessionMetadata =

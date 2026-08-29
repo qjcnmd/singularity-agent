@@ -26,8 +26,9 @@ use crate::provider::attempt::{
     ProviderAttemptInProgress, emit_provider_attempt_started, record_provider_attempt,
 };
 use crate::provider::contract::{
-    ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
-    request_uses_tool_protocol, validate_model_request_with_capabilities,
+    ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
+    provider_request_validation_error, request_uses_tool_protocol,
+    validate_model_request_with_capabilities,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
 use crate::provider::telemetry::{
@@ -73,23 +74,22 @@ impl ProtocolAdapter {
 
     fn request_payload(
         self,
-        provider: &OpenAiProvider,
+        wire: &WireRequestOptions,
         request: &ModelTurnRequest,
         model_name: &str,
         capabilities: &ProviderProtocolContract,
         streaming: bool,
     ) -> Value {
-        let wire = WireRequestOptions::from_selection(provider.selected_model.as_ref());
         match (self, streaming) {
             (Self::Chat, true) => {
-                openai_chat_stream_request_payload(request, model_name, capabilities, &wire)
+                openai_chat_stream_request_payload(request, model_name, capabilities, wire)
             }
-            (Self::Chat, false) => openai_request_payload(request, model_name, capabilities, &wire),
+            (Self::Chat, false) => openai_request_payload(request, model_name, capabilities, wire),
             (Self::Responses, true) => {
-                openai_responses_stream_request_payload(request, model_name, capabilities, &wire)
+                openai_responses_stream_request_payload(request, model_name, capabilities, wire)
             }
             (Self::Responses, false) => {
-                openai_responses_request_payload(request, model_name, capabilities, &wire)
+                openai_responses_request_payload(request, model_name, capabilities, wire)
             }
         }
     }
@@ -221,10 +221,11 @@ struct SseReadContext<'a> {
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
-/// 一次协议完成请求的上下文：协议契约、选择器与事件回调。
+/// 一次协议完成请求的上下文：协议契约、目录选择与事件回调。
 struct ProtocolRequestContext<'a> {
     cancellation: &'a CancellationToken,
     api_protocol: ProviderApiProtocol,
+    selection: &'a SelectedModel,
     on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
     on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
 }
@@ -297,6 +298,36 @@ impl OpenAiProvider {
         Self::new_with_request_timeout(config, crate::PROVIDER_TIMEOUT_SECONDS, runtime_handle)
     }
 
+    /// 绑定单一显式协议构造 provider：与目录无 reasoning 变体条目的选择同形
+    /// （reasoning 关闭、wire 开关取目录默认）。生产路径经
+    /// [`ProviderConfigSnapshot`] 解析目录后按需克隆；本入口供已知模型与协议
+    /// 的直连场景使用。
+    pub fn with_single_model(
+        config: OpenAiProviderConfig,
+        api_protocol: ProviderApiProtocol,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ProviderError> {
+        let model_name = config.model_name.clone();
+        let max_context_tokens = config.max_context_tokens;
+        let max_output_tokens = config.max_output_tokens;
+        let provider = Self::new(config, runtime_handle)?;
+        Ok(provider.with_selected_model(SelectedModel {
+            model_name,
+            api_protocol,
+            max_context_tokens,
+            max_output_tokens,
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
+            thinking_wire_format: ThinkingWireFormat::ThinkingType,
+            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
+            supports_developer_role: true,
+            supports_tool_choice: true,
+            requires_reasoning_content_for_tool_calls: false,
+            requires_assistant_content_for_tool_calls: false,
+        }))
+    }
+
     pub(crate) fn new_with_request_timeout(
         config: OpenAiProviderConfig,
         request_timeout_seconds: u64,
@@ -327,26 +358,16 @@ impl OpenAiProvider {
         selected
     }
 
-    pub(super) fn configured_provider_name(&self) -> &str {
-        &self.config.provider_name
-    }
-
-    /// 返回目录克隆的完整选择器（`provider/model#effort`），否则返回裸
-    /// legacy model id；未解析出模型时（未配置的 legacy provider）返回 `None`。
+    /// 返回目录克隆的完整选择器（`provider/model#effort`）；未选择目录模型时
+    /// 返回 `None`。
     pub(crate) fn resolved_selector(&self) -> Option<String> {
-        let Some(selection) = self.selected_model.as_ref() else {
-            return Some(self.config.model_name.clone());
-        };
+        let selection = self.selected_model.as_ref()?;
         let mut selector = format!("{}/{}", self.config.provider_name, selection.model_name);
         if let Some(variant) = selection.reasoning_variant.as_deref() {
             selector.push('#');
             selector.push_str(variant);
         }
         Some(selector)
-    }
-
-    pub(super) fn config_snapshot(&self) -> OpenAiProviderConfig {
-        self.config.clone()
     }
 
     /// 返回目录选择的不可变 catalog 协议（若非目录选择则为 `None`）。
@@ -356,15 +377,14 @@ impl OpenAiProvider {
             .map(|selection| selection.api_protocol)
     }
 
-    fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
+    fn validate_reasoning_history(
+        &self,
+        request: &ModelTurnRequest,
+        selection: &SelectedModel,
+    ) -> Result<(), ProviderError> {
         if request.provider_reasoning_history.is_empty() {
             return Ok(());
         }
-        let Some(selection) = self.selected_model.as_ref() else {
-            return Err(provider_tool_reasoning_history_error(
-                ProviderToolReasoningMode::Unspecified,
-            ));
-        };
         if !selection.reasoning_enabled
             || selection.tool_reasoning_mode == ProviderToolReasoningMode::Unspecified
         {
@@ -424,15 +444,11 @@ impl OpenAiProvider {
     fn prepare_completion_context_observed(
         &self,
         request: &ModelTurnRequest,
+        selection: &SelectedModel,
     ) -> Result<CompletionContext, ProviderError> {
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
-        // selected_model 或 endpoint 后缀决定。
+        // 目录选择决定。
         let capabilities = self.protocol_contract();
-        let api_protocol = self
-            .selected_model
-            .as_ref()
-            .map(|selection| selection.api_protocol)
-            .unwrap_or_else(|| self.config.completion_protocol_without_tools());
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
@@ -443,7 +459,7 @@ impl OpenAiProvider {
         }
         Ok(CompletionContext {
             capabilities,
-            api_protocol,
+            api_protocol: selection.api_protocol,
         })
     }
 
@@ -452,7 +468,7 @@ impl OpenAiProvider {
     /// wire 协议选择与 tool-reasoning 契约校验只在这一个入口实现，杜绝
     /// 流式/非流式双轨各自维护导致的静默漂移。
     fn complete_internal<'a>(
-        &self,
+        &'a self,
         request: &ModelTurnRequest,
         cancellation: &'a CancellationToken,
         on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
@@ -461,10 +477,17 @@ impl OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
+        // 快照不变量：到达请求路径的 provider 实例必带恰好一个目录选择；
+        // 缺失选择是构造缺陷，fail closed。
+        let Some(selection) = self.selected_model.as_ref() else {
+            return Err(super::config::configuration_error(
+                "provider request has no catalog model selection",
+                "provider_configuration_missing",
+            ));
+        };
         // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
         // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
-        if self.selected_model.is_some()
-            && let Some(model_name) = request.model_preferences.model_name.as_deref()
+        if let Some(model_name) = request.model_preferences.model_name.as_deref()
             && model_name != self.config.model_name
         {
             return Err(super::config::model_selector_error(
@@ -472,8 +495,8 @@ impl OpenAiProvider {
                 "provider_selector_unknown_model",
             ));
         }
-        self.validate_reasoning_history(request)?;
-        let context = self.prepare_completion_context_observed(request)?;
+        self.validate_reasoning_history(request, selection)?;
+        let context = self.prepare_completion_context_observed(request, selection)?;
         if on_event.is_some()
             && self.streaming_capability(context.api_protocol)
                 != ProviderStreamingCapability::OutputTextDelta
@@ -492,6 +515,7 @@ impl OpenAiProvider {
             ProtocolRequestContext {
                 cancellation,
                 api_protocol: context.api_protocol,
+                selection,
                 on_event,
                 on_attempt,
             },
@@ -500,9 +524,7 @@ impl OpenAiProvider {
             request_uses_tool_protocol(request),
             &completion,
             &context.capabilities,
-            self.selected_model
-                .as_ref()
-                .is_some_and(|selection| selection.requires_reasoning_content_for_tool_calls),
+            selection.requires_reasoning_content_for_tool_calls,
         )?;
         Ok(completion.response)
     }
@@ -518,21 +540,20 @@ impl OpenAiProvider {
         let ProtocolRequestContext {
             cancellation,
             api_protocol,
+            selection,
             mut on_event,
             on_attempt,
         } = context;
         let streaming = on_event.is_some();
         if streaming {
-            self.validate_reasoning_history(request)?;
+            self.validate_reasoning_history(request, selection)?;
         }
         let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
         let endpoint = adapter.endpoint(&self.config);
+        let wire = WireRequestOptions::from_selection(selection);
         let request_payload =
-            adapter.request_payload(self, request, model_name, capabilities, streaming);
-        let reasoning_variant = self
-            .selected_model
-            .as_ref()
-            .and_then(|selection| selection.reasoning_variant.as_deref());
+            adapter.request_payload(&wire, request, model_name, capabilities, streaming);
+        let reasoning_variant = selection.reasoning_variant.as_deref();
         self.complete_attempt(
             AttemptContext {
                 cancellation,

@@ -113,9 +113,10 @@ pub(super) fn provider_for_selection(
         )
     })?;
     let provider_instance = provider.provider.as_ref().ok_or_else(|| {
-        provider.provider_error.clone().unwrap_or_else(|| {
-            super::missing_provider_auth_error(Some(ProviderConfigSource::UserConfigFile))
-        })
+        provider
+            .provider_error
+            .clone()
+            .unwrap_or_else(super::missing_provider_auth_error)
     })?;
     let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
     let Some(requested_variant) = requested_variant else {

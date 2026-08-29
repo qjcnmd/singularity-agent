@@ -31,4 +31,5 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd.workspace = true
 portable-pty = "0.8.1"
+singularity_model = { path = "../model", features = ["test-support"] }
 singularity_runtime = { path = "../runtime", features = ["test-support"] }

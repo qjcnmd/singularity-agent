@@ -18,8 +18,8 @@ pub trait Provider {
 
     /// 报告本 provider 所选协议的规范化流式能力。
     ///
-    /// Legacy provider 默认不支持流式，即使其无关的协议元数据与
-    /// OpenAI 兼容适配器使用相同的枚举值。
+    /// 未覆写本方法的实现视为不支持流式；OpenAI 兼容适配器按所选协议
+    /// 覆写为规范化文本流能力。
     fn streaming_capability(
         &self,
         _selected_protocol: ProviderApiProtocol,

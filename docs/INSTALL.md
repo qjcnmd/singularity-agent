@@ -30,21 +30,18 @@ sg --help
 
 ## 配置 provider
 
-运行时按以下优先级解析 provider 配置：
+provider 配置只来自用户配置目录 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；provider 目录、endpoint 与 api key 都出自这一层，缺失时 fail closed。`config.json` 声明 provider 目录与默认 selector（完整示例见下），`auth.json` 按 provider 存 api key：
 
-1. 进程环境中只要存在任一 provider 变量（`SINGULARITY_BASE_URL` / `SINGULARITY_API_KEY` / `SINGULARITY_MODEL` 等），就只使用进程环境层；
-2. 否则读取 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；
-3. 三个必需值必须来自同一层，缺失时 fail closed。
-
-最小进程环境示例：
-
-```dotenv
-SINGULARITY_BASE_URL=https://provider.example/v1
-SINGULARITY_API_KEY=replace-with-your-api-key
-SINGULARITY_MODEL=your-model-name
+```json
+{
+  "schema_version": 1,
+  "providers": {
+    "dashscope": { "api_key": "replace-with-your-api-key" }
+  }
+}
 ```
 
-用户配置文件中每个模型必须显式声明 `api_protocol: chat|responses`；不会根据 URL 推断协议或跨协议 fallback。模型条目不接受未知字段。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`。
+每个模型必须显式声明 `api_protocol: chat|responses`；不会根据 URL 推断协议或跨协议 fallback。模型条目不接受未知字段。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`，且最大输出必须严格小于 context window。配置值不会被静默 trim 或纠正：含控制字符或首尾空白的必填值以 `provider_configuration_invalid` fail closed。
 
 ### 思考档位
 
@@ -80,8 +77,6 @@ SINGULARITY_MODEL=your-model-name
 ```
 
 续接中需要回放 provider reasoning 时必须设置 `tool_reasoning_history`：`reasoning_content` 只适用于 chat 协议；`responses_items` 只适用于 responses 协议并绑定 function-call IDs；默认 `disabled` 不回放。取值依据供应商官方协议说明或实际 wire 证据填写。
-
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 与最大输出 token 数；默认 `128000` / `4096`，最大输出必须严格小于 context window。配置值不会被静默 trim 或纠正：含控制字符或首尾空白的必填值以 `provider_configuration_invalid` fail closed。
 
 TUI 内用 `/model` 或 `/settings` 为当前 Thread 选择 provider/model/reasoning（写入该 Thread 元数据；活动 turn 期间排队到本轮结束后生效）。provider 注册、认证与全局限额编辑不进入 TUI。
 

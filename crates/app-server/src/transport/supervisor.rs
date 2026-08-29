@@ -468,8 +468,7 @@ fn initialize_app_server(runtime_handle: tokio::runtime::Handle) -> Result<AppSe
     }
     let paths = crate::paths::AppPaths::resolve()?;
     paths.prepare()?;
-    let provider_snapshot =
-        ProviderConfigSnapshot::capture(|name| std::env::var(name).ok(), runtime_handle);
+    let provider_snapshot = ProviderConfigSnapshot::capture(runtime_handle);
     Ok(AppServer::new(provider_snapshot, paths.sessions_dir))
 }
 

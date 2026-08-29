@@ -112,8 +112,8 @@ flowchart TD
             tr_retry["retry.rs — Retry-After 头解析"]
             tr_stream["stream.rs — SSE 流式解码器（双协议）"]
         end
-        subgraph config["config/ — 分层配置"]
-            cfg_mod["mod.rs — 配置分层解析与快照"]
+        subgraph config["config/ — 用户配置目录"]
+            cfg_mod["mod.rs — provider 目录解析与快照"]
             cfg_schema["schema.rs — schema 类型与校验"]
             cfg_runtime["runtime.rs — Provider 实例组装"]
             cfg_selection["selection.rs — provider/model selector 解析"]

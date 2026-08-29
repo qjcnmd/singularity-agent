@@ -34,15 +34,9 @@ cargo build --release --locked --package singularity_cli
 
 ## Provider 配置
 
-Provider 配置持久化在 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；也可用进程环境层整体覆盖（任一 provider 变量出现即只使用该层）：
+Provider 配置只来自用户配置目录 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；provider 目录、endpoint 与 api key 都出自这一层，缺失时 fail closed。
 
-```dotenv
-SINGULARITY_BASE_URL=https://provider.example/v1
-SINGULARITY_API_KEY=replace-with-your-api-key
-SINGULARITY_MODEL=your-model-name
-```
-
-运行时不会自动读取项目 `.env`。每个模型必须显式声明 `api_protocol: chat|responses`，不会根据 URL 推断或跨协议 fallback；配置非法时 fail closed。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`。
+每个模型必须显式声明 `api_protocol: chat|responses`，不会根据 URL 推断或跨协议 fallback。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`。
 
 思考档位是模型配置的一部分：`reasoning_variants` 是唯一事实源，每个 variant 必须写 `enabled`，启用档位可写 `wire_effort`；选择形如 `provider_id/model_id#variant`。示例：
 
@@ -73,7 +67,7 @@ SINGULARITY_MODEL=your-model-name
 }
 ```
 
-TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的 provider/model/reasoning（活动 turn 期间排队到该轮结束后生效）。`/resume`、`/new`、`/session`、`/compact` 与 `/name` 管理会话。TUI 不编辑 provider 注册、认证或全局配置。可选环境变量 `SINGULARITY_MODEL_CONTEXT_TOKENS` / `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 覆盖限额，默认 128000/4096。
+TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的 provider/model/reasoning（活动 turn 期间排队到该轮结束后生效）。`/resume`、`/new`、`/session`、`/compact` 与 `/name` 管理会话。TUI 不编辑 provider 注册、认证或全局配置。
 
 ## 使用
 

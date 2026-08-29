@@ -96,14 +96,41 @@ impl PtySession {
 
     fn spawn_with_base_url(base_url: Option<&str>) -> Result<Self, String> {
         let home = tempfile::tempdir().map_err(|error| format!("temp home: {error}"))?;
+        // 用户配置目录提供单一 Chat provider；fake 服务器只实现 chat completions。
+        let config = serde_json::json!({
+            "version": 1,
+            "default_provider": "openai_compatible",
+            "default_model": "openai_compatible/base-model",
+            "providers": {
+                "openai_compatible": {
+                    "base_url": base_url.unwrap_or("http://127.0.0.1:9/v1"),
+                    "models": {
+                        "base-model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 128000,
+                            "max_output_tokens": 4096
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(home.path().join("config.json"), config.to_string())
+            .map_err(|error| format!("write config.json: {error}"))?;
+        let auth = serde_json::json!({
+            "schema_version": 1,
+            "providers": { "openai_compatible": { "api_key": "tui-pty-test-placeholder" } }
+        });
+        let auth_path = home.path().join("auth.json");
+        std::fs::write(&auth_path, auth.to_string())
+            .map_err(|error| format!("write auth.json: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("restrict auth.json: {error}"))?;
+        }
         let mut builder = CommandBuilder::new(sg_binary());
         builder.env("SINGULARITY_HOME", home.path());
-        builder.env("SINGULARITY_MODEL", "base-model");
-        builder.env(
-            "SINGULARITY_BASE_URL",
-            base_url.unwrap_or("http://127.0.0.1:9/v1"),
-        );
-        builder.env("SINGULARITY_API_KEY", "tui-pty-test-placeholder");
         // PTY 注入整串按键在 ConPTY 上被聚合送达，等效于「粘贴」，会触发
         // TUI 的 paste-burst 检测（真实打字有自然间隔不会触发）；测试断言
         // 以按键为语义，故经逃生舱关闭 burst 检测（codex 同款开关）。

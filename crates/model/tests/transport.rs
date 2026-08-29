@@ -832,8 +832,12 @@ fn openai_provider_uses_external_runtime_handle_for_http_body() {
         .enable_all()
         .build()
         .expect("external Tokio runtime");
-    let provider = OpenAiProvider::new(provider_test_config(base_url), runtime.handle().clone())
-        .expect("provider");
+    let provider = OpenAiProvider::with_single_model(
+        provider_test_config(base_url),
+        ProviderApiProtocol::OpenAiChatCompletions,
+        runtime.handle().clone(),
+    )
+    .expect("provider");
     let request = ModelTurnRequest::new(
         "request_external_runtime",
         vec![ModelMessage::text(ModelRole::User, "hello")],
