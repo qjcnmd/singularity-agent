@@ -4,9 +4,7 @@
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
 //! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
 
-use singularity_agent::session::{
-    SessionManager, SessionMetadata, TurnTerminalStatus,
-};
+use singularity_agent::session::{SessionManager, SessionMetadata, TurnTerminalStatus};
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 

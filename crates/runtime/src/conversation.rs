@@ -153,7 +153,9 @@ impl TurnControls {
             return Vec::new();
         };
         guard.as_ref().map_or_else(Vec::new, |inbox| {
-            inbox.lock().map_or_else(|_| Vec::new(), |mut inbox| inbox.drain())
+            inbox
+                .lock()
+                .map_or_else(|_| Vec::new(), |mut inbox| inbox.drain())
         })
     }
 

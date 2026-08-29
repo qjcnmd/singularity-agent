@@ -22,6 +22,7 @@ use crate::params::{Thread, Turn};
 /// runtime 直接发射的稳定诊断代码。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
+    pub const STEER_UNDELIVERED: &str = "steer_undelivered";
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
@@ -411,13 +412,9 @@ impl TurnFailureCause {
     }
 }
 
-/// app-server 错误消息使用 Display 呈现原因词形。
+/// app-server 错误消息与 golden 词表测试经由 Display 呈现 wire 词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.wire_str())
     }
 }
-
-
-
-

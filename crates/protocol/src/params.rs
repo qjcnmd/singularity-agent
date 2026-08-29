@@ -335,17 +335,11 @@ pub struct TurnModelUsage {
     pub reasoning_tokens: u64,
     /// 原始 usage 对象是否存在；缺失时各计数保持既有 unknown 表示。
     /// 旧服务端数据无此字段时按存在解释。
-    #[serde(
-        alias = "usage_present",
-        default = "default_usage_present_protocol"
-    )]
+    #[serde(alias = "usage_present", default = "default_usage_present_protocol")]
     pub usage_present: bool,
     /// 该聚合表示的每个 provider 请求是否都报告了精确 usage；缺失/未知的
     /// 末次请求 usage 保持 partial 而非表示为 0。
-    #[serde(
-        alias = "usage_complete",
-        default = "default_usage_complete_protocol"
-    )]
+    #[serde(alias = "usage_complete", default = "default_usage_complete_protocol")]
     pub usage_complete: bool,
 }
 

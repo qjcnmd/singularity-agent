@@ -133,11 +133,9 @@ pub(crate) fn parse_session_lines_with_limits(
     while let Some(bounded_line) =
         crate::tools::line::read_bounded_line_with_termination(&mut reader, max_line_bytes)
             .map_err(|error| match error {
-                crate::tools::line::LineFailure::OverLimit { .. } => {
-                    SessionError::InvalidSession(format!(
-                        "session entry exceeds {max_line_bytes} bytes at line {line_number}"
-                    ))
-                }
+                crate::tools::line::LineFailure::OverLimit { .. } => SessionError::InvalidSession(
+                    format!("session entry exceeds {max_line_bytes} bytes at line {line_number}"),
+                ),
                 crate::tools::line::LineFailure::Io(error) => SessionError::Io(error),
             })?
     {

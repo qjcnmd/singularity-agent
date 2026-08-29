@@ -2,10 +2,8 @@
 use super::ExecutionStop;
 use crate::{AppServerCancellationHandle, AppServerOutput};
 use serde_json::Value;
-use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 
 /// Async 上下文的入队入口：队列满时在 `send().await` 上背压等待，
 /// 真实发送失败（writer 已消失）才触发全局停止。
@@ -24,25 +22,20 @@ pub(crate) async fn send_output_async(
 }
 
 /// 同步上下文（spawn_blocking worker、turn worker、stream 回调）的入队入口：
-/// 队列满时以 `try_send` + 短暂休眠轮询形成背压，channel 关闭才触发全局
-/// 停止。不能在 Tokio 异步任务中直接 await，但可以在 spawn_blocking 或
-/// 非运行时线程使用。
+/// 队列满时以 `blocking_send` 阻塞当前线程形成背压，channel 关闭才触发全局
+/// 停止。只能在非异步执行上下文调用（spawn_blocking 与非运行时线程均可），
+/// Tokio 异步任务内调用会按 tokio 合同 panic；异步任务一律走
+/// `send_output_async`。
 pub(crate) fn send_output(
     outputs: &mpsc::Sender<Value>,
     cancellation: &dyn ExecutionStop,
     message: Value,
 ) -> Result<(), String> {
-    loop {
-        match outputs.try_send(message.clone()) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Full(_)) => {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            Err(TrySendError::Closed(_)) => {
-                cancellation.request_execution_stop();
-                return Err("stdout transport unavailable".to_string());
-            }
+    match outputs.blocking_send(message) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            cancellation.request_execution_stop();
+            Err("stdout transport unavailable".to_string())
         }
     }
 }

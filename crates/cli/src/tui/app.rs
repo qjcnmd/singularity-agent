@@ -359,10 +359,8 @@ impl TuiApp {
             draft.push_str(&text);
         }
         self.editor.set_text(&draft);
-        self.transcript.push_note(
-            "interrupted input returned to the editor",
-            NoteStyle::Dim,
-        );
+        self.transcript
+            .push_note("interrupted input returned to the editor", NoteStyle::Dim);
     }
 
     /// 推进 spinner 节拍（由事件循环按固定间隔调用）。

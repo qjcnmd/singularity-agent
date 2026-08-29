@@ -4,9 +4,7 @@ use reqwest::Response;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
-use crate::error::{
-    ModelError, ModelErrorKind, ProviderError, ProviderErrorStage,
-};
+use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::types::ProviderToolReasoningMode;
 use crate::{
     HTTP_STATUS_CONFLICT, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
@@ -187,9 +185,9 @@ where
     });
     match outcome {
         ProviderWaitOutcome::Cancelled => Err(provider_cancelled_error()),
-        ProviderWaitOutcome::Done(result) => result.map_err(|error| {
-            provider_transport_error(error, error_code, error_stage.clone())
-        }),
+        ProviderWaitOutcome::Done(result) => {
+            result.map_err(|error| provider_transport_error(error, error_code, error_stage.clone()))
+        }
     }
 }
 
@@ -298,7 +296,9 @@ mod tests {
         assert!(is_context_length_exceeded_code(Some(
             PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE
         )));
-        assert!(!is_context_length_exceeded_code(Some("context_length_exceededx")));
+        assert!(!is_context_length_exceeded_code(Some(
+            "context_length_exceededx"
+        )));
         assert!(!is_context_length_exceeded_code(None));
     }
 }

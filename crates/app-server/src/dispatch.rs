@@ -503,6 +503,23 @@ impl AppServer {
         }
         let mut projection = crate::lifecycle::TurnProjection::new(request_id, emit);
         let run_result = reservation.run(&input, &mut projection);
+        if let Ok(outcome) = &run_result
+            && outcome.turn_status == singularity_protocol::TurnStatus::Interrupted
+            && !outcome.undelivered_inputs.is_empty()
+        {
+            // 中断后仍未交付的转向输入无法再进入对话；桌面端没有编辑器可
+            // 退还，以诊断事件携带原文本告知客户端。
+            singularity_runtime::events::TurnEventSink::emit(
+                &mut projection,
+                singularity_protocol::TurnEvent::Diagnostic {
+                    thread_id: outcome.thread_id.clone(),
+                    turn_id: outcome.turn_id.clone(),
+                    severity: singularity_protocol::DiagnosticSeverity::Info,
+                    code: singularity_protocol::diagnostic_code::STEER_UNDELIVERED.to_string(),
+                    message: outcome.undelivered_inputs.join("\n"),
+                },
+            );
+        }
         match run_result {
             Ok(_) => Ok(()),
             Err(singularity_runtime::ConversationError::Configuration(message))

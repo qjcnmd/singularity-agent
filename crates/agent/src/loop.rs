@@ -146,7 +146,10 @@ fn is_cancelled_agent_error(error: &AgentError) -> bool {
     matches!(
         error,
         AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
-    ) || matches!(error, AgentError::Compaction(crate::compaction::CompactionError::Aborted))
+    ) || matches!(
+        error,
+        AgentError::Compaction(crate::compaction::CompactionError::Aborted)
+    )
 }
 
 /// 逐轮聚合 provider 返回的真实 token/cache usage。
@@ -456,9 +459,9 @@ impl Agent {
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
             }
-            Err(crate::compaction::CompactionError::Aborted) => {
-                Err(AgentError::Compaction(crate::compaction::CompactionError::Aborted))
-            }
+            Err(crate::compaction::CompactionError::Aborted) => Err(AgentError::Compaction(
+                crate::compaction::CompactionError::Aborted,
+            )),
             Err(error) => {
                 emit_diagnostic(
                     events,

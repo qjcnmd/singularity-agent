@@ -46,9 +46,7 @@ impl<'a> TurnProjection<'a> {
             return;
         }
         self.response_sent = true;
-        let value = match serde_json::to_value(TurnStartResult {
-            turn: turn.clone(),
-        }) {
+        let value = match serde_json::to_value(TurnStartResult { turn: turn.clone() }) {
             Ok(value) => value,
             Err(error) => {
                 self.poison_or(AppServerError::InvalidJson(error));

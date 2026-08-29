@@ -8,8 +8,8 @@ pub use super::format::SessionError;
 use super::format::{
     Result, SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
 };
-use singularity_protocol::TurnModelUsage;
 pub use super::manager::SessionManager;
+use singularity_protocol::TurnModelUsage;
 
 impl SessionManager {
     /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。

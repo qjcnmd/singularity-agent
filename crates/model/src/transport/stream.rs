@@ -139,8 +139,15 @@ trait SseStreamDecoder {
     fn emitted_text_delta(&self) -> bool;
 }
 
+/// 字节泵与解码消费之间的通道容量：有界背压同时防解码侧失控内存。
+const SSE_CHUNK_CHANNEL_CAPACITY: usize = 8;
+
 /// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，失败路径携带
 /// 解码器边界快照（是否已发射文本增量）。
+///
+/// HTTP chunk 由 runtime 上的字节泵任务读取，经有界通道交给本线程解码；
+/// 解码回调（及其触发的同步事件出口）从不进入 `block_on` 的运行时上下文，
+/// 调用线程因此能在通道背压上阻塞等待。
 fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -164,30 +171,53 @@ fn read_sse_stream<D: SseStreamDecoder>(
         });
     }
 
-    let stream_result = runtime.block_on(async {
+    let pump_cancellation = cancellation.clone();
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, ProviderError>>(
+        SSE_CHUNK_CHANNEL_CAPACITY,
+    );
+    runtime.spawn(async move {
         loop {
-            let chunk = tokio::select! {
-                _ = cancellation.cancelled_notified() => {
-                    return Err(provider_cancelled_error());
+            tokio::select! {
+                _ = pump_cancellation.cancelled_notified() => {
+                    let _ = chunk_tx.send(Err(provider_cancelled_error())).await;
+                    return;
                 }
-                result = response.chunk() => {
-                    match result {
-                        Ok(Some(chunk)) => chunk,
-                        Ok(None) => break,
-                        Err(error) => {
-                            return Err(provider_transport_error(
+                result = response.chunk() => match result {
+                    Ok(Some(chunk)) => {
+                        if chunk_tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = chunk_tx
+                            .send(Err(provider_transport_error(
                                 error,
                                 "provider_response_body_read_failed",
                                 ProviderErrorStage::ResponseBodyRead,
-                            ));
-                        }
+                            )))
+                            .await;
+                        return;
                     }
                 }
-            };
-            decoder.push(&chunk)?;
+            }
         }
-        decoder.finish()
     });
+
+    let stream_result = loop {
+        match chunk_rx.blocking_recv() {
+            Some(Ok(chunk)) => {
+                if cancellation.is_cancelled() {
+                    break Err(provider_cancelled_error());
+                }
+                if let Err(error) = decoder.push(&chunk) {
+                    break Err(error);
+                }
+            }
+            Some(Err(error)) => break Err(error),
+            None => break decoder.finish(),
+        }
+    };
 
     match stream_result {
         Ok(payload) => Ok(StreamAttemptSuccess { payload }),
@@ -256,9 +286,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
 }
 
 impl<'a> ChatSseDecoder<'a> {
-    pub(super) fn new(
-        on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-    ) -> Self {
+    pub(super) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
             response_id: None,

@@ -50,9 +50,7 @@ impl SlashCommand {
 
     /// 整行精确匹配：返回命中的命令（无参数）；非精确命令返回 None。
     pub(crate) fn parse(text: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|item| item.as_str() == text)
+        Self::ALL.into_iter().find(|item| item.as_str() == text)
     }
 
     pub(crate) fn completions(prefix: &str) -> impl Iterator<Item = Self> {

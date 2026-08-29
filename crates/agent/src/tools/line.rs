@@ -11,10 +11,7 @@ use std::io::{self, BufRead};
 #[derive(Debug)]
 pub(crate) enum LineFailure {
     /// 行长度超过上限；`prefix` 为超限前已读入的、截断到上限内的前缀字节。
-    OverLimit {
-        limit: usize,
-        prefix: Vec<u8>,
-    },
+    OverLimit { limit: usize, prefix: Vec<u8> },
     /// 底层读取错误。
     Io(io::Error),
 }

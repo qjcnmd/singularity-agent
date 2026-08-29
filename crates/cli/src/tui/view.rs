@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{Phase, SPINNER_FRAMES, TuiApp};
 use super::commands::SlashCommand;
@@ -50,6 +50,69 @@ pub(super) fn truncate_label(text: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
+/// 状态行收尾合同：左侧内容按 unicode 宽度逐 span 裁剪到预算内，截断补
+/// `…`（截断体加省略号不超过剩余预算）；running 相位在 `width` 内右对齐
+/// 补 `[stop]`。返回各 span 的列宽合计恒不超过 `width`。
+pub(super) fn fit_status_line(
+    status: Vec<Span<'static>>,
+    width: u16,
+    running: bool,
+) -> Vec<Span<'static>> {
+    const STOP_STR: &str = "[stop]";
+    let stop_width = UnicodeWidthStr::width(STOP_STR) as u16;
+    let available = if running {
+        width.saturating_sub(stop_width + 1)
+    } else {
+        width
+    };
+
+    let mut trimmed = Vec::new();
+    let mut used = 0u16;
+    for span in status {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        let remaining = available.saturating_sub(used);
+        if span_width <= remaining {
+            trimmed.push(span);
+            used += span_width;
+        } else if remaining > 0 {
+            let style = span.style;
+            let text = span.content.as_ref();
+            // 为省略号预留 1 列：截断体列宽 + 1 恒不超过剩余预算。
+            let budget = (remaining - 1) as usize;
+            let mut cut_cells = 0usize;
+            let mut cut_bytes = 0usize;
+            for ch in text.chars() {
+                let cell = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cut_cells + cell > budget {
+                    break;
+                }
+                cut_cells += cell;
+                cut_bytes += ch.len_utf8();
+            }
+            let mut truncated = text[..cut_bytes].to_string();
+            truncated.push('…');
+            trimmed.push(Span::styled(truncated, style));
+            used += cut_cells as u16 + 1;
+            break;
+        } else {
+            break;
+        }
+    }
+
+    // running 相位右对齐 [stop]：左侧内容不足时以空白填充到右缘。
+    if running {
+        if used < available {
+            trimmed.push(Span::raw(" ".repeat((available - used) as usize)));
+        }
+        trimmed.push(Span::styled(" ".to_string(), Style::new()));
+        trimmed.push(Span::styled(
+            STOP_STR.to_string(),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    trimmed
+}
+
 impl TuiApp {
     /// footer 合同：状态行＝相位+spinner·具名等待对象·thread·模型·
     /// token/队列数·浏览指示（含新增计数）·压缩进行指示。提示行按上下文
@@ -63,14 +126,6 @@ impl TuiApp {
         viewport: usize,
         width: u16,
     ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-        const STOP_STR: &str = "[stop]";
-        let stop_width = UnicodeWidthStr::width(STOP_STR) as u16;
-        let available = if self.phase != Phase::Idle {
-            width.saturating_sub(stop_width + 1)
-        } else {
-            width
-        };
-
         let dim = Style::new().fg(Color::DarkGray);
         let warn = Style::new().fg(Color::Yellow);
         let magenta = Style::new().fg(Color::Magenta);
@@ -130,46 +185,8 @@ impl TuiApp {
             status.push(Span::styled(" · compacting…", warn));
         }
 
-        // 按可用宽度逐 span 裁剪，截断补 …（继承被截 span 样式）。
-        let mut trimmed = Vec::new();
-        let mut used = 0u16;
-        for span in status {
-            let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
-            let remaining = available.saturating_sub(used);
-            if span_width <= remaining {
-                trimmed.push(span);
-                used += span_width;
-            } else if remaining > 0 {
-                let style = span.style.clone();
-                let text = span.content.as_ref();
-                let mut cut = remaining as usize;
-                while cut > 0 && !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                let mut truncated = text[..cut].to_string();
-                truncated.push('…');
-                trimmed.push(Span::styled(truncated, style));
-                used += remaining;
-                break;
-            } else {
-                break;
-            }
-        }
-
-        // 运行中右对齐显示 [stop]：左侧内容不足时以空白填充到右缘。
-        if self.phase != Phase::Idle {
-            if used < available {
-                trimmed.push(Span::raw(" ".repeat((available - used) as usize)));
-            }
-            trimmed.push(Span::styled(
-                " ".to_string(),
-                Style::new(),
-            ));
-            trimmed.push(Span::styled(
-                STOP_STR.to_string(),
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-        }
+        // 按可用宽度收尾：裁剪与 [stop] 右对齐合同见 fit_status_line。
+        let trimmed = fit_status_line(status, width, self.phase != Phase::Idle);
 
         let hint_text = if self.quit_armed {
             "press Ctrl+C again to quit"
@@ -203,5 +220,54 @@ impl TuiApp {
         };
         let hint = vec![Span::styled(hint_text, hint_style)];
         (trimmed, hint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+
+    fn line_width(spans: &[Span<'static>]) -> usize {
+        spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    #[test]
+    fn truncated_status_line_never_exceeds_width() {
+        let status = vec![
+            Span::raw("spinner running · waiting: tool_call 12s · thread 0123abcd · ".to_string()),
+            Span::raw(
+                "超长中文模型标签与英文混排 gpt-5-codex-very-long-model-name · queue:2".to_string(),
+            ),
+        ];
+        let spans = fit_status_line(status, 40, true);
+        assert!(
+            line_width(&spans) <= 40,
+            "rendered width {}",
+            line_width(&spans)
+        );
+        assert_eq!(spans.last().expect("stop span").content.as_ref(), "[stop]");
+    }
+
+    #[test]
+    fn running_status_right_aligns_stop_within_width() {
+        let spans = fit_status_line(vec![Span::raw("short".to_string())], 60, true);
+        assert_eq!(line_width(&spans), 60);
+        assert_eq!(spans.last().expect("stop span").content.as_ref(), "[stop]");
+    }
+
+    #[test]
+    fn idle_status_has_no_stop_and_fits_width() {
+        let long = "中文内容远远超出可用宽度用来验证截断路径的列宽合同".to_string();
+        let spans = fit_status_line(vec![Span::raw(long)], 20, false);
+        assert!(
+            line_width(&spans) <= 20,
+            "rendered width {}",
+            line_width(&spans)
+        );
+        assert!(spans.iter().all(|span| span.content.as_ref() != "[stop]"));
     }
 }

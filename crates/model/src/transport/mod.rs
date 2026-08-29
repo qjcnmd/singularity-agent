@@ -134,15 +134,9 @@ impl ProtocolAdapter {
 /// 一次 attempt 内、成功 HTTP 响应上的协议侧工作结果。`Retry` 表示协议侧
 /// 允许调用方重发请求；`Failed` 禁止自动重放。
 enum AttemptBodyOutcome {
-    Completed {
-        completion: Box<OpenAiCompletion>,
-    },
-    Retry {
-        error: ProviderError,
-    },
-    Failed {
-        error: ProviderError,
-    },
+    Completed { completion: Box<OpenAiCompletion> },
+    Retry { error: ProviderError },
+    Failed { error: ProviderError },
 }
 
 /// 把一次流式解码 attempt 折叠进 [`AttemptBodyOutcome`]。流失败仅在首个
@@ -161,7 +155,9 @@ fn streaming_outcome(
         Err(failure) if !failure.emitted_text_delta => AttemptBodyOutcome::Retry {
             error: failure.error,
         },
-        Err(failure) => AttemptBodyOutcome::Failed { error: failure.error },
+        Err(failure) => AttemptBodyOutcome::Failed {
+            error: failure.error,
+        },
     }
 }
 
@@ -253,9 +249,7 @@ fn read_protocol_sse(
         on_event,
     } = context;
     match adapter {
-        ProtocolAdapter::Chat => {
-            read_openai_chat_sse(runtime, cancellation, response, on_event)
-        }
+        ProtocolAdapter::Chat => read_openai_chat_sse(runtime, cancellation, response, on_event),
         ProtocolAdapter::Responses => {
             read_openai_responses_sse(runtime, cancellation, response, on_event)
         }
@@ -666,8 +660,8 @@ impl OpenAiProvider {
     ) -> HttpFailure {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
-        let error_body = read_bounded_provider_response_body(&self.runtime, cancellation, response)
-            .ok();
+        let error_body =
+            read_bounded_provider_response_body(&self.runtime, cancellation, response).ok();
         let error_fields = error_body.as_deref().map(parse_provider_error_body);
         let context_length_exceeded = is_context_length_exceeded_code(
             error_fields

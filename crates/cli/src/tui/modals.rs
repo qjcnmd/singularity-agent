@@ -152,10 +152,9 @@ impl TuiApp {
                     self.thread_catalog.rename(&self.thread_id, &name)
                 };
                 match rename {
-                    Ok(()) => self.transcript.push_note(
-                        format!("session named {name}"),
-                        NoteStyle::Accent,
-                    ),
+                    Ok(()) => self
+                        .transcript
+                        .push_note(format!("session named {name}"), NoteStyle::Accent),
                     Err(error) => menu.error = Some(error),
                 }
                 self.settings = None;
@@ -298,11 +297,8 @@ impl TuiApp {
                 Style::new().fg(Color::DarkGray),
             )));
             frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("session name"),
-                ),
+                Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title("session name")),
                 popup,
             );
             return;
