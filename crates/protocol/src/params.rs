@@ -167,7 +167,7 @@ pub enum HistoryItem {
     },
     Usage {
         id: String,
-        usage: Value,
+        usage: TurnModelUsage,
     },
     Compaction {
         id: String,
