@@ -7,7 +7,7 @@
 //! 1. **触发判定**（`should_compact`）：请求发出前优先基于上一轮 provider usage
 //!    判定，首轮或 usage 缺失时使用本轮装配估算；超过「上下文窗口 −
 //!    `reserve_tokens` 预留」即触发，预留空间供模型回答使用。
-//! 2. **切点查找**（`find_cut_point`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
+//! 2. **切点查找**（`find_cut_point_in_range`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构；超长轮次支持 split turn 前缀摘要。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。

@@ -130,5 +130,5 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 ## 9. 当前维护边界
 
 - 本文只描述当前有效的进程边界、事件流、会话格式、AgentLoop、Compaction、工具语义、Provider 能力声明、配置、TUI 契约和评估入口。
-- app-server 的协议细节（命令/事件集、握手、控制 lane、并发 turn 裁定）作为 GUI 适配面的内部合同，由 crates/protocol 的事件两面 wire golden 测试与 crates/app-server 的 stdio 集成测试维护（协议事件名/字段/终态/取消/会话恢复不漂移）；runtime 只依赖 protocol 的稳定类型，不依赖客户端适配器。
+- app-server 的协议细节（命令/事件集、握手、控制 lane、并发 turn 裁定）作为 GUI 适配面的内部合同，由 crates/protocol 的事件两面 wire golden 测试与 runtime 的并发安全护栏测试维护（协议事件名/字段/终态/取消/会话恢复不漂移），端到端行为以外部评估器黑盒为准；runtime 只依赖 protocol 的稳定类型，不依赖客户端适配器。
 - 已移除机制、迁移过程和历史提交由 Git 保存；修改上述任一事实时必须同步更新对应章节并跑受影响验证。

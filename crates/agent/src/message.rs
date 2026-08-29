@@ -7,7 +7,7 @@
 //! [`AgentMessage`] 以角色为标签的枚举承载消息体：每个角色只携带其合法字段，
 //! 编译器拒绝「user 消息带 toolCallId」一类非法组合；序列化 wire 形状与历史
 //! 平铺格式逐字节一致（`tag = "role"` + 变体级 camelCase，键序由 serde_json
-//! Map 排序稳定），`wire_fixture_tests` 固化该契约。
+//! Map 排序稳定），session 层的 JSONL 字节夹具固化该契约。
 
 use singularity_model::{
     ModelStopReason, ModelToolCall, ModelToolParseStatus, ModelTurnResponse,
