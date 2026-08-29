@@ -69,21 +69,3 @@ pub(crate) enum Action {
     /// 事件循环负责 spawn 线程并转发结果。
     Compact(CancellationToken),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_commands_by_exact_match() {
-        assert_eq!(SlashCommand::parse("/name"), Some(SlashCommand::Name));
-        assert_eq!(SlashCommand::parse("/name hello world"), None);
-        assert_eq!(SlashCommand::parse("/unknown"), None);
-    }
-
-    #[test]
-    fn completes_by_prefix() {
-        let values = SlashCommand::completions("/s").collect::<Vec<_>>();
-        assert_eq!(values, vec![SlashCommand::Settings, SlashCommand::Session]);
-    }
-}

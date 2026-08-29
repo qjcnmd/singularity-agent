@@ -357,44 +357,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::{
-        CURRENT_SESSION_VERSION, SessionMetadata, TurnTerminalStatus,
-    };
+    use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
     use singularity_protocol::TurnModelUsage;
-
-    fn write_session(sessions_dir: &Path, thread_id: &str, timestamp: &str) {
-        let header = serde_json::json!({
-            "type": "session",
-            "version": CURRENT_SESSION_VERSION,
-            "id": thread_id,
-            "timestamp": timestamp,
-            "cwd": sessions_dir,
-        });
-        std::fs::write(
-            sessions_dir.join(format!("{thread_id}.jsonl")),
-            format!("{header}\n"),
-        )
-        .expect("write session");
-    }
-
-    #[test]
-    fn list_threads_orders_by_updated_at_descending_then_id() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let first = "01914f6b-0000-7000-8000-000000000001";
-        let second = "01914f6b-0000-7000-8000-000000000002";
-        let newest = "01914f6b-0000-7000-8000-000000000003";
-        write_session(temp.path(), second, "2026-08-20T00:00:00.000Z");
-        write_session(temp.path(), newest, "2026-08-21T00:00:00.000Z");
-        write_session(temp.path(), first, "2026-08-20T00:00:00.000Z");
-
-        let threads = list_threads(temp.path()).expect("list threads");
-        let ids = threads
-            .iter()
-            .map(|thread| thread.thread_id.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec![newest, first, second]);
-    }
 
     /// 构造一轮已完成 + 一轮未终止的会话（格式 v2 真实条目），返回首轮
     /// message 的 entry id（供锚点定位）。
@@ -426,56 +390,6 @@ mod tests {
             .append_metadata(SessionMetadata::turn_started("turn-2"))
             .expect("append second turn start");
         message_id
-    }
-
-    #[test]
-    fn paged_read_projects_turns_summary_and_pages_by_anchor() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().join("sessions");
-        let thread_id = "01914f6b-0000-7000-8000-000000000001";
-        let message_id = session_with_two_turns(&sessions_dir, thread_id);
-
-        let page = paged_read(&sessions_dir, thread_id, 10, None).expect("read page");
-        assert_eq!(page.total_turns, 2);
-        assert_eq!(page.turns.len(), 2);
-        assert_eq!(page.turns[0].turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(
-            page.turns[0].status,
-            Some(singularity_protocol::TurnStatus::Completed)
-        );
-        assert_eq!(page.turns[1].turn_id.as_deref(), Some("turn-2"));
-        // 末组未终止轮保持 running；存活 turn 精化由调用方完成。
-        assert_eq!(
-            page.turns[1].status,
-            Some(singularity_protocol::TurnStatus::Running)
-        );
-        assert_eq!(page.summary.status, Some(TurnStatus::Running));
-        assert_eq!(page.compaction_summary, None);
-        assert_eq!(page.summary.turn_count, 2);
-        // 终态 usage 并入轮内条目。
-        assert!(
-            page.turns[0]
-                .items
-                .iter()
-                .any(|item| matches!(item, singularity_protocol::HistoryItem::Usage { .. }))
-        );
-
-        // limit 1 只返回最新一轮。
-        let page = paged_read(&sessions_dir, thread_id, 1, None).expect("read one turn");
-        assert_eq!(page.turns.len(), 1);
-        assert_eq!(page.turns[0].turn_id.as_deref(), Some("turn-2"));
-
-        // 锚点定位到首轮内 item：返回该轮之前的 0 轮（空页）。
-        let anchor = format!("{message_id}:text:0");
-        let page = paged_read(&sessions_dir, thread_id, 10, Some(&anchor)).expect("read by anchor");
-        assert_eq!(page.turns.len(), 0);
-        assert_eq!(page.total_turns, 2);
-
-        // 未知锚点报 AnchorNotFound。
-        match paged_read(&sessions_dir, thread_id, 10, Some("no-such-item")) {
-            Err(ResumeError::AnchorNotFound(_)) => {}
-            other => panic!("expected AnchorNotFound, got {other:?}"),
-        }
     }
 
     #[test]

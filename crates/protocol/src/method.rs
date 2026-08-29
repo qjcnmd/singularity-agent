@@ -83,3 +83,57 @@ method_registry! {
     TurnInterrupt => ("turn/interrupt", Request),
     ServerShutdown => ("server/shutdown", Request),
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+
+    /// 注册表只保留已收敛方法：已删除方法名必须保持不可解析。
+    #[test]
+    fn method_registry_keeps_only_converged_methods() {
+        let names = METHOD_REGISTRY
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        for expected in [
+            "initialize",
+            "initialized",
+            "thread/list",
+            "thread/start",
+            "thread/settings",
+            "thread/read",
+            "session/delete",
+            "turn/start",
+            "turn/steer",
+            "turn/followUp",
+            "turn/interrupt",
+            "provider/status",
+            "server/shutdown",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing method {expected}: {names:?}"
+            );
+        }
+        for removed in [
+            "server/capabilities",
+            "thread/fork",
+            "thread/archive",
+            "thread/delete",
+            "turn/status",
+            "turn/pause",
+            "turn/resume",
+            "turn/input",
+            "event/subscribe",
+            "project/trust",
+        ] {
+            assert!(
+                Method::parse(removed).is_none(),
+                "removed method still registered: {removed}"
+            );
+        }
+        assert_eq!(Method::TurnSteer.spec().kind, MethodKind::Request);
+        assert_eq!(Method::TurnFollowUp.spec().kind, MethodKind::Request);
+    }
+}

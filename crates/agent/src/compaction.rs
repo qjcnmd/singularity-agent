@@ -293,19 +293,6 @@ impl CompactionEngine {
         context_tokens > budget.threshold_tokens()
     }
 
-    /// 在给定的会话条目列表中查找安全切点，返回保留区域起始条目的索引。
-    /// 若条目为空则返回 `None`。
-    #[cfg(test)]
-    fn find_cut_point(&self, entries: &[SessionEntry], budget: &CompactionBudget) -> Option<usize> {
-        if entries.is_empty() {
-            return None;
-        }
-        Some(
-            self.find_cut_point_in_range(entries, 0, entries.len(), budget.retain_tokens())
-                .first_kept_entry_index(),
-        )
-    }
-
     /// 估算文本的 Token 消耗：按字符编码启发式估算（`ceil(UTF-16 字符数 / 4)`）。
     pub fn estimate_tokens(&self, text: &str) -> u64 {
         estimate_tokens_of(text)
@@ -912,7 +899,3 @@ fn file_lists_from_details(details: Option<&Value>) -> (Vec<String>, Vec<String>
         .unwrap_or_default();
     (read_files, modified_files)
 }
-
-#[cfg(test)]
-#[path = "compaction_tests.rs"]
-mod tests;

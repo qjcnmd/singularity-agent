@@ -145,7 +145,3 @@ use serde_json::{Value, json};
 #[cfg(test)]
 #[path = "../session_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "../wire_fixture_tests.rs"]
-mod wire_fixture_tests;

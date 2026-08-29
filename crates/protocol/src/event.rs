@@ -416,3 +416,274 @@ impl std::fmt::Display for TurnFailureCause {
         formatter.write_str(self.wire_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+    use crate::params::{TurnModelUsage, TurnStatus};
+
+    fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
+        Turn {
+            turn_id: "turn-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            status,
+            usage: usage.then_some(TurnModelUsage {
+                input_tokens: 101,
+                output_tokens: 202,
+                total_tokens: 303,
+                cached_input_tokens: 404,
+                reasoning_tokens: 505,
+                usage_present: true,
+                usage_complete: true,
+            }),
+        }
+    }
+
+    /// 事件两面 golden：每行一个事件（fixture + JSON-RPC 通知全文 +
+    /// `--json` params），字节级合同。方法名、键名、嵌套形态、可选字段
+    /// 出现/省略的差异都会先在这张表上显形。
+    #[test]
+    fn turn_event_wire_goldens() {
+        let args = json!({"path": "src/main.rs", "old_string": "a"});
+        let cases: Vec<(&str, TurnEvent, &str, &str)> = vec![
+            (
+                "turn/started",
+                TurnEvent::TurnStarted {
+                    turn: execution_turn(TurnStatus::Running, false),
+                },
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}}"#,
+                r#"{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
+            ),
+            (
+                "item/started",
+                TurnEvent::ItemStarted {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "item/agentMessage/delta",
+                TurnEvent::AssistantDelta {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    delta: "hel".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "item/agentThinking",
+                TurnEvent::AssistantThinking {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    text: "think".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"item/agentThinking","params":{"text":"think","threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"text":"think","threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "tool/execution/start",
+                TurnEvent::ToolExecutionStart {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "edit".to_string(),
+                    args: args.clone(),
+                },
+                r#"{"jsonrpc":"2.0","method":"tool/execution/start","params":{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
+                r#"{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            ),
+            (
+                "tool/execution/update",
+                TurnEvent::ToolExecutionUpdate {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "edit".to_string(),
+                    args,
+                    partial_result: "chunk".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"tool/execution/update","params":{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
+                r#"{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            ),
+            (
+                "tool/execution/end",
+                TurnEvent::ToolExecutionEnd {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "edit".to_string(),
+                    result: "done".to_string(),
+                    is_error: false,
+                },
+                r#"{"jsonrpc":"2.0","method":"tool/execution/end","params":{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
+                r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            ),
+            (
+                "item/completed",
+                TurnEvent::ItemCompleted {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "item/failed",
+                TurnEvent::ItemFailed {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    error: "boom".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"item/failed","params":{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "agent/diagnostic",
+                TurnEvent::Diagnostic {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    severity: DiagnosticSeverity::Warning,
+                    code: "project_instructions_truncated".to_string(),
+                    message: "truncated".to_string(),
+                },
+                r#"{"jsonrpc":"2.0","method":"agent/diagnostic","params":{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "provider/attempt",
+                TurnEvent::ProviderAttempt {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    model_turn_ordinal: 3,
+                    provider: "opencode-go".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
+                    protocol: "openai_chat_completions".to_string(),
+                    status: ProviderAttemptStatus::Started,
+                    attempt_duration_ms: None,
+                    error_category: None,
+                    diagnostic_code: None,
+                },
+                r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "provider/attempt",
+                TurnEvent::ProviderAttempt {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    model_turn_ordinal: 3,
+                    provider: "opencode-go".to_string(),
+                    model: "deepseek-v4-flash".to_string(),
+                    protocol: "openai_responses".to_string(),
+                    status: ProviderAttemptStatus::Error,
+                    attempt_duration_ms: Some(421),
+                    error_category: Some("rate_limited".to_string()),
+                    diagnostic_code: Some("provider_retry_scheduled".to_string()),
+                },
+                r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "turn/completed",
+                TurnEvent::TurnCompleted {
+                    turn: execution_turn(TurnStatus::Completed, true),
+                },
+                r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true},"status":"completed","threadId":"thread-1","turnId":"turn-1"}}}"#,
+                r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true}}}"#,
+            ),
+            (
+                "turn/error",
+                TurnEvent::TurnFailed {
+                    turn: execution_turn(TurnStatus::Failed, false),
+                    error: TurnErrorDetail {
+                        stage: TurnFailureStage::AgentLoop,
+                        cause: TurnFailureCause::ProviderRateLimited,
+                        message: "rate limited".to_string(),
+                    },
+                },
+                r#"{"jsonrpc":"2.0","method":"turn/error","params":{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}}"#,
+                r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            ),
+            (
+                "thread/settingsApplied",
+                TurnEvent::ThreadSettingsApplied {
+                    thread: Thread {
+                        thread_id: "thread-1".to_string(),
+                        cwd: "C:\\work".to_string(),
+                        model: Some("opencode-go/deepseek-v4-flash#max".to_string()),
+                        last_turn_status: Some(TurnStatus::Completed),
+                    },
+                },
+                r#"{"jsonrpc":"2.0","method":"thread/settingsApplied","params":{"thread":{"cwd":"C:\\work","lastTurnStatus":"completed","model":"opencode-go/deepseek-v4-flash#max","threadId":"thread-1"}}}"#,
+                r#"{"thread":{"cwd":"C:\\work","lastTurnStatus":"completed","model":"opencode-go/deepseek-v4-flash#max","threadId":"thread-1"}}"#,
+            ),
+        ];
+        for (method, event, notification, jsonl_params) in cases {
+            assert_eq!(event.method(), method, "method drift");
+            let expected_notification: Value =
+                serde_json::from_str(notification).expect("notification golden parses");
+            assert_eq!(
+                turn_event_notification(&event).to_wire_value(),
+                expected_notification,
+                "{method}: json-rpc notification drift"
+            );
+            let expected_jsonl: Value =
+                serde_json::from_str(jsonl_params).expect("jsonl golden parses");
+            assert_eq!(
+                turn_event_params(&event),
+                expected_jsonl,
+                "{method}: --json params drift"
+            );
+        }
+    }
+
+    /// `turn/error.error.{stage,cause}` 线格式词形的唯一权威表。runtime 的
+    /// provider 分组映射与评估器解析都以此为终点：任一词条改名即协议破坏，
+    /// 必须先经 docs §2.1 与客户端合同评审。
+    #[test]
+    fn failure_taxonomy_wire_words_are_stable() {
+        assert_eq!(TurnFailureStage::AgentLoop.as_str(), "agent_loop");
+        assert_eq!(
+            TurnFailureStage::TerminalOutcome.as_str(),
+            "terminal_outcome"
+        );
+        for (cause, word) in [
+            (TurnFailureCause::Store, "store"),
+            (
+                TurnFailureCause::ProjectInstructions,
+                "project_instructions",
+            ),
+            (TurnFailureCause::Workspace, "workspace"),
+            (
+                TurnFailureCause::ProviderRateLimited,
+                "provider_rate_limited",
+            ),
+            (TurnFailureCause::ProviderNetwork, "provider_network"),
+            (TurnFailureCause::ProviderTimeout, "provider_timeout"),
+            (TurnFailureCause::ProviderAuth, "provider_auth"),
+            (TurnFailureCause::ProviderValidation, "provider_validation"),
+            (TurnFailureCause::ProviderOverloaded, "provider_overloaded"),
+            (TurnFailureCause::ProviderCancelled, "provider_cancelled"),
+            (
+                TurnFailureCause::ProviderContextOverflow,
+                "provider_context_overflow",
+            ),
+            (TurnFailureCause::ProviderUnknown, "provider_unknown"),
+            (TurnFailureCause::Internal, "internal"),
+        ] {
+            assert_eq!(cause.wire_str(), word);
+            assert_eq!(cause.to_string(), word, "Display must equal wire_str");
+            let round_trip: TurnFailureCause =
+                serde_json::from_value(json!(word)).expect("wire word deserializes");
+            assert_eq!(round_trip, cause, "serde tag must equal wire_str");
+        }
+    }
+}

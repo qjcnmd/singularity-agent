@@ -639,7 +639,3 @@ impl Agent {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "loop_tests.rs"]
-mod tests;

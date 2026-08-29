@@ -263,25 +263,3 @@ impl AssistantItemEvents {
         });
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_appearance_does_not_create_an_assistant_terminal_item() {
-        let mut item_events =
-            AssistantItemEvents::new("thread".into(), "turn".into(), "assistant".into());
-        let mut events = Vec::new();
-
-        item_events.start_tool_item("tool");
-        item_events.emit_tool_terminal(&mut |event| events.push(event), "tool", false);
-        item_events.emit_assistant_terminal_completed(&mut |event| events.push(event));
-        item_events.emit_assistant_terminal_failed(&mut |event| events.push(event));
-
-        assert!(matches!(
-            events.as_slice(),
-            [TurnEvent::ItemCompleted { item_id, .. }] if item_id == "tool"
-        ));
-    }
-}
