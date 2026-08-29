@@ -37,7 +37,7 @@ fn entry_ids(entries: &[SessionEntry]) -> Vec<String> {
 
 fn session_header(id: &str) -> String {
     format!(
-        r#"{{"type":"session","version":2,"id":"{id}","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
+        r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
     )
 }
 
@@ -72,7 +72,7 @@ fn create_append_reopen_roundtrip() {
     let content = std::fs::read_to_string(&file).unwrap();
     let first_line: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
     assert_eq!(first_line["type"], "session");
-    assert_eq!(first_line["version"], 2);
+    assert_eq!(first_line["version"], CURRENT_SESSION_VERSION);
     assert_eq!(
         first_line["cwd"],
         normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
@@ -178,7 +178,6 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
                 usage_complete: true,
                 ..TurnModelUsage::default()
             },
-            true,
         ))
         .unwrap();
     let file = manager.path().to_path_buf();
@@ -239,8 +238,7 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
                 "reasoningTokens": 0,
                 "usagePresent": true,
                 "usageComplete": true
-            },
-            "usageComplete": true
+            }
         }),
         json!({
             "metadataType": "turn_terminal",
@@ -254,8 +252,7 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
                 "reasoningTokens": 0,
                 "usagePresent": false,
                 "usageComplete": false
-            },
-            "usageComplete": false
+            }
         }),
         json!({
             "metadataType": "thread_settings",
@@ -275,23 +272,56 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
         );
     }
 
-    // 兼容读取：历史文件的部分/旧命名 usage 形状仍可反序列化。
-    let legacy: SessionMetadata = serde_json::from_value(json!({
+    // usage 的形状是封闭的：七个键全部必填、只认 camelCase；终态条目自身的键
+    // 集合里没有完整性标志，完整性只存在于 `usage` 内层。以上面的完整形状为准，
+    // 下面三种变形都必须读不进来。
+    let complete_usage = json!({
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "totalTokens": 42,
+        "cachedInputTokens": 0,
+        "reasoningTokens": 0,
+        "usagePresent": true,
+        "usageComplete": true
+    });
+    let mut missing_key = complete_usage.clone();
+    missing_key
+        .as_object_mut()
+        .expect("usage object")
+        .remove("usagePresent");
+    let mut other_casing = complete_usage.clone();
+    {
+        let object = other_casing.as_object_mut().expect("usage object");
+        object.remove("inputTokens");
+        object.insert("input_tokens".to_string(), json!(0));
+    }
+    let mut outer_completeness_key = json!({
         "metadataType": "turn_terminal",
         "turnId": "turn-1",
         "status": "completed",
-        "usage": {"totalTokens": 42},
-        "usageComplete": true
-    }))
-    .expect("legacy camelCase usage reads");
-    assert!(matches!(
-        &legacy,
-        SessionMetadata::TurnTerminal { usage, .. }
-            if usage.total_tokens == 42 && usage.usage_present
-    ));
-    let snake: TurnModelUsage =
-        serde_json::from_value(json!({"input_tokens": 3})).expect("snake usage reads");
-    assert_eq!(snake.input_tokens, 3);
+        "usage": complete_usage
+    });
+    outer_completeness_key["usageComplete"] = json!(true);
+    for metadata in [
+        json!({
+            "metadataType": "turn_terminal",
+            "turnId": "turn-1",
+            "status": "completed",
+            "usage": missing_key
+        }),
+        json!({
+            "metadataType": "turn_terminal",
+            "turnId": "turn-1",
+            "status": "completed",
+            "usage": other_casing
+        }),
+        outer_completeness_key,
+    ] {
+        assert!(
+            serde_json::from_value::<SessionMetadata>(metadata.clone()).is_err(),
+            "{metadata} must not read as a terminal entry"
+        );
+    }
 
     let metadata: SessionMetadata = serde_json::from_value(json!({
         "metadataType": "thread_settings",
@@ -417,7 +447,6 @@ fn v2_format_round_trips_nested_payloads() {
                 usage_complete: true,
                 ..TurnModelUsage::default()
             },
-            true,
         ))
         .unwrap();
     let file = manager.path().to_path_buf();
@@ -437,7 +466,6 @@ fn v2_format_round_trips_nested_payloads() {
                     turn_id,
                     status: TurnTerminalStatus::Completed,
                     usage,
-                    usage_complete: true,
                 },
             ..
         } if turn_id == "turn-1"
@@ -596,8 +624,8 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 2. 非当前版本 v1, v3, v4
-    for old_v in [1, 3, 4] {
+    // 2. header version 必须等于当前版本，其余一律拒绝打开
+    for old_v in [1, 2, 4] {
         let old_file = dir.path().join(format!("old-v{old_v}.jsonl"));
         std::fs::write(
             &old_file,
@@ -616,7 +644,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let unknown_field = dir.path().join("unknown-field.jsonl");
     std::fs::write(
         &unknown_field,
-        r#"{"type":"session","version":2,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
+        r#"{"type":"session","version":3,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -628,7 +656,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let non_uuid = dir.path().join("non-uuid.jsonl");
     std::fs::write(
         &non_uuid,
-        r#"{"type":"session","version":2,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
+        r#"{"type":"session","version":3,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
     )
     .unwrap();
     assert!(matches!(

@@ -41,7 +41,6 @@ pub(crate) struct TerminalCommit {
     terminal: TurnTerminalStatus,
     event_status: TurnStatus,
     usage: TurnModelUsage,
-    usage_complete: bool,
 }
 
 impl TerminalCommit {
@@ -58,18 +57,12 @@ impl TerminalCommit {
             terminal,
             event_status: status,
             usage: turn_usage_from_model_usage(usage, usage_complete),
-            usage_complete,
         })
     }
 
-    /// 构造终态 metadata 条目（status + usage + usageComplete 单条）。
+    /// 构造终态 metadata 条目（status + usage 单条）。
     fn metadata(&self) -> SessionMetadata {
-        SessionMetadata::turn_terminal(
-            &self.turn_id,
-            self.terminal,
-            self.usage.clone(),
-            self.usage_complete,
-        )
+        SessionMetadata::turn_terminal(&self.turn_id, self.terminal, self.usage.clone())
     }
 
     /// 单条落盘终态 metadata；同内容已存在时幂等跳过。
@@ -164,14 +157,12 @@ mod tests {
             Some(TurnTerminalStatus::Completed)
         );
         let SessionMetadata::TurnTerminal {
-            usage: persisted,
-            usage_complete,
-            ..
+            usage: persisted, ..
         } = &terminals[0]
         else {
             unreachable!("filtered to TurnTerminal");
         };
-        assert!(*usage_complete, "usageComplete persisted");
+        assert!(persisted.usage_complete, "usage completeness persisted");
         assert_eq!(persisted.input_tokens, 100);
         assert_eq!(persisted.total_tokens, 150);
     }

@@ -371,13 +371,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
+    use singularity_agent::session::{
+        CURRENT_SESSION_VERSION, SessionMetadata, TurnTerminalStatus,
+    };
     use singularity_protocol::TurnModelUsage;
 
     fn write_session(sessions_dir: &Path, thread_id: &str, timestamp: &str) {
         let header = serde_json::json!({
             "type": "session",
-            "version": 2,
+            "version": CURRENT_SESSION_VERSION,
             "id": thread_id,
             "timestamp": timestamp,
             "cwd": sessions_dir,
@@ -432,7 +434,6 @@ mod tests {
                     usage_complete: true,
                     ..TurnModelUsage::default()
                 },
-                true,
             ))
             .expect("append turn terminal");
         session

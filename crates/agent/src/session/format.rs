@@ -10,9 +10,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 唯一支持的当前会话格式版本。v2：条目 payload 嵌套为子对象、全量未知字段
-/// 拒绝、终态合并为单条 `turn_terminal`（status + usage + usageComplete）。
-pub const CURRENT_SESSION_VERSION: u32 = 2;
+/// 唯一支持的当前会话格式版本。v3：条目 payload 嵌套为子对象、全量未知字段
+/// 拒绝、终态合并为单条 `turn_terminal`（status + usage）。
+pub const CURRENT_SESSION_VERSION: u32 = 3;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -113,14 +113,13 @@ pub enum SessionMetadata {
         #[serde(rename = "turnId")]
         turn_id: String,
     },
-    /// turn 的原子终态：status、usage 与 usageComplete 单条落盘。
+    /// turn 的原子终态：status 与 usage 单条落盘；`usage.usageComplete` 是
+    /// usage 完整性的唯一落盘位置。
     TurnTerminal {
         #[serde(rename = "turnId")]
         turn_id: String,
         status: TurnTerminalStatus,
         usage: TurnModelUsage,
-        #[serde(rename = "usageComplete")]
-        usage_complete: bool,
     },
     ThreadSettings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,13 +170,11 @@ impl SessionMetadata {
         turn_id: impl Into<String>,
         status: TurnTerminalStatus,
         usage: TurnModelUsage,
-        usage_complete: bool,
     ) -> Self {
         Self::TurnTerminal {
             turn_id: turn_id.into(),
             status,
             usage,
-            usage_complete,
         }
     }
 

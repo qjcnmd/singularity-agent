@@ -43,7 +43,6 @@ impl SessionManager {
                 turn_id,
                 TurnTerminalStatus::Interrupted,
                 TurnModelUsage::default(),
-                false,
             ))?;
             repaired += 1;
         }

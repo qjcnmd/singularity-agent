@@ -319,36 +319,22 @@ pub struct Turn {
 
 /// 模型 usage 的协议线格式（与 `singularity_model::ModelUsage` 同构，
 /// 避免 protocol 依赖 model crate）。同时是 JSONL 会话 `turn_terminal`
-/// 的 usage 存储形状：camelCase 主名 + snake_case alias 兼容早期历史文件。
+/// 的 usage 存储形状：七个键全部必填、只认 camelCase，写出的形状与读入要求
+/// 的形状完全相同。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnModelUsage {
-    #[serde(alias = "input_tokens", default)]
     pub input_tokens: u64,
-    #[serde(alias = "output_tokens", default)]
     pub output_tokens: u64,
-    #[serde(alias = "total_tokens", default)]
     pub total_tokens: u64,
-    #[serde(alias = "cached_input_tokens", default)]
     pub cached_input_tokens: u64,
-    #[serde(alias = "reasoning_tokens", default)]
     pub reasoning_tokens: u64,
-    /// 原始 usage 对象是否存在；缺失时各计数保持既有 unknown 表示。
-    /// 旧服务端数据无此字段时按存在解释。
-    #[serde(alias = "usage_present", default = "default_usage_present_protocol")]
+    /// 原始 usage 对象是否存在；为 false 时各计数保持 unknown 表示，不把缺失
+    /// 伪装成零消费或其它可计算金额。
     pub usage_present: bool,
-    /// 该聚合表示的每个 provider 请求是否都报告了精确 usage；缺失/未知的
-    /// 末次请求 usage 保持 partial 而非表示为 0。
-    #[serde(alias = "usage_complete", default = "default_usage_complete_protocol")]
+    /// 该聚合表示的每个 provider 请求是否都报告了精确 usage；未报告的末次
+    /// 请求 usage 保持 partial 而非表示为 0。
     pub usage_complete: bool,
-}
-
-fn default_usage_present_protocol() -> bool {
-    true
-}
-
-fn default_usage_complete_protocol() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

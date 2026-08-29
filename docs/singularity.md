@@ -21,7 +21,7 @@
 - **crates/cli**：入口解析与三种渲染（TUI / 文本 / JSONL）。TUI 与无交互模式进程内调用 runtime 的 `Conversation`；渲染只消费 typed `TurnEvent`，投影失败只丢弃投影，不影响执行事实。
 - **headless core（库）**：
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退装配估算;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求恰好一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消指数退避、≤3 次、尊重 Retry-After、真实随机 ±10% 抖动,内部仅重发同一请求)→ **发送层**(`attempt_request`/`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
-  - `session` 子系统：严格 JSONL v2（format/file/manager/context/repair）；会话 JSONL 是唯一持久事实源；
+  - `session` 子系统：严格 JSONL v3（format/file/manager/context/repair）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）;
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
@@ -89,7 +89,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 5. 会话持久化与恢复
 
-- 严格 JSONL v2：首行 header（id/version/cwd/timestamp），未知字段写入即拒绝；metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 app-server 共用同一只读投影 API。
+- 严格 JSONL v3：首行 header（id/version/cwd/timestamp），header version 必须等于当前版本，非当前版本直接拒绝打开；metadata 载荷的 usage 七个键全部必填、只认 camelCase，终态条目的完整性标志由 `usage.usageComplete` 单点承载；未知字段写入即拒绝。metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 app-server 共用同一只读投影 API。
 - 列表、存在性检查、设置基线与读取头字段均按需扫描或读取 JSONL；摘要统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 经有界重试仍无法落盘时不发布虚假终态，转 fatal 存储诊断（fail-stop）。

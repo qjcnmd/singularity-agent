@@ -61,7 +61,7 @@ flowchart TD
 
 ## 4. crates/protocol — 协议类型
 
-单点定义 stdio JSON-RPC 的全部方法、请求/响应 envelope、生命周期事件（`TurnEvent`）、执行对象（`Thread`/`Turn`/`TurnUsage`/`TurnStatus`）与错误分类词表。
+单点定义 stdio JSON-RPC 的全部方法、请求/响应 envelope、生命周期事件（`TurnEvent`）、执行对象（`Thread`/`Turn`/`TurnModelUsage`/`TurnStatus`）与错误分类词表。
 
 ```mermaid
 flowchart TD
