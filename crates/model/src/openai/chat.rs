@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 use crate::error::ProviderError;
 use crate::provider::contract::{
     ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
-    provider_response_validation_error, validate_model_turn_response,
+    provider_finish_network_error, provider_response_validation_error,
+    validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
 use crate::transport::{provider_embedded_error, provider_error_fields};
@@ -87,6 +88,7 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
         ThinkingWireFormat::EnableThinking => {
             payload["enable_thinking"] = json!(enabled);
         }
+        ThinkingWireFormat::ReasoningEffort => {}
     }
 }
 
@@ -199,6 +201,13 @@ pub fn parse_openai_response(
             config,
             model_name,
             "provider Chat response was stopped by content filter",
+        ));
+    }
+    if finish_reason.as_deref() == Some("network_error") {
+        return Err(provider_finish_network_error(
+            config,
+            model_name,
+            "provider Chat response reported a network error",
         ));
     }
     let provider_reasoning_history = message

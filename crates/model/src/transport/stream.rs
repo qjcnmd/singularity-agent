@@ -305,15 +305,14 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim()
             .to_string();
+        // [DONE] 是流终点：此后到达的尾帧（如网关追加的计费帧）
+        // 不参与终态物化，一律忽略。
         if raw == "[DONE]" {
-            if self.done {
-                return Err(provider_chat_stream_malformed_error("event_after_done"));
-            }
             self.done = true;
             return Ok(());
         }
         if self.done {
-            return Err(provider_chat_stream_malformed_error("event_after_done"));
+            return Ok(());
         }
         let payload = serde_json::from_str::<Value>(&raw)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_json"))?;
@@ -361,7 +360,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 });
             }
             // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
-            // chutes.ai 双键同文）；按序取首个非空键，只累加一次。
+            // 双键同文）；按序取首个非空键，只累加一次。
             if let Some(reasoning) = ["reasoning_content", "reasoning", "reasoning_text"]
                 .iter()
                 .find_map(|key| {
@@ -706,7 +705,7 @@ mod frame_tests {
         );
     }
 
-    /// 兼容端点在同一 delta 里以多个键携带相同 reasoning（实测 chutes.ai
+    /// 兼容端点在同一 delta 里以多个键携带相同 reasoning（实测
     /// 双键同文）：每块按序只取首个非空键、只累加一次；空串键跳过。
     #[test]
     fn reasoning_delta_accumulates_once_per_chunk_across_keys() {
@@ -742,5 +741,44 @@ mod frame_tests {
             decoder.reasoning_content, "thinkmore",
             "dual keys must contribute once per chunk, empty values skipped"
         );
+    }
+
+    /// [DONE] 之后网关可能追加计费尾帧（实测形如
+    /// `{"choices":[],"cost":"0"}`）：DONE 即流终点，尾帧忽略，
+    /// 终态物化不受影响。
+    #[test]
+    fn trailing_frames_after_done_are_ignored() {
+        let mut on_event = |_event: ProviderStreamEvent| {};
+        let mut decoder = ChatSseDecoder {
+            frames: SseFrameDecoder::default(),
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: None,
+            usage: None,
+            saw_choice: false,
+            done: false,
+            emitted_text_delta: false,
+            on_event: &mut on_event,
+        };
+        let mut dispatch = |payload: &str| {
+            decoder
+                .dispatch_event(SseFrame {
+                    event_name: None,
+                    data: payload.as_bytes().to_vec(),
+                })
+                .expect("frame dispatches")
+        };
+        dispatch(
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}"#,
+        );
+        dispatch(r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+        dispatch("[DONE]");
+        dispatch(r#"{"choices":[],"cost":"0"}"#);
+        let terminal = decoder
+            .materialize_terminal()
+            .expect("terminal materializes despite trailing frame");
+        assert_eq!(terminal["choices"][0]["message"]["content"], "OK");
     }
 }

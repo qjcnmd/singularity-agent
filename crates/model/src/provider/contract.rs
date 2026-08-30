@@ -33,6 +33,9 @@ pub enum ThinkingWireFormat {
     ThinkingType,
     /// 文档化此能力的 provider 使用顶层 `enable_thinking` 布尔。
     EnableThinking,
+    /// 思考开关无独立 wire 字段：仅发送 `reasoning_effort`（部分
+    /// OpenAI 兼容网关的 Chat 形状）。
+    ReasoningEffort,
 }
 
 /// 模型提供方必须遵守、用于构建请求和校验响应的能力。
@@ -143,6 +146,26 @@ pub(crate) fn provider_content_filter_error(
             "content_filter",
             ProviderErrorStage::ResponseValidation,
             vec!["content_filter".to_string()],
+        )
+        .with_provider(config.provider_name.clone())
+        .with_model(model_name.to_string()),
+    )
+}
+
+/// 部分 Chat 兼容端点以 `finish_reason: "network_error"` 上报生成期网络
+/// 故障：定型为网络类错误，不作为空成功返回。
+pub(crate) fn provider_finish_network_error(
+    config: &OpenAiProviderConfig,
+    model_name: &str,
+    message: &str,
+) -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::diagnostic(
+            ModelErrorKind::NetworkError,
+            message,
+            "network_error",
+            ProviderErrorStage::ResponseValidation,
+            vec!["network_error".to_string()],
         )
         .with_provider(config.provider_name.clone())
         .with_model(model_name.to_string()),

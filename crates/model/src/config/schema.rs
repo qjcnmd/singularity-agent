@@ -202,9 +202,10 @@ pub(crate) fn parse_thinking_wire_format(
     let format = match value.unwrap_or("thinking_type") {
         "thinking_type" => ThinkingWireFormat::ThinkingType,
         "enable_thinking" => ThinkingWireFormat::EnableThinking,
+        "reasoning_effort" => ThinkingWireFormat::ReasoningEffort,
         _ => {
             return Err(configuration_error(
-                "thinking_wire_format must be thinking_type or enable_thinking",
+                "thinking_wire_format must be thinking_type, enable_thinking, or reasoning_effort",
                 "provider_configuration_invalid",
             ));
         }
